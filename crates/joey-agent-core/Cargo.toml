@@ -1,0 +1,24 @@
+[package]
+name = "joey-agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+joey-core.workspace = true
+joey-providers.workspace = true
+joey-tools.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+indexmap.workspace = true
+once_cell.workspace = true

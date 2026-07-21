@@ -1,0 +1,31 @@
+[package]
+name = "joey-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core shared foundation for joey-agent: branding, paths, config, state, logging."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+dirs.workspace = true
+dotenvy.workspace = true
+regex.workspace = true
+fancy-regex = "0.14"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+uuid.workspace = true
+tempfile.workspace = true
+libc.workspace = true
+indexmap.workspace = true
+which.workspace = true
+shellexpand.workspace = true
+rusqlite.workspace = true
+url.workspace = true
+once_cell.workspace = true
