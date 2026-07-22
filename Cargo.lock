@@ -1135,6 +1135,7 @@ dependencies = [
  "fancy-regex",
  "indexmap",
  "libc",
+ "nu-ansi-term",
  "once_cell",
  "regex",
  "rusqlite",

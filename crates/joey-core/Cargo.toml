@@ -30,3 +30,4 @@ shellexpand.workspace = true
 rusqlite.workspace = true
 url.workspace = true
 once_cell.workspace = true
+nu-ansi-term.workspace = true

@@ -20,6 +20,7 @@ pub mod logging;
 pub mod reasoning;
 pub mod redact;
 pub mod state;
+pub mod theme;
 pub mod time;
 pub mod utils;
 

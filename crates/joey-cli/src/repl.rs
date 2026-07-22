@@ -25,6 +25,9 @@ use reedline::{
 use crate::render::{self, RenderOptions};
 use crate::slash::{self, Resolution};
 
+/// Interval for automatic checkpoints (in seconds).
+const AUTO_CHECKPOINT_INTERVAL_SECS: u64 = 120;
+
 pub struct ChatOptions {
     pub query: Option<String>,
     pub quiet: bool,
@@ -66,6 +69,10 @@ struct ReplState {
     last_response: String,
     queued: Vec<String>,
     session_start: Instant,
+    /// Session-scoped filesystem checkpoint manager.
+    checkpoints: Option<joey_tools::vcs::CheckpointManager>,
+    /// Last time an automatic checkpoint was taken.
+    last_auto_checkpoint: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +295,17 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         last_response: String::new(),
         queued: Vec::new(),
         session_start: Instant::now(),
+        checkpoints: None,
+        last_auto_checkpoint: Instant::now(),
     };
+
+    // Initialize session-scoped filesystem checkpoints (fresh every session).
+    {
+        let cp = joey_tools::vcs::CheckpointManager::new(&st.session_id, &st.cwd);
+        if cp.is_enabled() {
+            st.checkpoints = Some(cp);
+        }
+    }
 
     if !opts.quiet {
         let enabled = build_agent_config(&st.config, &st.overrides).enabled_tools;
@@ -419,6 +436,10 @@ fn end_session(st: &ReplState, reason: &str) {
     if let Some(db) = st.agent.session_db() {
         let _ = db.end_session(&st.session_id, reason);
     }
+    // Clean up the shadow repo on session end.
+    if let Some(cp) = &st.checkpoints {
+        cp.cleanup();
+    }
 }
 
 enum LoopOutcome {
@@ -497,6 +518,11 @@ async fn run_turn_interactive(st: &mut ReplState, input: &str) -> String {
     }
     let final_text = render_handle.await.unwrap_or_default();
     st.last_response = final_text.clone();
+
+    // Auto-checkpoint: take a filesystem snapshot after each agent turn if
+    // enough time has passed.
+    maybe_auto_checkpoint(st);
+
     final_text
 }
 
@@ -632,6 +658,8 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         "version" => crate::commands::print_version_info(),
         "copy" => copy_last(st),
         "compress" => manual_compress(st, args).await,
+        "checkpoint" => checkpoint_slash(st, args),
+        "revert" | "rollback" => revert_slash(st, args),
         other => {
             // Registry says implemented but no handler — treat as unported.
             println!("Command '/{}' is not available in joey-agent yet.", other);
@@ -687,10 +715,21 @@ fn new_session(st: &mut ReplState, name: &str, quiet: bool) {
         }
     }
     end_session(st, "new_session");
+
+    // Re-initialize checkpoint manager for the new session.
+    st.session_id = new_id.clone();
+    st.checkpoints = None;
+    {
+        let cp = joey_tools::vcs::CheckpointManager::new(&new_id, &st.cwd);
+        if cp.is_enabled() {
+            st.checkpoints = Some(cp);
+        }
+    }
+    st.last_auto_checkpoint = Instant::now();
+
     match build_agent(&st.config, &st.cwd, &st.overrides, &new_id, Vec::new()) {
         Ok(agent) => {
             st.agent = agent;
-            st.session_id = new_id.clone();
             st.session_start = Instant::now();
             st.last_response.clear();
             joey_core::logging::set_session_context(Some(&new_id));
@@ -1149,3 +1188,96 @@ fn copy_last(st: &ReplState) {
     }
     render::error("no clipboard command found (pbcopy/xclip/wl-copy)");
 }
+
+// ---------------------------------------------------------------------------
+// Filesystem checkpoint commands (/checkpoint, /revert, /rollback)
+// ---------------------------------------------------------------------------
+
+/// Take an automatic checkpoint if the interval has elapsed.
+fn maybe_auto_checkpoint(st: &mut ReplState) {
+    let elapsed = st.last_auto_checkpoint.elapsed().as_secs();
+    if elapsed < AUTO_CHECKPOINT_INTERVAL_SECS {
+        return;
+    }
+    if let Some(cp) = &mut st.checkpoints {
+        if let Some(num) = cp.checkpoint("Auto-checkpoint") {
+            render::checkpoint_created(num, "Auto-checkpoint (periodic)");
+            st.last_auto_checkpoint = Instant::now();
+        }
+    }
+}
+
+/// `/checkpoint [message]` — create a named filesystem checkpoint.
+fn checkpoint_slash(st: &mut ReplState, args: &str) {
+    let Some(cp) = &mut st.checkpoints else {
+        render::info("Filesystem checkpoints are not available (git not found or init failed).");
+        return;
+    };
+    let message = if args.trim().is_empty() {
+        "Manual checkpoint"
+    } else {
+        args.trim()
+    };
+    if let Some(num) = cp.checkpoint(message) {
+        render::checkpoint_created(num, message);
+    } else {
+        render::info("No filesystem changes since the last checkpoint.");
+    }
+}
+
+/// `/revert <number>` or `/rollback [number]` — revert filesystem to checkpoint.
+fn revert_slash(st: &mut ReplState, args: &str) {
+    let Some(cp) = &st.checkpoints else {
+        render::info("Filesystem checkpoints are not available.");
+        return;
+    };
+
+    let checkpoints = match cp.list() {
+        Ok(list) => list,
+        Err(e) => {
+            render::error(&format!("failed to list checkpoints: {}", e));
+            return;
+        }
+    };
+
+    // No argument → list all checkpoints.
+    if args.trim().is_empty() {
+        render::checkpoint_list(&checkpoints);
+        return;
+    }
+
+    // Parse the checkpoint number.
+    let target_num: usize = match args.trim().parse() {
+        Ok(n) => n,
+        Err(_) => {
+            render::error("Usage: /revert <number> (use /revert with no args to list)");
+            return;
+        }
+    };
+
+    // Find the checkpoint.
+    if !checkpoints.iter().any(|c| c.number == target_num) {
+        render::error(&format!("Checkpoint #{} not found", target_num));
+        return;
+    }
+
+    // Confirm the revert.
+    let target = checkpoints.iter().find(|c| c.number == target_num).unwrap();
+    render::info(&format!(
+        "Reverting to checkpoint #{}: \"{}\" ({} files)",
+        target_num, target.message, target.files_changed
+    ));
+
+    match cp.revert(target_num) {
+        Ok(()) => {
+            render::checkpoint_reverted(target_num);
+            // Update auto-checkpoint timer so we don't immediately snapshot
+            // the reverted state.
+            st.last_auto_checkpoint = Instant::now();
+        }
+        Err(e) => {
+            render::error(&format!("revert failed: {}", e));
+        }
+    }
+}
+

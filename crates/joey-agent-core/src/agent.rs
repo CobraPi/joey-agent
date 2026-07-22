@@ -829,22 +829,12 @@ impl Agent {
                     } else {
                         jittered_backoff(retry_count as u32)
                     };
-                    let _ = tx.send(AgentEvent::Notice(if is_rate_limited {
-                        format!(
-                            "⏱️ Rate limited. Waiting {:.1}s (attempt {}/{})...",
-                            wait.as_secs_f64(),
-                            retry_count + 1,
-                            max_retries
-                        )
-                    } else {
-                        format!(
-                            "⚠️  API call failed (attempt {}/{}): {} — retrying in {:.1}s...",
-                            retry_count,
-                            max_retries,
-                            e,
-                            wait.as_secs_f64()
-                        )
-                    }));
+                    let _ = tx.send(AgentEvent::RetryAttempt {
+                        attempt: retry_count,
+                        max_retries: max_retries,
+                        error: e.to_string(),
+                        wait_secs: wait.as_secs_f64(),
+                    });
                     if self.sleep_with_interrupt(wait).await {
                         return Err(TurnAbort::Interrupted(format!(
                             "Operation interrupted during retry ({}, attempt {}/{}).",
@@ -1142,6 +1132,10 @@ impl Agent {
         self.ctx.state().memory_consolidation_failures = 0;
         self.invalid_tool_strikes = 0;
 
+        let _ = tx.send(AgentEvent::TurnStart {
+            max_iterations: self.config.max_turns,
+        });
+
         // Replay a stored compression warning once a live event channel
         // exists (conversation_compression.py `replay_compression_warning`).
         if !self.compression_warning_replayed {
@@ -1176,6 +1170,7 @@ impl Agent {
                 let _ = tx.send(AgentEvent::Done {
                     final_text: final_text.clone(),
                     usage: total_usage.clone(),
+                    iterations: api_calls,
                 });
                 return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true };
             }
@@ -1235,6 +1230,12 @@ impl Agent {
 
             api_calls += 1;
 
+            let _ = tx.send(AgentEvent::IterationStart {
+                iteration: api_calls,
+                max_iterations: self.config.max_turns,
+            });
+            let _ = tx.send(AgentEvent::ApiCallStart);
+
             // Assistant-turn boundary: reset the per-turn aggregate tool
             // output budget (tool_result_storage layer 3).
             self.ctx.turn_budget().reset();
@@ -1250,6 +1251,7 @@ impl Agent {
                     let _ = tx.send(AgentEvent::Done {
                         final_text: text.clone(),
                         usage: total_usage.clone(),
+                    iterations: api_calls,
                     });
                     return TurnResult { final_text: text, usage: total_usage, iterations: api_calls, interrupted: true };
                 }
@@ -1263,6 +1265,10 @@ impl Agent {
                 }
             };
             accumulate_usage(&mut total_usage, &self.usage_or_estimate(&resp));
+
+            let _ = tx.send(AgentEvent::ApiCallEnd {
+                usage: self.usage_or_estimate(&resp),
+            });
 
             // ── Feed real usage to the compressor (conversation_loop.py:
             // 2239-2272): only genuine provider usage counts; a usage-less
@@ -1414,6 +1420,7 @@ impl Agent {
                     let _ = tx.send(AgentEvent::Done {
                         final_text: final_text.clone(),
                         usage: total_usage.clone(),
+                    iterations: api_calls,
                     });
                     return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true };
                 }
@@ -1471,6 +1478,7 @@ impl Agent {
                 let _ = tx.send(AgentEvent::Done {
                     final_text: partial.clone(),
                     usage: total_usage.clone(),
+                    iterations: api_calls,
                 });
                 return TurnResult { final_text: partial, usage: total_usage, iterations: api_calls, interrupted: false };
             }
@@ -1534,6 +1542,7 @@ impl Agent {
                 let _ = tx.send(AgentEvent::Done {
                     final_text: final_text.clone(),
                     usage: total_usage.clone(),
+                    iterations: api_calls,
                 });
                 return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false };
             }
@@ -1546,6 +1555,7 @@ impl Agent {
             let _ = tx.send(AgentEvent::Done {
                 final_text: final_text.clone(),
                 usage: total_usage.clone(),
+                    iterations: api_calls,
             });
             return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false };
         }
@@ -1584,6 +1594,7 @@ impl Agent {
         let _ = tx.send(AgentEvent::Done {
             final_text: summary.clone(),
             usage: total_usage.clone(),
+                    iterations: api_calls,
         });
         TurnResult {
             final_text: summary,
@@ -1637,9 +1648,7 @@ impl Agent {
 
     /// Execute a validated batch: contiguous runs of read-only tools run
     /// concurrently; everything else runs sequentially with `tool_delay`
-    /// spacing. Returns true when the batch was interrupted. This is the
-    /// simple planner (read-only parallel, rest sequential) — upstream's
-    /// non-overlapping-path planning for write tools is not ported.
+    /// spacing. Returns true when the batch was interrupted.
     async fn execute_tool_calls(
         &mut self,
         tool_calls: &[ToolCall],
@@ -1666,6 +1675,7 @@ impl Agent {
                 // Emit starts, run all concurrently, append results in the
                 // model's call order (tool_executor's indexed fan-out).
                 let mut handles = Vec::with_capacity(calls.len());
+                let mut start_times = Vec::with_capacity(calls.len());
                 for tc in &calls {
                     let args = normalized_args(tc);
                     let _ = tx.send(AgentEvent::ToolStart {
@@ -1673,6 +1683,7 @@ impl Agent {
                         emoji: self.registry.get_emoji(&tc.function.name),
                         summary: summarize_args(&tc.function.name, &args),
                     });
+                    start_times.push(std::time::Instant::now());
                     let registry = self.registry.clone();
                     let ctx = self.ctx.clone();
                     let name = tc.function.name.clone();
@@ -1681,19 +1692,22 @@ impl Agent {
                         registry.dispatch_call(&name, args, &ctx, &id).await
                     }));
                 }
-                for (tc, handle) in calls.iter().zip(handles) {
+                for (idx, (tc, handle)) in calls.iter().zip(handles).enumerate() {
                     let (content, is_error) = match handle.await {
                         Ok(result) => (result.to_content_string(), result.is_error()),
-                        // Executor-level failure surface (tool_executor.py:658).
                         Err(e) => (
                             format!("Error executing tool '{}': {}", tc.function.name, e),
                             true,
                         ),
                     };
+                    let duration = start_times[idx].elapsed().as_secs_f64();
                     let wrapped = maybe_wrap_untrusted(&tc.function.name, &content);
+                    let preview = preview_result(&content);
                     let _ = tx.send(AgentEvent::ToolEnd {
                         name: tc.function.name.clone(),
                         is_error,
+                        result_preview: preview,
+                        duration_secs: duration,
                     });
                     self.push_message(
                         Message::tool_result(&tc.id, &tc.function.name, wrapped),
@@ -1709,15 +1723,22 @@ impl Agent {
                         emoji: self.registry.get_emoji(&tc.function.name),
                         summary: summarize_args(&tc.function.name, &args),
                     });
+                    let call_start = std::time::Instant::now();
                     let result = self
                         .registry
                         .dispatch_call(&tc.function.name, args, &self.ctx, &tc.id)
                         .await;
+                    let duration = call_start.elapsed().as_secs_f64();
+                    let is_error = result.is_error();
+                    let content_raw = result.to_content_string();
+                    let preview = preview_result(&content_raw);
                     let _ = tx.send(AgentEvent::ToolEnd {
                         name: tc.function.name.clone(),
-                        is_error: result.is_error(),
+                        is_error,
+                        result_preview: preview,
+                        duration_secs: duration,
                     });
-                    let wrapped = maybe_wrap_untrusted(&tc.function.name, &result.to_content_string());
+                    let wrapped = maybe_wrap_untrusted(&tc.function.name, &content_raw);
                     self.push_message(
                         Message::tool_result(&tc.id, &tc.function.name, wrapped),
                         None,
@@ -1725,7 +1746,6 @@ impl Agent {
                     executed += 1;
 
                     // Interrupt between sequential calls: skip the rest
-                    // (tool_executor.py:1731-1747).
                     if self.interrupted() && executed < total {
                         let remaining: Vec<&ToolCall> = tool_calls[executed..].iter().collect();
                         let _ = tx.send(AgentEvent::Notice(format!(
@@ -1750,8 +1770,6 @@ impl Agent {
                             .await
                             && executed < total
                         {
-                            // Treat an interrupt during the spacing sleep like
-                            // the between-calls interrupt above.
                             let remaining: Vec<&ToolCall> = tool_calls[executed..].iter().collect();
                             for skipped in remaining {
                                 let content = format!(
@@ -2061,6 +2079,21 @@ fn summarize_args(name: &str, args: &Value) -> String {
         "web_search" => pick(&["query"]).unwrap_or_default(),
         "skill_view" => pick(&["name"]).unwrap_or_default(),
         _ => String::new(),
+    }
+}
+
+/// A one-line preview of a tool result for verbose TUI display.
+/// Shows the first non-empty line, truncated to 100 chars.
+fn preview_result(content: &str) -> String {
+    let first_line = content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    let chars: Vec<char> = first_line.chars().collect();
+    if chars.len() > 100 {
+        format!("{}...", chars[..100].iter().collect::<String>())
+    } else {
+        first_line.to_string()
     }
 }
 

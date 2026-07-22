@@ -20,6 +20,7 @@ pub mod toolsets;
 pub mod tools;
 pub mod truncate;
 pub mod url_safety;
+pub mod vcs;
 
 pub use context::{SessionState, ToolContext, TurnBudget};
 pub use registry::{sanitize_tool_error, tool_error, Tool, ToolRegistry, ToolResult};
