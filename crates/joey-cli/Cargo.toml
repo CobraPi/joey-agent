@@ -15,22 +15,18 @@ joey-tools.workspace = true
 joey-agent-core.workspace = true
 joey-cron.workspace = true
 joey-mcp.workspace = true
-joey-gateway.workspace = true
 anyhow.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
-futures-util.workspace = true
-tracing.workspace = true
 clap.workspace = true
 reedline.workspace = true
 nu-ansi-term.workspace = true
-crossterm.workspace = true
 terminal_size.workspace = true
 unicode-width.workspace = true
-textwrap.workspace = true
-dirs.workspace = true
 chrono.workspace = true
 indexmap.workspace = true
 which.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

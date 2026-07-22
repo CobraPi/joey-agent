@@ -14,10 +14,11 @@ tokio.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
-cron.workspace = true
 uuid.workspace = true
 regex.workspace = true
 once_cell.workspace = true
+tempfile.workspace = true
+# Cross-process advisory flock for .jobs.lock / .tick.lock (port of fcntl.flock).
+fs2 = "0.4"
 
 [dev-dependencies]
-tempfile.workspace = true

@@ -34,10 +34,10 @@ system SQLite needed. `ripgrep` (`rg`) is recommended for faster search.
 ## Quick start
 
 ```bash
-joey model                              # see the resolved model/provider + whether a key is set
+joey model                              # interactive provider + model picker (persists to config)
 joey config set OPENROUTER_API_KEY sk-… # store a provider key (goes to ~/.joey/.env)
 joey                                    # start an interactive chat session
-joey -q "what changed in the last commit?"   # one-shot, prints only the final answer
+joey -z "what changed in the last commit?"   # one-shot, prints only the final answer
 ```
 
 Pick any provider with no code changes:
@@ -57,29 +57,35 @@ supported on both.
 
 ```
 joey                       Start the interactive REPL
-joey -q "<prompt>"         One-shot headless query (prints only the final answer)
+joey -z "<prompt>"         One-shot headless query (prints only the final answer)
+joey chat -q "<prompt>"    One-shot through the chat path (banner/session unless -Q)
 joey -m <model>            Override the model for this run
-joey -r <session-prefix>   Resume a past session
+joey -r <id-or-title>      Resume a past session · joey -c resumes the most recent
+joey -p <profile>          Use a named profile home (~/.joey/profiles/<name>)
 
-joey model                 Show the resolved model/provider and credential status
-joey tools                 List toolsets and built-in tools
-joey skills                List installed skills
-joey config get|set|show|path <key> [value]
-joey doctor                Diagnose the environment
+joey model                 Interactive provider + model picker (persists selection)
+joey tools                 --summary | list | enable/disable <names> [--platform]
+joey skills list           List installed skills
+joey config                show | edit | get | set | unset | path | env-path
+joey doctor [--fix]        Diagnose the environment (and fix what it can)
 joey version               Show version + upstream attribution
-joey home                  Print the resolved ~/.joey directory
+joey home                  Print the resolved ~/.joey directory (joey extension)
 
-joey cron list                         List scheduled jobs
+joey cron                              List scheduled jobs (also: cron list)
 joey cron create "<sched>" "<prompt>"  Create a job ("30m", "every 2h", "0 9 * * *", ISO)
-joey cron pause|resume|remove <id>     Manage a job
-joey cron tick                         Run all due jobs once
-joey cron run                          Run the 60s scheduler loop
+joey cron pause|resume|remove <job>    Manage a job (by id or name)
+joey cron run <job>                    Trigger a job now
+joey cron tick [--loop]                Run due jobs once (--loop: 60s scheduler daemon)
+joey cron status                       Scheduler heartbeat + job counts
 
-joey mcp list <command> [args…]        Connect to a stdio MCP server and list its tools
+joey mcp add <name> --command …        Register a stdio MCP server (config.yaml mcp_servers)
+joey mcp list | test <name> | remove   Inspect, probe, or remove configured servers
 ```
 
-Inside the REPL, slash commands mirror the CLI: `/help`, `/new` (`/reset`, `/clear`),
-`/model`, `/tools`, `/toolsets`, `/skills`, `/reasoning <level>`, `/version`, `/quit`.
+Inside the REPL the full upstream slash-command set is recognized (`/help` lists it);
+implemented today: `/help`, `/new [name]`, `/clear`, `/model`, `/reasoning`, `/tools`,
+`/toolsets`, `/skills`, `/history`, `/sessions`, `/resume`, `/config`, `/status`,
+`/usage`, `/queue` (`/q`), `/copy`, `/verbose`, `/timestamps`, `/version`, `/exit`.
 
 ## Built-in tools
 
@@ -105,20 +111,22 @@ State lives under `~/.joey/` (override with `JOEY_HOME`):
 
 ```
 ~/.joey/config.yaml     layered config (defaults ← config.yaml ← .env ← CLI flags)
-~/.joey/.env            provider keys and secrets
-~/.joey/state.db        SQLite session store (transcripts + FTS5 search)
+~/.joey/.env            provider keys and secrets (overrides shell env, like upstream)
+~/.joey/SOUL.md         the agent identity (seeded on first run; edit to customize)
+~/.joey/state.db        SQLite session store (hermes-compatible schema + FTS5 search)
 ~/.joey/memories/       MEMORY.md, USER.md
-~/.joey/skills/         installed Agent Skills
-~/.joey/cron/jobs.json  scheduled jobs
-~/.joey/logs/           rotating logs
+~/.joey/skills/         installed Agent Skills (73 upstream skills ship in-repo)
+~/.joey/cron/jobs.json  scheduled jobs (hermes-compatible format)
+~/.joey/logs/           size-rotated, secret-redacted logs
 ```
 
 Config keys use dotted paths (`agent.max_turns`, `terminal.backend`, `model.provider`).
 Keys ending in `_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` are routed to `.env` automatically.
 
-Preserved defaults from upstream: default model `anthropic/claude-opus-4.6`, OpenRouter
-base `https://openrouter.ai/api/v1`, `max_turns` 60, reasoning `medium`, tool-output cap
-50 000 chars (40/60 head-tail), cron ticker 60 s.
+Preserved defaults from upstream: model unset until you pick one (`joey model` or the
+first-run setup), OpenRouter base `https://openrouter.ai/api/v1`, `max_turns` 90,
+reasoning left to the provider default, tool-output cap 50 000 chars (40/60 head-tail),
+cron ticker 60 s.
 
 ## Architecture
 
@@ -145,6 +153,11 @@ partial, and deferred.
 
 Hermes Agent is © Nous Research and MIT-licensed; Joey Agent retains that license and
 attribution. This project is not affiliated with or endorsed by Nous Research.
+
+One deliberate behavioral difference: upstream's Anthropic-OAuth path impersonates
+Claude Code (spoofed client identity and headers) so subscription billing accepts its
+traffic; Joey omits that layer as it circumvents Anthropic's terms. Use an Anthropic
+API key instead. `PORTING.md` lists this and every other known deviation.
 
 ## License
 

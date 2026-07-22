@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 joey-core.workspace = true
-joey-agent-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

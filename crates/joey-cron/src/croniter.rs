@@ -55,30 +55,40 @@ pub struct CronExpr {
 
 /// Which local-timezone wall clock schedule math runs on.
 #[derive(Debug, Clone, Copy)]
-enum LocalZone {
+pub(crate) enum LocalZone {
     Named(Tz),
     System,
 }
 
 impl LocalZone {
-    fn configured() -> Self {
+    /// The configured joey timezone, falling back to the system zone —
+    /// exactly the clock `joey_core::time::now()` reads.
+    pub(crate) fn configured() -> Self {
         match joey_core::time::configured_tz() {
             Some(tz) => LocalZone::Named(tz),
             None => LocalZone::System,
         }
     }
 
-    fn naive_local(&self, instant: DateTime<FixedOffset>) -> NaiveDateTime {
+    pub(crate) fn naive_local(&self, instant: DateTime<FixedOffset>) -> NaiveDateTime {
         match self {
             LocalZone::Named(tz) => instant.with_timezone(tz).naive_local(),
             LocalZone::System => instant.with_timezone(&Local).naive_local(),
         }
     }
 
+    /// Re-express an instant in this zone's offset (Python `astimezone`).
+    pub(crate) fn to_fixed(&self, instant: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+        match self {
+            LocalZone::Named(tz) => instant.with_timezone(tz).fixed_offset(),
+            LocalZone::System => instant.with_timezone(&Local).fixed_offset(),
+        }
+    }
+
     /// Resolve a local wall-clock time to an instant. Ambiguous (fall-back)
     /// times take the earlier occurrence; nonexistent (spring-forward gap)
     /// times return None so the caller skips past the gap.
-    fn localize(&self, naive: NaiveDateTime) -> Option<DateTime<FixedOffset>> {
+    pub(crate) fn localize(&self, naive: NaiveDateTime) -> Option<DateTime<FixedOffset>> {
         match self {
             LocalZone::Named(tz) => match tz.from_local_datetime(&naive) {
                 LocalResult::Single(dt) => Some(dt.fixed_offset()),
@@ -91,6 +101,23 @@ impl LocalZone {
                 LocalResult::None => None,
             },
         }
+    }
+
+    /// Like [`localize`] but never fails: a wall time inside a DST gap is
+    /// resolved with the zone's offset for that instant (mirrors Python
+    /// `datetime.replace(tzinfo=...)`, which attaches without validation).
+    pub(crate) fn localize_lenient(&self, naive: NaiveDateTime) -> DateTime<FixedOffset> {
+        use chrono::{Offset, Utc};
+        if let Some(dt) = self.localize(naive) {
+            return dt;
+        }
+        let off: FixedOffset = match self {
+            LocalZone::Named(tz) => tz.offset_from_utc_datetime(&naive).fix(),
+            LocalZone::System => Local.offset_from_utc_datetime(&naive).fix(),
+        };
+        off.from_local_datetime(&naive)
+            .single()
+            .unwrap_or_else(|| Utc.from_utc_datetime(&naive).fixed_offset())
     }
 }
 

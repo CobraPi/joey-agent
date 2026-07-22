@@ -405,18 +405,18 @@ const EMPTY_PROVIDER_RESPONSE_PATTERNS: &[&str] = &[
 
 // ── Backoff (retry_utils.py:36-74) ──────────────────────────────────────────
 
-/// API-error retry backoff: base 2.0s, max 60.0s, jitter uniform in
-/// [0, 0.5·delay) — the variant the conversation loop uses for API errors
-/// (conversation_loop.py:4318: `jittered_backoff(retry_count, base_delay=2.0,
-/// max_delay=60.0)`).
+/// Jittered backoff with upstream's default parameters (base 5s, max 120s) —
+/// the bare `retry_utils.jittered_backoff(attempt)` signature. The API-error
+/// retry path uses [`jittered_backoff_api`] (base 2.0, max 60.0) instead.
 pub fn jittered_backoff(attempt: u32) -> Duration {
-    jittered_backoff_with(attempt, 2.0, 60.0)
+    jittered_backoff_with(attempt, 5.0, 120.0)
 }
 
-/// The default upstream `jittered_backoff` parameters (base 5s, max 120s) —
-/// used by the loop's non-API-error retries.
-pub fn jittered_backoff_slow(attempt: u32) -> Duration {
-    jittered_backoff_with(attempt, 5.0, 120.0)
+/// API-error retry backoff: base 2.0s, max 60.0s — the variant the conversation
+/// loop uses for provider API errors (conversation_loop.py:4318:
+/// `jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)`).
+pub fn jittered_backoff_api(attempt: u32) -> Duration {
+    jittered_backoff_with(attempt, 2.0, 60.0)
 }
 
 /// Jittered exponential backoff: `min(base·2^(attempt-1), max) + U[0, 0.5·delay)`
@@ -524,26 +524,26 @@ mod tests {
 
     #[test]
     fn backoff_bounds_with_real_jitter() {
-        // attempt 1 (base 2, max 60): delay=2, jitter ∈ [0,1) → [2,3)
+        // API variant attempt 1 (base 2, max 60): delay=2, jitter ∈ [0,1) → [2,3)
+        for _ in 0..50 {
+            let d = jittered_backoff_api(1).as_secs_f64();
+            assert!((2.0..3.0).contains(&d), "api attempt 1 out of bounds: {d}");
+        }
+        // API attempt 6: 2*2^5=64 → capped 60, jitter ∈ [0,30) → [60,90)
+        for _ in 0..50 {
+            let d = jittered_backoff_api(6).as_secs_f64();
+            assert!((60.0..90.0).contains(&d), "api attempt 6 out of bounds: {d}");
+        }
+        // Default (upstream) variant attempt 1: base 5 → [5, 7.5)
         for _ in 0..50 {
             let d = jittered_backoff(1).as_secs_f64();
-            assert!((2.0..3.0).contains(&d), "attempt 1 out of bounds: {d}");
-        }
-        // attempt 6: 2*2^5=64 → capped 60, jitter ∈ [0,30) → [60,90)
-        for _ in 0..50 {
-            let d = jittered_backoff(6).as_secs_f64();
-            assert!((60.0..90.0).contains(&d), "attempt 6 out of bounds: {d}");
-        }
-        // slow variant attempt 1: [5, 7.5)
-        for _ in 0..50 {
-            let d = jittered_backoff_slow(1).as_secs_f64();
-            assert!((5.0..7.5).contains(&d), "slow attempt 1 out of bounds: {d}");
+            assert!((5.0..7.5).contains(&d), "default attempt 1 out of bounds: {d}");
         }
         // jitter is actually random (two draws differ eventually)
-        let a = jittered_backoff(3);
+        let a = jittered_backoff_api(3);
         let mut differs = false;
         for _ in 0..20 {
-            if jittered_backoff(3) != a {
+            if jittered_backoff_api(3) != a {
                 differs = true;
                 break;
             }

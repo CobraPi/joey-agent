@@ -22,3 +22,12 @@ chrono.workspace = true
 uuid.workspace = true
 indexmap.workspace = true
 once_cell.workspace = true
+regex.workspace = true
+unicode-normalization.workspace = true
+shellexpand.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

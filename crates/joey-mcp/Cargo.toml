@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 joey-core.workspace = true
-joey-tools.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -14,7 +13,6 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-async-trait.workspace = true
 regex.workspace = true
 # fancy-regex is needed for the look-around assertions in the exfiltration
 # filter's egress pattern (ported from hermes_cli/mcp_security.py), which the
@@ -24,6 +22,7 @@ indexmap.workspace = true
 chrono.workspace = true
 base64.workspace = true
 shellexpand.workspace = true
+shlex.workspace = true
 which.workspace = true
 dotenvy.workspace = true
 

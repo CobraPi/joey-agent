@@ -79,7 +79,10 @@ fn home_from_env() -> PathBuf {
 }
 
 fn warn_profile_fallback_once() {
-    if PROFILE_FALLBACK_WARNED.swap(true, Ordering::SeqCst) {
+    // The latch is only set once the warning actually fires — until then every
+    // call re-checks the active profile (mirrors upstream, which keeps probing
+    // until the sticky profile condition is first observed).
+    if PROFILE_FALLBACK_WARNED.load(Ordering::SeqCst) {
         return;
     }
     let fallback_home = platform_default_home();
@@ -88,6 +91,7 @@ fn warn_profile_fallback_once() {
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if !active.is_empty() && active != "default" {
+        PROFILE_FALLBACK_WARNED.store(true, Ordering::SeqCst);
         // Straight to stderr: called before logging may be configured.
         eprintln!(
             "[{} fallback] {} is unset but active profile is {:?}. Falling back to {}, \
@@ -358,19 +362,18 @@ pub fn windows_path_to_wsl(path: &str) -> Option<String> {
 
 /// Convert a `\\wsl.localhost\<distro>\...` (or legacy `\\wsl$\...`) UNC path
 /// to a POSIX path inside the distro.
+///
+/// Mirrors the upstream regex `^\\\\wsl(?:\.localhost|\$)\\[^\\]+\\(.*)$`:
+/// a non-empty distro segment followed by a separator is REQUIRED, so
+/// `\\wsl$\Ubuntu` (no trailing separator) and an empty distro return `None`.
 pub fn wsl_unc_path_to_posix(path: &str) -> Option<String> {
+    use once_cell::sync::Lazy;
+    static UNC_RE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r"(?i)^\\\\wsl(?:\.localhost|\$)\\[^\\]+\\(.*)$").expect("wsl unc regex")
+    });
     let normalized = path.trim().replace('/', "\\");
-    let lower = normalized.to_lowercase();
-    let rest = if let Some(r) = lower.strip_prefix("\\\\wsl.localhost\\") {
-        &normalized[normalized.len() - r.len()..]
-    } else if let Some(r) = lower.strip_prefix("\\\\wsl$\\") {
-        &normalized[normalized.len() - r.len()..]
-    } else {
-        return None;
-    };
-    let mut parts = rest.splitn(2, '\\');
-    let _distro = parts.next()?;
-    let tail = parts.next().unwrap_or("").replace('\\', "/");
+    let caps = UNC_RE.captures(&normalized)?;
+    let tail = caps.get(1).map(|m| m.as_str()).unwrap_or("").replace('\\', "/");
     Some(if tail.is_empty() { "/".to_string() } else { format!("/{}", tail) })
 }
 
@@ -390,14 +393,47 @@ pub fn translate_cwd_for_wsl_backend(cwd: &str) -> String {
 
 // ─── Subprocess HOME Contract ────────────────────────────────────────────────
 
+/// Return a comparable absolute path string, or "" for empty input.
+///
+/// Port of upstream `_norm_home_path`: `normcase(abspath(expanduser(raw)))` —
+/// a purely LEXICAL normalization. No symlink resolution is performed
+/// (canonicalize would diverge from upstream for symlinked homes).
 fn norm_home_path(path: &str) -> String {
     let raw = path.trim();
     if raw.is_empty() {
         return String::new();
     }
     let expanded = shellexpand::tilde(raw).to_string();
-    let abs = std::fs::canonicalize(&expanded).unwrap_or_else(|_| PathBuf::from(&expanded));
-    let s = abs.to_string_lossy().to_string();
+    let p = Path::new(&expanded);
+    let abs: PathBuf = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(p)
+    };
+    // Lexical normpath: collapse `.` and resolve `..` component-wise.
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    let mut prefix = PathBuf::new();
+    for comp in abs.components() {
+        use std::path::Component;
+        match comp {
+            Component::Prefix(p) => prefix.push(p.as_os_str()),
+            Component::RootDir => prefix.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !parts.is_empty() {
+                    parts.pop();
+                }
+            }
+            Component::Normal(seg) => parts.push(seg.to_os_string()),
+        }
+    }
+    let mut norm = prefix;
+    for part in parts {
+        norm.push(part);
+    }
+    let s = norm.to_string_lossy().to_string();
     if cfg!(windows) {
         s.to_lowercase()
     } else {
@@ -425,6 +461,27 @@ fn env_or_process(env: Option<&indexmap::IndexMap<String, String>>, key: &str) -
         .to_string()
 }
 
+/// The passwd-database home directory for the current uid (unix only).
+/// Independent of `$HOME` — this is the third candidate upstream consults
+/// via `pwd.getpwuid(os.getuid()).pw_dir`.
+#[cfg(unix)]
+fn passwd_home_dir() -> Option<String> {
+    // SAFETY: getpwuid returns a pointer into static libc storage (or NULL);
+    // we copy the pw_dir C string out immediately and never retain it.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() {
+            return None;
+        }
+        let dir = (*pw).pw_dir;
+        if dir.is_null() {
+            return None;
+        }
+        let s = std::ffi::CStr::from_ptr(dir).to_string_lossy().trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+}
+
 fn real_home_candidates(env: Option<&indexmap::IndexMap<String, String>>) -> Vec<String> {
     let mut candidates = Vec::new();
     let explicit = env_or_process(env, branding::ENV_REAL_HOME);
@@ -435,10 +492,11 @@ fn real_home_candidates(env: Option<&indexmap::IndexMap<String, String>>) -> Vec
     if !home.is_empty() {
         candidates.push(home);
     }
+    // 3rd candidate: passwd-database home (getpwuid), independent of $HOME.
     #[cfg(unix)]
     {
-        if let Some(dir) = dirs::home_dir() {
-            candidates.push(dir.to_string_lossy().to_string());
+        if let Some(dir) = passwd_home_dir() {
+            candidates.push(dir);
         }
     }
     let userprofile = env_or_process(env, "USERPROFILE");
@@ -448,7 +506,20 @@ fn real_home_candidates(env: Option<&indexmap::IndexMap<String, String>>) -> Vec
     let drive = env_or_process(env, "HOMEDRIVE");
     let hpath = env_or_process(env, "HOMEPATH");
     if !drive.is_empty() && !hpath.is_empty() {
-        candidates.push(format!("{}{}", drive, hpath));
+        // Insert a separator when HOMEPATH doesn't start with one
+        // (upstream: `f"{drive}{path}"` if path startswith \\ or / else join).
+        if hpath.starts_with('\\') || hpath.starts_with('/') {
+            candidates.push(format!("{}{}", drive, hpath));
+        } else {
+            candidates.push(format!("{}{}{}", drive, std::path::MAIN_SEPARATOR, hpath));
+        }
+    }
+    // Last resort: `expanduser("~")` equivalent.
+    if let Some(dir) = dirs::home_dir() {
+        let s = dir.to_string_lossy().to_string();
+        if !s.is_empty() && s != "~" {
+            candidates.push(s);
+        }
     }
     candidates
 }
@@ -545,7 +616,28 @@ mod tests {
             wsl_unc_path_to_posix("\\\\wsl$\\Ubuntu\\"),
             Some("/".to_string())
         );
+        // No trailing separator after the distro → None (upstream regex
+        // requires `\<distro>\`).
+        assert_eq!(wsl_unc_path_to_posix("\\\\wsl$\\Ubuntu"), None);
+        // Empty distro segment → None.
+        assert_eq!(wsl_unc_path_to_posix("\\\\wsl$\\\\home"), None);
         assert_eq!(wsl_unc_path_to_posix("C:\\nope"), None);
+    }
+
+    #[test]
+    fn norm_home_is_lexical() {
+        // `..` collapses lexically; no symlink resolution happens.
+        assert_eq!(norm_home_path("/a/b/../c"), "/a/c");
+        assert_eq!(norm_home_path("/a/./b/"), "/a/b");
+        assert_eq!(norm_home_path(""), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passwd_home_present() {
+        // Every unix test environment has a passwd entry for the current uid.
+        let home = passwd_home_dir();
+        assert!(home.is_some());
     }
 
     #[test]

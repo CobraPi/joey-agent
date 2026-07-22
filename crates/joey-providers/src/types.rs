@@ -40,6 +40,18 @@ pub struct Message {
     /// anthropic_adapter.py:1964-2005, transports/anthropic.py:97-183).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_content_blocks: Option<Value>,
+    /// In-process marker: this message is a context-compaction summary
+    /// (upstream `COMPRESSED_SUMMARY_METADATA_KEY` = "_compressed_summary").
+    /// Underscore-prefixed keys are stripped by the upstream wire sanitizers
+    /// before the request leaves the process; `#[serde(skip)]` is the port's
+    /// equivalent — the flag never reaches the wire.
+    #[serde(skip)]
+    pub compressed_summary: bool,
+    /// In-process marker: user-role runtime scaffolding (upstream
+    /// `_todo_snapshot_synthetic` and sibling `_SYNTHETIC_USER_FLAGS`).
+    /// Never serialized.
+    #[serde(skip)]
+    pub synthetic: bool,
 }
 
 impl Message {
@@ -64,6 +76,8 @@ impl Message {
             reasoning: None,
             reasoning_details: None,
             anthropic_content_blocks: None,
+            compressed_summary: false,
+            synthetic: false,
         }
     }
 
@@ -79,6 +93,8 @@ impl Message {
             reasoning: None,
             reasoning_details: None,
             anthropic_content_blocks: None,
+            compressed_summary: false,
+            synthetic: false,
         }
     }
 
@@ -94,6 +110,8 @@ impl Message {
             reasoning: None,
             reasoning_details: None,
             anthropic_content_blocks: None,
+            compressed_summary: false,
+            synthetic: false,
         }
     }
 
