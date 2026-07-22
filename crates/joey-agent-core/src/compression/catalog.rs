@@ -166,21 +166,25 @@ pub const DEFAULT_CONTEXT_LENGTHS: &[(&str, i64)] = &[
     ("trinity", 262_144),
     // OpenRouter
     ("elephant", 262_144),
-    // Hugging Face Inference Providers — org/name ids (matched lowercased)
-    ("qwen/qwen3.5-397b-a17b", 131_072),
-    ("qwen/qwen3.5-35b-a3b", 131_072),
-    ("deepseek-ai/deepseek-v3.2", 65_536),
-    ("moonshotai/kimi-k2.5", 262_144),
-    ("moonshotai/kimi-k2.6", 262_144),
-    ("moonshotai/kimi-k2-thinking", 262_144),
-    ("minimaxai/minimax-m2.5", 204_800),
-    ("xiaomimimo/mimo-v2-flash", 262_144),
+    // Hugging Face Inference Providers — model IDs use org/name format.
+    // Keys are kept VERBATIM (mixed case): the lookup lowercases the model
+    // id but not the key (upstream `default_model in model_lower`), so the
+    // capitalized entries never substring-match — a latent upstream no-op
+    // the port reproduces exactly rather than "fixing".
+    ("Qwen/Qwen3.5-397B-A17B", 131_072),
+    ("Qwen/Qwen3.5-35B-A3B", 131_072),
+    ("deepseek-ai/DeepSeek-V3.2", 65_536),
+    ("moonshotai/Kimi-K2.5", 262_144),
+    ("moonshotai/Kimi-K2.6", 262_144),
+    ("moonshotai/Kimi-K2-Thinking", 262_144),
+    ("MiniMaxAI/MiniMax-M2.5", 204_800),
+    ("XiaomiMiMo/MiMo-V2-Flash", 262_144),
     ("mimo-v2-pro", 1_048_576),
     ("mimo-v2.5-pro", 1_048_576),
     ("mimo-v2.5", 1_048_576),
     ("mimo-v2-omni", 262_144),
     ("mimo-v2-flash", 262_144),
-    ("zai-org/glm-5", 202_752),
+    ("zai-org/GLM-5", 202_752),
 ];
 
 /// Get the context length for a model (the offline subset of

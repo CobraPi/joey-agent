@@ -55,6 +55,8 @@ auxiliary:
     base_url: ""
     api_key: ""
     timeout: 120
+    extra_body: {}
+    reasoning_effort: ""
 prompt_caching:
   cache_ttl: "5m"
 memory:

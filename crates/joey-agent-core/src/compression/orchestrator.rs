@@ -168,6 +168,10 @@ impl Agent {
                     .to_string()
             };
             self.compression_warning = Some(msg.clone());
+            if tx.is_some() {
+                // Delivered live — don't re-deliver via the turn-start replay.
+                self.compression_warning_replayed = true;
+            }
             Self::notice(tx, msg);
             tracing::warn!(
                 "No auxiliary LLM provider for compression — summaries will be unavailable."
@@ -229,6 +233,9 @@ impl Agent {
                 safe_pct
             );
             self.compression_warning = Some(msg.clone());
+            if tx.is_some() {
+                self.compression_warning_replayed = true;
+            }
             Self::notice(tx, msg);
             tracing::warn!(
                 "Auxiliary compression model {} has {} token context, below the main model's \
@@ -534,6 +541,9 @@ impl Agent {
                 cc
             );
             self.compression_warning = Some(cc_msg.clone());
+            if tx.is_some() {
+                self.compression_warning_replayed = true;
+            }
             Self::notice(tx, cc_msg);
         }
 

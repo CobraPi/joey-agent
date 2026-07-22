@@ -84,8 +84,14 @@ joey mcp list | test <name> | remove   Inspect, probe, or remove configured serv
 
 Inside the REPL the full upstream slash-command set is recognized (`/help` lists it);
 implemented today: `/help`, `/new [name]`, `/clear`, `/model`, `/reasoning`, `/tools`,
-`/toolsets`, `/skills`, `/history`, `/sessions`, `/resume`, `/config`, `/status`,
-`/usage`, `/queue` (`/q`), `/copy`, `/verbose`, `/timestamps`, `/version`, `/exit`.
+`/toolsets`, `/skills`, `/compress` (`/compact`), `/history`, `/sessions`, `/resume`,
+`/config`, `/status`, `/usage`, `/queue` (`/q`), `/copy`, `/verbose`, `/timestamps`,
+`/version`, `/exit`.
+
+Long sessions auto-compact like upstream: when context usage crosses the configured
+threshold (or the provider rejects an oversized request), older history is summarized
+by the auxiliary model and archived — recent messages, the system prompt, and the
+first turns are preserved verbatim, and archived rows remain searchable in `state.db`.
 
 ## Built-in tools
 

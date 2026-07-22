@@ -9,7 +9,7 @@ wire behavior, rebranded `hermes → joey`.
 upstream (commit `7651764`, 2026-07-20) and rewritten where it deviated. The
 ported surface below is now behavior-, format-, and text-faithful (modulo
 branding); tests assert exact schemas, envelopes, grammars, and prompt text
-(457 tests across the workspace). Anything not faithful is listed under
+(500 tests across the workspace). Anything not faithful is listed under
 *Partial*, *Deferred*, or *Deliberate deviations* — if it isn't listed there,
 it is intended to match upstream exactly.
 
@@ -110,6 +110,25 @@ it is intended to match upstream exactly.
   wrapping; interrupt handle with upstream's cancellation texts; incremental
   session persistence (assistant-before-tools, tool rows, error rows);
   usage accounting with the 4-chars/token estimator fallback.
+- **Context compression** (port of `agent/context_compressor.py`,
+  `agent/conversation_compression.py`, `agent/context_engine.py`,
+  `agent/context_breakdown.py`, `agent/model_metadata.py` context catalog):
+  the full `ContextCompressor` engine — threshold math (0.50 with the 0.75
+  raise-only floor under 512K windows), usage-driven `should_compress` with
+  anti-thrash and 600s failure cooldowns (persisted), window selection
+  (protect_first_n 3 / protect_last_n 20, tool-group alignment, user/assistant
+  anchors), aux-model summarization with upstream's verbatim prompt/prefix/
+  end-marker text (byte-diffed against upstream), deterministic fallback
+  summary + `abort_on_summary_failure` freeze path, tool-result pruning and
+  media stripping, DB-backed compression locks with lease refresh, in-place
+  `archive_and_compact` session rewrite (archived rows stay searchable),
+  cached-system-prompt refresh, the model context-length catalog + provider-
+  error context probe, and loop integration at all three upstream points:
+  preflight pressure check (`📦 Pre-API compression:`), post-response usage
+  tracking, and 413/context-overflow compress-and-retry (3-attempt cap, exact
+  disabled-compaction guard messages). CLI: `/compress` (`/compact`) with
+  force/focus semantics and upstream feedback strings; `/usage` shows the
+  context block; `/status` shows context usage.
 
 **Cron (`joey-cron`)** — port of `cron/`:
 - Hermes-compatible `jobs.json` (`{"jobs", "updated_at"}` envelope, nested
@@ -172,7 +191,7 @@ bundled and rebranded (env vars, paths, CLI names; upstream attribution URLs
 preserved; install instructions adapted to the Rust binary), plus the
 port-only `software-development/rust-review` skill.
 
-**Verified end-to-end:** `cargo test --workspace` — 31 suites, 457 tests, 0
+**Verified end-to-end:** `cargo test --workspace` — 31 suites, 500 tests, 0
 failures, 0 warnings. Live-verified command surfaces: one-shot exit codes,
 config round-trips incl. secret masking, cron create/pause/resume/run/remove/
 status, mcp add/list/test incl. security rejection, first-run guard, slash
@@ -209,9 +228,15 @@ prefix resolution, resume by id/title.
   (`ApiMode::CodexResponses` exists but refuses). No credential pools, model
   catalog, request_overrides/service-tier plumbing, Z.AI adaptive long
   backoff, or per-provider timeout table.
-- **Context compression** is not implemented: 413/context-overflow errors
-  abort with a classified error instead of compress-and-retry; there is no
-  auto-compaction. Thinking-only prefill continuation is likewise unported.
+- **Compression edges:** the codex app-server compaction path, pixel
+  re-encoding of oversized images (`try_shrink_image_parts_in_messages`),
+  the legacy session-rotation branch (`compression.in_place: false` — the
+  port always compacts in place, upstream's shipped default), live context-
+  length probes (OpenRouter/models.dev/Anthropic endpoints; the offline
+  catalog + provider-error probe are ported), plugin context engines
+  (`context.engine` — the trait is ported), and `/compress here|--preview|
+  --aggressive` (honest notices) are unported. Thinking-only prefill
+  continuation is likewise unported.
 - **Tools:** `session_search`, `delegate_task`, `clarify`, `process`
   (background procs), `cronjob` (agent-callable) remain stubs; `terminal`
   `background`/`pty` params return honest not-supported errors; document

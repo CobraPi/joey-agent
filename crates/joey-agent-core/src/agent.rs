@@ -262,6 +262,9 @@ pub struct Agent {
     pub(crate) last_compression_lock_warning_sid: Option<String>,
     /// Stored startup compression warning (upstream `agent._compression_warning`).
     pub(crate) compression_warning: Option<String>,
+    /// One-shot replay latch (upstream `replay_compression_warning` — the
+    /// stored warning is re-sent once a live event channel exists).
+    pub(crate) compression_warning_replayed: bool,
     /// Lazy feasibility-probe latch (upstream `_compression_feasibility_checked`).
     pub(crate) compression_feasibility_checked: bool,
 }
@@ -355,6 +358,7 @@ impl Agent {
             last_aux_fallback_warning_key: None,
             last_compression_lock_warning_sid: None,
             compression_warning: None,
+            compression_warning_replayed: false,
             compression_feasibility_checked: false,
         })
     }
@@ -1138,6 +1142,15 @@ impl Agent {
         self.ctx.state().memory_consolidation_failures = 0;
         self.invalid_tool_strikes = 0;
 
+        // Replay a stored compression warning once a live event channel
+        // exists (conversation_compression.py `replay_compression_warning`).
+        if !self.compression_warning_replayed {
+            if let Some(warning) = self.compression_warning.clone() {
+                self.compression_warning_replayed = true;
+                let _ = tx.send(AgentEvent::Notice(warning));
+            }
+        }
+
         // A crashed/interrupted prior turn can leave an unanswered
         // assistant-with-tool_calls tail; repair before the user message.
         self.repair_dangling_tool_tail();
@@ -1183,18 +1196,19 @@ impl Agent {
             } else {
                 compression::estimate_tools_tokens_rough(&tools)
             };
-            let deferred = self
-                .compressor
-                .should_defer_preflight_to_real_usage(request_pressure_tokens);
-            let cooldown_active = self
-                .compressor
-                .get_active_compression_failure_cooldown(false)
-                .is_some();
+            // Guard chain short-circuits exactly like upstream: the defer
+            // check (which advances its calibration baseline) and the
+            // cooldown read only run when the earlier gates pass.
             if self.compression_enabled
                 && self.history.len() > 1
                 && compression_attempts < 3
-                && !deferred
-                && !cooldown_active
+                && !self
+                    .compressor
+                    .should_defer_preflight_to_real_usage(request_pressure_tokens)
+                && self
+                    .compressor
+                    .get_active_compression_failure_cooldown(false)
+                    .is_none()
                 && self.compressor.should_compress(Some(request_pressure_tokens))
             {
                 compression_attempts += 1;

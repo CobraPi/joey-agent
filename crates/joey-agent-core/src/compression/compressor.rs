@@ -2905,6 +2905,99 @@ fn unix_now() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// The built-in compressor is the default [`ContextEngine`]
+/// (context_engine.py: `class ContextCompressor(ContextEngine)`). The trait
+/// keeps the plugin-engine surface possible; the agent drives the concrete
+/// type directly for the richer built-in-only calls (cooldowns, probes).
+#[async_trait::async_trait]
+impl super::engine::ContextEngine for ContextCompressor {
+    fn name(&self) -> &str {
+        "compressor"
+    }
+
+    fn last_prompt_tokens(&self) -> i64 {
+        self.last_prompt_tokens
+    }
+
+    fn threshold_tokens(&self) -> i64 {
+        self.threshold_tokens
+    }
+
+    fn context_length(&self) -> i64 {
+        self.context_length
+    }
+
+    fn compression_count(&self) -> u32 {
+        self.compression_count
+    }
+
+    fn update_from_response(&mut self, usage: &super::engine::UsageUpdate) {
+        ContextCompressor::update_from_response(self, usage)
+    }
+
+    fn should_compress(&mut self, prompt_tokens: Option<i64>) -> bool {
+        ContextCompressor::should_compress(self, prompt_tokens)
+    }
+
+    async fn compress(
+        &mut self,
+        messages: Vec<Message>,
+        current_tokens: Option<i64>,
+        focus_topic: Option<&str>,
+        force: bool,
+        memory_context: &str,
+    ) -> Vec<Message> {
+        ContextCompressor::compress(self, messages, current_tokens, focus_topic, force, memory_context)
+            .await
+    }
+
+    fn should_defer_preflight_to_real_usage(&mut self, rough_tokens: i64) -> bool {
+        ContextCompressor::should_defer_preflight_to_real_usage(self, rough_tokens)
+    }
+
+    fn has_content_to_compress(&self, messages: &[Message]) -> bool {
+        ContextCompressor::has_content_to_compress(self, messages)
+    }
+
+    fn on_session_start(&mut self, session_id: &str) {
+        // The port's start hook rebinds durable session state (the boundary
+        // bookkeeping upstream routes through on_session_start kwargs is
+        // owned by the orchestrator here).
+        let db = self.session_db.clone();
+        self.bind_session_state(db, session_id);
+    }
+
+    fn on_session_end(&mut self, session_id: &str, messages: &[Message]) {
+        ContextCompressor::on_session_end(self, session_id, messages)
+    }
+
+    fn on_session_reset(&mut self) {
+        ContextCompressor::on_session_reset(self)
+    }
+
+    fn update_model(
+        &mut self,
+        model: &str,
+        context_length: i64,
+        base_url: &str,
+        api_key: &str,
+        provider: &str,
+        api_mode: &str,
+        max_tokens: Option<i64>,
+    ) {
+        ContextCompressor::update_model(
+            self,
+            model,
+            context_length,
+            base_url,
+            api_key,
+            provider,
+            api_mode,
+            max_tokens,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
