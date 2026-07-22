@@ -9,7 +9,9 @@ wire behavior, rebranded `hermes → joey`.
 upstream (commit `7651764`, 2026-07-20) and rewritten where it deviated. The
 ported surface below is now behavior-, format-, and text-faithful (modulo
 branding); tests assert exact schemas, envelopes, grammars, and prompt text
-(500 tests across the workspace). Anything not faithful is listed under
+(520 tests across the workspace). 2026-07-22: the `joey model` setup wizard,
+Z.AI endpoint detection, the auth store, and the picker model catalog were
+ported (this file's sections below reflect that). Anything not faithful is listed under
 *Partial*, *Deferred*, or *Deliberate deviations* — if it isn't listed there,
 it is intended to match upstream exactly.
 
@@ -38,12 +40,27 @@ it is intended to match upstream exactly.
   (~40 vendor patterns + families, head6/tail4 masking, sentinel modes,
   `security.redact_secrets` kill-switch), reasoning-effort parsing with the
   full model-variant expansion, atomic writes (fsync, symlink-target, owner).
+- Auth store (`~/.joey/auth.json`): upstream's store shape (`version` 1,
+  `providers`, `active_provider`, `updated_at`), atomic 0600 writes with
+  0700 parent, corrupt-file preservation (`auth.json.corrupt`) with
+  empty-store recovery, bounded flock (15s), per-provider state get/merge,
+  `deactivate_provider`. (The profile→global-root fallback rides on
+  HERMES_HOME profile machinery; each joey profile keeps its own store.)
 
 **Provider layer (`joey-providers`)** — port of `providers/`, `agent/transports/`,
 `agent/anthropic_adapter.py`, `agent/error_classifier.py`:
 - Profile registry matching upstream composition (openrouter/openai-api/
   anthropic/nous/deepseek/zai/gemini/xai/custom) with aliases, env-var chains,
-  aux models; per-provider base-URL overrides (`<ID>_BASE_URL`).
+  aux models, picker metadata (display name, `tui_desc`, signup URL, curated
+  fallback models); per-provider base-URL overrides (`<ID>_BASE_URL`,
+  full auth.py table incl. `GLM_BASE_URL`).
+- Z.AI endpoint detection (auth.py `ZAI_ENDPOINTS` / `detect_zai_endpoint` /
+  `_resolve_zai_base_url`): the four official endpoints (Global, China,
+  Coding Plan Global/China) probed in order with per-endpoint candidate
+  models (1-token `chat/completions` ping), result cached in auth.json keyed
+  on `sha256(api_key)[:16]` (`set_active=false`), `GLM_BASE_URL` always wins,
+  empty-key probe suppression; wired into client construction so a bare
+  `GLM_API_KEY` lands on the right billing endpoint automatically.
 - OpenAI Chat Completions wire: request build (no tool_choice, max_tokens /
   `max_completion_tokens` tables, developer-role swap for gpt-5/codex),
   SSE streaming with upstream's tool-call assembly quirks (index-reuse fix,
@@ -177,7 +194,36 @@ it is intended to match upstream exactly.
   `~/.joey/.joey_history`, `❯` prompt, exit outro with resume hints, banner
   with model/context/cwd/session/tools/tips, dim Reasoning box + tool-progress
   modes, interactive streaming overlay.
-- Subcommands matching upstream semantics: `model` (interactive picker),
+- The full `joey model` setup wizard (`select_provider_and_model` +
+  `model_setup_flows`): current-model/active-provider header (custom
+  base-url matching, credential auto-detection, stale `OPENAI_BASE_URL`
+  custom detection), canonical provider rows with upstream `tui_desc` labels
+  + "← currently active" marker + `model_catalog.excluded_providers`
+  filtering, saved-custom-provider rows, `--refresh` cache clearing.
+  Flows: the generic API-key flow (first-time masked key entry saved to
+  `.env`, [K]eep/[R]eplace/[C]lear recovery, signup URLs, base-URL override
+  persistence, model resolution models.dev → curated (≥8) → live `/models`
+  probe, provider/base_url/api_mode persistence + `deactivate_provider` +
+  stale-`OPENAI_BASE_URL` cleanup), the **Z.AI endpoint picker** (four
+  official endpoints + custom proxy, defaulted to the active endpoint,
+  `GLM_BASE_URL` persistence), OpenRouter (curated∩live tools-filtered
+  catalog with free/default badges, live $/Mtok pricing columns), Anthropic
+  (credential reuse/reauth menu, masked API-key entry clearing the OAuth
+  slot), custom endpoints (URL+key prompts, local `/v1` hint, probe with
+  `/v1`-toggle fallback swap, explicit API-mode picker with URL detection,
+  probe-driven model pick, context length, display name, `custom_providers`
+  persistence + dedup + remove flow). Model selection puts the current model
+  first with a marker, aligned In/Out/Cache pricing columns, custom-name
+  entry, skip row, and the expensive-model guard (models.dev pricing,
+  $20/$100 per-Mtok thresholds, confirm prompt).
+- Model catalog: curated per-provider lists (zai's 8-model GLM list,
+  anthropic, openai-api, deepseek, gemini, nous, xai incl. the disk-cache-
+  derived xAI list with promote-top + curated extras), the models.dev
+  registry port (in-mem → fresh-disk → network → stale-disk cache hierarchy,
+  1h TTL, agentic filter: `tool_call` minus noise patterns minus hidden
+  Google models), the generic `/models` probe with `/v1` toggling and
+  Anthropic-mode headers, OpenRouter pricing fetch.
+- Subcommands matching upstream semantics:
   `config show|edit|get|set|unset|path|env-path` (bare = show, masked
   echoes, exit codes), `doctor` (sectioned report, `--fix`), `cron` (bare =
   list, add/rm/delete aliases, create flags, `run <job>` = trigger-now,
@@ -191,11 +237,13 @@ bundled and rebranded (env vars, paths, CLI names; upstream attribution URLs
 preserved; install instructions adapted to the Rust binary), plus the
 port-only `software-development/rust-review` skill.
 
-**Verified end-to-end:** `cargo test --workspace` — 31 suites, 500 tests, 0
+**Verified end-to-end:** `cargo test --workspace` — 31 suites, 520 tests, 0
 failures, 0 warnings. Live-verified command surfaces: one-shot exit codes,
 config round-trips incl. secret masking, cron create/pause/resume/run/remove/
 status, mcp add/list/test incl. security rejection, first-run guard, slash
-prefix resolution, resume by id/title.
+prefix resolution, resume by id/title, `joey model` TTY guard + `--refresh`,
+and the Z.AI endpoint probe (live: bogus key probes all four endpoints,
+falls back to the default URL, caches nothing).
 
 ## Deliberate deviations (not oversights)
 
@@ -220,14 +268,30 @@ prefix resolution, resume by id/title.
 - The SOUL.md identity line reads "based on Hermes Agent by Nous Research"
   rather than claiming Nous authorship; the prompt threat-scanner keeps the
   `HERMES` env-var token alongside `JOEY` so migrated homes stay protected.
+- **Local default model deviation:** upstream ships `model.default ""` +
+  `model.provider "auto"` (unset → first-run setup). This install bakes
+  `glm-5.2` / `zai` into `DEFAULT_CONFIG_YAML` as the out-of-box default (a
+  deliberate local preference, asserted in `config::tests`). Setup-wizard
+  behavior is unaffected: with no API keys configured the first-run guard
+  still triggers.
+- **Setup-wizard scope:** the wizard implements upstream's numbered-list
+  fallback UI (the curses radiolist/searchable menus are unported); the
+  Gemini free-tier probe (needs the unported native Gemini adapter), the
+  "Configure auxiliary models..." submenu, secret-source suffixes
+  (Bitwarden/1Password plugins), and the remote catalog manifest are
+  unported — curated in-repo snapshots (upstream's own fallbacks) are used.
+  The Anthropic flow's "Claude Pro/Max subscription (OAuth login)" option
+  explains the standing impersonation decision and directs to API keys.
 
 ## Partial
 
 - **Providers:** OpenAI-compatible + Anthropic wire modes only. Codex/
   Responses, Bedrock, native Gemini REST, Vertex, and Azure are not ported
-  (`ApiMode::CodexResponses` exists but refuses). No credential pools, model
-  catalog, request_overrides/service-tier plumbing, Z.AI adaptive long
-  backoff, or per-provider timeout table.
+  (`ApiMode::CodexResponses` exists but refuses). No credential pools,
+  request_overrides/service-tier plumbing, Z.AI adaptive long backoff, or
+  per-provider timeout table. The model catalog covers the picker surface
+  (curated lists + models.dev registry); the wider `model_metadata.py`
+  capability/vision lookups remain unported.
 - **Compression edges:** the codex app-server compaction path, pixel
   re-encoding of oversized images (`try_shrink_image_parts_in_messages`),
   the legacy session-rotation branch (`compression.in_place: false` — the

@@ -26,8 +26,8 @@ use crate::{constants, utils};
 /// (cli.py:441); unknown user keys merge on top and survive saves.
 pub const DEFAULT_CONFIG_YAML: &str = r#"
 model:
-  default: ""
-  provider: "auto"
+  default: "glm-5.2"
+  provider: "zai"
   base_url: ""
 agent:
   max_turns: 90
@@ -284,6 +284,20 @@ impl Config {
         if alias_norm == "model.api_base" || alias_norm == "api_base" {
             self.user_doc = normalize_root_model_keys(self.user_doc.clone());
         }
+        self.save()?;
+        self.rebuild_root();
+        Ok(())
+    }
+
+    /// Set a dotted key to an arbitrary YAML value and persist — the
+    /// structured sibling of [`Config::set_and_save`] for callers that write
+    /// non-scalar values (e.g. the setup wizard's `custom_providers` list).
+    /// No coercion, no env routing.
+    pub fn set_value_and_save(&mut self, dotted: &str, value: Value) -> Result<()> {
+        if !self.user_doc.is_mapping() {
+            self.user_doc = Value::Mapping(Mapping::new());
+        }
+        set_nested(&mut self.user_doc, dotted, value)?;
         self.save()?;
         self.rebuild_root();
         Ok(())
@@ -1373,9 +1387,12 @@ mod tests {
     #[test]
     fn defaults_match_upstream() {
         let cfg = Config::defaults();
-        assert_eq!(cfg.model(), "", "unset model must be empty string");
+        // Local deviation: upstream ships model.default "" + provider "auto"
+        // (unset → first-run setup). This install bakes Z.AI/GLM as the
+        // out-of-box default (DEFAULT_CONFIG_YAML); see PORTING.md.
+        assert_eq!(cfg.model(), "glm-5.2");
         assert_eq!(cfg.get_str("model.base_url", "x"), "");
-        assert_eq!(cfg.get_str("model.provider", "x"), "auto");
+        assert_eq!(cfg.get_str("model.provider", "x"), "zai");
         assert_eq!(cfg.get_i64("agent.max_turns", 0), 90);
         assert!(cfg.get("agent.reasoning_effort").is_none(), "no reasoning_effort default");
         assert!(cfg.get_bool("display.show_reasoning", false));
@@ -1566,10 +1583,17 @@ mod tests {
         assert_eq!(cfg.model(), "my/model");
         assert!(cfg.get("api_base").is_none());
 
-        // model.name canonicalizes to model.default.
-        let cfg = cfg_from("model:\n  name: some/model\n");
-        assert_eq!(cfg.model(), "some/model");
-        assert!(cfg.get("model.name").is_none());
+        // model.name canonicalizes to model.default. Tested on the raw doc:
+        // the baked-in local default model is truthy, so promotion is
+        // (correctly) masked in the merged view when the user doc has no
+        // explicit model.default.
+        let doc: Value = serde_yaml::from_str("model:\n  name: some/model\n").unwrap();
+        let norm = normalize_root_model_keys(doc);
+        assert_eq!(
+            get_nested(&norm, "model.default").and_then(|v| v.as_str()),
+            Some("some/model")
+        );
+        assert!(get_nested(&norm, "model.name").is_none());
 
         // Root max_turns moves under agent.
         let cfg = cfg_from("max_turns: 33\n");

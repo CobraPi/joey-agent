@@ -134,7 +134,7 @@ pub fn first_run_guard(config: &Config) -> Option<i32> {
     let reply = read_line_prompt("Run setup now? [Y/n] ").unwrap_or_else(|| "n".to_string());
     let reply = reply.to_lowercase();
     if reply.is_empty() || reply == "y" || reply == "yes" {
-        match interactive_model_picker() {
+        match interactive_model_picker(false) {
             Ok(true) => return None,
             Ok(false) => {
                 // A key may have been saved even without a model pick —
@@ -159,75 +159,22 @@ pub fn first_run_guard(config: &Config) -> Option<i32> {
 // `joey model` (main.py:2925-2935 — TTY-only interactive picker)
 // ---------------------------------------------------------------------------
 
-pub fn model_command() -> Result<i32> {
+/// `joey model [--refresh]` — the full provider + model setup wizard
+/// (`cmd_model`). `--refresh` clears the picker cache first.
+pub fn model_command(refresh: bool) -> Result<i32> {
     if let Some(code) = require_tty("model") {
         return Ok(code);
     }
-    match interactive_model_picker()? {
+    match interactive_model_picker(refresh)? {
         true => Ok(0),
         false => Ok(1),
     }
 }
 
-/// Minimal port of `select_provider_and_model`: numbered provider list →
-/// API-key prompt (saved to .env) → model entry → persisted to config.yaml.
-/// Returns whether a model was configured.
-pub fn interactive_model_picker() -> Result<bool> {
-    let providers = joey_providers::profile::provider_names();
-    println!();
-    println!("Select your inference provider:");
-    println!();
-    for (i, name) in providers.iter().enumerate() {
-        let profile = joey_providers::profile::get_profile(name).expect("registry name");
-        let key = profile.resolve_api_key();
-        let status = if key.is_some() { " (key configured)" } else { "" };
-        println!("  {}. {}{}", i + 1, name, status);
-    }
-    println!();
-
-    let choice = match read_line_prompt(&format!("Choice [1-{}]: ", providers.len())) {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            println!("Cancelled.");
-            return Ok(false);
-        }
-    };
-    let idx: usize = match choice.trim().parse::<usize>() {
-        Ok(n) if (1..=providers.len()).contains(&n) => n - 1,
-        _ => {
-            render::error(&format!("Invalid choice: {}", choice));
-            return Ok(false);
-        }
-    };
-    let provider = providers[idx];
-    let profile = joey_providers::profile::get_profile(provider).expect("registry name");
-
-    if profile.resolve_api_key().is_none() {
-        let env_var = profile.env_vars.first().copied().unwrap_or("API_KEY");
-        let key = read_line_prompt(&format!("Enter {} (leave empty to skip): ", env_var))
-            .unwrap_or_default();
-        if !key.is_empty() {
-            joey_core::config::save_env_value(env_var, &key)?;
-            println!("✓ Set {} in {}", env_var, joey_core::constants::env_path().display());
-        }
-    }
-
-    let model = read_line_prompt("Model (e.g. anthropic/claude-sonnet-4.6): ").unwrap_or_default();
-    if model.is_empty() {
-        println!("No model selected — nothing saved.");
-        return Ok(false);
-    }
-
-    let mut config = Config::load()?;
-    config.set_and_save("model.provider", provider)?;
-    config.set_and_save("model.default", &model)?;
-    println!(
-        "✓ Set model.default = {} (provider: {}) in {}",
-        model,
-        provider,
-        config.path().display()
-    );
-    Ok(true)
+/// The interactive setup wizard (port of `select_provider_and_model` — see
+/// `setup_wizard.rs`). Returns whether a model was configured.
+pub fn interactive_model_picker(refresh: bool) -> Result<bool> {
+    crate::setup_wizard::select_provider_and_model(refresh)
 }
 
 // ---------------------------------------------------------------------------

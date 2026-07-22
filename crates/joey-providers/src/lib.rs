@@ -12,6 +12,7 @@ pub mod error;
 pub mod profile;
 pub mod request;
 pub mod types;
+pub mod zai;
 
 pub use client::ProviderClient;
 pub use error::{jittered_backoff, jittered_backoff_api, jittered_backoff_with, parse_retry_after, ProviderError};
@@ -36,7 +37,23 @@ pub fn build_client(
     api_key: Option<String>,
 ) -> Result<ProviderClient, ProviderError> {
     let profile = resolve_profile(provider_setting, base_url, model);
-    let base_override = resolve_base_override(&profile, base_url);
+    let mut base_override = resolve_base_override(&profile, base_url);
+    // Z.AI: with no explicit override (env var or config base_url), resolve
+    // the endpoint by probing — global vs China vs Coding Plan billing paths
+    // accept different keys (auth.py `resolve_api_key_provider_credentials`
+    // → `_resolve_zai_base_url`; cached in auth.json after the first probe).
+    if base_override.is_none() && profile.name == "zai" {
+        let key = api_key
+            .clone()
+            .or_else(|| profile.resolve_api_key())
+            .unwrap_or_default();
+        // env_override is "" here: resolve_base_override already returned
+        // any GLM_BASE_URL value as Some above.
+        let resolved = zai::resolve_zai_base_url(&key, profile.base_url, "");
+        if resolved != profile.base_url {
+            base_override = Some(resolved);
+        }
+    }
     ProviderClient::new(profile, base_override, api_key)
 }
 

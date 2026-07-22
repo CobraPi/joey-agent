@@ -11,6 +11,7 @@ use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
 
+pub mod auth_store;
 pub mod branding;
 pub mod config;
 pub mod constants;
@@ -137,8 +138,9 @@ pub fn ensure_home() -> anyhow::Result<std::path::PathBuf> {
 mod tests {
     use super::*;
 
-    /// Serializes tests that install a process-global home override.
-    static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
+    /// Serializes tests that install a process-global home override
+    /// (crate-wide — see `constants::TEST_HOME_OVERRIDE_LOCK`).
+    use constants::TEST_HOME_OVERRIDE_LOCK as OVERRIDE_LOCK;
 
     #[test]
     fn ensure_home_skeleton_and_soul() {

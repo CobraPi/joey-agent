@@ -31,6 +31,12 @@ pub fn get_home_override() -> Option<PathBuf> {
     HOME_OVERRIDE.read().expect("home override lock").clone()
 }
 
+/// Serializes tests that install the process-global home override. Shared
+/// across the crate's (and dependents') test modules so parallel tests don't
+/// race [`HOME_OVERRIDE`]. Not for production use.
+#[doc(hidden)]
+pub static TEST_HOME_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// RAII guard that restores the previous home override when dropped.
 pub struct HomeOverrideGuard {
     previous: Option<PathBuf>,

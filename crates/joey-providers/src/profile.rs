@@ -50,8 +50,7 @@ pub struct ProviderProfile {
     /// Env vars that may hold the API key, in priority order.
     pub env_vars: &'static [&'static str],
     /// Env var that overrides the base URL for this provider, when upstream
-    /// defines one (auth.py `base_url_env_var`; only openai-api among the
-    /// ported providers).
+    /// defines one (auth.py `base_url_env_var`).
     pub base_url_env_var: Option<&'static str>,
     pub auth_type: AuthType,
     /// Default output-token cap when the caller doesn't specify one. Upstream
@@ -63,6 +62,16 @@ pub struct ProviderProfile {
     pub default_aux_model: &'static str,
     /// Extra static headers (name, value) to attach to every request.
     pub default_headers: &'static [(&'static str, &'static str)],
+    /// Short display name (auth.py `ProviderConfig.name` /
+    /// models.py `ProviderEntry.label`) — shown in picker rows and labels.
+    pub display_name: &'static str,
+    /// Longer picker description (models.py `ProviderEntry.tui_desc`).
+    pub tui_desc: &'static str,
+    /// Signup / key page shown during setup (plugin `signup_url`; "" = none).
+    pub signup_url: &'static str,
+    /// Curated fallback model ids shown when live fetch fails (plugin
+    /// `fallback_models`). Only agentic tool-calling models belong here.
+    pub fallback_models: &'static [&'static str],
 }
 
 impl ProviderProfile {
@@ -90,7 +99,8 @@ impl ProviderProfile {
 }
 
 macro_rules! profile {
-    ($name:expr, $aliases:expr, $mode:expr, $url:expr, $envs:expr, $burl_env:expr, $aux:expr) => {
+    ($name:expr, $aliases:expr, $mode:expr, $url:expr, $envs:expr, $burl_env:expr, $aux:expr,
+     $display:expr, $tui:expr, $signup:expr, $fallback:expr) => {
         ProviderProfile {
             name: $name,
             aliases: $aliases,
@@ -102,12 +112,20 @@ macro_rules! profile {
             default_max_tokens: None,
             default_aux_model: $aux,
             default_headers: &[],
+            display_name: $display,
+            tui_desc: $tui,
+            signup_url: $signup,
+            fallback_models: $fallback,
         }
     };
 }
 
 static PROFILES: Lazy<HashMap<&'static str, ProviderProfile>> = Lazy::new(|| {
     let mut m = HashMap::new();
+    // Metadata sources per provider: plugin `__init__.py` (signup_url,
+    // fallback_models, aux model), auth.py PROVIDER_REGISTRY
+    // (base_url_env_var, display name), models.py CANONICAL_PROVIDERS
+    // (label + tui_desc shown by the `joey model` picker).
     let list = [
         // plugins/model-providers/openrouter/__init__.py:170-186
         profile!(
@@ -117,7 +135,17 @@ static PROFILES: Lazy<HashMap<&'static str, ProviderProfile>> = Lazy::new(|| {
             "https://openrouter.ai/api/v1",
             &["OPENROUTER_API_KEY"],
             None,
-            ""
+            "",
+            "OpenRouter",
+            "OpenRouter (Pay-per-use API aggregator)",
+            "https://openrouter.ai/keys",
+            &[
+                "anthropic/claude-sonnet-4.6",
+                "openai/gpt-5.4",
+                "deepseek/deepseek-chat",
+                "google/gemini-3-flash-preview",
+                "qwen/qwen3-plus"
+            ]
         ),
         // plugins/model-providers/anthropic/__init__.py:44-52
         profile!(
@@ -126,8 +154,12 @@ static PROFILES: Lazy<HashMap<&'static str, ProviderProfile>> = Lazy::new(|| {
             ApiMode::AnthropicMessages,
             "https://api.anthropic.com",
             &["ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"],
-            None,
-            "claude-haiku-4-5-20251001"
+            Some("ANTHROPIC_BASE_URL"),
+            "claude-haiku-4-5-20251001",
+            "Anthropic",
+            "Anthropic (Claude models via API key or Claude Code)",
+            "https://platform.claude.com/settings/keys",
+            &[]
         ),
         // hermes_cli/auth.py:192-199 ("openai-api"). "openai" kept as an
         // alias because upstream accepts it as a provider setting elsewhere
@@ -139,7 +171,11 @@ static PROFILES: Lazy<HashMap<&'static str, ProviderProfile>> = Lazy::new(|| {
             "https://api.openai.com/v1",
             &["OPENAI_API_KEY"],
             Some("OPENAI_BASE_URL"),
-            ""
+            "",
+            "OpenAI API",
+            "OpenAI API (api.openai.com, API key)",
+            "",
+            &[]
         ),
         // plugins/model-providers/nous/__init__.py:43-58. Upstream auth_type
         // is oauth_device_code; the device-code OAuth flow is not ported, so
@@ -151,7 +187,11 @@ static PROFILES: Lazy<HashMap<&'static str, ProviderProfile>> = Lazy::new(|| {
             "https://inference-api.nousresearch.com/v1",
             &["NOUS_API_KEY"],
             None,
-            ""
+            "",
+            "Nous Portal",
+            "Nous Portal (Everything your agent needs, 300+ models with bundled tool use)",
+            "https://nousresearch.com/",
+            &["hermes-3-405b", "hermes-3-70b"]
         ),
         // plugins/model-providers/deepseek/__init__.py:85-98
         profile!(
@@ -160,8 +200,12 @@ static PROFILES: Lazy<HashMap<&'static str, ProviderProfile>> = Lazy::new(|| {
             ApiMode::ChatCompletions,
             "https://api.deepseek.com/v1",
             &["DEEPSEEK_API_KEY"],
-            None,
-            "deepseek-chat"
+            Some("DEEPSEEK_BASE_URL"),
+            "deepseek-chat",
+            "DeepSeek",
+            "DeepSeek (V3, R1, coder, direct API)",
+            "https://platform.deepseek.com/",
+            &["deepseek-chat", "deepseek-reasoner"]
         ),
         // plugins/model-providers/gemini/__init__.py:51-59. Upstream's gemini
         // profile uses a NATIVE Gemini REST adapter (GeminiNativeClient at
@@ -175,18 +219,27 @@ static PROFILES: Lazy<HashMap<&'static str, ProviderProfile>> = Lazy::new(|| {
             ApiMode::ChatCompletions,
             "https://generativelanguage.googleapis.com/v1beta/openai",
             &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
-            None,
-            "gemini-3.5-flash"
+            Some("GEMINI_BASE_URL"),
+            "gemini-3.5-flash",
+            "Google AI Studio",
+            "Google AI Studio (Native Gemini API)",
+            "",
+            &[]
         ),
-        // plugins/model-providers/zai/__init__.py:111-125
+        // plugins/model-providers/zai/__init__.py:111-125 +
+        // auth.py PROVIDER_REGISTRY["zai"] (GLM_BASE_URL override).
         profile!(
             "zai",
             &["glm", "z-ai", "z.ai", "zhipu"],
             ApiMode::ChatCompletions,
             "https://api.z.ai/api/paas/v4",
             &["GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"],
-            None,
-            "glm-4.5-flash"
+            Some("GLM_BASE_URL"),
+            "glm-4.5-flash",
+            "Z.AI / GLM",
+            "Z.AI / GLM (Zhipu direct API)",
+            "https://z.ai/",
+            &["glm-5.2", "glm-5", "glm-4-9b"]
         ),
         // plugins/model-providers/xai/__init__.py — upstream api_mode is
         // codex_responses. The codex wire is not ported; building a client
@@ -198,8 +251,12 @@ static PROFILES: Lazy<HashMap<&'static str, ProviderProfile>> = Lazy::new(|| {
             ApiMode::CodexResponses,
             "https://api.x.ai/v1",
             &["XAI_API_KEY"],
-            None,
-            ""
+            Some("XAI_BASE_URL"),
+            "",
+            "xAI",
+            "xAI Grok (Direct API)",
+            "",
+            &[]
         ),
     ];
     for p in list {
@@ -375,6 +432,13 @@ mod tests {
         let z = get_profile("zai").unwrap();
         assert_eq!(z.env_vars, &["GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"]);
         assert_eq!(z.default_aux_model, "glm-4.5-flash");
+        // zai picker metadata (zai/__init__.py:111-125 + auth.py registry +
+        // models.py CANONICAL_PROVIDERS).
+        assert_eq!(z.base_url_env_var, Some("GLM_BASE_URL"));
+        assert_eq!(z.display_name, "Z.AI / GLM");
+        assert_eq!(z.tui_desc, "Z.AI / GLM (Zhipu direct API)");
+        assert_eq!(z.signup_url, "https://z.ai/");
+        assert_eq!(z.fallback_models, &["glm-5.2", "glm-5", "glm-4-9b"]);
         let n = get_profile("nous").unwrap();
         assert_eq!(n.env_vars, &["NOUS_API_KEY"]);
         assert_eq!(n.default_aux_model, "");
@@ -385,9 +449,20 @@ mod tests {
         assert_eq!(oa.default_aux_model, "");
         let x = get_profile("xai").unwrap();
         assert_eq!(x.api_mode, ApiMode::CodexResponses);
+        assert_eq!(x.base_url_env_var, Some("XAI_BASE_URL"));
+        // base_url_env_var per auth.py PROVIDER_REGISTRY.
+        assert_eq!(a.base_url_env_var, Some("ANTHROPIC_BASE_URL"));
+        assert_eq!(g.base_url_env_var, Some("GEMINI_BASE_URL"));
+        assert_eq!(get_profile("deepseek").unwrap().base_url_env_var, Some("DEEPSEEK_BASE_URL"));
+        assert_eq!(o.base_url_env_var, None);
+        assert_eq!(n.base_url_env_var, None);
         // No invented per-provider output caps.
         for name in provider_names() {
-            assert_eq!(get_profile(name).unwrap().default_max_tokens, None);
+            let p = get_profile(name).unwrap();
+            assert_eq!(p.default_max_tokens, None);
+            // Every provider carries picker metadata (label + tui_desc).
+            assert!(!p.display_name.is_empty(), "{} missing display_name", name);
+            assert!(!p.tui_desc.is_empty(), "{} missing tui_desc", name);
         }
     }
 

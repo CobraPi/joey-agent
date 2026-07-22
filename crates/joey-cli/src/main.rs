@@ -10,9 +10,12 @@ mod config_cmd;
 mod cron_cmd;
 mod doctor_cmd;
 mod mcp_cmd;
+mod model_catalog;
 mod oneshot;
 mod render;
 mod repl;
+mod secret_prompt;
+mod setup_wizard;
 mod skills_cmd;
 mod slash;
 mod tools_cmd;
@@ -145,7 +148,7 @@ enum Command {
     /// Interactive chat with the agent
     Chat(ChatArgs),
     /// Select default model and provider
-    Model,
+    Model(ModelArgs),
     /// Configure which tools are enabled per platform
     Tools(tools_cmd::ToolsArgs),
     /// View and edit configuration
@@ -162,6 +165,14 @@ enum Command {
     Skills(skills_cmd::SkillsArgs),
     /// Print the resolved home directory (joey extension)
     Home,
+}
+
+/// `joey model` (main.py `cmd_model`): the provider + model setup wizard.
+#[derive(Args, Debug, Default)]
+pub struct ModelArgs {
+    /// Clear the cached model picker catalogs before showing the picker
+    #[arg(long = "refresh")]
+    pub refresh: bool,
 }
 
 /// `joey chat` — mirrors the top-level flags (with `-q`/`-Q` extras);
@@ -454,7 +465,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             commands::print_version_info();
             Ok(0)
         }
-        Some(Command::Model) => commands::model_command(),
+        Some(Command::Model(args)) => commands::model_command(args.refresh),
         Some(Command::Config(args)) => config_cmd::config_command(&args),
         Some(Command::Doctor(args)) => doctor_cmd::doctor_command(&args),
         Some(Command::Tools(args)) => tools_cmd::tools_command(&args),
