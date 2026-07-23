@@ -8,6 +8,7 @@ members = [
     "crates/joey-cron",
     "crates/joey-mcp",
     "crates/joey-gateway",
+    "crates/joey-tui",
     "crates/joey-cli",
 ]
 
@@ -26,6 +27,7 @@ joey-agent-core = { path = "crates/joey-agent-core" }
 joey-cron = { path = "crates/joey-cron" }
 joey-mcp = { path = "crates/joey-mcp" }
 joey-gateway = { path = "crates/joey-gateway" }
+joey-tui = { path = "crates/joey-tui" }
 
 anyhow = "1"
 thiserror = "2"
@@ -54,6 +56,7 @@ crossterm = "0.28"
 terminal_size = "0.4"
 unicode-width = "0.2"
 textwrap = "0.16"
+ratatui = { version = "0.30", features = ["crossterm"] }
 
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"

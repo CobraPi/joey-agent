@@ -20,6 +20,7 @@ mod setup_wizard;
 mod skills_cmd;
 mod slash;
 mod tools_cmd;
+mod tui;
 
 use std::sync::OnceLock;
 
@@ -140,6 +141,14 @@ pub struct Cli {
     #[arg(long = "safe-mode")]
     safe_mode: bool,
 
+    /// Launch the animated graphical TUI (ratatui) instead of the line-based
+    /// REPL. Shows a live multi-panel dashboard with particle backdrop,
+    /// gradient theme, spinners and an activity equalizer whose speed scales
+    /// with the number of active agents. Auto-enabled when stdout is a TTY
+    /// and JOEY_TUI=1.
+    #[arg(long = "tui")]
+    tui: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -248,6 +257,11 @@ pub struct ChatArgs {
     /// MCP servers (implies --ignore-user-config)
     #[arg(long = "safe-mode")]
     pub safe_mode: bool,
+
+    /// Launch the animated graphical TUI (ratatui) instead of the line-based
+    /// REPL. Auto-enabled when stdout is a TTY and JOEY_TUI=1.
+    #[arg(long = "tui")]
+    pub tui: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -493,8 +507,13 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 max_turns: chat.max_turns.or(cli.max_turns),
                 pass_session_id: chat.pass_session_id || cli.pass_session_id,
                 skills: if chat.skills.is_empty() { cli.skills } else { chat.skills },
+                tui: chat.tui || cli.tui,
             };
-            repl::run_chat(opts).await
+            if opts.tui {
+                tui::run(opts).await
+            } else {
+                repl::run_chat(opts).await
+            }
         }
         None => {
             let opts = repl::ChatOptions {
@@ -508,8 +527,13 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 max_turns: cli.max_turns,
                 pass_session_id: cli.pass_session_id,
                 skills: cli.skills,
+                tui: cli.tui,
             };
-            repl::run_chat(opts).await
+            if opts.tui {
+                tui::run(opts).await
+            } else {
+                repl::run_chat(opts).await
+            }
         }
     }
 }

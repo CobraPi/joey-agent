@@ -42,20 +42,22 @@ pub struct ChatOptions {
     pub pass_session_id: bool,
     #[allow(dead_code)] // accepted for CLI parity; preloading is not wired yet
     pub skills: Vec<String>,
+    /// Launch the animated ratatui TUI instead of the line-based REPL.
+    pub tui: bool,
 }
 
 /// Session-scoped overrides applied on (re)build of the agent.
 #[derive(Clone, Default)]
-struct Overrides {
-    model: Option<String>,
-    provider: Option<String>,
-    toolsets: Option<String>,
-    max_turns: Option<usize>,
-    reasoning: Option<String>,
-    pass_session_id: bool,
+pub(crate) struct Overrides {
+    pub(crate) model: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) toolsets: Option<String>,
+    pub(crate) max_turns: Option<usize>,
+    pub(crate) reasoning: Option<String>,
+    pub(crate) pass_session_id: bool,
 }
 
-struct ReplState {
+pub(crate) struct ReplState {
     config: Config,
     cwd: PathBuf,
     overrides: Overrides,
@@ -88,7 +90,7 @@ fn interactive_streaming(config: &Config) -> bool {
         .unwrap_or(true)
 }
 
-fn build_agent_config(config: &Config, ov: &Overrides) -> AgentConfig {
+pub(crate) fn build_agent_config(config: &Config, ov: &Overrides) -> AgentConfig {
     let mut cfg = AgentConfig::from_config(config);
     if let Some(m) = &ov.model {
         cfg.model = m.clone();
@@ -118,7 +120,7 @@ fn build_agent_config(config: &Config, ov: &Overrides) -> AgentConfig {
     cfg
 }
 
-fn build_agent(
+pub(crate) fn build_agent(
     config: &Config,
     cwd: &PathBuf,
     ov: &Overrides,
@@ -139,7 +141,7 @@ fn build_agent(
     Ok(agent)
 }
 
-fn restore_history(db: &SessionDb, session_id: &str) -> Vec<Message> {
+pub(crate) fn restore_history(db: &SessionDb, session_id: &str) -> Vec<Message> {
     db.messages(session_id)
         .unwrap_or_default()
         .into_iter()
@@ -152,7 +154,7 @@ fn restore_history(db: &SessionDb, session_id: &str) -> Vec<Message> {
 }
 
 /// Find a session by exact title (case-insensitive), newest first.
-fn find_by_title(db: &SessionDb, title: &str) -> Option<String> {
+pub(crate) fn find_by_title(db: &SessionDb, title: &str) -> Option<String> {
     let want = title.trim().to_lowercase();
     db.list_sessions(200)
         .ok()?
