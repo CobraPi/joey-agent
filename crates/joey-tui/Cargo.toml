@@ -5,11 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-joey-core.workspace = true
-joey-providers.workspace = true
 joey-agent-core.workspace = true
-anyhow.workspace = true
-tokio.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true

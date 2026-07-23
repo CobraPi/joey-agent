@@ -1,8 +1,20 @@
 //! Integration smoke tests: verify the widget rendering pipeline produces
-//! valid frames for representative app states without requiring a real TTY.
+//! valid frames for representative app states without requiring a real TTY,
+//! and pin down the event-stream contract (token accounting, message dedupe,
+//! tool lifecycle resolution).
 
 use joey_agent_core::AgentEvent;
 use joey_tui::theme::Theme;
+use joey_tui::TranscriptItem;
+
+fn usage(prompt: u64, completion: u64) -> joey_providers::Usage {
+    joey_providers::Usage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt + completion,
+        ..Default::default()
+    }
+}
 
 #[test]
 fn renders_idle_state_without_panic() {
@@ -40,7 +52,7 @@ fn renders_idle_state_without_panic() {
                 .direction(Direction::Horizontal)
                 .constraints([ratatui::layout::Constraint::Min(40), ratatui::layout::Constraint::Length(34)])
                 .split(chunks[1]);
-            joey_tui::widgets::draw_transcript(f, body[0], &app, theme);
+            joey_tui::widgets::draw_transcript(f, body[0], &app, theme, false, 0.5);
             joey_tui::widgets::draw_activity(
                 f,
                 body[1],
@@ -63,8 +75,10 @@ fn renders_busy_state_with_events() {
     app.cwd = "/home/joey".to_string();
 
     // Simulate a turn.
+    app.record_user("list my files");
     app.apply(AgentEvent::TurnStart { max_iterations: 90 });
     app.apply(AgentEvent::IterationStart { iteration: 1, max_iterations: 90 });
+    app.apply(AgentEvent::ApiCallStart);
     app.apply(AgentEvent::ReasoningDelta("Let me think about this. ".into()));
     app.apply(AgentEvent::ContentDelta("Hello! ".into()));
     app.apply(AgentEvent::ToolStart {
@@ -78,14 +92,10 @@ fn renders_busy_state_with_events() {
         result_preview: "file1.rs\nfile2.rs".into(),
         duration_secs: 0.12,
     });
+    app.apply(AgentEvent::ApiCallEnd { usage: usage(100, 50) });
     app.apply(AgentEvent::Done {
         final_text: "Hello! Here are your files.".into(),
-        usage: joey_providers::Usage {
-            prompt_tokens: 100,
-            completion_tokens: 50,
-            total_tokens: 150,
-            ..Default::default()
-        },
+        usage: usage(100, 50),
         iterations: 1,
     });
 
@@ -111,15 +121,161 @@ fn renders_busy_state_with_events() {
                     Constraint::Length(1),
                 ])
                 .split(area);
-            joey_tui::widgets::draw_transcript(f, chunks[1], &app, theme);
+            joey_tui::widgets::draw_transcript(f, chunks[1], &app, theme, true, 0.5);
         })
         .unwrap();
 
     // Verify the transcript has the content.
     assert!(app.transcript_len() >= 2); // user + assistant at minimum
     assert!(!app.last_final_text.is_empty());
+    // Tokens are counted once, from ApiCallEnd; Done's cumulative usage must
+    // not be added on top.
     assert_eq!(app.tokens.prompt, 100);
     assert_eq!(app.tokens.completion, 50);
+}
+
+#[test]
+fn done_usage_is_not_double_counted() {
+    let mut app = joey_tui::AppState::new("s", "m");
+    app.apply(AgentEvent::TurnStart { max_iterations: 10 });
+    app.apply(AgentEvent::ApiCallEnd { usage: usage(70, 30) });
+    app.apply(AgentEvent::ApiCallEnd { usage: usage(30, 20) });
+    // Done reports the turn TOTAL (100/50) — already counted per call.
+    app.apply(AgentEvent::Done {
+        final_text: "done".into(),
+        usage: usage(100, 50),
+        iterations: 2,
+    });
+    assert_eq!(app.tokens.prompt, 100);
+    assert_eq!(app.tokens.completion, 50);
+    assert_eq!(app.tokens.iterations, 2);
+}
+
+#[test]
+fn final_message_is_not_duplicated() {
+    let mut app = joey_tui::AppState::new("s", "m");
+    app.apply(AgentEvent::TurnStart { max_iterations: 10 });
+    app.apply(AgentEvent::ContentDelta("The answer is 42.".into()));
+    // The agent commits the message, then ends the turn with the same text.
+    app.apply(AgentEvent::AssistantMessage("The answer is 42.".into()));
+    app.apply(AgentEvent::Done {
+        final_text: "The answer is 42.".into(),
+        usage: usage(0, 0),
+        iterations: 1,
+    });
+    let assistant_items = app
+        .transcript
+        .iter()
+        .filter(|it| matches!(it, TranscriptItem::Assistant { .. }))
+        .count();
+    assert_eq!(assistant_items, 1, "final answer must appear exactly once");
+    assert_eq!(app.last_final_text, "The answer is 42.");
+    assert!(!app.is_busy());
+}
+
+#[test]
+fn tool_end_resolves_across_intervening_items() {
+    use joey_tui::state::ToolStatus;
+
+    let mut app = joey_tui::AppState::new("s", "m");
+    app.apply(AgentEvent::TurnStart { max_iterations: 10 });
+    app.apply(AgentEvent::ToolStart {
+        name: "terminal".into(),
+        emoji: "⚡".into(),
+        summary: "cargo build".into(),
+    });
+    // A retry notice lands between start and end — the tool must still
+    // resolve instead of spinning forever.
+    app.apply(AgentEvent::RetryAttempt {
+        attempt: 1,
+        max_retries: 3,
+        error: "flaky network".into(),
+        wait_secs: 0.5,
+    });
+    app.apply(AgentEvent::ToolEnd {
+        name: "terminal".into(),
+        is_error: false,
+        result_preview: "Finished".into(),
+        duration_secs: 4.2,
+    });
+
+    let tool = app
+        .transcript
+        .iter()
+        .find_map(|it| match it {
+            TranscriptItem::Tool { status, duration_secs, .. } => Some((*status, *duration_secs)),
+            _ => None,
+        })
+        .expect("tool item present");
+    assert_eq!(tool.0, ToolStatus::Done);
+    assert_eq!(tool.1, Some(4.2));
+}
+
+#[test]
+fn scroll_is_clamped_and_not_yanked_to_bottom() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = Theme::aurora();
+    let mut app = joey_tui::AppState::new("s", "m");
+    for i in 0..40 {
+        app.push_item(TranscriptItem::Notice {
+            text: format!("line {i}"),
+            kind: joey_tui::state::NoticeKind::Info,
+        });
+    }
+
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let draw = |t: &mut Terminal<TestBackend>, app: &joey_tui::AppState| {
+        t.draw(|f| {
+            let area = f.area();
+            joey_tui::widgets::draw_transcript(f, area, app, theme, false, 0.5);
+        })
+        .unwrap();
+    };
+
+    // First frame records the scrollable extent.
+    draw(&mut terminal, &app);
+    assert!(app.last_max_scroll.get() > 0);
+
+    // Scrolling far past the top clamps to the measured extent.
+    app.scroll_up(10_000);
+    let max = app.last_max_scroll.get();
+    assert!(app.scroll.unwrap() <= max);
+
+    // New streamed content must NOT yank the reader back to the bottom.
+    let before = app.scroll;
+    app.apply(AgentEvent::Notice("new event while reading".into()));
+    assert_eq!(app.scroll, before);
+
+    // But the user's own message snaps back to live.
+    app.record_user("next question");
+    assert_eq!(app.scroll, None);
+
+    draw(&mut terminal, &app);
+}
+
+#[test]
+fn failed_turn_flushes_partial_output() {
+    let mut app = joey_tui::AppState::new("s", "m");
+    app.apply(AgentEvent::TurnStart { max_iterations: 10 });
+    app.apply(AgentEvent::ReasoningDelta("hmm ".into()));
+    app.apply(AgentEvent::ContentDelta("partial ans".into()));
+    app.apply(AgentEvent::Failed("provider exploded".into()));
+
+    assert!(!app.is_busy());
+    assert!(app.active_agents.is_empty());
+    assert!(!app.reasoning_open);
+    assert!(app.streaming_assistant.is_empty());
+    let has_partial = app.transcript.iter().any(
+        |it| matches!(it, TranscriptItem::Assistant { text } if text == "partial ans"),
+    );
+    let has_error = app
+        .transcript
+        .iter()
+        .any(|it| matches!(it, TranscriptItem::Error { text } if text.contains("exploded")));
+    assert!(has_partial && has_error);
 }
 
 #[test]
@@ -144,4 +300,36 @@ fn activity_scales_with_agent_count() {
     }
     // Intensity should decay toward the baseline shimmer.
     assert!(a.intensity < 0.3, "intensity should decay: {}", a.intensity);
+}
+
+#[test]
+fn tiny_terminal_renders_without_panic() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = Theme::aurora();
+    let mut app = joey_tui::AppState::new("s", "m");
+    app.push_item(TranscriptItem::Notice {
+        text: "hello".into(),
+        kind: joey_tui::state::NoticeKind::Info,
+    });
+
+    // Degenerate sizes must not index outside the buffer.
+    for (w, h) in [(1u16, 1u16), (5, 2), (10, 3), (20, 4)] {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                joey_tui::widgets::draw_transcript(f, area, &app, theme, false, 0.5);
+                joey_tui::widgets::draw_status(
+                    f,
+                    area,
+                    &app,
+                    theme,
+                    std::time::Duration::from_secs(3),
+                );
+            })
+            .unwrap();
+    }
 }

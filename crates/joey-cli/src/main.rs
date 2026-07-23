@@ -144,8 +144,8 @@ pub struct Cli {
     /// Launch the animated graphical TUI (ratatui) instead of the line-based
     /// REPL. Shows a live multi-panel dashboard with particle backdrop,
     /// gradient theme, spinners and an activity equalizer whose speed scales
-    /// with the number of active agents. Auto-enabled when stdout is a TTY
-    /// and JOEY_TUI=1.
+    /// with the number of active agents. JOEY_TUI=1 enables it by default;
+    /// non-terminal stdio falls back to the line REPL.
     #[arg(long = "tui")]
     tui: bool,
 
@@ -259,7 +259,8 @@ pub struct ChatArgs {
     pub safe_mode: bool,
 
     /// Launch the animated graphical TUI (ratatui) instead of the line-based
-    /// REPL. Auto-enabled when stdout is a TTY and JOEY_TUI=1.
+    /// REPL. JOEY_TUI=1 enables it by default; non-terminal stdio falls back
+    /// to the line REPL.
     #[arg(long = "tui")]
     pub tui: bool,
 }
@@ -438,6 +439,14 @@ async fn main() {
     std::process::exit(code);
 }
 
+/// `JOEY_TUI=1` (or `true`) opts into the animated TUI without the flag.
+/// The TUI itself falls back to the line REPL when stdio isn't a terminal.
+fn tui_env_enabled() -> bool {
+    std::env::var("JOEY_TUI")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Wire the env-var-backed flags BEFORE any Config::load (config.rs reads
 /// JOEY_IGNORE_USER_CONFIG at load; joey-tools reads JOEY_YOLO_MODE; joey-mcp
 /// reads JOEY_SAFE_MODE).
@@ -507,7 +516,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 max_turns: chat.max_turns.or(cli.max_turns),
                 pass_session_id: chat.pass_session_id || cli.pass_session_id,
                 skills: if chat.skills.is_empty() { cli.skills } else { chat.skills },
-                tui: chat.tui || cli.tui,
+                tui: chat.tui || cli.tui || tui_env_enabled(),
             };
             if opts.tui {
                 tui::run(opts).await
@@ -527,7 +536,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 max_turns: cli.max_turns,
                 pass_session_id: cli.pass_session_id,
                 skills: cli.skills,
-                tui: cli.tui,
+                tui: cli.tui || tui_env_enabled(),
             };
             if opts.tui {
                 tui::run(opts).await

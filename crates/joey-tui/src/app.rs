@@ -1,26 +1,30 @@
-//! The TUI runtime: owns the terminal, the animation loop, and the bridge
-//! between crossterm input / agent events and the rendered frame.
+//! The TUI runtime: owns the terminal, the animation timers, and the mapping
+//! from crossterm key events to [`TuiAction`]s.
 //!
 //! Architecture (Elm-like, single source of truth):
 //!   - [`App`] (`state.rs`) is the model.
 //!   - [`Tui`] owns the terminal + animation timers.
-//!   - The run loop polls: crossterm input events, agent events, and a fixed
-//!     animation tick. On each, it updates the model and redraws.
+//!   - The host (joey-cli) runs the loop: it polls crossterm input, drains
+//!     agent events into the model, and calls [`Tui::tick_animations`] +
+//!     [`Tui::draw`] each frame.
 
 use std::io::{self, Stdout};
+use std::sync::Once;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
-use ratatui::widgets::Block;
+use ratatui::style::Style;
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Terminal;
-use tokio::sync::mpsc;
-
-use joey_agent_core::AgentEvent;
 
 use crate::anim::{Activity, Clock, Equalizer, ParticleField, Pulse, Spinner};
 use crate::input::Input;
@@ -31,7 +35,7 @@ use crate::widgets;
 /// A request emitted by the TUI to the host (the REPL) to act on user input.
 #[derive(Debug)]
 pub enum TuiAction {
-    /// Submit this prompt to the agent.
+    /// Submit this prompt to the agent (host queues it if a turn is running).
     Submit(String),
     /// The user wants to interrupt the current turn.
     Interrupt,
@@ -41,6 +45,24 @@ pub enum TuiAction {
 
 pub type FrameBackend = CrosstermBackend<Stdout>;
 pub type FrameTerminal = Terminal<FrameBackend>;
+
+/// Restore the terminal even if we panic mid-frame: a raw-mode alternate
+/// screen would otherwise swallow the panic message and wreck the shell.
+fn install_panic_hook() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let orig = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            orig(info);
+        }));
+    });
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+}
 
 /// The TUI controller.
 pub struct Tui {
@@ -58,6 +80,7 @@ pub struct Tui {
     pulse: Pulse,
     show_help: bool,
     focus: Focus,
+    restored: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,9 +92,14 @@ pub enum Focus {
 impl Tui {
     /// Enter the alternate screen and create the terminal.
     pub fn enter(app: App, theme: Theme) -> io::Result<Self> {
+        install_panic_hook();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+            // Leave the shell usable for the caller's line-REPL fallback.
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         let size = terminal.size()?;
@@ -89,13 +117,16 @@ impl Tui {
             pulse: Pulse::new(),
             show_help: false,
             focus: Focus::Input,
+            restored: false,
         })
     }
 
-    /// Restore the terminal. Must be called on exit (including panics).
+    /// Restore the terminal. Idempotent; also runs on Drop.
     pub fn leave(&mut self) -> io::Result<()> {
-        disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        if !self.restored {
+            self.restored = true;
+            restore_terminal();
+        }
         Ok(())
     }
 
@@ -115,76 +146,6 @@ impl Tui {
         }
     }
 
-    /// Render one frame.
-    fn draw_impl(&mut self) -> io::Result<()> {
-        let theme = self.theme;
-        let terminal = &mut self.terminal;
-
-        terminal.draw(|f| {
-            let area = f.area();
-            // 1. Background fill (deep void).
-            f.render_widget(Block::default().style(Style::default().bg(theme.bg_void.to_color())), area);
-            // 2. Particle backdrop.
-            widgets::draw_particles(f, &self.field, theme, area);
-            // 3. Layout: header / body / input / status.
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(2), // header
-                    Constraint::Min(8),   // body
-                    Constraint::Length(7), // input (multi-line)
-                    Constraint::Length(1), // status
-                ])
-                .split(area);
-
-            widgets::draw_header(f, chunks[0], &self.app, theme, &self.orbit_spinner, &self.pulse);
-
-            // Body: transcript (left, large) + sidebar (right).
-            let body = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Min(40),
-                    Constraint::Length(34),
-                ])
-                .split(chunks[1]);
-
-            // When reasoning is live, split transcript vertically: conversation + reasoning.
-            if self.app.reasoning_open {
-                let convo_split = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(4), Constraint::Length(8)])
-                    .split(body[0]);
-                widgets::draw_transcript(f, convo_split[0], &self.app, theme);
-                widgets::draw_reasoning(f, convo_split[1], &self.app, theme, &self.spinner);
-            } else {
-                widgets::draw_transcript(f, body[0], &self.app, theme);
-            }
-
-            widgets::draw_activity(
-                f,
-                body[1],
-                &self.app,
-                theme,
-                &self.spinner,
-                &self.equalizer,
-            );
-
-            widgets::draw_input(f, chunks[2], &self.input, &self.app, theme);
-
-            let elapsed = self
-                .app
-                .turn_started
-                .map(|t| t.elapsed())
-                .unwrap_or_default();
-            widgets::draw_status(f, chunks[3], &self.app, theme, elapsed);
-
-            if self.show_help {
-                widgets::draw_help_overlay(f, area, theme);
-            }
-        })?;
-        Ok(())
-    }
-
     /// Advance all animation state by the elapsed dt.
     pub fn tick_animations(&mut self) {
         let dt = self.clock.dt();
@@ -198,14 +159,111 @@ impl Tui {
         self.pulse.tick(dt, self.activity);
     }
 
-    /// Render one frame to the terminal.
-    pub fn draw(&mut self) -> io::Result<()> {
-        self.draw_impl()
+    /// How long the host should sleep/poll between frames. Scales with
+    /// activity so an idle dashboard doesn't spin the CPU at 60fps.
+    pub fn frame_budget(&self) -> Duration {
+        let fps = u64::from(self.activity.target_fps().clamp(10, 60));
+        Duration::from_millis(1000 / fps)
     }
 
-    /// Handle a single crossterm key event. Returns an action for the host.
-    pub fn handle_key(&mut self, key: KeyEvent) -> Option<TuiAction> {
-        self.handle_key_impl(key)
+    /// Render one frame to the terminal.
+    pub fn draw(&mut self) -> io::Result<()> {
+        let Self {
+            app,
+            theme,
+            input,
+            terminal,
+            spinner,
+            orbit_spinner,
+            field,
+            equalizer,
+            pulse,
+            show_help,
+            focus,
+            ..
+        } = self;
+        let theme = *theme;
+        let glow = pulse.value();
+
+        terminal.draw(|f| {
+            let area = f.area();
+
+            // Tiny-terminal fallback: the full layout needs room.
+            if area.width < 24 || area.height < 9 {
+                let msg = Paragraph::new(Line::from("⚠ terminal too small"))
+                    .style(Style::default().fg(theme.warning.to_color()));
+                f.render_widget(msg, area);
+                return;
+            }
+
+            // 1. Background fill (deep void).
+            f.render_widget(
+                Block::default().style(Style::default().bg(theme.bg_void.to_color())),
+                area,
+            );
+            // 2. Particle backdrop.
+            widgets::draw_particles(f, field, theme, area);
+
+            // 3. Layout: header / body / input / status. The input grows with
+            // its content (1 visible row minimum, up to 5).
+            let input_h = (input.line_count() as u16 + 2).clamp(3, 7);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),        // header
+                    Constraint::Min(5),           // body
+                    Constraint::Length(input_h),  // input
+                    Constraint::Length(1),        // status
+                ])
+                .split(area);
+
+            widgets::draw_header(f, chunks[0], app, theme, orbit_spinner, pulse);
+
+            // Body: transcript (left, large) + sidebar (right). The sidebar
+            // yields entirely on narrow terminals.
+            let show_sidebar = chunks[1].width >= 72;
+            let body = if show_sidebar {
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(40), Constraint::Length(34)])
+                    .split(chunks[1])
+            } else {
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(1)])
+                    .split(chunks[1])
+            };
+
+            let transcript_focused = *focus == Focus::Transcript;
+            // When reasoning is live (and shown), split the transcript
+            // vertically: conversation + reasoning.
+            let show_reasoning_panel =
+                app.reasoning_open && app.show_reasoning && body[0].height >= 14;
+            if show_reasoning_panel {
+                let convo_split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(4), Constraint::Length(8)])
+                    .split(body[0]);
+                widgets::draw_transcript(f, convo_split[0], app, theme, transcript_focused, glow);
+                widgets::draw_reasoning(f, convo_split[1], app, theme, spinner);
+            } else {
+                widgets::draw_transcript(f, body[0], app, theme, transcript_focused, glow);
+            }
+
+            if show_sidebar {
+                widgets::draw_activity(f, body[1], app, theme, spinner, equalizer);
+            }
+
+            widgets::draw_input(f, chunks[2], input, app, theme, *focus == Focus::Input, glow);
+
+            let elapsed = app.turn_started.map(|t| t.elapsed()).unwrap_or_default();
+            widgets::draw_status(f, chunks[3], app, theme, elapsed);
+
+            if *show_help {
+                widgets::draw_help_overlay(f, area, theme);
+            }
+        })?;
+        Ok(())
     }
 
     /// Resize the internal buffers (call on terminal resize events).
@@ -224,29 +282,76 @@ impl Tui {
         &mut self.app
     }
 
+    /// Toggle the help overlay (also reachable via `?` / F1).
+    pub fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+
+    fn toggle_reasoning(&mut self) {
+        self.app.show_reasoning = !self.app.show_reasoning;
+        if !self.app.show_reasoning {
+            // Drop the live block so the panel doesn't linger with stale text.
+            self.app.reasoning_open = false;
+            self.app.streaming_reasoning.clear();
+        }
+    }
+
     /// Handle a single crossterm key event. Returns an action for the host.
-    fn handle_key_impl(&mut self, key: KeyEvent) -> Option<TuiAction> {
+    ///
+    /// Design: printable characters ALWAYS reach the input box when it has
+    /// focus — global shortcuts are limited to control-modified keys and
+    /// keys that can't collide with typing (Esc, Tab, F1, PgUp/PgDn).
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<TuiAction> {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+
+        // Help overlay swallows keys until dismissed.
+        if self.show_help {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') | KeyCode::Enter => {
+                    self.show_help = false;
+                }
+                _ => {}
+            }
+            return None;
+        }
+
         // Global keys.
-        match (key.modifiers, key.code) {
-            (m, KeyCode::Char('c')) if m.contains(KeyModifiers::CONTROL) => {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => {
                 if self.app.is_busy() {
                     return Some(TuiAction::Interrupt);
                 }
                 self.app.mode = RunMode::Quitting;
                 return Some(TuiAction::Quit);
             }
-            (_, KeyCode::Char('?')) => {
-                self.show_help = !self.show_help;
+            KeyCode::Char('d') if ctrl => {
+                // EOF on an empty idle prompt quits; otherwise delete-forward.
+                if !self.app.is_busy() && self.focus == Focus::Input && self.input.is_empty() {
+                    self.app.mode = RunMode::Quitting;
+                    return Some(TuiAction::Quit);
+                }
+                if self.focus == Focus::Input {
+                    self.input.delete();
+                }
                 return None;
             }
-            (_, KeyCode::Char('r')) | (_, KeyCode::Char('R')) => {
-                self.app.show_reasoning = !self.app.show_reasoning;
+            KeyCode::Char('r') if ctrl => {
+                self.toggle_reasoning();
                 return None;
             }
-            (_, KeyCode::Tab) => {
+            KeyCode::Char('l') if ctrl => {
+                self.app.transcript.clear();
+                self.app.scroll = None;
+                return None;
+            }
+            KeyCode::F(1) => {
+                self.show_help = true;
+                return None;
+            }
+            KeyCode::Tab => {
                 self.focus = if self.focus == Focus::Input {
                     Focus::Transcript
                 } else {
@@ -254,7 +359,15 @@ impl Tui {
                 };
                 return None;
             }
-            (_, KeyCode::Esc) => {
+            KeyCode::PageUp => {
+                self.app.scroll_up(10);
+                return None;
+            }
+            KeyCode::PageDown => {
+                self.app.scroll_down(10);
+                return None;
+            }
+            KeyCode::Esc => {
                 if self.app.is_busy() {
                     return Some(TuiAction::Interrupt);
                 }
@@ -270,8 +383,10 @@ impl Tui {
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => self.app.scroll_up(1),
                     KeyCode::Down | KeyCode::Char('j') => self.app.scroll_down(1),
-                    KeyCode::PageUp => self.app.scroll_up(10),
-                    KeyCode::PageDown => self.app.scroll_down(10),
+                    KeyCode::Char('g') | KeyCode::Home => self.app.scroll_to_top(),
+                    KeyCode::Char('G') | KeyCode::End => self.app.scroll_to_bottom(),
+                    KeyCode::Char('?') => self.show_help = true,
+                    KeyCode::Char('r') => self.toggle_reasoning(),
                     _ => {}
                 }
                 None
@@ -281,224 +396,137 @@ impl Tui {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) -> Option<TuiAction> {
-        // If busy, most input is locked except interrupts (handled above).
-        if self.app.is_busy() {
-            return None;
-        }
-        match (key.modifiers, key.code) {
-            (m, KeyCode::Enter) if m.contains(KeyModifiers::ALT) => {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Enter if alt => {
                 self.input.insert_newline();
                 None
             }
-            (_, KeyCode::Enter) => {
+            KeyCode::Char('j') if ctrl => {
+                self.input.insert_newline();
+                None
+            }
+            KeyCode::Enter => {
                 let text = self.input.text();
                 if !text.trim().is_empty() {
                     self.input.clear();
-                    self.app.record_user(&text);
+                    // The host records/queues; while busy this becomes a
+                    // queued prompt for the next turn.
                     return Some(TuiAction::Submit(text));
                 }
                 None
             }
-            (m, KeyCode::Char('j')) if m.contains(KeyModifiers::CONTROL) => {
-                self.input.move_down();
-                None
-            }
-            (m, KeyCode::Char('k')) if m.contains(KeyModifiers::CONTROL) => {
-                self.input.move_up();
-                None
-            }
-            (m, KeyCode::Char('h')) if m.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('h') if ctrl => {
                 self.input.backspace();
                 None
             }
-            (m, KeyCode::Char('d')) if m.contains(KeyModifiers::CONTROL) => {
-                self.input.delete();
-                None
-            }
-            (m, KeyCode::Char('a')) if m.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('a') if ctrl => {
                 self.input.move_line_start();
                 None
             }
-            (m, KeyCode::Char('e')) if m.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('e') if ctrl => {
                 self.input.move_line_end();
                 None
             }
-            (m, KeyCode::Char('b')) if m.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('b') if ctrl => {
                 self.input.move_left();
                 None
             }
-            (m, KeyCode::Char('f')) if m.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('f') if ctrl => {
                 self.input.move_right();
                 None
             }
-            (m, KeyCode::Left) if m.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('k') if ctrl => {
+                self.input.kill_to_end();
+                None
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.input.kill_to_start();
+                None
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.input.delete_word_back();
+                None
+            }
+            KeyCode::Char('b') if alt => {
                 self.input.move_word_left();
                 None
             }
-            (m, KeyCode::Right) if m.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('f') if alt => {
                 self.input.move_word_right();
                 None
             }
-            (_, KeyCode::Left) => { self.input.move_left(); None }
-            (_, KeyCode::Right) => { self.input.move_right(); None }
-            (_, KeyCode::Up) => { self.input.move_up(); None }
-            (_, KeyCode::Down) => { self.input.move_down(); None }
-            (_, KeyCode::Home) => { self.input.move_line_start(); None }
-            (_, KeyCode::End) => { self.input.move_line_end(); None }
-            (_, KeyCode::Backspace) => { self.input.backspace(); None }
-            (_, KeyCode::Delete) => { self.input.delete(); None }
-            (_, KeyCode::Char(c)) => { self.input.insert_char(c); None }
+            KeyCode::Backspace if alt => {
+                self.input.delete_word_back();
+                None
+            }
+            KeyCode::Left if ctrl => {
+                self.input.move_word_left();
+                None
+            }
+            KeyCode::Right if ctrl => {
+                self.input.move_word_right();
+                None
+            }
+            KeyCode::Left => {
+                self.input.move_left();
+                None
+            }
+            KeyCode::Right => {
+                self.input.move_right();
+                None
+            }
+            // On a single-line prompt, ↑/↓ scroll the transcript (there is
+            // nowhere for the cursor to go); in a multi-line draft they move
+            // the cursor.
+            KeyCode::Up => {
+                if self.input.line_count() > 1 {
+                    self.input.move_up();
+                } else {
+                    self.app.scroll_up(1);
+                }
+                None
+            }
+            KeyCode::Down => {
+                if self.input.line_count() > 1 {
+                    self.input.move_down();
+                } else {
+                    self.app.scroll_down(1);
+                }
+                None
+            }
+            KeyCode::Home => {
+                self.input.move_line_start();
+                None
+            }
+            KeyCode::End => {
+                self.input.move_line_end();
+                None
+            }
+            KeyCode::Backspace => {
+                self.input.backspace();
+                None
+            }
+            KeyCode::Delete => {
+                self.input.delete();
+                None
+            }
+            KeyCode::Char('?') if self.input.is_empty() && !ctrl => {
+                self.show_help = true;
+                None
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.input.insert_char(c);
+                None
+            }
             _ => None,
         }
     }
-
-    /// Main loop. Drains agent events, pumps input, and redraws at the
-    /// activity-scaled frame rate. Returns the final assistant text.
-    pub async fn run_turn(
-        &mut self,
-        prompt: &str,
-        mut rx: mpsc::UnboundedReceiver<AgentEvent>,
-    ) -> String {
-        self.app.record_user(prompt);
-        // Pump the animation loop until the turn completes.
-        let frame_budget = Duration::from_millis(1000 / self.activity.target_fps().max(20) as u64);
-        loop {
-            // 1. Drain agent events.
-            while let Ok(ev) = rx.try_recv() {
-                self.app.apply(ev);
-            }
-            // 2. Check terminal events (resize only during turn).
-            while event::poll(Duration::from_millis(0)).unwrap_or(false) {
-                if let Ok(Event::Resize(w, h)) = event::read() {
-                    let _ = self.terminal.resize(ratatui::layout::Rect::new(0, 0, w, h));
-                    self.field.resize(w as usize, h as usize);
-                } else if let Ok(Event::Key(k)) = event::read() {
-                    if let Some(action) = self.handle_key(k) {
-                        match action {
-                            TuiAction::Interrupt => { /* host owns interrupt */ }
-                            TuiAction::Quit => {
-                                self.app.mode = RunMode::Quitting;
-                                return self.app.last_final_text.clone();
-                            }
-                            TuiAction::Submit(_) => {}
-                        }
-                    }
-                }
-            }
-            // 3. Tick + render.
-            self.tick_animations();
-            let _ = self.draw();
-
-            // Termination.
-            if !self.app.is_busy() && self.app.active_agents.is_empty() && self.app.streaming_assistant.is_empty() {
-                // Turn done — one final flush of events.
-                while let Ok(ev) = rx.try_recv() {
-                    self.app.apply(ev);
-                }
-                let _ = self.draw();
-                break;
-            }
-            // Sleep the remainder of the frame budget.
-            tokio::time::sleep(frame_budget.min(Duration::from_millis(50))).await;
-        }
-        self.app.last_final_text.clone()
-    }
-
-    /// Drive the interactive REPL loop: read user input via the TUI, emit
-    /// Submit actions, and let the host run the turn with its own event
-    /// channel.
-    pub async fn run_interactive<F, Fut>(&mut self, mut on_submit: F)
-    where
-        F: FnMut(String) -> Fut,
-        Fut: std::future::Future<Output = ()>,
-    {
-        let frame_budget = Duration::from_millis(16);
-        loop {
-            // Pump any leftover agent events (defensive).
-            // Input loop: poll events, tick animations, render.
-            self.tick_animations();
-            let _ = self.draw();
-            if event::poll(frame_budget).unwrap_or(false) {
-                match event::read() {
-                    Ok(Event::Key(k)) => {
-                        if let Some(action) = self.handle_key(k) {
-                            match action {
-                                TuiAction::Quit => {
-                                    self.app.mode = RunMode::Quitting;
-                                    let _ = self.draw();
-                                    return;
-                                }
-                                TuiAction::Submit(text) => {
-                                    on_submit(text).await;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Ok(Event::Resize(w, h)) => {
-                        let _ = self.terminal.resize(ratatui::layout::Rect::new(0, 0, w, h));
-                        self.field.resize(w as usize, h as usize);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
 }
 
-// The helper `Rect` import is used in resize calls above.
-
-/// One-shot render of the current state to stdout (for testing / headless).
-pub fn render_once(app: &App, theme: Theme) -> io::Result<()> {
-    let mut stdout = io::stdout();
-    enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let mut spinner = Spinner::dots();
-    let mut eq = Equalizer::new(28);
-    let mut field = ParticleField::new(80, 24);
-    let mut pulse = Pulse::new();
-    let mut activity = Activity::idle();
-    let mut clock = Clock::start();
-    let size = terminal.size()?;
-    field.resize(size.width as usize, size.height as usize);
-    // a few ticks for animation richness
-    for _ in 0..5 {
-        let dt = clock.dt();
-        activity.update(app.active_count(), dt);
-        spinner.tick(dt, activity.speed());
-        eq.tick(dt, activity);
-        field.tick(dt, activity, theme);
-        pulse.tick(dt, activity);
+impl Drop for Tui {
+    fn drop(&mut self) {
+        let _ = self.leave();
     }
-    terminal.draw(|f| {
-        let area = f.area();
-        f.render_widget(Block::default().style(Style::default().bg(theme.bg_void.to_color())), area);
-        widgets::draw_particles(f, &field, theme, area);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(8),
-                Constraint::Length(7),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        widgets::draw_header(f, chunks[0], app, theme, &spinner, &pulse);
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(40), Constraint::Length(34)])
-            .split(chunks[1]);
-        widgets::draw_transcript(f, body[0], app, theme);
-        widgets::draw_activity(f, body[1], app, theme, &spinner, &eq);
-    })?;
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn _unused_style_mod() {
-    let _ = Modifier::BOLD;
 }

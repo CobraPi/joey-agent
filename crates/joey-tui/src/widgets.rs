@@ -19,7 +19,7 @@ use crate::state::{
     AgentPhase, App, NoticeKind, RunMode, ToolStatus, TranscriptItem,
 };
 use crate::theme::{gradient_spans, Rgb, Theme};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Helper: build a Block with a gradient title.
 pub fn gradient_block(title: &str, theme: Theme) -> Block<'_> {
@@ -47,14 +47,31 @@ pub fn gradient_block_focused(title: &str, theme: Theme, pulse: f32) -> Block<'_
         .style(Style::default().bg(theme.bg_panel.to_color()))
 }
 
+fn panel_block(title: &str, theme: Theme, focused: bool, glow: f32) -> Block<'_> {
+    if focused {
+        gradient_block_focused(title, theme, glow)
+    } else {
+        gradient_block(title, theme)
+    }
+}
+
 // ── Particle backdrop ───────────────────────────────────────────────────────
 //
 // Drawn first across the full terminal as a subtle animated starfield behind
 // all panels. Panels have opaque backgrounds so they sit on top cleanly.
 
 pub fn draw_particles(f: &mut Frame, field: &ParticleField, theme: Theme, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let buf = f.buffer_mut();
     for p in field.particles() {
+        // Off-screen particles (spawn margins are negative) must be skipped
+        // BEFORE the cast — `as u16` clamps negatives to 0 and would pile
+        // them up along the top/left edges.
+        if p.x < 0.0 || p.y < 0.0 {
+            continue;
+        }
         let x = p.x as u16;
         let y = p.y as u16;
         if x >= area.width || y >= area.height {
@@ -76,6 +93,9 @@ pub fn draw_particles(f: &mut Frame, field: &ParticleField, theme: Theme, area: 
 // ── Header banner ───────────────────────────────────────────────────────────
 
 pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: &Spinner, pulse: &Pulse) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let buf_area = Block::default()
         .style(Style::default().bg(theme.bg_elevated.to_color()));
     f.render_widget(buf_area, area);
@@ -148,195 +168,246 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
         }
     }
 
-    // Subtle gradient underline.
-    let underline_y = area.y + area.height.saturating_sub(1);
-    for i in 0..area.width {
-        let t = i as f32 / area.width.max(1) as f32;
-        let c = crate::theme::sample_stops(&[theme.grad_0, theme.grad_1, theme.grad_2, theme.grad_3], t);
-        let cell = &mut buf[(area.x + i, underline_y)];
-        cell.set_char('─')
-            .set_style(Style::default().fg(c.to_color()));
+    // Subtle gradient underline (only when the header has its second row).
+    if area.height >= 2 {
+        let underline_y = area.y + area.height - 1;
+        for i in 0..area.width {
+            let t = i as f32 / area.width.max(1) as f32;
+            let c = crate::theme::sample_stops(&[theme.grad_0, theme.grad_1, theme.grad_2, theme.grad_3], t);
+            let cell = &mut buf[(area.x + i, underline_y)];
+            cell.set_char('─')
+                .set_style(Style::default().fg(c.to_color()));
+        }
     }
 }
 
 fn short_id(id: &str) -> String {
-    let len = id.len().min(8);
-    id[..len].to_string()
+    id.chars().take(8).collect()
 }
 
 // ── Conversation / transcript ───────────────────────────────────────────────
 
-pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
-    let block = gradient_block("conversation", theme);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    // Build the text lines from the transcript, wrapping each item.
-    let content_w = inner.width.max(1) as usize;
+/// Render one transcript item as wrapped lines.
+fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
-
-    for item in app.transcript.iter() {
-        match item {
-            TranscriptItem::User { text } => {
-                let prompt_span = Span::styled(
-                    "❯ ",
-                    Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
-                );
-                lines.push(Line::from(vec![prompt_span]));
-                for wl in wrap(text, content_w.saturating_sub(2)) {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("  {}", wl),
-                        Style::default().fg(theme.fg_base.to_color()),
-                    )]));
-                }
-            }
-            TranscriptItem::Assistant { text } => {
-                let badge = Span::styled(
-                    "◆ assistant ",
-                    Style::default()
-                        .fg(theme.info.to_color())
-                        .add_modifier(Modifier::BOLD),
-                );
-                lines.push(Line::from(vec![badge]));
-                for wl in wrap(text, content_w.saturating_sub(2)) {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("  {}", wl),
-                        Style::default().fg(theme.fg_base.to_color()),
-                    )]));
-                }
-                lines.push(Line::from(vec![Span::raw("")]));
-            }
-            TranscriptItem::AssistantStreaming { text } => {
-                let badge = Span::styled(
-                    "◆ assistant ",
-                    Style::default()
-                        .fg(theme.info.to_color())
-                        .add_modifier(Modifier::BOLD),
-                );
-                lines.push(Line::from(vec![badge]));
-                for wl in wrap(text, content_w.saturating_sub(2)) {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("  {}", wl),
-                        Style::default().fg(theme.fg_base.to_color()),
-                    )]));
-                }
-            }
-            TranscriptItem::Reasoning { text } => {
-                let head = Span::styled(
-                    "┄ reasoning ",
-                    Style::default().fg(theme.fg_more_subtle.to_color()),
-                );
-                lines.push(Line::from(vec![head]));
-                for wl in wrap(text, content_w.saturating_sub(2)) {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("  {}", wl),
-                        Style::default()
-                            .fg(theme.fg_more_subtle.to_color())
-                            .add_modifier(Modifier::DIM),
-                    )]));
-                }
-            }
-            TranscriptItem::Tool { name, emoji, summary, status, duration_secs, result_preview } => {
-                let (icon, col) = match status {
-                    ToolStatus::Running => ("⟳", theme.busy),
-                    ToolStatus::Done => ("✓", theme.success),
-                    ToolStatus::Failed => ("✗", theme.error),
-                };
-                let dur_str = duration_secs
-                    .map(|d| format!("  {:.1}s", d))
-                    .unwrap_or_default();
-                let mut spans = vec![
-                    Span::styled(
-                        format!("  {} ", icon),
-                        Style::default().fg(col.to_color()).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("{} ", emoji),
-                        Style::default().fg(theme.accent.to_color()),
-                    ),
-                    Span::styled(
-                        name.clone(),
-                        Style::default().fg(theme.fg_base.to_color()).add_modifier(Modifier::BOLD),
-                    ),
-                ];
-                if !summary.is_empty() {
-                    let s: String = summary.chars().take(content_w.saturating_sub(name.len() + 10)).collect();
-                    spans.push(Span::styled(
-                        format!(" {}", s),
-                        Style::default().fg(theme.fg_most_subtle.to_color()),
-                    ));
-                }
-                spans.push(Span::styled(
-                    dur_str,
-                    Style::default().fg(theme.fg_more_subtle.to_color()),
-                ));
-                lines.push(Line::from(spans));
-                if *status == ToolStatus::Done && !result_preview.is_empty() {
-                    let preview: String = result_preview.chars().take(100).collect();
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("    └ {}", preview),
-                        Style::default().fg(theme.fg_most_subtle.to_color()),
-                    )]));
-                }
-            }
-            TranscriptItem::Notice { text, kind } => {
-                let col = match kind {
-                    NoticeKind::Info => theme.info,
-                    NoticeKind::Warning => theme.warning,
-                    NoticeKind::Success => theme.success,
-                    NoticeKind::Busy => theme.busy,
-                };
-                lines.push(Line::from(vec![
-                    Span::styled("  · ", Style::default().fg(col.to_color())),
-                    Span::styled(text.clone(), Style::default().fg(theme.fg_more_subtle.to_color())),
-                ]));
-            }
-            TranscriptItem::Error { text } => {
+    match item {
+        TranscriptItem::User { text } => {
+            lines.push(Line::from(vec![Span::styled(
+                "❯ ",
+                Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
+            )]));
+            for wl in wrap(text, content_w.saturating_sub(2)) {
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  ✗ {}", text),
+                    format!("  {}", wl),
+                    Style::default().fg(theme.fg_base.to_color()),
+                )]));
+            }
+        }
+        TranscriptItem::Assistant { text } => {
+            lines.push(Line::from(vec![Span::styled(
+                "◆ assistant ",
+                Style::default()
+                    .fg(theme.info.to_color())
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            for wl in wrap(text, content_w.saturating_sub(2)) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  {}", wl),
+                    Style::default().fg(theme.fg_base.to_color()),
+                )]));
+            }
+            lines.push(Line::from(vec![Span::raw("")]));
+        }
+        TranscriptItem::Reasoning { text } => {
+            lines.push(Line::from(vec![Span::styled(
+                "┄ reasoning ",
+                Style::default().fg(theme.fg_more_subtle.to_color()),
+            )]));
+            for wl in wrap(text, content_w.saturating_sub(2)) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  {}", wl),
+                    Style::default()
+                        .fg(theme.fg_more_subtle.to_color())
+                        .add_modifier(Modifier::DIM),
+                )]));
+            }
+        }
+        TranscriptItem::Tool { name, emoji, summary, status, duration_secs, result_preview } => {
+            let (icon, col) = match status {
+                ToolStatus::Running => ("⟳", theme.busy),
+                ToolStatus::Done => ("✓", theme.success),
+                ToolStatus::Failed => ("✗", theme.error),
+            };
+            let dur_str = duration_secs
+                .map(|d| format!("  {:.1}s", d))
+                .unwrap_or_default();
+            let mut spans = vec![
+                Span::styled(
+                    format!("  {} ", icon),
+                    Style::default().fg(col.to_color()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{} ", emoji),
+                    Style::default().fg(theme.accent.to_color()),
+                ),
+                Span::styled(
+                    name.clone(),
+                    Style::default().fg(theme.fg_base.to_color()).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if !summary.is_empty() {
+                let s = one_line(summary, content_w.saturating_sub(name.len() + 10));
+                spans.push(Span::styled(
+                    format!(" {}", s),
+                    Style::default().fg(theme.fg_most_subtle.to_color()),
+                ));
+            }
+            spans.push(Span::styled(
+                dur_str,
+                Style::default().fg(theme.fg_more_subtle.to_color()),
+            ));
+            lines.push(Line::from(spans));
+            if !result_preview.is_empty() && !matches!(status, ToolStatus::Running) {
+                let preview = one_line(result_preview, 100);
+                let col = if matches!(status, ToolStatus::Failed) {
+                    theme.error
+                } else {
+                    theme.fg_most_subtle
+                };
+                lines.push(Line::from(vec![Span::styled(
+                    format!("    └ {}", preview),
+                    Style::default().fg(col.to_color()),
+                )]));
+            }
+        }
+        TranscriptItem::Notice { text, kind } => {
+            let col = match kind {
+                NoticeKind::Info => theme.info,
+                NoticeKind::Warning => theme.warning,
+                NoticeKind::Success => theme.success,
+                NoticeKind::Busy => theme.busy,
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  · ", Style::default().fg(col.to_color())),
+                Span::styled(
+                    one_line(text, content_w.saturating_sub(4)),
+                    Style::default().fg(theme.fg_more_subtle.to_color()),
+                ),
+            ]));
+        }
+        TranscriptItem::Error { text } => {
+            for wl in wrap(text, content_w.saturating_sub(4)) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  ✗ {}", wl),
                     Style::default().fg(theme.error.to_color()).add_modifier(Modifier::BOLD),
                 )]));
             }
         }
     }
+    lines
+}
 
-    // Append live streaming content (not yet committed).
+pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focused: bool, glow: f32) {
+    let block = panel_block("conversation", theme, focused, glow);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let content_w = inner.width as usize;
+    let visible = inner.height as usize;
+    let offset = app.scroll.unwrap_or(0);
+    // One extra line beyond the viewport tells us whether more content
+    // exists above (so scroll_up may keep going).
+    let needed = visible + offset + 1;
+
+    // Build lines lazily from the NEWEST item backwards — older items that
+    // can't be on screen are never wrapped. This keeps per-frame cost
+    // proportional to the viewport, not the session length.
+    let mut blocks_rev: Vec<Vec<Line>> = Vec::new();
+    let mut built = 0usize;
+
+    // Live streaming tail is the newest block. (Live reasoning is rendered by
+    // the dedicated reasoning panel, not here.)
     if !app.streaming_assistant.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
+        let mut tail = vec![Line::from(vec![Span::styled(
             "◆ assistant ",
             Style::default().fg(theme.info.to_color()).add_modifier(Modifier::BOLD),
-        )]));
+        )])];
         for wl in wrap(&app.streaming_assistant, content_w.saturating_sub(2)) {
-            lines.push(Line::from(vec![Span::styled(
+            tail.push(Line::from(vec![Span::styled(
                 format!("  {}", wl),
                 Style::default().fg(theme.fg_base.to_color()),
             )]));
         }
+        built += tail.len();
+        blocks_rev.push(tail);
     }
-    if app.reasoning_open && !app.streaming_reasoning.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            "┄ reasoning ",
-            Style::default().fg(theme.fg_more_subtle.to_color()),
-        )]));
-        for wl in wrap(&app.streaming_reasoning, content_w.saturating_sub(2)) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("  {}", wl),
-                Style::default().fg(theme.fg_more_subtle.to_color()).add_modifier(Modifier::DIM),
-            )]));
+
+    let mut exhausted = true;
+    for item in app.transcript.iter().rev() {
+        if built >= needed {
+            exhausted = false;
+            break;
+        }
+        let ls = item_lines(item, content_w, theme);
+        built += ls.len();
+        blocks_rev.push(ls);
+    }
+
+    let lines: Vec<Line> = blocks_rev.into_iter().rev().flatten().collect();
+    let total = lines.len();
+
+    // Record how far up the user may scroll. When we stopped building early
+    // there is definitely more above — allow at least another page.
+    let max_scroll = if exhausted {
+        total.saturating_sub(visible)
+    } else {
+        offset + visible
+    };
+    app.last_max_scroll.set(max_scroll);
+
+    let clamped = offset.min(max_scroll);
+    let scroll_rows = total.saturating_sub(visible + clamped).min(u16::MAX as usize);
+
+    let para = Paragraph::new(Text::from(lines)).scroll((scroll_rows as u16, 0));
+    f.render_widget(para, inner);
+
+    // Scrolled-up indicator: bottom-right badge showing the distance to live.
+    if app.scroll.is_some() && clamped > 0 {
+        let badge = format!(" ↓ {} line{} below ", clamped, if clamped == 1 { "" } else { "s" });
+        let bw = UnicodeWidthStr::width(badge.as_str()) as u16;
+        if bw < inner.width {
+            let bx = inner.x + inner.width - bw;
+            let by = inner.y + inner.height - 1;
+            let buf = f.buffer_mut();
+            for (xx, ch) in (bx..).zip(badge.chars()) {
+                let cell = &mut buf[(xx, by)];
+                cell.set_char(ch).set_style(
+                    Style::default()
+                        .fg(theme.bg_void.to_color())
+                        .bg(theme.gold.to_color())
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
         }
     }
+}
 
-    // Compute scroll: auto-follow bottom unless user scrolled up.
-    let total = lines.len();
-    let visible = inner.height as usize;
-    let scroll = match app.scroll {
-        Some(offset) => total.saturating_sub(visible + offset),
-        None => total.saturating_sub(visible),
-    };
-
-    let para = Paragraph::new(Text::from(lines))
-        .scroll((scroll as u16, 0));
-    f.render_widget(para, inner);
+/// Collapse a possibly multi-line string to one line, truncated to `max` chars.
+fn one_line(s: &str, max: usize) -> String {
+    let mut out: String = s
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max.max(1))
+        .collect();
+    if out.is_empty() {
+        out.push('…');
+    }
+    out
 }
 
 /// Word-wrap a string to a given display width.
@@ -364,6 +435,9 @@ pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinne
     let block = gradient_block_focused("reasoning", theme, 0.5);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
     if !app.reasoning_open || app.streaming_reasoning.is_empty() {
         let placeholder = Line::from(vec![
@@ -386,7 +460,11 @@ pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinne
     }
     // trailing spinner
     lines.push(Line::from(vec![Span::raw(" "), spinner.styled_glyph(theme)]));
-    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+    // Keep the newest reasoning visible.
+    let total = lines.len();
+    let visible = inner.height as usize;
+    let scroll = total.saturating_sub(visible).min(u16::MAX as usize) as u16;
+    f.render_widget(Paragraph::new(Text::from(lines)).scroll((scroll, 0)), inner);
 }
 
 // ── Activity / tools sidebar ────────────────────────────────────────────────
@@ -399,9 +477,12 @@ pub fn draw_activity(
     spinner: &Spinner,
     equalizer: &Equalizer,
 ) {
-    let block = gradient_block_focused("activity", theme, 0.5);
+    let block = gradient_block("activity", theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
     let cw = inner.width.max(1) as usize;
 
@@ -417,9 +498,7 @@ pub fn draw_activity(
             let (phase_text, phase_col): (String, Rgb) = match &a.phase {
                 AgentPhase::Idle => ("queued".to_string(), theme.fg_more_subtle),
                 AgentPhase::QueryingModel => ("querying model".to_string(), theme.info),
-                AgentPhase::RunningTool(t) => {
-                    (t.clone(), theme.accent)
-                }
+                AgentPhase::RunningTool(t) => (t.clone(), theme.accent),
                 AgentPhase::Reasoning => ("reasoning".to_string(), theme.keyword),
                 AgentPhase::Done => ("done".to_string(), theme.success),
             };
@@ -510,32 +589,45 @@ fn fmt_tokens(n: u64) -> String {
 
 // ── Input box ───────────────────────────────────────────────────────────────
 
-pub fn draw_input(f: &mut Frame, area: Rect, input: &Input, app: &App, theme: Theme) {
-    let focused = matches!(app.mode, RunMode::Input);
-    let title = if app.is_busy() { "input (busy)" } else { "input" };
-    let block = if focused {
-        gradient_block_focused(title, theme, 0.8)
-    } else {
-        gradient_block(title, theme)
-    };
+pub fn draw_input(
+    f: &mut Frame,
+    area: Rect,
+    input: &Input,
+    app: &App,
+    theme: Theme,
+    focused: bool,
+    glow: f32,
+) {
+    let title = if app.is_busy() { "input · ⏎ queues" } else { "input" };
+    let block = panel_block(title, theme, focused, glow);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
-    let (first_line, x_off) = input.view_offset(inner);
-    let cw = inner.width.saturating_sub(1) as usize;
+    // 2 columns of prefix ("❯ " / "… ") then content.
+    let cw = inner.width.saturating_sub(2) as usize;
+    let (first_line, x_off) = input.view_offset(inner.height as usize, cw.max(1));
 
     let mut lines: Vec<Line> = Vec::new();
-    let visible_lines = &input.lines()[first_line..];
-    for (idx, l) in visible_lines.iter().enumerate() {
-        let actual_line = first_line + idx;
-        let prefix = if actual_line == 0 { "❯ " } else { "… " };
+    for (idx, l) in input.lines().iter().enumerate().skip(first_line) {
+        let prefix = if idx == 0 { "❯ " } else { "… " };
         let prefix_span = Span::styled(
             prefix,
             Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
         );
-        // Horizontal crop around cursor.
-        let chars: Vec<char> = l.chars().collect();
-        let cropped: String = chars.iter().skip(x_off).take(cw).collect();
+        // Horizontal crop around the cursor, respecting display width.
+        let mut cropped = String::new();
+        let mut used = 0usize;
+        for ch in l.chars().skip(x_off) {
+            let w = ch.width().unwrap_or(0);
+            if used + w > cw {
+                break;
+            }
+            used += w;
+            cropped.push(ch);
+        }
         let content_span = Span::styled(
             cropped,
             Style::default().fg(theme.fg_base.to_color()),
@@ -543,39 +635,59 @@ pub fn draw_input(f: &mut Frame, area: Rect, input: &Input, app: &App, theme: Th
         lines.push(Line::from(vec![prefix_span, content_span]));
     }
 
-    // Ensure at least one line.
-    if lines.is_empty() {
-        let prefix_span = Span::styled(
-            "❯ ",
-            Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
-        );
-        let placeholder = Span::styled(
-            if app.is_busy() { "agent working… (Esc/Ctrl-C to interrupt)" } else { "" },
-            Style::default().fg(theme.fg_most_subtle.to_color()),
-        );
-        lines.push(Line::from(vec![prefix_span, placeholder]));
+    // Placeholder when the buffer is empty.
+    if input.is_empty() {
+        let hint = if app.is_busy() {
+            "agent working — type to queue the next prompt · Esc interrupts"
+        } else {
+            "type a prompt · ? for help"
+        };
+        lines.clear();
+        lines.push(Line::from(vec![
+            Span::styled(
+                "❯ ",
+                Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(hint, Style::default().fg(theme.fg_most_subtle.to_color())),
+        ]));
     }
 
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 
-    // Place the block cursor.
-    let (cur_line, cur_col) = input.cursor();
-    let view_line = cur_line.saturating_sub(first_line);
-    let cursor_x = inner.x + 2 + (cur_col.saturating_sub(x_off)) as u16;
-    let cursor_y = inner.y + view_line as u16;
-    if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
-        let cell = &mut f.buffer_mut()[(cursor_x, cursor_y)];
-        cell.set_style(
-            Style::default()
-                .bg(theme.secondary.to_color())
-                .add_modifier(Modifier::REVERSED),
-        );
+    // Place the block cursor (only when the input owns focus).
+    if focused {
+        let (cur_line, cur_col) = input.cursor();
+        let view_line = cur_line.saturating_sub(first_line);
+        let col_w: usize = input
+            .lines()
+            .get(cur_line)
+            .map(|l| {
+                l.chars()
+                    .skip(x_off)
+                    .take(cur_col.saturating_sub(x_off))
+                    .map(|c| c.width().unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0);
+        let cursor_x = inner.x + 2 + col_w.min(u16::MAX as usize) as u16;
+        let cursor_y = inner.y + view_line.min(u16::MAX as usize) as u16;
+        if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
+            let cell = &mut f.buffer_mut()[(cursor_x, cursor_y)];
+            cell.set_style(
+                Style::default()
+                    .bg(theme.secondary.to_color())
+                    .add_modifier(Modifier::REVERSED),
+            );
+        }
     }
 }
 
 // ── Status bar ──────────────────────────────────────────────────────────────
 
 pub fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: Theme, elapsed: Duration) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let bg = theme.bg_elevated.to_color();
     let bg_block = Block::default().style(Style::default().bg(bg));
     f.render_widget(bg_block, area);
@@ -626,33 +738,28 @@ pub fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: Theme, elapsed: 
         ));
     }
 
-    // Right-aligned keymap hint.
-    let hint = "⏎ send  ⎇↵ newline  ↑↓ scroll  R reasoning  ? help  ⎋ quit";
-    let hint_span = Span::styled(
-        hint.to_string(),
-        Style::default().fg(theme.fg_most_subtle.to_color()),
-    );
-
     let line = Line::from(spans);
-    // Compose with right-aligned hint by rendering hint into trailing cells.
     let para = Paragraph::new(line).style(Style::default().bg(bg));
     f.render_widget(para, area);
 
-    // Right-aligned hint.
+    // Right-aligned keymap hint (matches the actual bindings).
+    let hint = if app.is_busy() {
+        "⏎ queue  Esc interrupt  ^R reasoning  ? help"
+    } else {
+        "⏎ send  ⌥⏎ newline  Tab focus  ^R reasoning  ? help  Esc quit"
+    };
+    let hint_style = Style::default().fg(theme.fg_most_subtle.to_color());
     let hint_w = UnicodeWidthStr::width(hint) as u16;
     let hx = area.x + area.width.saturating_sub(hint_w + 1);
     let hy = area.y;
     if hx > area.x {
         let buf = f.buffer_mut();
-        let mut xx = hx;
-        for ch in hint.chars() {
+        for (xx, ch) in (hx..).zip(hint.chars()) {
             if xx >= area.x + area.width {
                 break;
             }
             let cell = &mut buf[(xx, hy)];
-            cell.set_char(ch)
-                .set_style(hint_span.style);
-            xx += 1;
+            cell.set_char(ch).set_style(hint_style);
         }
     }
 }
@@ -662,17 +769,18 @@ fn fmt_elapsed(d: Duration) -> String {
     if s >= 60 {
         format!("{}m{:02}s", s / 60, s % 60)
     } else {
-        format!("{}.{:.0}s", s, d.subsec_millis() / 100)
+        format!("{}.{}s", s, d.subsec_millis() / 100)
     }
 }
 
 fn shorten_path(p: &str, max: usize) -> String {
-    if p.len() <= max {
+    if p.chars().count() <= max {
         return p.to_string();
     }
     let last = p.rsplit('/').next().unwrap_or(p);
-    if last.len() >= max {
-        return format!("…/{}", &last[..max.saturating_sub(2).min(last.len())]);
+    if last.chars().count() >= max {
+        let cut: String = last.chars().take(max.saturating_sub(2)).collect();
+        return format!("…/{}", cut);
     }
     format!("…/{}", last)
 }
@@ -681,33 +789,40 @@ fn shorten_path(p: &str, max: usize) -> String {
 
 pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
     // Centered modal.
-    let w = 52.min(area.width);
-    let h = 16.min(area.height);
+    let w = 56.min(area.width);
+    let h = 18.min(area.height);
+    if w < 20 || h < 5 {
+        return;
+    }
     let x = area.x + (area.width - w) / 2;
     let y = area.y + (area.height - h) / 2;
     let modal = Rect::new(x, y, w, h);
     f.render_widget(Clear, modal);
-    let block = gradient_block_focused(" help — press ? to close ", theme, 0.8);
+    let block = gradient_block_focused(" help — ? closes ", theme, 0.8);
     let inner = block.inner(modal);
     f.render_widget(block, modal);
 
     let keymap = [
-        ("Enter", "send message"),
-        ("Alt+Enter", "insert newline"),
-        ("Ctrl+C / Esc", "interrupt running turn"),
-        ("Ctrl+C twice", "quit"),
-        ("↑ / ↓", "scroll transcript"),
-        ("PageUp/PageDn", "scroll faster"),
-        ("R", "toggle reasoning panel"),
-        ("Tab", "cycle focus"),
-        ("?", "toggle this help"),
+        ("Enter", "send · queues next prompt while busy"),
+        ("Alt+Enter / Ctrl+J", "insert newline"),
+        ("Esc / Ctrl+C", "interrupt turn (idle: quit)"),
+        ("Ctrl+C ×2", "force exit during a turn"),
+        ("Ctrl+D", "quit (on empty input)"),
+        ("Tab", "focus input ↔ transcript"),
+        ("↑ / ↓", "scroll transcript (single-line input)"),
+        ("PgUp / PgDn", "scroll transcript"),
+        ("g / G", "top / bottom (transcript focus)"),
+        ("Ctrl+R", "toggle reasoning panel"),
+        ("Ctrl+L", "clear transcript view"),
+        ("Ctrl+A/E  Ctrl+U/K/W", "line start/end · kill line/word"),
+        ("? / F1", "toggle this help"),
     ];
     let items: Vec<ListItem> = keymap
         .iter()
         .map(|(k, desc)| {
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("  {:<16}", k),
+                    format!("  {:<22}", k),
                     Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -720,11 +835,3 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
     let list = List::new(items);
     f.render_widget(list, inner);
 }
-
-// ── Streaming-only renderer: full-frame used by the headless runner ────────
-//
-// This lets us render a TUI during a turn even when there's no line-editor,
-// mirroring the behavior of `render_turn` but animated.
-
-// Re-exports so callers can access the helpers.
-pub use draw_transcript as render_transcript;
