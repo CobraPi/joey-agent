@@ -1,0 +1,62 @@
+model:
+  default: glm-5.2
+  provider: zai
+  base_url: https://api.z.ai/api/coding/paas/v4
+agent:
+  max_turns: 600000
+  verbose: true
+  reasoning_effort: max
+  reasoning_overrides: {}
+  api_max_retries: 3
+  gateway_timeout: 1800
+terminal:
+  backend: local
+  cwd: .
+  timeout: 180
+toolsets:
+- joey-cli
+compression:
+  enabled: true
+  threshold: 0.7
+  target_ratio: 0.2
+  protect_last_n: 20
+  protect_first_n: 3
+prompt_caching:
+  cache_ttl: 5m
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 2200
+  user_char_limit: 1375
+  nudge_interval: 10
+  flush_min_turns: 6
+skills:
+  creation_nudge_interval: 15
+  external_dirs: []
+delegation:
+  max_iterations: 50
+  max_concurrent_children: 3
+  max_spawn_depth: 1
+code_execution:
+  timeout: 300
+  max_tool_calls: 50
+display:
+  compact: false
+  tool_progress: all
+  show_reasoning: true
+  streaming: true
+  timestamps: true
+  skin: default
+tool_output:
+  max_bytes: 50000
+  max_lines: 2000
+  max_line_length: 2000
+file_read_max_chars: 100000
+cron:
+  provider: in-process
+_config_version: 33
+mcp_servers:
+  web-tools:
+    command: node
+    args:
+    - /Users/joey/.joey/mcp-servers/web-tools/server.js
