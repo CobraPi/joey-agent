@@ -356,6 +356,30 @@ impl App {
                     kind: NoticeKind::Warning,
                 });
             }
+            AgentEvent::SubagentSpawn { goal, model, toolset_summary, depth: _ } => {
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("🤖 Subagent: {} ({}) [{}]", goal, model, toolset_summary),
+                    kind: NoticeKind::Busy,
+                });
+            }
+            AgentEvent::SubagentComplete { goal, success, summary_preview, token_usage, duration_secs: _ } => {
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("{} {}: {}", if success { "✓" } else { "✗" }, goal, summary_preview),
+                    kind: if success { NoticeKind::Success } else { NoticeKind::Warning },
+                });
+            }
+            AgentEvent::SubagentFailed { goal, error, duration_secs: _ } => {
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("✗ {}: {}", goal, error),
+                    kind: NoticeKind::Warning,
+                });
+            }
+            AgentEvent::DelegationBatchComplete { total, succeeded, failed, total_duration_secs: _ } => {
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("Batch: {}/{} done, {} failed", succeeded, total, failed),
+                    kind: if failed > 0 { NoticeKind::Warning } else { NoticeKind::Success },
+                });
+            }
             AgentEvent::Done { final_text, usage: _, iterations } => {
                 // Tokens were already counted per ApiCallEnd; only the
                 // iteration count is new information here.

@@ -173,7 +173,7 @@ fn parse_fallback_chain(cfg: &Config) -> Vec<FallbackEntry> {
 
 /// Provider abstraction so the loop can be driven by a scripted mock in tests.
 #[async_trait]
-pub(crate) trait Transport: Send + Sync {
+pub trait Transport: Send + Sync {
     async fn complete(&self, req: &ProviderRequest) -> Result<NormalizedResponse, ProviderError>;
     async fn stream(
         &self,
@@ -248,6 +248,10 @@ pub struct Agent {
     invalid_tool_strikes: u32,
     /// Test hook: overrides the provider client when set.
     transport_override: Option<Arc<dyn Transport>>,
+    /// Optional shared concurrency limiter (orchestration). When set, each
+    /// provider call acquires a permit before transport_call and drops it
+    /// after. This is the integration point for subagent dispatch throttling.
+    provider_permit: Option<Arc<tokio::sync::Semaphore>>,
     /// The built-in context engine (upstream `agent.context_compressor`).
     pub(crate) compressor: ContextCompressor,
     /// `compression.enabled` (upstream `agent.compression_enabled`).
@@ -351,6 +355,7 @@ impl Agent {
             fallback_index: 0,
             invalid_tool_strikes: 0,
             transport_override: None,
+            provider_permit: None,
             compressor,
             compression_enabled,
             ephemeral_max_output_tokens: None,
@@ -456,6 +461,12 @@ impl Agent {
     #[cfg(test)]
     pub(crate) fn set_transport_for_tests(&mut self, t: Arc<dyn Transport>) {
         self.transport_override = Some(t);
+    }
+
+    /// Set the shared concurrency limiter (orchestration). Each provider
+    /// call will acquire a permit before transport_call and drop it after.
+    pub fn set_provider_semaphore(&mut self, sem: Arc<tokio::sync::Semaphore>) {
+        self.provider_permit = Some(sem);
     }
 
     // ── Persistence ──────────────────────────────────────────────────────
@@ -689,6 +700,14 @@ impl Agent {
         req: &ProviderRequest,
         tx: &mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<NormalizedResponse, ProviderError> {
+        // Acquire a concurrency-limiter permit when the orchestration
+        // semaphore is set (subagent dispatch throttling). The permit is
+        // held through the call and dropped on return.
+        let _permit = if let Some(sem) = &self.provider_permit {
+            Some(sem.acquire().await.expect("semaphore not closed"))
+        } else {
+            None
+        };
         if req.stream {
             let (ptx, mut prx) = mpsc::unbounded_channel::<StreamEvent>();
             let agent_tx = tx.clone();

@@ -129,9 +129,36 @@ pub(crate) fn build_agent(
 ) -> Result<Agent> {
     let agent_cfg = build_agent_config(config, ov);
     let ctx = ToolContext::new(cwd.to_path_buf(), config.clone(), session_id.to_string());
-    let registry = ToolRegistry::with_builtins();
+    let mut registry = ToolRegistry::with_builtins();
+
+    // Wire session_search with the session DB.
+    let session_db = SessionDb::open_default().ok().map(|db| {
+        let arc = std::sync::Arc::new(std::sync::Mutex::new(db));
+        arc
+    });
+    joey_tools::builtins::register_session_tools(&mut registry, session_db);
+
+    // Wire clarify (interactive only — channel wired at runtime).
+    joey_tools::builtins::register_clarify_tool(&mut registry, None);
+
+    // Wire orchestration: construct SubagentManager and register delegate_task.
+    let mgr_config = joey_orchestration::ManagerConfig::from_config(config);
+    let manager = std::sync::Arc::new(joey_orchestration::SubagentManager::new(mgr_config));
+    // Snapshot the base registry (builtins only) for subagents to use.
+    let base_registry = registry.clone();
+    joey_orchestration::register_orchestration(
+        &mut registry,
+        manager.clone(),
+        agent_cfg.clone(),
+        config.clone(),
+        base_registry,
+        None, // events are emitted via the per-turn channel at runtime
+    );
+
     let mut agent =
         Agent::new(agent_cfg, registry, ctx).map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Inject the shared concurrency limiter into the agent's transport path.
+    agent.set_provider_semaphore(manager.semaphore());
     if !history.is_empty() {
         agent.set_history(history);
     }

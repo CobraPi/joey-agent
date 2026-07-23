@@ -81,6 +81,36 @@ pub enum AgentEvent {
         to_model: String,
     },
 
+    // ── Orchestration events ──────────────────────────────────────────
+    /// A subagent was spawned (per child).
+    SubagentSpawn {
+        goal: String,
+        model: String,
+        toolset_summary: String,
+        depth: usize,
+    },
+    /// A subagent completed successfully.
+    SubagentComplete {
+        goal: String,
+        success: bool,
+        summary_preview: String,
+        token_usage: Usage,
+        duration_secs: f64,
+    },
+    /// A subagent failed with an error.
+    SubagentFailed {
+        goal: String,
+        error: String,
+        duration_secs: f64,
+    },
+    /// A batch delegation resolved (all children done or failed).
+    DelegationBatchComplete {
+        total: usize,
+        succeeded: usize,
+        failed: usize,
+        total_duration_secs: f64,
+    },
+
     // ── Turn end ──────────────────────────────────────────────────────
     /// The turn finished; carries the final text and cumulative usage.
     Done {

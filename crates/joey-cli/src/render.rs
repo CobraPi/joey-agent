@@ -323,6 +323,32 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     println!("{}", t.warning.ansi().paint(label));
                 }
             }
+            AgentEvent::SubagentSpawn { goal, model, toolset_summary, depth } => {
+                if !opts.quiet {
+                    let indent = "  ".repeat(depth);
+                    let label = format!("{}🤖 Subagent: {} ({}) [{}]", indent, goal, model, toolset_summary);
+                    println!("{}", t.info.ansi().paint(label));
+                }
+            }
+            AgentEvent::SubagentComplete { goal, success, summary_preview, token_usage, duration_secs } => {
+                if !opts.quiet {
+                    let status = if success { "✓" } else { "✗" };
+                    let label = format!("  {} {} ({} tok, {:.1}s): {}", status, goal, token_usage.total_tokens, duration_secs, summary_preview);
+                    println!("{}", t.success_more_subtle.ansi().paint(label));
+                }
+            }
+            AgentEvent::SubagentFailed { goal, error, duration_secs } => {
+                if !opts.quiet {
+                    let label = format!("  ✗ {} ({:.1}s): {}", goal, duration_secs, error);
+                    println!("{}", t.error.ansi().paint(label));
+                }
+            }
+            AgentEvent::DelegationBatchComplete { total, succeeded, failed, total_duration_secs } => {
+                if !opts.quiet {
+                    let label = format!("  🤖 Batch: {}/{} succeeded, {} failed ({:.1}s)", succeeded, total, failed, total_duration_secs);
+                    println!("{}", t.info_more_subtle.ansi().paint(label));
+                }
+            }
             AgentEvent::Done { final_text: text, usage: _, iterations } => {
                 close_reasoning(&mut reasoning_open, &mut reasoning_buf);
                 if streamed_any {

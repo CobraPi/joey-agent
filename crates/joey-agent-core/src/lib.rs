@@ -14,7 +14,7 @@ pub mod guidance;
 pub mod prompt;
 pub mod threat_scan;
 
-pub use agent::{Agent, AgentConfig, TurnResult};
+pub use agent::{Agent, AgentConfig, TurnResult, Transport};
 pub use compression::ContextCompressor;
 pub use events::AgentEvent;
 pub use prompt::{build_system_prompt, PromptInputs};

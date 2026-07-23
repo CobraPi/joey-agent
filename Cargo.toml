@@ -11,6 +11,7 @@ members = [
     "crates/joey-tui",
     "crates/joey-cli",
     "crates/joey-speckit-ui",
+    "crates/joey-orchestration",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ joey-cron = { path = "crates/joey-cron" }
 joey-mcp = { path = "crates/joey-mcp" }
 joey-gateway = { path = "crates/joey-gateway" }
 joey-tui = { path = "crates/joey-tui" }
+joey-orchestration = { path = "crates/joey-orchestration" }
 
 anyhow = "1"
 thiserror = "2"

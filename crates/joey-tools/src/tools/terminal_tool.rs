@@ -236,15 +236,16 @@ impl Tool for Terminal {
         let timeout_arg = args.get("timeout").and_then(|v| v.as_i64()).map(|t| t as u64);
         let workdir = args.get("workdir").and_then(|v| v.as_str()).map(str::to_string);
 
-        // Honest not-supported stubs: the background process registry and PTY
-        // driver are not ported yet; never silently run these as foreground.
+        // Compute cwd early so background mode can use it.
+        let cwd = match &workdir {
+            Some(w) => ctx.resolve_path(w),
+            None => ctx.effective_cwd(),
+        };
+
+        // Background mode: spawn the process, register in ProcessRegistry,
+        // and return the session_id immediately (FR-012, T069).
         if background {
-            return ToolResult::Text(dumps(&json!({
-                "output": "",
-                "exit_code": -1,
-                "error": "background=true is not supported in this build: the process tool (background session registry) is unavailable. Run the command in the foreground with a generous timeout instead.",
-                "status": "error",
-            })));
+            return self.execute_background(command, &cwd, args).await;
         }
         if pty {
             return ToolResult::Text(dumps(&json!({
@@ -268,10 +269,7 @@ impl Tool for Terminal {
         }
         let effective_timeout = timeout_arg.unwrap_or_else(|| default_timeout(ctx));
 
-        let cwd = match &workdir {
-            Some(w) => ctx.resolve_path(w),
-            None => ctx.effective_cwd(),
-        };
+        // cwd was computed above (before the background check).
 
         let (raw_output, returncode, timed_out) =
             run_bash(&command, &cwd, effective_timeout).await;
@@ -328,6 +326,71 @@ impl Tool for Terminal {
             result.insert("exit_code_meaning".into(), json!(note));
         }
         ToolResult::Text(dumps(&Value::Object(result)))
+    }
+}
+
+impl Terminal {
+    /// Spawn a command in the background, register it in the global
+    /// ProcessRegistry, and return a session handle immediately (FR-012).
+    async fn execute_background(
+        &self,
+        command: String,
+        cwd: &std::path::Path,
+        args: Value,
+    ) -> ToolResult {
+        let notify_on_complete = args
+            .get("notify_on_complete")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let bash = find_bash();
+        let mut cmd = tokio::process::Command::new(&bash);
+        cmd.arg("-c")
+            .arg(&command)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd.env_clear();
+        for (k, v) in sanitized_env() {
+            cmd.env(k, v);
+        }
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolResult::Text(dumps(&json!({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": format!("Failed to spawn background process: {}", e),
+                    "status": "error",
+                })));
+            }
+        };
+
+        let session_id = format!("proc-{}", uuid::Uuid::new_v4().simple());
+
+        // Register in the global ProcessRegistry.
+        let registry = crate::tools::process_tool::process_registry();
+        {
+            let mut reg = registry.lock().unwrap_or_else(|p| p.into_inner());
+            let mut session =
+                crate::tools::process_tool::ProcessSession::new(
+                    session_id.clone(),
+                    child,
+                    command.clone(),
+                    cwd.display().to_string(),
+                );
+            session.notify_on_complete = notify_on_complete;
+            reg.insert(session_id.clone(), session);
+        }
+
+        ToolResult::Text(dumps(&json!({
+            "output": format!("Background process started. Use process(action=\"poll\", session_id=\"{}\") to check output.", session_id),
+            "exit_code": -1,
+            "session_id": session_id,
+            "status": "background",
+        })))
     }
 }
 
@@ -514,8 +577,11 @@ mod tests {
     #[tokio::test]
     async fn background_and_pty_are_honest_stubs() {
         let c = ctx();
+        // Background mode now spawns a real process.
         let bg = parse(&Terminal.execute(json!({"command": "true", "background": true}), &c).await);
-        assert!(bg["error"].as_str().unwrap().contains("process tool"));
+        assert_eq!(bg["status"], "background");
+        assert!(bg["session_id"].as_str().unwrap().starts_with("proc-"));
+        // PTY mode is still a stub.
         let pty = parse(&Terminal.execute(json!({"command": "true", "pty": true}), &c).await);
         assert!(pty["error"].as_str().unwrap().contains("pty=true is not supported"));
     }

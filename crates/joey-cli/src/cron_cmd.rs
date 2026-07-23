@@ -479,10 +479,31 @@ fn build_runner() -> joey_cron::JobRunner {
                 .map(std::path::PathBuf::from)
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_default();
-            let ctx = ToolContext::new(cwd, config, format!("cron-{}", job.id)).with_interactive(false);
-            let registry = ToolRegistry::with_builtins();
+            let ctx = ToolContext::new(cwd, config.clone(), format!("cron-{}", job.id)).with_interactive(false);
+            let mut registry = ToolRegistry::with_builtins();
+
+            // Wire session_search.
+            let session_db = joey_core::SessionDb::open_default()
+                .ok()
+                .map(|db| std::sync::Arc::new(std::sync::Mutex::new(db)));
+            joey_tools::builtins::register_session_tools(&mut registry, session_db);
+
+            // Wire orchestration.
+            let mgr_config = joey_orchestration::ManagerConfig::from_config(&config);
+            let manager = std::sync::Arc::new(joey_orchestration::SubagentManager::new(mgr_config));
+            let base_registry = registry.clone();
+            joey_orchestration::register_orchestration(
+                &mut registry,
+                manager.clone(),
+                agent_cfg.clone(),
+                config.clone(),
+                base_registry,
+                None,
+            );
+
             let mut agent = Agent::new(agent_cfg, registry, ctx)
                 .map_err(|e| anyhow::anyhow!("agent init failed: {}", e))?;
+            agent.set_provider_semaphore(manager.semaphore());
             let prompt = build_cron_prompt(&job);
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let drain = tokio::spawn(async move {
