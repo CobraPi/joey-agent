@@ -362,7 +362,7 @@ impl App {
                     kind: NoticeKind::Busy,
                 });
             }
-            AgentEvent::SubagentComplete { goal, success, summary_preview, token_usage, duration_secs: _ } => {
+            AgentEvent::SubagentComplete { goal, success, summary_preview, token_usage: _, duration_secs: _ } => {
                 self.push_item(TranscriptItem::Notice {
                     text: format!("{} {}: {}", if success { "✓" } else { "✗" }, goal, summary_preview),
                     kind: if success { NoticeKind::Success } else { NoticeKind::Warning },

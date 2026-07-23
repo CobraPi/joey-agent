@@ -7,7 +7,6 @@
 use async_trait::async_trait;
 use joey_agent_core::{AgentConfig, AgentEvent};
 use joey_core::Config;
-use joey_providers::Usage;
 use joey_tools::registry::{Tool, ToolResult};
 use joey_tools::{ToolContext, ToolRegistry};
 use serde_json::{json, Value};

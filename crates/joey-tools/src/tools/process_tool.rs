@@ -129,11 +129,6 @@ pub fn process_registry() -> Arc<Mutex<std::collections::HashMap<String, Process
     PROCESS_REGISTRY.clone()
 }
 
-/// Generate a unique session ID.
-fn new_session_id() -> String {
-    format!("proc-{}", uuid::Uuid::new_v4().simple())
-}
-
 /// The process tool.
 pub struct Process;
 
@@ -379,7 +374,7 @@ fn action_write(session_id: Option<&str>, data: Option<&Value>, add_newline: boo
     let registry = process_registry();
     let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
 
-    let Some(session) = registry.get_mut(sid) else {
+    let Some(_session) = registry.get_mut(sid) else {
         return ToolResult::Error(format!("Process session {} not found", sid));
     };
 
@@ -396,7 +391,7 @@ fn action_close(session_id: Option<&str>) -> ToolResult {
     };
 
     let registry = process_registry();
-    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
 
     let Some(_session) = registry.get(sid) else {
         return ToolResult::Error(format!("Process session {} not found", sid));
