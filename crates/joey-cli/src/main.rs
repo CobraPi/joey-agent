@@ -6,6 +6,7 @@
 //! cron/mcp/skills/version. A rewrite of Hermes Agent (Nous Research, MIT).
 
 mod commands;
+mod auth_cmd;
 mod config_cmd;
 mod cron_cmd;
 mod doctor_cmd;
@@ -149,6 +150,8 @@ enum Command {
     Chat(ChatArgs),
     /// Select default model and provider
     Model(ModelArgs),
+    /// Manage provider authentication
+    Auth(auth_cmd::AuthArgs),
     /// Configure which tools are enabled per platform
     Tools(tools_cmd::ToolsArgs),
     /// View and edit configuration
@@ -466,6 +469,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             Ok(0)
         }
         Some(Command::Model(args)) => commands::model_command(args.refresh),
+        Some(Command::Auth(args)) => auth_cmd::auth_command(args),
         Some(Command::Config(args)) => config_cmd::config_command(&args),
         Some(Command::Doctor(args)) => doctor_cmd::doctor_command(&args),
         Some(Command::Tools(args)) => tools_cmd::tools_command(&args),

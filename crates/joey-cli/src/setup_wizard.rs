@@ -36,6 +36,7 @@ const CANONICAL_ORDER: &[&str] = &[
     "openrouter",
     "anthropic",
     "openai-api",
+    "copilot",
     "gemini",
     "deepseek",
     "xai",
@@ -169,6 +170,12 @@ fn custom_provider_map(config: &Config) -> Vec<CustomProviderInfo> {
 /// OpenRouter env keys → openrouter; provider-specific keys → that provider;
 /// auth.json `active_provider` last.
 fn auto_active_provider() -> Option<String> {
+    if joey_providers::copilot::resolve_copilot_token()
+        .map(|(token, _)| !token.is_empty())
+        .unwrap_or(false)
+    {
+        return Some("copilot".to_string());
+    }
     if !env_value("OPENAI_API_KEY").is_empty() || !env_value("OPENROUTER_API_KEY").is_empty() {
         return Some("openrouter".to_string());
     }
@@ -338,6 +345,7 @@ pub fn select_provider_and_model(refresh: bool) -> Result<bool> {
     let configured = match selected.as_str() {
         "openrouter" => flow_openrouter(&current_model)?,
         "anthropic" => flow_anthropic(&current_model)?,
+        "copilot" => flow_copilot(&current_model)?,
         "custom" => flow_custom()?,
         "remove-custom" => {
             remove_custom_provider()?;
@@ -680,6 +688,94 @@ fn flow_api_key_provider(provider_id: &str, current_model: &str) -> Result<bool>
         println!("No change.");
         Ok(false)
     }
+}
+
+// ---------------------------------------------------------------------------
+// GitHub Copilot flow (Hermes `_model_flow_copilot`)
+// ---------------------------------------------------------------------------
+
+fn flow_copilot(current_model: &str) -> Result<bool> {
+    use joey_providers::copilot;
+    use std::time::Duration;
+
+    let (raw_token, source) = copilot::resolve_copilot_token()?;
+    if raw_token.is_empty() {
+        println!("No GitHub token configured for GitHub Copilot.");
+        println!("  1. Login with GitHub (OAuth device code flow)");
+        println!("  2. Enter an OAuth/fine-grained token manually");
+        println!("  3. Cancel");
+        match read_line("  Choice [1-3]: ").as_deref() {
+            Some("1") => {
+                let token = copilot::device_code_login(Duration::from_secs(300))?;
+                save_env_value("COPILOT_GITHUB_TOKEN", &token)?;
+                std::env::set_var("COPILOT_GITHUB_TOKEN", token);
+            }
+            Some("2") => {
+                let token = masked_secret_prompt("  Token: ").unwrap_or_empty().trim().to_string();
+                if token.is_empty() { return Ok(false); }
+                if let Err(message) = copilot::validate_copilot_token(&token) {
+                    render::error(&message);
+                    return Ok(false);
+                }
+                save_env_value("COPILOT_GITHUB_TOKEN", &token)?;
+                std::env::set_var("COPILOT_GITHUB_TOKEN", token);
+            }
+            _ => return Ok(false),
+        }
+    } else if source == "gh auth token" {
+        println!("  GitHub token: ✓ (from `gh auth token`)");
+    } else {
+        println!("  GitHub token: {}... ✓ ({})", key_prefix(&raw_token, 8), source);
+    }
+
+    let catalog = match copilot::fetch_model_catalog(Duration::from_secs(10)) {
+        Ok(entries) => entries,
+        Err(error) => {
+            println!("  ⚠ Live Copilot catalog unavailable: {}", error);
+            Vec::new()
+        }
+    };
+    let models = if catalog.is_empty() {
+        copilot::fallback_models()
+    } else {
+        catalog.iter()
+            .filter_map(|v| v.get("id").and_then(serde_json::Value::as_str))
+            .map(str::to_string).collect()
+    };
+    let current = copilot::normalize_model_id(current_model);
+    let Some(selected) = prompt_model_selection(&models, &current, &Default::default(), "copilot") else {
+        return Ok(false);
+    };
+    let selected = copilot::normalize_model_id(&selected);
+    let entry = catalog.iter().find(|v| {
+        v.get("id").and_then(serde_json::Value::as_str) == Some(selected.as_str())
+    });
+    let api_mode = copilot::model_api_mode(&selected, entry).as_str();
+
+    if let Some(entry) = entry {
+        if let Some(context) = copilot::catalog_context_window(entry) {
+            Config::load()?.set_and_save("model.context_length", &context.to_string())?;
+        }
+    }
+    let efforts = copilot::model_reasoning_efforts(&selected, entry);
+    if !efforts.is_empty() {
+        let chosen = read_line(&format!("Reasoning effort [{}]: ", efforts.join("/")))
+            .unwrap_or_default().to_lowercase();
+        if efforts.contains(&chosen) {
+            Config::load()?.set_and_save("agent.reasoning_effort", &chosen)?;
+        }
+    }
+
+    save_model_choice(&selected)?;
+    let mut cfg = Config::load()?;
+    cfg.set_and_save("model.provider", "copilot")?;
+    cfg.set_and_save("model.base_url", copilot::COPILOT_BASE_URL)?;
+    cfg.set_and_save("model.api_mode", api_mode)?;
+    let _ = cfg.unset("model.api_key");
+    let _ = cfg.unset("model.api");
+    auth_store::deactivate_provider();
+    println!("Default model set to: {} (via GitHub Copilot)", selected);
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

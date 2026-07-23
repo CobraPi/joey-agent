@@ -8,6 +8,7 @@
 pub mod anthropic;
 pub mod chat;
 pub mod client;
+pub mod copilot;
 pub mod error;
 pub mod profile;
 pub mod request;
@@ -36,7 +37,19 @@ pub fn build_client(
     model: &str,
     api_key: Option<String>,
 ) -> Result<ProviderClient, ProviderError> {
-    let profile = resolve_profile(provider_setting, base_url, model);
+    let mut profile = resolve_profile(provider_setting, base_url, model);
+    if profile.name == "copilot" {
+        // Hermes consults the live catalog for non-GPT models because Claude
+        // may expose only /v1/messages while Gemini/older models use chat.
+        let normalized = copilot::normalize_model_id(model);
+        let catalog = copilot::fetch_model_catalog(std::time::Duration::from_secs(5)).ok();
+        let entry = catalog.as_ref().and_then(|items| {
+            items.iter().find(|item| {
+                item.get("id").and_then(serde_json::Value::as_str) == Some(normalized.as_str())
+            })
+        });
+        profile.api_mode = copilot::model_api_mode(model, entry);
+    }
     let mut base_override = resolve_base_override(&profile, base_url);
     // Z.AI: with no explicit override (env var or config base_url), resolve
     // the endpoint by probing — global vs China vs Coding Plan billing paths

@@ -126,14 +126,25 @@ pub fn doctor_command(args: &DoctorArgs) -> Result<i32> {
     let provider_setting = config.get_str("model.provider", "auto");
     let base_url = config.get_str("model.base_url", "");
     let profile = joey_providers::resolve_profile(&provider_setting, &base_url, &model);
-    if profile.resolve_api_key().is_some() {
+    let has_credentials = if profile.name == "copilot" {
+        joey_providers::copilot::resolve_copilot_token()
+            .map(|(token, _)| !token.is_empty())
+            .unwrap_or(false)
+    } else {
+        profile.resolve_api_key().is_some()
+    };
+    if has_credentials {
         check_ok("provider credentials found", &format!("(provider: {})", profile.name));
     } else {
         check_fail("no API key for the active provider", &format!("(provider: {})", profile.name));
-        issues.push(format!(
-            "Set an API key: `joey config set {} <key>`",
-            profile.env_vars.first().copied().unwrap_or("PROVIDER_API_KEY")
-        ));
+        if profile.name == "copilot" {
+            issues.push("Authenticate with `joey auth copilot login`".to_string());
+        } else {
+            issues.push(format!(
+                "Set an API key: `joey config set {} <key>`",
+                profile.env_vars.first().copied().unwrap_or("PROVIDER_API_KEY")
+            ));
+        }
     }
 
     // ── External Tools ─────────────────────────────────────────────────

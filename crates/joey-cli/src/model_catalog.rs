@@ -211,6 +211,7 @@ pub fn provider_models(provider: &str) -> Vec<String> {
             "deepseek-reasoner",
         ],
         "xai" => return xai_curated_models(),
+        "copilot" => return joey_providers::copilot::fallback_models(),
         _ => &[],
     };
     list.iter().map(|s| s.to_string()).collect()

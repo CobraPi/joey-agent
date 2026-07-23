@@ -68,6 +68,12 @@ pub fn require_tty(command_name: &str) -> Option<i32> {
 /// env var resolves, or a custom OPENAI_BASE_URL is set, or the user pinned a
 /// model in config).
 pub fn has_any_provider_configured(config: &Config) -> bool {
+    if joey_providers::copilot::resolve_copilot_token()
+        .map(|(token, _)| !token.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
     for name in joey_providers::profile::provider_names() {
         if let Some(profile) = joey_providers::profile::get_profile(name) {
             if profile.resolve_api_key().is_some() {

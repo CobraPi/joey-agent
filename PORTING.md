@@ -285,9 +285,13 @@ falls back to the default URL, caches nothing).
 
 ## Partial
 
-- **Providers:** OpenAI-compatible + Anthropic wire modes only. Codex/
-  Responses, Bedrock, native Gemini REST, Vertex, and Azure are not ported
-  (`ApiMode::CodexResponses` exists but refuses). No credential pools,
+- **Providers:** OpenAI-compatible + Anthropic wire modes, plus the complete
+  GitHub Copilot provider path: OAuth device login, GitHub-to-Copilot token
+  exchange/refresh, live model catalog, endpoint discovery, Chat Completions,
+  Anthropic Messages, and OpenAI Responses routing by model. Generic
+  Codex/Responses for non-Copilot providers, Bedrock, native Gemini REST,
+  Vertex, and Azure are not ported (`ApiMode::CodexResponses` still refuses
+  outside Copilot). No credential pools,
   request_overrides/service-tier plumbing, Z.AI adaptive long backoff, or
   per-provider timeout table. The model catalog covers the picker surface
   (curated lists + models.dev registry); the wider `model_metadata.py`

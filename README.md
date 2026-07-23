@@ -48,10 +48,23 @@ joey config set model.default anthropic/claude-opus-4.6
 joey config set ANTHROPIC_API_KEY sk-ant-…
 ```
 
+GitHub Copilot uses the same two-phase authentication flow as Hermes Agent:
+
+```bash
+joey auth copilot login                 # OAuth device-code login
+joey model                              # select GitHub Copilot + a live catalog model
+joey auth copilot status
+```
+
+Joey resolves `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, then
+`gh auth token`; exchanges it for a short-lived Copilot API token; refreshes on
+expiry/401; and honors enterprise endpoints returned by GitHub.
+
 Supported provider wire protocols out of the box: **OpenAI Chat Completions** (OpenRouter,
-OpenAI, Nous, DeepSeek, Groq, Gemini, xAI, Z.ai, Ollama, and any custom OpenAI-compatible
-endpoint) and **Anthropic Messages** (native, with extended thinking). SSE streaming is
-supported on both.
+OpenAI, Nous, DeepSeek, Groq, Gemini, xAI, Z.ai, Ollama, GitHub Copilot, and custom
+OpenAI-compatible endpoints), **OpenAI Responses** (including Copilot GPT-5+/Codex), and
+**Anthropic Messages** (native and Copilot Claude, with extended thinking). SSE streaming
+is supported on all three.
 
 ## Commands
 

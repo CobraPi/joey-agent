@@ -3,7 +3,8 @@
 //! and the `hermes_cli/auth.py` provider registry entries).
 //!
 //! Only the providers actually ported to this crate are registered:
-//! openrouter, anthropic, openai-api, nous, deepseek, gemini, zai, xai.
+//! openrouter, anthropic, openai-api, nous, deepseek, gemini, zai, xai,
+//! and GitHub Copilot.
 
 use std::collections::HashMap;
 
@@ -16,9 +17,7 @@ pub enum ApiMode {
     ChatCompletions,
     /// Anthropic Messages API.
     AnthropicMessages,
-    /// OpenAI Responses / Codex wire (upstream `codex_responses`). Not yet
-    /// ported — building a client for such a profile returns an error rather
-    /// than silently remapping onto a different wire.
+    /// OpenAI Responses / Codex wire (upstream `codex_responses`).
     CodexResponses,
 }
 
@@ -177,6 +176,19 @@ static PROFILES: Lazy<HashMap<&'static str, ProviderProfile>> = Lazy::new(|| {
             "",
             &[]
         ),
+        profile!(
+            "copilot",
+            &["github-copilot", "github-models", "github-model", "github"],
+            ApiMode::ChatCompletions,
+            "https://api.githubcopilot.com",
+            &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+            Some("COPILOT_API_BASE_URL"),
+            "",
+            "GitHub Copilot",
+            "GitHub Copilot (OAuth or fine-grained token)",
+            "https://github.com/settings/copilot",
+            &[]
+        ),
         // plugins/model-providers/nous/__init__.py:43-58. Upstream auth_type
         // is oauth_device_code; the device-code OAuth flow is not ported, so
         // auth stays ApiKey (NOUS_API_KEY) here — deliberate adaptation.
@@ -242,9 +254,7 @@ static PROFILES: Lazy<HashMap<&'static str, ProviderProfile>> = Lazy::new(|| {
             &["glm-5.2", "glm-5", "glm-4-9b"]
         ),
         // plugins/model-providers/xai/__init__.py — upstream api_mode is
-        // codex_responses. The codex wire is not ported; building a client
-        // for this profile fails with a clear error instead of silently
-        // remapping to chat_completions.
+        // codex_responses.
         profile!(
             "xai",
             &["grok", "x-ai", "x.ai"],
@@ -294,6 +304,7 @@ pub fn provider_names() -> Vec<&'static str> {
 /// Known provider prefixes that can appear in a `provider/model` string.
 const KNOWN_PREFIXES: &[&str] = &[
     "anthropic", "openai", "google", "openrouter", "xai", "deepseek", "nous", "gemini", "zai",
+    "copilot", "github-copilot", "github-models", "github-model", "github",
 ];
 
 /// Resolve which provider profile to use, given an explicit provider setting
@@ -317,6 +328,9 @@ pub fn resolve_profile(provider_setting: &str, base_url: &str, model: &str) -> P
     }
     if host.contains("api.openai.com") {
         return get_profile("openai-api").unwrap();
+    }
+    if host == "api.githubcopilot.com" || host.ends_with(".githubcopilot.com") {
+        return get_profile("copilot").unwrap();
     }
     if host.contains("nousresearch.com") {
         return get_profile("nous").unwrap();
@@ -365,6 +379,9 @@ pub fn wire_model_name(profile: &ProviderProfile, model: &str) -> String {
     if profile.name == "openrouter" {
         return model.to_string();
     }
+    if profile.name == "copilot" {
+        return crate::copilot::normalize_model_id(model);
+    }
     if profile.api_mode == ApiMode::AnthropicMessages {
         return crate::anthropic::normalize_model_name(model);
     }
@@ -379,6 +396,17 @@ pub fn wire_model_name(profile: &ProviderProfile, model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_profile_and_wire_names_resolve() {
+        let p = resolve_profile("github-copilot", "", "github-copilot/gpt-5.4");
+        assert_eq!(p.name, "copilot");
+        for alias in ["github-models", "github-model", "github"] {
+            assert_eq!(get_profile(alias).unwrap().name, "copilot");
+        }
+        assert_eq!(wire_model_name(&p, "github-copilot/gpt-5.4"), "gpt-5.4");
+        assert_eq!(resolve_profile("auto", "https://api.githubcopilot.com", "gpt-4.1").name, "copilot");
+    }
 
     #[test]
     fn resolves_by_base_url() {

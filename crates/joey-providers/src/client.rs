@@ -3,6 +3,7 @@
 //! streaming. Port of the `chat_completions` + `anthropic` transports and the
 //! client-construction logic in `run_agent.py`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -11,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::anthropic;
 use crate::chat;
+use crate::copilot::{self, CopilotAuth};
 use crate::error::{parse_retry_after, ProviderError};
 use crate::profile::{ApiMode, ProviderProfile};
 use crate::request::ProviderRequest;
@@ -28,6 +30,7 @@ pub struct ProviderClient {
     profile: ProviderProfile,
     base_url: String,
     api_key: Option<String>,
+    copilot_auth: Option<Arc<CopilotAuth>>,
 }
 
 impl ProviderClient {
@@ -39,9 +42,9 @@ impl ProviderClient {
         base_url: Option<String>,
         api_key: Option<String>,
     ) -> Result<Self, ProviderError> {
-        // xAI's upstream wire is codex_responses, which is not ported. Refuse
-        // rather than silently remap onto chat_completions (M1).
-        if profile.api_mode == ApiMode::CodexResponses {
+        // xAI's upstream wire is codex_responses, which is not ported. Copilot
+        // uses the Responses transport implemented in this client.
+        if profile.api_mode == ApiMode::CodexResponses && profile.name != "copilot" {
             return Err(ProviderError::Other(format!(
                 "provider '{}' requires the codex_responses wire mode, not yet ported",
                 profile.name
@@ -51,20 +54,36 @@ impl ProviderClient {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs()))
             .connect_timeout(Duration::from_secs(10))
-            .user_agent(format!("{}/{}", joey_core::branding::CLI_NAME, joey_core::branding::VERSION))
+            .user_agent(format!(
+                "{}/{}",
+                joey_core::branding::CLI_NAME,
+                joey_core::branding::VERSION
+            ))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
         let base = base_url
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| profile.base_url.to_string());
-        let key = api_key.or_else(|| profile.resolve_api_key());
+        let mut key = api_key.or_else(|| profile.resolve_api_key());
+        let copilot_auth = if profile.name == "copilot" {
+            let raw = if let Some(explicit) = key.take() {
+                copilot::validate_copilot_token(&explicit).map_err(ProviderError::Auth)?;
+                explicit
+            } else {
+                copilot::resolve_copilot_token()?.0
+            };
+            (!raw.is_empty()).then(|| Arc::new(CopilotAuth::new(raw)))
+        } else {
+            None
+        };
 
         Ok(Self {
             http,
             profile,
             base_url: base.trim_end_matches('/').to_string(),
             api_key: key,
+            copilot_auth,
         })
     }
 
@@ -74,16 +93,22 @@ impl ProviderClient {
 
     pub fn has_credentials(&self) -> bool {
         self.api_key.is_some()
+            || self
+                .copilot_auth
+                .as_ref()
+                .map(|a| a.has_raw_token())
+                .unwrap_or(false)
     }
 
     /// Non-streaming completion. Returns a fully-assembled response.
-    pub async fn complete(&self, req: &ProviderRequest) -> Result<NormalizedResponse, ProviderError> {
+    pub async fn complete(
+        &self,
+        req: &ProviderRequest,
+    ) -> Result<NormalizedResponse, ProviderError> {
         match self.profile.api_mode {
             ApiMode::ChatCompletions => self.chat_completions(req, None).await,
             ApiMode::AnthropicMessages => self.anthropic_messages(req, None).await,
-            ApiMode::CodexResponses => Err(ProviderError::Other(
-                "codex_responses wire mode not ported".into(),
-            )),
+            ApiMode::CodexResponses => self.responses(req, None).await,
         }
     }
 
@@ -102,9 +127,7 @@ impl ProviderClient {
         let result = match self.profile.api_mode {
             ApiMode::ChatCompletions => self.chat_completions(&streaming_req, Some(&tx)).await,
             ApiMode::AnthropicMessages => self.anthropic_messages(&streaming_req, Some(&tx)).await,
-            ApiMode::CodexResponses => Err(ProviderError::Other(
-                "codex_responses wire mode not ported".into(),
-            )),
+            ApiMode::CodexResponses => self.responses(&streaming_req, Some(&tx)).await,
         };
         if let Ok(resp) = &result {
             let _ = tx.send(StreamEvent::Done(resp.clone()));
@@ -133,6 +156,47 @@ impl ProviderClient {
         b
     }
 
+    async fn request_credentials(&self) -> Result<(String, Option<String>), ProviderError> {
+        if let Some(auth) = &self.copilot_auth {
+            let credentials = auth.credentials(&self.http).await?;
+            return Ok((credentials.base_url, Some(credentials.token)));
+        }
+        Ok((self.base_url.clone(), self.api_key.clone()))
+    }
+
+    fn copilot_headers(
+        &self,
+        mut builder: reqwest::RequestBuilder,
+        token: &str,
+        user_initiated: bool,
+        is_vision: bool,
+    ) -> reqwest::RequestBuilder {
+        builder = builder.bearer_auth(token);
+        for (name, value) in copilot::request_headers(user_initiated, is_vision) {
+            builder = builder.header(name, value);
+        }
+        builder
+    }
+
+    /// Retry once with a freshly exchanged Copilot API token after a 401.
+    async fn send_with_auth_refresh(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let retry = builder.try_clone();
+        let response = builder.send().await?;
+        if response.status().as_u16() != 401 || self.copilot_auth.is_none() {
+            return Ok(response);
+        }
+        let Some(retry) = retry else {
+            return Ok(response);
+        };
+        let auth = self.copilot_auth.as_ref().expect("checked above");
+        auth.invalidate();
+        let credentials = auth.credentials(&self.http).await?;
+        Ok(retry.bearer_auth(credentials.token).send().await?)
+    }
+
     // ── OpenAI Chat Completions ──────────────────────────────────────────────
 
     async fn chat_completions(
@@ -140,19 +204,32 @@ impl ProviderClient {
         req: &ProviderRequest,
         tx: Option<&mpsc::UnboundedSender<StreamEvent>>,
     ) -> Result<NormalizedResponse, ProviderError> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let (request_base, request_key) = self.request_credentials().await?;
+        let url = format!("{}/chat/completions", request_base);
         let body = self.build_openai_body(req);
 
-        let mut builder = self.auth_header_openai(self.http.post(&url));
+        let mut builder = if self.profile.name == "copilot" {
+            let token = request_key.as_deref().ok_or_else(|| {
+                ProviderError::Auth(
+                    "No GitHub Copilot token found. Run `joey auth copilot login` or `joey model`."
+                        .into(),
+                )
+            })?;
+            self.copilot_headers(
+                self.http.post(&url),
+                token,
+                request_is_user_initiated(req),
+                request_has_images(req),
+            )
+        } else {
+            self.auth_header_openai(self.http.post(&url))
+        };
         // x-anthropic-beta for Claude models via OpenRouter (agent_init.py:1107-1118).
         if self.profile.name == "openrouter" && req.model.to_lowercase().contains("claude") {
-            builder = builder.header(
-                "x-anthropic-beta",
-                "fine-grained-tool-streaming-2025-05-14",
-            );
+            builder = builder.header("x-anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
         }
 
-        let resp = builder.json(&body).send().await?;
+        let resp = self.send_with_auth_refresh(builder.json(&body)).await?;
 
         if !resp.status().is_success() {
             return Err(status_error(resp).await);
@@ -161,7 +238,10 @@ impl ProviderClient {
         if req.stream {
             self.parse_openai_stream(resp, tx).await
         } else {
-            let v: Value = resp.json().await.map_err(|e| ProviderError::Parse(e.to_string()))?;
+            let v: Value = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Parse(e.to_string()))?;
             parse_openai_response(&v)
         }
     }
@@ -267,7 +347,10 @@ impl ProviderClient {
                     .and_then(|r| r.as_str())
                     .filter(|s| !s.is_empty())
                     .or_else(|| {
-                        delta.get("reasoning").and_then(|r| r.as_str()).filter(|s| !s.is_empty())
+                        delta
+                            .get("reasoning")
+                            .and_then(|r| r.as_str())
+                            .filter(|s| !s.is_empty())
                     });
                 if let Some(r) = r {
                     reasoning.push_str(r);
@@ -334,6 +417,262 @@ impl ProviderClient {
         })
     }
 
+    // ── OpenAI Responses (Copilot GPT-5+/Codex) ─────────────────────────────
+
+    fn build_responses_body(&self, req: &ProviderRequest) -> Value {
+        let mut input = Vec::new();
+        for message in &req.messages {
+            if message.role == "tool" {
+                if let Some(call_id) = &message.tool_call_id {
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": message.text_content(),
+                    }));
+                }
+                continue;
+            }
+            if let Some(parts) = &message.content_parts {
+                let content: Vec<Value> = parts
+                    .iter()
+                    .map(|part| match part {
+                        crate::types::ContentPart::Text { text } => {
+                            json!({"type": "input_text", "text": text})
+                        }
+                        crate::types::ContentPart::ImageUrl { image_url } => {
+                            json!({"type": "input_image", "image_url": image_url.url})
+                        }
+                    })
+                    .collect();
+                if !content.is_empty() {
+                    input.push(json!({"role": message.role, "content": content}));
+                }
+            } else if !message.text_content().trim().is_empty() {
+                input.push(json!({"role": message.role, "content": message.text_content()}));
+            }
+            if message.role == "assistant" {
+                for call in &message.tool_calls {
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": call.id,
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    }));
+                }
+            }
+        }
+        let tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "name": tool.function.name,
+                    "description": tool.function.description,
+                    "parameters": tool.function.parameters,
+                    "strict": false,
+                })
+            })
+            .collect();
+        let mut body = json!({
+            "model": copilot::normalize_model_id(&req.model),
+            "input": input,
+            "stream": req.stream,
+            "store": false,
+        });
+        let obj = body.as_object_mut().unwrap();
+        if let Some(system) = req.system.as_ref().filter(|s| !s.trim().is_empty()) {
+            obj.insert("instructions".into(), json!(system));
+        }
+        if !tools.is_empty() {
+            obj.insert("tools".into(), Value::Array(tools));
+            obj.insert("tool_choice".into(), json!("auto"));
+            obj.insert("parallel_tool_calls".into(), json!(true));
+        }
+        if let Some(max_tokens) = req.max_tokens {
+            obj.insert("max_output_tokens".into(), json!(max_tokens));
+        }
+        if let Some(crate::request::ReasoningEffort::Level(effort)) = &req.reasoning {
+            obj.insert("reasoning".into(), json!({"effort": effort}));
+        }
+        body
+    }
+
+    async fn responses(
+        &self,
+        req: &ProviderRequest,
+        tx: Option<&mpsc::UnboundedSender<StreamEvent>>,
+    ) -> Result<NormalizedResponse, ProviderError> {
+        if self.profile.name != "copilot" {
+            return Err(ProviderError::Other(
+                "codex_responses wire mode is only implemented for Copilot".into(),
+            ));
+        }
+        let (request_base, request_key) = self.request_credentials().await?;
+        let token = request_key.as_deref().ok_or_else(|| {
+            ProviderError::Auth(
+                "No GitHub Copilot token found. Run `joey auth copilot login` or `joey model`."
+                    .into(),
+            )
+        })?;
+        let url = format!("{}/responses", request_base.trim_end_matches('/'));
+        let body = self.build_responses_body(req);
+        tracing::debug!(target: "joey_providers::copilot", body = %body, "Copilot Responses request");
+        let builder = self.copilot_headers(
+            self.http.post(url).json(&body),
+            token,
+            request_is_user_initiated(req),
+            request_has_images(req),
+        );
+        let response = self.send_with_auth_refresh(builder).await?;
+        if !response.status().is_success() {
+            return Err(status_error(response).await);
+        }
+        if req.stream {
+            self.parse_responses_stream(response, tx).await
+        } else {
+            let value: Value = response
+                .json()
+                .await
+                .map_err(|e| ProviderError::Parse(e.to_string()))?;
+            parse_responses_response(&value)
+        }
+    }
+
+    async fn parse_responses_stream(
+        &self,
+        response: reqwest::Response,
+        tx: Option<&mpsc::UnboundedSender<StreamEvent>>,
+    ) -> Result<NormalizedResponse, ProviderError> {
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        // item_id -> (wire call_id, function name, accumulated arguments)
+        let mut calls: std::collections::HashMap<String, (String, String, String)> =
+            Default::default();
+        let mut completed: Option<Value> = None;
+        let mut buffer = String::new();
+        let mut stream = response.bytes_stream();
+        let read_timeout = Duration::from_secs(stream_read_timeout_secs());
+        while let Some(chunk) = tokio::time::timeout(read_timeout, stream.next())
+            .await
+            .map_err(|_| ProviderError::Timeout("Responses stream stalled".into()))?
+        {
+            let chunk = chunk.map_err(|e| ProviderError::Connection(e.to_string()))?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(newline) = buffer.find('\n') {
+                let line = buffer[..newline].trim().to_string();
+                buffer.drain(..=newline);
+                let Some(raw) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                if raw.trim() == "[DONE]" {
+                    continue;
+                }
+                let Ok(event) = serde_json::from_str::<Value>(raw.trim()) else {
+                    continue;
+                };
+                match event.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "response.output_text.delta" => {
+                        if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                            content.push_str(delta);
+                            if let Some(tx) = tx {
+                                let _ = tx.send(StreamEvent::ContentDelta(delta.into()));
+                            }
+                        }
+                    }
+                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                        if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                            reasoning.push_str(delta);
+                            if let Some(tx) = tx {
+                                let _ = tx.send(StreamEvent::ReasoningDelta(delta.into()));
+                            }
+                        }
+                    }
+                    "response.output_item.added" => {
+                        let item = event.get("item").unwrap_or(&Value::Null);
+                        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                            let item_id = item
+                                .get("id")
+                                .or_else(|| item.get("call_id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&item_id)
+                                .to_string();
+                            let name = item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            if !item_id.is_empty() {
+                                calls
+                                    .entry(item_id)
+                                    .or_insert((call_id, name, String::new()));
+                            }
+                        }
+                    }
+                    "response.function_call_arguments.delta" => {
+                        let item_id = event
+                            .get("item_id")
+                            .or_else(|| event.get("call_id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                        if !item_id.is_empty() {
+                            calls
+                                .entry(item_id.clone())
+                                .or_insert_with(|| (item_id, String::new(), String::new()))
+                                .2
+                                .push_str(delta);
+                        }
+                    }
+                    "response.completed" => completed = event.get("response").cloned(),
+                    "error" | "response.failed" => {
+                        return Err(ProviderError::ServerError(event.to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(value) = completed {
+            let parsed = parse_responses_response(&value)?;
+            if !parsed.content.is_empty() || !parsed.tool_calls.is_empty() {
+                return Ok(parsed);
+            }
+        }
+        let tool_calls = calls
+            .into_iter()
+            .map(|(_, (call_id, name, arguments))| ToolCall {
+                id: call_id,
+                call_type: "function".into(),
+                function: FunctionCall { name, arguments },
+            })
+            .collect::<Vec<_>>();
+        if content.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
+            return Err(ProviderError::EmptyStream(
+                "Copilot Responses stream returned no output".into(),
+            ));
+        }
+        Ok(NormalizedResponse {
+            content,
+            finish_reason: if tool_calls.is_empty() {
+                FinishReason::Stop
+            } else {
+                FinishReason::ToolCalls
+            },
+            tool_calls,
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            usage: Usage::default(),
+            model: None,
+            reasoning_details: None,
+            anthropic_content_blocks: None,
+        })
+    }
+
     // ── Anthropic Messages ───────────────────────────────────────────────────
 
     async fn anthropic_messages(
@@ -343,11 +682,17 @@ impl ProviderClient {
     ) -> Result<NormalizedResponse, ProviderError> {
         // Strip a trailing /v1 before appending /v1/messages (L5,
         // anthropic_adapter.py:780-783).
-        let base = strip_trailing_v1(&self.base_url);
+        let (request_base, request_key) = self.request_credentials().await?;
+        let base = strip_trailing_v1(&request_base);
         let url = format!("{}/v1/messages", base);
-        let mut body = anthropic::build_anthropic_body(req, &self.base_url);
+        let mut body = anthropic::build_anthropic_body(req, &request_base);
+        if self.profile.name == "copilot" {
+            body["model"] = json!(copilot::normalize_model_id(&req.model));
+        }
         if req.stream {
-            body.as_object_mut().unwrap().insert("stream".into(), json!(true));
+            body.as_object_mut()
+                .unwrap()
+                .insert("stream".into(), json!(true));
         }
 
         let mut builder = self
@@ -355,7 +700,20 @@ impl ProviderClient {
             .post(&url)
             .header("anthropic-version", "2023-06-01")
             .json(&body);
-        if let Some(key) = &self.api_key {
+        if self.profile.name == "copilot" {
+            let token = request_key.as_deref().ok_or_else(|| {
+                ProviderError::Auth(
+                    "No GitHub Copilot token found. Run `joey auth copilot login` or `joey model`."
+                        .into(),
+                )
+            })?;
+            builder = self.copilot_headers(
+                builder,
+                token,
+                request_is_user_initiated(req),
+                request_has_images(req),
+            );
+        } else if let Some(key) = &self.api_key {
             // OAuth-shaped tokens use Bearer; Console keys use x-api-key
             // (anthropic_adapter.py:395-420). See module note: only the honest
             // token-detection layer is replicated, not the identity spoofing.
@@ -370,7 +728,7 @@ impl ProviderClient {
             builder = builder.header("anthropic-beta", betas);
         }
 
-        let resp = builder.send().await?;
+        let resp = self.send_with_auth_refresh(builder).await?;
         if !resp.status().is_success() {
             return Err(status_error(resp).await);
         }
@@ -378,7 +736,10 @@ impl ProviderClient {
         if req.stream {
             self.parse_anthropic_stream(resp, tx).await
         } else {
-            let v: Value = resp.json().await.map_err(|e| ProviderError::Parse(e.to_string()))?;
+            let v: Value = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Parse(e.to_string()))?;
             anthropic::parse_anthropic_response(&v)
         }
     }
@@ -468,23 +829,33 @@ impl ProviderClient {
                         let idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                         ensure_block(&mut blocks, idx);
                         let delta = v.get("delta");
-                        if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
+                        if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str())
+                        {
                             blocks[idx].text.push_str(t);
                             if let Some(tx) = tx {
                                 let _ = tx.send(StreamEvent::ContentDelta(t.to_string()));
                             }
                         }
-                        if let Some(t) = delta.and_then(|d| d.get("thinking")).and_then(|t| t.as_str()) {
+                        if let Some(t) = delta
+                            .and_then(|d| d.get("thinking"))
+                            .and_then(|t| t.as_str())
+                        {
                             blocks[idx].thinking.push_str(t);
                             if let Some(tx) = tx {
                                 let _ = tx.send(StreamEvent::ReasoningDelta(t.to_string()));
                             }
                         }
                         // Signed thinking: signature_delta carries `signature`.
-                        if let Some(sig) = delta.and_then(|d| d.get("signature")).and_then(|s| s.as_str()) {
+                        if let Some(sig) = delta
+                            .and_then(|d| d.get("signature"))
+                            .and_then(|s| s.as_str())
+                        {
                             blocks[idx].signature.push_str(sig);
                         }
-                        if let Some(pj) = delta.and_then(|d| d.get("partial_json")).and_then(|t| t.as_str()) {
+                        if let Some(pj) = delta
+                            .and_then(|d| d.get("partial_json"))
+                            .and_then(|t| t.as_str())
+                        {
                             blocks[idx].json_buf.push_str(pj);
                         }
                     }
@@ -503,7 +874,10 @@ impl ProviderClient {
                     Some("message_start") => {
                         if let Some(msg) = v.get("message") {
                             if model.is_none() {
-                                model = msg.get("model").and_then(|m| m.as_str()).map(str::to_string);
+                                model = msg
+                                    .get("model")
+                                    .and_then(|m| m.as_str())
+                                    .map(str::to_string);
                             }
                             if let Some(u) = msg.get("usage") {
                                 anthropic::merge_anthropic_usage(&mut usage, u);
@@ -632,6 +1006,142 @@ async fn status_error(resp: reqwest::Response) -> ProviderError {
 
 // ── OpenAI response parsing ──────────────────────────────────────────────────
 
+fn request_is_user_initiated(req: &ProviderRequest) -> bool {
+    req.messages
+        .last()
+        .map(|message| message.role == "user")
+        .unwrap_or(true)
+}
+
+fn request_has_images(req: &ProviderRequest) -> bool {
+    req.messages.iter().any(|message| {
+        message
+            .content_parts
+            .as_ref()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .any(|part| matches!(part, crate::types::ContentPart::ImageUrl { .. }))
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn parse_responses_response(v: &Value) -> Result<NormalizedResponse, ProviderError> {
+    if let Some(error) = v.get("error").filter(|e| !e.is_null()) {
+        return Err(ProviderError::ServerError(error.to_string()));
+    }
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    for item in v
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match item.get("type").and_then(Value::as_str).unwrap_or("") {
+            "message" => {
+                for part in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                        "output_text" | "text" => {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                content.push_str(text);
+                            }
+                        }
+                        "refusal" => {
+                            if let Some(text) = part
+                                .get("refusal")
+                                .or_else(|| part.get("text"))
+                                .and_then(Value::as_str)
+                            {
+                                content.push_str(text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "function_call" => {
+                let id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                tool_calls.push(ToolCall::new(id, name, arguments));
+            }
+            "reasoning" => {
+                for summary in item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(text) = summary.get("text").and_then(Value::as_str) {
+                        if !reasoning.is_empty() {
+                            reasoning.push('\n');
+                        }
+                        reasoning.push_str(text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let usage_value = v.get("usage").unwrap_or(&Value::Null);
+    let input_tokens = usage_value
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage_value
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let usage = Usage {
+        prompt_tokens: input_tokens,
+        completion_tokens: output_tokens,
+        total_tokens: usage_value
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(input_tokens + output_tokens),
+        reasoning_tokens: usage_value
+            .get("output_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        ..Usage::default()
+    };
+    if content.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
+        return Err(ProviderError::Parse(
+            "Copilot Responses payload contained no output".into(),
+        ));
+    }
+    Ok(NormalizedResponse {
+        content,
+        finish_reason: if tool_calls.is_empty() {
+            FinishReason::Stop
+        } else {
+            FinishReason::ToolCalls
+        },
+        tool_calls,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
+        usage,
+        model: v.get("model").and_then(Value::as_str).map(str::to_string),
+        reasoning_details: None,
+        anthropic_content_blocks: None,
+    })
+}
+
 fn parse_openai_response(v: &Value) -> Result<NormalizedResponse, ProviderError> {
     let choice = v
         .get("choices")
@@ -654,10 +1164,22 @@ fn parse_openai_response(v: &Value) -> Result<NormalizedResponse, ProviderError>
     let mut tool_calls = Vec::new();
     if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tcs {
-            let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+            let id = tc
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_string();
             let f = tc.get("function").unwrap_or(&Value::Null);
-            let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-            let args = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}").to_string();
+            let name = f
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args = f
+                .get("arguments")
+                .and_then(|a| a.as_str())
+                .unwrap_or("{}")
+                .to_string();
             tool_calls.push(ToolCall::new(id, name, args));
         }
     }
@@ -671,7 +1193,10 @@ fn parse_openai_response(v: &Value) -> Result<NormalizedResponse, ProviderError>
 
     // Structured refusal → content + content_filter finish, but only when it
     // is the sole payload (chat_completions.py:739-760, M9).
-    let refusal = msg.get("refusal").and_then(|r| r.as_str()).filter(|s| !s.trim().is_empty());
+    let refusal = msg
+        .get("refusal")
+        .and_then(|r| r.as_str())
+        .filter(|s| !s.trim().is_empty());
     if let Some(refusal) = refusal {
         if content.trim().is_empty() && tool_calls.is_empty() {
             content = refusal.to_string();
@@ -684,7 +1209,10 @@ fn parse_openai_response(v: &Value) -> Result<NormalizedResponse, ProviderError>
     let usage = v.get("usage").map(parse_usage).unwrap_or_default();
     let model = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
     // Keep reasoning_details (OpenRouter unified format) for downstream replay (M9).
-    let reasoning_details = msg.get("reasoning_details").filter(|v| !v.is_null()).cloned();
+    let reasoning_details = msg
+        .get("reasoning_details")
+        .filter(|v| !v.is_null())
+        .cloned();
 
     Ok(NormalizedResponse {
         content,
@@ -709,7 +1237,10 @@ fn parse_usage(u: &Value) -> Usage {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     if cache_read == 0 {
-        cache_read = u.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        cache_read = u
+            .get("prompt_cache_hit_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
     }
     let cache_write = details
         .and_then(|d| d.get("cache_write_tokens"))
@@ -750,9 +1281,15 @@ fn accumulate_tool_calls(
 ) {
     for tc in tcs {
         let raw_idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-        let delta_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+        let delta_id = tc
+            .get("id")
+            .and_then(|i| i.as_str())
+            .unwrap_or("")
+            .to_string();
 
-        active_slot_by_idx.entry(raw_idx).or_insert(raw_idx as usize);
+        active_slot_by_idx
+            .entry(raw_idx)
+            .or_insert(raw_idx as usize);
         if !delta_id.is_empty() {
             if let Some(prev) = last_id_at_idx.get(&raw_idx) {
                 if *prev != delta_id {
@@ -788,8 +1325,16 @@ fn finalize_tool_calls(accum: Vec<ToolAccum>) -> Vec<ToolCall> {
         .filter(|a| !a.name.is_empty())
         .enumerate()
         .map(|(i, a)| {
-            let id = if a.id.is_empty() { format!("call_{}", i) } else { a.id };
-            let args = if a.args.is_empty() { "{}".to_string() } else { a.args };
+            let id = if a.id.is_empty() {
+                format!("call_{}", i)
+            } else {
+                a.id
+            };
+            let args = if a.args.is_empty() {
+                "{}".to_string()
+            } else {
+                a.args
+            };
             ToolCall::new(id, a.name, args)
         })
         .collect()
@@ -846,6 +1391,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn copilot_initiator_tracks_user_vs_tool_loop() {
+        let user_request = ProviderRequest::new(
+            "gpt-4.1",
+            vec![crate::types::Message::user("hello")],
+        );
+        assert!(request_is_user_initiated(&user_request));
+
+        let tool_request = ProviderRequest::new(
+            "gpt-4.1",
+            vec![
+                crate::types::Message::user("read a file"),
+                crate::types::Message::tool_result("call_1", "read_file", "contents"),
+            ],
+        );
+        assert!(!request_is_user_initiated(&tool_request));
+    }
+
+    #[test]
+    fn copilot_responses_body_preserves_multimodal_content() {
+        let profile = crate::profile::get_profile("copilot").unwrap();
+        let client = ProviderClient::new(profile, None, Some("ghu_test".into())).unwrap();
+        let mut message = crate::types::Message::user("");
+        message.content = None;
+        message.content_parts = Some(vec![
+            crate::types::ContentPart::Text { text: "inspect".into() },
+            crate::types::ContentPart::ImageUrl {
+                image_url: crate::types::ImageUrl { url: "data:image/png;base64,AA==".into() },
+            },
+        ]);
+        let request = ProviderRequest::new("gpt-5.4", vec![message]);
+        let body = client.build_responses_body(&request);
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(body["input"][0]["content"][1]["image_url"], "data:image/png;base64,AA==");
+        assert!(request_has_images(&request));
+    }
+
+    #[test]
+    fn copilot_responses_parser_normalizes_text_tools_reasoning_and_usage() {
+        let response = parse_responses_response(&json!({
+            "id": "resp_1",
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "checked"}]},
+                {"type": "message", "content": [{"type": "output_text", "text": "done"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "read_file", "arguments": "{\"path\":\"README.md\"}"}
+            ],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15,
+                "output_tokens_details": {"reasoning_tokens": 2}
+            }
+        }))
+        .unwrap();
+        assert_eq!(response.content, "done");
+        assert_eq!(response.reasoning.as_deref(), Some("checked"));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].function.name, "read_file");
+        assert_eq!(response.usage.prompt_tokens, 10);
+        assert_eq!(response.usage.reasoning_tokens, 2);
+    }
+
+    #[test]
     fn ollama_index_reuse_gets_fresh_slot() {
         // M7: a new tool call reusing index 0 with a NEW id → fresh slot.
         let mut accum = Vec::new();
@@ -864,7 +1472,11 @@ mod tests {
             &mut active,
         );
         let calls = finalize_tool_calls(accum);
-        assert_eq!(calls.len(), 2, "reused index with a new id gets its own slot");
+        assert_eq!(
+            calls.len(),
+            2,
+            "reused index with a new id gets its own slot"
+        );
         assert_eq!(calls[0].id, "a");
         assert_eq!(calls[1].id, "b");
     }
@@ -879,7 +1491,9 @@ mod tests {
         for _ in 0..2 {
             accumulate_tool_calls(
                 &mut accum,
-                &[json!({"index": 0, "id": "a", "function": {"name": "read_file", "arguments": "{\"x\":1"}})],
+                &[
+                    json!({"index": 0, "id": "a", "function": {"name": "read_file", "arguments": "{\"x\":1"}}),
+                ],
                 &mut last,
                 &mut active,
             );
@@ -887,7 +1501,10 @@ mod tests {
         let calls = finalize_tool_calls(accum);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read_file");
-        assert_eq!(calls[0].function.arguments, r#"{"x":1{"x":1"#, "args concatenate");
+        assert_eq!(
+            calls[0].function.arguments, r#"{"x":1{"x":1"#,
+            "args concatenate"
+        );
     }
 
     #[test]
@@ -939,17 +1556,33 @@ mod tests {
 
     #[test]
     fn base_url_helpers() {
-        assert_eq!(strip_trailing_v1("https://api.anthropic.com/v1"), "https://api.anthropic.com");
-        assert_eq!(strip_trailing_v1("https://api.anthropic.com"), "https://api.anthropic.com");
-        assert!(is_native_gemini_base_url("https://generativelanguage.googleapis.com/v1beta"));
-        assert!(!is_native_gemini_base_url("https://generativelanguage.googleapis.com/v1beta/openai"));
+        assert_eq!(
+            strip_trailing_v1("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            strip_trailing_v1("https://api.anthropic.com"),
+            "https://api.anthropic.com"
+        );
+        assert!(is_native_gemini_base_url(
+            "https://generativelanguage.googleapis.com/v1beta"
+        ));
+        assert!(!is_native_gemini_base_url(
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        ));
     }
 
     #[test]
     fn anthropic_stream_error_classification() {
-        assert!(matches!(anthropic_stream_error("overloaded_error", "busy"), ProviderError::Overloaded(_)));
+        assert!(matches!(
+            anthropic_stream_error("overloaded_error", "busy"),
+            ProviderError::Overloaded(_)
+        ));
         assert!(anthropic_stream_error("overloaded_error", "busy").is_retryable());
-        assert!(matches!(anthropic_stream_error("api_error", "boom"), ProviderError::ServerError(_)));
+        assert!(matches!(
+            anthropic_stream_error("api_error", "boom"),
+            ProviderError::ServerError(_)
+        ));
         assert!(matches!(
             anthropic_stream_error("invalid_request_error", "bad"),
             ProviderError::FormatError(_)
