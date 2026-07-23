@@ -1035,6 +1035,7 @@ fn manage_thinking_signatures(result: &mut [Value], base_url: &str, model: &str)
         .iter()
         .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
 
+    #[allow(clippy::needless_range_loop)]
     for idx in 0..result.len() {
         if result[idx].get("role").and_then(|r| r.as_str()) != Some("assistant") {
             continue;

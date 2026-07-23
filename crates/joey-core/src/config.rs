@@ -459,20 +459,20 @@ pub fn normalize_root_model_keys(config: Value) -> Value {
         other => return other,
     };
 
-    let model_in = map.get(&skey("model")).cloned();
+    let model_in = map.get(skey("model")).cloned();
     let model_has_alias = matches!(
         &model_in,
-        Some(Value::Mapping(m)) if m.get(&skey("api_base")).map(value_truthy).unwrap_or(false)
+        Some(Value::Mapping(m)) if m.get(skey("api_base")).map(value_truthy).unwrap_or(false)
     );
     let model_needs_canon = matches!(
         &model_in,
         Some(Value::Mapping(m))
-            if m.get(&skey("model")).map(value_truthy).unwrap_or(false)
-                || m.get(&skey("name")).map(value_truthy).unwrap_or(false)
+            if m.get(skey("model")).map(value_truthy).unwrap_or(false)
+                || m.get(skey("name")).map(value_truthy).unwrap_or(false)
     );
     let has_root = ["provider", "base_url", "context_length", "api_base"]
         .iter()
-        .any(|k| map.get(&skey(k)).map(value_truthy).unwrap_or(false));
+        .any(|k| map.get(skey(k)).map(value_truthy).unwrap_or(false));
 
     if !has_root && !model_has_alias && !model_needs_canon {
         return Value::Mapping(map);
@@ -489,42 +489,40 @@ pub fn normalize_root_model_keys(config: Value) -> Value {
     };
 
     for key in ["provider", "base_url", "context_length"] {
-        let root_val = map.get(&skey(key)).cloned();
+        let root_val = map.get(skey(key)).cloned();
         if let Some(v) = root_val {
-            if value_truthy(&v) && !model.get(&skey(key)).map(value_truthy).unwrap_or(false) {
+            if value_truthy(&v) && !model.get(skey(key)).map(value_truthy).unwrap_or(false) {
                 model.insert(skey(key), v);
             }
         }
-        map.remove(&skey(key));
+        map.remove(skey(key));
     }
 
     // api_base is an alias for base_url, at the root OR inside model.
-    for alias_val in [map.get(&skey("api_base")).cloned(), model.get(&skey("api_base")).cloned()] {
-        if let Some(v) = alias_val {
-            if value_truthy(&v) && !model.get(&skey("base_url")).map(value_truthy).unwrap_or(false) {
-                model.insert(skey("base_url"), v);
-            }
+    for v in [map.get(skey("api_base")).cloned(), model.get(skey("api_base")).cloned()].into_iter().flatten() {
+        if value_truthy(&v) && !model.get(skey("base_url")).map(value_truthy).unwrap_or(false) {
+            model.insert(skey("base_url"), v);
         }
     }
-    map.remove(&skey("api_base"));
-    model.remove(&skey("api_base"));
+    map.remove(skey("api_base"));
+    model.remove(skey("api_base"));
 
     // Canonicalize the model id to `default`; `model` and `name` are
     // last-resort aliases (in that order), then dropped.
-    let default_truthy = model.get(&skey("default")).map(value_truthy).unwrap_or(false);
+    let default_truthy = model.get(skey("default")).map(value_truthy).unwrap_or(false);
     if !default_truthy {
         let alias = model
-            .get(&skey("model"))
+            .get(skey("model"))
             .filter(|v| value_truthy(v))
-            .or_else(|| model.get(&skey("name")).filter(|v| value_truthy(v)))
+            .or_else(|| model.get(skey("name")).filter(|v| value_truthy(v)))
             .cloned();
         if let Some(alias) = alias {
             model.insert(skey("default"), alias);
         }
     }
-    if model.get(&skey("default")).map(value_truthy).unwrap_or(false) {
-        model.remove(&skey("model"));
-        model.remove(&skey("name"));
+    if model.get(skey("default")).map(value_truthy).unwrap_or(false) {
+        model.remove(skey("model"));
+        model.remove(skey("name"));
     }
 
     map.insert(skey("model"), Value::Mapping(model));
@@ -754,7 +752,7 @@ pub fn unset_nested(root: &mut Value, dotted: &str) -> bool {
                 let idx: usize = head.parse().ok()?;
                 seq.get_mut(idx)?
             }
-            Value::Mapping(m) => m.get_mut(&skey(head))?,
+            Value::Mapping(m) => m.get_mut(skey(head))?,
             _ => return None,
         };
         let removed = remove_at(child, rest)?;

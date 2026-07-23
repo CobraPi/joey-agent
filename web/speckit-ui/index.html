@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SpecKit Visual UI</title>
+    <style>
+      body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #1e1e1e; color: #eee; }
+      #app { display: flex; flex-direction: column; height: 100vh; }
+      header { padding: 8px 16px; background: #252526; border-bottom: 1px solid #3c3c3c; display: flex; align-items: center; gap: 12px; }
+      nav button { background: #2d2d2d; color: #ddd; border: 1px solid #444; padding: 6px 12px; cursor: pointer; border-radius: 4px; }
+      nav button.active { background: #094771; border-color: #1177bb; }
+      main { flex: 1; overflow: hidden; position: relative; }
+      .view { position: absolute; inset: 0; display: none; }
+      .view.active { display: block; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <strong>SpecKit Visual UI</strong>
+        <nav id="view-nav">
+          <button data-view="canvas" class="active">Canvas</button>
+          <button data-view="workspace">Workspace</button>
+          <button data-view="board">Board</button>
+          <button data-view="init">Init</button>
+        </nav>
+      </header>
+      <main>
+        <div id="view-canvas" class="view active"></div>
+        <div id="view-workspace" class="view"></div>
+        <div id="view-board" class="view"></div>
+        <div id="view-init" class="view"></div>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

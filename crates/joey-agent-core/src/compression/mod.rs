@@ -11,11 +11,13 @@ pub mod engine;
 pub mod estimator;
 pub mod feedback;
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod loop_tests;
 pub mod orchestrator;
 pub mod summary;
 
 /// Scripted summary backend shared by the compression test suites.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::summary::SummaryBackend;

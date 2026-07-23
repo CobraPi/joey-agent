@@ -58,7 +58,7 @@ fn read_entries(path: &PathBuf) -> Vec<String> {
         .collect()
 }
 
-fn write_entries(path: &PathBuf, entries: &[String]) -> Result<(), String> {
+fn write_entries(path: &std::path::Path, entries: &[String]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to write memory file {}: {}", path.display(), e))?;
@@ -98,9 +98,9 @@ struct FileLock {
 }
 
 impl FileLock {
-    fn acquire(path: &PathBuf) -> Self {
+    fn acquire(path: &std::path::Path) -> Self {
         let lock_path = {
-            let mut os = path.clone().into_os_string();
+            let mut os = path.to_path_buf().into_os_string();
             os.push(".lock");
             PathBuf::from(os)
         };
@@ -163,7 +163,7 @@ fn detect_external_drift(path: &PathBuf, limit: usize) -> Option<String> {
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let bak_path = {
         let mut os = path.clone().into_os_string();
-        os.push(&format!(".bak.{}", ts));
+        os.push(format!(".bak.{}", ts));
         PathBuf::from(os)
     };
     match std::fs::write(&bak_path, &raw) {
@@ -175,7 +175,7 @@ fn detect_external_drift(path: &PathBuf, limit: usize) -> Option<String> {
     }
 }
 
-fn drift_error(path: &PathBuf, bak_path: &str) -> Value {
+fn drift_error(path: &std::path::Path, bak_path: &str) -> Value {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     json!({
         "success": false,
@@ -430,7 +430,7 @@ fn apply_batch(ctx: &ToolContext, target: &str, operations: &[Value]) -> Value {
                 if content.is_empty() {
                     return batch_error(ctx, target, &entries, &format!("{}: content is required.", pos));
                 }
-                if working.iter().any(|e| *e == content) {
+                if working.contains(&content) {
                     continue; // idempotent — skip duplicate, don't fail the batch
                 }
                 working.push(content);

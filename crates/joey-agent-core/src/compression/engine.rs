@@ -133,6 +133,7 @@ pub trait ContextEngine: Send + Sync {
     }
 
     /// Called when the user switches models or on fallback activation.
+    #[allow(clippy::too_many_arguments)]
     fn update_model(
         &mut self,
         model: &str,

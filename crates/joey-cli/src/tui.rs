@@ -397,7 +397,7 @@ fn handle_slash_tui(input: &str, tui: &mut Tui) -> SlashAction {
                 kind: NoticeKind::Warning,
             });
         }
-        Resolution::Command { def, .. } => match def.name.as_ref() {
+        Resolution::Command { def, .. } => match def.name {
             "quit" | "exit" => return SlashAction::Quit,
             "help" => tui.toggle_help(),
             "clear" => {

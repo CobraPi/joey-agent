@@ -452,7 +452,7 @@ pub fn banner(info: &BannerInfo) {
     let inner = width - 2;
 
     // ── Logo: gradient wordmark + diagonal field (Crush-style) ──
-    let logo_name = format!("{} {}", branding::AGENT_NAME, format!("v{}", branding::VERSION));
+    let logo_name = format!("{} v{}", branding::AGENT_NAME, branding::VERSION);
     let logo_line = theme::gradient_fg_bold(&logo_name, t.primary, t.secondary, true);
 
     let field_width = inner.saturating_sub(strip_ansi_width(&logo_line)).max(3);
@@ -666,7 +666,7 @@ pub fn exit_outro(info: &OutroInfo) {
         println!("{}", sep);
     } else {
         // Gradient farewell.
-        let farewell = format!("Goodbye! ⚕");
+        let farewell = "Goodbye! ⚕".to_string();
         println!("{}", theme::gradient_fg(&farewell, t.primary, t.secondary));
     }
 }

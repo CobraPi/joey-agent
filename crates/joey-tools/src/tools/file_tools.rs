@@ -471,7 +471,7 @@ fn suggest_similar_files(path: &str, resolved: &Path) -> Value {
             }
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|s| std::cmp::Reverse(s.0));
     let similar: Vec<String> = scored.into_iter().take(5).map(|(_, p)| p).collect();
 
     let mut d = Map::new();
@@ -1810,7 +1810,7 @@ fn search_files_walk(root: &Path, pattern: &str, limit: usize, offset: usize) ->
         }
     }
     // Sorted by modification time, most recent first (rg --sortr=modified).
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.sort_by_key(|f| std::cmp::Reverse(f.0));
     // Mirror the rg path's fetch cap: gather limit+offset rows, and flag
     // truncation when the cap was reached.
     let fetch_limit = limit + offset;

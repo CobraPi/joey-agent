@@ -555,6 +555,7 @@ pub fn fetch_api_models(api_key: &str, base_url: &str) -> Option<Vec<String>> {
 // OpenRouter picker catalog (models.py `fetch_openrouter_models`)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::type_complexity)]
 static OPENROUTER_CATALOG_CACHE: Lazy<Mutex<Option<Vec<(String, String)>>>> =
     Lazy::new(|| Mutex::new(None));
 

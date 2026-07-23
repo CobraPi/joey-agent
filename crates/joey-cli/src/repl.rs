@@ -122,13 +122,13 @@ pub(crate) fn build_agent_config(config: &Config, ov: &Overrides) -> AgentConfig
 
 pub(crate) fn build_agent(
     config: &Config,
-    cwd: &PathBuf,
+    cwd: &std::path::Path,
     ov: &Overrides,
     session_id: &str,
     history: Vec<Message>,
 ) -> Result<Agent> {
     let agent_cfg = build_agent_config(config, ov);
-    let ctx = ToolContext::new(cwd.clone(), config.clone(), session_id.to_string());
+    let ctx = ToolContext::new(cwd.to_path_buf(), config.clone(), session_id.to_string());
     let registry = ToolRegistry::with_builtins();
     let mut agent =
         Agent::new(agent_cfg, registry, ctx).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -756,7 +756,7 @@ fn rebuild_agent_preserving_history(st: &mut ReplState) -> Result<()> {
 
 fn model_slash(st: &mut ReplState, args: &str) {
     let mut parts: Vec<&str> = args.split_whitespace().collect();
-    let global = parts.iter().any(|p| *p == "--global");
+    let global = parts.contains(&"--global");
     parts.retain(|p| *p != "--global" && *p != "--session");
     if parts.is_empty() {
         let cfg = build_agent_config(&st.config, &st.overrides);
@@ -795,7 +795,7 @@ const REASONING_LEVELS: &[&str] =
 
 fn reasoning_slash(st: &mut ReplState, args: &str) {
     let mut parts: Vec<&str> = args.split_whitespace().collect();
-    let global = parts.iter().any(|p| *p == "--global");
+    let global = parts.contains(&"--global");
     parts.retain(|p| *p != "--global");
     match parts.first().copied() {
         None => {
@@ -1150,7 +1150,7 @@ fn commafy_i64(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);

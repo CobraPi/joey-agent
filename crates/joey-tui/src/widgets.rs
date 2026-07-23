@@ -31,11 +31,12 @@ pub fn gradient_block(title: &str, theme: Theme) -> Block<'_> {
         .style(Style::default().bg(theme.bg_panel.to_color()))
 }
 
-/// Focused variant: the border glows in the primary color.
+/// Focused variant: the border tints toward the primary color. crush-style —
+/// a steady focus indicator rather than a pulsing glow; `pulse` now only
+/// contributes a subtle amount so the border reads as "focused", not "alive".
 pub fn gradient_block_focused(title: &str, theme: Theme, pulse: f32) -> Block<'_> {
     let title_spans = gradient_spans(title, theme);
-    // Blend border between separator and primary using the pulse value.
-    let border = theme.separator.lerp(theme.primary, 0.4 + pulse * 0.6);
+    let border = theme.separator.lerp(theme.primary, 0.75 + pulse * 0.1);
     Block::default()
         .borders(Borders::ALL)
         .title(Line::from(title_spans))
@@ -100,15 +101,16 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
         .style(Style::default().bg(theme.bg_elevated.to_color()));
     f.render_widget(buf_area, area);
 
-    // Left: gradient wordmark "joey" with glowing effect.
+    // Left: gradient wordmark "joey" with a faint breathing highlight
+    // (toned down considerably from the original glow — crush's header is
+    // static; we keep a hint of life without the "light show" feel).
     let logo = "✦ joey";
     let glow = pulse.value();
-    // Brighten the gradient with glow.
     let bright_stops = [
-        theme.grad_0.lerp(Rgb(255, 255, 255), glow * 0.4),
-        theme.grad_1.lerp(Rgb(255, 255, 255), glow * 0.4),
-        theme.grad_2.lerp(Rgb(255, 255, 255), glow * 0.4),
-        theme.grad_3.lerp(Rgb(255, 255, 255), glow * 0.4),
+        theme.grad_0.lerp(Rgb(255, 255, 255), glow * 0.08),
+        theme.grad_1.lerp(Rgb(255, 255, 255), glow * 0.08),
+        theme.grad_2.lerp(Rgb(255, 255, 255), glow * 0.08),
+        theme.grad_3.lerp(Rgb(255, 255, 255), glow * 0.08),
     ];
     let logo_spans =
         crate::theme::gradient_spans_stops(logo, &bright_stops);

@@ -81,6 +81,7 @@ pub fn fuzzy_find_and_replace(
         };
     }
 
+    #[allow(clippy::type_complexity)]
     let strategies: &[(&'static str, fn(&str, &str) -> Matches)] = &[
         ("exact", strategy_exact),
         ("line_trimmed", strategy_line_trimmed),
@@ -355,7 +356,7 @@ fn apply_replacements(
     old_string: Option<&str>,
 ) -> String {
     let mut sorted_matches = matches.clone();
-    sorted_matches.sort_by(|a, b| b.0.cmp(&a.0));
+    sorted_matches.sort_by_key(|m| std::cmp::Reverse(m.0));
     let mut result = content.to_string();
     for (start, end) in sorted_matches {
         let adjusted = match old_string {
@@ -632,9 +633,6 @@ fn map_normalized_positions(
             if orig_idx < ob.len() && ob[orig_idx] != b' ' && ob[orig_idx] != b'\t' {
                 norm_idx += 1;
             }
-        } else if ob[orig_idx] == b' ' || ob[orig_idx] == b'\t' {
-            orig_to_norm.push(norm_idx);
-            orig_idx += 1;
         } else {
             orig_to_norm.push(norm_idx);
             orig_idx += 1;

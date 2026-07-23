@@ -426,7 +426,7 @@ fn custom_unit_to_cp(chars: &[char], budget: usize, measure: &dyn Fn(&str) -> us
     }
     let (mut lo, mut hi) = (0usize, chars.len());
     while lo < hi {
-        let mid = (lo + hi + 1) / 2;
+        let mid = (lo + hi).div_ceil(2);
         let prefix: String = chars[..mid].iter().collect();
         if measure(&prefix) <= budget {
             lo = mid;
@@ -870,7 +870,7 @@ mod tests {
 
     #[test]
     fn classify_send_error_reads_error_display() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "Chat not found");
+        let err = std::io::Error::other("Chat not found");
         let dyn_err: &(dyn std::error::Error + 'static) = &err;
         assert_eq!(classify_send_error(Some(dyn_err), ""), "not_found");
     }
@@ -907,7 +907,7 @@ mod tests {
         // No content lost (modulo the whitespace consumed at split points).
         let rejoined: String = chunks
             .iter()
-            .map(|c| c.rsplitn(2, " (").nth(1).unwrap().to_string() + " ")
+            .map(|c| c.rsplit_once(" (").unwrap().0.to_string() + " ")
             .collect();
         assert_eq!(
             rejoined.split_whitespace().count(),
@@ -925,7 +925,7 @@ mod tests {
         let chunks = truncate_message(&content, 60, None);
         assert!(chunks.len() > 1);
         // First chunk closes the fence before its indicator...
-        let first_body = chunks[0].rsplitn(2, " (").nth(1).unwrap();
+        let first_body = chunks[0].rsplit_once(" (").unwrap().0;
         assert!(first_body.ends_with("\n```"), "no fence close: {:?}", chunks[0]);
         // ...and the continuation reopens it with the language tag.
         assert!(

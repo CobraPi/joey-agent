@@ -203,9 +203,9 @@ pub fn ensure_aware(stamp: &IsoStamp) -> DateTime<FixedOffset> {
                 .from_local_datetime(&stamp.naive)
                 .single()
                 .unwrap_or_else(|| chrono::Utc.from_utc_datetime(&stamp.naive).fixed_offset());
-            configured.to_fixed(aware)
+            configured.convert_fixed(aware)
         }
-        None => configured.to_fixed(LocalZone::System.localize_lenient(stamp.naive)),
+        None => configured.convert_fixed(LocalZone::System.localize_lenient(stamp.naive)),
     }
 }
 
@@ -1073,10 +1073,10 @@ impl CronStore {
         let _guard = self.lock_jobs();
         let (mut jobs, _) = self.load_repaired()?;
         let mut updated: Option<Job> = None;
-        for i in 0..jobs.len() {
-            if jobs[i].id == job_id {
-                mutate(&mut jobs[i]);
-                updated = Some(jobs[i].clone());
+        for job in jobs.iter_mut() {
+            if job.id == job_id {
+                mutate(job);
+                updated = Some(job.clone());
                 break;
             }
         }
@@ -1341,11 +1341,11 @@ impl CronStore {
         let mut due: Vec<Job> = Vec::new();
         let mut removals: Vec<usize> = Vec::new();
 
-        for idx in 0..jobs.len() {
-            let decision = due_decision(&mut jobs[idx], now, run_claim_ttl, &mut needs_save);
+        for (idx, job) in jobs.iter_mut().enumerate() {
+            let decision = due_decision(job, now, run_claim_ttl, &mut needs_save);
             match decision {
                 DueDecision::Skip => {}
-                DueDecision::Due => due.push(jobs[idx].clone()),
+                DueDecision::Due => due.push(job.clone()),
                 DueDecision::Remove => removals.push(idx),
             }
         }

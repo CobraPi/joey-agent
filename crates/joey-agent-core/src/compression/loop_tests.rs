@@ -202,6 +202,9 @@ fn notices(events: &[AgentEvent]) -> Vec<String> {
         .collect()
 }
 
+// Guard held deliberately across `.await` in tests: it serializes tests
+// that mutate the process-global HOME env var, not an async resource.
+#[allow(clippy::await_holding_lock)]
 fn lock<'a>() -> std::sync::MutexGuard<'a, ()> {
     crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -466,7 +469,7 @@ async fn compress_context_rewrites_history_and_session_store_in_place() {
             let guard = fx.agent.session_db().unwrap();
             let mut row = joey_core::StoredMessage::new(
                 sid.clone(),
-                joey_core::Role::from_str(&m.role),
+                joey_core::Role::from_label(&m.role),
                 m.text_content(),
             );
             row.timestamp = 1000.0 + i as f64;

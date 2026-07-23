@@ -137,7 +137,7 @@ pub fn estimate_messages_tokens_rough(messages: &[Message]) -> i64 {
         total_chars += estimate_message_chars(msg);
         image_tokens += count_image_tokens(msg, REQUEST_IMAGE_TOKEN_COST);
     }
-    ((total_chars + 3) / 4) as i64 + image_tokens as i64
+    total_chars.div_ceil(4) as i64 + image_tokens as i64
 }
 
 /// Rough token estimate for a full chat request
@@ -149,7 +149,7 @@ pub fn estimate_request_tokens_rough(
 ) -> i64 {
     let mut total: i64 = 0;
     if !system_prompt.is_empty() {
-        total += ((system_prompt.len() + 3) / 4) as i64;
+        total += system_prompt.len().div_ceil(4) as i64;
     }
     if !messages.is_empty() {
         total += estimate_messages_tokens_rough(messages);
@@ -175,7 +175,7 @@ pub fn estimate_tools_tokens_rough(tools: &[ToolSchema]) -> i64 {
             .map(|s| s.len())
             .unwrap_or(0);
     }
-    ((total_chars + 3) / 4) as i64
+    total_chars.div_ceil(4) as i64
 }
 
 #[cfg(test)]

@@ -220,7 +220,7 @@ pub(crate) fn commafy(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -1360,23 +1360,23 @@ impl ContextCompressor {
             use sha2::Digest;
             let hash = hex::encode(sha2::Sha256::digest(content.as_bytes()));
             let hash = hash[..12].to_string();
-            if content_hashes.contains_key(&hash) {
+            if let std::collections::hash_map::Entry::Vacant(e) = content_hashes.entry(hash) {
+                e.insert(i);
+            } else {
                 result[i].content = Some(
                     "[Duplicate tool output — same content as a more recent call]".to_string(),
                 );
                 pruned += 1;
-            } else {
-                content_hashes.insert(hash, i);
             }
         }
 
         // Pass 2: replace old tool results with informative summaries.
-        for i in 0..prune_boundary {
-            if result[i].role != "tool" {
+        for item in result.iter_mut().take(prune_boundary) {
+            if item.role != "tool" {
                 continue;
             }
             // Multimodal content: strip image payloads for a text placeholder.
-            if let Some(parts) = &result[i].content_parts {
+            if let Some(parts) = &item.content_parts {
                 let had_image = parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. }));
                 if had_image {
                     let stripped: Vec<ContentPart> = parts
@@ -1388,12 +1388,12 @@ impl ContextCompressor {
                             other => other.clone(),
                         })
                         .collect();
-                    result[i].content_parts = Some(stripped);
+                    item.content_parts = Some(stripped);
                     pruned += 1;
                 }
                 continue;
             }
-            let Some(content) = result[i].content.clone() else { continue };
+            let Some(content) = item.content.clone() else { continue };
             if content.is_empty() || content == PRUNED_TOOL_PLACEHOLDER {
                 continue;
             }
@@ -1401,13 +1401,13 @@ impl ContextCompressor {
                 continue;
             }
             if content.len() > 200 {
-                let call_id = result[i].tool_call_id.clone().unwrap_or_default();
+                let call_id = item.tool_call_id.clone().unwrap_or_default();
                 let (tool_name, tool_args) = call_id_to_tool
                     .get(&call_id)
                     .cloned()
                     .unwrap_or_else(|| ("unknown".to_string(), String::new()));
                 let summary = summarize_tool_result(&tool_name, &tool_args, &content);
-                result[i].content = Some(summary);
+                item.content = Some(summary);
                 pruned += 1;
             }
         }
@@ -2506,7 +2506,7 @@ Write only the summary body. Do not include any preamble or prefix."#,
         let token_budget = token_budget.unwrap_or(self.tail_token_budget);
         let n = messages.len();
         let available_tail = n.saturating_sub(head_end + 1);
-        let min_tail_floor = self.protect_last_n.min(MAX_TAIL_MESSAGE_FLOOR).max(3);
+        let min_tail_floor = self.protect_last_n.clamp(3, MAX_TAIL_MESSAGE_FLOOR);
         let compressible_tail_cap = available_tail.saturating_sub(2).max(3);
         let min_tail = if available_tail > 1 {
             min_tail_floor.min(compressible_tail_cap).min(available_tail)

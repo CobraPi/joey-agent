@@ -43,14 +43,17 @@ impl Activity {
         self.intensity += (target_intensity - self.intensity) * k_int;
     }
 
-    /// Effective animation speed multiplier. 1.0 baseline, up to ~3x when busy.
+    /// Effective animation speed multiplier. Toned down from the original
+    /// synthwave build (crush-style: motion should be a quiet status signal,
+    /// not a light show) — 0.8 baseline, up to ~1.5x when busy.
     pub fn speed(self) -> f32 {
-        0.6 + self.intensity * 2.4
+        0.8 + self.intensity * 0.7
     }
 
-    /// FPS target for the render loop, scaled by activity.
+    /// FPS target for the render loop, scaled by activity. Lower ceiling
+    /// keeps CPU usage down and avoids visual restlessness while idle.
     pub fn target_fps(self) -> u32 {
-        (16.0 + self.intensity * 28.0).round() as u32
+        (12.0 + self.intensity * 12.0).round() as u32
     }
 }
 
@@ -156,8 +159,10 @@ impl ParticleField {
 
         // Spawn rate scales with intensity and screen area.
         let area = self.width * self.height;
-        let spawn_rate = 0.5 + intensity * 8.0; // particles / sec baseline scaled
-        self.spawn_accum += dt * spawn_rate * (area / 2000.0).max(1.0).min(12.0);
+        // Toned down considerably: the particle backdrop is now a faint
+        // ambient signal rather than a dense starfield.
+        let spawn_rate = 0.15 + intensity * 1.5; // particles / sec baseline scaled
+        self.spawn_accum += dt * spawn_rate * (area / 2000.0).clamp(1.0, 4.0);
         while self.spawn_accum >= 1.0 {
             self.spawn_accum -= 1.0;
             self.spawn_one(theme);
@@ -232,6 +237,10 @@ impl Equalizer {
         self.bars.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.bars.is_empty()
+    }
+
     /// Advance the bars. Amplitude and frequency scale with activity.
     pub fn tick(&mut self, dt: Duration, activity: Activity) {
         let dt = dt.as_secs_f32();
@@ -242,7 +251,8 @@ impl Equalizer {
             // target is a layered sine; amplitude scales with intensity.
             let s = (*ph).sin() * 0.5 + 0.5;
             let s2 = (*ph * 1.7 + i as f32).sin() * 0.5 + 0.5;
-            let target = (0.08 + intensity * 0.92) * (0.4 * s + 0.6 * s2);
+            // Toned-down amplitude range: calmer at rest, less jittery when busy.
+            let target = (0.06 + intensity * 0.55) * (0.4 * s + 0.6 * s2);
             // smooth toward target
             let k = 1.0 - (-dt * 12.0).exp();
             *b += (target - *b) * k;
@@ -299,6 +309,7 @@ impl Rng {
         Self { state: if seed == 0 { 0x9E3779B9 } else { seed } }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> f32 {
         let mut x = self.state;
         x ^= x << 13;

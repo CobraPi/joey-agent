@@ -660,7 +660,7 @@ fn commafy(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -676,7 +676,11 @@ fn render_memory_block(target: &str, entries: &[String], limit: usize) -> String
     }
     let content = entries.join(joey_tools::tools::memory_tool::ENTRY_DELIMITER);
     let current = char_len(&content);
-    let pct = if limit > 0 { std::cmp::min(100, current * 100 / limit) } else { 0 };
+    let pct = if limit > 0 {
+        current.checked_mul(100).map(|v| v / limit).unwrap_or(100).min(100)
+    } else {
+        0
+    };
     let header = if target == "user" {
         format!("USER PROFILE (who the user is) [{}% — {}/{} chars]", pct, commafy(current), commafy(limit))
     } else {
@@ -914,7 +918,7 @@ mod tests {
         let entries = vec!["User prefers tabs".to_string(), "Project uses cargo".to_string()];
         let block = render_memory_block("memory", &entries, 2200);
         let sep = "═".repeat(46);
-        let content = format!("User prefers tabs\n§\nProject uses cargo");
+        let content = "User prefers tabs\n§\nProject uses cargo".to_string();
         let current = content.chars().count();
         let pct = current * 100 / 2200;
         assert_eq!(

@@ -708,7 +708,7 @@ fn cached_prompt_reflects_builtin_memory(ctx: &joey_tools::ToolContext, cached_p
 fn message_to_stored(session_id: &str, msg: &Message) -> StoredMessage {
     let mut row = StoredMessage::new(
         session_id.to_string(),
-        Role::from_str(&msg.role),
+        Role::from_label(&msg.role),
         msg.text_content(),
     );
     row.tool_call_id = msg.tool_call_id.clone();

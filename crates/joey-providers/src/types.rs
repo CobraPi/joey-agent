@@ -308,5 +308,5 @@ pub enum StreamEvent {
     /// A chunk of reasoning/thinking text.
     ReasoningDelta(String),
     /// The stream finished; carries the fully-assembled response.
-    Done(NormalizedResponse),
+    Done(Box<NormalizedResponse>),
 }

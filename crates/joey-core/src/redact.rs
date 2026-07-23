@@ -639,7 +639,7 @@ pub fn is_env_dump_command(command: &str) -> bool {
     if command.is_empty() {
         return false;
     }
-    for seg in command.split(|c| c == '|' || c == ';' || c == '&') {
+    for seg in command.split(['|', ';', '&']) {
         let seg = seg.trim();
         if seg.is_empty() {
             continue;

@@ -203,7 +203,7 @@ pub fn get_model_context_length(model: &str, config_context_length: Option<i64>)
     let model = strip_provider_prefix(model);
     let model_lower = model.to_lowercase();
     let mut entries: Vec<&(&str, i64)> = DEFAULT_CONTEXT_LENGTHS.iter().collect();
-    entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.0.len()));
     for (default_model, length) in entries {
         if model_lower.contains(default_model) {
             return *length;

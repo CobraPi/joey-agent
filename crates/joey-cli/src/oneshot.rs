@@ -156,9 +156,9 @@ pub async fn run_oneshot(opts: OneshotOptions) -> Result<i32> {
     let env_model = std::env::var("JOEY_INFERENCE_MODEL").unwrap_or_default().trim().to_string();
     let arg_model = opts.model.as_deref().unwrap_or("").trim().to_string();
     if opts.provider.is_some() && arg_model.is_empty() && env_model.is_empty() {
-        eprint!(
+        eprintln!(
             "joey -z: --provider requires --model (or JOEY_INFERENCE_MODEL). \
-             Pass both explicitly, or neither to use your configured defaults.\n"
+             Pass both explicitly, or neither to use your configured defaults."
         );
         return Ok(2);
     }

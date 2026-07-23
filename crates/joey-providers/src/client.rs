@@ -130,7 +130,7 @@ impl ProviderClient {
             ApiMode::CodexResponses => self.responses(&streaming_req, Some(&tx)).await,
         };
         if let Ok(resp) = &result {
-            let _ = tx.send(StreamEvent::Done(resp.clone()));
+            let _ = tx.send(StreamEvent::Done(Box::new(resp.clone())));
         }
         result
     }

@@ -292,7 +292,9 @@ fn activity_scales_with_agent_count() {
     }
     // Intensity should be significantly elevated with 4 agents.
     assert!(a.intensity > 0.5, "intensity should be high: {}", a.intensity);
-    assert!(a.speed() > 1.5, "speed should scale up: {}", a.speed());
+    // Speed scaling was toned down (crush-style calmer motion): baseline 0.8,
+    // up to ~1.5x at full intensity, rather than the old 3x range.
+    assert!(a.speed() > 1.2, "speed should scale up: {}", a.speed());
 
     // Now go idle.
     for _ in 0..120 {

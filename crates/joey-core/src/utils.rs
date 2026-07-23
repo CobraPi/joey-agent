@@ -125,8 +125,8 @@ pub fn atomic_replace(path: &Path, contents: &[u8]) -> Result<()> {
         }
         Err(err) => {
             // EXDEV (cross-device) / EBUSY fallback: copy + fsync + unlink.
-            let exdev = err.raw_os_error() == Some(libc::EXDEV as i32)
-                || err.raw_os_error() == Some(libc::EBUSY as i32);
+            let exdev = err.raw_os_error() == Some(libc::EXDEV)
+                || err.raw_os_error() == Some(libc::EBUSY);
             if !exdev {
                 return Err(err)
                     .with_context(|| format!("renaming into place: {}", real_target.display()));
@@ -226,7 +226,7 @@ pub fn estimate_tokens(text: &str) -> usize {
     if n == 0 {
         return 0;
     }
-    (n + 3) / 4
+    n.div_ceil(4)
 }
 
 #[cfg(test)]

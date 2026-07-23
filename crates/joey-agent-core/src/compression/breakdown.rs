@@ -39,7 +39,7 @@ fn chars_to_tokens(text: &str) -> i64 {
     if text.is_empty() {
         return 0;
     }
-    ((text.len() + 3) / 4) as i64
+    text.len().div_ceil(4) as i64
 }
 
 fn json_tokens(value: &[&ToolSchema]) -> i64 {

@@ -65,7 +65,7 @@ pub fn is_summary_access_or_quota_error(e: &ProviderError) -> bool {
     if SUMMARY_MISSING_CREDENTIAL_MARKERS.iter().any(|m| err_text.contains(m)) {
         return true;
     }
-    if matches!(e, ProviderError::Status { status: 401 | 402 | 403, .. }) {
+    if matches!(e, ProviderError::Status { status: 401..=403, .. }) {
         return true;
     }
     SUMMARY_PERMANENT_QUOTA_MARKERS.iter().any(|m| err_text.contains(m))

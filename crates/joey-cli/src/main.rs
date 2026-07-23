@@ -322,12 +322,11 @@ pub fn scan_profile_flag(argv: &[String]) -> (Option<String>, Option<(usize, usi
             }
             return (Some(rest.to_string()), Some((i, 1)));
         }
-        if !arg.contains('=') && VALUE_FLAGS.contains(&arg.as_str()) && i + 1 < argv.len() {
-            i += 2;
-        } else if !arg.contains('=')
-            && OPTIONAL_VALUE_FLAGS.contains(&arg.as_str())
-            && i + 1 < argv.len()
-            && !argv[i + 1].starts_with('-')
+        if (!arg.contains('=') && VALUE_FLAGS.contains(&arg.as_str()) && i + 1 < argv.len())
+            || (!arg.contains('=')
+                && OPTIONAL_VALUE_FLAGS.contains(&arg.as_str())
+                && i + 1 < argv.len()
+                && !argv[i + 1].starts_with('-'))
         {
             i += 2;
         } else {

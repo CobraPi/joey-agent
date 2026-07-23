@@ -465,7 +465,7 @@ impl Agent {
         let db = db_mutex.lock().unwrap_or_else(|p| p.into_inner());
         let mut row = StoredMessage::new(
             sid.clone(),
-            Role::from_str(&msg.role),
+            Role::from_label(&msg.role),
             msg.text_content(),
         );
         row.tool_call_id = msg.tool_call_id.clone();
@@ -831,7 +831,7 @@ impl Agent {
                     };
                     let _ = tx.send(AgentEvent::RetryAttempt {
                         attempt: retry_count,
-                        max_retries: max_retries,
+                        max_retries,
                         error: e.to_string(),
                         wait_secs: wait.as_secs_f64(),
                     });
@@ -1764,12 +1764,12 @@ impl Agent {
                         }
                         return true;
                     }
-                    if self.config.tool_delay > 0.0 && executed < total {
-                        if self
+                    if self.config.tool_delay > 0.0
+                        && executed < total
+                        && self
                             .sleep_with_interrupt(Duration::from_secs_f64(self.config.tool_delay))
                             .await
-                            && executed < total
-                        {
+                    {
                             let remaining: Vec<&ToolCall> = tool_calls[executed..].iter().collect();
                             for skipped in remaining {
                                 let content = format!(
@@ -1783,7 +1783,6 @@ impl Agent {
                             }
                             return true;
                         }
-                    }
                 }
             }
         }
@@ -2082,6 +2081,58 @@ fn summarize_args(name: &str, args: &Value) -> String {
     }
 }
 
+/// Infinite-supply transport for stress tests: cycles a tool-call response
+/// then a stop response forever, carrying real usage so compression
+/// thresholds get exercised across many turns.
+#[cfg(test)]
+struct CyclingTransport {
+    calls: std::sync::Mutex<u64>,
+}
+
+#[cfg(test)]
+impl CyclingTransport {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { calls: std::sync::Mutex::new(0) })
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl Transport for CyclingTransport {
+    async fn complete(&self, _req: &ProviderRequest) -> Result<NormalizedResponse, ProviderError> {
+        let mut n = self.calls.lock().unwrap();
+        *n += 1;
+        let usage = Usage {
+            prompt_tokens: 500,
+            completion_tokens: 100,
+            total_tokens: 600,
+            ..Default::default()
+        };
+        if n.is_multiple_of(2) {
+            Ok(NormalizedResponse {
+                tool_calls: vec![ToolCall::new(&format!("call_{n}"), "echo", r#"{"text": "hi"}"#)],
+                finish_reason: FinishReason::ToolCalls,
+                usage,
+                ..NormalizedResponse::empty()
+            })
+        } else {
+            Ok(NormalizedResponse {
+                content: format!("turn response {n}"),
+                finish_reason: FinishReason::Stop,
+                usage,
+                ..NormalizedResponse::empty()
+            })
+        }
+    }
+    async fn stream(
+        &self,
+        req: &ProviderRequest,
+        _tx: mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<NormalizedResponse, ProviderError> {
+        self.complete(req).await
+    }
+}
+
 /// A one-line preview of a tool result for verbose TUI display.
 /// Shows the first non-empty line, truncated to 100 chars.
 fn preview_result(content: &str) -> String {
@@ -2098,6 +2149,7 @@ fn preview_result(content: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use joey_tools::registry::{Tool, ToolResult};
@@ -2262,6 +2314,10 @@ mod tests {
         out
     }
 
+    // Guard held deliberately across `.await` in tests below: it serializes
+    // tests that mutate the process-global HOME env var, not an async
+    // resource, so there is no real lock-contention/deadlock risk here.
+    #[allow(clippy::await_holding_lock)]
     fn lock<'a>() -> std::sync::MutexGuard<'a, ()> {
         crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -2731,5 +2787,52 @@ mod tests {
         );
         assert!(invalid_tool_name_error_content("", &valid)
             .starts_with("Tool call rejected: the tool name was empty."));
+    }
+
+    /// Many-turn stress: 300 sequential `run_turn` calls, each finishing in
+    /// bounded time. A hang shows up as this test timing out; a crash shows
+    /// up as a panic. Guards against turn-count-dependent underflow/index
+    /// bugs in `drop_trailing_synthetic_scaffolding` /
+    /// `repair_dangling_tool_tail` / compression bookkeeping — the class of
+    /// bug that only manifests "after a certain number of turns".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn many_sequential_turns_never_panics_or_hangs() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf(), Config::defaults(), "stress-session");
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let config = AgentConfig {
+            model: "test-model".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: None,
+            max_turns: 20,
+            api_max_retries: 3,
+            tool_delay: 0.0,
+            reasoning: None,
+            enabled_tools: vec!["echo".to_string()],
+            max_tokens: None,
+            stream: false,
+            pass_session_id: false,
+        };
+        let mut agent = Agent::new(config, registry, ctx).expect("agent");
+        let transport = CyclingTransport::new();
+        agent.set_transport_for_tests(transport);
+
+        let total_turns = 300;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            for i in 0..total_turns {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let r = agent.run_turn(&format!("question {i}"), tx).await;
+                drain(&mut rx);
+                assert!(!r.final_text.is_empty(), "turn {i} produced empty final text");
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "agent hung before completing {total_turns} turns");
+        drop(guard);
     }
 }

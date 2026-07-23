@@ -67,7 +67,7 @@ pub fn safe_result_filename(tool_use_id: &str) -> String {
         let digest = hex::encode(Sha256::digest(raw_id.as_bytes()));
         let short = &digest[..12];
         let mut base: String = stem.chars().take(MAX_STEM).collect();
-        base = base.trim_end_matches(|c| c == '.' || c == '_' || c == '-').to_string();
+        base = base.trim_end_matches(['.', '_', '-']).to_string();
         if base.is_empty() {
             base = "tool_result".to_string();
         }

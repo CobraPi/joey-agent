@@ -78,7 +78,7 @@ impl LocalZone {
     }
 
     /// Re-express an instant in this zone's offset (Python `astimezone`).
-    pub(crate) fn to_fixed(&self, instant: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+    pub(crate) fn convert_fixed(&self, instant: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
         match self {
             LocalZone::Named(tz) => instant.with_timezone(tz).fixed_offset(),
             LocalZone::System => instant.with_timezone(&Local).fixed_offset(),

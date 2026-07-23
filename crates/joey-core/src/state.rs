@@ -282,7 +282,7 @@ impl Role {
         }
     }
 
-    pub fn from_str(s: &str) -> Role {
+    pub fn from_label(s: &str) -> Role {
         match s {
             "system" => Role::System,
             "assistant" => Role::Assistant,
@@ -572,6 +572,7 @@ impl SessionDb {
     /// Extract expected columns per table from SCHEMA_SQL using an in-memory
     /// reference database (port of `_parse_schema_columns` — SQLite itself
     /// parses the DDL, zero regex edge cases).
+    #[allow(clippy::type_complexity)]
     fn parse_schema_columns() -> Result<Vec<(String, Vec<(String, String)>)>> {
         let reference = Connection::open_in_memory()?;
         reference.execute_batch(SCHEMA_SQL)?;
@@ -672,12 +673,12 @@ impl SessionDb {
                 Ok(v) => {
                     let n = self.write_count.get() + 1;
                     self.write_count.set(n);
-                    if n % CHECKPOINT_EVERY_N_WRITES == 0 {
+                    if n.is_multiple_of(CHECKPOINT_EVERY_N_WRITES) {
                         let _ = self
                             .conn
                             .execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
                     }
-                    if n % OPTIMIZE_EVERY_N_WRITES == 0 && self.fts_enabled {
+                    if n.is_multiple_of(OPTIMIZE_EVERY_N_WRITES) && self.fts_enabled {
                         let _ = self.conn.execute_batch(
                             "INSERT INTO messages_fts(messages_fts) VALUES('optimize')",
                         );
@@ -803,7 +804,7 @@ impl SessionDb {
             Ok(StoredMessage {
                 id: Some(r.get(0)?),
                 session_id: r.get(1)?,
-                role: Role::from_str(&r.get::<_, String>(2)?),
+                role: Role::from_label(&r.get::<_, String>(2)?),
                 content: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 tool_calls: r.get(4)?,
                 tool_call_id: r.get(5)?,
@@ -945,7 +946,7 @@ impl SessionDb {
             Ok(SearchHit {
                 session_id: r.get(0)?,
                 message_id: r.get(1)?,
-                role: Role::from_str(&r.get::<_, String>(2)?),
+                role: Role::from_label(&r.get::<_, String>(2)?),
                 snippet: r.get(3)?,
             })
         })?;

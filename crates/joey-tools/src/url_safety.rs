@@ -236,7 +236,7 @@ mod tests {
     }
 
     fn no_dns(_: &str) -> std::io::Result<Vec<IpAddr>> {
-        Err(std::io::Error::new(std::io::ErrorKind::Other, "no dns in tests"))
+        Err(std::io::Error::other("no dns in tests"))
     }
 
     #[test]

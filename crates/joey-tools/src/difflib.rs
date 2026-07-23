@@ -217,7 +217,7 @@ impl<'a, T: Eq + Hash> SequenceMatcher<'a, T> {
             }
             group.push((tag, i1, i2, j1, j2));
         }
-        if !group.is_empty() && !(group.len() == 1 && group[0].0 == Tag::Equal) {
+        if !(group.is_empty() || (group.len() == 1 && group[0].0 == Tag::Equal)) {
             groups.push(group);
         }
         groups

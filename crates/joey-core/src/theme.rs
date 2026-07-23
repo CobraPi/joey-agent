@@ -296,7 +296,7 @@ pub fn diagonal_field(width: usize, color: Rgb) -> String {
 
 /// A gradient diagonal field: `╱` characters with a left-to-right gradient.
 pub fn gradient_diagonal_field(width: usize, c1: Rgb, c2: Rgb) -> String {
-    let field: String = std::iter::repeat('╱').take(width).collect();
+    let field: String = std::iter::repeat_n('╱', width).collect();
     gradient_fg(&field, c1, c2)
 }
 

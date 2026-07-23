@@ -113,7 +113,7 @@ struct CustomProviderInfo {
 }
 
 fn yaml_str(map: &serde_yaml::Mapping, key: &str) -> String {
-    map.get(&Yaml::String(key.to_string()))
+    map.get(Yaml::String(key.to_string()))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
@@ -956,7 +956,7 @@ fn detect_api_mode_for_url(base_url: &str) -> Option<&'static str> {
     }
     // Anthropic-compatible gateways conventionally expose the native
     // protocol under an /anthropic suffix.
-    let path = normalized.splitn(2, "://").nth(1).and_then(|rest| rest.find('/').map(|i| &rest[i..]))
+    let path = normalized.split_once("://").map(|x| x.1).and_then(|rest| rest.find('/').map(|i| &rest[i..]))
         .unwrap_or("");
     let path = path.trim_end_matches('/');
     if path.ends_with("/anthropic") || path.ends_with("/anthropic/v1") {
@@ -1069,7 +1069,7 @@ fn save_custom_provider(
         if !model.is_empty() {
             map.insert(Yaml::String("model".into()), Yaml::String(model.into()));
             if let Some(ctx) = context_length {
-                let mut models_cfg = match map.get(&Yaml::String("models".into())) {
+                let mut models_cfg = match map.get(Yaml::String("models".into())) {
                     Some(Yaml::Mapping(m)) => m.clone(),
                     _ => serde_yaml::Mapping::new(),
                 };
@@ -1082,7 +1082,7 @@ fn save_custom_provider(
         if !api_mode.is_empty() {
             map.insert(Yaml::String("api_mode".into()), Yaml::String(api_mode.into()));
         } else {
-            map.remove(&Yaml::String("api_mode".into()));
+            map.remove(Yaml::String("api_mode".into()));
         }
         cfg.set_value_and_save("custom_providers", Yaml::Sequence(providers))?;
         return Ok(());
@@ -1090,7 +1090,7 @@ fn save_custom_provider(
 
     let display_name = if name.is_empty() { auto_provider_name(base_url) } else { name.to_string() };
     let mut map = serde_yaml::Mapping::new();
-    map.insert(Yaml::String("name".into()), Yaml::String(display_name.clone().into()));
+    map.insert(Yaml::String("name".into()), Yaml::String(display_name.clone()));
     map.insert(Yaml::String("base_url".into()), Yaml::String(base_url.into()));
     if !api_key.is_empty() {
         map.insert(Yaml::String("api_key".into()), Yaml::String(api_key.into()));
@@ -1569,9 +1569,7 @@ fn prompt_model_selection(
     println!();
 
     loop {
-        let Some(choice) = read_line(&format!("Choice [1-{}] (default: skip): ", n + 2)) else {
-            return None;
-        };
+        let choice = read_line(&format!("Choice [1-{}] (default: skip): ", n + 2))?;
         if choice.is_empty() {
             return None;
         }
