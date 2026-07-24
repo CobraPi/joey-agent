@@ -689,12 +689,163 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         "compress" => manual_compress(st, args).await,
         "checkpoint" => checkpoint_slash(st, args),
         "revert" | "rollback" => revert_slash(st, args),
+        // ── OMO slash commands ──
+        "agents" => omo_agents_slash(st),
+        "goal" => omo_goal_slash(st, args),
+        "start-work" => omo_start_work_slash(st, args).await,
         other => {
             // Registry says implemented but no handler — treat as unported.
             println!("Command '/{}' is not available in joey-agent yet.", other);
         }
     }
     SlashOutcome::Continue
+}
+
+// ---------------------------------------------------------------------------
+// OMO slash command handlers
+// ---------------------------------------------------------------------------
+
+/// `/agents` — list all 11 OMO agents with resolved models, modes, availability.
+fn omo_agents_slash(_st: &ReplState) {
+    // Build a registry with an empty available set (shows all agents, marks
+    // unresolved ones as unavailable).
+    let available = joey_omo::AvailableModelSet::new();
+    let overrides = joey_omo::agents::registry::ModelOverrides::new();
+    let registry = joey_omo::AgentRegistry::build(available, &overrides);
+
+    println!();
+    println!("{}", Color::Cyan.bold().paint("OMO Agent Registry (11 agents)"));
+    println!();
+    for agent in registry.all() {
+        let status = if agent.is_available() {
+            format!("[{}]", agent.resolved_model.as_deref().unwrap_or("?"))
+        } else {
+            Color::DarkGray.paint("(unavailable)").to_string()
+        };
+        let mode_label = if agent.mode.is_primary() { "Primary" } else { "Sub    " };
+        println!(
+            "  {:<20} {}  {}  {}",
+            Color::Green.paint(&agent.display_name),
+            mode_label,
+            status,
+            Color::DarkGray.paint(&agent.description),
+        );
+    }
+    println!();
+    println!("{}", Color::DarkGray.paint("Press Tab in TUI to cycle: Default → Sisyphus → Hephaestus → Prometheus → Atlas"));
+}
+
+/// `/goal` — manage persistent per-session objective (T094).
+fn omo_goal_slash(st: &mut ReplState, args: &str) {
+    let omo_dir = st.cwd.join(".omo");
+    let action = joey_omo::parse_goal_command(args);
+    let session_id = st.session_id.clone();
+
+    match action {
+        joey_omo::GoalAction::Set { objective } => {
+            if objective.is_empty() {
+                render::info("Usage: /goal set <objective text>");
+                return;
+            }
+            let goal = joey_omo::GoalState::new(session_id, objective.clone());
+            match goal.write(&omo_dir) {
+                Ok(_) => render::success(&format!("Goal set: {}", objective)),
+                Err(e) => render::error(&format!("Failed to write goal: {}", e)),
+            }
+        }
+        joey_omo::GoalAction::Pause => {
+            if let Some(mut goal) = joey_omo::GoalState::read(&omo_dir) {
+                goal.status = joey_omo::GoalStatus::Paused;
+                let _ = goal.write(&omo_dir);
+                render::info("Goal paused (no continuation injection).");
+            } else {
+                render::info("No goal set. Use /goal set <text>.");
+            }
+        }
+        joey_omo::GoalAction::Resume => {
+            if let Some(mut goal) = joey_omo::GoalState::read(&omo_dir) {
+                goal.status = joey_omo::GoalStatus::Active;
+                let _ = goal.write(&omo_dir);
+                render::info("Goal resumed (continuation injection active).");
+            } else {
+                render::info("No goal set. Use /goal set <text>.");
+            }
+        }
+        joey_omo::GoalAction::Clear => {
+            joey_omo::GoalState::clear(&omo_dir);
+            render::info("Goal cleared.");
+        }
+        joey_omo::GoalAction::Show => {
+            match joey_omo::GoalState::read(&omo_dir) {
+                Some(goal) => {
+                    let status = match goal.status {
+                        joey_omo::GoalStatus::Active => "Active",
+                        joey_omo::GoalStatus::Paused => "Paused",
+                    };
+                    println!("Goal [{}]: {}", status, goal.objective);
+                }
+                None => {
+                    render::info("No goal set. Usage: /goal set <text>");
+                }
+            }
+        }
+    }
+}
+
+/// `/start-work [plan-name]` — activate Atlas on a plan (T092).
+async fn omo_start_work_slash(st: &mut ReplState, args: &str) {
+    let omo_dir = st.cwd.join(".omo");
+    let plans_dir = omo_dir.join("plans");
+
+    // Determine the plan to work on.
+    let plan_name = if args.trim().is_empty() {
+        // No plan name given — check boulder state for auto-resume (BC-021).
+        let boulder = joey_omo::BoulderState::read(&omo_dir);
+        match boulder.active_count() {
+            0 => {
+                render::error("No active work. Usage: /start-work <plan-name>");
+                render::info("Use Prometheus to create a plan first.");
+                return;
+            }
+            1 => {
+                let active = boulder.select_active().unwrap();
+                render::info(&format!("Auto-resuming: {}", active.plan_name));
+                active.plan_name.clone()
+            }
+            _ => {
+                render::info("Multiple active works. Specify a plan name: /start-work <name>");
+                for w in &boulder.works {
+                    if w.status == joey_omo::BoulderWorkStatus::Active {
+                        println!("  · {}", w.plan_name);
+                    }
+                }
+                return;
+            }
+        }
+    } else {
+        args.trim().to_string()
+    };
+
+    // Check plan exists (BC-020).
+    let plan_path = plans_dir.join(format!("{}.md", plan_name));
+    if !plan_path.exists() {
+        render::error(&format!("Plan not found: .omo/plans/{}.md", plan_name));
+        render::info("Use Prometheus (@plan) to create a plan first.");
+        return;
+    }
+
+    // Create/update boulder state.
+    let mut boulder = joey_omo::BoulderState::read(&omo_dir);
+    let work = boulder.create_work(
+        plan_path.to_string_lossy().to_string(),
+        plan_name.clone(),
+        st.session_id.clone(),
+    );
+    let work_id = work.id.clone();
+    let _ = boulder.write(&omo_dir);
+
+    render::success(&format!("Started work: {} (id: {})", plan_name, work_id));
+    render::info("Atlas activated. Tasks will be delegated and verified.");
 }
 
 fn print_help() {

@@ -111,6 +111,43 @@ pub enum AgentEvent {
         total_duration_secs: f64,
     },
 
+    // ── OMO orchestration events ─────────────────────────────────────
+    /// The active agent mode changed via Tab picker (T035, BC-015).
+    AgentModeChanged {
+        agent_name: String,
+        model: String,
+    },
+    /// A category-based delegation was dispatched (T059).
+    CategoryDelegation {
+        category: String,
+        model: String,
+    },
+    /// Boulder work started (T097, BC-029).
+    BoulderWorkStarted {
+        plan_name: String,
+        work_id: String,
+    },
+    /// Boulder work resumed.
+    BoulderWorkResumed {
+        plan_name: String,
+        work_id: String,
+    },
+    /// Boulder work completed (all tasks done).
+    BoulderWorkCompleted {
+        plan_name: String,
+        work_id: String,
+    },
+    /// A goal was set or updated (T097).
+    GoalSet {
+        objective: String,
+    },
+    /// A goal was cleared.
+    GoalCleared,
+    /// Wisdom accumulated during plan execution (T097).
+    WisdomAccumulated {
+        learnings_count: usize,
+    },
+
     // ── Turn end ──────────────────────────────────────────────────────
     /// The turn finished; carries the final text and cumulative usage.
     Done {

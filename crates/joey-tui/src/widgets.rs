@@ -16,7 +16,7 @@ use ratatui::Frame;
 use crate::anim::{Equalizer, ParticleField, Pulse, Spinner};
 use crate::input::Input;
 use crate::state::{
-    AgentPhase, App, NoticeKind, RunMode, ToolStatus, TranscriptItem,
+    AgentPhase, App, DisplayAgent, NoticeKind, RunMode, ToolStatus, TranscriptItem,
 };
 use crate::theme::{gradient_spans, Rgb, Theme};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -836,4 +836,134 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         .collect();
     let list = List::new(items);
     f.render_widget(list, inner);
+}
+
+// ── Agent picker overlay (T028 / BC-013) ────────────────────────────────────
+
+/// Render the agent picker as a centered popup. Only draws when
+/// `app.agent_picker_open` is true.
+pub fn draw_agent_picker(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    if !app.agent_picker_open {
+        return;
+    }
+
+    let theme = *theme;
+    let roster_len = app.agent_roster.len();
+    if roster_len == 0 {
+        return;
+    }
+
+    // Width ~44; height = one row per agent + footer + border (2).
+    let content_rows = roster_len + 1; // +1 for the hint/footer line
+    let w = 44.min(area.width);
+    let h = ((content_rows + 2) as u16).min(area.height); // +2 for borders
+    if w < 24 || h < 5 {
+        return;
+    }
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 2;
+    let modal = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, modal);
+    let block = gradient_block_focused(" Agent Mode ", theme, 0.8);
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(roster_len + 1);
+    for (i, agent) in app.agent_roster.iter().enumerate() {
+        let is_cursor = i == app.agent_picker_cursor;
+        let is_active = i == app.active_agent_index;
+
+        let marker = if is_cursor { "► " } else { "  " };
+        let marker_col = if is_cursor { theme.accent } else { theme.fg_most_subtle };
+
+        let name_col = if is_active {
+            theme.gold
+        } else if is_cursor {
+            theme.fg_base
+        } else {
+            theme.fg_subtle
+        };
+
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(
+            marker.to_string(),
+            Style::default().fg(marker_col.to_color()).add_modifier(Modifier::BOLD),
+        )];
+
+        // Active badge (star) before the display name.
+        if is_active {
+            spans.push(Span::styled(
+                "★ ".to_string(),
+                Style::default().fg(theme.gold.to_color()),
+            ));
+        }
+
+        let name_mod = if is_active || is_cursor {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        };
+        spans.push(Span::styled(
+            agent.display_name.clone(),
+            Style::default().fg(name_col.to_color()).add_modifier(name_mod),
+        ));
+
+        // Mode tag (Primary/Sub).
+        spans.push(Span::styled(
+            format!("  {}", agent.mode),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ));
+
+        // Resolved model in brackets (dimmed).
+        let model_str = agent
+            .resolved_model
+            .clone()
+            .unwrap_or_else(|| "unavailable".to_string());
+        spans.push(Span::styled(
+            format!("  [{}]", model_str),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        ));
+
+        lines.push(Line::from(spans));
+    }
+
+    // Footer hint.
+    lines.push(Line::from(vec![Span::styled(
+        " ↑↓ navigate · ⏎ select · Esc cancel ".to_string(),
+        Style::default().fg(theme.fg_most_subtle.to_color()),
+    )]));
+
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Build the TUI agent roster from joey-omo's `AgentRegistry`.
+///
+/// The "Default" agent (the existing joey-agent) is always first, followed by
+/// each available primary agent in canonical Tab order (`tab_order()`).
+pub fn build_agent_roster_from_registry(registry: &joey_omo::AgentRegistry) -> Vec<DisplayAgent> {
+    let mut roster = Vec::new();
+
+    // 1. The "Default" agent — always present, always first.
+    roster.push(DisplayAgent {
+        name: "default".to_string(),
+        display_name: "Default".to_string(),
+        color: String::new(),
+        mode: "Primary".to_string(),
+        resolved_model: None,
+        description: "The standard joey-agent (no OMO orchestration)".to_string(),
+    });
+
+    // 2. Available primary agents in canonical Tab order.
+    for agent in registry.tab_order() {
+        roster.push(DisplayAgent {
+            name: agent.name.clone(),
+            display_name: agent.display_name.clone(),
+            color: agent.color.clone(),
+            mode: agent.mode.label().to_string(),
+            resolved_model: agent.resolved_model.clone(),
+            description: agent.description.clone(),
+        });
+    }
+
+    roster
 }

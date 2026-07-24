@@ -1562,6 +1562,7 @@ dependencies = [
  "joey-core",
  "joey-cron",
  "joey-mcp",
+ "joey-omo",
  "joey-orchestration",
  "joey-providers",
  "joey-tools",
@@ -1670,6 +1671,24 @@ dependencies = [
  "tokio",
  "tracing",
  "which",
+]
+
+[[package]]
+name = "joey-omo"
+version = "0.19.0"
+dependencies = [
+ "chrono",
+ "joey-agent-core",
+ "joey-core",
+ "joey-orchestration",
+ "joey-providers",
+ "joey-tools",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1798,6 +1817,7 @@ version = "0.19.0"
 dependencies = [
  "crossterm 0.28.1",
  "joey-agent-core",
+ "joey-omo",
  "joey-providers",
  "ratatui",
  "textwrap",

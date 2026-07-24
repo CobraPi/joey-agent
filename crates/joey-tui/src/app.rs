@@ -41,6 +41,8 @@ pub enum TuiAction {
     Interrupt,
     /// The user wants to quit the session.
     Quit,
+    /// Switch to a different agent (T033, BC-015).
+    SwitchAgent(String),
 }
 
 pub type FrameBackend = CrosstermBackend<Stdout>;
@@ -262,6 +264,10 @@ impl Tui {
             if *show_help {
                 widgets::draw_help_overlay(f, area, theme);
             }
+
+            if app.agent_picker_open {
+                widgets::draw_agent_picker(f, area, app, &theme);
+            }
         })?;
         Ok(())
     }
@@ -317,6 +323,46 @@ impl Tui {
             return None;
         }
 
+        // Agent picker overlay swallows keys until dismissed (BC-014).
+        if self.app.agent_picker_open {
+            let roster_len = self.app.agent_roster.len();
+            match key.code {
+                KeyCode::Esc => {
+                    self.app.agent_picker_open = false;
+                    return None;
+                }
+                KeyCode::Enter => {
+                    // Select the highlighted agent (BC-015).
+                    let idx = self.app.agent_picker_cursor;
+                    self.app.agent_picker_open = false;
+                    if idx < roster_len {
+                        let agent_name = self.app.agent_roster[idx].name.clone();
+                        self.app.active_agent_index = idx;
+                        return Some(TuiAction::SwitchAgent(agent_name));
+                    }
+                    return None;
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    if roster_len > 0 {
+                        self.app.agent_picker_cursor =
+                            (self.app.agent_picker_cursor + 1) % roster_len;
+                    }
+                    return None;
+                }
+                KeyCode::Up => {
+                    if roster_len > 0 {
+                        if self.app.agent_picker_cursor == 0 {
+                            self.app.agent_picker_cursor = roster_len - 1;
+                        } else {
+                            self.app.agent_picker_cursor -= 1;
+                        }
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+
         // Global keys.
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -352,11 +398,25 @@ impl Tui {
                 return None;
             }
             KeyCode::Tab => {
-                self.focus = if self.focus == Focus::Input {
-                    Focus::Transcript
+                // Tab opens the agent picker overlay (BC-013). If busy, the
+                // switch is deferred to the next turn (BC-016).
+                if self.app.is_busy() {
+                    // Deferred: queue for next turn (host handles the queue).
+                    // For now, just ignore — the host can check on next turn.
                 } else {
-                    Focus::Input
-                };
+                    self.app.agent_picker_open = true;
+                }
+                return None;
+            }
+            KeyCode::BackTab => {
+                // Shift+Tab: if picker is open, cycle backward. Otherwise no-op.
+                if self.app.agent_picker_open && !self.app.agent_roster.is_empty() {
+                    if self.app.agent_picker_cursor == 0 {
+                        self.app.agent_picker_cursor = self.app.agent_roster.len() - 1;
+                    } else {
+                        self.app.agent_picker_cursor -= 1;
+                    }
+                }
                 return None;
             }
             KeyCode::PageUp => {

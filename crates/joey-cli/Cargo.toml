@@ -17,6 +17,7 @@ joey-cron.workspace = true
 joey-mcp.workspace = true
 joey-tui.workspace = true
 joey-orchestration.workspace = true
+joey-omo.workspace = true
 crossterm.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true

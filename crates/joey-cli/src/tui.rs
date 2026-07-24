@@ -224,6 +224,13 @@ async fn interactive_loop(tui: &mut Tui, agent: &mut Agent) -> anyhow::Result<()
         match action {
             TuiAction::Quit => return Ok(()),
             TuiAction::Interrupt => continue,
+            TuiAction::SwitchAgent(agent_name) => {
+                // The host handles agent switching by rebuilding the AgentConfig.
+                // For now, emit a notice so the user sees feedback.
+                tui.app_mut().apply(joey_agent_core::AgentEvent::Notice(
+                    format!("Switched to agent: {}", agent_name),
+                ));
+            }
             TuiAction::Submit(text) => {
                 if text.trim_start().starts_with('/') {
                     if let SlashAction::Quit = handle_slash_tui(&text, tui) {
@@ -354,6 +361,12 @@ async fn run_turn(
                                                 preview
                                             ),
                                             kind: NoticeKind::Busy,
+                                        });
+                                    }
+                                    TuiAction::SwitchAgent(agent_name) => {
+                                        tui.app_mut().push_item(TranscriptItem::Notice {
+                                            text: format!("Switched to: {}", agent_name),
+                                            kind: NoticeKind::Info,
                                         });
                                     }
                                 }

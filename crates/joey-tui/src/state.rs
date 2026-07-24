@@ -69,6 +69,52 @@ pub enum AgentPhase {
     Done,
 }
 
+/// For the Tab picker and activity panel roster (T028, data-model.md).
+#[derive(Clone, Debug)]
+pub struct DisplayAgent {
+    /// Canonical name (e.g. "sisyphus", "default").
+    pub name: String,
+    /// Human label (e.g. "Sisyphus", "Default").
+    pub display_name: String,
+    /// Hex color string.
+    pub color: String,
+    /// Primary or Subagent.
+    pub mode: String,
+    /// Resolved model (None = unavailable/skipped).
+    pub resolved_model: Option<String>,
+    /// Short description.
+    pub description: String,
+}
+
+/// For the activity panel when subagents are running (T064).
+#[derive(Clone, Debug)]
+pub struct ActiveSubagentEntry {
+    /// Unique entry ID.
+    pub id: usize,
+    /// "explore", "librarian", "oracle", "sisyphus-junior", etc.
+    pub agent_type: String,
+    /// If category-spawned (e.g. "quick").
+    pub category: Option<String>,
+    /// Running, Done, Failed.
+    pub status: SubagentStatus,
+    /// "querying model", "running tool: X", "reasoning".
+    pub phase: String,
+    /// Resolved model.
+    pub model: String,
+    /// API calls made.
+    pub iterations: usize,
+    /// For elapsed time.
+    pub started: Instant,
+}
+
+/// Status of a subagent entry in the activity panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubagentStatus {
+    Running,
+    Done,
+    Failed,
+}
+
 /// Top-level run mode of the TUI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunMode {
@@ -123,6 +169,19 @@ pub struct App {
     /// immutable rendering.
     pub last_max_scroll: Cell<usize>,
     pub last_final_text: String,
+    // ── OMO agent picker state (T028) ──
+    /// Agent picker overlay is open.
+    pub agent_picker_open: bool,
+    /// Cursor position in the agent picker.
+    pub agent_picker_cursor: usize,
+    /// The agent roster for the picker (Default + available OMO agents).
+    pub agent_roster: Vec<DisplayAgent>,
+    /// Index of the currently active agent (0=Default).
+    pub active_agent_index: usize,
+    /// Active subagent entries for the activity panel (T064).
+    pub subagent_entries: Vec<ActiveSubagentEntry>,
+    /// Learnings counter for wisdom accumulation display.
+    pub learnings_count: usize,
 }
 
 impl App {
@@ -147,6 +206,12 @@ impl App {
             scroll: None,
             last_max_scroll: Cell::new(0),
             last_final_text: String::new(),
+            agent_picker_open: false,
+            agent_picker_cursor: 0,
+            agent_roster: Vec::new(),
+            active_agent_index: 0,
+            subagent_entries: Vec::new(),
+            learnings_count: 0,
         }
     }
 
@@ -378,6 +443,56 @@ impl App {
                 self.push_item(TranscriptItem::Notice {
                     text: format!("Batch: {}/{} done, {} failed", succeeded, total, failed),
                     kind: if failed > 0 { NoticeKind::Warning } else { NoticeKind::Success },
+                });
+            }
+            // ── OMO orchestration events (additive — no UI action needed in
+            // the transcript; the activity panel reads these separately) ──
+            AgentEvent::AgentModeChanged { agent_name, model: _ } => {
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("Agent: {}", agent_name),
+                    kind: NoticeKind::Info,
+                });
+            }
+            AgentEvent::CategoryDelegation { category, model } => {
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("Category [{}] → {}", category, model),
+                    kind: NoticeKind::Busy,
+                });
+            }
+            AgentEvent::BoulderWorkStarted { plan_name, work_id: _ } => {
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("Started work: {}", plan_name),
+                    kind: NoticeKind::Success,
+                });
+            }
+            AgentEvent::BoulderWorkResumed { plan_name, work_id: _ } => {
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("Resumed work: {}", plan_name),
+                    kind: NoticeKind::Info,
+                });
+            }
+            AgentEvent::BoulderWorkCompleted { plan_name, work_id: _ } => {
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("Completed work: {}", plan_name),
+                    kind: NoticeKind::Success,
+                });
+            }
+            AgentEvent::GoalSet { objective } => {
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("Goal set: {}", objective),
+                    kind: NoticeKind::Success,
+                });
+            }
+            AgentEvent::GoalCleared => {
+                self.push_item(TranscriptItem::Notice {
+                    text: "Goal cleared".into(),
+                    kind: NoticeKind::Info,
+                });
+            }
+            AgentEvent::WisdomAccumulated { learnings_count } => {
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("Wisdom: {} learnings", learnings_count),
+                    kind: NoticeKind::Info,
                 });
             }
             AgentEvent::Done { final_text, usage: _, iterations } => {

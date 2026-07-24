@@ -380,6 +380,45 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 println!("{}", t.error.ansi().paint(format!("Error: {}", err)));
                 break;
             }
+            // ── OMO orchestration events (additive) ──
+            AgentEvent::AgentModeChanged { agent_name, model: _ } => {
+                println!("{} agent → {}",
+                    t.fg_subtle.ansi().paint("◆"),
+                    t.fg_base.ansi().paint(&agent_name));
+            }
+            AgentEvent::CategoryDelegation { category, model } => {
+                println!("{} [{}] → {}",
+                    t.fg_subtle.ansi().paint("◇"),
+                    category, model);
+            }
+            AgentEvent::BoulderWorkStarted { plan_name, work_id: _ } => {
+                println!("{} started work: {}",
+                    t.success.ansi().paint("▶"),
+                    plan_name);
+            }
+            AgentEvent::BoulderWorkResumed { plan_name, work_id: _ } => {
+                println!("{} resumed work: {}",
+                    t.fg_subtle.ansi().paint("↻"),
+                    plan_name);
+            }
+            AgentEvent::BoulderWorkCompleted { plan_name, work_id: _ } => {
+                println!("{} completed: {}",
+                    t.success.ansi().paint("✓"),
+                    plan_name);
+            }
+            AgentEvent::GoalSet { objective } => {
+                println!("{} goal set: {}",
+                    t.success.ansi().paint("◎"),
+                    objective);
+            }
+            AgentEvent::GoalCleared => {
+                println!("{} goal cleared", t.fg_subtle.ansi().paint("○"));
+            }
+            AgentEvent::WisdomAccumulated { learnings_count } => {
+                println!("{} {} learnings accumulated",
+                    t.fg_subtle.ansi().paint("✦"),
+                    learnings_count);
+            }
         }
     }
     final_text
