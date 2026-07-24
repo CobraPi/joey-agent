@@ -36,6 +36,10 @@ pub fn error(msg: &str) {
     eprintln!("{}", theme().error.ansi().paint(format!("error: {}", msg)));
 }
 
+pub fn warning(msg: &str) {
+    eprintln!("{}", theme().warning.ansi().paint(format!("⚠ {}", msg)));
+}
+
 pub fn success(msg: &str) {
     println!("{}", theme().success.ansi().paint(msg));
 }

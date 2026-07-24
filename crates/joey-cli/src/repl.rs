@@ -75,6 +75,14 @@ pub(crate) struct ReplState {
     checkpoints: Option<joey_tools::vcs::CheckpointManager>,
     /// Last time an automatic checkpoint was taken.
     last_auto_checkpoint: Instant,
+    /// Active OMO agent name for IntentGate ("default" when no OMO agent is
+    /// selected — the line REPL has no Tab picker, so this stays "default"
+    /// unless a future agent-switch slash command sets it).
+    active_agent: String,
+    /// Pending OMO context injection (set by /start-work, consumed on next prompt).
+    pending_context_injection: Option<String>,
+    /// The current model name (for dispatch_system_prompt calls).
+    model: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +149,15 @@ pub(crate) fn build_agent(
     // Wire clarify (interactive only — channel wired at runtime).
     joey_tools::builtins::register_clarify_tool(&mut registry, None);
 
+    // ── Initialize LSP from config (crush-style code intelligence) ────
+    {
+        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let lsp_mgr = joey_tools::lsp::LspManager::from_joey_config(&config, root);
+        if lsp_mgr.has_servers() {
+            joey_tools::tools::lsp_tools::register_lsp_manager(lsp_mgr);
+        }
+    }
+
     // Wire orchestration: construct SubagentManager and register delegate_task.
     let mgr_config = joey_orchestration::ManagerConfig::from_config(config);
     let manager = std::sync::Arc::new(joey_orchestration::SubagentManager::new(mgr_config));
@@ -159,6 +176,19 @@ pub(crate) fn build_agent(
         Agent::new(agent_cfg, registry, ctx).map_err(|e| anyhow::anyhow!("{}", e))?;
     // Inject the shared concurrency limiter into the agent's transport path.
     agent.set_provider_semaphore(manager.semaphore());
+
+    // ── Load PreToolUse hooks from config (crush-style) ──────────────
+    {
+        let hooks_cfg = joey_agent_core::hooks::load_hooks_from_config(&config);
+        if !hooks_cfg.is_empty() {
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let runner = joey_agent_core::hooks::PreToolUseRunner::new(hooks_cfg, cwd);
+            agent.set_hooks(Some(runner));
+        }
+    }
+
     if !history.is_empty() {
         agent.set_history(history);
     }
@@ -240,6 +270,42 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let db = SessionDb::open_default().ok();
 
+    // ── Project trust check (pi-style) ───────────────────────────────
+    {
+        let resources = crate::project_trust::scan_project(&cwd);
+        if resources.requires_trust_prompt() {
+            let mut trust_store = crate::project_trust::TrustStore::load();
+            let cwd_str = cwd.to_string_lossy().to_string();
+            if !trust_store.is_trusted(&cwd_str) {
+                // Display the trust prompt.
+                let prompt = crate::project_trust::trust_prompt(&cwd, &resources);
+                render::boxed_header("⚕ Project Trust");
+                println!("{}", prompt);
+                println!();
+                print!("Trust this project? [y/N/session] ");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let mut input = String::new();
+                let _ = std::io::stdin().read_line(&mut input);
+                let input = input.trim().to_lowercase();
+                let level = match input.as_str() {
+                    "y" | "yes" => {
+                        crate::project_trust::TrustLevel::Trusted
+                    }
+                    "s" | "session" => {
+                        crate::project_trust::TrustLevel::SessionOnly
+                    }
+                    _ => {
+                        render::warning("Project not trusted — project-local resources will be ignored.");
+                        crate::project_trust::TrustLevel::Untrusted
+                    }
+                };
+                trust_store.set(&cwd_str, level);
+                let _ = trust_store.save();
+            }
+        }
+    }
+
     // Establish or resume a session (-r by id-or-title; -c by name/most recent).
     let mut resumed = false;
     let session_id = if let Some(target) = &opts.resume {
@@ -312,6 +378,7 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         quiet: opts.quiet,
     };
 
+    let st_config_model = config.model();
     let mut st = ReplState {
         config,
         cwd: cwd.clone(),
@@ -326,6 +393,9 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         session_start: Instant::now(),
         checkpoints: None,
         last_auto_checkpoint: Instant::now(),
+        active_agent: "default".to_string(),
+        pending_context_injection: None,
+        model: st_config_model.clone(),
     };
 
     // Initialize session-scoped filesystem checkpoints (fresh every session).
@@ -492,8 +562,15 @@ async fn process_input(raw: &str, st: &mut ReplState) -> LoopOutcome {
     }
 
     let mut turn_input = String::new();
+    // Inject pending OMO context (from /start-work) as the base.
+    if let Some(ctx) = st.pending_context_injection.take() {
+        turn_input = ctx;
+    }
     if !st.queued.is_empty() {
-        turn_input = st.queued.join("\n");
+        if !turn_input.is_empty() {
+            turn_input.push('\n');
+        }
+        turn_input.push_str(&st.queued.join("\n"));
         st.queued.clear();
     }
     if !input.is_empty() {
@@ -511,6 +588,7 @@ async fn process_input(raw: &str, st: &mut ReplState) -> LoopOutcome {
         return LoopOutcome::Continue;
     }
 
+    apply_intent_gate(st, &turn_input);
     run_turn_interactive(st, &turn_input).await;
     println!();
     LoopOutcome::Continue
@@ -553,6 +631,41 @@ async fn run_turn_interactive(st: &mut ReplState, input: &str) -> String {
     maybe_auto_checkpoint(st);
 
     final_text
+}
+
+// ---------------------------------------------------------------------------
+// IntentGate — OMO keyword detection (FR-022/FR-024, T107/T141)
+// ---------------------------------------------------------------------------
+
+/// Scan the user's message for OMO keyword triggers before the turn runs.
+/// When `ultrawork`/`ulw` is detected and the active agent supports it,
+/// inject the ultrawork instruction set as an overlay on the system prompt.
+/// Prometheus and unknown agents silently ignore ultrawork (BC-025).
+fn apply_intent_gate(st: &mut ReplState, message: &str) {
+    let Some(keyword) = joey_omo::detect_keyword(message) else {
+        return;
+    };
+
+    match keyword {
+        joey_omo::KeywordType::Ultrawork | joey_omo::KeywordType::HyperplanUltraworkCombo => {
+            if joey_omo::check_ultrawork_activation(keyword, &st.active_agent).is_some() {
+                let overlay = joey_omo::ultrawork_prompt(st.agent.model());
+                st.agent.set_extra_instructions(Some(overlay));
+                render::success("⚡ ULTRAWORK MODE ENABLED!");
+            } else {
+                render::info(&format!(
+                    "ultrawork ignored — {} is a read-only planner",
+                    st.active_agent
+                ));
+            }
+        }
+        joey_omo::KeywordType::Hyperplan => {
+            render::info("⚡ HYPERPLAN MODE ENABLED!");
+        }
+        joey_omo::KeywordType::Team => {
+            render::info("TEAM MODE ENABLED!");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +767,7 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         }
         "config" => config_slash(st, args),
         "status" => show_status(st),
+        "changes" => show_changes(),
         "usage" => show_usage(st),
         "verbose" => {
             let next = match st.ropts.tool_progress.as_str() {
@@ -793,59 +907,51 @@ fn omo_goal_slash(st: &mut ReplState, args: &str) {
 }
 
 /// `/start-work [plan-name]` — activate Atlas on a plan (T092).
+///
+/// Uses the OMO orchestrator runtime: reads boulder state, resolves the plan,
+/// switches agent to Atlas, and injects the execution context.
 async fn omo_start_work_slash(st: &mut ReplState, args: &str) {
     let omo_dir = st.cwd.join(".omo");
-    let plans_dir = omo_dir.join("plans");
 
-    // Determine the plan to work on.
-    let plan_name = if args.trim().is_empty() {
-        // No plan name given — check boulder state for auto-resume (BC-021).
-        let boulder = joey_omo::BoulderState::read(&omo_dir);
-        match boulder.active_count() {
-            0 => {
-                render::error("No active work. Usage: /start-work <plan-name>");
-                render::info("Use Prometheus to create a plan first.");
-                return;
-            }
-            1 => {
-                let active = boulder.select_active().unwrap();
-                render::info(&format!("Auto-resuming: {}", active.plan_name));
-                active.plan_name.clone()
-            }
-            _ => {
-                render::info("Multiple active works. Specify a plan name: /start-work <name>");
-                for w in &boulder.works {
-                    if w.status == joey_omo::BoulderWorkStatus::Active {
-                        println!("  · {}", w.plan_name);
-                    }
-                }
-                return;
-            }
-        }
+    // Use the orchestrator's start_work runtime.
+    let plan_name_opt = if args.trim().is_empty() {
+        None
     } else {
-        args.trim().to_string()
+        Some(args.trim())
     };
 
-    // Check plan exists (BC-020).
-    let plan_path = plans_dir.join(format!("{}.md", plan_name));
-    if !plan_path.exists() {
-        render::error(&format!("Plan not found: .omo/plans/{}.md", plan_name));
-        render::info("Use Prometheus (@plan) to create a plan first.");
-        return;
+    match joey_omo::start_work(&omo_dir, &st.session_id, plan_name_opt) {
+        Ok(result) => {
+            // Switch agent to Atlas by injecting Atlas identity.
+            let atlas_prompt = joey_omo::dispatch_system_prompt("atlas", &st.model);
+            st.agent.set_agent_identity(Some(atlas_prompt));
+            st.active_agent = "atlas".to_string();
+
+            if result.is_resume {
+                render::info(&format!(
+                    "Resuming work on plan: {}",
+                    result.boulder.works
+                        .iter()
+                        .filter(|w| w.status == joey_omo::BoulderWorkStatus::Active)
+                        .last()
+                        .map(|w| w.plan_name.as_str())
+                        .unwrap_or("unknown")
+                ));
+            } else {
+                render::success("Started new work session. Atlas activated.");
+            }
+
+            // The context injection will be prepended to the next user prompt
+            // by the REPL's turn handler.
+            st.pending_context_injection = Some(result.context_injection);
+
+            render::info("Describe the work to begin, or just press Enter to start execution.");
+        }
+        Err(msg) => {
+            render::error(&msg);
+            render::info("Use Prometheus (@plan) to create a plan first.");
+        }
     }
-
-    // Create/update boulder state.
-    let mut boulder = joey_omo::BoulderState::read(&omo_dir);
-    let work = boulder.create_work(
-        plan_path.to_string_lossy().to_string(),
-        plan_name.clone(),
-        st.session_id.clone(),
-    );
-    let work_id = work.id.clone();
-    let _ = boulder.write(&omo_dir);
-
-    render::success(&format!("Started work: {} (id: {})", plan_name, work_id));
-    render::info("Atlas activated. Tasks will be delegated and verified.");
 }
 
 fn print_help() {
@@ -1193,6 +1299,34 @@ fn show_status(st: &ReplState) {
         if st.ropts.show_reasoning { "shown" } else { "hidden" },
         st.ropts.tool_progress
     );
+}
+
+fn show_changes() {
+    let summary = joey_tools::file_tracker::FileTracker::change_summary();
+    if summary.files_modified == 0 {
+        render::info("No files changed in this session.");
+        return;
+    }
+    render::boxed_header("⚕ Session Changes");
+    println!("  {} file(s) read, {} file(s) modified",
+             summary.files_read, summary.files_modified);
+    println!();
+
+    // Show diffs for each modified file.
+    let diffs = joey_tools::file_tracker::FileTracker::diffs_for_all_modified();
+    if diffs.is_empty() {
+        println!("  (no diffs available — files may not have original snapshots)");
+        return;
+    }
+    for diff in &diffs {
+        println!("  {} {} ({})",
+                 if diff.added > 0 || diff.removed > 0 { "✏" } else { "•" },
+                 diff.path,
+                 diff.stat_line());
+    }
+    println!();
+    println!("  {} Use '/changes <file>' for a full diff of a specific file",
+             nu_ansi_term::Color::DarkGray.paint("•").to_string());
 }
 
 fn show_usage(st: &ReplState) {

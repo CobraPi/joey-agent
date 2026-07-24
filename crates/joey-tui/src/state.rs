@@ -186,8 +186,17 @@ pub struct App {
     pub pending_agent_switch: Option<String>,
     /// Active subagent entries for the activity panel (T064).
     pub subagent_entries: Vec<ActiveSubagentEntry>,
+    /// Monotonic ID generator for subagent entries.
+    pub next_subagent_id: usize,
     /// Learnings counter for wisdom accumulation display.
     pub learnings_count: usize,
+    // ── Search-in-history ──
+    /// Search overlay is open.
+    pub search_open: bool,
+    /// Current search query.
+    pub search_query: String,
+    /// Whether search found any matches (updated on each query change).
+    pub search_has_match: bool,
 }
 
 impl App {
@@ -219,7 +228,11 @@ impl App {
             default_model: None,
             pending_agent_switch: None,
             subagent_entries: Vec::new(),
+            next_subagent_id: 1,
             learnings_count: 0,
+            search_open: false,
+            search_query: String::new(),
+            search_has_match: false,
         }
     }
 
@@ -430,18 +443,56 @@ impl App {
                 });
             }
             AgentEvent::SubagentSpawn { goal, model, toolset_summary, depth: _ } => {
+                // Populate the activity panel's subagent roster (T064).
+                let id = self.next_subagent_id;
+                self.next_subagent_id += 1;
+                // The goal text is the closest thing to an agent_type label we
+                // have at spawn time; the summary_preview on completion is too
+                // late for the "running" state the panel needs to show.
+                let label: String = goal.chars().take(28).collect();
+                self.subagent_entries.push(ActiveSubagentEntry {
+                    id,
+                    agent_type: label,
+                    category: None,
+                    status: SubagentStatus::Running,
+                    phase: "querying model".to_string(),
+                    model,
+                    iterations: 0,
+                    started: Instant::now(),
+                });
                 self.push_item(TranscriptItem::Notice {
-                    text: format!("🤖 Subagent: {} ({}) [{}]", goal, model, toolset_summary),
+                    text: format!("🤖 Subagent: {} [{}]", goal, toolset_summary),
                     kind: NoticeKind::Busy,
                 });
             }
             AgentEvent::SubagentComplete { goal, success, summary_preview, token_usage: _, duration_secs: _ } => {
+                // Mark the matching subagent entry as done/failed (T064).
+                // Entries are matched by goal prefix (the label we stored at
+                // spawn time). Stale entries are cleaned up on turn Done.
+                let label: String = goal.chars().take(28).collect();
+                for entry in self.subagent_entries.iter_mut().rev() {
+                    if entry.status == SubagentStatus::Running && entry.agent_type == label {
+                        entry.status = if success {
+                            SubagentStatus::Done
+                        } else {
+                            SubagentStatus::Failed
+                        };
+                        break;
+                    }
+                }
                 self.push_item(TranscriptItem::Notice {
                     text: format!("{} {}: {}", if success { "✓" } else { "✗" }, goal, summary_preview),
                     kind: if success { NoticeKind::Success } else { NoticeKind::Warning },
                 });
             }
             AgentEvent::SubagentFailed { goal, error, duration_secs: _ } => {
+                let label: String = goal.chars().take(28).collect();
+                for entry in self.subagent_entries.iter_mut().rev() {
+                    if entry.status == SubagentStatus::Running && entry.agent_type == label {
+                        entry.status = SubagentStatus::Failed;
+                        break;
+                    }
+                }
                 self.push_item(TranscriptItem::Notice {
                     text: format!("✗ {}: {}", goal, error),
                     kind: NoticeKind::Warning,
@@ -498,6 +549,7 @@ impl App {
                 });
             }
             AgentEvent::WisdomAccumulated { learnings_count } => {
+                self.learnings_count = learnings_count;
                 self.push_item(TranscriptItem::Notice {
                     text: format!("Wisdom: {} learnings", learnings_count),
                     kind: NoticeKind::Info,
@@ -519,6 +571,7 @@ impl App {
                     self.last_final_text = text;
                 }
                 self.active_agents.clear();
+                self.subagent_entries.clear();
                 self.mode = RunMode::Input;
                 self.turn_started = None;
             }
@@ -537,6 +590,7 @@ impl App {
                 self.push_item(TranscriptItem::Error { text: err.clone() });
                 self.last_error = Some(err);
                 self.active_agents.clear();
+                self.subagent_entries.clear();
                 self.mode = RunMode::Input;
                 self.turn_started = None;
             }
@@ -582,5 +636,94 @@ impl App {
     /// Resume auto-follow at the bottom.
     pub fn scroll_to_bottom(&mut self) {
         self.scroll = None;
+    }
+
+    // ── Search ─────────────���────────────────────────────────────────────
+
+    /// Run a search query against the transcript, scrolling to the first match.
+    /// Called when the user types in the search bar.
+    pub fn run_search(&mut self) {
+        if self.search_query.is_empty() {
+            self.search_has_match = false;
+            return;
+        }
+        let query = self.search_query.to_lowercase();
+        // Search from the newest item backward.
+        for (idx, item) in self.transcript.iter().rev().enumerate() {
+            let text = transcript_item_text(item);
+            if text.to_lowercase().contains(&query) {
+                // Scroll to show this item — approximate by scrolling up
+                // proportionally to the item position.
+                let total = self.transcript.len();
+                let from_bottom = idx;
+                let target_scroll = from_bottom.saturating_sub(2).min(
+                    self.last_max_scroll.get(),
+                );
+                self.scroll = Some(target_scroll);
+                self.search_has_match = true;
+                let _ = total;
+                return;
+            }
+        }
+        self.search_has_match = false;
+    }
+
+    /// Find the next/previous search match from the current scroll position.
+    pub fn search_next(&mut self, forward: bool) {
+        if self.search_query.is_empty() {
+            return;
+        }
+        let query = self.search_query.to_lowercase();
+        let current_scroll = self.scroll.unwrap_or(0);
+
+        // Collect match positions (items that contain the query).
+        let matches: Vec<usize> = self
+            .transcript
+            .iter()
+            .rev()
+            .enumerate()
+            .filter(|(_, item)| {
+                transcript_item_text(item).to_lowercase().contains(&query)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if matches.is_empty() {
+            return;
+        }
+
+        // Find the next match beyond the current scroll position.
+        let target = if forward {
+            // Forward = scroll down toward newer messages (decrease scroll).
+            matches
+                .iter()
+                .find(|&&idx| idx < current_scroll)
+                .or_else(|| matches.first())
+        } else {
+            // Backward = scroll up toward older messages (increase scroll).
+            matches
+                .iter()
+                .find(|&&idx| idx > current_scroll)
+                .or_else(|| matches.last())
+        };
+
+        if let Some(&idx) = target {
+            let target_scroll = idx.saturating_sub(2).min(self.last_max_scroll.get());
+            self.scroll = Some(target_scroll);
+        }
+    }
+}
+
+/// Extract searchable text from a transcript item.
+fn transcript_item_text(item: &TranscriptItem) -> String {
+    match item {
+        TranscriptItem::User { text } => format!("user: {}", text),
+        TranscriptItem::Assistant { text } => text.clone(),
+        TranscriptItem::Reasoning { text } => text.clone(),
+        TranscriptItem::Tool { name, summary, result_preview, .. } => {
+            format!("{} {} {}", name, summary, result_preview)
+        }
+        TranscriptItem::Notice { text, .. } => text.clone(),
+        TranscriptItem::Error { text } => text.clone(),
     }
 }

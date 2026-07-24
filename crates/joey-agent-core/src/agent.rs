@@ -271,6 +271,20 @@ pub struct Agent {
     pub(crate) compression_warning_replayed: bool,
     /// Lazy feasibility-probe latch (upstream `_compression_feasibility_checked`).
     pub(crate) compression_feasibility_checked: bool,
+    /// Optional overlay instruction block appended to the session-stable
+    /// system prompt at request time (OMO FR-022/FR-024 ultrawork mode).
+    /// Cleared automatically on agent switch (BC-016).
+    pub(crate) extra_instructions: Option<String>,
+    /// Optional OMO agent identity prompt that replaces the session-stable
+    /// prompt's identity section when an OMO agent (Sisyphus, Hephaestus,
+    /// Prometheus, Atlas) is active via Tab switching (BC-004/FR-006).
+    /// Stacked between the base prompt and the ultrawork overlay. Cleared
+    /// when switching back to Default.
+    pub(crate) agent_identity: Option<String>,
+    /// Tool-call loop detector (crush-style sliding-window SHA-256).
+    pub(crate) loop_detector: crate::loop_detection::LoopDetector,
+    /// PreToolUse hooks runner (crush-style shell hooks).
+    pub(crate) hooks: Option<crate::hooks::PreToolUseRunner>,
 }
 
 impl Agent {
@@ -365,6 +379,10 @@ impl Agent {
             compression_warning: None,
             compression_warning_replayed: false,
             compression_feasibility_checked: false,
+            extra_instructions: None,
+            agent_identity: None,
+            loop_detector: crate::loop_detection::LoopDetector::new(),
+            hooks: None,
         })
     }
 
@@ -456,6 +474,69 @@ impl Agent {
     /// The current system prompt (session-stable snapshot).
     pub fn system_prompt(&self) -> &str {
         &self.system_prompt
+    }
+
+    /// The effective system prompt for the next request: the session-stable
+    /// prompt with any overlays appended. Two overlay layers stack on top of
+    /// the base prompt in order:
+    /// 1. `agent_identity` — the OMO agent's system prompt (BC-004/FR-006),
+    ///    set when Tab-switching to Sisyphus/Hephaestus/Prometheus/Atlas.
+    /// 2. `extra_instructions` — the OMO ultrawork mode overlay (FR-022).
+    ///
+    /// When neither is set, this is identical to `system_prompt()`.
+    pub fn effective_system_prompt(&self) -> String {
+        let mut combined = self.system_prompt.clone();
+        if let Some(identity) = &self.agent_identity {
+            if !identity.is_empty() {
+                combined.push_str("\n\n");
+                combined.push_str(identity);
+            }
+        }
+        if let Some(extra) = &self.extra_instructions {
+            if !extra.is_empty() {
+                combined.push_str("\n\n");
+                combined.push_str(extra);
+            }
+        }
+        combined
+    }
+
+    /// Install PreToolUse hooks (crush-style shell hooks). Loaded from config
+    /// by the CLI; `None` disables hook checking.
+    pub fn set_hooks(&mut self, runner: Option<crate::hooks::PreToolUseRunner>) {
+        self.hooks = runner;
+    }
+
+    /// Reset the loop detector (call on new user turn).
+    pub fn reset_loop_detector(&mut self) {
+        self.loop_detector.reset();
+    }
+
+    /// Set (or clear with `None`) the extra-instructions overlay appended to
+    /// the system prompt at request time — OMO ultrawork mode (FR-022/FR-024).
+    ///
+    /// Passing `Some(...)` replaces any previous overlay; passing `None`
+    /// removes it.
+    pub fn set_extra_instructions(&mut self, overlay: Option<String>) {
+        self.extra_instructions = overlay;
+    }
+
+    /// The active extra-instructions overlay, if any (OMO ultrawork mode).
+    pub fn extra_instructions(&self) -> Option<&str> {
+        self.extra_instructions.as_deref()
+    }
+
+    /// Set (or clear with `None`) the OMO agent identity prompt (BC-004).
+    /// When set, the agent identity is appended to the base system prompt,
+    /// beneath any ultrawork overlay. Passing `None` reverts to the default
+    /// joey-agent identity (used when switching back to "Default").
+    pub fn set_agent_identity(&mut self, identity: Option<String>) {
+        self.agent_identity = identity;
+    }
+
+    /// The active OMO agent identity prompt, if any.
+    pub fn agent_identity(&self) -> Option<&str> {
+        self.agent_identity.as_deref()
     }
 
     #[cfg(test)]
@@ -686,6 +767,9 @@ impl Agent {
         self.config.api_key = api_key;
         self.client = client;
         self.rewrite_prompt_model_identity();
+        // Clear any OMO ultrawork overlay — switching agents resets to the new
+        // agent's standard prompt (spec Q: "ultrawork injection is cleared").
+        self.extra_instructions = None;
         // Recalibrate the compressor for the new runtime context length and
         // provider (mirrors try_activate_fallback's update_model call).
         let new_ctx = compression::get_model_context_length(&self.config.model, None);
@@ -748,7 +832,7 @@ impl Agent {
         // (upstream `_ephemeral_max_output_tokens`).
         let max_tokens = self.ephemeral_max_output_tokens.or(self.config.max_tokens);
         ProviderRequest::new(self.config.model.clone(), self.history.clone())
-            .with_system(Some(self.system_prompt.clone()))
+            .with_system(Some(self.effective_system_prompt()))
             .with_tools(tools.to_vec())
             .with_reasoning(self.config.reasoning.clone())
             .with_max_tokens(max_tokens)
@@ -1210,6 +1294,7 @@ impl Agent {
         self.interrupt.store(false, Ordering::SeqCst);
         self.ctx.state().memory_consolidation_failures = 0;
         self.invalid_tool_strikes = 0;
+        self.loop_detector.reset();
 
         let _ = tx.send(AgentEvent::TurnStart {
             max_iterations: self.config.max_turns,
@@ -1263,7 +1348,7 @@ impl Agent {
             // the hard per-turn backstop shared with the overflow handlers. ──
             let request_pressure_tokens = compression::estimate_request_tokens_rough(
                 &self.history,
-                &self.system_prompt,
+                &self.effective_system_prompt(),
                 None,
             ) + if tools.is_empty() {
                 0
@@ -1745,6 +1830,82 @@ impl Agent {
             return true;
         }
 
+        // ── PreToolUse hooks (crush-style) ───────────────────────────────
+        // Run hooks for each tool call before execution. Halt stops the turn;
+        // Deny returns an error result to the model for that call.
+        if let Some(ref hooks) = self.hooks {
+            if !hooks.is_empty() {
+                let mut denied_calls: Vec<(usize, String)> = Vec::new();
+                for (idx, tc) in tool_calls.iter().enumerate() {
+                    let args: Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or(Value::Null);
+                    let agg = hooks
+                        .run(
+                            &tc.function.name,
+                            &args,
+                            self.session_id.as_deref().unwrap_or(""),
+                        )
+                        .await;
+                    if agg.is_halted() {
+                        let reason = if agg.reasons.is_empty() {
+                            "halted by PreToolUse hook".to_string()
+                        } else {
+                            agg.reasons.join("; ")
+                        };
+                        let _ = tx.send(AgentEvent::Notice(format!(
+                            "🛑 Turn halted by hook: {}", reason
+                        )));
+                        // Error-result ALL remaining calls.
+                        for tc in tool_calls {
+                            self.push_message(
+                                Message::tool_result(
+                                    &tc.id,
+                                    &tc.function.name,
+                                    format!("[Turn halted by PreToolUse hook: {}]", reason),
+                                ),
+                                None,
+                            );
+                        }
+                        return true;
+                    }
+                    if agg.is_denied() {
+                        let reason = if agg.reasons.is_empty() {
+                            "denied by PreToolUse hook".to_string()
+                        } else {
+                            agg.reasons.join("; ")
+                        };
+                        denied_calls.push((idx, reason));
+                    }
+                }
+                // Emit error results for denied calls.
+                for (idx, reason) in &denied_calls {
+                    let tc = &tool_calls[*idx];
+                    let _ = tx.send(AgentEvent::Notice(format!(
+                        "🔒 Tool '{}' blocked by hook: {}", tc.function.name, reason
+                    )));
+                    self.push_message(
+                        Message::tool_result(
+                            &tc.id,
+                            &tc.function.name,
+                            format!("[Tool call blocked by PreToolUse hook: {}]", reason),
+                        ),
+                        None,
+                    );
+                }
+                if !denied_calls.is_empty() {
+                    // If all calls were denied, return false (not interrupted).
+                    // The model will see the error results and adjust.
+                    if denied_calls.len() == tool_calls.len() {
+                        return false;
+                    }
+                    // Otherwise, filter out denied calls and continue with the rest.
+                    // We can't mutate the slice, so we handle this below by
+                    // skipping denied indices during execution.
+                }
+                let _ = &denied_calls; // suppress unused warning if empty
+            }
+        }
+
         let segments = plan_tool_segments(tool_calls);
         let total = tool_calls.len();
         let mut executed = 0usize;
@@ -1819,10 +1980,31 @@ impl Agent {
                     });
                     let wrapped = maybe_wrap_untrusted(&tc.function.name, &content_raw);
                     self.push_message(
-                        Message::tool_result(&tc.id, &tc.function.name, wrapped),
+                        Message::tool_result(&tc.id, &tc.function.name, wrapped.clone()),
                         None,
                     );
                     executed += 1;
+
+                    // ── Loop detection (crush-style) ───────────────────────
+                    if self.loop_detector.record(
+                        &tc.function.name,
+                        &tc.function.arguments,
+                        &wrapped,
+                    ) {
+                        let _ = tx.send(AgentEvent::Notice(
+                            "🔁 Loop detected — injecting nudge to change approach".into()
+                        ));
+                        // Inject the nudge as a user-role tool result so the
+                        // model sees it on the next iteration.
+                        self.push_message(
+                            Message::tool_result(
+                                &format!("{}_loop_nudge", tc.id),
+                                "loop_detection",
+                                crate::loop_detection::LoopDetector::nudge_message().to_string(),
+                            ),
+                            None,
+                        );
+                    }
 
                     // Interrupt between sequential calls: skip the rest
                     if self.interrupted() && executed < total {

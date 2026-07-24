@@ -129,7 +129,15 @@ fn build_all_agents(
         overrides,
     ));
 
-    // Prometheus — read-only planner
+    // Prometheus — read-only planner; can only write .omo/*.md files
+    // Deny terminal (no code execution), deny delegate_task (not an orchestrator)
+    let prometheus_perms = ToolPermissions::new(
+        vec![],
+        vec![
+            "terminal".to_string(),
+            "delegate_task".to_string(),
+        ],
+    );
     agents.push(build_agent(
         "prometheus",
         "Prometheus",
@@ -139,12 +147,20 @@ fn build_all_agents(
         prometheus_requirement(),
         0.1,
         None,
-        ToolPermissions::allow_all(),
+        prometheus_perms,
         available,
         overrides,
     ));
 
-    // Atlas — conductor; never writes code
+    // Atlas — conductor; never writes code directly, only delegates + verifies
+    // Deny write_file/patch (must delegate all implementation), allow terminal for verification
+    let atlas_perms = ToolPermissions::new(
+        vec![],
+        vec![
+            "write_file".to_string(),
+            "patch".to_string(),
+        ],
+    );
     agents.push(build_agent(
         "atlas",
         "Atlas",
@@ -154,14 +170,22 @@ fn build_all_agents(
         atlas_requirement(),
         0.1,
         None,
-        ToolPermissions::allow_all(),
+        atlas_perms,
         available,
         overrides,
     ));
 
     // ── Subagent agents ─────────────────────────────────────────────
 
-    // Oracle — architecture consultant
+    // Oracle — architecture consultant; READ-ONLY (deny write/edit/task/delegate)
+    let oracle_perms = ToolPermissions::new(
+        vec![],
+        vec![
+            "write_file".to_string(),
+            "patch".to_string(),
+            "delegate_task".to_string(),
+        ],
+    );
     agents.push(build_agent(
         "oracle",
         "Oracle",
@@ -171,12 +195,20 @@ fn build_all_agents(
         oracle_requirement(),
         0.1,
         None,
-        ToolPermissions::allow_all(),
+        oracle_perms,
         available,
         overrides,
     ));
 
-    // Librarian — docs/OSS search
+    // Librarian — docs search; READ-ONLY (deny write/edit/task/delegate)
+    let librarian_perms = ToolPermissions::new(
+        vec![],
+        vec![
+            "write_file".to_string(),
+            "patch".to_string(),
+            "delegate_task".to_string(),
+        ],
+    );
     agents.push(build_agent(
         "librarian",
         "Librarian",
@@ -186,12 +218,20 @@ fn build_all_agents(
         librarian_requirement(),
         0.1,
         None,
-        ToolPermissions::allow_all(),
+        librarian_perms,
         available,
         overrides,
     ));
 
-    // Explore — fast codebase grep
+    // Explore — fast codebase grep; READ-ONLY (deny write/edit/task/delegate)
+    let explore_perms = ToolPermissions::new(
+        vec![],
+        vec![
+            "write_file".to_string(),
+            "patch".to_string(),
+            "delegate_task".to_string(),
+        ],
+    );
     agents.push(build_agent(
         "explore",
         "Explore",
@@ -201,7 +241,7 @@ fn build_all_agents(
         explore_requirement(),
         0.1,
         None,
-        ToolPermissions::allow_all(),
+        explore_perms,
         available,
         overrides,
     ));
@@ -221,7 +261,14 @@ fn build_all_agents(
         overrides,
     ));
 
-    // Metis — gap analyzer
+    // Metis — gap analyzer; READ-ONLY (deny write/edit)
+    let metis_perms = ToolPermissions::new(
+        vec![],
+        vec![
+            "write_file".to_string(),
+            "patch".to_string(),
+        ],
+    );
     agents.push(build_agent(
         "metis",
         "Metis",
@@ -231,12 +278,19 @@ fn build_all_agents(
         metis_requirement(),
         0.1,
         None,
-        ToolPermissions::allow_all(),
+        metis_perms,
         available,
         overrides,
     ));
 
-    // Momus — plan reviewer
+    // Momus — plan reviewer; READ-ONLY (deny write/edit)
+    let momus_perms = ToolPermissions::new(
+        vec![],
+        vec![
+            "write_file".to_string(),
+            "patch".to_string(),
+        ],
+    );
     agents.push(build_agent(
         "momus",
         "Momus",
@@ -246,7 +300,7 @@ fn build_all_agents(
         momus_requirement(),
         0.1,
         None,
-        ToolPermissions::allow_all(),
+        momus_perms,
         available,
         overrides,
     ));

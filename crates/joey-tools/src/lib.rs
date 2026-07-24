@@ -9,12 +9,16 @@
 pub mod builtins;
 pub mod context;
 pub mod difflib;
+pub mod file_tracker;
 pub mod fuzzy;
 pub mod guards;
+pub mod lsp;
 pub mod patch_parser;
 pub mod pyjson;
 pub mod registry;
+pub mod safe_commands;
 pub mod sanitize;
+pub mod sanitize_input;
 pub mod storage;
 pub mod toolsets;
 pub mod tools;

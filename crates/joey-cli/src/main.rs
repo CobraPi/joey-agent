@@ -9,10 +9,12 @@ mod commands;
 mod auth_cmd;
 mod config_cmd;
 mod cron_cmd;
+mod discover;
 mod doctor_cmd;
 mod mcp_cmd;
 mod model_catalog;
 mod oneshot;
+mod project_trust;
 mod render;
 mod repl;
 mod secret_prompt;
@@ -175,6 +177,8 @@ enum Command {
     Mcp(mcp_cmd::McpArgs),
     /// Search, install, configure, and manage skills
     Skills(skills_cmd::SkillsArgs),
+    /// Discover local model servers (Ollama, LM Studio, llama.cpp, etc.)
+    Discover,
     /// Print the resolved home directory (joey extension)
     Home,
 }
@@ -496,6 +500,10 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Some(Command::Doctor(args)) => doctor_cmd::doctor_command(&args),
         Some(Command::Tools(args)) => tools_cmd::tools_command(&args),
         Some(Command::Skills(args)) => skills_cmd::skills_command(&args),
+        Some(Command::Discover) => {
+            discover::run_discover().await;
+            Ok(0)
+        }
         Some(Command::Cron(args)) => cron_cmd::cron_command(args).await,
         Some(Command::Mcp(args)) => mcp_cmd::mcp_command(args).await,
         Some(Command::Home) => {

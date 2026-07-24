@@ -363,6 +363,33 @@ pub fn resolve_profile(provider_setting: &str, base_url: &str, model: &str) -> P
         return get_profile("anthropic").unwrap();
     }
 
+    // Detect from bare model family name when no host/prefix was recognized.
+    // This matters for OMO agent switching: when a fallback chain resolves a
+    // bare model ID like "glm-5.2", switch_model forwards provider="auto" with
+    // an empty base_url. Without this family-level detection the model would
+    // fall through to the OpenRouter aggregator below — but GLM models have a
+    // native Z.AI provider that should be used directly. Match the same family
+    // prefixes that ModelFamily::detect knows about.
+    let lower = model.to_ascii_lowercase();
+    if lower.starts_with("glm-") {
+        return get_profile("zai").unwrap();
+    }
+    if lower.starts_with("claude-") {
+        return get_profile("anthropic").unwrap();
+    }
+    if lower.starts_with("gpt-") {
+        return get_profile("openai-api").unwrap();
+    }
+    if lower.starts_with("gemini-") {
+        return get_profile("gemini").unwrap();
+    }
+    if lower.starts_with("deepseek-") {
+        return get_profile("deepseek").unwrap();
+    }
+    if lower.starts_with("grok-") {
+        return get_profile("xai").unwrap();
+    }
+
     // Fall back to OpenRouter (the aggregator default) — many custom
     // OpenAI-compatible endpoints land here with a base_url override.
     get_profile("openrouter").unwrap()
@@ -419,6 +446,44 @@ mod tests {
     fn resolves_by_model_prefix() {
         let p = resolve_profile("auto", "https://openrouter.ai/api/v1", "anthropic/claude-opus-4.6");
         assert_eq!(p.name, "openrouter");
+    }
+
+    /// Bare GLM model names (no provider prefix, no base_url) resolve to the
+    /// native zai provider, not the OpenRouter aggregator. This is the OMO
+    /// agent-switch path: switch_model forwards provider="auto" with an empty
+    /// base_url, and the fallback chain produces bare IDs like "glm-5.2".
+    #[test]
+    fn bare_glm_resolves_to_zai() {
+        let p = resolve_profile("auto", "", "glm-5.2");
+        assert_eq!(p.name, "zai");
+        assert_eq!(p.base_url, "https://api.z.ai/api/paas/v4");
+        // GLM-4.6v (vision variant) also routes natively
+        assert_eq!(resolve_profile("auto", "", "glm-4.6v").name, "zai");
+        assert_eq!(resolve_profile("auto", "", "glm-5").name, "zai");
+    }
+
+    /// Bare model names for other families resolve to their native providers
+    /// instead of falling through to the aggregator default.
+    #[test]
+    fn bare_family_names_resolve_to_native_providers() {
+        assert_eq!(resolve_profile("auto", "", "claude-opus-4-8").name, "anthropic");
+        assert_eq!(resolve_profile("auto", "", "gpt-5.6-sol").name, "openai-api");
+        assert_eq!(resolve_profile("auto", "", "gemini-3.1-pro").name, "gemini");
+        assert_eq!(resolve_profile("auto", "", "deepseek-chat").name, "deepseek");
+        assert_eq!(resolve_profile("auto", "", "grok-4").name, "xai");
+    }
+
+    /// Explicit host detection still wins over bare-name family detection:
+    /// a base_url pointing at z.ai with a glm model returns zai even though
+    /// both paths agree — and pointing at openrouter.ai keeps it openrouter.
+    #[test]
+    fn host_detection_takes_priority_over_bare_name() {
+        // Host match wins and is not masked by the bare-name fallback.
+        let p = resolve_profile("auto", "https://api.z.ai/api/paas/v4", "glm-5.2");
+        assert_eq!(p.name, "zai");
+        // Explicit OpenRouter host with a glm model → openrouter (aggregator).
+        let or = resolve_profile("auto", "https://openrouter.ai/api/v1", "glm-5.2");
+        assert_eq!(or.name, "openrouter");
     }
 
     #[test]

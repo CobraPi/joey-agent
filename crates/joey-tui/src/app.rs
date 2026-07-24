@@ -13,7 +13,8 @@ use std::sync::Once;
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -63,7 +64,12 @@ fn install_panic_hook() {
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
 }
 
 /// The TUI controller.
@@ -97,7 +103,12 @@ impl Tui {
         install_panic_hook();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+        if let Err(e) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        ) {
             // Leave the shell usable for the caller's line-REPL fallback.
             let _ = disable_raw_mode();
             return Err(e);
@@ -268,6 +279,10 @@ impl Tui {
             if app.agent_picker_open {
                 widgets::draw_agent_picker(f, area, app, &theme);
             }
+
+            if app.search_open {
+                widgets::draw_search_bar(f, area, app, &theme);
+            }
         })?;
         Ok(())
     }
@@ -323,6 +338,11 @@ impl Tui {
             return None;
         }
 
+        // Search overlay: route all keys to search input.
+        if self.app.search_open {
+            return self.handle_search_key(key);
+        }
+
         // Agent picker overlay swallows keys until dismissed (BC-014).
         if self.app.agent_picker_open {
             let roster_len = self.app.agent_roster.len();
@@ -366,7 +386,27 @@ impl Tui {
         // Global keys.
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            // Ctrl+C always quits the program (busy or idle).
             KeyCode::Char('c') if ctrl => {
+                self.app.mode = RunMode::Quitting;
+                return Some(TuiAction::Quit);
+            }
+            // Esc interrupts the agent when busy; otherwise closes
+            // overlays / returns focus / quits.
+            KeyCode::Esc => {
+                if self.app.search_open {
+                    self.app.search_open = false;
+                    self.app.search_query.clear();
+                    return None;
+                }
+                if self.app.agent_picker_open {
+                    self.app.agent_picker_open = false;
+                    return None;
+                }
+                if self.focus == Focus::Transcript {
+                    self.focus = Focus::Input;
+                    return None;
+                }
                 if self.app.is_busy() {
                     return Some(TuiAction::Interrupt);
                 }
@@ -397,6 +437,22 @@ impl Tui {
                 self.show_help = true;
                 return None;
             }
+            // ── Focus switching ──────────────────────────────────────
+            // Ctrl+T toggles between Input and Transcript focus, giving full
+            // vim-style navigation (j/k/g/G) over the conversation history.
+            KeyCode::Char('t') if ctrl => {
+                self.focus = match self.focus {
+                    Focus::Input => Focus::Transcript,
+                    Focus::Transcript => Focus::Input,
+                };
+                return None;
+            }
+            // When in Input focus, Shift+Up switches to Transcript scroll mode.
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.focus = Focus::Transcript;
+                self.app.scroll_up(1);
+                return None;
+            }
             KeyCode::Tab => {
                 // Tab opens the agent picker overlay (BC-013). If busy, the
                 // switch is deferred to the next turn (BC-016).
@@ -421,18 +477,37 @@ impl Tui {
             }
             KeyCode::PageUp => {
                 self.app.scroll_up(10);
+                // Switch to transcript focus so the user sees j/k are available.
+                if self.focus == Focus::Input {
+                    self.focus = Focus::Transcript;
+                }
                 return None;
             }
             KeyCode::PageDown => {
                 self.app.scroll_down(10);
+                // If we've reached the bottom, return focus to input.
+                if self.app.scroll.is_none() {
+                    self.focus = Focus::Input;
+                }
                 return None;
             }
-            KeyCode::Esc => {
-                if self.app.is_busy() {
-                    return Some(TuiAction::Interrupt);
+            // Half-page scrolling (Ctrl+u / Ctrl+d style, but using Ctrl+b/f
+            // to avoid clobbering the input editor's kill commands).
+            KeyCode::Char('b') if ctrl => {
+                let half = 15usize;
+                self.app.scroll_up(half);
+                if self.focus == Focus::Input {
+                    self.focus = Focus::Transcript;
                 }
-                self.app.mode = RunMode::Quitting;
-                return Some(TuiAction::Quit);
+                return None;
+            }
+            KeyCode::Char('f') if ctrl => {
+                let half = 15usize;
+                self.app.scroll_down(half);
+                if self.app.scroll.is_none() {
+                    self.focus = Focus::Input;
+                }
+                return None;
             }
             _ => {}
         }
@@ -445,8 +520,33 @@ impl Tui {
                     KeyCode::Down | KeyCode::Char('j') => self.app.scroll_down(1),
                     KeyCode::Char('g') | KeyCode::Home => self.app.scroll_to_top(),
                     KeyCode::Char('G') | KeyCode::End => self.app.scroll_to_bottom(),
+                    KeyCode::Enter => {
+                        self.focus = Focus::Input;
+                        return None;
+                    }
                     KeyCode::Char('?') => self.show_help = true,
                     KeyCode::Char('r') => self.toggle_reasoning(),
+                    KeyCode::Char('/') => {
+                        // Enter search mode.
+                        self.app.search_open = true;
+                        self.app.search_query.clear();
+                    }
+                    KeyCode::Char('n') => {
+                        // Find next match.
+                        self.app.search_next(true);
+                    }
+                    KeyCode::Char('N') => {
+                        // Find previous match.
+                        self.app.search_next(false);
+                    }
+                    // Any other printable character returns focus to input
+                    // and is injected there, so the user doesn't have to
+                    // press Ctrl+T before typing.
+                    KeyCode::Char(c) => {
+                        self.focus = Focus::Input;
+                        self.input.insert_char(c);
+                        return None;
+                    }
                     _ => {}
                 }
                 None
@@ -576,11 +676,71 @@ impl Tui {
                 self.show_help = true;
                 None
             }
+            // '/' on an empty input opens search-in-history (vim-style).
+            KeyCode::Char('/') if self.input.is_empty() && !ctrl => {
+                self.app.search_open = true;
+                self.app.search_query.clear();
+                None
+            }
             KeyCode::Char(c) if !ctrl => {
                 self.input.insert_char(c);
                 None
             }
             _ => None,
+        }
+    }
+
+    /// Handle keys in the search bar.
+    fn handle_search_key(&mut self, key: KeyEvent) -> Option<TuiAction> {
+        match key.code {
+            KeyCode::Esc => {
+                self.app.search_open = false;
+                self.app.search_query.clear();
+                None
+            }
+            KeyCode::Enter => {
+                // Confirm search and jump to first match.
+                self.app.run_search();
+                // Keep search open so n/N can cycle.
+                None
+            }
+            KeyCode::Backspace => {
+                self.app.search_query.pop();
+                self.app.run_search();
+                None
+            }
+            KeyCode::Char('n') => {
+                self.app.search_next(true);
+                None
+            }
+            KeyCode::Char('N') => {
+                self.app.search_next(false);
+                None
+            }
+            KeyCode::Char(c) => {
+                self.app.search_query.push(c);
+                self.app.run_search();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Handle a mouse event for scroll wheel support.
+    ///
+    /// Call this from the host when a MouseEvent is received. Enables mouse
+    /// wheel scrolling in the transcript area.
+    pub fn handle_mouse_scroll(&mut self, _row: u16, _col: u16, delta_up: bool) {
+        if delta_up {
+            self.app.scroll_up(3);
+            if self.focus == Focus::Input {
+                self.focus = Focus::Transcript;
+            }
+        } else {
+            self.app.scroll_down(3);
+            if self.app.scroll.is_none() {
+                self.focus = Focus::Input;
+            }
         }
     }
 }

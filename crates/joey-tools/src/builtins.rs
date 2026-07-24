@@ -13,6 +13,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register(Arc::new(file_tools::ReadFile));
     registry.register(Arc::new(file_tools::WriteFile));
     registry.register(Arc::new(file_tools::Patch));
+    registry.register(Arc::new(file_tools::MultiEdit));
     registry.register(Arc::new(file_tools::SearchFiles));
     registry.register(Arc::new(terminal_tool::Terminal));
     registry.register(Arc::new(todo_tool::Todo));
@@ -22,6 +23,12 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register(Arc::new(skills_tool::SkillsList));
     registry.register(Arc::new(skills_tool::SkillView));
     registry.register(Arc::new(process_tool::Process));
+    // LSP-backed tools (conditionally available — check() returns false when
+    // no LSP manager is registered).
+    registry.register(Arc::new(lsp_tools::LspDiagnostics));
+    registry.register(Arc::new(lsp_tools::LspDefinition));
+    registry.register(Arc::new(lsp_tools::LspReferences));
+    registry.register(Arc::new(lsp_tools::LspSymbols));
 }
 
 /// Register the session_search tool with an optional session DB handle.

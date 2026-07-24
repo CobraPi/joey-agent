@@ -59,6 +59,7 @@ pub static REGISTRY: &[CommandDef] = &[
     cmd!("moa", &[], "Run one prompt through the default Mixture of Agents preset", "Session", "<prompt>", false),
     cmd!("subgoal", &[], "Add or manage extra criteria on the active goal", "Session", "[text | remove N | clear]", false),
     cmd!("status", &[], "Show session, model, token, and context info", "Session", "", true),
+    cmd!("changes", &[], "Show files changed in this session with diffs", "Session", "", true),
     cmd!("whoami", &[], "Show your slash command access (admin / user)", "Info", "", false),
     cmd!("profile", &[], "Show active profile name and home directory", "Info", "", false),
     cmd!("resume", &[], "Resume a previously-named session", "Session", "[name]", true),

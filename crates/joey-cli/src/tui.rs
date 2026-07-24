@@ -131,6 +131,14 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     // Welcome banner into the transcript.
     {
         let sid_short: String = session_id.chars().take(8).collect();
+        // Populate status-bar fields (cwd, provider, model) on the AppState
+        // so the bar isn't blank.
+        tui.app_mut().provider = provider_name.to_string();
+        tui.app_mut().model = model_name.to_string();
+        tui.app_mut().cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
         tui.app_mut().push_item(TranscriptItem::Notice {
             text: format!(
                 "✦ joey-agent — model {} · provider {} · session {}",
@@ -164,6 +172,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     // normal terminal (the alternate screen vanishes on exit).
     if let Some(query) = &opts.query {
         let mut queued = VecDeque::new();
+        apply_intent_gate(&mut tui, &mut agent, query);
         run_turn(&mut tui, &mut agent, query, &mut queued).await;
         let final_text = tui.app().last_final_text.clone();
         let _ = tui.leave();
@@ -255,7 +264,8 @@ fn switch_agent(tui: &mut Tui, agent: &mut Agent, agent_name: &str) {
                 return;
             }
         };
-        apply_model_switch(tui, agent, "default", &target, "auto");
+        // Clear the OMO identity — Default uses the joey-agent base prompt.
+        apply_model_switch(tui, agent, "default", &target, "auto", None);
         return;
     }
 
@@ -283,19 +293,33 @@ fn switch_agent(tui: &mut Tui, agent: &mut Agent, agent_name: &str) {
         });
         return;
     };
+    // Build the OMO identity prompt for this agent (model-family-aware variant).
+    // This is what makes Tab-switching actually activate the agent's persona
+    // rather than just swapping the model (BC-004/FR-006).
+    let identity = joey_omo::dispatch_system_prompt(agent_name, &model);
     // Let the provider auto-resolve from the model (provider="auto"), matching
     // how an explicit `--model` is handled at startup.
-    apply_model_switch(tui, agent, &omo_agent.display_name, &model, "auto");
+    apply_model_switch(
+        tui,
+        agent,
+        &omo_agent.display_name,
+        &model,
+        "auto",
+        Some(identity),
+    );
 }
 
 /// Apply the model swap, surfacing the result as a transcript notice and
-/// syncing the TUI's model label.
+/// syncing the TUI's model label. When `identity` is Some, the OMO agent's
+/// system prompt is injected as the agent identity overlay (BC-004/FR-006);
+/// None clears it (reverting to the default joey-agent identity).
 fn apply_model_switch(
     tui: &mut Tui,
     agent: &mut Agent,
     display_name: &str,
     model: &str,
     provider: &str,
+    identity: Option<String>,
 ) {
     // Stash the session's original model the first time we switch away.
     if tui.app().default_model.is_none() {
@@ -303,6 +327,11 @@ fn apply_model_switch(
     }
     match agent.switch_model(provider, "", model, None) {
         Ok(msg) => {
+            // Inject (or clear) the OMO agent identity AFTER switch_model
+            // succeeds. switch_model clears the ultrawork overlay (BC-016);
+            // the identity is a separate layer that persists until the next
+            // agent switch.
+            agent.set_agent_identity(identity);
             tui.app_mut().model = agent.model().to_string();
             tui.app_mut().provider = agent.provider_name().to_string();
             tui.app_mut().push_item(TranscriptItem::Notice {
@@ -336,11 +365,12 @@ async fn interactive_loop(tui: &mut Tui, agent: &mut Agent) -> anyhow::Result<()
             }
             TuiAction::Submit(text) => {
                 if text.trim_start().starts_with('/') {
-                    if let SlashAction::Quit = handle_slash_tui(&text, tui) {
+                    if let SlashAction::Quit = handle_slash_tui(&text, tui, agent) {
                         return Ok(());
                     }
                     continue;
                 }
+                apply_intent_gate(tui, agent, &text);
                 run_turn(tui, agent, &text, &mut queued).await;
                 // BC-016: honor an agent switch requested mid-turn, now that
                 // the turn's mutable borrow of `agent` has been released.
@@ -372,6 +402,18 @@ async fn wait_for_action(tui: &mut Tui) -> TuiAction {
                     }
                     Ok(Event::Paste(s)) => tui.input.insert_str(&s),
                     Ok(Event::Resize(w, h)) => tui.resize(w, h),
+                    Ok(Event::Mouse(m)) => {
+                        use crossterm::event::MouseEventKind;
+                        match m.kind {
+                            MouseEventKind::ScrollUp => {
+                                tui.handle_mouse_scroll(m.row, m.column, true);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                tui.handle_mouse_scroll(m.row, m.column, false);
+                            }
+                            _ => {}
+                        }
+                    }
                     _ => {}
                 }
                 if !event::poll(Duration::from_millis(0)).unwrap_or(false) {
@@ -491,6 +533,18 @@ async fn run_turn(
                         }
                         Ok(Event::Paste(s)) => tui.input.insert_str(&s),
                         Ok(Event::Resize(w, h)) => tui.resize(w, h),
+                        Ok(Event::Mouse(m)) => {
+                            use crossterm::event::MouseEventKind;
+                            match m.kind {
+                                MouseEventKind::ScrollUp => {
+                                    tui.handle_mouse_scroll(m.row, m.column, true);
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    tui.handle_mouse_scroll(m.row, m.column, false);
+                                }
+                                _ => {}
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -506,9 +560,71 @@ enum SlashAction {
     Quit,
 }
 
+/// IntentGate (FR-022/FR-024, T141): scan the user's message for OMO
+/// keyword triggers before the turn runs. When `ultrawork`/`ulw` is
+/// detected and the active agent supports it, inject the ultrawork
+/// instruction set as an overlay on the system prompt. Prometheus and
+/// unknown agents silently ignore ultrawork (BC-025).
+///
+/// The active agent name is resolved from the TUI's agent roster +
+/// active_agent_index (populated by `populate_agent_roster` / Tab cycling).
+/// When no roster entry exists (e.g. the default agent at startup), the
+/// agent is treated as "default", which is ultrawork-valid.
+fn apply_intent_gate(tui: &mut Tui, agent: &mut Agent, message: &str) {
+    let Some(keyword) = joey_omo::detect_keyword(message) else {
+        return;
+    };
+
+    // Resolve the active agent's canonical name from the Tab picker state.
+    // Clone to release the immutable borrow of `tui` before we mutate it.
+    let active_agent_name = tui
+        .app()
+        .agent_roster
+        .get(tui.app().active_agent_index)
+        .map(|a| a.name.clone())
+        .unwrap_or_else(|| "default".to_string());
+
+    match keyword {
+        joey_omo::KeywordType::Ultrawork | joey_omo::KeywordType::HyperplanUltraworkCombo => {
+            if let Some(_announcement) =
+                joey_omo::check_ultrawork_activation(keyword, &active_agent_name)
+            {
+                // Inject the ultrawork overlay (model-family-aware variant).
+                let overlay = joey_omo::ultrawork_prompt(agent.model());
+                agent.set_extra_instructions(Some(overlay));
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "⚡ ULTRAWORK MODE ENABLED!".into(),
+                    kind: NoticeKind::Success,
+                });
+            } else {
+                // Prometheus or other incompatible agent — silently ignored.
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!(
+                        "ultrawork ignored — {} is a read-only planner",
+                        active_agent_name
+                    ),
+                    kind: NoticeKind::Warning,
+                });
+            }
+        }
+        joey_omo::KeywordType::Hyperplan => {
+            tui.app_mut().push_item(TranscriptItem::Notice {
+                text: "⚡ HYPERPLAN MODE ENABLED!".into(),
+                kind: NoticeKind::Info,
+            });
+        }
+        joey_omo::KeywordType::Team => {
+            tui.app_mut().push_item(TranscriptItem::Notice {
+                text: "TEAM MODE ENABLED!".into(),
+                kind: NoticeKind::Info,
+            });
+        }
+    }
+}
+
 /// Slash-command handling inside the TUI. A few commands work natively;
 /// the rest answer honestly instead of pretending to run.
-fn handle_slash_tui(input: &str, tui: &mut Tui) -> SlashAction {
+fn handle_slash_tui(input: &str, tui: &mut Tui, agent: &Agent) -> SlashAction {
     match slash::resolve(input) {
         Resolution::Unknown => {
             tui.app_mut().push_item(TranscriptItem::Error {
@@ -537,6 +653,80 @@ fn handle_slash_tui(input: &str, tui: &mut Tui) -> SlashAction {
                     text: "view cleared — conversation history is unchanged".into(),
                     kind: NoticeKind::Info,
                 });
+            }
+            "agents" => {
+                tui.app_mut().agent_picker_open = true;
+            }
+            "model" => {
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!("Current model: {} — use `joey model` outside the TUI to change", agent.model()),
+                    kind: NoticeKind::Info,
+                });
+            }
+            "status" => {
+                let (sid, mdl, tok_prompt, tok_comp, tok_iter, msg_count) = {
+                    let app = tui.app();
+                    (
+                        app.session_id.clone(),
+                        app.model.clone(),
+                        app.tokens.prompt,
+                        app.tokens.completion,
+                        app.tokens.iterations,
+                        app.transcript.len(),
+                    )
+                };
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!(
+                        "session {} | model {} | tokens in:{} out:{} api:{} | messages {}",
+                        sid, mdl, tok_prompt, tok_comp, tok_iter, msg_count,
+                    ),
+                    kind: NoticeKind::Info,
+                });
+            }
+            "timestamps" | "ts" => {
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "Timestamps are always shown inline in the TUI transcript".into(),
+                    kind: NoticeKind::Info,
+                });
+            }
+            "tools" => {
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "Use `joey tools list` outside the TUI to manage tools".into(),
+                    kind: NoticeKind::Info,
+                });
+            }
+            "new" | "reset" => {
+                tui.app_mut().transcript.clear();
+                tui.app_mut().scroll = None;
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "New session — history cleared (start a new joey session for a fresh ID)".into(),
+                    kind: NoticeKind::Info,
+                });
+            }
+            "verbose" => {
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "Tool progress is always shown in the TUI transcript".into(),
+                    kind: NoticeKind::Info,
+                });
+            }
+            "changes" => {
+                use joey_tools::file_tracker::FileTracker;
+                let summary = FileTracker::change_summary();
+                if summary.files_modified == 0 {
+                    tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "No files changed in this session.".into(),
+                        kind: NoticeKind::Info,
+                    });
+                } else {
+                    let paths = summary.modified_paths.join(", ");
+                    tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: format!(
+                            "{} file(s) read, {} modified: {}",
+                            summary.files_read, summary.files_modified, paths,
+                        ),
+                        kind: NoticeKind::Info,
+                    });
+                }
             }
             name => {
                 tui.app_mut().push_item(TranscriptItem::Notice {

@@ -401,11 +401,18 @@ impl Tool for ReadFile {
             );
         }
 
+        // Track file read for session change detection.
+        _track_file_read(&resolved_str, &text);
+
         ToolResult::Text(dumps(&Value::Object(result)))
     }
 }
 
-/// Port of `_suggest_similar_files` — the ENOENT scored-suggestion path.
+/// Record file read for session tracking — called after successful read_file.
+/// (Separate from the tool's own dedup tracking.)
+fn _track_file_read(resolved: &str, content: &str) {
+    crate::file_tracker::FileTracker::record_read(resolved, Some(content));
+}
 fn suggest_similar_files(path: &str, resolved: &Path) -> Value {
     let dir_path = resolved.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
     let orig_dir = Path::new(path).parent().map(|p| p.to_string_lossy().to_string());
@@ -680,6 +687,8 @@ impl Tool for WriteFile {
                 result.insert("resolved_path".into(), json!(resolved.to_string_lossy()));
                 result.insert("files_modified".into(), json!([resolved.to_string_lossy()]));
                 update_read_timestamp(ctx, &resolved);
+                // Track for session change detection.
+                crate::file_tracker::FileTracker::record_write(&resolved.to_string_lossy());
             }
             Err(e) => {
                 result.insert("error".into(), json!(e));
@@ -908,6 +917,8 @@ impl Tool for Patch {
             }
             for (_, r) in &path_to_resolved {
                 update_read_timestamp(ctx, r);
+                // Track for session change detection.
+                crate::file_tracker::FileTracker::record_write(&r.to_string_lossy());
             }
             ctx.state().reset_patch_failures(
                 &path_to_resolved
@@ -1065,6 +1076,230 @@ fn patch_v4a(ctx: &ToolContext, patch_content: &str) -> Map<String, Value> {
         d.insert("error".into(), json!(e));
     }
     d
+}
+
+// ---------------------------------------------------------------------------
+// multi_edit (port of crush's internal/agent/tools/multiedit.go)
+// ---------------------------------------------------------------------------
+
+/// Apply multiple find-and-replace operations to a single file atomically.
+/// Validates all edits before applying any (atomicity). Port of crush's
+/// MultiEditParams. Uses fuzzy matching like the patch tool.
+pub struct MultiEdit;
+
+#[async_trait]
+impl Tool for MultiEdit {
+    fn name(&self) -> &str {
+        "multi_edit"
+    }
+    fn toolset(&self) -> &str {
+        "file"
+    }
+    fn description(&self) -> &str {
+        "Apply multiple find-and-replace edits to a single file in one tool call. \
+Validates all edits before applying any (atomicity). Each edit uses fuzzy matching. \
+Only the first edit may have empty old_string (file creation). Reduces tool-call \
+count for multi-spot edits."
+    }
+    fn emoji(&self) -> &str {
+        "📝"
+    }
+    fn max_result_chars(&self) -> Option<usize> {
+        Some(100_000)
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the file to edit."
+                },
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string", "description": "Text to find. Empty only for first edit (file creation)."},
+                            "new_string": {"type": "string", "description": "Replacement text."},
+                            "replace_all": {"type": "boolean", "description": "Replace all occurrences.", "default": false}
+                        },
+                        "required": ["old_string", "new_string"]
+                    },
+                    "description": "Array of edit operations to apply sequentially.",
+                    "minItems": 1
+                },
+                "cross_profile": {
+                    "type": "boolean",
+                    "description": "Opt out of cross-profile soft guard.",
+                    "default": false
+                }
+            },
+            "required": ["file_path", "edits"]
+        })
+    }
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
+        let path = match args.get("file_path").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return tool_error("multi_edit: missing required field 'file_path'."),
+        };
+
+        let edits_arr = match args.get("edits").and_then(|v| v.as_array()) {
+            Some(a) if !a.is_empty() => a,
+            _ => return tool_error("multi_edit: 'edits' must be a non-empty array."),
+        };
+
+        // Parse edits.
+        let mut edits: Vec<(String, String, bool)> = Vec::new();
+        for (i, e) in edits_arr.iter().enumerate() {
+            let old_string = e.get("old_string").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let new_string = e.get("new_string").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let replace_all = e.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Only edits[0] may have empty old_string (file creation).
+            if i > 0 && old_string.is_empty() {
+                return tool_error(format!(
+                    "multi_edit: edit #{} has empty old_string. Only the first edit may have empty old_string (for file creation).",
+                    i + 1
+                ));
+            }
+            edits.push((old_string, new_string, replace_all));
+        }
+
+        let resolved = ctx.resolve_path(&path);
+        if let Some(err) = guards::check_sensitive_path(&path, &resolved) {
+            return tool_error(err);
+        }
+
+        // Determine if this is file creation (first edit has empty old_string).
+        let is_creation = edits[0].0.is_empty();
+
+        let mut result = Map::new();
+
+        if is_creation {
+            // File creation: file must NOT exist.
+            if resolved.exists() {
+                return tool_error(format!("file already exists: {}", path));
+            }
+            let content = &edits[0].1;
+            // Syntax gate.
+            if let Some(err) = syntax_gate(&path, content) {
+                result.insert("error".into(), json!(err));
+                return ToolResult::Text(dumps(&Value::Object(result)));
+            }
+            match write_with_preservation(&resolved, content) {
+                Ok((bytes_written, dirs_created)) => {
+                    result.insert("success".into(), json!(true));
+                    result.insert("bytes_written".into(), json!(bytes_written));
+                    result.insert("dirs_created".into(), json!(dirs_created));
+                    result.insert("edits_applied".into(), json!(1));
+                    result.insert("edits_failed".into(), json!([]));
+                    result.insert("resolved_path".into(), json!(resolved.to_string_lossy()));
+                    result.insert("files_modified".into(), json!([resolved.to_string_lossy()]));
+                    update_read_timestamp(ctx, &resolved);
+                    crate::file_tracker::FileTracker::record_write(&resolved.to_string_lossy());
+                }
+                Err(e) => {
+                    result.insert("success".into(), json!(false));
+                    result.insert("error".into(), json!(e));
+                }
+            }
+            return ToolResult::Text(dumps(&Value::Object(result)));
+        }
+
+        // Existing file edit.
+        let raw = match std::fs::read_to_string(&resolved) {
+            Ok(c) => c,
+            Err(_) => {
+                return tool_error(format!("File not found: {}", path));
+            }
+        };
+        let (raw_bomless, _) = strip_bom(&raw);
+        let original_content = raw_bomless.to_string();
+        let original_ending = detect_line_ending(&original_content);
+
+        // Apply edits sequentially, collecting failures.
+        let mut current_content = original_content.clone();
+        let mut failed: Vec<Value> = Vec::new();
+        let mut applied = 0usize;
+
+        for (i, (old_str, new_str, repl_all)) in edits.iter().enumerate() {
+            let outcome = fuzzy::fuzzy_find_and_replace(
+                &current_content,
+                old_str,
+                new_str,
+                *repl_all,
+            );
+            if outcome.error.is_some() || outcome.match_count == 0 {
+                let err_msg = outcome
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("Could not find match for old_string in edit #{}", i + 1));
+                failed.push(json!({
+                    "index": i + 1,
+                    "error": err_msg,
+                }));
+            } else {
+                current_content = outcome.new_content;
+                applied += 1;
+            }
+        }
+
+        // Check if any changes were made.
+        let changed = current_content != original_content;
+        if !changed {
+            if failed.is_empty() {
+                result.insert("success".into(), json!(false));
+                result.insert("error".into(), json!("no changes made - all edits resulted in identical content"));
+            } else {
+                result.insert("success".into(), json!(false));
+                result.insert(
+                    "error".into(),
+                    json!(format!("no changes made - all {} edit(s) failed", failed.len())),
+                );
+                result.insert("edits_failed".into(), json!(failed));
+            }
+            return ToolResult::Text(dumps(&Value::Object(result)));
+        }
+
+        // Line-ending preservation.
+        if let Some(ending) = original_ending {
+            current_content = normalize_line_endings(&current_content, ending);
+        }
+
+        // Write.
+        if let Err(e) = write_with_preservation(&resolved, &current_content) {
+            result.insert("success".into(), json!(false));
+            result.insert("error".into(), json!(format!("Failed to write changes: {}", e)));
+            if !failed.is_empty() {
+                result.insert("edits_failed".into(), json!(failed));
+            }
+            return ToolResult::Text(dumps(&Value::Object(result)));
+        }
+
+        // Generate diff.
+        let diff = unified_diff(
+            &original_content,
+            &current_content,
+            &format!("a/{}", path),
+            &format!("b/{}", path),
+        );
+
+        result.insert("success".into(), json!(true));
+        result.insert("edits_applied".into(), json!(applied));
+        if !failed.is_empty() {
+            result.insert("edits_failed".into(), json!(failed));
+        }
+        if !diff.is_empty() {
+            result.insert("diff".into(), json!(diff));
+        }
+        result.insert("resolved_path".into(), json!(resolved.to_string_lossy()));
+        result.insert("files_modified".into(), json!([resolved.to_string_lossy()]));
+
+        update_read_timestamp(ctx, &resolved);
+        crate::file_tracker::FileTracker::record_write(&resolved.to_string_lossy());
+
+        ToolResult::Text(dumps(&Value::Object(result)))
+    }
 }
 
 // ---------------------------------------------------------------------------

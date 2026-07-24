@@ -10,13 +10,19 @@
 pub mod agent;
 pub mod compression;
 pub mod events;
+pub mod guardrails;
 pub mod guidance;
+pub mod hooks;
+pub mod loop_detection;
 pub mod prompt;
 pub mod threat_scan;
+pub mod verification;
 
 pub use agent::{Agent, AgentConfig, TurnResult, Transport};
 pub use compression::ContextCompressor;
 pub use events::AgentEvent;
+pub use hooks::PreToolUseRunner;
+pub use loop_detection::LoopDetector;
 pub use prompt::{build_system_prompt, PromptInputs};
 
 /// Serializes tests that override the process-global joey home.

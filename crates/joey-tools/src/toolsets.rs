@@ -63,6 +63,11 @@ pub const CORE_TOOLS: &[&str] = &[
     "session_search",
     // Clarifying questions
     "clarify",
+    // LSP code intelligence
+    "lsp_diagnostics",
+    "lsp_definition",
+    "lsp_references",
+    "lsp_symbols",
     // Code execution + delegation
     "execute_code",
     "delegate_task",

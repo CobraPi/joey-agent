@@ -16,7 +16,7 @@ use ratatui::Frame;
 use crate::anim::{Equalizer, ParticleField, Pulse, Spinner};
 use crate::input::Input;
 use crate::state::{
-    AgentPhase, App, DisplayAgent, NoticeKind, RunMode, ToolStatus, TranscriptItem,
+    AgentPhase, App, DisplayAgent, NoticeKind, RunMode, SubagentStatus, ToolStatus, TranscriptItem,
 };
 use crate::theme::{gradient_spans, Rgb, Theme};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -310,15 +310,43 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
 }
 
 pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focused: bool, glow: f32) {
-    let block = panel_block("conversation", theme, focused, glow);
+    // Build header showing message count and scroll position.
+    let msg_count = app.transcript.len();
+    let scroll_info = if let Some(offset) = app.scroll {
+        let max = app.last_max_scroll.get();
+        if max > 0 {
+            let pct = ((1.0 - (offset as f64 / max as f64)) * 100.0).round() as usize;
+            format!(" {} messages · {}% from top ", msg_count, pct)
+        } else {
+            format!(" {} messages ", msg_count)
+        }
+    } else {
+        format!(" {} messages · live ", msg_count)
+    };
+    let title = if focused {
+        format!(" conversation [scroll: j/k g/G PgUp/PgDn /search ] {} ", scroll_info)
+    } else {
+        format!(" conversation {} ", scroll_info)
+    };
+    let block = panel_block(&title, theme, focused, glow);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
-    let content_w = inner.width as usize;
-    let visible = inner.height as usize;
+    // Reserve 1 column on the right for the scrollbar.
+    let content_width = inner.width.saturating_sub(1) as usize;
+    let scrollbar_area = Rect::new(
+        inner.x + inner.width.saturating_sub(1),
+        inner.y,
+        1,
+        inner.height,
+    );
+    let text_area = Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height);
+
+    let content_w = content_width;
+    let visible = text_area.height as usize;
     let offset = app.scroll.unwrap_or(0);
     // One extra line beyond the viewport tells us whether more content
     // exists above (so scroll_up may keep going).
@@ -374,15 +402,18 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
     let scroll_rows = total.saturating_sub(visible + clamped).min(u16::MAX as usize);
 
     let para = Paragraph::new(Text::from(lines)).scroll((scroll_rows as u16, 0));
-    f.render_widget(para, inner);
+    f.render_widget(para, text_area);
+
+    // ── Scrollbar ────────────────────────────────────────────────────
+    draw_scrollbar(f, scrollbar_area, app, theme, total, visible, clamped);
 
     // Scrolled-up indicator: bottom-right badge showing the distance to live.
     if app.scroll.is_some() && clamped > 0 {
         let badge = format!(" ↓ {} line{} below ", clamped, if clamped == 1 { "" } else { "s" });
         let bw = UnicodeWidthStr::width(badge.as_str()) as u16;
-        if bw < inner.width {
-            let bx = inner.x + inner.width - bw;
-            let by = inner.y + inner.height - 1;
+        if bw < text_area.width {
+            let bx = text_area.x + text_area.width - bw;
+            let by = text_area.y + text_area.height - 1;
             let buf = f.buffer_mut();
             for (xx, ch) in (bx..).zip(badge.chars()) {
                 let cell = &mut buf[(xx, by)];
@@ -394,6 +425,54 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
                 );
             }
         }
+    }
+}
+
+/// Draw a scrollbar on the right edge of the transcript.
+fn draw_scrollbar(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: Theme,
+    total_lines: usize,
+    visible_lines: usize,
+    current_offset: usize,
+) {
+    if area.width == 0 || area.height == 0 || total_lines <= visible_lines {
+        // No scrollbar needed — everything fits.
+        return;
+    }
+
+    let buf = f.buffer_mut();
+    let h = area.height as usize;
+
+    // Calculate the thumb position and size.
+    let content_ratio = visible_lines as f64 / total_lines as f64;
+    let thumb_size = ((h as f64 * content_ratio).ceil() as usize).max(1).min(h);
+    let scroll_progress = if total_lines > visible_lines {
+        current_offset as f64 / (total_lines - visible_lines) as f64
+    } else {
+        0.0
+    };
+    // When auto-following (scroll=None, offset=0), the thumb is at the bottom.
+    let thumb_top = (h - thumb_size)
+        .saturating_mul((1.0 - scroll_progress) as usize);
+
+    let track_color = theme.bg_panel.to_color();
+    let thumb_color = if app.scroll.is_some() {
+        theme.gold.to_color()
+    } else {
+        theme.info.to_color()
+    };
+
+    for y in 0..h {
+        let cell = &mut buf[(area.x, area.y + y as u16)];
+        let in_thumb = y >= thumb_top && y < thumb_top + thumb_size;
+        let ch = if in_thumb { '█' } else { '│' };
+        cell.set_char(ch).set_style(
+            Style::default()
+                .fg(if in_thumb { thumb_color } else { track_color }),
+        );
     }
 }
 
@@ -528,6 +607,39 @@ pub fn draw_activity(
     }
     lines.push(Line::from(vec![Span::raw("")]));
 
+    // Section 1b: active subagents (delegation roster, T064).
+    if !app.subagent_entries.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  subagents".to_string(),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        )]));
+        for entry in &app.subagent_entries {
+            let (icon, col) = match entry.status {
+                SubagentStatus::Running => ("⟳", theme.busy),
+                SubagentStatus::Done => ("✓", theme.success),
+                SubagentStatus::Failed => ("✗", theme.error),
+            };
+            let elapsed = entry.started.elapsed().as_secs();
+            let label = truncate_str(&entry.agent_type, cw.saturating_sub(14));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{} ", icon),
+                    Style::default().fg(col.to_color()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    label,
+                    Style::default().fg(theme.fg_subtle.to_color()),
+                ),
+                Span::styled(
+                    format!("  {}s", elapsed),
+                    Style::default().fg(theme.fg_most_subtle.to_color()),
+                ),
+            ]));
+        }
+        lines.push(Line::from(vec![Span::raw("")]));
+    }
+
     // Section 2: equalizer bars.
     lines.push(Line::from(vec![Span::styled(
         "  activity".to_string(),
@@ -552,9 +664,18 @@ pub fn draw_activity(
         Style::default().fg(theme.fg_subtle.to_color()),
     )]));
     lines.push(Line::from(vec![Span::styled(
-        format!("   it  {}", t.iterations),
+        format!("   api {}", t.iterations),
         Style::default().fg(theme.fg_subtle.to_color()),
     )]));
+
+    // Section 4: learnings / wisdom counter (persistent, T065).
+    if app.learnings_count > 0 {
+        lines.push(Line::from(vec![Span::raw("")]));
+        lines.push(Line::from(vec![Span::styled(
+            format!("  ♾ {} learnings", app.learnings_count),
+            Style::default().fg(theme.keyword.to_color()),
+        )]));
+    }
 
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
@@ -587,6 +708,18 @@ fn fmt_tokens(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Truncate a string to `max` chars, appending an ellipsis if cut.
+fn truncate_str(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    format!("{}…", chars[..max - 1].iter().collect::<String>())
 }
 
 // ── Input box ───────────────────────────────────────────────────────────────
@@ -640,9 +773,9 @@ pub fn draw_input(
     // Placeholder when the buffer is empty.
     if input.is_empty() {
         let hint = if app.is_busy() {
-            "agent working — type to queue the next prompt · Esc interrupts"
+            "agent working — type to queue · Esc interrupts · Ctrl+C quits"
         } else {
-            "type a prompt · ? for help"
+            "type a prompt · ? for help · Ctrl+C quits"
         };
         lines.clear();
         lines.push(Line::from(vec![
@@ -758,9 +891,9 @@ pub fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: Theme, elapsed: 
 
     // Right-aligned keymap hint (matches the actual bindings).
     let hint = if app.is_busy() {
-        "⏎ queue  Esc interrupt  ^R reasoning  ? help"
+        "⏎ queue  Esc interrupt  ^T scroll  ^R reasoning  ? help"
     } else {
-        "⏎ send  ⌥⏎ newline  Tab focus  ^R reasoning  ? help  Esc quit"
+        "⏎ send  ⌥⏎ newline  ^T scroll  ^R reasoning  ? help  ^C quit"
     };
     let hint_style = Style::default().fg(theme.fg_most_subtle.to_color());
     let hint_w = UnicodeWidthStr::width(hint) as u16;
@@ -822,10 +955,12 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("Esc / Ctrl+C", "interrupt turn (idle: quit)"),
         ("Ctrl+C ×2", "force exit during a turn"),
         ("Ctrl+D", "quit (on empty input)"),
-        ("Tab", "focus input ↔ transcript"),
-        ("↑ / ↓", "scroll transcript (single-line input)"),
-        ("PgUp / PgDn", "scroll transcript"),
+        ("Ctrl+T", "toggle focus: input ↔ transcript"),
+        ("PgUp / PgDn", "scroll transcript (enters scroll mode)"),
+        ("Ctrl+B / Ctrl+F", "half-page scroll up/down"),
+        ("j / k  ↑ / ↓", "scroll one line (in transcript focus)"),
         ("g / G", "top / bottom (transcript focus)"),
+        ("/ n N", "search history · next · previous match"),
         ("Ctrl+R", "toggle reasoning panel"),
         ("Ctrl+L", "clear transcript view"),
         ("Ctrl+A/E  Ctrl+U/K/W", "line start/end · kill line/word"),
@@ -848,6 +983,53 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         .collect();
     let list = List::new(items);
     f.render_widget(list, inner);
+}
+
+// ── Search bar overlay ──────────────────────────────────────────────
+
+/// Render the search bar as a bottom overlay. Only draws when
+/// `app.search_open` is true.
+pub fn draw_search_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    if !app.search_open {
+        return;
+    }
+    let theme = *theme;
+
+    // Bottom 3-row bar.
+    let h = 3u16;
+    let y = area.y + area.height.saturating_sub(h);
+    let search_area = Rect::new(area.x, y, area.width, h);
+    f.render_widget(Clear, search_area);
+
+    let title = if app.search_query.is_empty() {
+        " search (Esc to close) "
+    } else if app.search_has_match {
+        " search · match found (n=next N=prev) "
+    } else {
+        " search · no matches "
+    };
+    let block = gradient_block_focused(title, theme, 0.7);
+    let inner = block.inner(search_area);
+    f.render_widget(block, search_area);
+
+    let prompt_line = Line::from(vec![
+        Span::styled(
+            "/",
+            Style::default()
+                .fg(theme.gold.to_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            &app.search_query,
+            Style::default().fg(theme.fg_base.to_color()),
+        ),
+        Span::styled(
+            "▏",
+            Style::default().fg(theme.accent.to_color()),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(prompt_line), inner);
 }
 
 // ── Agent picker overlay (T028 / BC-013) ────────────────────────────────────
