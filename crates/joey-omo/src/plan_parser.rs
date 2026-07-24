@@ -63,7 +63,7 @@ impl ParsedPlan {
 /// Dependency lines (optional): `> Depends on: N, M` following a task.
 pub fn parse_plan(markdown: &str) -> ParsedPlan {
     let mut tasks: Vec<ParsedTask> = Vec::new();
-    let mut last_task_deps: Vec<usize> = Vec::new();
+    let mut last_task_deps: Vec<usize>;
 
     for line in markdown.lines() {
         let trimmed = line.trim();

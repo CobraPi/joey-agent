@@ -207,7 +207,7 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
         }
         TranscriptItem::Assistant { text } => {
             lines.push(Line::from(vec![Span::styled(
-                "◆ assistant ",
+                "◆ agent ",
                 Style::default()
                     .fg(theme.info.to_color())
                     .add_modifier(Modifier::BOLD),
@@ -334,7 +334,7 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
     // the dedicated reasoning panel, not here.)
     if !app.streaming_assistant.is_empty() {
         let mut tail = vec![Line::from(vec![Span::styled(
-            "◆ assistant ",
+            "◆ agent ",
             Style::default().fg(theme.info.to_color()).add_modifier(Modifier::BOLD),
         )])];
         for wl in wrap(&app.streaming_assistant, content_w.saturating_sub(2)) {
@@ -706,6 +706,18 @@ pub fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: Theme, elapsed: 
         Style::default().bg(mode_col.to_color()).fg(theme.bg_void.to_color()).add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::raw("  "));
+    // active agent (OMO agent picker, T145). When the roster is populated,
+    // show the active agent's colored display name so the status bar reflects
+    // a Tab switch even when the picker overlay is closed.
+    if let Some(agent) = app.agent_roster.get(app.active_agent_index) {
+        if !agent.display_name.is_empty() {
+            spans.push(Span::styled(
+                format!("◆ {}", agent.display_name),
+                Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("  "));
+        }
+    }
     // cwd
     let cwd_short = shorten_path(&app.cwd, 28);
     spans.push(Span::styled(

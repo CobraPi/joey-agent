@@ -7,6 +7,42 @@
 
 use std::collections::{HashMap, HashSet};
 
+// ── Billing Plan Aliases (BC-010) ─────────────────────────────────────
+//
+// OMO fallback chains reference billing namespace names that map to
+// canonical providers. These are registered as provider aliases so
+// requires_provider checks match correctly.
+
+/// Return billing plan aliases for a given canonical provider name.
+/// These are the billing namespace names used in OMO fallback chains.
+fn billing_plan_aliases_for(canonical_provider: &str) -> &'static [&'static str] {
+    match canonical_provider {
+        "zai" => &[
+            "zai-coding-plan",
+            "bailian-coding-plan",
+            "moonshotai-cn",
+            "opencode-go",
+        ],
+        "openrouter" => &[
+            "opencode",
+            "vercel",
+            "kimi-for-coding",
+            "moonshotai",
+            "ollama-cloud",
+            "aihubmix",
+            "minimax-coding-plan",
+            "minimax-cn-coding-plan",
+        ],
+        "anthropic" => &["github-copilot", "vercel", "opencode"],
+        "openai-api" => &["github-copilot", "vercel", "opencode"],
+        "google" => &["github-copilot", "vercel", "opencode"],
+        "xai" => &["github-copilot", "vercel", "opencode"],
+        "deepseek" => &["github-copilot", "vercel", "opencode"],
+        "nous" => &["github-copilot", "vercel", "opencode"],
+        _ => &[],
+    }
+}
+
 // ── ModelFamily ─────────────────────────────────────────────────────
 
 /// A coarse model vendor/family classification derived from the model ID
@@ -130,6 +166,39 @@ impl AvailableModelSet {
         Self::default()
     }
 
+    /// Build a set from a single connected provider profile + the active model.
+    ///
+    /// Registers the provider under its canonical name **and** every alias, so
+    /// `requiresProvider` gating (BC-010) matches the namespace names used in
+    /// the OMO fallback chains (e.g. `"openai"` is an alias of the
+    /// `"openai-api"` profile; `"github-copilot"` is an alias of `"copilot"`).
+    /// Seeds concrete model IDs from the active model, the profile's default
+    /// aux model, and its curated fallback list, so fallback chains resolve via
+    /// exact and family-level fuzzy matches.
+    pub fn from_connected(profile: &joey_providers::ProviderProfile, active_model: &str) -> Self {
+        let mut set = Self::new();
+        set.add_provider(profile.name.to_string());
+        for alias in profile.aliases {
+            set.add_provider((*alias).to_string());
+        }
+        // Add billing plan aliases (BC-010): OMO fallback chains reference
+        // billing namespace names that map to canonical providers. These are
+        // registered here so requires_provider checks match correctly.
+        for billing_plan in billing_plan_aliases_for(profile.name) {
+            set.add_provider(billing_plan.to_string());
+        }
+        if !active_model.is_empty() {
+            set.add_model(active_model.to_string());
+        }
+        if !profile.default_aux_model.is_empty() {
+            set.add_model(profile.default_aux_model.to_string());
+        }
+        for m in profile.fallback_models {
+            set.add_model((*m).to_string());
+        }
+        set
+    }
+
     /// Build a set from an iterator of available model IDs.
     pub fn from_models<I>(models: I) -> Self
     where
@@ -145,7 +214,10 @@ impl AvailableModelSet {
     /// Add a known-available model ID.
     pub fn add_model(&mut self, model: String) {
         let family = ModelFamily::detect(&model);
-        self.family_index.entry(family).or_default().push(model.clone());
+        self.family_index
+            .entry(family)
+            .or_default()
+            .push(model.clone());
         self.models.insert(model);
     }
 
@@ -165,9 +237,12 @@ impl AvailableModelSet {
     }
 
     /// Return the first available model ID in this family (if any).
-    /// Used by BC-007 fuzzy resolution.
+    /// Used for BC-007 fuzzy resolution.
     pub fn first_in_family(&self, family: ModelFamily) -> Option<&str> {
-        self.family_index.get(&family).and_then(|v| v.first()).map(|s| s.as_str())
+        self.family_index
+            .get(&family)
+            .and_then(|v| v.first())
+            .map(|s| s.as_str())
     }
 
     /// Is this provider connected?
@@ -177,7 +252,9 @@ impl AvailableModelSet {
 
     /// True if any of the listed providers is connected.
     pub fn has_any_provider(&self, providers: &[String]) -> bool {
-        providers.iter().any(|p| self.connected_providers.contains(p))
+        providers
+            .iter()
+            .any(|p| self.connected_providers.contains(p))
     }
 
     /// Number of available models.
@@ -233,8 +310,14 @@ mod tests {
     /// T016: ModelFamily::detect() correctly classifies known model IDs.
     #[test]
     fn detect_classifies_known_models() {
-        assert_eq!(ModelFamily::detect("claude-opus-4-8"), ModelFamily::Anthropic);
-        assert_eq!(ModelFamily::detect("claude-sonnet-4-6"), ModelFamily::Anthropic);
+        assert_eq!(
+            ModelFamily::detect("claude-opus-4-8"),
+            ModelFamily::Anthropic
+        );
+        assert_eq!(
+            ModelFamily::detect("claude-sonnet-4-6"),
+            ModelFamily::Anthropic
+        );
         assert_eq!(ModelFamily::detect("gpt-5.6-sol"), ModelFamily::Gpt);
         assert_eq!(ModelFamily::detect("kimi-k3"), ModelFamily::Kimi);
         assert_eq!(ModelFamily::detect("glm-5"), ModelFamily::Glm);
@@ -264,17 +347,14 @@ mod tests {
         };
 
         // Only Anthropic available → entry 1 exact match
-        let anthropic_only = AvailableModelSet::from_models(
-            ["claude-opus-4-8".to_string()].into_iter(),
-        );
+        let anthropic_only =
+            AvailableModelSet::from_models(["claude-opus-4-8".to_string()].into_iter());
         let (model, variant) = resolve_model(&chain, &anthropic_only).unwrap();
         assert_eq!(model, "claude-opus-4-8");
         assert_eq!(variant.as_deref(), Some("max"));
 
         // Only GLM available → entry 4 family match (glm-5)
-        let glm_only = AvailableModelSet::from_models(
-            ["glm-5".to_string()].into_iter(),
-        );
+        let glm_only = AvailableModelSet::from_models(["glm-5".to_string()].into_iter());
         let (model2, _) = resolve_model(&chain, &glm_only).unwrap();
         assert_eq!(model2, "glm-5");
 
@@ -320,5 +400,58 @@ mod tests {
         let (model, _) = resolve_model(&chain, &available).unwrap();
         // Family match returns the first available GLM model (glm-5.2)
         assert_eq!(model, "glm-5.2");
+    }
+
+    /// from_connected() registers the provider under every alias + seeds model
+    /// IDs from the active model + profile catalog.
+    #[test]
+    fn from_connected_registers_aliases_and_models() {
+        // zai aliases include "glm"; fallback_models include glm-5.2/glm-5.
+        let profile = joey_providers::profile::get_profile("zai").unwrap();
+        let set = AvailableModelSet::from_connected(&profile, "glm-5.2");
+        assert!(set.has_provider("zai"));
+        assert!(set.has_provider("glm"), "alias 'glm' must be registered");
+        assert!(set.contains_exact("glm-5.2"), "active model seeded");
+        assert!(set.contains_exact("glm-5"), "fallback model seeded");
+        assert!(set.contains_family(ModelFamily::Glm));
+    }
+
+    /// from_connected() makes OpenAI alias "openai" available for BC-010.
+    #[test]
+    fn from_connected_openai_alias_matches_chain_namespace() {
+        let profile = joey_providers::profile::get_profile("openai-api").unwrap();
+        let set = AvailableModelSet::from_connected(&profile, "gpt-5.6-sol");
+        // The OMO hephaestus chain references the namespace "openai".
+        assert!(
+            set.has_provider("openai"),
+            "openai alias must be registered"
+        );
+        assert!(set.contains_exact("gpt-5.6-sol"));
+    }
+
+    /// BC-010: billing plan aliases are registered for zai provider.
+    #[test]
+    fn from_connected_registers_billing_plan_aliases_for_zai() {
+        let profile = joey_providers::profile::get_profile("zai").unwrap();
+        let set = AvailableModelSet::from_connected(&profile, "glm-5.2");
+        // OMO fallback chains reference these billing namespace names
+        assert!(set.has_provider("zai-coding-plan"));
+        assert!(set.has_provider("bailian-coding-plan"));
+        assert!(set.has_provider("moonshotai-cn"));
+        assert!(set.has_provider("opencode-go"));
+    }
+
+    /// BC-010: billing plan aliases are registered for openrouter provider.
+    #[test]
+    fn from_connected_registers_billing_plan_aliases_for_openrouter() {
+        let profile = joey_providers::profile::get_profile("openrouter").unwrap();
+        let set = AvailableModelSet::from_connected(&profile, "claude-opus-4-8");
+        // OMO fallback chains reference these billing namespace names
+        assert!(set.has_provider("opencode"));
+        assert!(set.has_provider("vercel"));
+        assert!(set.has_provider("kimi-for-coding"));
+        assert!(set.has_provider("moonshotai"));
+        assert!(set.has_provider("ollama-cloud"));
+        assert!(set.has_provider("aihubmix"));
     }
 }

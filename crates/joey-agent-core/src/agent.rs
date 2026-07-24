@@ -654,6 +654,66 @@ impl Agent {
         None
     }
 
+    /// Switch the runtime model/provider live (OMO agent switching, T033).
+    ///
+    /// Mirrors the failover path in [`try_activate_fallback`]: rebuilds the
+    /// provider client, swaps the model/provider identity, rewrites the cached
+    /// prompt's `Model:`/`Provider:` lines, and recalibrates the context
+    /// compressor for the new backend. Returns a human-readable notice string
+    /// on success, or an error if the new client cannot be built (the agent
+    /// keeps its previous runtime in that case).
+    ///
+    /// `base_url` empty → the new profile's default endpoint.
+    pub fn switch_model(
+        &mut self,
+        provider: &str,
+        base_url: &str,
+        model: &str,
+        api_key: Option<String>,
+    ) -> Result<String, ProviderError> {
+        // No-op if already on this exact backend — avoids a needless rebuild.
+        if provider.eq_ignore_ascii_case(&self.provider_name) && model == self.config.model {
+            return Ok(format!("Already on {} via {}", model, self.provider_name));
+        }
+        let client = build_client(provider, base_url, model, api_key.clone())?;
+        let old_model = std::mem::replace(&mut self.config.model, model.to_string());
+        let old_provider =
+            std::mem::replace(&mut self.provider_name, client.profile().name.to_string());
+        self.config.provider = provider.to_string();
+        if !base_url.trim().is_empty() {
+            self.config.base_url = base_url.to_string();
+        }
+        self.config.api_key = api_key;
+        self.client = client;
+        self.rewrite_prompt_model_identity();
+        // Recalibrate the compressor for the new runtime context length and
+        // provider (mirrors try_activate_fallback's update_model call).
+        let new_ctx = compression::get_model_context_length(&self.config.model, None);
+        self.compressor.update_model(
+            &self.config.model,
+            new_ctx,
+            &self.config.base_url,
+            "",
+            &self.provider_name,
+            "",
+            None,
+        );
+        Ok(format!(
+            "🔄 Switched to {} via {} (was {} via {})",
+            self.config.model, self.provider_name, old_model, old_provider
+        ))
+    }
+
+    /// The active model ID.
+    pub fn model(&self) -> &str {
+        &self.config.model
+    }
+
+    /// The active provider (canonical profile name).
+    pub fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
     /// Point the cached prompt's `Model:`/`Provider:` lines at the active
     /// runtime after a failover — only the LAST occurrence of each
     /// (chat_completion_helpers.py `rewrite_prompt_model_identity`).
@@ -2853,5 +2913,30 @@ mod tests {
         .await;
         assert!(result.is_ok(), "agent hung before completing {total_turns} turns");
         drop(guard);
+    }
+
+    /// switch_model() live-swaps the runtime model/provider and is idempotent
+    /// for the same backend (T033). Uses the scripted-transport fixture so no
+    /// real network call is made; only the client identity is rebuilt.
+    #[tokio::test]
+    async fn switch_model_swaps_identity_and_is_idempotent() {
+        let f = fixture(vec![], 5, 3, None);
+        let mut agent = f.agent;
+        assert_eq!(agent.model(), "test-model");
+
+        // Switch to a different model on the same OpenRouter provider.
+        let msg = agent
+            .switch_model("openrouter", "", "anthropic/claude-sonnet-4.6", None)
+            .expect("switch");
+        assert!(msg.contains("claude-sonnet-4.6"));
+        assert_eq!(agent.model(), "anthropic/claude-sonnet-4.6");
+        assert_eq!(agent.provider_name(), "openrouter");
+
+        // Re-selecting the current backend is a no-op (no rebuild, no error).
+        let again = agent
+            .switch_model("openrouter", "", "anthropic/claude-sonnet-4.6", None)
+            .expect("idempotent switch");
+        assert!(again.contains("Already on"));
+        assert_eq!(agent.model(), "anthropic/claude-sonnet-4.6");
     }
 }

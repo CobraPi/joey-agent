@@ -105,7 +105,7 @@ pub static REGISTRY: &[CommandDef] = &[
     cmd!("topup", &[], "Show your balance and manage billing on the portal", "Info", "", false),
     cmd!("insights", &[], "Show usage insights and analytics", "Info", "[days]", false),
     cmd!("platforms", &["gateway"], "Show gateway/messaging platform status", "Info", "", false),
-    cmd!("copy", &[], "Copy the last assistant response to clipboard", "Info", "[number]", true),
+    cmd!("copy", &[], "Copy the last agent response to clipboard", "Info", "[number]", true),
     cmd!("paste", &[], "Attach clipboard image from your clipboard", "Info", "", false),
     cmd!("image", &[], "Attach a local image file for your next prompt", "Info", "<path>", false),
     cmd!("update", &[], "Update Joey Agent to the latest version", "Info", "", false),

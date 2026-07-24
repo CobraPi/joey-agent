@@ -3,7 +3,6 @@
 //! Port of OMO's team mode. OFF by default (FR-041). When enabled, team members
 //! coordinate via a shared mailbox and shared task list.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};

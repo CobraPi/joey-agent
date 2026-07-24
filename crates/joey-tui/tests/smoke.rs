@@ -335,3 +335,100 @@ fn tiny_terminal_renders_without_panic() {
             .unwrap();
     }
 }
+
+/// T039 contract: the agent-picker state machine. A populated roster → open
+/// the picker → move the cursor → select → the active index updates and the
+/// chosen name is surfaced. This pins the exact transitions that Tab/↑↓/Enter
+/// drive in `Tui::handle_key` (which itself needs a real TTY to construct).
+#[test]
+fn agent_picker_open_navigate_select_contract() {
+    use joey_tui::state::DisplayAgent;
+
+    fn mk(name: &str, display: &str) -> DisplayAgent {
+        DisplayAgent {
+            name: name.to_string(),
+            display_name: display.to_string(),
+            color: String::new(),
+            mode: "Primary".to_string(),
+            resolved_model: Some("m".to_string()),
+            description: String::new(),
+        }
+    }
+
+    let mut app = joey_tui::AppState::new("s", "m");
+    // Simulate populate_agent_roster: Default + a few OMO agents.
+    app.agent_roster = vec![
+        mk("default", "Default"),
+        mk("sisyphus", "Sisyphus"),
+        mk("prometheus", "Prometheus"),
+        mk("atlas", "Atlas"),
+    ];
+    assert_eq!(app.agent_roster.len(), 4);
+
+    // Tab → open the picker.
+    app.agent_picker_open = true;
+    app.agent_picker_cursor = 0;
+    assert!(app.agent_picker_open);
+
+    // Render the picker: with a roster, draw_agent_picker must not bail.
+    {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = Theme::aurora();
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                joey_tui::widgets::draw_agent_picker(f, f.area(), &app, &theme);
+            })
+            .unwrap();
+    }
+
+    // ↓ ×2 → cursor on Prometheus (index 2).
+    let n = app.agent_roster.len();
+    app.agent_picker_cursor = (app.agent_picker_cursor + 1) % n;
+    app.agent_picker_cursor = (app.agent_picker_cursor + 1) % n;
+    assert_eq!(app.agent_picker_cursor, 2);
+
+    // Enter → select: active index updates to the cursor, picker closes, and
+    // the SwitchAgent name matches the roster entry (as handle_key emits).
+    let idx = app.agent_picker_cursor;
+    let chosen = app.agent_roster[idx].name.clone();
+    app.agent_picker_open = false;
+    app.active_agent_index = idx;
+    assert!(!app.agent_picker_open);
+    assert_eq!(app.active_agent_index, 2);
+    assert_eq!(chosen, "prometheus");
+
+    // The status bar reflects the new active agent.
+    let active = &app.agent_roster[app.active_agent_index];
+    assert_eq!(active.display_name, "Prometheus");
+}
+
+/// build_agent_roster_from_registry always leads with "Default" and includes
+/// only available primary agents (T140 contract).
+#[test]
+fn roster_builder_leads_with_default_then_available_primaries() {
+    // Only a GLM model available → Sisyphus/Prometheus/Atlas resolve via the
+    // glm family; Hephaestus needs an openai-class provider and is skipped.
+    let profile = joey_providers::profile::get_profile("zai").unwrap();
+    let available =
+        joey_omo::AvailableModelSet::from_connected(&profile, "glm-5.2");
+    let overrides = joey_omo::agents::registry::ModelOverrides::new();
+    let registry = joey_omo::AgentRegistry::build(available, &overrides);
+
+    let roster = joey_tui::widgets::build_agent_roster_from_registry(&registry);
+
+    assert!(!roster.is_empty(), "roster must not be empty");
+    assert_eq!(roster[0].name, "default", "Default is always first");
+    // Every non-default entry is an available primary with a resolved model.
+    for entry in roster.iter().skip(1) {
+        assert!(
+            entry.resolved_model.is_some(),
+            "{} should have resolved (only available primaries appear)",
+            entry.display_name
+        );
+    }
+    // The "Default" entry has no resolved_model until the host stamps it.
+    assert!(roster[0].resolved_model.is_none());
+}

@@ -155,6 +155,11 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         }
     }
 
+    // Populate the Tab agent roster from the OMO registry, resolved against the
+    // connected provider + active model (T140). Without this, Tab opens an
+    // empty picker that renders nothing — the visible "Tab does nothing" bug.
+    populate_agent_roster(&mut tui, &agent);
+
     // Single-query mode: run one turn, then hand the answer back to the
     // normal terminal (the alternate screen vanishes on exit).
     if let Some(query) = &opts.query {
@@ -212,6 +217,107 @@ fn end_session(agent: &Agent, session_id: &str, reason: &str) {
     }
 }
 
+/// Build the Tab-picker agent roster from the OMO registry, resolved against
+/// the currently connected provider + active model (T140). The first entry is
+/// always "Default" (the live joey-agent); followed by each available primary
+/// OMO agent in canonical Tab order.
+fn populate_agent_roster(tui: &mut Tui, agent: &Agent) {
+    let available = joey_omo::AvailableModelSet::from_connected(
+        agent.client().profile(),
+        agent.model(),
+    );
+    let overrides = joey_omo::agents::registry::ModelOverrides::new();
+    let registry = joey_omo::AgentRegistry::build(available, &overrides);
+    tui.app_mut().agent_roster =
+        joey_tui::widgets::build_agent_roster_from_registry(&registry);
+    // Stamp the Default entry's runtime so the picker shows the live model.
+    if let Some(default) = tui.app_mut().agent_roster.first_mut() {
+        default.resolved_model = Some(agent.model().to_string());
+    }
+}
+
+/// Look up the agent's model requirement in the OMO registry and switch the
+/// live runtime to it (T033/BC-015). Returns a human-readable notice.
+/// "Default" reverts to the model the session started with (saved on the App).
+fn switch_agent(tui: &mut Tui, agent: &mut Agent, agent_name: &str) {
+    // "Default" → restore the session's original model. We stash it in the
+    // App the first time we switch AWAY from it.
+    if agent_name == "default" {
+        let target = tui.app().default_model.clone();
+        let target = match target {
+            Some(m) if !m.is_empty() => m,
+            _ => {
+                // Nothing saved (shouldn't happen post-startup) — stay put.
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "Already on the default agent".into(),
+                    kind: NoticeKind::Info,
+                });
+                return;
+            }
+        };
+        apply_model_switch(tui, agent, "default", &target, "auto");
+        return;
+    }
+
+    // Rebuild a registry to read the agent's resolved model + provider.
+    let available = joey_omo::AvailableModelSet::from_connected(
+        agent.client().profile(),
+        agent.model(),
+    );
+    let overrides = joey_omo::agents::registry::ModelOverrides::new();
+    let registry = joey_omo::AgentRegistry::build(available, &overrides);
+    let Some(omo_agent) = registry.get(agent_name) else {
+        tui.app_mut().push_item(TranscriptItem::Notice {
+            text: format!("Unknown agent: {agent_name}"),
+            kind: NoticeKind::Warning,
+        });
+        return;
+    };
+    let Some(model) = omo_agent.resolved_model.clone() else {
+        tui.app_mut().push_item(TranscriptItem::Notice {
+            text: format!(
+                "{} is unavailable with the current provider/model",
+                omo_agent.display_name
+            ),
+            kind: NoticeKind::Warning,
+        });
+        return;
+    };
+    // Let the provider auto-resolve from the model (provider="auto"), matching
+    // how an explicit `--model` is handled at startup.
+    apply_model_switch(tui, agent, &omo_agent.display_name, &model, "auto");
+}
+
+/// Apply the model swap, surfacing the result as a transcript notice and
+/// syncing the TUI's model label.
+fn apply_model_switch(
+    tui: &mut Tui,
+    agent: &mut Agent,
+    display_name: &str,
+    model: &str,
+    provider: &str,
+) {
+    // Stash the session's original model the first time we switch away.
+    if tui.app().default_model.is_none() {
+        tui.app_mut().default_model = Some(agent.model().to_string());
+    }
+    match agent.switch_model(provider, "", model, None) {
+        Ok(msg) => {
+            tui.app_mut().model = agent.model().to_string();
+            tui.app_mut().provider = agent.provider_name().to_string();
+            tui.app_mut().push_item(TranscriptItem::Notice {
+                text: format!("{msg} — agent mode: {display_name}"),
+                kind: NoticeKind::Success,
+            });
+        }
+        Err(e) => {
+            tui.app_mut().push_item(TranscriptItem::Error {
+                text: format!("Could not switch to {display_name}: {e}"),
+            });
+        }
+    }
+}
+
 /// The interactive read → submit → render loop driven by the TUI.
 async fn interactive_loop(tui: &mut Tui, agent: &mut Agent) -> anyhow::Result<()> {
     let mut queued: VecDeque<String> = VecDeque::new();
@@ -225,11 +331,8 @@ async fn interactive_loop(tui: &mut Tui, agent: &mut Agent) -> anyhow::Result<()
             TuiAction::Quit => return Ok(()),
             TuiAction::Interrupt => continue,
             TuiAction::SwitchAgent(agent_name) => {
-                // The host handles agent switching by rebuilding the AgentConfig.
-                // For now, emit a notice so the user sees feedback.
-                tui.app_mut().apply(joey_agent_core::AgentEvent::Notice(
-                    format!("Switched to agent: {}", agent_name),
-                ));
+                // T033/BC-015: rebuild the runtime onto the chosen agent's model.
+                switch_agent(tui, agent, &agent_name);
             }
             TuiAction::Submit(text) => {
                 if text.trim_start().starts_with('/') {
@@ -239,6 +342,11 @@ async fn interactive_loop(tui: &mut Tui, agent: &mut Agent) -> anyhow::Result<()
                     continue;
                 }
                 run_turn(tui, agent, &text, &mut queued).await;
+                // BC-016: honor an agent switch requested mid-turn, now that
+                // the turn's mutable borrow of `agent` has been released.
+                if let Some(agent_name) = tui.app_mut().pending_agent_switch.take() {
+                    switch_agent(tui, agent, &agent_name);
+                }
             }
         }
     }
@@ -364,9 +472,18 @@ async fn run_turn(
                                         });
                                     }
                                     TuiAction::SwitchAgent(agent_name) => {
+                                        // BC-016: a live turn holds a mutable
+                                        // borrow of the agent, and the switch
+                                        // targets the NEXT turn anyway. Stash
+                                        // it; applied once the turn ends.
+                                        tui.app_mut().pending_agent_switch =
+                                            Some(agent_name.clone());
                                         tui.app_mut().push_item(TranscriptItem::Notice {
-                                            text: format!("Switched to: {}", agent_name),
-                                            kind: NoticeKind::Info,
+                                            text: format!(
+                                                "⧗ will switch to {} next turn",
+                                                agent_name
+                                            ),
+                                            kind: NoticeKind::Busy,
                                         });
                                     }
                                 }

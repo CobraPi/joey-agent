@@ -55,6 +55,93 @@ fn sisyphus_glm_variant_mentions_glm() {
 }
 
 #[test]
+fn every_glm_variant_mentions_glm() {
+    // Agents that carry an explicit GLM prompt variant must mention GLM when
+    // dispatched with a glm-5.2 model. These are the agents whose for_model()
+    // now routes ModelFamily::Glm to a dedicated glm()/glm_5_2() function.
+    let glm_agents = [
+        "sisyphus",
+        "sisyphus-junior",
+        "atlas",
+        "oracle",
+        "momus",
+        "metis",
+        "hephaestus",
+    ];
+    for &agent in &glm_agents {
+        let prompt = joey_omo::agents::prompts::dispatch_system_prompt(agent, "glm-5.2");
+        assert!(
+            prompt.contains("GLM"),
+            "GLM variant for {} must mention GLM",
+            agent
+        );
+    }
+}
+
+#[test]
+fn glm_variants_contain_calibration_block() {
+    // Every explicit GLM variant must carry the GLM 5.2 calibration overlay.
+    let glm_agents = [
+        "sisyphus",
+        "sisyphus-junior",
+        "atlas",
+        "oracle",
+        "momus",
+        "metis",
+        "hephaestus",
+    ];
+    for &agent in &glm_agents {
+        let prompt = joey_omo::agents::prompts::dispatch_system_prompt(agent, "glm-5.2");
+        assert!(
+            prompt.contains("LITERAL FOLLOWING") || prompt.contains("glm_5_2_calibration") || prompt.contains("glm_52_calibration"),
+            "GLM variant for {} must contain the GLM 5.2 calibration block",
+            agent
+        );
+    }
+}
+
+#[test]
+fn hephaestus_glm_variant_is_autonomous_worker() {
+    let prompt = joey_omo::agents::prompts::dispatch_system_prompt("hephaestus", "glm-5.2");
+    assert!(prompt.contains("Hephaestus"), "GLM Hephaestus must identify as Hephaestus");
+    assert!(
+        prompt.to_lowercase().contains("verify"),
+        "GLM Hephaestus must keep the verification gate"
+    );
+}
+
+#[test]
+fn oracle_glm_variant_is_read_only() {
+    let prompt = joey_omo::agents::prompts::dispatch_system_prompt("oracle", "glm-5.2");
+    assert!(
+        prompt.to_lowercase().contains("read-only"),
+        "GLM Oracle must declare read-only"
+    );
+}
+
+#[test]
+fn momus_glm_variant_keeps_verdict_format() {
+    let prompt = joey_omo::agents::prompts::dispatch_system_prompt("momus", "glm-5.2");
+    assert!(prompt.contains("OKAY"), "GLM Momus must keep the OKAY/REJECT verdict format");
+    assert!(prompt.contains("REJECT"));
+}
+
+#[test]
+fn sisyphus_glm_variant_is_full_port() {
+    // The enriched Sisyphus GLM port must contain all the sections from OMO's
+    // buildGlm52SisyphusPrompt: outcome_first, exploration, communication,
+    // constraints, plus the glm_52_calibration block.
+    let prompt = joey_omo::agents::prompts::dispatch_system_prompt("sisyphus", "glm-5.2");
+    assert!(prompt.contains("<outcome_first>"), "Sisyphus GLM must include outcome_first");
+    assert!(prompt.contains("<exploration>"), "Sisyphus GLM must include exploration");
+    assert!(prompt.contains("<communication>"), "Sisyphus GLM must include communication");
+    assert!(prompt.contains("<constraints>"), "Sisyphus GLM must include constraints");
+    assert!(prompt.contains("LITERAL FOLLOWING"));
+    assert!(prompt.contains("OVER-EXPLORATION"));
+    assert!(prompt.contains("CAPABILITY UNDER-REACH"));
+}
+
+#[test]
 fn sisyphus_gemini_variant_has_tool_call_mandate() {
     let prompt = joey_omo::agents::prompts::dispatch_system_prompt("sisyphus", "gemini-3.1-pro");
     assert!(prompt.contains("TOOL_CALL_MANDATE"), "Gemini sisyphus must have tool call mandate");

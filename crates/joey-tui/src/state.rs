@@ -178,6 +178,12 @@ pub struct App {
     pub agent_roster: Vec<DisplayAgent>,
     /// Index of the currently active agent (0=Default).
     pub active_agent_index: usize,
+    /// The session's original model, stashed on first agent switch so switching
+    /// back to "Default" can restore it. None until the user switches away.
+    pub default_model: Option<String>,
+    /// An agent switch requested while a turn was running — applied to the
+    /// next turn (BC-016). Cleared once honored.
+    pub pending_agent_switch: Option<String>,
     /// Active subagent entries for the activity panel (T064).
     pub subagent_entries: Vec<ActiveSubagentEntry>,
     /// Learnings counter for wisdom accumulation display.
@@ -210,6 +216,8 @@ impl App {
             agent_picker_cursor: 0,
             agent_roster: Vec::new(),
             active_agent_index: 0,
+            default_model: None,
+            pending_agent_switch: None,
             subagent_entries: Vec::new(),
             learnings_count: 0,
         }

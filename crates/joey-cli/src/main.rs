@@ -59,7 +59,7 @@ For more help on a command:
 #[derive(Parser, Debug)]
 #[command(
     name = "joey",
-    about = "Joey Agent - AI assistant with tool-calling capabilities",
+    about = "Joey Agent - AI agent with tool-calling capabilities",
     after_help = EPILOGUE,
     disable_help_subcommand = true,
     disable_version_flag = true

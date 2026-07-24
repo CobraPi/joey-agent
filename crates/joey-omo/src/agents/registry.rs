@@ -508,4 +508,48 @@ mod tests {
         let order: Vec<&str> = registry.tab_order().iter().map(|a| a.name.as_str()).collect();
         assert_eq!(order, vec!["sisyphus", "hephaestus", "prometheus", "atlas"]);
     }
+
+    /// Z.ai-native: with only the zai provider + GLM models available, every
+    /// one of the 11 agents must resolve to a model. This is the core
+    /// optimization — OMO runs natively on z.ai/GLM 5.2 with no other provider.
+    #[test]
+    fn all_agents_resolve_on_zai_only_setup() {
+        let profile = joey_providers::profile::get_profile("zai").unwrap();
+        let available = AvailableModelSet::from_connected(&profile, "glm-5.2");
+        let registry = AgentRegistry::build(available, &ModelOverrides::new());
+
+        assert_eq!(registry.all().len(), 11, "all 11 agents present");
+        for agent in registry.all() {
+            assert!(
+                agent.resolved_model.is_some(),
+                "agent '{}' must resolve a model on a z.ai-only setup (got None)",
+                agent.name
+            );
+            // Every resolved model should be in the GLM family.
+            let family = crate::models::ModelFamily::detect(agent.effective_model());
+            assert_eq!(
+                family,
+                crate::models::ModelFamily::Glm,
+                "agent '{}' should resolve a GLM model on z.ai-only, got '{}'",
+                agent.name,
+                agent.effective_model()
+            );
+        }
+    }
+
+    /// Hephaestus activates on z.ai (provider gate now accepts zai).
+    #[test]
+    fn hephaestus_available_with_zai_provider() {
+        let mut available = AvailableModelSet::new();
+        available.add_model("glm-5.2".into());
+        available.add_provider("zai".into());
+
+        let registry = AgentRegistry::build(available, &ModelOverrides::new());
+        let hephaestus = registry.get("hephaestus").unwrap();
+        assert!(
+            hephaestus.resolved_model.is_some(),
+            "Hephaestus must activate on z.ai provider + GLM model"
+        );
+        assert_eq!(hephaestus.resolved_model.as_deref(), Some("glm-5.2"));
+    }
 }

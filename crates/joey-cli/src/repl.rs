@@ -1081,10 +1081,17 @@ fn show_history(st: &ReplState) {
         if content.chars().count() > 100 {
             content = format!("{}…", content.chars().take(100).collect::<String>());
         }
+        // Display label for the role column. The assistant role is shown to the
+        // user as "agent" while the internal role string stays "assistant"
+        // (OpenAI chat-completion wire format / DB schema).
+        let display_label: std::borrow::Cow<str> = match m.role {
+            Role::Assistant => "agent".into(),
+            _ => role.into(),
+        };
         let colored_role = match m.role {
-            Role::User => Color::Cyan.paint(role).to_string(),
-            Role::Assistant => Color::Green.paint(role).to_string(),
-            _ => Color::DarkGray.paint(role).to_string(),
+            Role::User => Color::Cyan.paint(display_label.as_ref()).to_string(),
+            Role::Assistant => Color::Green.paint(display_label.as_ref()).to_string(),
+            _ => Color::DarkGray.paint(display_label.as_ref()).to_string(),
         };
         println!("  {}{:<12} {}", Color::DarkGray.paint(ts), colored_role, content);
     }
@@ -1210,7 +1217,7 @@ fn show_usage(st: &ReplState) {
     println!("  Messages recorded:  {}", msgs.len());
     println!("  With token counts:  {}", counted);
     println!("  Total tokens:       {}", total);
-    println!("  Assistant tokens:   {}", assistant_tokens);
+    println!("  Agent tokens:       {}", assistant_tokens);
     // Upstream `/usage` context block (cli.py `_show_usage`).
     let comp = st.agent.compressor();
     let last_prompt = comp.last_prompt_tokens.max(0);

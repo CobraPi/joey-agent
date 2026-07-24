@@ -8,7 +8,7 @@ pub mod prompts;
 pub mod registry;
 
 use crate::mode::{AgentMode, ToolPermissions};
-use crate::models::{ModelFamily, ModelRequirement};
+use crate::models::ModelRequirement;
 
 // ── OmoAgent ────────────────────────────────────────────────────────
 
@@ -73,7 +73,7 @@ pub fn sisyphus_requirement() -> ModelRequirement {
             FE::new("claude-opus-4-8", Some("max"), &["anthropic", "github-copilot", "opencode", "vercel"]),
             FE::new("kimi-k3", None, &["opencode-go", "kimi-for-coding", "moonshotai", "opencode", "vercel", "bailian-coding-plan", "moonshotai-cn", "firmware", "ollama-cloud", "aihubmix"]),
             FE::new("gpt-5.6-sol", Some("medium"), &["openai", "github-copilot", "opencode", "vercel"]),
-            FE::new("glm-5", None, &["zai-coding-plan", "opencode", "bailian-coding-plan", "vercel"]),
+            FE::new("glm-5.2", None, &["zai", "zai-coding-plan", "opencode", "bailian-coding-plan", "vercel"]),
             FE::new("big-pickle", None, &["opencode"]),
         ],
         requires_any_model: true,
@@ -81,11 +81,16 @@ pub fn sisyphus_requirement() -> ModelRequirement {
     }
 }
 
-/// Hephaestus: GPT-only; requiresProvider=[openai, github-copilot, opencode, vercel].
+/// Hephaestus: GPT-preferred high-precision coding specialist.
+///
+/// Originally GPT-only (requiresProvider=[openai, github-copilot, opencode,
+/// vercel]). The `zai` provider is now an accepted provider so the agent
+/// activates on a z.ai/GLM-only setup, with GLM 5.2 as a fallback model.
 pub fn hephaestus_requirement() -> ModelRequirement {
     ModelRequirement {
         fallback_chain: vec![
             FE::new("gpt-5.6-sol", Some("medium"), &["openai", "github-copilot", "vercel", "opencode"]),
+            FE::new("glm-5.2", None, &["zai", "zai-coding-plan", "opencode-go", "vercel"]),
         ],
         requires_any_model: true,
         requires_provider: Some(vec![
@@ -93,6 +98,7 @@ pub fn hephaestus_requirement() -> ModelRequirement {
             "github-copilot".into(),
             "opencode".into(),
             "vercel".into(),
+            "zai".into(),
         ]),
     }
 }
@@ -105,7 +111,7 @@ pub fn oracle_requirement() -> ModelRequirement {
             FE::new("gpt-5.6-sol", Some("high"), &["github-copilot"]),
             FE::new("gemini-3.1-pro", Some("high"), &["google", "github-copilot", "opencode", "vercel"]),
             FE::new("claude-opus-4-8", Some("max"), &["anthropic", "github-copilot", "opencode", "vercel"]),
-            FE::new("glm-5.2", None, &["opencode-go", "vercel"]),
+            FE::new("glm-5.2", None, &["zai", "opencode-go", "vercel"]),
         ],
         requires_any_model: false,
         requires_provider: None,
@@ -121,6 +127,7 @@ pub fn librarian_requirement() -> ModelRequirement {
         FE::new("minimax-m3", None, &["opencode-go", "vercel"]),
         FE::new("MiniMax-M3", None, &["minimax-coding-plan", "minimax-cn-coding-plan"]),
         FE::new("minimax-m2.7", None, &["opencode-go", "vercel"]),
+        FE::new("glm-4.6v", None, &["zai", "zai-coding-plan", "vercel"]),
         FE::new("claude-haiku-4-5", None, &["anthropic", "github-copilot", "vercel"]),
         FE::new("gpt-5.4-nano", None, &["openai", "vercel"]),
     ];
@@ -142,7 +149,7 @@ pub fn multimodal_requirement() -> ModelRequirement {
         fallback_chain: vec![
             FE::new("gpt-5.6-sol", Some("low"), &["openai", "opencode", "vercel"]),
             FE::new("kimi-k3", None, &["opencode-go", "vercel"]),
-            FE::new("glm-4.6v", None, &["zai-coding-plan", "vercel"]),
+            FE::new("glm-4.6v", None, &["zai", "zai-coding-plan", "vercel"]),
             FE::new("gpt-5-nano", None, &["openai", "github-copilot", "opencode", "vercel"]),
         ],
         requires_any_model: false,
@@ -156,7 +163,7 @@ pub fn prometheus_requirement() -> ModelRequirement {
         fallback_chain: vec![
             FE::new("claude-opus-4-8", Some("max"), &["anthropic", "github-copilot", "opencode", "vercel"]),
             FE::new("gpt-5.6-sol", Some("high"), &["openai", "github-copilot", "opencode", "vercel"]),
-            FE::new("glm-5.2", None, &["opencode-go", "vercel"]),
+            FE::new("glm-5.2", None, &["zai", "opencode-go", "vercel"]),
             FE::new("gemini-3.1-pro", None, &["google", "github-copilot", "opencode", "vercel"]),
         ],
         requires_any_model: false,
@@ -171,7 +178,7 @@ pub fn metis_requirement() -> ModelRequirement {
             FE::new("claude-sonnet-4-6", None, &["anthropic", "github-copilot", "opencode", "vercel"]),
             FE::new("claude-opus-4-8", Some("max"), &["anthropic", "github-copilot", "opencode", "vercel"]),
             FE::new("gpt-5.6-sol", Some("medium"), &["openai", "github-copilot", "opencode", "vercel"]),
-            FE::new("glm-5.2", None, &["opencode-go", "vercel"]),
+            FE::new("glm-5.2", None, &["zai", "opencode-go", "vercel"]),
             FE::new("kimi-k3", None, &["kimi-for-coding"]),
         ],
         requires_any_model: false,
@@ -189,7 +196,7 @@ pub fn momus_requirement() -> ModelRequirement {
             FE::new("gpt-5.6-sol", Some("high"), &["github-copilot"]),
             FE::new("claude-opus-4-8", Some("max"), &["anthropic", "github-copilot", "opencode", "vercel"]),
             FE::new("gemini-3.1-pro", Some("high"), &["google", "github-copilot", "opencode", "vercel"]),
-            FE::new("glm-5.2", None, &["opencode-go", "vercel"]),
+            FE::new("glm-5.2", None, &["zai", "opencode-go", "vercel"]),
         ],
         requires_any_model: false,
         requires_provider: None,
@@ -203,6 +210,7 @@ pub fn atlas_requirement() -> ModelRequirement {
             FE::new("claude-sonnet-4-6", None, &["anthropic", "github-copilot", "opencode", "vercel"]),
             FE::new("kimi-k3", None, &["opencode-go", "vercel"]),
             FE::new("gpt-5.6-sol", Some("medium"), &["openai", "github-copilot", "opencode", "vercel"]),
+            FE::new("glm-5.2", None, &["zai", "opencode-go", "vercel"]),
             FE::new("minimax-m3", None, &["opencode-go", "vercel"]),
             FE::new("MiniMax-M3", None, &["minimax-coding-plan", "minimax-cn-coding-plan"]),
             FE::new("minimax-m2.7", None, &["opencode-go", "vercel"]),
@@ -219,6 +227,7 @@ pub fn sisyphus_junior_requirement() -> ModelRequirement {
             FE::new("claude-sonnet-4-6", None, &["anthropic", "github-copilot", "opencode", "vercel"]),
             FE::new("kimi-k3", None, &["opencode-go", "vercel"]),
             FE::new("gpt-5.6-sol", Some("medium"), &["openai", "github-copilot", "opencode", "vercel"]),
+            FE::new("glm-5.2", None, &["zai", "opencode-go", "vercel"]),
             FE::new("minimax-m3", None, &["opencode-go", "vercel"]),
             FE::new("MiniMax-M3", None, &["minimax-coding-plan", "minimax-cn-coding-plan"]),
             FE::new("minimax-m2.7", None, &["opencode-go", "vercel"]),

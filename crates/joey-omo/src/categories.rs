@@ -6,7 +6,7 @@
 //! 1-to-1 port of OMO's `category-model-requirements.ts`.
 
 use crate::agents::registry::AgentRegistry;
-use crate::models::{resolve_model, AvailableModelSet, FallbackEntry, ModelRequirement};
+use crate::models::{resolve_model, ModelRequirement};
 
 // ── CategoryConfig ──────────────────────────────────────────────────
 
@@ -285,6 +285,7 @@ pub fn validate_delegation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::AvailableModelSet;
 
     #[test]
     fn exactly_eleven_categories() {
