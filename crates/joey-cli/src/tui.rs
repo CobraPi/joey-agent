@@ -370,8 +370,19 @@ async fn interactive_loop(tui: &mut Tui, agent: &mut Agent) -> anyhow::Result<()
                     }
                     continue;
                 }
-                apply_intent_gate(tui, agent, &text);
-                run_turn(tui, agent, &text, &mut queued).await;
+                // T114: @plan prefix detection (CLI/TUI parity with repl.rs).
+                // Switches the active agent to Prometheus and strips the prefix,
+                // so the rest of the message is treated as the planning goal.
+                let turn_text = handle_at_plan_prefix(tui, agent, &text);
+                // T114: prepend any pending OMO context (from /start-work) once,
+                // then clear it (mirrors repl.rs pending_context_injection).
+                let turn_text = match tui.app_mut().pending_context_injection.take() {
+                    Some(ctx) if !turn_text.is_empty() => format!("{ctx}\n{turn_text}"),
+                    Some(ctx) => ctx,
+                    None => turn_text,
+                };
+                apply_intent_gate(tui, agent, &turn_text);
+                run_turn(tui, agent, &turn_text, &mut queued).await;
                 // BC-016: honor an agent switch requested mid-turn, now that
                 // the turn's mutable borrow of `agent` has been released.
                 if let Some(agent_name) = tui.app_mut().pending_agent_switch.take() {
@@ -560,6 +571,30 @@ enum SlashAction {
     Quit,
 }
 
+/// T114: `@plan` prefix detection (CLI/TUI parity with repl.rs T108/T142).
+///
+/// When the user's message starts with `@plan`, switch the active agent to
+/// Prometheus (read-only planner) and strip the prefix so the remainder of the
+/// message becomes the planning goal. Execution is NOT started — the plan is
+/// produced, then the user decides whether to proceed.
+///
+/// Returns the text to actually send to the agent (prefix stripped). If the
+/// stripped text is empty, a notice is pushed and the caller should skip the
+/// turn; we return the empty string in that case and `run_turn` is a no-op on
+/// empty input.
+fn handle_at_plan_prefix(tui: &mut Tui, agent: &mut Agent, message: &str) -> String {
+    if !(message.starts_with("@plan ") || message == "@plan") {
+        return message.to_string();
+    }
+    let overlay = joey_omo::agents::prompts::dispatch_system_prompt("prometheus", agent.model());
+    agent.set_extra_instructions(Some(overlay));
+    tui.app_mut().push_item(TranscriptItem::Notice {
+        text: "📋 Switched to Prometheus (@plan) — create a plan, no execution.".into(),
+        kind: NoticeKind::Info,
+    });
+    message.trim_start_matches("@plan").trim().to_string()
+}
+
 /// IntentGate (FR-022/FR-024, T141): scan the user's message for OMO
 /// keyword triggers before the turn runs. When `ultrawork`/`ulw` is
 /// detected and the active agent supports it, inject the ultrawork
@@ -624,7 +659,7 @@ fn apply_intent_gate(tui: &mut Tui, agent: &mut Agent, message: &str) {
 
 /// Slash-command handling inside the TUI. A few commands work natively;
 /// the rest answer honestly instead of pretending to run.
-fn handle_slash_tui(input: &str, tui: &mut Tui, agent: &Agent) -> SlashAction {
+fn handle_slash_tui(input: &str, tui: &mut Tui, agent: &mut Agent) -> SlashAction {
     match slash::resolve(input) {
         Resolution::Unknown => {
             tui.app_mut().push_item(TranscriptItem::Error {
@@ -646,6 +681,16 @@ fn handle_slash_tui(input: &str, tui: &mut Tui, agent: &Agent) -> SlashAction {
         Resolution::Command { def, .. } => match def.name {
             "quit" | "exit" => return SlashAction::Quit,
             "help" => tui.toggle_help(),
+            // T114: /start-work — activate Atlas on a plan (CLI/TUI parity).
+            "start-work" => {
+                let args = slash_args_after(input, "start-work");
+                handle_start_work_tui(tui, agent, args);
+            }
+            // T114: /goal — persistent per-session objective (CLI/TUI parity).
+            "goal" => {
+                let args = slash_args_after(input, "goal");
+                handle_goal_tui(tui, args);
+            }
             "clear" => {
                 tui.app_mut().transcript.clear();
                 tui.app_mut().scroll = None;
@@ -740,4 +785,164 @@ fn handle_slash_tui(input: &str, tui: &mut Tui, agent: &Agent) -> SlashAction {
         },
     }
     SlashAction::Handled
+}
+
+/// Extract the argument substring after `/command` in a slash input string.
+/// E.g. "/start-work my-plan" → "my-plan", "/goal set Ship it" → "set Ship it".
+fn slash_args_after<'a>(input: &'a str, command: &str) -> &'a str {
+    // input starts with '/'; strip it, then the command name (case-insensitive).
+    let stripped = input.trim_start_matches('/');
+    let lower = stripped.to_ascii_lowercase();
+    // "/command <rest>" → "<rest>"
+    let prefix = format!("{command} ");
+    if lower.starts_with(&prefix) {
+        return &stripped[prefix.len()..];
+    }
+    // Bare "/command" with no args → empty.
+    if lower == command {
+        return "";
+    }
+    // Fallback: anything after the first space.
+    stripped.split_once(' ').map(|(_, r)| r).unwrap_or("")
+}
+
+/// T114: `/start-work [plan-name]` in the TUI — mirrors the CLI handler
+/// (`omo_start_work_slash`). Uses the OMO orchestrator runtime to resolve the
+/// plan / auto-resume, switch the agent to Atlas, and stash the context
+/// injection for the next submitted turn.
+fn handle_start_work_tui(tui: &mut Tui, agent: &mut Agent, args: &str) {
+    let cwd = std::path::PathBuf::from(tui.app().cwd.clone());
+    let omo_dir = cwd.join(".omo");
+    let session_id = tui.app().session_id.clone();
+    let plan_name_opt = if args.trim().is_empty() {
+        None
+    } else {
+        Some(args.trim())
+    };
+
+    match joey_omo::start_work(&omo_dir, &session_id, plan_name_opt) {
+        Ok(result) => {
+            let atlas_prompt = joey_omo::dispatch_system_prompt("atlas", agent.model());
+            agent.set_agent_identity(Some(atlas_prompt));
+            tui.app_mut().pending_context_injection = Some(result.context_injection);
+
+            if result.is_resume {
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!(
+                        "Resuming work on plan: {}",
+                        result
+                            .boulder
+                            .works
+                            .iter()
+                            .filter(|w| w.status == joey_omo::BoulderWorkStatus::Active)
+                            .last()
+                            .map(|w| w.plan_name.as_str())
+                            .unwrap_or("unknown")
+                    ),
+                    kind: NoticeKind::Success,
+                });
+            } else {
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "Started new work session. Atlas activated.".into(),
+                    kind: NoticeKind::Success,
+                });
+            }
+            tui.app_mut().push_item(TranscriptItem::Notice {
+                text: "Describe the work to begin, or just press Enter to start execution.".into(),
+                kind: NoticeKind::Info,
+            });
+        }
+        Err(msg) => {
+            tui.app_mut().push_item(TranscriptItem::Error { text: msg });
+            tui.app_mut().push_item(TranscriptItem::Notice {
+                text: "Use Prometheus (@plan) to create a plan first.".into(),
+                kind: NoticeKind::Info,
+            });
+        }
+    }
+}
+
+/// T114: `/goal <subcommand>` in the TUI — mirrors the CLI handler
+/// (`omo_goal_slash`). Manages the persistent per-session objective stored in
+/// `.omo/goal.json` (set/pause/resume/clear/show).
+fn handle_goal_tui(tui: &mut Tui, args: &str) {
+    let cwd = std::path::PathBuf::from(tui.app().cwd.clone());
+    let omo_dir = cwd.join(".omo");
+    let session_id = tui.app().session_id.clone();
+    let action = joey_omo::parse_goal_command(args);
+
+    match action {
+        joey_omo::GoalAction::Set { objective } => {
+            if objective.is_empty() {
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "Usage: /goal set <objective text>".into(),
+                    kind: NoticeKind::Info,
+                });
+                return;
+            }
+            let goal = joey_omo::GoalState::new(session_id, objective.clone());
+            match goal.write(&omo_dir) {
+                Ok(_) => tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!("Goal set: {objective}"),
+                    kind: NoticeKind::Success,
+                }),
+                Err(e) => tui.app_mut().push_item(TranscriptItem::Error {
+                    text: format!("Failed to write goal: {e}"),
+                }),
+            }
+        }
+        joey_omo::GoalAction::Pause => {
+            if let Some(mut goal) = joey_omo::GoalState::read(&omo_dir) {
+                goal.status = joey_omo::GoalStatus::Paused;
+                let _ = goal.write(&omo_dir);
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "Goal paused (no continuation injection).".into(),
+                    kind: NoticeKind::Info,
+                });
+            } else {
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "No goal set. Use /goal set <text>.".into(),
+                    kind: NoticeKind::Info,
+                });
+            }
+        }
+        joey_omo::GoalAction::Resume => {
+            if let Some(mut goal) = joey_omo::GoalState::read(&omo_dir) {
+                goal.status = joey_omo::GoalStatus::Active;
+                let _ = goal.write(&omo_dir);
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "Goal resumed (continuation injection active).".into(),
+                    kind: NoticeKind::Info,
+                });
+            } else {
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "No goal set. Use /goal set <text>.".into(),
+                    kind: NoticeKind::Info,
+                });
+            }
+        }
+        joey_omo::GoalAction::Clear => {
+            joey_omo::GoalState::clear(&omo_dir);
+            tui.app_mut().push_item(TranscriptItem::Notice {
+                text: "Goal cleared.".into(),
+                kind: NoticeKind::Info,
+            });
+        }
+        joey_omo::GoalAction::Show => match joey_omo::GoalState::read(&omo_dir) {
+            Some(goal) => {
+                let status = match goal.status {
+                    joey_omo::GoalStatus::Active => "Active",
+                    joey_omo::GoalStatus::Paused => "Paused",
+                };
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!("Goal [{}]: {}", status, goal.objective),
+                    kind: NoticeKind::Info,
+                });
+            }
+            None => tui.app_mut().push_item(TranscriptItem::Notice {
+                text: "No goal set. Usage: /goal set <text>".into(),
+                kind: NoticeKind::Info,
+            }),
+        },
+    }
 }

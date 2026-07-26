@@ -550,7 +550,7 @@ pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinne
 
 // ── Activity / tools sidebar ────────────────────────────────────────────────
 
-pub fn draw_activity(
+pub fn draw_omo_panel(
     f: &mut Frame,
     area: Rect,
     app: &App,
@@ -558,18 +558,105 @@ pub fn draw_activity(
     spinner: &Spinner,
     equalizer: &Equalizer,
 ) {
-    let block = gradient_block("activity", theme);
+    let block = gradient_block("omo", theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
-    let cw = inner.width.max(1) as usize;
+    // T072: graceful degradation for very short terminals (<9 rows).
+    if inner.height < 3 {
+        // Single-line: just show active agent name or "idle".
+        let label = if app.is_busy() { "busy" } else { "idle" };
+        f.render_widget(
+            Paragraph::new(Text::from(vec![Line::from(vec![Span::styled(
+                format!(" ◌ {}", label),
+                Style::default().fg(theme.fg_more_subtle.to_color()),
+            )])])),
+            inner,
+        );
+        return;
+    }
 
-    // Section 1: active agents list.
+    let cw = inner.width.max(1) as usize;
     let mut lines: Vec<Line> = Vec::new();
-    if app.active_agents.is_empty() {
+
+    // ── Section 0: pinned active agent + concurrency indicator (T066) ──
+    if let Some(active) = app.agent_roster.get(app.active_agent_index) {
+        let model_str = active
+            .resolved_model
+            .clone()
+            .unwrap_or_else(|| "unavailable".to_string());
+        lines.push(Line::from(vec![
+            Span::styled(
+                "★ ".to_string(),
+                Style::default().fg(theme.gold.to_color()),
+            ),
+            Span::styled(
+                active.display_name.clone(),
+                Style::default()
+                    .fg(theme.fg_base.to_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  [{}]", truncate_str(&model_str, cw.saturating_sub(10))),
+                Style::default().fg(theme.fg_most_subtle.to_color()),
+            ),
+        ]));
+        // Concurrency indicator (T070): X/Y slots.
+        let active_count = app
+            .subagent_entries
+            .iter()
+            .filter(|e| e.status == SubagentStatus::Running)
+            .count();
+        let slots = app.active_agents.len() + active_count;
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {}/{} slots", slots, slots.max(1)),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        )]));
+        lines.push(Line::from(vec![Span::raw("")]));
+    }
+
+    // ── Section 1: active agents list (or idle roster, T067) ──
+    // T067: When idle (no active agents, no subagent entries), show the full
+    // agent roster with resolved models.
+    let is_idle = app.active_agents.is_empty() && app.subagent_entries.is_empty();
+    if is_idle && !app.agent_roster.is_empty() {
+        // T067/T072: Full roster on idle, capped by terminal height.
+        let max_agents = if inner.height < 15 { 5 } else { 12 };
+        for (i, agent) in app.agent_roster.iter().take(max_agents).enumerate() {
+            let marker = if Some(i) == Some(app.active_agent_index) {
+                "▶"
+            } else {
+                " "
+            };
+            let model_str = agent
+                .resolved_model
+                .clone()
+                .unwrap_or_else(|| "unavailable".to_string());
+            let (model_col, name_col) = if agent.resolved_model.is_some() {
+                (theme.fg_more_subtle, theme.fg_base)
+            } else {
+                (theme.fg_most_subtle, theme.fg_most_subtle)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", marker),
+                    Style::default().fg(theme.gold.to_color()),
+                ),
+                Span::styled(
+                    truncate_str(&agent.display_name, 12),
+                    Style::default().fg(name_col.to_color()),
+                ),
+                Span::styled(
+                    format!("  {}", truncate_str(&model_str, cw.saturating_sub(18))),
+                    Style::default().fg(model_col.to_color()),
+                ),
+            ]));
+        }
+        lines.push(Line::from(vec![Span::raw("")]));
+    } else if app.active_agents.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  ◌ idle — awaiting input".to_string(),
             Style::default().fg(theme.fg_most_subtle.to_color()),
@@ -608,13 +695,16 @@ pub fn draw_activity(
     lines.push(Line::from(vec![Span::raw("")]));
 
     // Section 1b: active subagents (delegation roster, T064).
+    // T072: Cap subagent entries when terminal is short.
     if !app.subagent_entries.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  subagents".to_string(),
             Style::default().fg(theme.fg_more_subtle.to_color()),
         )]));
-        for entry in &app.subagent_entries {
+        let max_entries = if inner.height < 15 { 3 } else { 20 };
+        for entry in app.subagent_entries.iter().take(max_entries) {
             let (icon, col) = match entry.status {
+                SubagentStatus::Pending => ("○", theme.fg_more_subtle),
                 SubagentStatus::Running => ("⟳", theme.busy),
                 SubagentStatus::Done => ("✓", theme.success),
                 SubagentStatus::Failed => ("✗", theme.error),
@@ -637,6 +727,60 @@ pub fn draw_activity(
                 ),
             ]));
         }
+        lines.push(Line::from(vec![Span::raw("")]));
+    }
+
+    // Section 1c: Atlas job board (T155, FR-036, US6/AC4).
+    // Shown during Atlas plan execution (BoulderWorkStarted sets the flag).
+    // Lists each delegated task's title, status (pending/running/done/failed),
+    // tool-call count, and last tool used.
+    if app.job_board_visible && !app.subagent_entries.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  ┌─ jobs ─────────────────".to_string(),
+            Style::default()
+                .fg(theme.accent.to_color())
+                .add_modifier(Modifier::BOLD),
+        )]));
+        let max_jobs = if inner.height < 15 { 3 } else { 12 };
+        for entry in app.subagent_entries.iter().take(max_jobs) {
+            let (marker, status_word, col) = match entry.status {
+                SubagentStatus::Pending => ("○", "pending", theme.fg_more_subtle),
+                SubagentStatus::Running => ("►", "running", theme.busy),
+                SubagentStatus::Done => ("✓", "done", theme.success),
+                SubagentStatus::Failed => ("✗", "failed", theme.error),
+            };
+            // Title line: marker + task title (or agent_type fallback).
+            let title = entry
+                .task_title
+                .clone()
+                .unwrap_or_else(|| entry.agent_type.clone());
+            let title_disp = truncate_str(&title, cw.saturating_sub(6));
+            lines.push(Line::from(vec![
+                Span::raw("  │ "),
+                Span::styled(
+                    format!("{} ", marker),
+                    Style::default().fg(col.to_color()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    title_disp,
+                    Style::default().fg(theme.fg_subtle.to_color()),
+                ),
+            ]));
+            // Detail line: status + tool-call count + last tool.
+            let mut detail = format!("    {}, {} calls", status_word, entry.tool_call_count);
+            if let Some(ref lt) = entry.last_tool {
+                let lt_short = truncate_str(lt, 16);
+                detail.push_str(&format!(" · {}", lt_short));
+            }
+            lines.push(Line::from(vec![Span::styled(
+                detail,
+                Style::default().fg(theme.fg_most_subtle.to_color()),
+            )]));
+        }
+        lines.push(Line::from(vec![Span::styled(
+            "  └─────────────────────────".to_string(),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        )]));
         lines.push(Line::from(vec![Span::raw("")]));
     }
 
@@ -937,7 +1081,7 @@ fn shorten_path(p: &str, max: usize) -> String {
 pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
     // Centered modal.
     let w = 56.min(area.width);
-    let h = 18.min(area.height);
+    let h = 21.min(area.height);
     if w < 20 || h < 5 {
         return;
     }
@@ -952,6 +1096,9 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
     let keymap = [
         ("Enter", "send · queues next prompt while busy"),
         ("Alt+Enter / Ctrl+J", "insert newline"),
+        ("Tab", "switch agent (opens picker; BC-013)"),
+        ("Shift+Tab", "reverse cycle agent picker"),
+        ("Up", "focus transcript (when single-line input)"),
         ("Esc / Ctrl+C", "interrupt turn (idle: quit)"),
         ("Ctrl+C ×2", "force exit during a turn"),
         ("Ctrl+D", "quit (on empty input)"),

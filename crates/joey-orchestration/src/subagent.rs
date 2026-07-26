@@ -184,6 +184,24 @@ impl Subagent {
         let ts_sum = toolset_summary(&req.toolsets);
         let mut agent = Agent::new(child_agent_cfg, child_registry, child_ctx)?;
 
+        // T060/T149: Inject category prompt_append as extra instructions.
+        // This is prepended to the system prompt alongside any loaded skills.
+        if let Some(ref append) = req.prompt_append {
+            if !append.is_empty() {
+                let mut overlay = String::new();
+                for skill in &req.load_skills {
+                    overlay.push_str(&format!(
+                        "--- Loaded Skill: {} ---\n(Load and follow this skill's guidance.)\n\n",
+                        skill
+                    ));
+                }
+                overlay.push_str("--- Category Directive ---\n");
+                overlay.push_str(append);
+                overlay.push_str("\n--- End Category Directive ---\n");
+                agent.set_extra_instructions(Some(overlay));
+            }
+        }
+
         // Wire the cooperative interrupt handle into the child Agent so
         // setting the batch-level interrupt flag stops the subagent's turn
         // loop at the next check point (FR-015).
@@ -332,26 +350,30 @@ pub(crate) fn specs_to_requests(
     role: SubagentRole,
 ) -> Vec<DelegationRequest> {
     tasks
-        .iter()
-        .map(|spec| DelegationRequest {
-            goal: spec.goal.clone(),
-            context: spec.context.clone(),
-            tasks: Vec::new(),
-            model: spec
-                .model
-                .clone()
-                .or_else(|| batch_model.map(|s| s.to_string())),
-            toolsets: if spec.toolsets.is_empty() {
-                batch_toolsets.to_vec()
-            } else {
-                spec.toolsets.clone()
-            },
-            max_turns: batch_max_turns,
-            persist,
-            role,
-            workdir: None,
-        })
-        .collect()
+    .iter()
+    .map(|spec| DelegationRequest {
+        goal: spec.goal.clone(),
+        context: spec.context.clone(),
+        tasks: Vec::new(),
+        model: spec
+            .model
+            .clone()
+            .or_else(|| batch_model.map(|s| s.to_string())),
+        toolsets: if spec.toolsets.is_empty() {
+            batch_toolsets.to_vec()
+        } else {
+            spec.toolsets.clone()
+        },
+        max_turns: batch_max_turns,
+        persist,
+        role,
+        workdir: None,
+        category: None,
+        subagent_type: None,
+        load_skills: Vec::new(),
+        prompt_append: None,
+    })
+    .collect()
 }
 
 #[cfg(test)]

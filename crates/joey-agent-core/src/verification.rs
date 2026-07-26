@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use once_cell::sync::Lazy;
 
@@ -45,20 +45,6 @@ pub enum VerificationKind {
     Format,
     Check,
     AdHoc,
-}
-
-impl VerificationKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            VerificationKind::Test => "test",
-            VerificationKind::Lint => "lint",
-            VerificationKind::Typecheck => "typecheck",
-            VerificationKind::Build => "build",
-            VerificationKind::Format => "format",
-            VerificationKind::Check => "check",
-            VerificationKind::AdHoc => "ad_hoc",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

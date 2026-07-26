@@ -264,7 +264,7 @@ impl Tui {
             }
 
             if show_sidebar {
-                widgets::draw_activity(f, body[1], app, theme, spinner, equalizer);
+                widgets::draw_omo_panel(f, body[1], app, theme, spinner, equalizer);
             }
 
             widgets::draw_input(f, chunks[2], input, app, theme, *focus == Focus::Input, glow);
@@ -451,6 +451,17 @@ impl Tui {
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.focus = Focus::Transcript;
                 self.app.scroll_up(1);
+                return None;
+            }
+            // T031/T146: Plain Up (no modifier) on single-line input switches
+            // focus to the transcript, restoring the behavior Tab used to have
+            // before it was repurposed for agent switching.
+            KeyCode::Up
+                if self.focus == Focus::Input
+                    && !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && self.input.line_count() == 1 =>
+            {
+                self.focus = Focus::Transcript;
                 return None;
             }
             KeyCode::Tab => {

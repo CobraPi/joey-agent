@@ -95,7 +95,7 @@ pub struct ActiveSubagentEntry {
     pub agent_type: String,
     /// If category-spawned (e.g. "quick").
     pub category: Option<String>,
-    /// Running, Done, Failed.
+    /// Pending, Running, Done, Failed.
     pub status: SubagentStatus,
     /// "querying model", "running tool: X", "reasoning".
     pub phase: String,
@@ -105,11 +105,22 @@ pub struct ActiveSubagentEntry {
     pub iterations: usize,
     /// For elapsed time.
     pub started: Instant,
+    /// T155: Human-readable delegated task title for the Atlas job board
+    /// (e.g. "Task 1: Implement auth"). Populated from the delegation goal or
+    /// BoulderWorkStarted task title. None for non-plan delegations.
+    pub task_title: Option<String>,
+    /// T155: Number of tool calls this entry has made. Incremented on each
+    /// ToolStart attributed to the entry.
+    pub tool_call_count: usize,
+    /// T155: Name of the most recent tool invoked by this entry.
+    pub last_tool: Option<String>,
 }
 
 /// Status of a subagent entry in the activity panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubagentStatus {
+    /// Queued but not yet started (job board).
+    Pending,
     Running,
     Done,
     Failed,
@@ -190,6 +201,12 @@ pub struct App {
     pub next_subagent_id: usize,
     /// Learnings counter for wisdom accumulation display.
     pub learnings_count: usize,
+    /// T155: when true, the Atlas job board section renders in draw_omo_panel.
+    /// Set on BoulderWorkStarted, cleared on BoulderWorkCompleted / turn Done.
+    pub job_board_visible: bool,
+    /// T114: OMO context injection set by `/start-work`, consumed (and cleared)
+    /// on the next submitted turn. Mirrors ReplState.pending_context_injection.
+    pub pending_context_injection: Option<String>,
     // ── Search-in-history ──
     /// Search overlay is open.
     pub search_open: bool,
@@ -230,6 +247,8 @@ impl App {
             subagent_entries: Vec::new(),
             next_subagent_id: 1,
             learnings_count: 0,
+            job_board_visible: false,
+            pending_context_injection: None,
             search_open: false,
             search_query: String::new(),
             search_has_match: false,
@@ -364,6 +383,19 @@ impl App {
                 if let Some(a) = self.active_agents.last_mut() {
                     a.phase = AgentPhase::RunningTool(name.clone());
                 }
+                // T155: attribute this tool call to the most recent running
+                // subagent entry for the Atlas job board. Tool events from a
+                // running subagent are forwarded to the parent's channel
+                // (subagent.rs), so the latest Running entry is the best
+                // attribution we have on the wire.
+                for entry in self.subagent_entries.iter_mut().rev() {
+                    if entry.status == SubagentStatus::Running {
+                        entry.tool_call_count += 1;
+                        entry.last_tool = Some(name.clone());
+                        entry.phase = format!("running tool: {}", name);
+                        break;
+                    }
+                }
                 self.push_item(TranscriptItem::Tool {
                     name,
                     emoji,
@@ -450,6 +482,8 @@ impl App {
                 // have at spawn time; the summary_preview on completion is too
                 // late for the "running" state the panel needs to show.
                 let label: String = goal.chars().take(28).collect();
+                // T155: use the full goal as the job-board task title.
+                let task_title = if goal.is_empty() { None } else { Some(goal.clone()) };
                 self.subagent_entries.push(ActiveSubagentEntry {
                     id,
                     agent_type: label,
@@ -459,6 +493,9 @@ impl App {
                     model,
                     iterations: 0,
                     started: Instant::now(),
+                    task_title,
+                    tool_call_count: 0,
+                    last_tool: None,
                 });
                 self.push_item(TranscriptItem::Notice {
                     text: format!("🤖 Subagent: {} [{}]", goal, toolset_summary),
@@ -507,30 +544,59 @@ impl App {
             // ── OMO orchestration events (additive — no UI action needed in
             // the transcript; the activity panel reads these separately) ──
             AgentEvent::AgentModeChanged { agent_name, model: _ } => {
+                // T065/T139: update active_agent_index to match the new agent.
+                if let Some(idx) = self
+                    .agent_roster
+                    .iter()
+                    .position(|a| a.name == agent_name || a.display_name == agent_name)
+                {
+                    self.active_agent_index = idx;
+                }
                 self.push_item(TranscriptItem::Notice {
                     text: format!("Agent: {}", agent_name),
                     kind: NoticeKind::Info,
                 });
             }
             AgentEvent::CategoryDelegation { category, model } => {
+                // T065/T139: add a subagent entry with the category label.
+                let id = self.next_subagent_id;
+                self.next_subagent_id += 1;
+                let title = format!("[{}] delegation", category);
+                self.subagent_entries.push(ActiveSubagentEntry {
+                    id,
+                    agent_type: format!("junior:{}", category),
+                    category: Some(category.clone()),
+                    status: SubagentStatus::Running,
+                    phase: "querying model".to_string(),
+                    model: model.clone(),
+                    iterations: 0,
+                    started: Instant::now(),
+                    task_title: Some(title),
+                    tool_call_count: 0,
+                    last_tool: None,
+                });
                 self.push_item(TranscriptItem::Notice {
                     text: format!("Category [{}] → {}", category, model),
                     kind: NoticeKind::Busy,
                 });
             }
             AgentEvent::BoulderWorkStarted { plan_name, work_id: _ } => {
+                // T069/T155: show the Atlas job board during plan execution.
+                self.job_board_visible = true;
                 self.push_item(TranscriptItem::Notice {
                     text: format!("Started work: {}", plan_name),
                     kind: NoticeKind::Success,
                 });
             }
             AgentEvent::BoulderWorkResumed { plan_name, work_id: _ } => {
+                self.job_board_visible = true;
                 self.push_item(TranscriptItem::Notice {
                     text: format!("Resumed work: {}", plan_name),
                     kind: NoticeKind::Info,
                 });
             }
             AgentEvent::BoulderWorkCompleted { plan_name, work_id: _ } => {
+                self.job_board_visible = false;
                 self.push_item(TranscriptItem::Notice {
                     text: format!("Completed work: {}", plan_name),
                     kind: NoticeKind::Success,
@@ -725,5 +791,246 @@ fn transcript_item_text(item: &TranscriptItem) -> String {
         }
         TranscriptItem::Notice { text, .. } => text.clone(),
         TranscriptItem::Error { text } => text.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use joey_agent_core::AgentEvent;
+
+    fn mk_agent(name: &str, display: &str) -> DisplayAgent {
+        DisplayAgent {
+            name: name.to_string(),
+            display_name: display.to_string(),
+            color: String::new(),
+            mode: "Primary".to_string(),
+            resolved_model: Some("m".to_string()),
+            description: String::new(),
+        }
+    }
+
+    /// T040: active_agent_index cycles forward and backward across the roster,
+    /// and the picker cursor wraps at both boundaries (BC-014, BC-017).
+    #[test]
+    fn active_agent_index_cycles_and_wraps() {
+        let mut app = App::new("s", "m");
+        app.agent_roster = vec![
+            mk_agent("default", "Default"),
+            mk_agent("sisyphus", "Sisyphus"),
+            mk_agent("prometheus", "Prometheus"),
+            mk_agent("atlas", "Atlas"),
+        ];
+        let n = app.agent_roster.len();
+        assert_eq!(n, 4);
+        assert_eq!(app.active_agent_index, 0);
+
+        // Forward cycle 0 → 1 → 2 → 3 → 0.
+        app.active_agent_index = (app.active_agent_index + 1) % n;
+        assert_eq!(app.active_agent_index, 1);
+        app.active_agent_index = (app.active_agent_index + 1) % n;
+        assert_eq!(app.active_agent_index, 2);
+        app.active_agent_index = (app.active_agent_index + 1) % n;
+        assert_eq!(app.active_agent_index, 3);
+        app.active_agent_index = (app.active_agent_index + 1) % n;
+        assert_eq!(app.active_agent_index, 0, "must wrap to start");
+
+        // Backward cycle (Shift+Tab logic from app.rs) 0 → n-1 → n-2 …
+        app.agent_picker_cursor = app.active_agent_index;
+        if app.agent_picker_cursor == 0 {
+            app.agent_picker_cursor = n - 1;
+        } else {
+            app.agent_picker_cursor -= 1;
+        }
+        assert_eq!(app.agent_picker_cursor, 3, "backward wrap to end");
+        if app.agent_picker_cursor == 0 {
+            app.agent_picker_cursor = n - 1;
+        } else {
+            app.agent_picker_cursor -= 1;
+        }
+        assert_eq!(app.agent_picker_cursor, 2);
+    }
+
+    /// T075: SubagentSpawn adds a Running entry; SubagentComplete marks it
+    /// Done; SubagentFailed marks it Failed; three parallel spawns create
+    /// three entries (contracts/activity-panel.md event stream mapping).
+    #[test]
+    fn subagent_spawn_complete_failed_drive_entries() {
+        let mut app = App::new("s", "m");
+        // Three parallel explore spawns.
+        for i in 1..=3 {
+            app.apply(AgentEvent::SubagentSpawn {
+                goal: format!("explore task {i}"),
+                model: "glm-5".into(),
+                toolset_summary: "read".into(),
+                depth: 1,
+            });
+        }
+        assert_eq!(app.subagent_entries.len(), 3, "three parallel spawns");
+        assert!(
+            app.subagent_entries
+                .iter()
+                .all(|e| e.status == SubagentStatus::Running),
+            "all start Running"
+        );
+
+        // First completes successfully → Done.
+        app.apply(AgentEvent::SubagentComplete {
+            goal: "explore task 1".into(),
+            success: true,
+            summary_preview: "ok".into(),
+            token_usage: joey_providers::Usage::default(),
+            duration_secs: 4.2,
+        });
+        let e0 = &app.subagent_entries[0];
+        assert_eq!(e0.status, SubagentStatus::Done, "complete → Done");
+
+        // Third fails → Failed.
+        app.apply(AgentEvent::SubagentFailed {
+            goal: "explore task 3".into(),
+            error: "boom".into(),
+            duration_secs: 1.0,
+        });
+        let e2 = &app.subagent_entries[2];
+        assert_eq!(e2.status, SubagentStatus::Failed, "failed → Failed");
+
+        // The middle one is still Running.
+        assert_eq!(
+            app.subagent_entries[1].status,
+            SubagentStatus::Running
+        );
+    }
+
+    /// T076: CategoryDelegation event adds an entry whose category label is
+    /// populated and whose agent_type is "junior:<category>" (contracts/
+    /// activity-panel.md "category-spawned subagents show their category").
+    #[test]
+    fn category_delegation_adds_category_labelled_entry() {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::CategoryDelegation {
+            category: "quick".into(),
+            model: "gpt-5.4-mini".into(),
+        });
+        assert_eq!(app.subagent_entries.len(), 1);
+        let entry = &app.subagent_entries[0];
+        assert_eq!(entry.category.as_deref(), Some("quick"));
+        assert!(entry.agent_type.contains("junior"), "junior label");
+        assert!(entry.agent_type.contains("quick"), "category in label");
+        assert_eq!(entry.model, "gpt-5.4-mini");
+        assert_eq!(entry.status, SubagentStatus::Running);
+    }
+
+    /// Done event clears the subagent entries for the next turn (state.rs
+    /// line ~595). This guards the panel's idle-state recovery.
+    #[test]
+    fn done_clears_subagent_entries() {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::SubagentSpawn {
+            goal: "explore x".into(),
+            model: "m".into(),
+            toolset_summary: "read".into(),
+            depth: 1,
+        });
+        assert!(!app.subagent_entries.is_empty());
+        app.apply(AgentEvent::TurnStart { max_iterations: 5 });
+        app.apply(AgentEvent::Done {
+            final_text: "done".into(),
+            usage: joey_providers::Usage::default(),
+            iterations: 1,
+        });
+        assert!(
+            app.subagent_entries.is_empty(),
+            "Done must clear subagent entries"
+        );
+    }
+
+    /// T155: the Atlas job board fields. SubagentSpawn populates task_title;
+    /// ToolStart increments tool_call_count and sets last_tool on the most
+    /// recent running entry; BoulderWorkStarted sets job_board_visible so the
+    /// draw_omo_panel job-board section renders during Atlas execution.
+    #[test]
+    fn job_board_fields_populated_by_events() {
+        let mut app = App::new("s", "m");
+        assert!(!app.job_board_visible, "job board hidden by default");
+
+        // BoulderWorkStarted reveals the job board.
+        app.apply(AgentEvent::BoulderWorkStarted {
+            plan_name: "feat-x".into(),
+            work_id: "w1".into(),
+        });
+        assert!(app.job_board_visible, "BoulderWorkStarted shows job board");
+
+        // A delegated task spawns an entry carrying the task title.
+        app.apply(AgentEvent::SubagentSpawn {
+            goal: "Task 1: Implement auth".into(),
+            model: "glm-5".into(),
+            toolset_summary: "file".into(),
+            depth: 1,
+        });
+        let entry = &app.subagent_entries[0];
+        assert_eq!(
+            entry.task_title.as_deref(),
+            Some("Task 1: Implement auth"),
+            "task_title populated from goal"
+        );
+        assert_eq!(entry.tool_call_count, 0);
+        assert!(entry.last_tool.is_none());
+
+        // ToolStart attributed to the running entry.
+        app.apply(AgentEvent::ToolStart {
+            name: "grep".into(),
+            emoji: "🔍".into(),
+            summary: "auth".into(),
+        });
+        let entry = &app.subagent_entries[0];
+        assert_eq!(entry.tool_call_count, 1, "tool_call_count incremented");
+        assert_eq!(entry.last_tool.as_deref(), Some("grep"), "last_tool set");
+        assert!(
+            entry.phase.contains("running tool"),
+            "phase updated to running tool: got {}",
+            entry.phase
+        );
+
+        // A second tool call increments again.
+        app.apply(AgentEvent::ToolStart {
+            name: "read_file".into(),
+            emoji: "📖".into(),
+            summary: "src/auth.rs".into(),
+        });
+        let entry = &app.subagent_entries[0];
+        assert_eq!(entry.tool_call_count, 2);
+        assert_eq!(entry.last_tool.as_deref(), Some("read_file"));
+
+        // BoulderWorkCompleted hides the job board.
+        app.apply(AgentEvent::BoulderWorkCompleted {
+            plan_name: "feat-x".into(),
+            work_id: "w1".into(),
+        });
+        assert!(!app.job_board_visible, "completed hides job board");
+    }
+
+    /// T155: a category delegation also gets a task title so it shows up on the
+    /// job board alongside spawned subagents.
+    #[test]
+    fn category_delegation_carries_task_title() {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::CategoryDelegation {
+            category: "quick".into(),
+            model: "gpt-5.4-mini".into(),
+        });
+        let entry = &app.subagent_entries[0];
+        assert!(
+            entry.task_title.is_some(),
+            "category delegation has a task title"
+        );
+        assert!(
+            entry
+                .task_title
+                .as_ref()
+                .unwrap()
+                .contains("quick"),
+            "title references the category"
+        );
+        assert_eq!(entry.tool_call_count, 0);
     }
 }

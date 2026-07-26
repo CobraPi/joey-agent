@@ -163,19 +163,42 @@ pub(crate) fn build_agent(
     let manager = std::sync::Arc::new(joey_orchestration::SubagentManager::new(mgr_config));
     // Snapshot the base registry (builtins only) for subagents to use.
     let base_registry = registry.clone();
-    joey_orchestration::register_orchestration(
+    // Build OMO category resolver (T057/T135). Populated after agent construction
+    // when the provider profile + active model are known.
+    let resolver = crate::omo_resolver::build_omo_resolver();
+    joey_orchestration::register_orchestration_with_resolver(
         &mut registry,
         manager.clone(),
         agent_cfg.clone(),
         config.clone(),
         base_registry,
         None, // events are emitted via the per-turn channel at runtime
+        resolver.clone(),
     );
 
     let mut agent =
         Agent::new(agent_cfg, registry, ctx).map_err(|e| anyhow::anyhow!("{}", e))?;
     // Inject the shared concurrency limiter into the agent's transport path.
     agent.set_provider_semaphore(manager.semaphore());
+
+    // Populate the OMO category resolver with the now-available provider
+    // profile + active model (T057/T135). This enables category/subagent_type
+    // delegation in the delegate_task tool.
+    {
+        let available = joey_omo::AvailableModelSet::from_connected(
+            agent.client().profile(),
+            agent.model(),
+        );
+        let overrides = joey_omo::agents::registry::ModelOverrides::new();
+        // T154: load user-defined custom categories from config (FR-012).
+        let custom_cats = joey_omo::categories::load_custom_categories(&config);
+        let omo_registry = if custom_cats.is_empty() {
+            joey_omo::AgentRegistry::build(available, &overrides)
+        } else {
+            joey_omo::AgentRegistry::build_with_categories(available, &overrides, custom_cats)
+        };
+        resolver.populate(omo_registry);
+    }
 
     // ── Load PreToolUse hooks from config (crush-style) ──────────────
     {
@@ -249,7 +272,15 @@ impl reedline::Prompt for JoeyPrompt {
         }
     }
     fn get_prompt_color(&self) -> reedline::Color {
-        reedline::Color::DarkGrey
+        // US6 (descoped): reedline owns a synchronous blocking editor loop and
+        // re-renders the prompt only on keystroke redraws, not on an external
+        // tick. An external tick-driven blink would require a separate thread
+        // writing cursor escapes during reedline's blocking stdin read, which
+        // would corrupt its rendering. Per the T031 spike decision in
+        // research.md, US6 is descoped to a static colored prompt (no blink).
+        // Color: a bright cyan/teal approximating Pantera `info` for a
+        // polished look within reedline's ANSI-16 Color enum.
+        reedline::Color::Cyan
     }
 }
 
@@ -372,10 +403,22 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
 
     let agent = build_agent(&config, &cwd, &overrides, &session_id, history)?;
 
-    let ropts = RenderOptions {
-        show_reasoning: config.get_bool("display.show_reasoning", true),
-        tool_progress: config.get_str("display.tool_progress", "all"),
-        quiet: opts.quiet,
+    let ropts = {
+        let capability = crate::capability::RenderCapability::detect();
+        let level = capability.level();
+        let animations_enabled = !opts.quiet
+            && !matches!(level, crate::capability::Capability::NonInteractive);
+        let animation_fps = config
+            .get_i64("display.animation_fps", 0)
+            .clamp(0, 60) as u32;
+        RenderOptions {
+            show_reasoning: config.get_bool("display.show_reasoning", true),
+            tool_progress: config.get_str("display.tool_progress", "all"),
+            quiet: opts.quiet,
+            animations_enabled,
+            animation_fps: if animation_fps > 0 { animation_fps } else { capability.target_fps.max(12) },
+            capability,
+        }
     };
 
     let st_config_model = config.model();
@@ -409,14 +452,17 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
     if !opts.quiet {
         let enabled = build_agent_config(&st.config, &st.overrides).enabled_tools;
         let ctx_len = st.config.get_i64("model.context_length", 0);
-        render::banner(&render::BannerInfo {
-            model: &build_agent_config(&st.config, &st.overrides).model,
-            context_length: if ctx_len > 0 { Some(ctx_len) } else { None },
-            cwd: &cwd.to_string_lossy(),
-            session_id: &st.session_id,
-            enabled_tools: &enabled,
-            yolo: std::env::var("JOEY_YOLO_MODE").map(|v| v == "1").unwrap_or(false),
-        });
+        render::banner_animated(
+            &render::BannerInfo {
+                model: &build_agent_config(&st.config, &st.overrides).model,
+                context_length: if ctx_len > 0 { Some(ctx_len) } else { None },
+                cwd: &cwd.to_string_lossy(),
+                session_id: &st.session_id,
+                enabled_tools: &enabled,
+                yolo: std::env::var("JOEY_YOLO_MODE").map(|v| v == "1").unwrap_or(false),
+            },
+            &st.ropts,
+        );
         if resumed && restored_count > 0 {
             render::info(&format!(
                 "Resumed session {} ({} messages).",
@@ -561,10 +607,46 @@ async fn process_input(raw: &str, st: &mut ReplState) -> LoopOutcome {
         };
     }
 
+    // T108/T142: @plan prefix detection — delegate to Prometheus for planning.
+    // Equivalent to switching to Prometheus + describing the work, but does NOT
+    // start execution (the plan is produced, then the user decides).
+    let mut input = input;
+    if input.starts_with("@plan ") || input == "@plan" {
+        st.active_agent = "prometheus".to_string();
+        let overlay = joey_omo::agents::prompts::dispatch_system_prompt("prometheus", st.agent.model());
+        st.agent.set_extra_instructions(Some(overlay));
+        render::info("📋 Switched to Prometheus (@plan) — create a plan, no execution.");
+        // Strip the @plan prefix so the rest of the message is the planning goal.
+        input = input.trim_start_matches("@plan").trim().to_string();
+        if input.is_empty() {
+            return LoopOutcome::Continue;
+        }
+    }
+
     let mut turn_input = String::new();
+
+    // T143: Goal continuation injection — when GoalState is Active (FR-032/BC-022),
+    // prepend the goal objective as a continuation prompt so the agent keeps
+    // working toward the persistent goal across turns.
+    {
+        let omo_dir = st.cwd.join(".omo");
+        if let Some(goal) = joey_omo::GoalState::read(&omo_dir) {
+            if goal.status == joey_omo::GoalStatus::Active {
+                turn_input.push_str(&format!(
+                    "[goal continuation] You are working toward this objective: {}\n\
+                     Continue making progress toward it with the current task.",
+                    goal.objective
+                ));
+            }
+        }
+    }
+
     // Inject pending OMO context (from /start-work) as the base.
     if let Some(ctx) = st.pending_context_injection.take() {
-        turn_input = ctx;
+        if !turn_input.is_empty() {
+            turn_input.push('\n');
+        }
+        turn_input.push_str(&ctx);
     }
     if !st.queued.is_empty() {
         if !turn_input.is_empty() {
@@ -804,7 +886,7 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         "checkpoint" => checkpoint_slash(st, args),
         "revert" | "rollback" => revert_slash(st, args),
         // ── OMO slash commands ──
-        "agents" => omo_agents_slash(st),
+        "agents" | "agent" => omo_agents_slash(st, args),
         "goal" => omo_goal_slash(st, args),
         "start-work" => omo_start_work_slash(st, args).await,
         other => {
@@ -820,33 +902,93 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
 // ---------------------------------------------------------------------------
 
 /// `/agents` — list all 11 OMO agents with resolved models, modes, availability.
-fn omo_agents_slash(_st: &ReplState) {
-    // Build a registry with an empty available set (shows all agents, marks
-    // unresolved ones as unavailable).
-    let available = joey_omo::AvailableModelSet::new();
+fn omo_agents_slash(st: &mut ReplState, args: &str) {
+    let available = joey_omo::AvailableModelSet::from_connected(
+        st.agent.client().profile(),
+        st.agent.model(),
+    );
     let overrides = joey_omo::agents::registry::ModelOverrides::new();
     let registry = joey_omo::AgentRegistry::build(available, &overrides);
 
+    // T034/T150: If a numeric arg is given, switch to that agent (BC-018, BC-019).
+    let trimmed = args.trim();
+    if !trimmed.is_empty() {
+        // Try to parse as a number (1-based index into the tab order).
+        if let Ok(n) = trimmed.parse::<usize>() {
+            let primary: Vec<_> = registry.tab_order();
+            if n == 0 || n > primary.len() {
+                render::error(&format!("Invalid agent number '{}'. Use 1-{}.", n, primary.len()));
+                return;
+            }
+            let target = primary[n - 1];
+            st.active_agent = target.name.clone();
+            let overlay = joey_omo::agents::prompts::dispatch_system_prompt(&target.name, st.agent.model());
+            st.agent.set_extra_instructions(Some(overlay));
+            render::success(&format!("Switched to {} [{}].", target.display_name, target.name));
+            return;
+        }
+        // Otherwise, try to match by name.
+        let lower = trimmed.to_lowercase();
+        if let Some(agent) = registry.all().iter().find(|a| a.name == lower || a.display_name.to_lowercase() == lower) {
+            if agent.is_available() {
+                st.active_agent = agent.name.clone();
+                let overlay = joey_omo::agents::prompts::dispatch_system_prompt(&agent.name, st.agent.model());
+                st.agent.set_extra_instructions(Some(overlay));
+                render::success(&format!("Switched to {} [{}].", agent.display_name, agent.name));
+            } else {
+                render::error(&format!("Agent '{}' is not available (no model resolved).", agent.display_name));
+            }
+            return;
+        }
+        render::error(&format!("Unknown agent '{}'. Use /agents to list.", trimmed));
+        return;
+    }
+
+    // No arg: print numbered list (BC-018).
     println!();
-    println!("{}", Color::Cyan.bold().paint("OMO Agent Registry (11 agents)"));
+    println!("{}", Color::Cyan.bold().paint("OMO Agent Registry"));
     println!();
-    for agent in registry.all() {
-        let status = if agent.is_available() {
-            format!("[{}]", agent.resolved_model.as_deref().unwrap_or("?"))
-        } else {
-            Color::DarkGray.paint("(unavailable)").to_string()
-        };
-        let mode_label = if agent.mode.is_primary() { "Primary" } else { "Sub    " };
+    let primary: Vec<_> = registry.tab_order();
+    for (i, agent) in primary.iter().enumerate() {
+        let marker = if agent.name == st.active_agent { "▶" } else { " " };
+        let status = format!("[{}]", agent.resolved_model.as_deref().unwrap_or("?"));
         println!(
-            "  {:<20} {}  {}  {}",
+            "  {} {:<2} {:<20} {}  {}",
+            marker,
+            Color::Yellow.bold().paint(format!("{}", i + 1)),
             Color::Green.paint(&agent.display_name),
-            mode_label,
             status,
             Color::DarkGray.paint(&agent.description),
         );
     }
+    // Show secondary agents too.
+    let secondary: Vec<_> = registry
+        .all()
+        .iter()
+        .filter(|a| !a.mode.is_primary())
+        .collect();
+    if !secondary.is_empty() {
+        println!();
+        println!("{}", Color::DarkGray.paint("Sub-agents (delegation only):"));
+        for agent in &secondary {
+            let status = if agent.is_available() {
+                format!("[{}]", agent.resolved_model.as_deref().unwrap_or("?"))
+            } else {
+                Color::DarkGray.paint("(unavailable)").to_string()
+            };
+            println!(
+                "    {:<20} {}  {}",
+                Color::Green.paint(&agent.display_name),
+                status,
+                Color::DarkGray.paint(&agent.description),
+            );
+        }
+    }
     println!();
-    println!("{}", Color::DarkGray.paint("Press Tab in TUI to cycle: Default → Sisyphus → Hephaestus → Prometheus → Atlas"));
+    println!(
+        "{}",
+        Color::DarkGray.paint("Switch with: /agent <number> or /agent <name>"),
+    );
 }
 
 /// `/goal` — manage persistent per-session objective (T094).

@@ -13,9 +13,11 @@ joey-orchestration.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 regex.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

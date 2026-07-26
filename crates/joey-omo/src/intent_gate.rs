@@ -186,4 +186,67 @@ mod tests {
             Some(KeywordType::Ultrawork)
         );
     }
+
+    /// T113: the `ulw-plan` skill exists on disk with valid frontmatter and the
+    /// mandatory content Prometheus and the ultrawork planner doctrine reference
+    /// via `skill(name="ulw-plan")`. Without this skill, both references resolve
+    /// to nothing.
+    #[test]
+    fn ulw_plan_skill_present() {
+        use std::path::PathBuf;
+        // crates/joey-omo → repo root is two levels up.
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let skill_md = manifest_dir
+            .join("..")
+            .join("..")
+            .join("skills")
+            .join("ulw-plan")
+            .join("SKILL.md");
+        let content = std::fs::read_to_string(&skill_md).unwrap_or_else(|e| {
+            panic!(
+                "ulw-plan SKILL.md not found at {}: {e}",
+                skill_md.display()
+            )
+        });
+
+        // Frontmatter: name must be ulw-plan.
+        let head: String = content.chars().take(4000).collect();
+        assert!(
+            head.contains("name: \"ulw-plan\"") || head.contains("name: ulw-plan"),
+            "ulw-plan SKILL.md frontmatter must declare name: ulw-plan"
+        );
+
+        // The mandatory announcement / identity text the workflow centers on.
+        assert!(
+            content.contains("ulw-plan"),
+            "ulw-plan SKILL.md must reference the ulw-plan workflow by name"
+        );
+        // Prometheus is read-only and must not implement.
+        assert!(
+            content.contains("read-only") || content.contains("do not implement") || content.contains("never edit product code"),
+            "ulw-plan SKILL.md must enforce Prometheus's read-only constraint"
+        );
+
+        // The three reference files named in research.md Decision 6 must be
+        // declared as references and exist on disk.
+        let refs_dir = manifest_dir
+            .join("..")
+            .join("..")
+            .join("skills")
+            .join("ulw-plan")
+            .join("references");
+        for name in ["full-workflow.md", "intent-clear.md", "intent-unclear.md"] {
+            assert!(
+                refs_dir.join(name).is_file(),
+                "ulw-plan reference file {} must exist at {}",
+                name,
+                refs_dir.join(name).display()
+            );
+            assert!(
+                content.contains(name),
+                "ulw-plan SKILL.md must reference {}",
+                name
+            );
+        }
+    }
 }

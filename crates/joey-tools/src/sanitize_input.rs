@@ -11,7 +11,7 @@ use serde_json::Value;
 /// Returns (parsed_args, was_sanitized).
 /// If sanitization occurs, returns (Null, true) so the caller can produce
 /// the appropriate error result.
-pub fn sanitize_tool_input(tool_name: &str, tool_call_id: &str, input: &str) -> (Value, bool) {
+pub fn sanitize_tool_input(_tool_name: &str, _tool_call_id: &str, input: &str) -> (Value, bool) {
     match serde_json::from_str::<Value>(input) {
         Ok(parsed) => {
             // Even if parsed, verify it's an object (tool args must be objects).

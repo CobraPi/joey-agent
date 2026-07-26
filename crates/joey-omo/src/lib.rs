@@ -52,3 +52,7 @@ pub use models::{
 };
 pub use boulder::{BoulderState, BoulderWork, BoulderWorkStatus};
 pub use goal::{parse_goal_command, GoalAction, GoalState, GoalStatus};
+pub use team::{
+    activate_team, MemberActivity, TeamActivationError, TeamMailbox, TeamMember, TeamMemberKind,
+    TeamModeConfig, TeamSpec, TeamTask, TeamTaskList, TeamTaskStatus, TmuxVisualizer,
+};

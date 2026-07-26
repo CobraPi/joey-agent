@@ -282,6 +282,78 @@ pub fn validate_delegation(
     }
 }
 
+/// Load user-defined custom categories from config (FR-012, T154).
+///
+/// Reads `omo.categories` from the config tree as a list of category definitions.
+/// Each entry has: name, description, model (a single model ID — simplest form),
+/// temperature (optional), prompt_append (optional).
+///
+/// Custom categories with the same name as a builtin will replace it.
+/// Categories are user-configurable and extendable per FR-012.
+pub fn load_custom_categories(config: &joey_core::Config) -> Vec<CategoryConfig> {
+    let mut custom = Vec::new();
+    // Read omo.categories as a sequence of mappings.
+    if let Some(serde_yaml::Value::Sequence(cats)) = config.get("omo.categories") {
+        for cat_val in cats {
+            if let Some(mapping) = cat_val.as_mapping() {
+                let name = mapping
+                    .get(&serde_yaml::Value::String("name".into()))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let description = mapping
+                    .get(&serde_yaml::Value::String("description".into()))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Custom user-defined category")
+                    .to_string();
+                let model = mapping
+                    .get(&serde_yaml::Value::String("model".into()))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let temperature = mapping
+                    .get(&serde_yaml::Value::String("temperature".into()))
+                    .and_then(|v| v.as_f64());
+                let prompt_append = mapping
+                    .get(&serde_yaml::Value::String("prompt_append".into()))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                // Build a simple single-model fallback chain.
+                let model_requirement = if model.is_empty() {
+                    ModelRequirement {
+                        fallback_chain: vec![],
+                        requires_any_model: true,
+                        requires_provider: None,
+                    }
+                } else {
+                    ModelRequirement {
+                        fallback_chain: vec![crate::models::FallbackEntry::new(
+                            &model,
+                            None,
+                            &[],
+                        )],
+                        requires_any_model: false,
+                        requires_provider: None,
+                    }
+                };
+
+                custom.push(CategoryConfig {
+                    name,
+                    description,
+                    model_requirement,
+                    temperature,
+                    prompt_append,
+                });
+            }
+        }
+    }
+    custom
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -28,6 +28,12 @@ pub struct ManagerConfig {
     pub default_persist: bool,
     /// Default model for subagents (falls back to parent model if None).
     pub default_model: Option<String>,
+    /// OMO: default background-task concurrency (FR-031). Default 5.
+    pub omo_default_concurrency: usize,
+    /// OMO: per-provider concurrency overrides (provider name → max parallel).
+    pub omo_provider_concurrency: std::collections::HashMap<String, usize>,
+    /// OMO: per-model concurrency overrides (model id → max parallel).
+    pub omo_model_concurrency: std::collections::HashMap<String, usize>,
 }
 
 impl Default for ManagerConfig {
@@ -39,12 +45,15 @@ impl Default for ManagerConfig {
             default_max_turns: 50,
             default_persist: false,
             default_model: None,
+            omo_default_concurrency: 5,
+            omo_provider_concurrency: std::collections::HashMap::new(),
+            omo_model_concurrency: std::collections::HashMap::new(),
         }
     }
 }
 
 impl ManagerConfig {
-    /// Build from a Config tree, reading `delegation.*` keys.
+    /// Build from a Config tree, reading `delegation.*` and `omo.background_task.*` keys.
     pub fn from_config(cfg: &Config) -> Self {
         let max_children = cfg.get_i64("delegation.max_concurrent_children", 3) as usize;
         let max_requests = cfg.get_i64(
@@ -52,6 +61,15 @@ impl ManagerConfig {
             (max_children + 2) as i64,
         ) as usize;
         let default_model = cfg.get_str("delegation.default_model", "").to_string();
+
+        // OMO concurrency config (FR-031, T148).
+        let omo_default_concurrency =
+            cfg.get_i64("omo.background_task.defaultConcurrency", 5) as usize;
+        let omo_provider_concurrency =
+            parse_concurrency_map(cfg, "omo.background_task.providerConcurrency");
+        let omo_model_concurrency =
+            parse_concurrency_map(cfg, "omo.background_task.modelConcurrency");
+
         Self {
             max_concurrent_children: max_children,
             max_concurrent_requests: max_requests,
@@ -63,8 +81,28 @@ impl ManagerConfig {
             } else {
                 Some(default_model)
             },
+            omo_default_concurrency,
+            omo_provider_concurrency,
+            omo_model_concurrency,
         }
     }
+}
+
+/// Parse a config key that maps to a HashMap<String, usize>.
+/// Reads `omo.background_task.{key}` as a table of provider/model → limit pairs.
+fn parse_concurrency_map(
+    cfg: &Config,
+    key: &str,
+) -> std::collections::HashMap<String, usize> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(serde_yaml::Value::Mapping(table)) = cfg.get(key) {
+        for (k, v) in table {
+            if let (Some(name), Some(n)) = (k.as_str(), v.as_i64()) {
+                map.insert(name.to_string(), n as usize);
+            }
+        }
+    }
+    map
 }
 
 /// The orchestrator that owns the concurrency limiter and dispatches batches.

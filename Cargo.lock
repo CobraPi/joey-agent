@@ -1571,6 +1571,7 @@ dependencies = [
  "libc",
  "nu-ansi-term",
  "once_cell",
+ "pulldown-cmark",
  "reedline",
  "regex",
  "reqwest",
@@ -1688,8 +1689,10 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

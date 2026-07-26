@@ -49,6 +49,31 @@ impl AgentRegistry {
         }
     }
 
+    /// Build with custom categories merged on top of (or replacing) builtins.
+    /// Custom categories with the same name as a builtin replace it; others
+    /// are appended. This satisfies FR-012: "Categories are user-configurable
+    /// and extendable." (T154)
+    pub fn build_with_categories(
+        available: AvailableModelSet,
+        overrides: &ModelOverrides,
+        custom: Vec<CategoryConfig>,
+    ) -> Self {
+        let agents = build_all_agents(&available, overrides);
+        let mut categories = builtin_categories();
+        for cat in custom {
+            if let Some(existing) = categories.iter_mut().find(|c| c.name == cat.name) {
+                *existing = cat;
+            } else {
+                categories.push(cat);
+            }
+        }
+        Self {
+            agents,
+            categories,
+            available_models: available,
+        }
+    }
+
     /// All 11 agents (including skipped ones) — BC-001.
     pub fn all(&self) -> &[OmoAgent] {
         &self.agents
@@ -605,5 +630,68 @@ mod tests {
             "Hephaestus must activate on z.ai provider + GLM model"
         );
         assert_eq!(hephaestus.resolved_model.as_deref(), Some("glm-5.2"));
+    }
+
+    /// T082 (integration): with only glm-5 available, Sisyphus resolves to its
+    /// GLM family chain entry (entry 4), and Hephaestus is skipped (requires
+    /// an OpenAI-class provider). This is US7's acceptance scenario 1.
+    #[test]
+    fn sisyphus_resolves_glm_family_hephaestus_skipped_on_glm_only() {
+        let mut available = AvailableModelSet::new();
+        // Only glm-5 available — no anthropic, no openai.
+        available.add_model("glm-5".into());
+        // No OpenAI-class provider registered.
+
+        let registry = AgentRegistry::build(available, &ModelOverrides::new());
+
+        // Sisyphus: chain entry 1 (claude-opus), 2 (sonnet), ... entry 4 (glm-5).
+        // Only glm-5 is available → entry 4 family match wins.
+        let sisyphus = registry.get("sisyphus").unwrap();
+        let sisyphus_model = sisyphus
+            .resolved_model
+            .as_deref()
+            .expect("Sisyphus must resolve via glm family match");
+        let family = crate::models::ModelFamily::detect(sisyphus_model);
+        assert_eq!(
+            family,
+            crate::models::ModelFamily::Glm,
+            "Sisyphus should resolve a GLM model, got '{sisyphus_model}'"
+        );
+
+        // Hephaestus: requires an OpenAI-class provider — none connected → skipped.
+        let hephaestus = registry.get("hephaestus").unwrap();
+        assert!(
+            hephaestus.resolved_model.is_none(),
+            "Hephaestus must be skipped with no OpenAI provider (US7 AC1)"
+        );
+    }
+
+    /// T083 (registry-level): a user override bypasses the fallback chain even
+    /// when the override model is NOT in the available set (BC-009). The
+    /// requiresProvider gate (BC-010) is checked first, so this is demonstrated
+    /// on Sisyphus (no provider constraint), not Hephaestus.
+    #[test]
+    fn user_override_bypasses_chain_and_provider_requirement() {
+        let available = AvailableModelSet::new(); // empty — chain can't resolve
+        let mut overrides = ModelOverrides::new();
+        // Force Sisyphus to a model that is NOT in any available set.
+        overrides.insert("sisyphus".into(), "custom-proxy-model".into());
+
+        let registry = AgentRegistry::build(available, &ModelOverrides::new());
+        let sisyphus = registry.get("sisyphus").unwrap();
+        // Without the override, Sisyphus is skipped (empty available set).
+        assert!(
+            sisyphus.resolved_model.is_none(),
+            "Sisyphus skipped when nothing resolves"
+        );
+
+        let registry =
+            AgentRegistry::build(AvailableModelSet::new(), &overrides);
+        let sisyphus = registry.get("sisyphus").unwrap();
+        assert_eq!(
+            sisyphus.resolved_model.as_deref(),
+            Some("custom-proxy-model"),
+            "user override bypasses the chain entirely (BC-009)"
+        );
     }
 }

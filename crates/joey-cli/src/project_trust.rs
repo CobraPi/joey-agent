@@ -127,6 +127,7 @@ impl TrustStore {
     }
 
     /// Remove the trust entry for a project path.
+    #[allow(dead_code)]
     pub fn remove(&mut self, path: &str) {
         self.projects.remove(path);
     }

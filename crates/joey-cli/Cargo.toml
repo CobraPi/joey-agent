@@ -36,6 +36,7 @@ regex.workspace = true
 once_cell.workspace = true
 futures.workspace = true
 serde.workspace = true
+pulldown-cmark.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

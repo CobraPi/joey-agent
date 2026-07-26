@@ -58,6 +58,7 @@ clap = { version = "4", features = ["derive", "wrap_help"] }
 reedline = "0.40"
 nu-ansi-term = "0.50"
 crossterm = "0.28"
+pulldown-cmark = "0.12"
 terminal_size = "0.4"
 unicode-width = "0.2"
 textwrap = "0.16"

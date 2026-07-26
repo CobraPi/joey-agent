@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::agents::registry::AgentRegistry;
-use crate::agents::OmoAgent;
 use crate::boulder::{BoulderState, BoulderWork, BoulderWorkStatus};
 use crate::notepad::{NotepadFile, NotepadStore};
 use crate::plan_parser::ParsedTask;
@@ -869,5 +868,56 @@ mod tests {
         assert_eq!(impl_tasks[0].number, 1);
         assert_eq!(verify_tasks[0].number, 1);
         assert!(verify_tasks[0].is_final_verification);
+    }
+
+    /// T131: AgentRegistry::build() completes well under the 50ms budget even
+    /// on a realistic connected-provider setup (SC-003). This catches
+    /// accidental O(n²) growth in model resolution.
+    #[test]
+    fn registry_build_is_fast() {
+        use std::time::Instant;
+        let profile = joey_providers::profile::get_profile("zai").unwrap();
+        let available = crate::models::AvailableModelSet::from_connected(&profile, "glm-5.2");
+        let overrides = crate::agents::registry::ModelOverrides::new();
+
+        // Warm up (page in the binary / JIT-ish effects).
+        let _ = crate::agents::registry::AgentRegistry::build(available.clone(), &overrides);
+
+        let start = Instant::now();
+        let registry = crate::agents::registry::AgentRegistry::build(available, &overrides);
+        let elapsed = start.elapsed();
+        assert_eq!(registry.all().len(), 11);
+        assert!(
+            elapsed.as_millis() < 50,
+            "AgentRegistry::build took {:?}, must be <50ms",
+            elapsed
+        );
+    }
+
+    /// T131: model fallback resolution is well under the 5ms/agent budget. We
+    /// resolve the full sisyphus chain against a small available set.
+    #[test]
+    fn model_fallback_resolution_is_fast() {
+        use crate::models::{resolve_model, AvailableModelSet};
+        use std::time::Instant;
+
+        let mut available = AvailableModelSet::new();
+        available.add_model("glm-5".into());
+        available.add_provider("zai".into());
+        let requirement = crate::agents::sisyphus_requirement();
+
+        // Warm up.
+        let _ = resolve_model(&requirement, &available);
+
+        let start = Instant::now();
+        for _ in 0..100 {
+            let _ = resolve_model(&requirement, &available);
+        }
+        let per_call = start.elapsed() / 100;
+        assert!(
+            per_call.as_millis() < 5,
+            "resolve_model took {:?}/call, must be <5ms",
+            per_call
+        );
     }
 }

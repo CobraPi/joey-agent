@@ -66,6 +66,7 @@ pub struct DiscoveredModel {
     pub base_url: String,
 }
 
+#[allow(dead_code)]
 impl DiscoveredModel {
     /// The provider string for config (e.g. "openai" for OpenAI-compatible).
     pub fn provider(&self) -> &'static str {
@@ -101,6 +102,7 @@ pub async fn discover_all() -> Vec<DiscoveredServer> {
 }
 
 /// Discover all local models (flattened).
+#[allow(dead_code)]
 pub async fn discover_models() -> Vec<DiscoveredModel> {
     discover_all()
         .await

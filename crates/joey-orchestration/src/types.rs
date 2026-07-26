@@ -54,6 +54,19 @@ pub struct DelegationRequest {
     pub role: SubagentRole,
     /// Per-subagent working directory override.
     pub workdir: Option<std::path::PathBuf>,
+    /// OMO category name (e.g. "quick"). When set, the model should be
+    /// resolved from the category's fallback chain and `prompt_append`
+    /// injected into the subagent's system prompt. Mutually exclusive with
+    /// `subagent_type` (BC-011).
+    pub category: Option<String>,
+    /// OMO subagent type (e.g. "oracle", "explore"). When set, the model
+    /// should be resolved from that agent's requirement. Mutually exclusive
+    /// with `category` (BC-011).
+    pub subagent_type: Option<String>,
+    /// Skill names to load and prepend to the subagent's system prompt.
+    pub load_skills: Vec<String>,
+    /// Text prepended to the subagent's system prompt (from category config).
+    pub prompt_append: Option<String>,
 }
 
 impl DelegationRequest {
@@ -69,6 +82,10 @@ impl DelegationRequest {
             persist: false,
             role: SubagentRole::Leaf,
             workdir: None,
+            category: None,
+            subagent_type: None,
+            load_skills: Vec::new(),
+            prompt_append: None,
         }
     }
 }
