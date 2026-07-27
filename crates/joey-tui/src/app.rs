@@ -428,6 +428,18 @@ impl Tui {
                 self.toggle_reasoning();
                 return None;
             }
+            // Feature 005 (T023): Ctrl+E cycles the most-recent reasoning
+            // block through the three-state expand cycle.
+            KeyCode::Char('e') if ctrl => {
+                self.app.cycle_focused_reasoning_expand();
+                return None;
+            }
+            // Feature 005 (T028): Ctrl+G toggles the most-recent tool call's
+            // expanded state (full args/result view).
+            KeyCode::Char('g') if ctrl => {
+                self.app.toggle_focused_tool_expand();
+                return None;
+            }
             KeyCode::Char('l') if ctrl => {
                 self.app.transcript.clear();
                 self.app.scroll = None;

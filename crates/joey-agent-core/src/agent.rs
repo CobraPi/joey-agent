@@ -1943,6 +1943,8 @@ impl Agent {
                     let duration = start_times[idx].elapsed().as_secs_f64();
                     let wrapped = maybe_wrap_untrusted(&tc.function.name, &content);
                     let preview = preview_result(&content);
+                    // Feature 005 (T011): emit FileChange events before ToolEnd.
+                    emit_pending_file_changes(&tx, &tc.function.name, &content);
                     let _ = tx.send(AgentEvent::ToolEnd {
                         name: tc.function.name.clone(),
                         is_error,
@@ -1972,6 +1974,8 @@ impl Agent {
                     let is_error = result.is_error();
                     let content_raw = result.to_content_string();
                     let preview = preview_result(&content_raw);
+                    // Feature 005 (T011): emit FileChange events before ToolEnd.
+                    emit_pending_file_changes(&tx, &tc.function.name, &content_raw);
                     let _ = tx.send(AgentEvent::ToolEnd {
                         name: tc.function.name.clone(),
                         is_error,
@@ -2407,6 +2411,110 @@ fn preview_result(content: &str) -> String {
     } else {
         first_line.to_string()
     }
+}
+
+/// Feature 005 (T011): drain pending file changes from the `FileTracker` and
+/// emit one `AgentEvent::FileChange` per result. Called after each mutating
+/// tool call completes, **before** the matching `ToolEnd`, so the inline
+/// diff is attributed to that tool call in the stream.
+///
+/// `tool_name` is used to decide whether to drain at all: read-only tools
+/// (the "parallel-safe" set) never produce file changes, so we skip the
+/// drain entirely for them (avoids a needless lock acquire + disk read).
+/// `content_raw` is checked for embedded unified-diff text (FR-005) and, if
+/// found, emits a `Detected`-source `FileChange`.
+fn emit_pending_file_changes(
+    tx: &tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+    tool_name: &str,
+    content_raw: &str,
+) {
+    use joey_tools::file_tracker::{FileTracker, PendingDiffKind};
+
+    // 1. Structured file-change events (file tools / terminal mutations).
+    //    Skip for known read-only tools to avoid needless work.
+    if !is_readonly_tool(tool_name) {
+        for d in FileTracker::drain_pending_diffs() {
+            let kind = match d.kind {
+                PendingDiffKind::Create => crate::events::FileChangeKind::Create,
+                PendingDiffKind::Edit => crate::events::FileChangeKind::Edit,
+                PendingDiffKind::Delete => crate::events::FileChangeKind::Delete,
+            };
+            // Infer source: terminal-tool path vs explicit file tool.
+            let source = if tool_name == "terminal" || tool_name == "bash" {
+                crate::events::FileChangeSource::Terminal
+            } else {
+                crate::events::FileChangeSource::FileTool
+            };
+            let _ = tx.send(AgentEvent::FileChange {
+                path: d.path.clone(),
+                kind,
+                before: d.before.clone(),
+                after: d.after.clone(),
+                diff: d.diff,
+                is_binary: d.is_binary,
+                source,
+            });
+        }
+    }
+
+    // 2. Diff-text detection (FR-005): if the tool's textual output is itself
+    //    a unified diff, emit a Detected-source FileChange so it renders
+    //    visually. We do this for all tools (read-only included) since a
+    //    search/grep result can contain a pasted diff.
+    if joey_tools::file_tracker::is_unified_diff(content_raw) {
+        // Best-effort: extract a path from the diff header if present.
+        let path = extract_diff_path(content_raw).unwrap_or_else(|| "detected.diff".to_string());
+        let _ = tx.send(AgentEvent::FileChange {
+            path,
+            kind: crate::events::FileChangeKind::Edit,
+            before: String::new(),
+            after: content_raw.to_string(),
+            diff: joey_tools::file_tracker::DiffResult {
+                path: String::new(),
+                diff: content_raw.to_string(),
+                added: content_raw.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count(),
+                removed: content_raw.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count(),
+            },
+            is_binary: false,
+            source: crate::events::FileChangeSource::Detected,
+        });
+    }
+}
+
+/// Whether a tool is read-only (never mutates files). Read-only tools skip
+/// the `drain_pending_diffs` call. This mirrors the parallel-safe/sequential
+/// distinction in the tool registry but is kept local and conservative: when
+/// unsure, treat as mutating (drain anyway — a drain with nothing pending is
+/// a cheap no-op).
+fn is_readonly_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "search_files"
+            | "web_search"
+            | "web_extract"
+            | "session_search"
+            | "ls"
+            | "glob"
+            | "grep"
+            | "memory"
+            | "todo"
+            | "skills_list"
+            | "skill_view"
+    )
+}
+
+/// Best-effort extraction of a file path from a unified-diff header.
+fn extract_diff_path(diff: &str) -> Option<String> {
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            return Some(rest.trim().to_string());
+        }
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

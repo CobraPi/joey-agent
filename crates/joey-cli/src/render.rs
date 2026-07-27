@@ -33,7 +33,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use joey_agent_core::AgentEvent;
+use joey_agent_core::events::{FileChangeKind, AgentEvent};
 use joey_core::branding;
 use joey_core::theme::{self, Theme};
 use tokio::sync::mpsc;
@@ -146,6 +146,11 @@ pub struct RenderOptions {
     pub animation_fps: u32,
     /// Detected capability profile, resolved once at REPL startup.
     pub capability: crate::capability::RenderCapability,
+    /// `display.syntax_highlighting`: gate per-language syntax highlighting
+    /// of diff code lines (feature 005). Default true. When false, the
+    /// highlight helper is never invoked (zero cost — Principle VIII escape
+    /// hatch for the syntect dependency).
+    pub syntax_highlighting: bool,
 }
 
 impl Default for RenderOptions {
@@ -159,8 +164,60 @@ impl Default for RenderOptions {
             animations_enabled: !matches!(level, crate::capability::Capability::NonInteractive),
             animation_fps: capability.target_fps.max(12),
             capability,
+            syntax_highlighting: true,
         }
     }
+}
+
+/// Feature 005 (E2 resolution): maximum number of diff lines rendered in the
+/// interactive view before tail-truncation kicks in. Mirrors the reasoning/
+/// tool truncation pattern. Ported from crush's `MAX_COLLAPSED_HEIGHT`.
+const MAX_DIFF_BLOCK_HEIGHT: usize = 50;
+
+/// Feature 005 (T015): render one diff line with add/remove/context coloring
+/// and optional syntax highlighting. Returns the ANSI-styled string.
+///
+/// - Lines starting with `+` (and not `+++`) → green (addition).
+/// - Lines starting with `-` (and not `---`) → red (removal).
+/// - Hunk headers (`@@`) → subtle accent.
+/// - File headers (`---`/`+++`) → subtle.
+/// - Context lines (` ` prefix) → base color.
+///
+/// When `syntax_highlighting` is enabled, the code portion of add/context
+/// lines is passed through `joey_tools::highlight::highlight_line` for
+/// per-language coloring (layered on top of the add/context tint).
+fn render_diff_line(line: &str, path: &str, syntax_highlighting: bool, t: &Theme) -> String {
+    // Strip the leading marker for syntax highlighting, then re-apply color.
+    if line.starts_with("+++") || line.starts_with("---") {
+        return t.fg_most_subtle.ansi().paint(line).to_string();
+    }
+    if line.starts_with("@@") {
+        return t.info_most_subtle.ansi().paint(line).to_string();
+    }
+    if let Some(code) = line.strip_prefix('+') {
+        // Addition line.
+        if syntax_highlighting {
+            if let Some(hl) = joey_tools::highlight::highlight_line(code, path, true) {
+                return format!("{}{}", t.success.ansi().paint("+"), hl);
+            }
+        }
+        return t.success.ansi().paint(line).to_string();
+    }
+    if let Some(code) = line.strip_prefix('-') {
+        // Removal line (no syntax highlight on the removed side — keeps the
+        // red tint readable; crush does the same).
+        let _ = code;
+        return t.error.ansi().paint(line).to_string();
+    }
+    // Context line.
+    if let Some(code) = line.strip_prefix(' ') {
+        if syntax_highlighting {
+            if let Some(hl) = joey_tools::highlight::highlight_line(code, path, true) {
+                return format!(" {}", hl);
+            }
+        }
+    }
+    t.fg_base.ansi().paint(line).to_string()
 }
 
 fn term_width() -> usize {
@@ -209,6 +266,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
     let mut streamed_line_count: u32 = 0;
     let mut reasoning_open = false;
     let mut reasoning_buf = String::new();
+    let mut reasoning_line_count: usize = 0; // Feature 005 (T025): reasoning size tracking
     let mut last_tool_line: Option<String> = None;
     let mut total_prompt_tokens: u64 = 0;
     let mut total_completion_tokens: u64 = 0;
@@ -314,16 +372,32 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             )
         }
     };
-    let close_reasoning = |open: &mut bool, buf: &mut String| {
+    let close_reasoning = |open: &mut bool, buf: &mut String, line_count: &mut usize| {
         if *open {
             if !buf.is_empty() {
                 println!("{}", t.fg_more_subtle.ansi().paint(buf.as_str()));
                 buf.clear();
             }
-            let w = box_width();
-            let border = theme::gradient_diagonal_field(w.saturating_sub(2), t.info_most_subtle, t.fg_most_subtle);
-            println!("{}", border);
+            // Feature 005 (T025): show line count in the close border (parity
+            // with TUI's expand affordance).
+            if *line_count > 0 {
+                let summary = format!(" {} lines of reasoning ", line_count);
+                let w = box_width();
+                let fill = w.saturating_sub(2 + summary.len());
+                let label_styled = t.fg_most_subtle.ansi().paint(summary).to_string();
+                let fill_styled = theme::gradient_fg(
+                    &"─".repeat(fill.saturating_sub(1)),
+                    t.info_most_subtle,
+                    t.fg_most_subtle,
+                );
+                println!("{}{}", label_styled, fill_styled);
+            } else {
+                let w = box_width();
+                let border = theme::gradient_diagonal_field(w.saturating_sub(2), t.info_most_subtle, t.fg_most_subtle);
+                println!("{}", border);
+            }
             *open = false;
+            *line_count = 0;
         }
     };
 
@@ -417,9 +491,11 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 while let Some(pos) = reasoning_buf.find('\n') {
                     let line: String = reasoning_buf.drain(..=pos).collect();
                     println!("{}", t.fg_more_subtle.ansi().paint(line.trim_end_matches('\n')));
+                    reasoning_line_count += 1; // Feature 005 (T025)
                 }
                 if reasoning_buf.len() > 80 {
                     println!("{}", t.fg_more_subtle.ansi().paint(reasoning_buf.as_str()));
+                    reasoning_line_count += 1; // Feature 005 (T025)
                     reasoning_buf.clear();
                 }
                 let _ = std::io::stdout().flush();
@@ -450,7 +526,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     );
                     caret_visible = false;
                 }
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf);
+                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count);
                 print!("{}", d);
                 let _ = std::io::stdout().flush();
                 streamed_any = true;
@@ -463,7 +539,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             AgentEvent::AssistantMessage(text) => {
                 final_text = text;
                 if !opts.quiet && !streamed_any && !final_text.is_empty() {
-                    close_reasoning(&mut reasoning_open, &mut reasoning_buf);
+                    close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count);
                     println!("{}", final_text);
                 }
             }
@@ -474,7 +550,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 }
                 // T040: stop caret when tool output begins.
                 caret_active = false;
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf);
+                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count);
                 // US2: finalize spinner before tool output.
                 if let Some(s) = spinner_state.as_mut() {
                     if s.running {
@@ -616,8 +692,14 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
 
                 // Show result preview in verbose mode.
                 if !is_error && opts.tool_progress == "verbose" && !result_preview.is_empty() {
-                    let preview_trimmed: String = result_preview.chars().take(120).collect();
-                    println!("    {} {}", t.fg_more_subtle.ansi().paint("└"), t.fg_most_subtle.ansi().paint(&preview_trimmed));
+                    // Feature 005 (T030): non-interactive mode emits full result
+                    // untruncated (FR-012); interactive verbose trims to 120.
+                    if !opts.capability.is_interactive {
+                        println!("    └ {}", result_preview);
+                    } else {
+                        let preview_trimmed: String = result_preview.chars().take(120).collect();
+                        println!("    {} {}", t.fg_more_subtle.ansi().paint("└"), t.fg_most_subtle.ansi().paint(&preview_trimmed));
+                    }
                 }
             }
             AgentEvent::Notice(msg) => {
@@ -675,8 +757,58 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     println!("{}", t.info_more_subtle.ansi().paint(label));
                 }
             }
+            // Feature 005: inline file-change diff rendering (T014/T015/T016/T017).
+            AgentEvent::FileChange { path, kind, before: _, after: _, diff, is_binary, source: _ } => {
+                if opts.quiet {
+                    // --quiet: skip diffs entirely (only final response prints).
+                    continue;
+                }
+                let t = theme();
+                // Path header: "  ◆ path  +N -M" with kind label.
+                let kind_label = match kind {
+                    FileChangeKind::Create => " (new file)",
+                    FileChangeKind::Delete => " (deleted)",
+                    FileChangeKind::Edit => "",
+                };
+                let header = format!("  ◆ {}{}  {}", path, kind_label, diff.stat_line());
+                println!("{}", t.fg_subtle.ansi().paint(header));
+
+                if is_binary {
+                    // T017: binary-file placeholder (FR-016).
+                    println!("{}", t.fg_most_subtle.ansi().paint("    binary file changed"));
+                    continue;
+                }
+
+                // T016: non-interactive / piped → plain text, no color, no truncation (FR-012).
+                if !opts.capability.is_interactive {
+                    for line in diff.diff.lines() {
+                        println!("{}", line);
+                    }
+                    continue;
+                }
+
+                // T014 + T015: interactive — colored + syntax-highlighted diff,
+                // with large-diff height bounding (E2 resolution).
+                let diff_lines: Vec<&str> = diff.diff.lines().collect();
+                let max_height = MAX_DIFF_BLOCK_HEIGHT;
+                let hidden = if diff_lines.len() > max_height {
+                    diff_lines.len() - max_height
+                } else {
+                    0
+                };
+                // Render only the tail `max_height` lines when truncated.
+                let start = hidden;
+                for &line in &diff_lines[start..] {
+                    let rendered = render_diff_line(line, &path, opts.syntax_highlighting, &t);
+                    println!("{}", rendered);
+                }
+                if hidden > 0 {
+                    let affordance = format!("    … ({} earlier lines hidden)", hidden);
+                    println!("{}", t.fg_most_subtle.ansi().paint(affordance));
+                }
+            }
             AgentEvent::Done { final_text: text, usage: _, iterations } => {
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf);
+                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count);
 
                 // T040: erase the streaming caret if visible.
                 if caret_visible {
@@ -748,7 +880,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 break;
             }
             AgentEvent::Failed(err) => {
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf);
+                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count);
                 if streamed_any {
                     println!();
                 }
@@ -1322,7 +1454,7 @@ pub fn checkpoint_reverted(number: usize) {
 mod tests {
     use super::*;
     use crate::capability::{Capability, RenderCapability};
-    use joey_agent_core::AgentEvent;
+    use joey_agent_core::events::{FileChangeKind, AgentEvent};
     use joey_providers::Usage;
     use tokio::sync::mpsc;
 
@@ -1343,6 +1475,7 @@ mod tests {
                     term_width: 80,
                     target_fps: 0,
                 },
+                syntax_highlighting: true,
             },
             Capability::Reduced => RenderOptions {
                 show_reasoning: false,
@@ -1357,6 +1490,7 @@ mod tests {
                     term_width: 50,
                     target_fps: 8,
                 },
+                syntax_highlighting: true,
             },
             Capability::Full => RenderOptions {
                 show_reasoning: false,
@@ -1371,6 +1505,7 @@ mod tests {
                     term_width: 80,
                     target_fps: 12,
                 },
+                syntax_highlighting: true,
             },
         }
     }

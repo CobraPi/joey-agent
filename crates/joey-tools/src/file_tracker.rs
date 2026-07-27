@@ -25,6 +25,13 @@ pub struct FileTracker {
     write_times: HashMap<String, SystemTime>,
     /// Ordered list of files modified in this session.
     modified_files: Vec<String>,
+    /// Paths written since the last `drain_pending_diffs` call. Each path
+    /// appears at most once; a second write before a drain just keeps the
+    /// existing entry (the drain re-reads the latest on-disk content).
+    /// Feature 005: feeds inline `AgentEvent::FileChange` emission.
+    pending_writes: Vec<String>,
+    /// Paths deleted since the last drain. Feature 005 (T010).
+    pending_deletes: Vec<String>,
 }
 
 impl FileTracker {
@@ -34,6 +41,8 @@ impl FileTracker {
             read_times: HashMap::new(),
             write_times: HashMap::new(),
             modified_files: Vec::new(),
+            pending_writes: Vec::new(),
+            pending_deletes: Vec::new(),
         }
     }
 
@@ -55,8 +64,33 @@ impl FileTracker {
         let key = normalize_path(path);
         t.write_times.insert(key.clone(), SystemTime::now());
         if !t.modified_files.contains(&key) {
-            t.modified_files.push(key);
+            t.modified_files.push(key.clone());
         }
+        // Feature 005: queue for inline diff emission (dedup; the drain
+        // re-reads the latest on-disk content, so a second pre-drain write
+        // just keeps the existing entry).
+        if !t.pending_writes.contains(&key) {
+            t.pending_writes.push(key.clone());
+        }
+        // A write supersedes any pending delete for the same path.
+        t.pending_deletes.retain(|p| p != &key);
+    }
+
+    /// Record that a file was deleted (feature 005, T010). The prior content
+    /// (from `originals`, if the agent read it before) becomes the removal
+    /// side of the emitted diff.
+    pub fn record_delete(path: &str) {
+        let mut t = TRACKER.lock().unwrap();
+        let key = normalize_path(path);
+        t.write_times.insert(key.clone(), SystemTime::now());
+        if !t.modified_files.contains(&key) {
+            t.modified_files.push(key.clone());
+        }
+        if !t.pending_deletes.contains(&key) {
+            t.pending_deletes.push(key.clone());
+        }
+        // A delete supersedes any pending write for the same path.
+        t.pending_writes.retain(|p| p != &key);
     }
 
     /// Get the original content snapshot for a file (if tracked).
@@ -101,6 +135,104 @@ impl FileTracker {
             .collect()
     }
 
+    /// Drain all writes and deletes recorded since the last call, producing
+    /// one [`PendingDiff`] per changed file with before/after content and the
+    /// computed diff. Clears the pending sets. Feature 005 (T009/T010).
+    ///
+    /// Producer: called by the agent turn loop after each mutating tool call
+    /// (T011) to emit inline `AgentEvent::FileChange` events.
+    ///
+    /// Binary handling (T007): if either the original or the on-disk content
+    /// fails UTF-8 decode, `is_binary` is set true, `diff.diff` is emptied,
+    /// and the renderer is expected to show a placeholder (FR-016).
+    pub fn drain_pending_diffs() -> Vec<PendingDiff> {
+        let mut t = TRACKER.lock().unwrap();
+        let writes = std::mem::take(&mut t.pending_writes);
+        let deletes = std::mem::take(&mut t.pending_deletes);
+        // Drop the lock while doing disk I/O so we don't hold it across reads.
+        // (Originals map is cloned for the same reason.)
+        let originals = t.originals.clone();
+        drop(t);
+
+        let mut out = Vec::with_capacity(writes.len() + deletes.len());
+
+        for path in &writes {
+            let before = originals.get(path).cloned().unwrap_or_default();
+            // Try to decode the current on-disk content as UTF-8.
+            let after_bytes = std::fs::read(path).ok();
+            let (after, is_binary) = match after_bytes.as_deref() {
+                None => (String::new(), false), // file may have vanished — treat as empty
+                Some(bytes) => match std::str::from_utf8(bytes) {
+                    Ok(s) => (s.to_string(), false),
+                    Err(_) => (String::new(), true),
+                },
+            };
+            // If before is non-empty but not valid UTF-8 in memory, that's
+            // already impossible (it's stored as String); only after can be
+            // binary. But if after is binary we mark the whole change binary.
+            let kind = if before.is_empty() && !is_binary {
+                PendingDiffKind::Create
+            } else {
+                PendingDiffKind::Edit
+            };
+            let diff = if is_binary {
+                DiffResult {
+                    path: path.clone(),
+                    diff: String::new(),
+                    added: 0,
+                    removed: 0,
+                }
+            } else {
+                generate_diff(&before, &after, path)
+            };
+            out.push(PendingDiff {
+                path: path.clone(),
+                kind,
+                before,
+                after,
+                diff,
+                is_binary,
+            });
+        }
+
+        for path in &deletes {
+            // Prior content becomes the removal side.
+            let before = originals.get(path).cloned().unwrap_or_default();
+            let diff = if before.is_empty() {
+                DiffResult {
+                    path: path.clone(),
+                    diff: String::new(),
+                    added: 0,
+                    removed: 0,
+                }
+            } else {
+                generate_diff(&before, "", path)
+            };
+            out.push(PendingDiff {
+                path: path.clone(),
+                kind: PendingDiffKind::Delete,
+                before,
+                after: String::new(),
+                diff,
+                is_binary: false,
+            });
+        }
+
+        out
+    }
+
+    /// Mark a file as externally mutated (feature 005, T012 terminal-mutation
+    /// detection). The diff is computed from the stored baseline (`originals`
+    /// if the agent read it earlier) vs. current on-disk content. Returns the
+    /// path's normalized key so the caller can attribute it. If the file was
+    /// never read, it is reported as a Create.
+    pub fn record_external_mutation(path: &str) -> String {
+        // Reuse the write path so the file enters the pending queue; the
+        // drain will compute baseline vs. on-disk.
+        Self::record_write(path);
+        normalize_path(path)
+    }
+
     /// Clear all tracking state (new session).
     pub fn reset() {
         let mut t = TRACKER.lock().unwrap();
@@ -108,6 +240,8 @@ impl FileTracker {
         t.read_times.clear();
         t.write_times.clear();
         t.modified_files.clear();
+        t.pending_writes.clear();
+        t.pending_deletes.clear();
     }
 
     /// Summary of changes for display.
@@ -119,6 +253,30 @@ impl FileTracker {
             modified_paths: t.modified_files.clone(),
         }
     }
+}
+
+/// One file change awaiting inline emission. Feature 005 (T009).
+///
+/// `before`/`after` are the decoded contents used by the renderer and the
+/// diff engine; `is_binary` is true when either side failed UTF-8 decode
+/// (in which case `diff.diff` is empty and the renderer shows a binary
+/// placeholder per FR-016).
+#[derive(Debug, Clone)]
+pub struct PendingDiff {
+    pub path: String,
+    pub kind: PendingDiffKind,
+    pub before: String,
+    pub after: String,
+    pub diff: DiffResult,
+    pub is_binary: bool,
+}
+
+/// What kind of pending change a [`PendingDiff`] represents. Feature 005.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingDiffKind {
+    Create,
+    Edit,
+    Delete,
 }
 
 /// A summary of session file changes.
@@ -507,6 +665,7 @@ mod tests {
 
     #[test]
     fn tracker_records_and_resets() {
+        let _guard = FT_TEST_LOCK.lock().unwrap();
         FileTracker::reset();
         FileTracker::record_read("/tmp/test_file_a.txt", Some("original"));
         FileTracker::record_write("/tmp/test_file_a.txt");
@@ -519,5 +678,157 @@ mod tests {
         FileTracker::reset();
         let summary = FileTracker::change_summary();
         assert_eq!(summary.files_modified, 0);
+    }
+
+    // -- Feature 005 tests (T006/T007/T008) -------------------------------
+    //
+    // NOTE: FileTracker is a process-global singleton. These tests mutate
+    // global state and MUST NOT run concurrently with each other (or with
+    // `tracker_records_and_resets`). We serialize them with a static mutex
+    // guard acquired at the top of each test.
+
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    static FT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Helper: write a temp file with the given content and return its path.
+    fn tmp_write(name: &str, content: &str) -> String {
+        let path = format!("/tmp/joey_ft_test_{}", name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        path
+    }
+
+    /// T006: drain_pending_diffs returns the diff for a written file and
+    /// clears the pending set; a no-op write yields empty/no diff.
+    #[test]
+    fn drain_pending_diffs_edit_and_clear() {
+        let _guard = FT_TEST_LOCK.lock().unwrap();
+        FileTracker::reset();
+        let path = tmp_write("t006.txt", "line1\nline2\nline3\n");
+        // Simulate the agent reading the file (baseline snapshot).
+        FileTracker::record_read(&path, Some("line1\nline2\nline3\n"));
+        // Simulate an edit: rewrite content + record_write.
+        let _ = tmp_write("t006.txt", "line1\nMODIFIED\nline3\n");
+        FileTracker::record_write(&path);
+
+        let diffs = FileTracker::drain_pending_diffs();
+        assert_eq!(diffs.len(), 1, "one pending write should yield one diff");
+        let d = &diffs[0];
+        assert_eq!(d.path, path);
+        assert_eq!(d.kind, PendingDiffKind::Edit);
+        assert!(!d.is_binary);
+        assert_eq!(d.diff.added, 1);
+        assert_eq!(d.diff.removed, 1);
+        assert!(d.diff.diff.contains("+MODIFIED"));
+        assert!(d.diff.diff.contains("-line2"));
+
+        // Second drain is empty — pending set was cleared.
+        let again = FileTracker::drain_pending_diffs();
+        assert!(again.is_empty(), "drain must clear the pending set");
+
+        let _ = std::fs::remove_file(&path);
+        FileTracker::reset();
+    }
+
+    /// T006 (Create variant): a write with no prior read baseline yields
+    /// `kind == Create` and the whole content as additions.
+    #[test]
+    fn drain_pending_diffs_create() {
+        let _guard = FT_TEST_LOCK.lock().unwrap();
+        FileTracker::reset();
+        let path = tmp_write("t006b.txt", "new\ncontent\n");
+        FileTracker::record_write(&path); // no record_read → Create
+
+        let diffs = FileTracker::drain_pending_diffs();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].kind, PendingDiffKind::Create);
+        assert_eq!(diffs[0].diff.added, 2);
+        assert_eq!(diffs[0].diff.removed, 0);
+
+        let _ = std::fs::remove_file(&path);
+        FileTracker::reset();
+    }
+
+    /// T006 (no-op): a write that doesn't change content yields a diff with
+    /// 0 additions / 0 removals (the drain still returns the entry, but the
+    /// renderer will treat zero-count diffs as non-events).
+    #[test]
+    fn drain_pending_diffs_noop_write() {
+        let _guard = FT_TEST_LOCK.lock().unwrap();
+        FileTracker::reset();
+        let path = tmp_write("t006c.txt", "same\n");
+        FileTracker::record_read(&path, Some("same\n"));
+        // Rewrite identical content.
+        let _ = tmp_write("t006c.txt", "same\n");
+        FileTracker::record_write(&path);
+
+        let diffs = FileTracker::drain_pending_diffs();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].diff.added, 0, "identical content → 0 additions");
+        assert_eq!(diffs[0].diff.removed, 0, "identical content → 0 removals");
+
+        let _ = std::fs::remove_file(&path);
+        FileTracker::reset();
+    }
+
+    /// T007: binary-file detection. A write whose after-content fails UTF-8
+    /// decode sets `is_binary` and yields empty diff text.
+    #[test]
+    fn drain_pending_diffs_binary() {
+        let _guard = FT_TEST_LOCK.lock().unwrap();
+        FileTracker::reset();
+        let path = "/tmp/joey_ft_test_t007.bin";
+        // Write invalid UTF-8 bytes.
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&[0xFF, 0xFE, 0x00, 0x01, 0x80]).unwrap();
+        FileTracker::record_read(path, Some("text baseline\n"));
+        FileTracker::record_write(path);
+
+        let diffs = FileTracker::drain_pending_diffs();
+        assert_eq!(diffs.len(), 1);
+        let d = &diffs[0];
+        assert!(d.is_binary, "non-UTF-8 content must be flagged binary");
+        assert!(d.diff.diff.is_empty(), "binary diff text must be empty");
+
+        let _ = std::fs::remove_file(path);
+        FileTracker::reset();
+    }
+
+    /// T008: diff-text detection (`is_unified_diff`) classifies a real diff
+    /// vs plain text (FR-005). (The existing `diff_detect_basic` covers the
+    /// happy path; this adds an explicit plain-text negative and a git-header
+    /// positive.)
+    #[test]
+    fn diff_text_detection_classification() {
+        // Pure function — no global state, no guard needed.
+        // Plain text is not a diff.
+        assert!(!is_unified_diff("just some prose\nwith a + plus sign\n"));
+        assert!(!is_unified_diff("a\nb\nc\n"));
+
+        // Hunk + file header is a diff.
+        assert!(is_unified_diff("--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n"));
+        // Git header + file header is a diff even without a hunk line.
+        assert!(is_unified_diff("diff --git a/x b/x\n--- a/x\n+++ b/x\n"));
+    }
+
+    /// T010: delete tracking via record_delete produces a Delete diff with
+    /// the prior content as removals.
+    #[test]
+    fn drain_pending_diffs_delete() {
+        let _guard = FT_TEST_LOCK.lock().unwrap();
+        FileTracker::reset();
+        let path = tmp_write("t010.txt", "to be removed\nsecond line\n");
+        FileTracker::record_read(&path, Some("to be removed\nsecond line\n"));
+        let _ = std::fs::remove_file(&path);
+        FileTracker::record_delete(&path);
+
+        let diffs = FileTracker::drain_pending_diffs();
+        assert_eq!(diffs.len(), 1, "delete should yield one diff");
+        assert_eq!(diffs[0].kind, PendingDiffKind::Delete);
+        assert_eq!(diffs[0].diff.removed, 2, "prior content becomes removals");
+        assert!(diffs[0].diff.diff.contains("-to be removed"));
+        FileTracker::reset();
     }
 }

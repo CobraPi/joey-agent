@@ -40,3 +40,6 @@ once_cell.workspace = true
 uuid.workspace = true
 tempfile.workspace = true
 libc.workspace = true
+# Syntax highlighting helper for diff rendering (feature 005). Lives here as
+# the DAG-valid shared ancestor of joey-cli and joey-tui (see plan.md C1).
+syntect.workspace = true

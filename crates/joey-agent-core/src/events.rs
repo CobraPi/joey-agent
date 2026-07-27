@@ -6,6 +6,33 @@
 
 use joey_providers::Usage;
 
+// Feature 005: supporting enums for FileChange events. Lives at the event
+// layer so both the CLI renderer and the TUI state machine can consume them
+// from a single stream (constitution Principle II: CLI/TUI parity).
+// See specs/005-expandable-diff-ui/contracts/agent-event.md.
+
+/// What kind of file change a `FileChange` event represents (FR-004).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChangeKind {
+    /// A brand-new file was created (all additions, no baseline).
+    Create,
+    /// An existing file was edited.
+    Edit,
+    /// A file was deleted (all removals).
+    Delete,
+}
+
+/// What produced a `FileChange` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChangeSource {
+    /// An explicit joey file tool (`write_file`, `patch`).
+    FileTool,
+    /// A terminal command mutated the file (snapshot-diff detected).
+    Terminal,
+    /// Diff text detected in a tool's textual output (FR-005).
+    Detected,
+}
+
 /// An event emitted during a turn. The CLI/gateway renders these live.
 ///
 /// Ordering guarantees: `ContentDelta`/`ReasoningDelta` stream during a
@@ -14,6 +41,12 @@ use joey_providers::Usage;
 /// previous interim — conversation_loop.py:4997-5013); `ToolStart` /
 /// `ToolProgress` / `ToolEnd` bracket tool execution; exactly one of
 /// `Done`/`Failed` ends the turn.
+///
+/// `FileChange` (feature 005) is emitted by the tool execution path,
+/// positioned within the stream as `ToolStart` → (`FileChange`)* → `ToolEnd`
+/// for the same tool call. Only the tool layer (in `joey-tools`) produces
+/// these; the render layer consumes them. See
+/// `specs/005-expandable-diff-ui/contracts/agent-event.md`.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     // ── Streaming deltas ───────────────────────────────────────────────
@@ -52,6 +85,34 @@ pub enum AgentEvent {
         result_preview: String,
         /// Execution duration in seconds.
         duration_secs: f64,
+    },
+
+    // ── File changes (feature 005) ────────────────────────────────────
+    /// A file was created, edited, or deleted by the agent during a turn.
+    /// Emitted inline with the tool execution that caused the change, so the
+    /// renderer can draw an inline diff attributed to that tool call.
+    /// Ordering: `ToolStart` → (`FileChange`)* → `ToolEnd` for one tool call.
+    /// Producer surface: only the tool layer (`joey-tools`).
+    FileChange {
+        /// Display-normalized file path.
+        path: String,
+        /// What kind of change this is (drives the new-file / deleted-file label).
+        kind: FileChangeKind,
+        /// Baseline content (from `FileTracker::get_original`). Empty for Create.
+        before: String,
+        /// Post-write on-disk content. Empty for Delete.
+        after: String,
+        /// The computed unified diff + counts. Reuses
+        /// `joey_tools::file_tracker::DiffResult`. Empty `.diff` when
+        /// `is_binary` is true.
+        diff: joey_tools::file_tracker::DiffResult,
+        /// True when before/after could not be decoded as UTF-8. When true the
+        /// renderer MUST show a "binary file changed" placeholder (FR-016) and
+        /// MUST NOT attempt to render `.diff`.
+        is_binary: bool,
+        /// What produced this event: an explicit file tool, a terminal
+        /// snapshot, or diff-text detection (FR-005).
+        source: FileChangeSource,
     },
 
     // ── Assistant messages ────────────────────────────────────────────
@@ -158,4 +219,58 @@ pub enum AgentEvent {
     },
     /// The turn failed with an error message.
     Failed(String),
+}
+
+#[cfg(test)]
+mod tests {
+    //! Feature 005 regression coverage for the new public `FileChange`
+    //! variant (constitution Principle VII). Asserts the variant is
+    //! constructible and carries through `Clone`/`Debug`, and that the
+    //! supporting enums derive their intended traits.
+
+    use super::*;
+
+    #[test]
+    fn file_change_variant_constructs_and_clones() {
+        let diff = joey_tools::file_tracker::DiffResult {
+            path: "src/main.rs".to_string(),
+            diff: "--- a/src/main.rs\n+++ b/src/main.rs\n".to_string(),
+            added: 1,
+            removed: 1,
+        };
+        let ev = AgentEvent::FileChange {
+            path: "src/main.rs".to_string(),
+            kind: FileChangeKind::Edit,
+            before: "old\n".to_string(),
+            after: "new\n".to_string(),
+            diff: diff.clone(),
+            is_binary: false,
+            source: FileChangeSource::FileTool,
+        };
+        // Clone round-trips.
+        let cloned = ev.clone();
+        // Debug formats without panicking (covers all fields).
+        let _dbg = format!("{:?}", cloned);
+        // The variant is a FileChange and kind/source match what we set.
+        match ev {
+            AgentEvent::FileChange { kind, source, .. } => {
+                assert_eq!(kind, FileChangeKind::Edit);
+                assert_eq!(source, FileChangeSource::FileTool);
+            }
+            _ => panic!("expected FileChange variant"),
+        }
+    }
+
+    #[test]
+    fn file_change_kinds_are_distinct() {
+        assert_ne!(FileChangeKind::Create, FileChangeKind::Edit);
+        assert_ne!(FileChangeKind::Edit, FileChangeKind::Delete);
+        assert_ne!(FileChangeKind::Create, FileChangeKind::Delete);
+    }
+
+    #[test]
+    fn file_change_sources_are_distinct() {
+        assert_ne!(FileChangeSource::FileTool, FileChangeSource::Terminal);
+        assert_ne!(FileChangeSource::Terminal, FileChangeSource::Detected);
+    }
 }

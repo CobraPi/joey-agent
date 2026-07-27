@@ -683,6 +683,7 @@ fn flow_api_key_provider(provider_id: &str, current_model: &str) -> Result<bool>
         let _ = cfg.unset("model.api_mode");
         auth_store::deactivate_provider();
         println!("Default model set to: {} (via {})", selected, profile.display_name);
+        prompt_context_window(provider_id, &selected, None)?;
         Ok(true)
     } else {
         println!("No change.");
@@ -752,11 +753,11 @@ fn flow_copilot(current_model: &str) -> Result<bool> {
     });
     let api_mode = copilot::model_api_mode(&selected, entry).as_str();
 
-    if let Some(entry) = entry {
-        if let Some(context) = copilot::catalog_context_window(entry) {
-            Config::load()?.set_and_save("model.context_length", &context.to_string())?;
-        }
-    }
+    // Context window: pass the Copilot catalog value as an extra candidate;
+    // prompt_context_window also checks models.dev + the hardcoded catalog
+    // and pre-selects when all sources agree.
+    let copilot_ctx = entry.and_then(copilot::catalog_context_window).map(|v| v as i64);
+    prompt_context_window("copilot", &selected, copilot_ctx)?;
     let efforts = copilot::model_reasoning_efforts(&selected, entry);
     if !efforts.is_empty() {
         let chosen = read_line(&format!("Reasoning effort [{}]: ", efforts.join("/")))
@@ -809,6 +810,7 @@ fn flow_openrouter(current_model: &str) -> Result<bool> {
         let _ = cfg.unset("model.api");
         auth_store::deactivate_provider();
         println!("Default model set to: {} (via OpenRouter)", selected);
+        prompt_context_window("openrouter", &selected, None)?;
         Ok(true)
     } else {
         println!("No change.");
@@ -931,6 +933,7 @@ fn flow_anthropic(current_model: &str) -> Result<bool> {
         let _ = cfg.unset("model.api_mode");
         auth_store::deactivate_provider();
         println!("Default model set to: {} (via Anthropic)", selected);
+        prompt_context_window("anthropic", &selected, None)?;
         Ok(true)
     } else {
         println!("No change.");
@@ -1361,6 +1364,7 @@ fn flow_named_custom(info: &CustomProviderInfo, current_model: &str) -> Result<b
         // Remember the chosen model on the saved entry.
         save_custom_provider(&info.base_url, &info.api_key, &selected, None, &info.name, &info.api_mode)?;
         println!("Default model set to: {} (via {})", selected, info.name);
+        prompt_context_window("custom", &selected, None)?;
         Ok(true)
     } else {
         println!("No change.");
@@ -1594,6 +1598,148 @@ fn save_model_choice(model_id: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Context-window prompt (asked after model selection)
+// ---------------------------------------------------------------------------
+
+/// Format a token count with thousands separators for display.
+fn format_context_tokens(n: i64) -> String {
+    let digits = n.abs().to_string();
+    let mut s = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            s.insert(0, ',');
+        }
+        s.insert(0, c);
+    }
+    s
+}
+
+/// Parse a context-length string, accepting commas and K/M suffixes
+/// (e.g. "128000", "128,000", "128k", "1m"). None on invalid input.
+fn parse_context_length(input: &str) -> Option<i64> {
+    let cleaned = input
+        .trim()
+        .replace(',', "")
+        .replace(['k', 'K'], "000")
+        .replace(['m', 'M'], "000000");
+    cleaned.parse::<i64>().ok().filter(|n| *n > 0)
+}
+
+/// Context window from the hardcoded family catalog, but only when the model
+/// genuinely matches a known family key (None when it would fall back to the
+/// generic 256K default — that's not a real detection).
+fn hardcoded_context_window(model: &str) -> Option<i64> {
+    use joey_agent_core::compression::catalog::{
+        strip_provider_prefix, DEFAULT_CONTEXT_LENGTHS,
+    };
+    let model_lower = strip_provider_prefix(model).to_lowercase();
+    let mut entries: Vec<&(&str, i64)> = DEFAULT_CONTEXT_LENGTHS.iter().collect();
+    // Longest key first for specificity (same as get_model_context_length).
+    entries.sort_by_key(|e| std::cmp::Reverse(e.0.len()));
+    for (default_model, length) in entries {
+        if model_lower.contains(default_model) {
+            return Some(*length);
+        }
+    }
+    None
+}
+
+/// Collect distinct context-window candidates from all detection sources,
+/// preserving source-priority order: models.dev registry first, then the
+/// hardcoded family catalog, then any caller-supplied extra candidate.
+fn context_window_candidates(provider_id: &str, model: &str, extra: Option<i64>) -> Vec<i64> {
+    let mut out: Vec<i64> = Vec::new();
+    if let Some(ctx) = catalog::models_dev_context_window(provider_id, model) {
+        if !out.contains(&ctx) {
+            out.push(ctx);
+        }
+    }
+    if let Some(ctx) = hardcoded_context_window(model) {
+        if !out.contains(&ctx) {
+            out.push(ctx);
+        }
+    }
+    if let Some(ctx) = extra {
+        if !out.contains(&ctx) {
+            out.push(ctx);
+        }
+    }
+    out
+}
+
+/// After a model is selected, determine and persist its context-window size.
+///
+/// Candidates are auto-detected from the models.dev registry and the
+/// hardcoded family catalog (plus an optional caller-supplied source, e.g.
+/// the Copilot catalog). When exactly one candidate exists it is
+/// pre-selected automatically; when several disagree the user picks one;
+/// when none are detected the user is asked to enter a value (blank leaves
+/// runtime auto-detection in place).
+fn prompt_context_window(provider_id: &str, model: &str, extra: Option<i64>) -> Result<()> {
+    let candidates = context_window_candidates(provider_id, model, extra);
+
+    let chosen: Option<i64> = match candidates.len() {
+        // No detection — ask for manual entry (blank = runtime auto-detect).
+        0 => {
+            let input = read_line("Context window size in tokens [blank for runtime auto-detect]: ")
+                .unwrap_or_default();
+            parse_context_length(&input)
+        }
+        // Exactly one candidate — pre-select it silently.
+        1 => {
+            let ctx = candidates[0];
+            println!(
+                "  Context window: {} tokens (auto-detected)",
+                format_context_tokens(ctx)
+            );
+            Some(ctx)
+        }
+        // Multiple candidates disagree — let the user pick.
+        _ => {
+            println!("Multiple context-window sizes detected for this model:");
+            for (i, ctx) in candidates.iter().enumerate() {
+                let marker = if i == 0 { "→" } else { " " };
+                println!("  {} {}. {} tokens", marker, i + 1, format_context_tokens(*ctx));
+            }
+            let manual_idx = candidates.len() + 1;
+            let skip_idx = candidates.len() + 2;
+            println!("  {}. Enter a different value", manual_idx);
+            println!("  {}. Skip (runtime auto-detect)", skip_idx);
+            println!();
+            loop {
+                let val = read_line(&format!("Choice [1-{}] (default 1): ", skip_idx));
+                let val = match val {
+                    None => return Ok(()), // EOF/cancel — leave config unchanged.
+                    Some(s) if s.is_empty() => break Some(candidates[0]),
+                    Some(s) => s,
+                };
+                match val.parse::<usize>() {
+                    Ok(n) if (1..=candidates.len()).contains(&n) => break Some(candidates[n - 1]),
+                    Ok(n) if n == manual_idx => {
+                        let input = read_line("Context window size in tokens: ").unwrap_or_default();
+                        break parse_context_length(&input);
+                    }
+                    Ok(n) if n == skip_idx => break None,
+                    _ => println!("Please enter 1-{}", skip_idx),
+                }
+            }
+        }
+    };
+
+    match chosen {
+        Some(ctx) => {
+            Config::load()?.set_and_save("model.context_length", &ctx.to_string())?;
+        }
+        None => {
+            // No value chosen — clear any stale override so runtime detection
+            // (hardcoded catalog / provider-error fallback) takes over.
+            let _ = Config::load()?.unset("model.context_length");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1652,5 +1798,49 @@ mod tests {
         assert_eq!(auto_provider_name("http://localhost:11434/v1"), "Local (localhost:11434)");
         assert_eq!(auto_provider_name("https://xyz.runpod.io/v1"), "RunPod (xyz.runpod.io)");
         assert_eq!(auto_provider_name("https://api.example.com/v1"), "Api.example.com");
+    }
+
+    #[test]
+    fn format_context_tokens_groups_thousands() {
+        assert_eq!(format_context_tokens(0), "0");
+        assert_eq!(format_context_tokens(999), "999");
+        assert_eq!(format_context_tokens(1_000), "1,000");
+        assert_eq!(format_context_tokens(128_000), "128,000");
+        assert_eq!(format_context_tokens(1_048_576), "1,048,576");
+    }
+
+    #[test]
+    fn parse_context_length_accepts_plain_commas_and_suffixes() {
+        assert_eq!(parse_context_length("128000"), Some(128_000));
+        assert_eq!(parse_context_length("128,000"), Some(128_000));
+        assert_eq!(parse_context_length("128k"), Some(128_000));
+        assert_eq!(parse_context_length("1m"), Some(1_000_000));
+        assert_eq!(parse_context_length("  64000  "), Some(64_000));
+        assert_eq!(parse_context_length("0"), None);
+        assert_eq!(parse_context_length("abc"), None);
+        assert_eq!(parse_context_length(""), None);
+    }
+
+    #[test]
+    fn hardcoded_context_window_matches_known_families() {
+        // Specific Claude entries take precedence over the "claude" catch-all.
+        assert_eq!(hardcoded_context_window("claude-sonnet-4.6"), Some(1_000_000));
+        assert_eq!(hardcoded_context_window("claude-3-haiku"), Some(200_000));
+        assert_eq!(hardcoded_context_window("gpt-5.6-luna"), Some(1_050_000));
+        assert_eq!(hardcoded_context_window("glm-5.2"), Some(1_048_576));
+        // Unknown model → no genuine match (not the 256K fallback).
+        assert_eq!(hardcoded_context_window("totally-unknown-model"), None);
+    }
+
+    #[test]
+    fn context_window_candidates_dedups_preserving_priority() {
+        // extra duplicates a catalog entry → only one kept.
+        let c = context_window_candidates("openrouter", "claude-sonnet-4.6", Some(1_000_000));
+        assert_eq!(c, vec![1_000_000]);
+        // Unknown model + a lone extra → just the extra.
+        let c = context_window_candidates("custom", "no-such-model", Some(64_000));
+        assert_eq!(c, vec![64_000]);
+        // Unknown model, no extra → empty.
+        assert!(context_window_candidates("custom", "no-such-model", None).is_empty());
     }
 }

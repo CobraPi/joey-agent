@@ -12,6 +12,7 @@ pub mod difflib;
 pub mod file_tracker;
 pub mod fuzzy;
 pub mod guards;
+pub mod highlight;
 pub mod lsp;
 pub mod patch_parser;
 pub mod pyjson;

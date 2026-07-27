@@ -463,6 +463,28 @@ fn models_dev_cost(provider: &str, model: &str) -> Option<(f64, f64)> {
     (input > 0.0 || output > 0.0).then_some((input, output))
 }
 
+/// Context-window size (prompt/context token limit) for a model from the
+/// models.dev registry (the `limit.context` field). Mirrors the exact +
+/// case-insensitive model lookup used by [`models_dev_cost`]. Returns None
+/// when the model or its limit is absent/invalid.
+pub fn models_dev_context_window(provider: &str, model: &str) -> Option<i64> {
+    let mdev_id = models_dev_provider_id(provider)?;
+    let data = fetch_models_dev(false);
+    let models = data.get(mdev_id)?.get("models")?.as_object()?;
+    let entry = models.get(model).or_else(|| {
+        let lower = model.to_lowercase();
+        models
+            .iter()
+            .find(|(mid, _)| mid.to_lowercase() == lower)
+            .map(|(_, v)| v)
+    })?;
+    let ctx = entry
+        .get("limit")
+        .and_then(|v| v.get("context"))
+        .and_then(Value::as_i64)?;
+    (ctx > 0).then_some(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // Generic /models endpoint probe (models.py `probe_api_models`)
 // ---------------------------------------------------------------------------

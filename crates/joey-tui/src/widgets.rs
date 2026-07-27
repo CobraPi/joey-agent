@@ -21,6 +21,16 @@ use crate::state::{
 use crate::theme::{gradient_spans, Rgb, Theme};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// Feature 005 (E2 resolution): max diff lines rendered in the TUI before
+/// tail-truncation. Mirrors the CLI `MAX_DIFF_BLOCK_HEIGHT`.
+const MAX_DIFF_LINES: usize = 50;
+/// Feature 005 (T022): max lines in the collapsed reasoning view.
+/// Must match `state::MAX_COLLAPSED_HEIGHT`.
+const MAX_COLLAPSED_LINES: usize = 10;
+/// Feature 005 (T022): max lines in the tail-window reasoning view.
+/// Must match `state::MAX_TAIL_WINDOW_LINES`.
+const MAX_TAIL_WINDOW_LINES_TUI: usize = 200;
+
 /// Helper: build a Block with a gradient title.
 pub fn gradient_block(title: &str, theme: Theme) -> Block<'_> {
     let title_spans = gradient_spans(title, theme);
@@ -220,21 +230,66 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             }
             lines.push(Line::from(vec![Span::raw("")]));
         }
-        TranscriptItem::Reasoning { text } => {
+        TranscriptItem::Reasoning { text, expand_state } => {
+            // Feature 005 (T022): three-state expandable reasoning render.
+            use crate::state::ReasoningExpandState;
+            let all_lines: Vec<&str> = text.lines().collect();
+            let total = all_lines.len();
+            let (shown_lines, affordance): (Vec<String>, Option<String>) = match expand_state {
+                ReasoningExpandState::Collapsed => {
+                    if total <= MAX_COLLAPSED_LINES {
+                        (all_lines.iter().map(|s| s.to_string()).collect(), None)
+                    } else {
+                        let head = &all_lines[..MAX_COLLAPSED_LINES];
+                        (
+                            head.iter().map(|s| s.to_string()).collect(),
+                            Some(format!("… ({} more lines, press to expand)", total - MAX_COLLAPSED_LINES)),
+                        )
+                    }
+                }
+                ReasoningExpandState::TailWindow => {
+                    if total <= MAX_TAIL_WINDOW_LINES_TUI {
+                        (all_lines.iter().map(|s| s.to_string()).collect(), None)
+                    } else {
+                        let tail = &all_lines[total - MAX_TAIL_WINDOW_LINES_TUI..];
+                        (
+                            tail.iter().map(|s| s.to_string()).collect(),
+                            Some(format!("… showing last {} of {} lines", MAX_TAIL_WINDOW_LINES_TUI, total)),
+                        )
+                    }
+                }
+                ReasoningExpandState::Full => {
+                    (all_lines.iter().map(|s| s.to_string()).collect(), None)
+                }
+            };
+            let label = match expand_state {
+                ReasoningExpandState::Collapsed => "┄ reasoning ",
+                ReasoningExpandState::TailWindow => "┄ reasoning (tail) ",
+                ReasoningExpandState::Full => "┄ reasoning (full) ",
+            };
             lines.push(Line::from(vec![Span::styled(
-                "┄ reasoning ",
+                label,
                 Style::default().fg(theme.fg_more_subtle.to_color()),
             )]));
-            for wl in wrap(text, content_w.saturating_sub(2)) {
+            for wl in &shown_lines {
+                let wrapped = wrap(wl, content_w.saturating_sub(2));
+                for w in wrapped {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("  {}", w),
+                        Style::default()
+                            .fg(theme.fg_more_subtle.to_color())
+                            .add_modifier(Modifier::DIM),
+                    )]));
+                }
+            }
+            if let Some(msg) = affordance {
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  {}", wl),
-                    Style::default()
-                        .fg(theme.fg_more_subtle.to_color())
-                        .add_modifier(Modifier::DIM),
+                    format!("  {}", msg),
+                    Style::default().fg(theme.fg_most_subtle.to_color()),
                 )]));
             }
         }
-        TranscriptItem::Tool { name, emoji, summary, status, duration_secs, result_preview } => {
+        TranscriptItem::Tool { name, emoji, summary, status, duration_secs, result_preview, expanded, full_args, full_result } => {
             let (icon, col) = match status {
                 ToolStatus::Running => ("⟳", theme.busy),
                 ToolStatus::Done => ("✓", theme.success),
@@ -243,6 +298,7 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             let dur_str = duration_secs
                 .map(|d| format!("  {:.1}s", d))
                 .unwrap_or_default();
+            let expand_hint = if *expanded { "▾" } else { "▸" };
             let mut spans = vec![
                 Span::styled(
                     format!("  {} ", icon),
@@ -258,7 +314,7 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                 ),
             ];
             if !summary.is_empty() {
-                let s = one_line(summary, content_w.saturating_sub(name.len() + 10));
+                let s = one_line(summary, content_w.saturating_sub(name.len() + 12));
                 spans.push(Span::styled(
                     format!(" {}", s),
                     Style::default().fg(theme.fg_most_subtle.to_color()),
@@ -268,8 +324,13 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                 dur_str,
                 Style::default().fg(theme.fg_more_subtle.to_color()),
             ));
+            // Feature 005 (T029): expand affordance indicator.
+            spans.push(Span::styled(
+                format!("  {}", expand_hint),
+                Style::default().fg(theme.fg_most_subtle.to_color()),
+            ));
             lines.push(Line::from(spans));
-            if !result_preview.is_empty() && !matches!(status, ToolStatus::Running) {
+            if !result_preview.is_empty() && !matches!(status, ToolStatus::Running) && !*expanded {
                 let preview = one_line(result_preview, 100);
                 let col = if matches!(status, ToolStatus::Failed) {
                     theme.error
@@ -280,6 +341,99 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     format!("    └ {}", preview),
                     Style::default().fg(col.to_color()),
                 )]));
+            }
+            // Feature 005 (T029): expanded view — full args + full result.
+            if *expanded {
+                if let Some(args) = full_args {
+                    if !args.is_empty() {
+                        lines.push(Line::from(vec![Span::styled(
+                            "    args:".to_string(),
+                            Style::default().fg(theme.fg_more_subtle.to_color()),
+                        )]));
+                        for arg_line in args.lines() {
+                            lines.push(Line::from(vec![Span::styled(
+                                format!("      {}", arg_line),
+                                Style::default().fg(theme.fg_most_subtle.to_color()),
+                            )]));
+                        }
+                    }
+                }
+                if let Some(result) = full_result {
+                    if !result.is_empty() {
+                        lines.push(Line::from(vec![Span::styled(
+                            "    result:".to_string(),
+                            Style::default().fg(theme.fg_more_subtle.to_color()),
+                        )]));
+                        let result_lines: Vec<&str> = result.lines().collect();
+                        let max_result_lines = 50;
+                        let start = if result_lines.len() > max_result_lines {
+                            result_lines.len() - max_result_lines
+                        } else {
+                            0
+                        };
+                        if start > 0 {
+                            lines.push(Line::from(vec![Span::styled(
+                                format!("      … ({} earlier lines hidden)", start),
+                                Style::default().fg(theme.fg_most_subtle.to_color()),
+                            )]));
+                        }
+                        for rl in &result_lines[start..] {
+                            lines.push(Line::from(vec![Span::styled(
+                                format!("      {}", rl),
+                                Style::default().fg(theme.fg_most_subtle.to_color()),
+                            )]));
+                        }
+                    }
+                }
+            }
+        }
+        TranscriptItem::FileDiff { path, stat, lines: diff_lines, is_binary } => {
+            // Feature 005 (T019): render the inline diff block.
+            // Header: "  ◆ path  +N -M"
+            lines.push(Line::from(vec![
+                Span::styled("  ◆ ", Style::default().fg(theme.fg_subtle.to_color())),
+                Span::styled(
+                    format!("{}  {}", path, stat),
+                    Style::default().fg(theme.fg_subtle.to_color()),
+                ),
+            ]));
+            if *is_binary {
+                // T017 parity: binary placeholder (FR-016).
+                lines.push(Line::from(Span::styled(
+                    "    binary file changed",
+                    Style::default().fg(theme.fg_most_subtle.to_color()),
+                )));
+            } else {
+                // E2 resolution: height-bound the diff block.
+                let max_height = MAX_DIFF_LINES;
+                let start = if diff_lines.len() > max_height {
+                    diff_lines.len() - max_height
+                } else {
+                    0
+                };
+                if start > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("    … ({} earlier lines hidden)", start),
+                        Style::default().fg(theme.fg_most_subtle.to_color()),
+                    )));
+                }
+                for dl in &diff_lines[start..] {
+                    let col = if dl.starts_with("+++") || dl.starts_with("---") {
+                        theme.fg_most_subtle
+                    } else if dl.starts_with("@@") {
+                        theme.info
+                    } else if dl.starts_with('+') {
+                        theme.success
+                    } else if dl.starts_with('-') {
+                        theme.error
+                    } else {
+                        theme.fg_base
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", dl),
+                        Style::default().fg(col.to_color()),
+                    )));
+                }
             }
         }
         TranscriptItem::Notice { text, kind } => {

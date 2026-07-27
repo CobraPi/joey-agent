@@ -11,6 +11,8 @@
 use std::io::Read;
 use std::time::Duration;
 
+use crate::file_tracker::FileTracker;
+
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use serde_json::{json, Map, Value};
@@ -271,6 +273,10 @@ impl Tool for Terminal {
 
         // cwd was computed above (before the background check).
 
+        // Feature 005 (T012): snapshot known-read files before running the
+        // command so we can detect terminal-caused mutations afterward.
+        let pre_snapshot = snapshot_tracked_files();
+
         let (raw_output, returncode, timed_out) =
             run_bash(&command, &cwd, effective_timeout).await;
 
@@ -310,6 +316,11 @@ impl Tool for Terminal {
         };
 
         let exit_note = interpret_exit_code(&command, returncode);
+
+        // Feature 005 (T012): detect files mutated by this terminal command
+        // and record them so the agent turn loop's drain emits FileChange
+        // events with source: Terminal. We compare mtime+hash before/after.
+        detect_terminal_mutations(&pre_snapshot);
 
         let mut result = Map::new();
         result.insert("output".into(), json!(output));
@@ -488,6 +499,71 @@ async fn run_bash(command: &str, cwd: &std::path::Path, timeout_secs: u64) -> (S
         None => -1,
     };
     (output, code, timed_out)
+}
+
+// ── Feature 005: terminal-mutation detection (T012) ──────────────────────
+
+/// Snapshot of a tracked file: its mtime and content hash at snapshot time.
+#[derive(Debug, Clone)]
+struct FileSnapshot {
+    path: String,
+    mtime: Option<std::time::SystemTime>,
+    hash: Option<u64>,
+}
+
+/// Snapshot all files the agent has read this session (per
+/// `FileTracker::read_files()`). Used as the "before" baseline for
+/// detecting terminal-caused mutations.
+fn snapshot_tracked_files() -> Vec<FileSnapshot> {
+    use std::hash::{Hash, Hasher};
+    FileTracker::read_files()
+        .into_iter()
+        .map(|path| {
+            let meta = std::fs::metadata(&path).ok();
+            let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+            let hash = std::fs::read(&path)
+                .ok()
+                .map(|bytes| {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    bytes.hash(&mut h);
+                    h.finish()
+                });
+            FileSnapshot { path, mtime, hash }
+        })
+        .collect()
+}
+
+/// Compare the post-command state of each snapshotted file to its pre-command
+/// snapshot. For any file whose mtime or content hash changed, record it via
+/// `FileTracker::record_external_mutation` so the turn loop's drain emits a
+/// `FileChange { source: Terminal }`.
+fn detect_terminal_mutations(pre: &[FileSnapshot]) {
+    use std::hash::{Hash, Hasher};
+    for snap in pre {
+        let now_meta = std::fs::metadata(&snap.path).ok();
+        let now_mtime = now_meta.as_ref().and_then(|m| m.modified().ok());
+        let now_hash = std::fs::read(&snap.path)
+            .ok()
+            .map(|bytes| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut h);
+                h.finish()
+            });
+        // Changed if mtime differs OR hash differs (hash is authoritative;
+        // mtime is a fast-path skip when unchanged).
+        let mtime_changed = match (snap.mtime, now_mtime) {
+            (Some(a), Some(b)) => a != b,
+            _ => true, // treat missing metadata as "potentially changed"
+        };
+        let hash_changed = match (snap.hash, now_hash) {
+            (Some(a), Some(b)) => a != b,
+            (None, Some(_)) => true, // file gained content
+            _ => false,
+        };
+        if mtime_changed || hash_changed {
+            FileTracker::record_external_mutation(&snap.path);
+        }
+    }
 }
 
 #[cfg(test)]

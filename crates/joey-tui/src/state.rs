@@ -8,7 +8,65 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use joey_agent_core::AgentEvent;
+use joey_agent_core::events::{AgentEvent, FileChangeKind};
+
+/// Feature 005 (T021): the three-state expand cycle for reasoning blocks.
+///
+/// Collapsed → TailWindow → Full → Collapsed → …
+///
+/// **Skip rule:** if the reasoning text is short enough to fit in the
+/// collapsed view (≤ `MAX_COLLAPSED_HEIGHT` lines), `TailWindow` and `Full`
+/// would show the exact same content, so the cycle skips directly to the
+/// next distinct state to avoid a redundant no-op press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningExpandState {
+    /// Show only the first `MAX_COLLAPSED_HEIGHT` lines + "… (N more)".
+    Collapsed,
+    /// Show the last `MAX_TAIL_WINDOW_LINES` lines (most recent thinking).
+    TailWindow,
+    /// Show the full reasoning text, no truncation.
+    Full,
+}
+
+/// Feature 005 (T021): max lines shown in the collapsed reasoning view.
+const MAX_COLLAPSED_HEIGHT: usize = 10;
+/// Feature 005 (T021): max lines shown in the tail-window (expanded) view.
+const MAX_TAIL_WINDOW_LINES: usize = 200;
+
+impl ReasoningExpandState {
+    /// Advance to the next state in the cycle, applying the skip rule.
+    ///
+    /// `total_lines` is the number of lines in the reasoning text, used to
+    /// decide whether a state would be redundant.
+    pub fn cycle(self, total_lines: usize) -> Self {
+        use ReasoningExpandState::*;
+        let fits_collapsed = total_lines <= MAX_COLLAPSED_HEIGHT;
+        let fits_tail = total_lines <= MAX_TAIL_WINDOW_LINES;
+        match self {
+            Collapsed => {
+                if fits_collapsed {
+                    // Collapsed already shows everything; skip to Full.
+                    if fits_tail {
+                        Full
+                    } else {
+                        TailWindow
+                    }
+                } else {
+                    TailWindow
+                }
+            }
+            TailWindow => {
+                if fits_tail {
+                    // TailWindow == Full; skip to Collapsed.
+                    Collapsed
+                } else {
+                    Full
+                }
+            }
+            Full => Collapsed,
+        }
+    }
+}
 
 /// One entry in the conversation transcript.
 #[derive(Clone, Debug)]
@@ -16,8 +74,16 @@ pub enum TranscriptItem {
     User { text: String },
     Assistant { text: String },
     /// A complete reasoning block shown in a dimmed/collapsed style.
-    Reasoning { text: String },
+    /// Feature 005 (T021): carries a per-item expand state.
+    Reasoning {
+        text: String,
+        /// Per-item expand state for the three-state cycle
+        /// (collapsed → tail-window → full → collapsed). See
+        /// `contracts/expandable.md`.
+        expand_state: ReasoningExpandState,
+    },
     /// A tool call rendered inline with its result.
+    /// Feature 005 (T026): carries `expanded` toggle + full args/result.
     Tool {
         name: String,
         emoji: String,
@@ -25,6 +91,22 @@ pub enum TranscriptItem {
         status: ToolStatus,
         duration_secs: Option<f64>,
         result_preview: String,
+        /// Feature 005 (T026): per-item expand toggle for the full view.
+        expanded: bool,
+        /// Feature 005 (T026): full arguments JSON for the expanded view.
+        full_args: Option<String>,
+        /// Feature 005 (T026): full result text for the expanded view.
+        full_result: Option<String>,
+    },
+    /// Feature 005 (T018): an inline file-change diff block. Pushed when an
+    /// `AgentEvent::FileChange` arrives, rendered as a path header + stat +
+    /// colored diff lines (T019). See `data-model.md` RenderedDiffBlock.
+    FileDiff {
+        path: String,
+        stat: String,
+        /// Pre-split diff lines (including `+`/`-`/` ` markers).
+        lines: Vec<String>,
+        is_binary: bool,
     },
     /// A system notice / status line.
     Notice { text: String, kind: NoticeKind },
@@ -272,9 +354,41 @@ impl App {
         if self.reasoning_open {
             let text = std::mem::take(&mut self.streaming_reasoning);
             if !text.is_empty() {
-                self.push_item(TranscriptItem::Reasoning { text });
+                self.push_item(TranscriptItem::Reasoning {
+                    text,
+                    expand_state: ReasoningExpandState::Collapsed,
+                });
             }
             self.reasoning_open = false;
+        }
+    }
+
+    /// Feature 005 (T021/T023): advance the most-recent reasoning block's
+    /// expand state to the next step in the three-state cycle.
+    ///
+    /// The TUI uses scroll-based navigation (no per-item cursor), so this
+    /// targets the last `Reasoning` item in the transcript — matching crush's
+    /// behavior of expanding the most recent thinking block first.
+    pub fn cycle_focused_reasoning_expand(&mut self) {
+        // Find the last Reasoning item in the transcript.
+        for i in (0..self.transcript.len()).rev() {
+            if let TranscriptItem::Reasoning { text, expand_state } = &mut self.transcript[i] {
+                let total_lines = text.lines().count();
+                *expand_state = expand_state.cycle(total_lines);
+                return;
+            }
+        }
+    }
+
+    /// Feature 005 (T026/T028): toggle the most-recent tool call's `expanded`
+    /// field. Targets the last completed `Tool` item (FR-018: per-item
+    /// isolation — only one item is affected).
+    pub fn toggle_focused_tool_expand(&mut self) {
+        for i in (0..self.transcript.len()).rev() {
+            if let TranscriptItem::Tool { expanded, .. } = &mut self.transcript[i] {
+                *expanded = !*expanded;
+                return;
+            }
         }
     }
 
@@ -403,6 +517,9 @@ impl App {
                     status: ToolStatus::Running,
                     duration_secs: None,
                     result_preview: String::new(),
+                    expanded: false,
+                    full_args: None,
+                    full_result: None,
                 });
             }
             AgentEvent::ToolProgress { name, progress } => {
@@ -621,6 +738,27 @@ impl App {
                     kind: NoticeKind::Info,
                 });
             }
+            // Feature 005 (T018): build a FileDiff transcript item from the
+            // FileChange event. Rendering happens in widgets.rs (T019).
+            AgentEvent::FileChange { path, kind, diff, is_binary, .. } => {
+                let label = match kind {
+                    FileChangeKind::Create => " (new file)",
+                    FileChangeKind::Delete => " (deleted)",
+                    FileChangeKind::Edit => "",
+                };
+                let stat = format!("{}{}", diff.stat_line(), label);
+                let lines: Vec<String> = if is_binary {
+                    Vec::new()
+                } else {
+                    diff.diff.lines().map(|l| l.to_string()).collect()
+                };
+                self.push_item(TranscriptItem::FileDiff {
+                    path,
+                    stat,
+                    lines,
+                    is_binary,
+                });
+            }
             AgentEvent::Done { final_text, usage: _, iterations } => {
                 // Tokens were already counted per ApiCallEnd; only the
                 // iteration count is new information here.
@@ -785,12 +923,24 @@ fn transcript_item_text(item: &TranscriptItem) -> String {
     match item {
         TranscriptItem::User { text } => format!("user: {}", text),
         TranscriptItem::Assistant { text } => text.clone(),
-        TranscriptItem::Reasoning { text } => text.clone(),
-        TranscriptItem::Tool { name, summary, result_preview, .. } => {
-            format!("{} {} {}", name, summary, result_preview)
+        TranscriptItem::Reasoning { text, .. } => text.clone(),
+        TranscriptItem::Tool { name, summary, result_preview, full_args, full_result, .. } => {
+            let mut s = format!("{} {} {}", name, summary, result_preview);
+            if let Some(a) = full_args {
+                s.push(' ');
+                s.push_str(a);
+            }
+            if let Some(r) = full_result {
+                s.push(' ');
+                s.push_str(r);
+            }
+            s
         }
         TranscriptItem::Notice { text, .. } => text.clone(),
         TranscriptItem::Error { text } => text.clone(),
+        TranscriptItem::FileDiff { path, stat, lines, .. } => {
+            format!("{} {} {}", path, stat, lines.join(" "))
+        }
     }
 }
 
@@ -1032,5 +1182,122 @@ mod tests {
             "title references the category"
         );
         assert_eq!(entry.tool_call_count, 0);
+    }
+
+    // ── Feature 005 tests (T021a) ─────────────────────────────────────────
+
+    #[test]
+    fn reasoning_expand_cycle_short_text_skips_tail() {
+        // Short text (5 lines, fits collapsed): Collapsed → Full → Collapsed.
+        // TailWindow is skipped because it would show the same content.
+        let text = "line1\nline2\nline3\nline4\nline5";
+        let total = text.lines().count();
+        assert_eq!(total, 5);
+
+        let s = ReasoningExpandState::Collapsed;
+        // Collapsed(5 lines) → should skip TailWindow, go to Full.
+        assert_eq!(s.cycle(total), ReasoningExpandState::Full);
+        // Full → Collapsed.
+        assert_eq!(ReasoningExpandState::Full.cycle(total), ReasoningExpandState::Collapsed);
+    }
+
+    #[test]
+    fn reasoning_expand_cycle_medium_text() {
+        // Medium text (50 lines): doesn't fit collapsed, but fits in tail
+        // window (≤200). Collapsed → TailWindow → Collapsed (Full is skipped
+        // because TailWindow already shows everything).
+        let total = 50;
+        let s = ReasoningExpandState::Collapsed;
+        assert_eq!(s.cycle(total), ReasoningExpandState::TailWindow);
+        assert_eq!(
+            ReasoningExpandState::TailWindow.cycle(total),
+            ReasoningExpandState::Collapsed
+        );
+    }
+
+    #[test]
+    fn reasoning_expand_cycle_long_text_skips_full_from_tail() {
+        // Long text (300 lines): doesn't fit collapsed or tail window.
+        // Collapsed → TailWindow → Full → Collapsed (full cycle, no skips).
+        let total = 300;
+        let s = ReasoningExpandState::Collapsed;
+        assert_eq!(s.cycle(total), ReasoningExpandState::TailWindow);
+        assert_eq!(
+            ReasoningExpandState::TailWindow.cycle(total),
+            ReasoningExpandState::Full
+        );
+        assert_eq!(
+            ReasoningExpandState::Full.cycle(total),
+            ReasoningExpandState::Collapsed
+        );
+    }
+
+    #[test]
+    fn reasoning_expand_cycle_wraps_after_full() {
+        // Verify the cycle wraps for medium text (50 lines, fits tail):
+        // Full → Collapsed → TailWindow → Collapsed → …
+        // (Full → Collapsed because TailWindow and Collapsed are the only
+        //  two distinct states for text that fits in the tail window.)
+        let total = 50;
+        let s = ReasoningExpandState::Full;
+        let s = s.cycle(total); // Full → Collapsed
+        assert_eq!(s, ReasoningExpandState::Collapsed);
+        let s = s.cycle(total); // Collapsed → TailWindow
+        assert_eq!(s, ReasoningExpandState::TailWindow);
+        let s = s.cycle(total); // TailWindow → Collapsed (Full skipped)
+        assert_eq!(s, ReasoningExpandState::Collapsed);
+    }
+
+    // ── Feature 005 tests (T026a) ─────────────────────────────────────────
+
+    #[test]
+    fn tool_expand_toggle_flips_and_isolates() {
+        // FR-018: per-item isolation — toggling one tool doesn't affect others.
+        let mut app = App::new("test", "test-model");
+        // Push two tool items.
+        app.push_item(TranscriptItem::Tool {
+            name: "read_file".to_string(),
+            emoji: "📖".to_string(),
+            summary: "read foo.rs".to_string(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.1),
+            result_preview: "ok".to_string(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+        });
+        app.push_item(TranscriptItem::Tool {
+            name: "write_file".to_string(),
+            emoji: "✏️".to_string(),
+            summary: "write bar.rs".to_string(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.2),
+            result_preview: "ok".to_string(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+        });
+        // Toggle the most-recent (write_file) tool.
+        app.toggle_focused_tool_expand();
+        // The most recent tool should be expanded.
+        let last = app.transcript.back().unwrap();
+        if let TranscriptItem::Tool { expanded, .. } = last {
+            assert!(*expanded, "most-recent tool should be expanded after toggle");
+        } else {
+            panic!("expected Tool item");
+        }
+        // The first tool should still be collapsed (per-item isolation).
+        let first = &app.transcript[0];
+        if let TranscriptItem::Tool { expanded, .. } = first {
+            assert!(!*expanded, "first tool should still be collapsed (FR-018 isolation)");
+        } else {
+            panic!("expected Tool item");
+        }
+        // Toggle again — should collapse.
+        app.toggle_focused_tool_expand();
+        let last = app.transcript.back().unwrap();
+        if let TranscriptItem::Tool { expanded, .. } = last {
+            assert!(!*expanded, "most-recent tool should collapse on second toggle");
+        }
     }
 }

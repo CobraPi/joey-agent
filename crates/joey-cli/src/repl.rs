@@ -71,7 +71,8 @@ pub(crate) struct ReplState {
     last_response: String,
     queued: Vec<String>,
     session_start: Instant,
-    /// Session-scoped filesystem checkpoint manager.
+    /// Filesystem checkpoint manager for this project (backed by a shared
+    /// cross-session git store; see `joey_tools::vcs`).
     checkpoints: Option<joey_tools::vcs::CheckpointManager>,
     /// Last time an automatic checkpoint was taken.
     last_auto_checkpoint: Instant,
@@ -418,6 +419,7 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
             animations_enabled,
             animation_fps: if animation_fps > 0 { animation_fps } else { capability.target_fps.max(12) },
             capability,
+            syntax_highlighting: config.get_bool("display.syntax_highlighting", true),
         }
     };
 
@@ -442,6 +444,12 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
     };
 
     // Initialize session-scoped filesystem checkpoints (fresh every session).
+    // NOTE (004-git-checkpoint-perf / T014): `CheckpointManager::new()` is
+    // cheap by construction — it only resolves the project hash and probes
+    // `git` on PATH, performing no filesystem/store mutation. The shared
+    // store, this project's ref/index, and the first snapshot are only
+    // created lazily inside `checkpoint()` on first use, so this
+    // construction never blocks reaching the interactive prompt.
     {
         let cp = joey_tools::vcs::CheckpointManager::new(&st.session_id, &st.cwd);
         if cp.is_enabled() {

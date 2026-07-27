@@ -1,1 +1,3 @@
-{"feature_directory":"specs/004-claude-code-cli-style"}
+{
+  "feature_directory": "specs/005-expandable-diff-ui"
+}

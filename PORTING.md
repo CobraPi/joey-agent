@@ -107,6 +107,37 @@ it is intended to match upstream exactly.
 - Toolsets with upstream memberships/descriptions (incl. `search`, `safe`,
   `debugging` with includes, `coding`, platform auto-bundles), schema
   sanitizer incl. reactive strippers.
+- Filesystem checkpointing (`vcs.rs`) — port of `tools/checkpoint_manager.py`,
+  **2026-07-24 rewritten (004-git-checkpoint-perf)**: replaced the original
+  per-session shadow-git-repo design (new bare repo + eager full-tree initial
+  commit on every session start) with a single shared bare git store at
+  `~/.joey/checkpoints/store` (JOEY_HOME-aware), matching upstream's v2
+  shared-store architecture. Per-project state (`refs/joey/<hash16>`, a
+  per-project git index, and `store/projects/<hash16>.json` metadata) is
+  keyed by `sha256(canonicalized_abs_path)[:16]`, so git's content-addressable
+  object store deduplicates blobs/trees across every project and session.
+  `CheckpointManager::new()` is now fully lazy — cheap path/hash resolution
+  and a `git`-on-PATH probe only, no filesystem mutation — with store/ref/
+  first-snapshot creation deferred to the first `checkpoint()` call, so the
+  interactive prompt is never blocked on a startup-path scan/add/commit
+  (FR-001/FR-002). Default excludes (build output, dependency dirs, VCS
+  metadata, caches, venvs, media/archives, secrets, logs) are applied via
+  the shared store's `info/exclude` (FR-003). Every git subprocess call is
+  isolated from user global/system git config (`GIT_CONFIG_GLOBAL`/
+  `GIT_CONFIG_SYSTEM=/dev/null`, FR-004) and bounded by a hand-rolled 5-second
+  poll-loop timeout — no new dependency (`git2`) was introduced; still shells
+  out to the `git` binary (FR-005, research.md R1/R5). Retention is enforced
+  opportunistically and throttled (`.last_prune` marker, ≥1h between passes)
+  at the tail of `checkpoint()`: 50 snapshots/project, 2GB total store cap
+  (oldest-checkpoint-across-projects-first eviction), a 90-day stale-project
+  window, and orphan pruning for deleted working directories (FR-007). Old
+  per-session shadow-repo directories from the pre-rewrite design are
+  discarded outright during the same pruning pass — **not migrated**, per
+  the feature's explicit clarification that old per-session data is ephemeral
+  (FR-009). `list()`/`revert()` externally-observable semantics (checkpoint
+  numbering, added/modified/deleted file restoration) are unchanged from the
+  pre-rewrite behavior; only the storage substrate moved. See
+  `specs/004-git-checkpoint-perf/` for the full spec/plan/tasks trail.
 
 **Agent loop (`joey-agent-core`)** — port of `run_agent.py`,
 `agent/conversation_loop.py`, `agent/system_prompt.py`, `agent/prompt_builder.py`:
