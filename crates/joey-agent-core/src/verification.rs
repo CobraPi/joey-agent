@@ -149,6 +149,8 @@ pub fn record_terminal_result(
     let root = find_project_root(cwd);
     let event = classify_verification_command(command, cwd, session_id, exit_code, output, &root)?;
 
+    // SAFETY: LEDGER is an internal Mutex; poisoning only occurs on a
+    // prior panic-while-locked, which is a bug.
     let mut ledger = LEDGER.lock().unwrap();
     let state = ledger.get_or_create(session_id, &root);
     state.last_event = Some(event.clone());
@@ -163,6 +165,8 @@ pub fn record_terminal_result(
 /// Mark that files were edited in the workspace.
 pub fn mark_workspace_edited(session_id: &str, cwd: &str, paths: &[String]) {
     let root = find_project_root(cwd);
+    // SAFETY: LEDGER is an internal Mutex; poisoning only occurs on a
+    // prior panic-while-locked, which is a bug.
     let mut ledger = LEDGER.lock().unwrap();
     let state = ledger.get_or_create(session_id, &root);
 
@@ -185,6 +189,8 @@ pub fn mark_workspace_edited(session_id: &str, cwd: &str, paths: &[String]) {
 /// Query the verification status for a session.
 pub fn verification_status(session_id: &str, cwd: &str) -> VerificationQuery {
     let root = find_project_root(cwd);
+    // SAFETY: LEDGER is an internal Mutex; poisoning only occurs on a
+    // prior panic-while-locked, which is a bug.
     let ledger = LEDGER.lock().unwrap();
     let key = (session_id.to_string(), root.clone());
     match ledger.sessions.get(&key) {
@@ -202,6 +208,8 @@ pub fn verification_status(session_id: &str, cwd: &str) -> VerificationQuery {
             } else if state.changed_paths.is_empty()
                 && state.last_edit_at.is_none()
             {
+                // SAFETY: `last_event.is_none()` was excluded by the
+                // preceding elif branches; guaranteed Some here.
                 match state.last_event.as_ref().unwrap().status {
                     VerificationStatus::Passed => EvidenceStatus::Passed,
                     VerificationStatus::Failed => EvidenceStatus::Failed,
@@ -209,6 +217,8 @@ pub fn verification_status(session_id: &str, cwd: &str) -> VerificationQuery {
             } else {
                 // We have edits and/or a verification event.
                 // Stale = edits happened after the verification.
+                // SAFETY: `last_event.is_none()` was excluded by the
+                // preceding elif branches; guaranteed Some here.
                 match state.last_event.as_ref().unwrap().status {
                     VerificationStatus::Passed => {
                         // If there are pending changed_paths, it's stale.
@@ -233,12 +243,16 @@ pub fn verification_status(session_id: &str, cwd: &str) -> VerificationQuery {
 
 /// Clear state for a session (on session end/reset).
 pub fn clear_session(session_id: &str) {
+    // SAFETY: LEDGER is an internal Mutex; poisoning only occurs on a
+    // prior panic-while-locked, which is a bug.
     let mut ledger = LEDGER.lock().unwrap();
     ledger.sessions.retain(|(sid, _), _| sid != session_id);
 }
 
 /// Clear all state (for tests).
 pub fn clear_all() {
+    // SAFETY: LEDGER is an internal Mutex; poisoning only occurs on a
+    // prior panic-while-locked, which is a bug.
     let mut ledger = LEDGER.lock().unwrap();
     ledger.sessions.clear();
 }
@@ -787,5 +801,107 @@ mod tests {
         let summary = summarize_output(&long);
         assert!(summary.contains("[output truncated"));
         assert!(summary.len() < 5000);
+    }
+
+    // ── FR-006/SC-005 regression tests (hardened sites) ──────────────────
+
+    /// SAFETY site: `LEDGER.lock().unwrap()` in `record_terminal_result`.
+    /// Mutex lock must not panic on normal concurrent-ish use.
+    #[test]
+    fn record_terminal_result_ledger_lock_does_not_panic() {
+        let _g = lock();
+        clear_all();
+        // Multiple records to the same session exercise the lock path.
+        let ev = record_terminal_result("cargo test", "/tmp/proj", "fr006-a", 0, "ok");
+        assert!(ev.is_some());
+        let ev2 = record_terminal_result("cargo test", "/tmp/proj", "fr006-a", 1, "fail");
+        assert!(ev2.is_some());
+        clear_all();
+    }
+
+    /// SAFETY site: `LEDGER.lock().unwrap()` in `mark_workspace_edited`
+    /// plus the `changed_paths[start..]` slice after the 200-item cap.
+    #[test]
+    fn mark_workspace_edited_lock_and_cap_slice_does_not_panic() {
+        let _g = lock();
+        clear_all();
+        // Edge: exactly 200 paths — boundary of the cap slice.
+        let paths: Vec<String> = (0..200).map(|i| format!("src/file_{i}.rs")).collect();
+        mark_workspace_edited("fr006-b", "/tmp/proj", &paths);
+        let q = verification_status("fr006-b", "/tmp/proj");
+        assert_eq!(q.status, EvidenceStatus::Unverified);
+        assert_eq!(q.changed_paths.len(), 200);
+
+        // Edge: 201 paths — exercises `len() - 200` slice start.
+        let paths2: Vec<String> = (0..201).map(|i| format!("src/extra_{i}.rs")).collect();
+        mark_workspace_edited("fr006-c", "/tmp/proj", &paths2);
+        let q2 = verification_status("fr006-c", "/tmp/proj");
+        assert_eq!(q2.changed_paths.len(), 200);
+
+        // Edge: empty paths vec.
+        mark_workspace_edited("fr006-d", "/tmp/proj", &[]);
+        clear_all();
+    }
+
+    /// SAFETY site: `LEDGER.lock().unwrap()` + `last_event.as_ref().unwrap()`
+    /// in `verification_status` — exercises all four EvidenceStatus branches
+    /// that depend on the unwrap'd Option.
+    #[test]
+    fn verification_status_last_event_unwrap_does_not_panic() {
+        let _g = lock();
+        clear_all();
+
+        // Branch 1: no session → NotApplicable (no unwrap reached).
+        let q = verification_status("fr006-e", "/tmp/proj");
+        assert_eq!(q.status, EvidenceStatus::NotApplicable);
+
+        // Branch 2: edits but no verification event → Unverified (no unwrap
+        // on last_event; the is_none() elif catches it).
+        mark_workspace_edited("fr006-e", "/tmp/proj", &["src/a.rs".to_string()]);
+        let q = verification_status("fr006-e", "/tmp/proj");
+        assert_eq!(q.status, EvidenceStatus::Unverified);
+
+        // Branch 3: passed verification, no pending edits → the
+        // `changed_paths.is_empty() && last_edit_at.is_none()` elif that
+        // does `last_event.as_ref().unwrap()`.
+        record_terminal_result("cargo test", "/tmp/proj", "fr006-e", 0, "ok");
+        let q = verification_status("fr006-e", "/tmp/proj");
+        assert_eq!(q.status, EvidenceStatus::Passed);
+
+        // Branch 4: edits after verification → Stale, also hits
+        // `last_event.as_ref().unwrap()` in the else arm.
+        mark_workspace_edited("fr006-e", "/tmp/proj", &["src/b.rs".to_string()]);
+        let q = verification_status("fr006-e", "/tmp/proj");
+        assert_eq!(q.status, EvidenceStatus::Stale);
+
+        // Branch 5: failed verification → the unwrap in the else arm.
+        record_terminal_result("cargo test", "/tmp/proj", "fr006-f", 1, "boom");
+        let q = verification_status("fr006-f", "/tmp/proj");
+        assert_eq!(q.status, EvidenceStatus::Failed);
+
+        clear_all();
+    }
+
+    /// SAFETY site: `LEDGER.lock().unwrap()` in `clear_session`.
+    #[test]
+    fn clear_session_ledger_lock_does_not_panic() {
+        let _g = lock();
+        clear_all();
+        mark_workspace_edited("fr006-g", "/tmp/proj", &["src/x.rs".to_string()]);
+        clear_session("fr006-g");
+        // Clearing a non-existent session is also safe.
+        clear_session("fr006-nonexistent");
+        let q = verification_status("fr006-g", "/tmp/proj");
+        assert_eq!(q.status, EvidenceStatus::NotApplicable);
+        clear_all();
+    }
+
+    /// SAFETY site: `LEDGER.lock().unwrap()` in `clear_all`.
+    #[test]
+    fn clear_all_ledger_lock_does_not_panic() {
+        let _g = lock();
+        mark_workspace_edited("fr006-h", "/tmp/proj", &["src/y.rs".to_string()]);
+        clear_all();
+        clear_all(); // double clear is safe
     }
 }

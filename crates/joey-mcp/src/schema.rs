@@ -71,6 +71,8 @@ fn rewrite_local_refs(node: &Value) -> Value {
                     // Keys of this map are user-facing property names, not
                     // meta-keywords. Preserve them verbatim; recurse only into
                     // each property's schema.
+                    // SAFETY: `value.is_object()` was checked in the if
+                    // condition above; the Option is guaranteed to be Some.
                     let props = value.as_object().expect("checked is_object");
                     let rewritten: Map<String, Value> = props
                         .iter()
@@ -299,5 +301,55 @@ mod tests {
         let schema = json!({"properties": {"a": {"type": "string"}}});
         let out = normalize_mcp_input_schema(Some(&schema));
         assert_eq!(out["type"], json!("object"));
+    }
+
+    // FR-006/SC-005: regression tests for hardened sites in rewrite_local_refs.
+    // The guarded expect at schema.rs:76 (`as_object().expect("checked
+    // is_object")`) is protected by a prior `is_object()` check. These tests
+    // exercise the code path with edge-case properties values to verify no
+    // panic occurs.
+
+    #[test]
+    fn properties_with_object_values_does_not_panic() {
+        // Normal case: properties is an object map of prop_name -> schema.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "number"}
+            }
+        });
+        let out = normalize_mcp_input_schema(Some(&schema));
+        // Properties keys preserved verbatim, each prop_schema recursed.
+        assert!(out["properties"]["name"]["type"] == json!("string"));
+        assert!(out["properties"]["age"]["type"] == json!("number"));
+    }
+
+    #[test]
+    fn pattern_properties_with_object_values_does_not_panic() {
+        let schema = json!({
+            "type": "object",
+            "patternProperties": {
+                "^[a-z]+$": {"type": "string"}
+            }
+        });
+        let out = normalize_mcp_input_schema(Some(&schema));
+        assert!(out["patternProperties"]["^[a-z]+$"]["type"] == json!("string"));
+    }
+
+    #[test]
+    fn definitions_promoted_to_dollar_defs_via_properties_path() {
+        // Exercises the rewrite_local_refs path that includes the guarded
+        // expect: a $ref to #/definitions/X inside a properties schema.
+        let schema = json!({
+            "type": "object",
+            "definitions": {"Foo": {"type": "string"}},
+            "properties": {
+                "foo": {"$ref": "#/definitions/Foo"}
+            }
+        });
+        let out = normalize_mcp_input_schema(Some(&schema));
+        // $ref should be rewritten to #/$defs/Foo
+        assert_eq!(out["properties"]["foo"]["$ref"], json!("#/$defs/Foo"));
     }
 }

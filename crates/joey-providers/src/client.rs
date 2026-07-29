@@ -191,6 +191,8 @@ impl ProviderClient {
         let Some(retry) = retry else {
             return Ok(response);
         };
+        // SAFETY: the retry path that reaches here only runs when
+        // copilot_auth was Some (checked in the retry decision above).
         let auth = self.copilot_auth.as_ref().expect("checked above");
         auth.invalidate();
         let credentials = auth.credentials(&self.http).await?;
@@ -249,6 +251,8 @@ impl ProviderClient {
     fn build_openai_body(&self, req: &ProviderRequest) -> Value {
         let mut body = chat::build_openai_body(&self.profile, &self.base_url, req);
         if req.stream {
+            // SAFETY: `body` comes from `chat::build_openai_body` which
+            // always returns a `Value::Object`.
             let obj = body.as_object_mut().unwrap();
             obj.insert("stream".into(), json!(true));
             // stream_options.include_usage: omit ONLY for native-Gemini
@@ -480,6 +484,7 @@ impl ProviderClient {
             "stream": req.stream,
             "store": false,
         });
+        // SAFETY: `body` is constructed from `json!({ ... })` above.
         let obj = body.as_object_mut().unwrap();
         if let Some(system) = req.system.as_ref().filter(|s| !s.trim().is_empty()) {
             obj.insert("instructions".into(), json!(system));
@@ -690,6 +695,7 @@ impl ProviderClient {
             body["model"] = json!(copilot::normalize_model_id(&req.model));
         }
         if req.stream {
+            // SAFETY: `body` was just built as a json!({...}) object.
             body.as_object_mut()
                 .unwrap()
                 .insert("stream".into(), json!(true));
@@ -1299,6 +1305,8 @@ fn accumulate_tool_calls(
             }
             last_id_at_idx.insert(raw_idx, delta_id.clone());
         }
+        // SAFETY: `active_slot_by_idx` was populated for `raw_idx` during
+        // the first pass through the tool-call accumulation loop.
         let slot = *active_slot_by_idx.get(&raw_idx).unwrap();
         while accum.len() <= slot {
             accum.push(ToolAccum::default());
@@ -1596,5 +1604,72 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("codex_responses")),
             Ok(_) => panic!("xai codex mode should be refused"),
         }
+    }
+
+    #[test]
+    fn parse_sse_delta_malformed_does_not_panic() {
+        // FR-006/SC-005: accumulate_tool_calls (SAFETY comment at client.rs:1308)
+        // processes tool_calls delta objects from SSE events. The unwrap on
+        // active_slot_by_idx is guarded by the entry().or_insert() above.
+        // Feed malformed delta objects to prove no panic.
+
+        // Missing index field (defaults to 0 via unwrap_or).
+        let mut accum = Vec::new();
+        let mut last: std::collections::HashMap<u64, String> = Default::default();
+        let mut active: std::collections::HashMap<u64, usize> = Default::default();
+        accumulate_tool_calls(
+            &mut accum,
+            &[json!({"function": {"name": "f", "arguments": "{}"}})],
+            &mut last,
+            &mut active,
+        );
+
+        // Missing function field entirely.
+        accumulate_tool_calls(
+            &mut accum,
+            &[json!({"index": 0, "id": "x"})],
+            &mut last,
+            &mut active,
+        );
+
+        // Non-object delta (string element in the array).
+        accumulate_tool_calls(
+            &mut accum,
+            &[json!("not an object")],
+            &mut last,
+            &mut active,
+        );
+
+        // Null tool call element.
+        accumulate_tool_calls(
+            &mut accum,
+            &[Value::Null],
+            &mut last,
+            &mut active,
+        );
+
+        // Index as a non-numeric type.
+        accumulate_tool_calls(
+            &mut accum,
+            &[json!({"index": "zero", "function": {"name": "g"}})],
+            &mut last,
+            &mut active,
+        );
+
+        // Large index value.
+        accumulate_tool_calls(
+            &mut accum,
+            &[json!({"index": 999, "id": "big", "function": {"name": "h", "arguments": "{}"}})],
+            &mut last,
+            &mut active,
+        );
+
+        // The function processed all malformed deltas without panicking.
+        // Names at shared slots get overwritten; just verify no panic and
+        // that the finalization produced valid output.
+        let calls = finalize_tool_calls(accum);
+        // Slot 0 was overwritten by "g" (both share raw_idx=0); slot 999 has "h".
+        assert!(calls.iter().any(|c| c.function.name == "h"));
+        assert!(calls.iter().all(|c| !c.function.name.is_empty()));
     }
 }

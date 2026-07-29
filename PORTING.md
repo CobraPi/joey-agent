@@ -276,6 +276,38 @@ prefix resolution, resume by id/title, `joey model` TTY guard + `--refresh`,
 and the Z.AI endpoint probe (live: bogus key probes all four endpoints,
 falls back to the default URL, caches nothing).
 
+## Bug-sweep / panic-hardening pass (feature 006, 2026-07-28)
+
+Audited all `.unwrap()` / `.expect()` / `panic!()` / `unreachable!()` sites
+across the 7 core crates for external-input exposure. Classification:
+
+- **external-input**: file/buffer that touches untrusted data (tool results,
+  MCP JSON-RPC, web content, config files, provider SSE) — must not panic.
+- **safe**: provably-infallible (static regex compilation, post-condition
+  get/get_mut, json! object_mut) — retained with an inline `// SAFETY:` comment.
+- **internal**: internal Mutex `.lock().expect()` — poisoning only occurs on a
+  prior panic-while-locked; retained with SAFETY comments per the constitution.
+
+Result: **0 unhardened external-input sites** across all 7 crates.
+`scripts/audit-external-input-unwraps.sh` (FR-010) confirms PASS (exit 0).
+
+Per-crate summary (external → 0, safe+comment count):
+
+| Crate | Sites hardened | Technique |
+|---|---|---|
+| joey-mcp | 8 | SAFETY comments on static regexes; mutex→unwrap_or_else+warn! on tool provenance |
+| joey-gateway | 0 | Already clean |
+| joey-cron | 7 | SAFETY comments on regex captures + guarded Options |
+| joey-core | 12 | SAFETY comments on mutex locks, static regexes, post-insert get_mut |
+| joey-providers | 9 | SAFETY comments on json! object_mut, guarded auth/slot access |
+| joey-tools | 7 | SAFETY comments on static regexes, unreachable! after is_array check |
+| joey-agent-core | 28 | SAFETY comments on LEDGER mutex, static regexes, last()/last_mut() guards |
+
+No public surface changed: SCHEMA_VERSION=22, no CLI flags, no config keys,
+no trait signatures modified. All changes are additive SAFETY comments and
+the audit script improvements (cfg(test) filtering, standalone test-file
+detection).
+
 ## Deliberate deviations (not oversights)
 
 - **Anthropic OAuth "Claude Code" impersonation is NOT ported.** Upstream,

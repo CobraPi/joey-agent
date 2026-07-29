@@ -166,6 +166,7 @@ static SECRET_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?:sk-ant-[A-Za-z0-9_\-]{8,}|sk-or-[A-Za-z0-9_\-]{8,}|sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{16,})",
     )
+    // SAFETY: provably-safe call on a value constructed or checked in the same scope.
     .unwrap()
 });
 
@@ -195,11 +196,14 @@ fn web_extract_url(value: &Value) -> Option<String> {
 /// Port of `convert_base64_images_to_links`.
 pub fn convert_base64_images_to_links(text: &str) -> String {
     static MD_B64: Lazy<Regex> = Lazy::new(|| {
+        // SAFETY: compile-time constant regex pattern; correctness verified at author time.
         Regex::new(r"!\[(?P<alt>[^\]]*)\]\(\s*data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)").unwrap()
     });
     static PAREN_B64: Lazy<Regex> =
+        // SAFETY: compile-time constant regex pattern; correctness verified at author time.
         Lazy::new(|| Regex::new(r"\(\s*data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)").unwrap());
     static BARE_B64: Lazy<Regex> =
+        // SAFETY: compile-time constant regex pattern; correctness verified at author time.
         Lazy::new(|| Regex::new(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+").unwrap());
 
     let out = MD_B64.replace_all(text, |caps: &regex::Captures| {
@@ -223,6 +227,7 @@ fn store_full_text(url: &str, content: &str) -> Option<String> {
         .and_then(|u| u.host_str().map(|h| h.to_string()))
         .unwrap_or_else(|| "page".to_string())
         .replace(':', "_");
+    // SAFETY: compile-time constant regex pattern; correctness verified at author time.
     static SLUG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^A-Za-z0-9._-]").unwrap());
     let slug_full = SLUG_RE.replace_all(&host, "-").into_owned();
     let slug_cut: String = slug_full.chars().take(60).collect();

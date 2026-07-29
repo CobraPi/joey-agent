@@ -114,6 +114,7 @@ static CHECK_CACHE: Lazy<Mutex<CheckCache>> = Lazy::new(|| Mutex::new(CheckCache
 /// Drop all cached check results — call after config changes that affect
 /// tool availability.
 pub fn invalidate_check_cache() {
+    // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
     let mut cache = CHECK_CACHE.lock().unwrap();
     cache.cached.clear();
     cache.last_good.clear();
@@ -123,6 +124,7 @@ fn check_cached(tool: &dyn Tool, ctx: &ToolContext) -> bool {
     let name = tool.name().to_string();
     let now = Instant::now();
     {
+        // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
         let cache = CHECK_CACHE.lock().unwrap();
         if let Some((ts, value)) = cache.cached.get(&name) {
             if now.duration_since(*ts).as_secs_f64() < CHECK_TTL_SECONDS {
@@ -133,6 +135,7 @@ fn check_cached(tool: &dyn Tool, ctx: &ToolContext) -> bool {
     // Probe outside the lock; panics count as failure.
     let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.check(ctx)))
         .unwrap_or(false);
+    // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
     let mut cache = CHECK_CACHE.lock().unwrap();
     if value {
         cache.last_good.insert(name.clone(), now);
@@ -164,13 +167,17 @@ static TOOL_ERROR_ROLE_TAG_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?i)</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>",
     )
+    // SAFETY: provably-safe call on a value constructed or checked in the same scope.
     .unwrap()
 });
 static TOOL_ERROR_FENCE_OPEN_RE: Lazy<Regex> =
+    // SAFETY: compile-time constant regex pattern; correctness verified at author time.
     Lazy::new(|| Regex::new(r"(?m)^\s*```(?:json|xml|html|markdown)?\s*").unwrap());
 static TOOL_ERROR_FENCE_CLOSE_RE: Lazy<Regex> =
+    // SAFETY: compile-time constant regex pattern; correctness verified at author time.
     Lazy::new(|| Regex::new(r"(?m)\s*```\s*$").unwrap());
 static TOOL_ERROR_CDATA_RE: Lazy<Regex> =
+    // SAFETY: compile-time constant regex pattern; correctness verified at author time.
     Lazy::new(|| Regex::new(r"(?s)<!\[CDATA\[.*?\]\]>").unwrap());
 const TOOL_ERROR_MAX_LEN: usize = 2000;
 

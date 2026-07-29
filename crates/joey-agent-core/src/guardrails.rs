@@ -493,8 +493,7 @@ mod tests {
         for _ in 0..2 {
             let d = ctrl.after_call("read_file", &args, r#"{"error": "not found"}"#);
             // After 2nd failure, count=2, warn_after=2 → warning fires.
-            if d.is_some() {
-                let d = d.unwrap();
+            if let Some(d) = d {
                 assert_eq!(d.action, GuardrailAction::Warn);
                 assert_eq!(d.code, GuardrailCode::RepeatedExactFailureWarning);
                 assert_eq!(d.count, 2);
@@ -504,8 +503,10 @@ mod tests {
 
     #[test]
     fn test_exact_failure_block() {
-        let mut config = GuardrailConfig::default();
-        config.hard_stop_enabled = true;
+        let config = GuardrailConfig {
+            hard_stop_enabled: true,
+            ..Default::default()
+        };
         let mut ctrl = ToolGuardrailController::new(config);
         let args = json!({"path": "/tmp/test.txt"});
 

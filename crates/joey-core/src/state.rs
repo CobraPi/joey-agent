@@ -1274,14 +1274,20 @@ fn retry_jitter_ms() -> u64 {
 pub fn sanitize_fts5_query(query: &str) -> String {
     use once_cell::sync::Lazy;
     static SPECIALS: Lazy<regex::Regex> =
+        // SAFETY: compile-time constant regex pattern; correctness verified at author time.
         Lazy::new(|| regex::Regex::new(r#"[+{}():"^]"#).unwrap());
+    // SAFETY: compile-time constant regex pattern; correctness verified at author time.
     static STARS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"\*+").unwrap());
+    // SAFETY: compile-time constant regex pattern; correctness verified at author time.
     static LEAD_STAR: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(^|\s)\*").unwrap());
     static LEAD_BOOL: Lazy<regex::Regex> =
+        // SAFETY: compile-time constant regex pattern; correctness verified at author time.
         Lazy::new(|| regex::Regex::new(r"(?i)^(AND|OR|NOT)\b\s*").unwrap());
     static TRAIL_BOOL: Lazy<regex::Regex> =
+        // SAFETY: compile-time constant regex pattern; correctness verified at author time.
         Lazy::new(|| regex::Regex::new(r"(?i)\s+(AND|OR|NOT)\s*$").unwrap());
     static DOTTED_TERM: Lazy<regex::Regex> =
+        // SAFETY: compile-time constant regex pattern; correctness verified at author time.
         Lazy::new(|| regex::Regex::new(r"\b(\w+(?:[._-]\w+)+)\b").unwrap());
 
     // Cap user-controlled input before any regex processing.

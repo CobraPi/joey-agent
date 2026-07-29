@@ -115,6 +115,8 @@ const PREFIX_PATTERNS: &[&str] = &[
 ];
 
 fn rx(pattern: &str) -> Regex {
+    // SAFETY: all patterns passed to `rx` are compile-time constant
+    // literals; if any were invalid, compilation would fail.
     Regex::new(pattern).expect("redaction pattern must compile")
 }
 

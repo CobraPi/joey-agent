@@ -52,6 +52,7 @@ const PROVIDER_PREFIXES: &[&str] = &[
 ];
 
 static OLLAMA_TAG_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    // SAFETY: the regex pattern is a compile-time constant literal.
     Regex::new(r"(?i)^(\d+\.?\d*b|latest|stable|q\d|fp?\d|instruct|chat|coder|vision|text)").unwrap()
 });
 
@@ -230,6 +231,7 @@ static CONTEXT_LIMIT_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         r"(\d{4,})\s*(?:max(?:imum)?)\b",
     ]
     .iter()
+    // SAFETY: all patterns in the array are compile-time constant literals.
     .map(|p| Regex::new(p).unwrap())
     .collect()
 });
@@ -286,6 +288,7 @@ pub fn parse_available_output_tokens_from_error(error_msg: &str) -> Option<i64> 
     }
 
     static RANGE_RE: Lazy<Regex> = Lazy::new(|| {
+        // SAFETY: the regex pattern is a compile-time constant literal.
         Regex::new(r"range of max_tokens should be\s*\[\s*\d+\s*,\s*(\d+)\s*\]").unwrap()
     });
     if let Some(c) = RANGE_RE.captures(&e).and_then(|c| c.get(1)) {
@@ -303,6 +306,7 @@ pub fn parse_available_output_tokens_from_error(error_msg: &str) -> Option<i64> 
             r"=\s*(\d+)\s*$",
         ]
         .iter()
+        // SAFETY: all patterns in the array are compile-time constant literals.
         .map(|p| Regex::new(p).unwrap())
         .collect()
     });
@@ -316,8 +320,10 @@ pub fn parse_available_output_tokens_from_error(error_msg: &str) -> Option<i64> 
         }
     }
 
+    // SAFETY: the regex pattern is a compile-time constant literal.
     static CTX_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"maximum context length is (\d+)").unwrap());
     static PARTS_RE: Lazy<Regex> = Lazy::new(|| {
+        // SAFETY: the regex pattern is a compile-time constant literal.
         Regex::new(r"\((\d+)\s+of text input,\s*(\d+)\s+of tool input,\s*(\d+)\s+in the output\)")
             .unwrap()
     });
@@ -331,8 +337,10 @@ pub fn parse_available_output_tokens_from_error(error_msg: &str) -> Option<i64> 
         }
     }
 
+    // SAFETY: the regex pattern is a compile-time constant literal.
     static CTX_TOK_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"maximum context length is (\d+)\s*token").unwrap());
+    // SAFETY: the regex pattern is a compile-time constant literal.
     static CHARS_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"prompt contains (\d+)\s*character").unwrap());
     if let (Some(ctx), Some(chars)) = (CTX_TOK_RE.captures(&e), CHARS_RE.captures(&e)) {
@@ -345,6 +353,7 @@ pub fn parse_available_output_tokens_from_error(error_msg: &str) -> Option<i64> 
         }
     }
 
+    // SAFETY: the regex pattern is a compile-time constant literal.
     static VLLM_INPUT_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"prompt contains (?:at least )?(\d+)\s*input tokens").unwrap());
     if let (Some(ctx), Some(input)) = (CTX_TOK_RE.captures(&e), VLLM_INPUT_RE.captures(&e)) {

@@ -103,6 +103,8 @@ pub fn insert_real_user_anchor(messages: &mut Vec<Message>, anchor: Message) {
         messages.push(anchor);
         return;
     }
+    // SAFETY: `messages` was pushed to above (or returned early);
+    // guaranteed non-empty here.
     let last = messages.last().unwrap();
     if super::compressor::ContextCompressor::is_context_summary_content(&message_text(last)) {
         // Never merge into a compaction summary: the summary prefix must stay
@@ -112,6 +114,8 @@ pub fn insert_real_user_anchor(messages: &mut Vec<Message>, anchor: Message) {
     }
     // Trailing user-role scaffolding (e.g. the todo snapshot): merge instead
     // of inserting a consecutive same-role message (#55677).
+    // SAFETY: `messages` is non-empty (checked above);
+    // `last_mut()` is guaranteed Some.
     let last = messages.last_mut().unwrap();
     merge_anchor_into_user_message(last, &anchor);
 }
@@ -132,4 +136,98 @@ pub fn ensure_compressed_has_user_turn(original_messages: &[Message], compressed
         "Continue from the compressed conversation context above. \
 This marker exists because no human user turn was available.",
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── FR-006/SC-005 regression tests (hardened sites) ──────────────────
+
+    /// SAFETY sites (anchors.rs:106-119): `messages.last().unwrap()` and
+    /// `messages.last_mut().unwrap()`.
+    ///
+    /// The guarded path is reached only when `messages` ends with a
+    /// user-role turn (otherwise the anchor is appended/inserted before
+    /// the unwrap). This test constructs exactly that input: a trailing
+    /// synthetic user message that is NOT a compaction summary, forcing
+    /// the code through both `.last().unwrap()` and `.last_mut().unwrap()`.
+    #[test]
+    fn insert_real_user_anchor_trailing_user_last_unwrap_does_not_panic() {
+        let mut messages = vec![
+            Message::assistant("I will help you."),
+            // Trailing user message — triggers the `ends_with_user` branch,
+            // which then does `.last().unwrap()` and `.last_mut().unwrap()`.
+            Message::user("[System: The previous response was cut off. Please continue.]"),
+        ];
+        // Mark synthetic so `is_real_user_message` returns false for the
+        // trailing message but the text is not a compaction summary either.
+        messages[1].synthetic = true;
+
+        let anchor = Message::user("What is 2+2?");
+        insert_real_user_anchor(&mut messages, anchor);
+
+        // The anchor should have been merged into the trailing user message
+        // (merge path) or pushed — either way, no panic.
+        assert!(!messages.is_empty());
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, "user");
+    }
+
+    /// SAFETY site: `messages.last().unwrap()` when the trailing user
+    /// message IS a context-compaction summary — the code takes the early
+    /// return (push) after calling `.last().unwrap()`.
+    #[test]
+    fn insert_real_user_anchor_summary_last_unwrap_does_not_panic() {
+        let summary_text = format!(
+            "{}\n## Goal\nsummary body\n{}",
+            super::super::compressor::SUMMARY_PREFIX.as_str(),
+            super::super::compressor::SUMMARY_END_MARKER,
+        );
+        let mut messages = vec![
+            Message::assistant("working..."),
+            // Trailing user message that IS a compaction summary.
+            Message::user(summary_text),
+        ];
+        messages[1].synthetic = true;
+
+        let anchor = Message::user("Continue with the task.");
+        insert_real_user_anchor(&mut messages, anchor);
+
+        // The anchor is pushed (not merged into a summary).
+        assert!(messages.len() >= 2);
+    }
+
+    /// Edge: empty messages vec — exercises the "no assistant" + "empty"
+    /// path where `.last()` returns None (handled by `unwrap_or(false)`).
+    #[test]
+    fn insert_real_user_anchor_empty_messages_does_not_panic() {
+        let mut messages: Vec<Message> = vec![];
+        let anchor = Message::user("Hello");
+        insert_real_user_anchor(&mut messages, anchor);
+        assert_eq!(messages.len(), 1);
+    }
+
+    /// `ensure_compressed_has_user_turn` when compressed has no real user
+    /// messages and original has none either — pushes a synthetic marker.
+    #[test]
+    fn ensure_compressed_has_user_turn_no_real_user_does_not_panic() {
+        let original = vec![Message::assistant("I did things.")];
+        let mut compressed = vec![Message::assistant("summary content")];
+        ensure_compressed_has_user_turn(&original, &mut compressed);
+        assert!(compressed.len() >= 2);
+    }
+
+    /// `ensure_compressed_has_user_turn` when compressed already has a
+    /// real user message — early return, no modification.
+    #[test]
+    fn ensure_compressed_has_user_turn_already_has_user_does_not_panic() {
+        let original = vec![Message::user("original question")];
+        let mut compressed = vec![
+            Message::assistant("summary"),
+            Message::user("real question"),
+        ];
+        ensure_compressed_has_user_turn(&original, &mut compressed);
+        assert_eq!(compressed.len(), 2);
+    }
 }

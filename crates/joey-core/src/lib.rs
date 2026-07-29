@@ -86,6 +86,8 @@ pub fn ensure_home() -> anyhow::Result<std::path::PathBuf> {
     let home = joey_home();
 
     {
+        // SAFETY: HOME_ENSURED is an internal Mutex; poisoning only occurs if
+        // a thread panics while holding it, which is a bug, not external input.
         let ensured = HOME_ENSURED.lock().expect("home ensured lock");
         if ensured.contains(&home) && home.is_dir() {
             return Ok(home);
@@ -130,6 +132,8 @@ pub fn ensure_home() -> anyhow::Result<std::path::PathBuf> {
 
     HOME_ENSURED
         .lock()
+        // SAFETY: HOME_ENSURED is an internal Mutex; poisoning only occurs if
+        // a thread panics while holding it, which is a bug, not external input.
         .expect("home ensured lock")
         .insert(home.clone());
     Ok(home)

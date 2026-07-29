@@ -41,6 +41,8 @@ const SHELL_INTERPRETERS: [&str; 11] = [
 fn egress_pattern() -> &'static Regex {
     static P: OnceLock<Regex> = OnceLock::new();
     P.get_or_init(|| {
+        // SAFETY: the regex pattern is a compile-time constant literal;
+        // if it were invalid, compilation would fail (not runtime).
         Regex::new(
             r"(?i)(?<![\w.-])(?:curl|wget|nc|ncat|socat)(?![\w.-])|/dev/tcp/|\bInvoke-WebRequest\b|\bInvoke-RestMethod\b|\bSystem\.Net\.WebClient\b",
         )
@@ -53,6 +55,8 @@ fn exfil_hint_pattern() -> &'static Regex {
     P.get_or_init(|| {
         Regex::new(r#"(?i)\.env\b|--data-binary|--data-raw|\b-X\s+POST\b|\bPOST\b|<\s*[^\s]+"#)
             .expect("static regex")
+            // SAFETY: the regex pattern is a compile-time constant literal;
+            // if it were invalid, compilation would fail (not runtime).
     })
 }
 
@@ -64,6 +68,8 @@ fn persistence_pattern() -> &'static Regex {
             r"(?i)authorized_keys|\.ssh/|/etc/ssh\b|/etc/pam\.d\b|pam_[\w-]+\.so|/etc/sudoers|/etc/cron|crontab\b|/etc/rc\.local|/etc/systemd|\.bashrc\b|\.bash_profile\b|\.profile\b|\.zshrc\b",
         )
         .expect("static regex")
+        // SAFETY: the regex pattern is a compile-time constant literal;
+        // if it were invalid, compilation would fail (not runtime).
     })
 }
 

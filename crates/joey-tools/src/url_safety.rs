@@ -37,6 +37,7 @@ fn always_blocked(ip: &IpAddr) -> bool {
                 return always_blocked_v4(mapped);
             }
             // fd00:ec2::254 — AWS metadata (IPv6).
+            // SAFETY: provably-safe call on a value constructed or checked in the same scope.
             *v6 == "fd00:ec2::254".parse::<Ipv6Addr>().unwrap()
         }
     }

@@ -739,9 +739,11 @@ fn v4a_header_paths(patch: &str) -> Result<Vec<String>, String> {
     use once_cell::sync::Lazy;
     use regex::Regex;
     static FILE_RE: Lazy<Regex> = Lazy::new(|| {
+        // SAFETY: the regex pattern is a compile-time constant literal.
         Regex::new(r"(?m)^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$").unwrap()
     });
     static MOVE_RE: Lazy<Regex> =
+        // SAFETY: the regex pattern is a compile-time constant literal.
         Lazy::new(|| Regex::new(r"(?m)^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$").unwrap());
     let reject = |p: &str| -> Option<String> {
         if guards::has_traversal_component(p) {
@@ -1644,6 +1646,7 @@ fn split_tool_diagnostics(output: &str) -> (String, String) {
     use once_cell::sync::Lazy;
     use regex::Regex;
     static SEARCH_OUTPUT_RE: Lazy<Regex> =
+        // SAFETY: the regex pattern is a compile-time constant literal.
         Lazy::new(|| Regex::new(r"^(?:[A-Za-z]:)?[^\s:][^\n]*?[:\-]\d|^[^\s:][^\s]*$").unwrap());
     let mut diagnostics: Vec<&str> = Vec::new();
     let mut payload: Vec<&str> = Vec::new();
@@ -1668,6 +1671,7 @@ fn split_tool_diagnostics(output: &str) -> (String, String) {
 fn parse_search_context_line(line: &str) -> Option<(String, u64, String)> {
     use once_cell::sync::Lazy;
     use regex::Regex;
+    // SAFETY: the regex pattern is a compile-time constant literal.
     static CTX_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"-(\d+)-").unwrap());
     if line.is_empty() || line == "--" {
         return None;
@@ -1894,6 +1898,7 @@ async fn search_with_rg(
     use once_cell::sync::Lazy;
     use regex::Regex;
     static MATCH_RE: Lazy<Regex> =
+        // SAFETY: the regex pattern is a compile-time constant literal.
         Lazy::new(|| Regex::new(r"^([A-Za-z]:)?(.*?):(\d+):(.*)$").unwrap());
     let mut matches: Vec<SearchMatch> = Vec::new();
     for line in stdout.trim().split('\n') {
@@ -2345,5 +2350,68 @@ mod tests {
         );
         assert!(v["error"].as_str().unwrap().starts_with("Path not found: "));
         assert_eq!(v["total_count"], 0);
+    }
+
+    // ── FR-006/SC-005 regression tests ──────────────────────────────
+
+    #[test]
+    fn v4a_header_paths_malformed_input_does_not_panic() {
+        // Empty string.
+        let _ = v4a_header_paths("");
+        // Garbage with no recognizable headers.
+        let _ = v4a_header_paths("random text\nmore random text");
+        // Null bytes.
+        let _ = v4a_header_paths("*** Update File: \u{0000}null\u{0000}\n");
+        // Very long single line.
+        let long = format!("*** Update File: {}\n", "x".repeat(100_000));
+        let _ = v4a_header_paths(&long);
+        // Truncated header (no path after colon).
+        let _ = v4a_header_paths("*** Update File: \n*** Add File:\n*** Delete File:");
+        // Move file with malformed arrow.
+        let _ = v4a_header_paths("*** Move File: src\n*** Move File: a -> -> b\n");
+        // Path traversal attempts (should error, not panic).
+        let _ = v4a_header_paths("*** Update File: ../../../etc/passwd\n");
+        // Mixed valid + invalid.
+        let _ = v4a_header_paths("*** Update File: valid.txt\n*** Move File: a -> b\ngarbage\n");
+    }
+
+    #[test]
+    fn split_tool_diagnostics_malformed_input_does_not_panic() {
+        // Empty string.
+        let (d, p) = split_tool_diagnostics("");
+        assert!(d.is_empty());
+        assert!(p.is_empty());
+        // Null bytes.
+        let _ = split_tool_diagnostics("\u{0000}\u{0001}\u{0002}");
+        // Very long line with no match pattern.
+        let long = "x".repeat(100_000);
+        let _ = split_tool_diagnostics(&long);
+        // Mixed rg/grep diagnostics with payload.
+        let _ = split_tool_diagnostics("rg: error here\nsrc/main.rs:10:match\n--\ngrep: warning");
+        // Lines that look like Windows paths.
+        let _ = split_tool_diagnostics("C:\\Users\\test\\file.rs:42:content");
+        // Only whitespace lines.
+        let _ = split_tool_diagnostics("   \n\t\n  ");
+    }
+
+    #[test]
+    fn parse_search_context_line_malformed_input_does_not_panic() {
+        // Empty string.
+        assert!(parse_search_context_line("").is_none());
+        // Just dashes.
+        assert!(parse_search_context_line("--").is_none());
+        // No number pattern at all.
+        assert!(parse_search_context_line("path/without/numbers").is_none());
+        // Null bytes.
+        let _ = parse_search_context_line("\u{0000}-42-\u{0000}");
+        // Path with embedded number.
+        let r = parse_search_context_line("src/main-100-some content");
+        assert!(r.is_some());
+        // Very long line.
+        let long = format!("file-999-{}", "x".repeat(100_000));
+        let _ = parse_search_context_line(&long);
+        // Multiple number patterns (should take last).
+        let r = parse_search_context_line("path-1-foo-2-bar");
+        assert!(r.is_some());
     }
 }

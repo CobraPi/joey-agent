@@ -45,13 +45,16 @@ impl Formatter for PyFormatter {
 pub fn dumps(value: &Value) -> String {
     let mut out = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut out, PyFormatter);
+    // SAFETY: serde_json serialization of in-memory Value types cannot fail.
     serde::Serialize::serialize(value, &mut ser).expect("JSON serialization cannot fail");
+    // SAFETY: serde_json serialization of in-memory Value types cannot fail.
     String::from_utf8(out).expect("serde_json emits UTF-8")
 }
 
 /// `json.dumps(value, indent=2, ensure_ascii=False)` equivalent — serde_json's
 /// pretty printer matches Python's `indent=2` layout exactly.
 pub fn dumps_indent2(value: &Value) -> String {
+    // SAFETY: serde_json serialization of in-memory Value types cannot fail.
     serde_json::to_string_pretty(value).expect("JSON serialization cannot fail")
 }
 

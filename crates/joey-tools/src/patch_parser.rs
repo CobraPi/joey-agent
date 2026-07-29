@@ -58,11 +58,16 @@ pub struct V4aResult {
     pub error: Option<String>,
 }
 
+// SAFETY: compile-time constant regex pattern; correctness verified at author time.
 static UPDATE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\*\*\*\s*Update\s+File:\s*(.+)").unwrap());
+// SAFETY: compile-time constant regex pattern; correctness verified at author time.
 static ADD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\*\*\*\s*Add\s+File:\s*(.+)").unwrap());
+// SAFETY: compile-time constant regex pattern; correctness verified at author time.
 static DELETE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\*\*\*\s*Delete\s+File:\s*(.+)").unwrap());
 static MOVE_RE: Lazy<Regex> =
+    // SAFETY: compile-time constant regex pattern; correctness verified at author time.
     Lazy::new(|| Regex::new(r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)").unwrap());
+// SAFETY: compile-time constant regex pattern; correctness verified at author time.
 static HINT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^@@\s*(.+?)\s*@@").unwrap());
 
 /// Port of `parse_v4a_patch`.
@@ -564,6 +569,7 @@ fn apply_update(op: &PatchOperation, file_ops: &dyn V4aFileOps) -> Result<String
                         hint, occurrences
                     ));
                 } else {
+                    // SAFETY: provably-safe call on a value constructed or checked in the same scope.
                     let hint_pos = new_content.find(hint.as_str()).unwrap();
                     match new_content[hint_pos..].find('\n') {
                         Some(rel_eol) => {

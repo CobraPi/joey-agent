@@ -321,30 +321,39 @@ pub fn resolve_profile(provider_setting: &str, base_url: &str, model: &str) -> P
     // Detect from base_url hostname.
     let host = joey_core::utils::base_url_hostname(base_url);
     if host.contains("openrouter.ai") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("openrouter").unwrap();
     }
     if host.contains("api.anthropic.com") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("anthropic").unwrap();
     }
     if host.contains("api.openai.com") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("openai-api").unwrap();
     }
     if host == "api.githubcopilot.com" || host.ends_with(".githubcopilot.com") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("copilot").unwrap();
     }
     if host.contains("nousresearch.com") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("nous").unwrap();
     }
     if host.contains("x.ai") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("xai").unwrap();
     }
     if host.contains("z.ai") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("zai").unwrap();
     }
     if host.contains("deepseek.com") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("deepseek").unwrap();
     }
     if host.contains("googleapis.com") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("gemini").unwrap();
     }
 
@@ -352,6 +361,7 @@ pub fn resolve_profile(provider_setting: &str, base_url: &str, model: &str) -> P
     if let Some((prefix, _)) = model.split_once('/') {
         if KNOWN_PREFIXES.contains(&prefix) {
             if prefix == "google" {
+                // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
                 return get_profile("gemini").unwrap();
             }
             if let Some(p) = get_profile(prefix) {
@@ -360,6 +370,7 @@ pub fn resolve_profile(provider_setting: &str, base_url: &str, model: &str) -> P
         }
     }
     if model.starts_with("claude-") && host.contains("anthropic") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("anthropic").unwrap();
     }
 
@@ -372,26 +383,33 @@ pub fn resolve_profile(provider_setting: &str, base_url: &str, model: &str) -> P
     // prefixes that ModelFamily::detect knows about.
     let lower = model.to_ascii_lowercase();
     if lower.starts_with("glm-") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("zai").unwrap();
     }
     if lower.starts_with("claude-") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("anthropic").unwrap();
     }
     if lower.starts_with("gpt-") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("openai-api").unwrap();
     }
     if lower.starts_with("gemini-") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("gemini").unwrap();
     }
     if lower.starts_with("deepseek-") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("deepseek").unwrap();
     }
     if lower.starts_with("grok-") {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("xai").unwrap();
     }
 
     // Fall back to OpenRouter (the aggregator default) — many custom
     // OpenAI-compatible endpoints land here with a base_url override.
+    // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
     get_profile("openrouter").unwrap()
 }
 

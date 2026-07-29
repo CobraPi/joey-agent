@@ -118,6 +118,7 @@ fn interpret_exit_code(command: &str, exit_code: i64) -> Option<&'static str> {
         return None;
     }
     static SPLIT_RE: Lazy<regex::Regex> =
+        // SAFETY: compile-time constant regex pattern; correctness verified at author time.
         Lazy::new(|| regex::Regex::new(r"\s*(?:\|\||&&|[|;])\s*").unwrap());
     let segments: Vec<&str> = SPLIT_RE.split(command).collect();
     let last_segment = segments.last().copied().unwrap_or(command).trim();

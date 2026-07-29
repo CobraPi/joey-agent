@@ -400,6 +400,7 @@ fn strategy_line_trimmed(content: &str, pattern: &str) -> Matches {
     find_normalized_matches(content, &content_lines, &content_normalized_lines, &pattern_normalized)
 }
 
+// SAFETY: compile-time constant regex pattern; correctness verified at author time.
 static WS_RUN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[ \t]+").unwrap());
 
 fn strategy_whitespace_normalized(content: &str, pattern: &str) -> Matches {

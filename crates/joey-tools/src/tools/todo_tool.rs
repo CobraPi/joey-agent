@@ -210,6 +210,7 @@ impl Tool for Todo {
         let todos_val = args.get("todos").cloned();
 
         let items: Vec<TodoItem> = {
+            // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
             let mut guard = store().lock().unwrap();
             let list = guard.entry(ctx.session_id().to_string()).or_default();
             match todos_val {

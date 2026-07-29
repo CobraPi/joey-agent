@@ -285,10 +285,12 @@ static PLATFORM_REGISTRY: Lazy<RwLock<HashSet<String>>> =
 
 /// Register a gateway platform so `joey-<name>` resolves to the core tools.
 pub fn register_platform(name: &str) {
+    // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
     PLATFORM_REGISTRY.write().unwrap().insert(name.to_string());
 }
 
 fn platform_registered(name: &str) -> bool {
+    // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
     PLATFORM_REGISTRY.read().unwrap().contains(name)
 }
 

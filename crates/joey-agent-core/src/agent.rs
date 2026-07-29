@@ -73,6 +73,7 @@ const LENGTH_CONTINUATION_PROMPT: &str =
      restart or repeat prior text. Finish the answer directly.]";
 
 static DELIMITER_TOKEN_RE: Lazy<Regex> =
+    // SAFETY: the regex pattern is a compile-time constant literal.
     Lazy::new(|| Regex::new(r"(?i)untrusted_tool_result").unwrap());
 
 /// Runtime configuration for the agent.
@@ -638,7 +639,7 @@ impl Agent {
                         start -= 1;
                     }
                     if start == 0 {
-                        self.history.truncate(0);
+                        self.history.clear();
                         continue;
                     }
                     let parent = &self.history[start - 1];
@@ -2375,7 +2376,7 @@ impl Transport for CyclingTransport {
         };
         if n.is_multiple_of(2) {
             Ok(NormalizedResponse {
-                tool_calls: vec![ToolCall::new(&format!("call_{n}"), "echo", r#"{"text": "hi"}"#)],
+                tool_calls: vec![ToolCall::new(format!("call_{n}"), "echo", r#"{"text": "hi"}"#)],
                 finish_reason: FinishReason::ToolCalls,
                 usage,
                 ..NormalizedResponse::empty()

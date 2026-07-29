@@ -23,11 +23,13 @@ static PROFILE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 /// per-task scoping; the Rust port scopes per process, which matches how
 /// the CLI and gateway spawn profile work into separate processes.
 pub fn set_home_override(path: Option<PathBuf>) -> Option<PathBuf> {
+    // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
     let mut guard = HOME_OVERRIDE.write().expect("home override lock");
     std::mem::replace(&mut guard, path)
 }
 
 pub fn get_home_override() -> Option<PathBuf> {
+    // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
     HOME_OVERRIDE.read().expect("home override lock").clone()
 }
 
@@ -375,6 +377,7 @@ pub fn windows_path_to_wsl(path: &str) -> Option<String> {
 pub fn wsl_unc_path_to_posix(path: &str) -> Option<String> {
     use once_cell::sync::Lazy;
     static UNC_RE: Lazy<regex::Regex> = Lazy::new(|| {
+        // SAFETY: compile-time constant regex pattern; correctness verified at author time.
         regex::Regex::new(r"(?i)^\\\\wsl(?:\.localhost|\$)\\[^\\]+\\(.*)$").expect("wsl unc regex")
     });
     let normalized = path.trim().replace('/', "\\");

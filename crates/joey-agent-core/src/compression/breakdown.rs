@@ -16,6 +16,7 @@ use super::compressor::ContextCompressor;
 use super::estimator::estimate_messages_tokens_rough;
 
 static SKILLS_BLOCK_RE: Lazy<Regex> =
+    // SAFETY: the regex pattern is a compile-time constant literal.
     Lazy::new(|| Regex::new(r"(?s)<available_skills>.*?</available_skills>").unwrap());
 
 const SUBAGENT_TOOL_NAMES: &[&str] = &["delegate_task"];

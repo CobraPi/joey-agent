@@ -189,6 +189,8 @@ impl LspManager {
             let client = LspClient::start(cfg, &self.root)?;
             self.clients.insert(config_name.to_string(), client);
         }
+        // SAFETY: `config_name` was inserted into `self.clients` just
+        // above (or already existed); `get_mut` is guaranteed Some.
         Ok(self.clients.get_mut(config_name).unwrap())
     }
 
@@ -820,5 +822,66 @@ mod tests {
     fn manager_with_empty_config() {
         let mgr = LspManager::new("/tmp", HashMap::new());
         assert!(!mgr.has_servers());
+    }
+
+    // ── FR-006/SC-005 regression tests ──────────────────────────────
+
+    #[test]
+    fn lsp_parse_malformed_json_does_not_panic() {
+        // Malformed / degenerate values fed to every LSP JSON parser.
+        // These exercise the SAFETY-guarded parsing paths and the
+        // defensive `unwrap_or` / `filter_map` chains.
+
+        // parse_locations with non-array / non-object / null.
+        let locs = parse_locations(Value::Null);
+        assert!(locs.is_empty());
+        let locs = parse_locations(json!("just a string"));
+        assert!(locs.is_empty());
+        let locs = parse_locations(json!(42));
+        assert!(locs.is_empty());
+
+        // parse_locations with array of garbage entries.
+        let locs = parse_locations(json!([
+            { "not_uri": true },
+            { "uri": "file:///x.rs" },           // missing range
+            { "uri": 123 },                       // wrong type
+            { "uri": "file:///y.rs", "range": "not-an-object" },
+            null,
+            "garbage"
+        ]));
+        // Should not panic; entries without uri+range are silently dropped.
+        let _ = locs;
+
+        // parse_symbols with non-array and garbage entries.
+        let syms = parse_symbols(Value::Null);
+        assert!(syms.is_empty());
+        let syms = parse_symbols(json!("string"));
+        assert!(syms.is_empty());
+        let syms = parse_symbols(json!([
+            { "no_name": true },
+            { "name": "fn1", "kind": "not-a-number" },
+            { "name": 99 },
+            null,
+            { "name": "ok", "kind": 12, "range": { "start": { "line": "x" } } }
+        ]));
+        let _ = syms;
+
+        // parse_workspace_edits with malformed changes object.
+        let edits = parse_workspace_edits(json!({
+            "changes": "not-an-object"
+        }));
+        assert!(edits.is_empty());
+
+        let edits = parse_workspace_edits(json!({
+            "changes": {
+                "file:///a.rs": "not-an-array",
+                "file:///b.rs": [ { "no_newText": true }, null, { "newText": 42 } ]
+            }
+        }));
+        let _ = edits;
+
+        // parse_workspace_edits with no changes key at all.
+        let edits = parse_workspace_edits(json!({ "result": null }));
+        assert!(edits.is_empty());
     }
 }

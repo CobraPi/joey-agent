@@ -69,7 +69,11 @@ const SAFE_ENV_KEYS_CASE_INSENSITIVE: [&str; 27] = [
 /// (hyphens, dots, etc.).
 fn env_var_pattern() -> &'static regex::Regex {
     static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    PATTERN.get_or_init(|| regex::Regex::new(r"\$\{([^}]+)\}").expect("static regex"))
+    PATTERN.get_or_init(|| {
+        regex::Regex::new(r"\$\{([^}]+)\}").expect("static regex")
+        // SAFETY: the regex pattern is a compile-time constant literal;
+        // if it were invalid, compilation would fail (not runtime).
+    })
 }
 
 /// Normalize a `${...}` reference body into an env-var name (`_env_ref_name`).

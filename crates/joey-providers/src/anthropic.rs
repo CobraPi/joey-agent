@@ -326,6 +326,8 @@ fn strip_nullable_unions(schema: &Value) -> Value {
                     .collect();
                 if non_null.len() == 1 && non_null.len() != variants.len() {
                     let mut replacement = if non_null[0].is_object() {
+                        // SAFETY: `is_object()` was checked in the if
+                        // condition above; the Option is guaranteed Some.
                         non_null[0].as_object().unwrap().clone()
                     } else {
                         Map::new()
@@ -930,6 +932,8 @@ fn merge_consecutive_roles(result: Vec<Value>) -> Vec<Value> {
             fixed.push(m);
             continue;
         }
+        // SAFETY: the else-branch only runs when `fixed` is non-empty
+        // (checked above); `last_mut()` is guaranteed Some.
         let prev = fixed.last_mut().unwrap();
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
         let prev_content = prev.get("content").cloned().unwrap_or(Value::Null);
@@ -1358,6 +1362,7 @@ pub(crate) fn build_anthropic_body(req: &ProviderRequest, base_url: &str) -> Val
         "messages": anthropic_messages,
         "max_tokens": effective_max_tokens,
     });
+    // SAFETY: `body` is constructed from `json!({ ... })` above.
     let obj = body.as_object_mut().unwrap();
 
     if let Some(system) = system {
@@ -1920,5 +1925,63 @@ mod tests {
         let resp = json!({"content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn"});
         let n = parse_anthropic_response(&resp).unwrap();
         assert!(n.anthropic_content_blocks.is_none());
+    }
+
+    #[test]
+    fn strip_null_variants_as_object_does_not_panic() {
+        // FR-006/SC-005: `non_null[0].as_object().unwrap()` at anthropic.rs:331
+        // is guarded by the prior `is_object()` check. Exercise with various
+        // JSON schema inputs including edge cases.
+
+        // Standard nullable union — non-null variant is an object.
+        let schema = json!({"anyOf": [{"type": "string"}, {"type": "null"}]});
+        let result = strip_nullable_unions(&schema);
+        assert_eq!(result, json!({"type": "string"}));
+
+        // Type array form: {"type": ["null", "string"]} — does not enter the
+        // anyOf path but must still not panic.
+        let schema = json!({"type": ["null", "string"]});
+        let result = strip_nullable_unions(&schema);
+        assert!(result.is_object());
+
+        // Nullable union where non-null variant has nested properties.
+        let schema = json!({
+            "anyOf": [
+                {"type": "object", "properties": {"x": {"type": "string"}}},
+                {"type": "null"}
+            ]
+        });
+        let result = strip_nullable_unions(&schema);
+        assert_eq!(result["type"], json!("object"));
+
+        // oneOf with multiple non-null variants (not collapsed).
+        let schema = json!({"oneOf": [{"type": "string"}, {"type": "number"}]});
+        let result = strip_nullable_unions(&schema);
+        assert!(result["oneOf"].is_array());
+
+        // Null-only anyOf (all variants null → no non-null, not collapsed).
+        let schema = json!({"anyOf": [{"type": "null"}]});
+        let result = strip_nullable_unions(&schema);
+        assert!(result.is_object());
+
+        // Nested nullable unions inside properties.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "age": {"oneOf": [{"type": "integer"}, {"type": "null"}]}
+            }
+        });
+        let result = strip_nullable_unions(&schema);
+        assert_eq!(result["properties"]["name"], json!({"type": "string"}));
+        assert_eq!(result["properties"]["age"], json!({"type": "integer"}));
+
+        // Deeply nested array of schemas.
+        let schema = json!({
+            "type": "array",
+            "items": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}
+        });
+        let result = strip_nullable_unions(&schema);
+        assert_eq!(result["items"], json!({"type": "boolean"}));
     }
 }

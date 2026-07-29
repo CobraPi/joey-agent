@@ -232,6 +232,8 @@ fn sanitize_node(node: Value, path: &str) -> Value {
                         out.insert(key, sanitize_node(value, &p));
                     }
                 } else if ["anyOf", "oneOf", "allOf"].contains(&key.as_str()) && value.is_array() {
+                    // SAFETY: `value.is_array()` was checked in the elif
+                    // condition above; this branch is unreachable otherwise.
                     let Value::Array(items) = value else { unreachable!() };
                     let sanitized: Vec<Value> = items
                         .into_iter()
@@ -524,5 +526,65 @@ mod tests {
         let n2 = strip_slash_enum(&mut tools);
         assert_eq!(n2, 1);
         assert!(tools[0]["function"]["parameters"]["properties"]["model"].get("enum").is_none());
+    }
+
+    // ── FR-006/SC-005 regression tests ──────────────────────────────
+
+    #[test]
+    fn sanitize_tool_result_malformed_input_does_not_panic() {
+        // Empty string at schema position.
+        let _ = sanitize_parameters(json!(""));
+
+        // Very long string.
+        let long = "x".repeat(100_000);
+        let _ = sanitize_parameters(json!(long));
+
+        // Null bytes embedded in string values.
+        let _ = sanitize_parameters(json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "string", "default": "null\u{0000}byte" }
+            }
+        }));
+
+        // Non-UTF8-like sequences represented as escape surrogates /
+        // control characters inside nested anyOf (exercises the
+        // SAFETY-guarded `unreachable!()` branch at line 237).
+        let _ = sanitize_parameters(json!({
+            "type": "object",
+            "properties": {
+                "a": {
+                    "anyOf": [
+                        { "type": "string", "pattern": "\u{0000}\u{0001}\u{0002}" },
+                        { "type": "null" }
+                    ]
+                }
+            }
+        }));
+
+        // Deeply nested structures to stress recursion.
+        let mut deep = json!({"type": "string"});
+        for _ in 0..100 {
+            deep = json!({"type": "object", "properties": { "nested": deep }});
+        }
+        let _ = sanitize_parameters(deep);
+
+        // Non-object / non-string top-level (number, bool, null, array).
+        let _ = sanitize_parameters(json!(42));
+        let _ = sanitize_parameters(json!(true));
+        let _ = sanitize_parameters(json!(null));
+        let _ = sanitize_parameters(json!([1, 2, 3]));
+
+        // Malformed tool schema list (missing function key entirely).
+        let _ = sanitize_tool_schemas(&[json!("not an object"), json!(123), json!(null)]);
+
+        // anyOf/oneOf/allOf with non-array values — the elif guard
+        // (`value.is_array()`) prevents reaching `unreachable!()`.
+        let _ = sanitize_parameters(json!({
+            "type": "object",
+            "anyOf": "should-be-array",
+            "oneOf": 42,
+            "allOf": null
+        }));
     }
 }

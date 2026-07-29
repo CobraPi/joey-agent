@@ -55,6 +55,7 @@ fn normalize_path_str(path: &str) -> String {
         match comp {
             "" | "." => {}
             ".." => {
+                // SAFETY: provably-safe call on a value constructed or checked in the same scope.
                 if !parts.is_empty() && *parts.last().unwrap() != ".." {
                     parts.pop();
                 } else if !absolute {
@@ -378,9 +379,11 @@ static ANSI_ESCAPE_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?s)\x1b(?:\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\][\s\S]*?(?:\x07|\x1b\\)|[PX^_][\s\S]*?(?:\x1b\\)|[\x20-\x2f]+[\x30-\x7e]|[\x30-\x7e])|\u{9b}[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\u{9d}[\s\S]*?(?:\x07|\u{9c})|[\u{80}-\u{9f}]",
     )
+    // SAFETY: provably-safe call on a value constructed or checked in the same scope.
     .unwrap()
 });
 
+// SAFETY: compile-time constant regex pattern; correctness verified at author time.
 static HAS_ESCAPE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\x1b\u{80}-\u{9f}]").unwrap());
 
 /// Port of `strip_ansi`.

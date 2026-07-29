@@ -140,10 +140,7 @@ impl MessageEvent {
         }
         // Split on whitespace and get the first word, strip the "/".
         let (first, _) = split_whitespace_once(&self.text);
-        let mut raw = match first {
-            Some(token) => token[1..].to_lowercase(),
-            None => return None,
-        };
+        let mut raw = first?[1..].to_lowercase();
         if !raw.is_empty() && raw.contains('@') {
             raw = raw.split('@').next().unwrap_or("").to_string();
         }

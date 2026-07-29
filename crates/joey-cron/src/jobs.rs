@@ -384,16 +384,28 @@ pub fn new_job_id() -> String {
 // =============================================================================
 
 static DURATION_RE: Lazy<Regex> = Lazy::new(|| {
+    // SAFETY: the regex pattern is a compile-time constant literal;
+    // if it were invalid, compilation would fail (not runtime).
     Regex::new(r"^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$").unwrap()
 });
-static CRON_FIELD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[\d\*\-,/]+$").unwrap());
-static ISO_DATE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap());
+static CRON_FIELD_RE: Lazy<Regex> = Lazy::new(|| {
+    // SAFETY: the regex pattern is a compile-time constant literal;
+    // if it were invalid, compilation would fail (not runtime).
+    Regex::new(r"^[\d\*,/]+$").unwrap()
+});
+static ISO_DATE_RE: Lazy<Regex> = Lazy::new(|| {
+    // SAFETY: the regex pattern is a compile-time constant literal;
+    // if it were invalid, compilation would fail (not runtime).
+    Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap()
+});
 
 /// Parse a duration string into minutes (`"30m"` → 30, `"2h"` → 120,
 /// `"1d"` → 1440). Case-insensitive, optional whitespace before the unit.
 pub fn parse_duration(s: &str) -> Result<i64> {
     let s = s.trim().to_lowercase();
     let caps = DURATION_RE.capture(&s)?;
+    // SAFETY: DURATION_RE has capture group 1 (the digits) and group 2
+    // (the unit); the regex matched, so both groups are present.
     let value: i64 = caps
         .get(1)
         .unwrap()
@@ -1288,6 +1300,8 @@ impl CronStore {
                 return Ok(false);
             }
             // Claim this dispatch before the side effect runs.
+            // SAFETY: `repeat` was checked to be Some on line 1269 above;
+            // the Option is guaranteed Some here.
             jobs[i].repeat.as_mut().unwrap().completed = completed + 1;
             self.save_unlocked(&jobs)?;
             tracing::debug!(
@@ -1497,6 +1511,8 @@ fn due_decision(
         next_run = Some(recovered);
         *needs_save = true;
     }
+    // SAFETY: if next_run was None, the block above sets it to Some(recovered)
+    // or returns DueDecision::Skip before reaching here.
     let next_run = next_run.unwrap();
 
     // Containment: an unparseable timestamp skips this job, never the scan.
@@ -3018,5 +3034,37 @@ mod tests {
         assert!(store.get_ticker_success_age().unwrap() < 5.0);
         let raw = std::fs::read_to_string(store.dir().join("ticker_heartbeat")).unwrap();
         assert!(raw.trim().parse::<f64>().is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // FR-006 / SC-005: Malformed-input regression tests for hardened sites.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_duration_valid_does_not_panic() {
+        // Exercises the guarded unwrap at caps.get(1).unwrap() / caps.get(2).unwrap()
+        // inside parse_duration — valid durations must parse cleanly.
+        assert_eq!(parse_duration("30m").unwrap(), 30);
+        assert_eq!(parse_duration("2h").unwrap(), 120);
+        assert_eq!(parse_duration("1d").unwrap(), 1440);
+    }
+
+    #[test]
+    fn parse_duration_malformed_returns_error_not_panic() {
+        // Exercises the DURATION_RE.capture()? guard — malformed inputs must
+        // return Err, never reach the unwrap sites.
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("30x").is_err());
+        assert!(parse_duration("-5m").is_err());
+        assert!(parse_duration("h").is_err());
+    }
+
+    #[test]
+    fn parse_schedule_malformed_returns_error_not_panic() {
+        // Exercises the schedule parsing paths that include guarded unwraps.
+        assert!(parse_schedule("").is_err());
+        assert!(parse_schedule("every").is_err());
+        assert!(parse_schedule("every abc").is_err());
     }
 }

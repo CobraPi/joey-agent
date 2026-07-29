@@ -56,7 +56,9 @@ pub fn parse_effort_str(s: &str) -> Option<ReasoningConfig> {
     None
 }
 
+// SAFETY: compile-time constant regex pattern; correctness verified at author time.
 static DASH_TO_DOT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d)-(\d)").unwrap());
+// SAFETY: compile-time constant regex pattern; correctness verified at author time.
 static DOT_TO_DASH: Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d)\.(\d)").unwrap());
 
 fn dash_to_dot(s: &str) -> String {

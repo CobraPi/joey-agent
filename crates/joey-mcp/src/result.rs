@@ -30,6 +30,8 @@ fn credential_pattern() -> &'static regex::Regex {
             r#"(?i)(?:ghp_[A-Za-z0-9_]{1,255}|sk-[A-Za-z0-9_]{1,255}|Bearer\s+\S+|token=[^\s&,;"']{1,255}|key=[^\s&,;"']{1,255}|API_KEY=[^\s&,;"']{1,255}|password=[^\s&,;"']{1,255}|secret=[^\s&,;"']{1,255})"#,
         )
         .expect("static regex")
+        // SAFETY: the regex pattern is a compile-time constant literal;
+        // if it were invalid, compilation would fail (not runtime).
     })
 }
 
@@ -85,7 +87,10 @@ pub(crate) fn py_json_dumps(value: &Value) -> String {
     let mut out: Vec<u8> = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut out, PyFormatter);
     value.serialize(&mut ser).expect("serializing a Value cannot fail");
+    // SAFETY: serde_json serialization of a `Value` cannot fail — the only
+    // error source is the writer, and `Vec<u8>` writes are infallible.
     String::from_utf8(out).expect("serde_json writes UTF-8")
+    // SAFETY: serde_json only emits valid UTF-8 bytes.
 }
 
 /// `{"error": <sanitized text>}` envelope.

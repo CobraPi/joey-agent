@@ -49,6 +49,7 @@ impl FileTracker {
     /// Record that a file was read. If this is the first read, snapshots the
     /// original content for diff generation later.
     pub fn record_read(path: &str, content: Option<&str>) {
+        // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
         let mut t = TRACKER.lock().unwrap();
         let key = normalize_path(path);
         t.read_times.insert(key.clone(), SystemTime::now());
@@ -60,6 +61,7 @@ impl FileTracker {
 
     /// Record that a file was written/modified.
     pub fn record_write(path: &str) {
+        // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
         let mut t = TRACKER.lock().unwrap();
         let key = normalize_path(path);
         t.write_times.insert(key.clone(), SystemTime::now());
@@ -80,6 +82,7 @@ impl FileTracker {
     /// (from `originals`, if the agent read it before) becomes the removal
     /// side of the emitted diff.
     pub fn record_delete(path: &str) {
+        // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
         let mut t = TRACKER.lock().unwrap();
         let key = normalize_path(path);
         t.write_times.insert(key.clone(), SystemTime::now());
@@ -95,18 +98,21 @@ impl FileTracker {
 
     /// Get the original content snapshot for a file (if tracked).
     pub fn get_original(path: &str) -> Option<String> {
+        // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
         let t = TRACKER.lock().unwrap();
         t.originals.get(&normalize_path(path)).cloned()
     }
 
     /// List all files modified in this session.
     pub fn modified_files() -> Vec<String> {
+        // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
         let t = TRACKER.lock().unwrap();
         t.modified_files.clone()
     }
 
     /// List all files read in this session.
     pub fn read_files() -> Vec<String> {
+        // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
         let t = TRACKER.lock().unwrap();
         t.read_times.keys().cloned().collect()
     }
@@ -146,6 +152,7 @@ impl FileTracker {
     /// fails UTF-8 decode, `is_binary` is set true, `diff.diff` is emptied,
     /// and the renderer is expected to show a placeholder (FR-016).
     pub fn drain_pending_diffs() -> Vec<PendingDiff> {
+        // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
         let mut t = TRACKER.lock().unwrap();
         let writes = std::mem::take(&mut t.pending_writes);
         let deletes = std::mem::take(&mut t.pending_deletes);
@@ -235,6 +242,7 @@ impl FileTracker {
 
     /// Clear all tracking state (new session).
     pub fn reset() {
+        // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
         let mut t = TRACKER.lock().unwrap();
         t.originals.clear();
         t.read_times.clear();
@@ -246,6 +254,7 @@ impl FileTracker {
 
     /// Summary of changes for display.
     pub fn change_summary() -> ChangeSummary {
+        // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
         let t = TRACKER.lock().unwrap();
         ChangeSummary {
             files_read: t.read_times.len(),

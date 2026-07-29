@@ -198,15 +198,21 @@ const CONTENT_TAIL: usize = 1500;
 const TOOL_ARGS_MAX: usize = 1500;
 const TOOL_ARGS_HEAD: usize = 1200;
 
+// SAFETY: the regex pattern is a compile-time constant literal.
 static MEDIA_DIRECTIVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"MEDIA:\S+").unwrap());
+// SAFETY: the regex pattern is a compile-time constant literal.
 static PATH_MENTION_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?:/|~/?|[A-Za-z]:\\)[^\s`'")\]}<>]+"#).unwrap());
 static ERROR_WORD_RE: Lazy<Regex> = Lazy::new(|| {
+    // SAFETY: the regex pattern is a compile-time constant literal.
     Regex::new(r"(?i)\b(error|failed|exception|traceback|timeout|timed out|fatal)\b").unwrap()
 });
+// SAFETY: the regex pattern is a compile-time constant literal.
 static WS_RUN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+// SAFETY: the regex pattern is a compile-time constant literal.
 static GH_TOKEN_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\bgh[pousr]_[A-Za-z0-9_]{8,}\b").unwrap());
+// SAFETY: the regex pattern is a compile-time constant literal.
 static GH_TOKEN_LOOSE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\bgh[pousr]_[A-Za-z0-9_.-]+").unwrap());
 
@@ -440,6 +446,7 @@ pub fn summarize_tool_result(tool_name: &str, tool_args: &str, tool_content: &st
             if cmd.chars().count() > 80 {
                 cmd = format!("{}...", char_prefix(&cmd, 77));
             }
+            // SAFETY: the regex pattern is a compile-time constant literal.
             static EXIT_RE: Lazy<Regex> =
                 Lazy::new(|| Regex::new(r#""exit_code"\s*:\s*(-?\d+)"#).unwrap());
             let exit_code = EXIT_RE
@@ -471,6 +478,7 @@ pub fn summarize_tool_result(tool_name: &str, tool_args: &str, tool_content: &st
             let pattern = display_arg(&args, "pattern", "?");
             let path = display_arg(&args, "path", ".");
             let target = display_arg(&args, "target", "content");
+            // SAFETY: the regex pattern is a compile-time constant literal.
             static COUNT_RE: Lazy<Regex> =
                 Lazy::new(|| Regex::new(r#""total_count"\s*:\s*(\d+)"#).unwrap());
             let count = COUNT_RE
@@ -3511,5 +3519,160 @@ respond to the message below, not the summary above ---";
         db.lock().unwrap().set_compression_fallback_streak(&sid, 2).unwrap();
         c2.bind_session_state(Some(db.clone()), &sid);
         assert_eq!(c2.fallback_streak_for_tests(), 2);
+    }
+
+    // ── FR-006/SC-005 regression tests (hardened sites) ──────────────────
+
+    /// SAFETY site: `summarize_tool_result` JSON parsing — the function
+    /// does `serde_json::from_str(tool_args).unwrap_or(...)` then checks
+    /// `args.is_object()`. Malformed JSON must not panic.
+    #[test]
+    fn summarize_tool_result_malformed_json_does_not_panic() {
+        // Completely invalid JSON.
+        let result = summarize_tool_result("terminal", "not json at all {{{", "output");
+        assert!(result.contains("[terminal]"));
+
+        // Empty string (special-cased to empty object).
+        let result = summarize_tool_result("terminal", "", "output");
+        assert!(result.contains("[terminal]"));
+
+        // JSON array instead of object — `is_object()` guard catches it.
+        let result = summarize_tool_result("terminal", "[1, 2, 3]", "output");
+        assert!(result.contains("[terminal]"));
+
+        // JSON null.
+        let result = summarize_tool_result("terminal", "null", "output");
+        assert!(result.contains("[terminal]"));
+
+        // JSON number.
+        let result = summarize_tool_result("terminal", "42", "output");
+        assert!(result.contains("[terminal]"));
+
+        // Truncated JSON object.
+        let result = summarize_tool_result("terminal", r#"{"command": "np"#, "output");
+        assert!(result.contains("[terminal]"));
+    }
+
+    /// SAFETY site: `summarize_tool_result` — the `web_extract` arm indexes
+    /// into `list[0]` after checking `!list.is_empty()`. Exercises the
+    /// array element unwrap patterns with various value types.
+    #[test]
+    fn summarize_tool_result_web_extract_array_indexing_does_not_panic() {
+        // Array of string URLs.
+        let args = r#"{"urls": ["https://example.com/page"]}"#;
+        let result = summarize_tool_result("web_extract", args, "content here");
+        assert!(result.contains("[web_extract]"));
+
+        // Array of objects with "url" key.
+        let args = r#"{"urls": [{"url": "https://example.com"}]}"#;
+        let result = summarize_tool_result("web_extract", args, "content");
+        assert!(result.contains("[web_extract]"));
+
+        // Array of objects with "href" key (fallback).
+        let args = r#"{"urls": [{"href": "https://example.com"}]}"#;
+        let result = summarize_tool_result("web_extract", args, "content");
+        assert!(result.contains("[web_extract]"));
+
+        // Empty array.
+        let args = r#"{"urls": []}"#;
+        let result = summarize_tool_result("web_extract", args, "content");
+        assert!(result.contains("[web_extract]"));
+
+        // Array with non-string, non-object first element.
+        let args = r#"{"urls": [42]}"#;
+        let result = summarize_tool_result("web_extract", args, "content");
+        assert!(result.contains("[web_extract]"));
+
+        // Multiple URLs (extra count).
+        let args = r#"{"urls": ["https://a.com", "https://b.com", "https://c.com"]}"#;
+        let result = summarize_tool_result("web_extract", args, "content");
+        assert!(result.contains("+2 more"));
+    }
+
+    /// SAFETY site: `summarize_tool_result` — `read_file` arm does
+    /// `args.get("offset").cloned().unwrap_or(Value::from(1))`. Exercises
+    /// various offset value types.
+    #[test]
+    fn summarize_tool_result_read_file_offset_unwrap_does_not_panic() {
+        let content = "x".repeat(100);
+        // Normal numeric offset.
+        let result = summarize_tool_result("read_file", r#"{"path": "f.txt", "offset": 50}"#, &content);
+        assert!(result.contains("[read_file]"));
+
+        // String offset.
+        let result = summarize_tool_result("read_file", r#"{"path": "f.txt", "offset": "100"}"#, &content);
+        assert!(result.contains("[read_file]"));
+
+        // Null offset.
+        let result = summarize_tool_result("read_file", r#"{"path": "f.txt", "offset": null}"#, &content);
+        assert!(result.contains("[read_file]"));
+
+        // Missing offset entirely.
+        let result = summarize_tool_result("read_file", r#"{"path": "f.txt"}"#, &content);
+        assert!(result.contains("[read_file]"));
+    }
+
+    /// SAFETY site: `summarize_tool_result` — `write_file` arm does
+    /// `args.get("content").map(|v| !v.is_null()).unwrap_or(false)`.
+    #[test]
+    fn summarize_tool_result_write_file_content_check_does_not_panic() {
+        // Normal content.
+        let result = summarize_tool_result("write_file", r#"{"path": "f.txt", "content": "hello\nworld"}"#, "");
+        assert!(result.contains("[write_file]"));
+
+        // Null content.
+        let result = summarize_tool_result("write_file", r#"{"path": "f.txt", "content": null}"#, "");
+        assert!(result.contains("[write_file]"));
+
+        // Missing content.
+        let result = summarize_tool_result("write_file", r#"{"path": "f.txt"}"#, "");
+        assert!(result.contains("[write_file]"));
+    }
+
+    /// SAFETY site: `truncate_tool_call_args_json` — does
+    /// `serde_json::from_str::<Value>(args)` returning early on parse
+    /// failure. Exercises deeply nested and malformed inputs.
+    #[test]
+    fn truncate_tool_call_args_json_malformed_does_not_panic() {
+        // Non-JSON returns unchanged.
+        let result = truncate_tool_call_args_json("not json", 100);
+        assert_eq!(result, "not json");
+
+        // Empty string.
+        let result = truncate_tool_call_args_json("", 100);
+        assert_eq!(result, "");
+
+        // Valid JSON object with long string value — shrinks but stays valid.
+        let args = format!(r#"{{"path": "/foo", "content": "{}"}}"#, "A".repeat(500));
+        let result = truncate_tool_call_args_json(&args, 100);
+        let parsed: Value = serde_json::from_str(&result).expect("still valid JSON");
+        assert_eq!(parsed["path"], "/foo");
+
+        // Deeply nested arrays — the function must not panic; the output
+        // may be truncated so we only assert no panic, not valid JSON.
+        let args = r#"{"data": [[[[[[[[1]]]]]]]}"#;
+        let _result = truncate_tool_call_args_json(args, 10);
+
+        // JSON that is just a string (not an object) — shrink still applies
+        // and truncates the value to head_chars.
+        let result = truncate_tool_call_args_json(r#""just a string""#, 10);
+        assert!(result.starts_with(r#""just a st"#));
+    }
+
+    /// SAFETY site: `summarize_tool_result` generic fallback arm does
+    /// `if let Value::Object(map) = &args` iterating `map.iter().take(2)`.
+    #[test]
+    fn summarize_tool_result_generic_fallback_object_iter_does_not_panic() {
+        // Unknown tool name triggers generic fallback.
+        let result = summarize_tool_result("unknown_tool", r#"{"key1": "val1", "key2": "val2"}"#, "content");
+        assert!(result.contains("[unknown_tool]"));
+
+        // Empty object.
+        let result = summarize_tool_result("unknown_tool", "{}", "content");
+        assert!(result.contains("[unknown_tool]"));
+
+        // Object with non-string values.
+        let result = summarize_tool_result("unknown_tool", r#"{"a": 42, "b": true}"#, "content");
+        assert!(result.contains("[unknown_tool]"));
     }
 }

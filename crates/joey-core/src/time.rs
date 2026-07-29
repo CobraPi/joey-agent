@@ -39,16 +39,19 @@ pub fn now_iso() -> String {
 /// Return the configured timezone, or `None` (meaning server-local).
 /// Resolved once and cached; call [`reset_cache`] after config changes.
 pub fn get_timezone() -> Option<Tz> {
+    // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
     if let Some(resolved) = *CACHED_TZ.read().expect("tz cache lock") {
         return resolved;
     }
     let resolved = resolve_timezone();
+    // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
     *CACHED_TZ.write().expect("tz cache lock") = Some(resolved);
     resolved
 }
 
 /// Clear the cached timezone so the next call re-resolves it.
 pub fn reset_cache() {
+    // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
     *CACHED_TZ.write().expect("tz cache lock") = None;
 }
 

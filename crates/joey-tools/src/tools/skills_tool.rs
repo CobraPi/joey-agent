@@ -414,6 +414,7 @@ impl Tool for SkillView {
                     } else {
                         continue;
                     };
+                    // SAFETY: provably-safe call on a value constructed or checked in the same scope.
                     buckets.get_mut(bucket).unwrap().push(rel);
                 }
                 for (k, v) in buckets {

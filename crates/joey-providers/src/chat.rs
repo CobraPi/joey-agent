@@ -329,6 +329,8 @@ pub(crate) fn build_openai_body(
     }
 
     let mut body = json!({ "model": wire_model, "messages": messages });
+    // SAFETY: `body` is constructed from `json!({ ... })` above, which
+    // always produces a `Value::Object`; the Option is guaranteed Some.
     let obj = body.as_object_mut().unwrap();
 
     if !req.tools.is_empty() {
@@ -628,5 +630,34 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], json!("developer"));
         let body = build_openai_body(&p, p.base_url, &req("gpt-4.1", None));
         assert_eq!(body["messages"][0]["role"], json!("system"));
+    }
+
+    #[test]
+    fn build_request_body_as_object_does_not_panic() {
+        // FR-006/SC-005: the `body.as_object_mut().unwrap()` at chat.rs:334
+        // is guarded by the prior `json!({ ... })` construction. Exercise
+        // edge-case requests to prove no panic under all code paths.
+        let p = get_profile("openai-api").unwrap();
+
+        // Empty messages vec — still produces a valid body object.
+        let empty_req = ProviderRequest::new("gpt-4.1", vec![]);
+        let body = build_openai_body(&p, p.base_url, &empty_req);
+        assert!(body.is_object());
+        assert_eq!(body["messages"].as_array().unwrap().len(), 0);
+
+        // No system prompt, empty user content, no tools, no reasoning.
+        let bare = ProviderRequest::new("gpt-4.1", vec![Message::user("")]);
+        let body = build_openai_body(&p, p.base_url, &bare);
+        assert!(body.is_object());
+
+        // Request with tools but nil-valued tool parameters.
+        let mut r = ProviderRequest::new("gpt-4.1", vec![Message::user("hi")]);
+        r.tools = vec![crate::types::ToolSchema::new(
+            "t",
+            "d",
+            json!(null),
+        )];
+        let body = build_openai_body(&p, p.base_url, &r);
+        assert!(body["tools"].is_array());
     }
 }

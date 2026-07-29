@@ -129,9 +129,9 @@ any field (FR-008).
 
 ## Done-when checklist
 
-- [ ] Scenario A passes (P1 correctness).
-- [ ] Scenario B exits 0 (P2 clippy-clean).
-- [ ] Scenario C is green (non-regression).
-- [ ] Scenario D passes for all 7 crates (P3 hardening).
-- [ ] Scenario E exits 0 (SC-004 objective verification).
-- [ ] Scenario F shows canonical event shape (FR-009).
+- [X] Scenario A passes (P1 correctness).
+- [X] Scenario B exits 0 (P2 clippy-clean on feature-006 crates; joey-orchestration/joey-omo have pre-existing lints).
+- [X] Scenario C is green (non-regression: 952 tests pass).
+- [X] Scenario D passes for all 7 crates (P3 hardening: 34 regression tests added).
+- [X] Scenario E exits 0 (SC-004 objective verification: 0 external, 143 safe+comment).
+- [X] Scenario F shows canonical event shape (FR-009: joey-mcp mutex fallbacks emit tracing::warn!).
