@@ -833,9 +833,7 @@ fn handle_start_work_tui(tui: &mut Tui, agent: &mut Agent, args: &str) {
                         result
                             .boulder
                             .works
-                            .iter()
-                            .filter(|w| w.status == joey_omo::BoulderWorkStatus::Active)
-                            .last()
+                            .iter().rfind(|w| w.status == joey_omo::BoulderWorkStatus::Active)
                             .map(|w| w.plan_name.as_str())
                             .unwrap_or("unknown")
                     ),

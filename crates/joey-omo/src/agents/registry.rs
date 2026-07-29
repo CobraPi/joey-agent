@@ -366,6 +366,7 @@ fn build_all_agents(
 
 /// Build a single agent, resolving its model via fallback chain.
 /// Honors user overrides (BC-009) and requiresProvider constraint (BC-010).
+#[allow(clippy::too_many_arguments)] // deviation: domain-shaped agent builder, parameter bag would be speculative abstraction
 fn build_agent(
     name: &str,
     display_name: &str,

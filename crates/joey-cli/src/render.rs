@@ -28,7 +28,7 @@
 //!   on `Done` (interactive only).
 //! - **Usage summary**: printed below the finalized text via `println!` —
 //!   never overwrites the streamed region (FR-005).
-//! diagonal field decorations, and semantic color tokens.
+//!   diagonal field decorations, and semantic color tokens.
 
 use std::io::Write;
 use std::time::Instant;
@@ -244,7 +244,7 @@ fn count_visual_lines(text: &str, width: usize) -> u32 {
         if line_w == 0 {
             lines += 1;
         } else {
-            lines += ((line_w + width - 1) / width) as u32;
+            lines += line_w.div_ceil(width) as u32;
         }
     }
     // split('\n') on "a\nb" gives ["a", "b"] = 2 visual lines, but the \n
@@ -440,7 +440,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                         // Print the initial spinner frame immediately.
                         let profile = spinner_profile;
                         let frame = profile.frames[0];
-                        let color = (profile.color)(&t);
+                        let color = (profile.color)(t);
                         let mut spinner_line = format!("\r{}", color.ansi().paint(frame));
                         if let Some(label) = profile.label {
                             spinner_line.push(' ');
@@ -578,7 +578,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                         if let Ok(pos) = cursor::position() {
                             // Print the entry line: spinner frame + name + summary.
                             let frame = tool_profile.frames[0];
-                            let color = (tool_profile.color)(&t);
+                            let color = (tool_profile.color)(t);
                             print!("  {} {}", color.ansi().paint(frame), name_styled);
                             if !summary.is_empty() {
                                 let short_summary: String = summary.chars().take(60).collect();
@@ -799,7 +799,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 // Render only the tail `max_height` lines when truncated.
                 let start = hidden;
                 for &line in &diff_lines[start..] {
-                    let rendered = render_diff_line(line, &path, opts.syntax_highlighting, &t);
+                    let rendered = render_diff_line(line, &path, opts.syntax_highlighting, t);
                     println!("{}", rendered);
                 }
                 if hidden > 0 {
@@ -842,7 +842,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     );
                     let _ = stdout.flush();
                     // Re-render as markdown.
-                    let rendered = crate::markdown::markdown_to_ansi(&text, &t);
+                    let rendered = crate::markdown::markdown_to_ansi(&text, t);
                     print!("{}", rendered);
                     let _ = std::io::stdout().flush();
                     println!();
@@ -947,7 +947,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                             terminal::Clear(terminal::ClearType::CurrentLine)
                         );
                         let frame = state.current_frame(spinner_profile);
-                        let color = (spinner_profile.color)(&t);
+                        let color = (spinner_profile.color)(t);
                         let glyph = color.ansi().paint(frame);
                         if let Some(label) = spinner_profile.label {
                             print!("{} {}", glyph, t.fg_more_subtle.ansi().paint(label));
@@ -970,7 +970,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 if caret_active && !caret_visible && !streamed_line_count_overflow(&streamed_line_count) {
                     let frame = caret_profile.frames
                         [usize::from(crate::animation::tick_phase(caret_profile, tick_count))];
-                    let color = (caret_profile.color)(&t);
+                    let color = (caret_profile.color)(t);
                     let _ = execute!(
                         std::io::stdout(),
                         cursor::SavePosition,
@@ -993,7 +993,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                             terminal::Clear(terminal::ClearType::CurrentLine),
                         );
                         let frame = state.current_frame(tool_profile);
-                        let color = (tool_profile.color)(&t);
+                        let color = (tool_profile.color)(t);
                         let _ = execute!(
                             std::io::stdout(),
                             cursor::MoveTo(0, row),
@@ -1140,7 +1140,7 @@ pub fn banner_animated(info: &BannerInfo, opts: &RenderOptions) {
             // Print a gradient shimmer line that cycles a few frames.
             for i in 0..profile.frames.len().min(6) {
                 let frame = profile.frames[i % profile.frames.len()];
-                let color = (profile.color)(&t);
+                let color = (profile.color)(t);
                 let pad = width.saturating_sub(frame.chars().count() + 6);
                 let pad_left = pad / 2;
                 let line = format!("{}{}{}", " ".repeat(pad_left), color.ansi().paint(frame), "");

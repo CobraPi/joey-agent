@@ -115,10 +115,7 @@ pub fn route_delegation(
             .ok_or("sisyphus-junior agent not found")?;
         let denied_tools: Vec<String> = junior
             .tool_permissions
-            .denied()
-            .iter()
-            .cloned()
-            .collect();
+            .denied().to_vec();
 
         return Ok(DelegationRoute {
             agent_name: "sisyphus-junior".to_string(),
@@ -138,10 +135,7 @@ pub fn route_delegation(
 
         let denied_tools: Vec<String> = agent
             .tool_permissions
-            .denied()
-            .iter()
-            .cloned()
-            .collect();
+            .denied().to_vec();
 
         return Ok(DelegationRoute {
             agent_name: agent_name.clone(),
@@ -415,7 +409,7 @@ pub fn build_task_delegation_prompt(
     prompt.push_str("- Create a todo list with `todo` before starting.\n");
     prompt.push_str("- Mark all todos complete before finishing.\n");
     prompt.push_str("- If you encounter errors, fix them before completing.\n");
-    prompt.push_str("\n");
+    prompt.push('\n');
     prompt.push_str("MUST NOT DO:\n");
     prompt.push_str("- Do NOT delegate further (no task/delegate_task calls).\n");
     prompt.push_str("- Do NOT modify .omo/plans/ files.\n");
@@ -478,9 +472,7 @@ pub fn start_work(
                 .or_else(|| {
                     existing
                         .works
-                        .iter()
-                        .filter(|w| w.status == BoulderWorkStatus::Active)
-                        .last()
+                        .iter().rfind(|w| w.status == BoulderWorkStatus::Active)
                 });
 
             if let Some(work) = active_work {
@@ -624,7 +616,7 @@ fn find_latest_plan(plans_dir: &Path) -> Result<PathBuf, String> {
     }
 
     // Sort by modification time, newest first.
-    plans.sort_by(|a, b| b.0.cmp(&a.0));
+    plans.sort_by_key(|b| std::cmp::Reverse(b.0));
     Ok(plans[0].1.clone())
 }
 

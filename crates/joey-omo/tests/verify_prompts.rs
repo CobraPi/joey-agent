@@ -199,3 +199,101 @@ fn omo_agent_system_prompt_dispatches() {
     let prompt = agent.system_prompt("glm-5.2");
     assert!(prompt.contains("GLM"), "OmoAgent.system_prompt should dispatch to GLM variant");
 }
+
+// ---------------------------------------------------------------------------
+// Kimi K2.6 prompt-selection regression tests (FR-001, FR-002, SC-003).
+// These assert the bug fix: k2.6 model ids must resolve to kimi_k2_6(),
+// NOT kimi_k2_7() (the bug was that both k2.7 and k2.6 arms returned
+// kimi_k2_7()). Pointer-equality is used because the functions return
+// &'static str — if two arms returned the same function pointer, the bug
+// is still present.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kimi_k2_6_model_id_dot_resolves_to_k2_6_prompt() {
+    use joey_omo::agents::prompts::junior;
+    let prompt = junior::for_model("kimi-k2.6");
+    assert!(
+        std::ptr::eq(prompt, junior::kimi_k2_6()),
+        "k2.6 model id must resolve to kimi_k2_6(), not kimi_k2_7()"
+    );
+}
+
+#[test]
+fn kimi_k2_6_model_id_dash_resolves_to_k2_6_prompt() {
+    use joey_omo::agents::prompts::junior;
+    let prompt = junior::for_model("kimi-k2-6");
+    assert!(
+        std::ptr::eq(prompt, junior::kimi_k2_6()),
+        "k2-6 model id must resolve to kimi_k2_6(), not kimi_k2_7()"
+    );
+}
+
+#[test]
+fn kimi_k2_7_model_id_dot_resolves_to_k2_7_prompt() {
+    use joey_omo::agents::prompts::junior;
+    let prompt = junior::for_model("kimi-k2.7");
+    assert!(
+        std::ptr::eq(prompt, junior::kimi_k2_7()),
+        "k2.7 model id must resolve to kimi_k2_7() (regression guard)"
+    );
+}
+
+#[test]
+fn kimi_k2_7_model_id_dash_resolves_to_k2_7_prompt() {
+    use joey_omo::agents::prompts::junior;
+    let prompt = junior::for_model("kimi-k2-7");
+    assert!(
+        std::ptr::eq(prompt, junior::kimi_k2_7()),
+        "k2-7 model id must resolve to kimi_k2_7() (regression guard)"
+    );
+}
+
+#[test]
+fn kimi_k3_model_id_falls_through_to_k3_prompt() {
+    use joey_omo::agents::prompts::junior;
+    let prompt = junior::for_model("kimi-k3");
+    assert!(
+        std::ptr::eq(prompt, junior::kimi_k3()),
+        "k3 model id must fall through to kimi_k3()"
+    );
+}
+
+#[test]
+fn kimi_k2_6_and_k2_7_prompts_are_distinct() {
+    use joey_omo::agents::prompts::junior;
+    // The bug made them the same pointer. They must now be distinct.
+    assert!(
+        !std::ptr::eq(junior::kimi_k2_6(), junior::kimi_k2_7()),
+        "kimi_k2_6() and kimi_k2_7() must be distinct prompts"
+    );
+}
+
+#[test]
+fn kimi_k2_6_prompt_mentions_k2_6() {
+    use joey_omo::agents::prompts::junior;
+    let prompt = junior::kimi_k2_6();
+    assert!(
+        prompt.contains("K2.6"),
+        "kimi_k2_6() prompt must identify the model as K2.6"
+    );
+}
+
+#[test]
+fn non_kimi_model_id_unchanged() {
+    use joey_omo::agents::prompts::junior;
+    let prompt = junior::for_model("gpt-5.6-sol");
+    // Non-Kimi ids should not resolve to any Kimi prompt.
+    assert!(
+        !std::ptr::eq(prompt, junior::kimi_k2_6()),
+        "non-Kimi model must not resolve to kimi_k2_6()"
+    );
+    assert!(
+        !std::ptr::eq(prompt, junior::kimi_k2_7()),
+        "non-Kimi model must not resolve to kimi_k2_7()"
+    );
+    assert!(
+        !std::ptr::eq(prompt, junior::kimi_k3()),
+        "non-Kimi model must not resolve to kimi_k3()"
+    );
+}

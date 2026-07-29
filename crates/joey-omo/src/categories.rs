@@ -297,7 +297,7 @@ pub fn load_custom_categories(config: &joey_core::Config) -> Vec<CategoryConfig>
         for cat_val in cats {
             if let Some(mapping) = cat_val.as_mapping() {
                 let name = mapping
-                    .get(&serde_yaml::Value::String("name".into()))
+                    .get(serde_yaml::Value::String("name".into()))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
@@ -305,20 +305,20 @@ pub fn load_custom_categories(config: &joey_core::Config) -> Vec<CategoryConfig>
                     continue;
                 }
                 let description = mapping
-                    .get(&serde_yaml::Value::String("description".into()))
+                    .get(serde_yaml::Value::String("description".into()))
                     .and_then(|v| v.as_str())
                     .unwrap_or("Custom user-defined category")
                     .to_string();
                 let model = mapping
-                    .get(&serde_yaml::Value::String("model".into()))
+                    .get(serde_yaml::Value::String("model".into()))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
                 let temperature = mapping
-                    .get(&serde_yaml::Value::String("temperature".into()))
+                    .get(serde_yaml::Value::String("temperature".into()))
                     .and_then(|v| v.as_f64());
                 let prompt_append = mapping
-                    .get(&serde_yaml::Value::String("prompt_append".into()))
+                    .get(serde_yaml::Value::String("prompt_append".into()))
                     .and_then(|v| v.as_str())
                     .map(String::from);
 

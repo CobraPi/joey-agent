@@ -525,7 +525,7 @@ fn compute_hunks(
                     } else {
                         // Close the hunk.
                         finalize_hunk(hunk);
-                        hunks.push(std::mem::replace(hunk, Hunk::default()));
+                        hunks.push(std::mem::take(hunk));
                         current_hunk = None;
                         context_count = 0;
                     }

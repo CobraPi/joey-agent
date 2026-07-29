@@ -142,8 +142,8 @@ pub(crate) fn build_agent(
 
     // Wire session_search with the session DB.
     let session_db = SessionDb::open_default().ok().map(|db| {
-        let arc = std::sync::Arc::new(std::sync::Mutex::new(db));
-        arc
+        
+        std::sync::Arc::new(std::sync::Mutex::new(db))
     });
     joey_tools::builtins::register_session_tools(&mut registry, session_db);
 
@@ -153,7 +153,7 @@ pub(crate) fn build_agent(
     // ── Initialize LSP from config (crush-style code intelligence) ────
     {
         let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let lsp_mgr = joey_tools::lsp::LspManager::from_joey_config(&config, root);
+        let lsp_mgr = joey_tools::lsp::LspManager::from_joey_config(config, root);
         if lsp_mgr.has_servers() {
             joey_tools::tools::lsp_tools::register_lsp_manager(lsp_mgr);
         }
@@ -192,7 +192,7 @@ pub(crate) fn build_agent(
         );
         let overrides = joey_omo::agents::registry::ModelOverrides::new();
         // T154: load user-defined custom categories from config (FR-012).
-        let custom_cats = joey_omo::categories::load_custom_categories(&config);
+        let custom_cats = joey_omo::categories::load_custom_categories(config);
         let omo_registry = if custom_cats.is_empty() {
             joey_omo::AgentRegistry::build(available, &overrides)
         } else {
@@ -203,7 +203,7 @@ pub(crate) fn build_agent(
 
     // ── Load PreToolUse hooks from config (crush-style) ──────────────
     {
-        let hooks_cfg = joey_agent_core::hooks::load_hooks_from_config(&config);
+        let hooks_cfg = joey_agent_core::hooks::load_hooks_from_config(config);
         if !hooks_cfg.is_empty() {
             let cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -1081,9 +1081,7 @@ async fn omo_start_work_slash(st: &mut ReplState, args: &str) {
                 render::info(&format!(
                     "Resuming work on plan: {}",
                     result.boulder.works
-                        .iter()
-                        .filter(|w| w.status == joey_omo::BoulderWorkStatus::Active)
-                        .last()
+                        .iter().rfind(|w| w.status == joey_omo::BoulderWorkStatus::Active)
                         .map(|w| w.plan_name.as_str())
                         .unwrap_or("unknown")
                 ));
@@ -1476,7 +1474,7 @@ fn show_changes() {
     }
     println!();
     println!("  {} Use '/changes <file>' for a full diff of a specific file",
-             nu_ansi_term::Color::DarkGray.paint("•").to_string());
+             nu_ansi_term::Color::DarkGray.paint("•"));
 }
 
 fn show_usage(st: &ReplState) {

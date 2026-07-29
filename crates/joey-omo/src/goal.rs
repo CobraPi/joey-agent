@@ -10,16 +10,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum GoalStatus {
+    #[default]
     Active,
     Paused,
 }
 
-impl Default for GoalStatus {
-    fn default() -> Self {
-        Self::Active
-    }
-}
 
 // ── GoalState ───────────────────────────────────────────────────────
 
@@ -50,7 +47,7 @@ impl GoalState {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 

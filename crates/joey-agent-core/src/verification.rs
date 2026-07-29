@@ -387,7 +387,7 @@ fn classify_kind(canonical: &str) -> Option<VerificationKind> {
         }
         "make" => {
             // make test, make check, make lint...
-            match parts.get(1).map(|s| *s) {
+            match parts.get(1).copied() {
                 Some("test") | Some("check") => Some(VerificationKind::Test),
                 Some("lint") => Some(VerificationKind::Lint),
                 Some("build") => Some(VerificationKind::Build),

@@ -9,16 +9,13 @@ use serde::{Deserialize, Serialize};
 /// (Orchestrator, requires `max_spawn_depth > 1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum SubagentRole {
+    #[default]
     Leaf,
     Orchestrator,
 }
 
-impl Default for SubagentRole {
-    fn default() -> Self {
-        Self::Leaf
-    }
-}
 
 /// Per-task specification within a batch delegation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

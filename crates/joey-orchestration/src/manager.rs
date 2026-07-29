@@ -181,6 +181,7 @@ impl SubagentManager {
     }
 
     /// Internal dispatch with explicit overrides (used by batch dispatch).
+    #[allow(clippy::too_many_arguments)] // deviation: domain-shaped dispatch, parameter bag would be speculative abstraction
     pub(crate) async fn dispatch_single_with_overrides(
         &self,
         req: &DelegationRequest,
@@ -277,6 +278,7 @@ impl SubagentManager {
     /// One failure does not cancel others. The parent's semaphore is shared
     /// across all children (FR-018). Batches larger than max_concurrent_children
     /// are chunked so at most that many run simultaneously (FR-018).
+    #[allow(clippy::too_many_arguments)] // deviation: domain-shaped batch dispatch, parameter bag would be speculative abstraction
     pub async fn dispatch_batch(
         &self,
         tasks: &[TaskSpec],

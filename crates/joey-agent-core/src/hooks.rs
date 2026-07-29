@@ -143,7 +143,7 @@ impl PreToolUseRunner {
         let hooks = configs
             .into_iter()
             .filter(|c| c.event == EVENT_PRE_TOOL_USE)
-            .filter_map(|c| {
+            .map(|c| {
                 let matcher = if c.matcher.is_empty() {
                     None
                 } else {
@@ -158,7 +158,7 @@ impl PreToolUseRunner {
                         }
                     }
                 };
-                Some(CompiledHook { config: c, matcher })
+                CompiledHook { config: c, matcher }
             })
             .collect();
         Self {
@@ -363,9 +363,7 @@ impl PreToolUseRunner {
             }
             BLOCK_EXIT_CODE => {
                 // Deny this tool call.
-                let reason = extract_reason(&stdout, &stderr)
-                    .map(String::from)
-                    .unwrap_or_else(|| "blocked by hook".to_string());
+                let reason = extract_reason(&stdout, &stderr).unwrap_or_else(|| "blocked by hook".to_string());
                 HookDecision {
                     action: HookAction::Deny,
                     reason,
@@ -374,9 +372,7 @@ impl PreToolUseRunner {
             }
             HALT_EXIT_CODE => {
                 // Halt the entire turn.
-                let reason = extract_reason(&stdout, &stderr)
-                    .map(String::from)
-                    .unwrap_or_else(|| "halted by hook".to_string());
+                let reason = extract_reason(&stdout, &stderr).unwrap_or_else(|| "halted by hook".to_string());
                 HookDecision {
                     action: HookAction::Halt,
                     reason,

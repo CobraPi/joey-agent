@@ -1944,7 +1944,7 @@ impl Agent {
                     let wrapped = maybe_wrap_untrusted(&tc.function.name, &content);
                     let preview = preview_result(&content);
                     // Feature 005 (T011): emit FileChange events before ToolEnd.
-                    emit_pending_file_changes(&tx, &tc.function.name, &content);
+                    emit_pending_file_changes(tx, &tc.function.name, &content);
                     let _ = tx.send(AgentEvent::ToolEnd {
                         name: tc.function.name.clone(),
                         is_error,
@@ -1975,7 +1975,7 @@ impl Agent {
                     let content_raw = result.to_content_string();
                     let preview = preview_result(&content_raw);
                     // Feature 005 (T011): emit FileChange events before ToolEnd.
-                    emit_pending_file_changes(&tx, &tc.function.name, &content_raw);
+                    emit_pending_file_changes(tx, &tc.function.name, &content_raw);
                     let _ = tx.send(AgentEvent::ToolEnd {
                         name: tc.function.name.clone(),
                         is_error,
@@ -2002,7 +2002,7 @@ impl Agent {
                         // model sees it on the next iteration.
                         self.push_message(
                             Message::tool_result(
-                                &format!("{}_loop_nudge", tc.id),
+                                format!("{}_loop_nudge", tc.id),
                                 "loop_detection",
                                 crate::loop_detection::LoopDetector::nudge_message().to_string(),
                             ),

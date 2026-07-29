@@ -124,6 +124,7 @@ impl FallbackEntry {
 ///
 /// Port of OMO's `ModelRequirement` type (data-model.md).
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct ModelRequirement {
     /// Ordered candidates (tried first → last).
     pub fallback_chain: Vec<FallbackEntry>,
@@ -134,15 +135,6 @@ pub struct ModelRequirement {
     pub requires_provider: Option<Vec<String>>,
 }
 
-impl Default for ModelRequirement {
-    fn default() -> Self {
-        Self {
-            fallback_chain: Vec::new(),
-            requires_any_model: false,
-            requires_provider: None,
-        }
-    }
-}
 
 // ── AvailableModelSet ───────────────────────────────────────────────
 

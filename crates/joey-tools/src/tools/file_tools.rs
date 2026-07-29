@@ -402,7 +402,7 @@ impl Tool for ReadFile {
         }
 
         // Track file read for session change detection.
-        _track_file_read(&resolved_str, &text);
+        _track_file_read(&resolved_str, text);
 
         ToolResult::Text(dumps(&Value::Object(result)))
     }

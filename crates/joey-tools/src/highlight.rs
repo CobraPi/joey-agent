@@ -135,7 +135,7 @@ fn language_for_path(path: &str) -> Option<&'static str> {
         "sh" => "sh",
         _ => return None,
     };
-    if SUPPORTED_EXTENSIONS.iter().any(|e| *e == lang) {
+    if SUPPORTED_EXTENSIONS.contains(&lang) {
         Some(lang)
     } else {
         None

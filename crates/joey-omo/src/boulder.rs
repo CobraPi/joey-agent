@@ -11,17 +11,14 @@ use serde::{Deserialize, Serialize};
 /// Status of a boulder work entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum BoulderWorkStatus {
+    #[default]
     Active,
     Completed,
     Abandoned,
 }
 
-impl Default for BoulderWorkStatus {
-    fn default() -> Self {
-        Self::Active
-    }
-}
 
 // ── BoulderWork ─────────────────────────────────────────────────────
 
@@ -92,7 +89,7 @@ impl BoulderState {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 

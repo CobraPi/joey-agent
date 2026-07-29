@@ -138,6 +138,7 @@ pub(crate) struct Subagent {
 
 impl Subagent {
     /// Construct a subagent from a delegation request.
+    #[allow(clippy::too_many_arguments)] // deviation: domain-shaped construction, parameter bag would be speculative abstraction
     pub(crate) fn new(
         req: &DelegationRequest,
         parent_config: &AgentConfig,

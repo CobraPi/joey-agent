@@ -316,10 +316,10 @@ impl DelegateTask {
                 r.goal
             ));
             if r.success {
-                output.push_str(&format!("      status: success\n"));
+                output.push_str("      status: success\n");
                 output.push_str(&format!("      summary: {}\n", r.summary));
             } else {
-                output.push_str(&format!("      status: failed\n"));
+                output.push_str("      status: failed\n");
                 output.push_str(&format!(
                     "      error: {}\n",
                     r.error.as_deref().unwrap_or("unknown")

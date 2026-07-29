@@ -106,8 +106,7 @@ pub fn is_safe_read_only_command(command: &str) -> bool {
 
     // Check git read-only subcommands.
     for safe_git in SAFE_GIT_SUBCOMMANDS {
-        if cmd_lower.starts_with(safe_git) {
-            let rest = &cmd_lower[safe_git.len()..];
+        if let Some(rest) = cmd_lower.strip_prefix(safe_git) {
             // Must be followed by space, hyphen, or end-of-string.
             if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('-') {
                 return true;

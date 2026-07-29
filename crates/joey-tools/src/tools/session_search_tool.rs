@@ -91,7 +91,7 @@ impl Tool for SessionSearch {
             .get("limit")
             .and_then(|v| v.as_i64())
             .unwrap_or(5)
-            .clamp(1, 20) as i64;
+            .clamp(1, 20);
 
         let session_id = args.get("session_id").and_then(|v| v.as_str());
         let around_message_id = args.get("around_message_id").and_then(|v| v.as_i64());
@@ -105,7 +105,7 @@ impl Tool for SessionSearch {
 
         // Scroll mode: session_id + around_message_id.
         if let (Some(sid), Some(msg_id)) = (session_id, around_message_id) {
-            return scroll_mode(&db, sid, msg_id as i64, window);
+            return scroll_mode(&db, sid, msg_id, window);
         }
 
         // Search mode.
