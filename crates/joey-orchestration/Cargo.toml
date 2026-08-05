@@ -9,6 +9,7 @@ joey-core.workspace = true
 joey-providers.workspace = true
 joey-tools.workspace = true
 joey-agent-core.workspace = true
+joey-llm-selector.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

@@ -160,6 +160,10 @@ pub struct AuxSummaryBackend {
     provider_label: String,
     timeout: Duration,
     aux_context_length: i64,
+    /// Optional dynamic model allocator (feature 011). When set and active,
+    /// the compression model is resolved by the allocator instead of the
+    /// configured `model`. None = byte-identical to pre-feature-011.
+    model_allocator: Option<std::sync::Arc<dyn joey_llm_selector::ModelAllocator>>,
 }
 
 impl AuxSummaryBackend {
@@ -233,7 +237,13 @@ impl AuxSummaryBackend {
         let aux_context_length =
             super::catalog::get_model_context_length(&model, aux_context_config);
 
-        Self { client, model, provider_label, timeout, aux_context_length }
+        Self { client, model, provider_label, timeout, aux_context_length, model_allocator: None }
+    }
+
+    /// Set the dynamic model allocator (feature 011). When set and active,
+    /// the compression call resolves its model via the allocator.
+    pub fn set_model_allocator(&mut self, allocator: std::sync::Arc<dyn joey_llm_selector::ModelAllocator>) {
+        self.model_allocator = Some(allocator);
     }
 }
 
@@ -249,7 +259,21 @@ impl SummaryBackend for AuxSummaryBackend {
                 "No LLM provider configured for task=compression".to_string(),
             ));
         };
-        let model = model_override.unwrap_or(&self.model).to_string();
+        let model = if let Some(allocator) = &self.model_allocator {
+            if allocator.is_active() {
+                let alloc = allocator.resolve(
+                    joey_llm_selector::ModuleId::Compression,
+                    false, // compression never has images
+                    false, // compression doesn't need tools
+                    self.aux_context_length.max(0) as u64,
+                );
+                alloc.model_id
+            } else {
+                model_override.unwrap_or(&self.model).to_string()
+            }
+        } else {
+            model_override.unwrap_or(&self.model).to_string()
+        };
         // A single user-role message, non-streaming, NO max_tokens: the
         // output cap must never truncate a summary
         // (context_compressor.py:2359-2379).

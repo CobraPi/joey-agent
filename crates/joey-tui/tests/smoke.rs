@@ -91,6 +91,8 @@ fn renders_busy_state_with_events() {
         is_error: false,
         result_preview: "file1.rs\nfile2.rs".into(),
         duration_secs: 0.12,
+        exit_code: Some(0),
+        full_result: "file1.rs\nfile2.rs".into(),
     });
     app.apply(AgentEvent::ApiCallEnd { usage: usage(100, 50) });
     app.apply(AgentEvent::Done {
@@ -197,6 +199,8 @@ fn tool_end_resolves_across_intervening_items() {
         is_error: false,
         result_preview: "Finished".into(),
         duration_secs: 4.2,
+        exit_code: Some(0),
+        full_result: "Finished".into(),
     });
 
     let tool = app

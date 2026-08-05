@@ -6,6 +6,7 @@
 //! cron/mcp/skills/version. A rewrite of Hermes Agent (Nous Research, MIT).
 
 mod commands;
+mod llm_selector;
 mod auth_cmd;
 mod config_cmd;
 mod cron_cmd;
@@ -187,6 +188,8 @@ enum Command {
     Discover,
     /// Print the resolved home directory (joey extension)
     Home,
+    /// Manage the dynamic LLM model selector (feature 011)
+    LlmSelector(LlmSelectorArgs),
 }
 
 /// `joey model` (main.py `cmd_model`): the provider + model setup wizard.
@@ -195,6 +198,17 @@ pub struct ModelArgs {
     /// Clear the cached model picker catalogs before showing the picker
     #[arg(long = "refresh")]
     pub refresh: bool,
+}
+
+/// `joey llm-selector` (feature 011): top-level CLI mirror of the `/llm-selector`
+/// REPL command (Constitution II — CLI/TUI parity). Passes all trailing args to
+/// the same handler the slash command uses, so output is identical.
+#[derive(Args, Debug, Default)]
+pub struct LlmSelectorArgs {
+    /// Subcommand + args forwarded verbatim to the `/llm-selector` handler
+    /// (e.g. `status`, `pool`, `pin <module> <model>`, `allocations`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
 }
 
 /// `joey chat` — mirrors the top-level flags (with `-q`/`-Q` extras);
@@ -515,6 +529,20 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Some(Command::Home) => {
             println!("{}", joey_core::joey_home().display());
             Ok(0)
+        }
+        Some(Command::LlmSelector(args)) => {
+            // Constitution II: same handler as the REPL slash command, so
+            // output is byte-identical between `joey llm-selector ...` and
+            // `/llm-selector ...`. Join the trailing args back into the
+            // whitespace-split string the handler expects.
+            let joined = args.args.join(" ");
+            match llm_selector::llm_selector_slash(&joined) {
+                Ok(()) => Ok(0),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    Ok(1)
+                }
+            }
         }
         Some(Command::Chat(chat)) => {
             wire_flag_env(chat.yolo, chat.ignore_user_config, chat.safe_mode);

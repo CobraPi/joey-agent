@@ -308,6 +308,39 @@ no trait signatures modified. All changes are additive SAFETY comments and
 the audit script improvements (cfg(test) filtering, standalone test-file
 detection).
 
+## Terminal async performance & streaming (feature 009, 2026-07-30)
+
+Replaced the terminal tool's blocking `spawn_blocking(read_to_end)` output
+capture with async chunked reads, and fixed the inert background-process
+`notify_on_complete` path. This is an **internal implementation change** —
+the observable contract is preserved:
+
+- **Result schema unchanged**: the `terminal` tool still returns
+  `{output, exit_code, error, exit_code_meaning}` with identical exit-code
+  semantics (0 success, non-zero command code, negative signal, 124 timeout),
+  timeout policy (180s default / 600s max), and CWD-marker / ANSI-strip /
+  redaction post-processing. The merged-stdout/stderr single `os_pipe`
+  contract is retained (the reader FD is wrapped in `tokio::io::AsyncFd` for
+  native async readiness — no `Stdio::piped()` switch that would alter byte
+  ordering). New dependency `tempfile` (justified in `research.md` R5).
+- **`Tool` trait unchanged**; `ToolContext` gained two additive optional
+  fields — `progress_sender: Option<UnboundedSender<String>>` and
+  `interrupt_flag: Option<Arc<AtomicBool>>` — both defaulting to `None`
+  (existing callers unaffected). Regression tests in `context.rs`.
+- **New behavior (additive, upstream-faithful surface)**: live `ToolProgress`
+  deltas during a command (≤1s latency), a "running… Ns" heartbeat for silent
+  commands (≥2s), cooperative Ctrl-C cancellation mid-command, and a
+  background reaper that drains child pipes into the existing `RingBuffer`
+  and fires a one-shot completion notice. None of these alter any on-disk
+  format, config key, CLI flag, or session-handle grammar.
+- **Deliberate divergence (unchanged)**: the upstream-equivalent streaming
+  reuses Joey's existing `AgentEvent::ToolProgress` variant (already consumed
+  by both CLI and TUI) rather than adding a new event type — `ToolProgress`
+  already carries the tool name + progress text, matching upstream's
+  `tool_progress` callback surface.
+
+Feature spec/tracking: `specs/009-terminal-async-perf/`.
+
 ## Deliberate deviations (not oversights)
 
 - **Anthropic OAuth "Claude Code" impersonation is NOT ported.** Upstream,
@@ -390,6 +423,46 @@ detection).
 - **Skills self-improvement** (curator, `skill_manage` authoring/patching)
   is not ported; skills are discovered, indexed into the prompt, and viewable.
 
+## Spec-Kit Development IDE (feature 010, 2026-08-03)
+
+`joey-speckit-ui` is a **Joey-original crate** (no upstream Hermes
+equivalent). It extends the visual UI from `specs/001` from a read-only
+viewer into a full authoring and execution surface for Spec-Kit artifacts.
+
+**Status: Complete (all phases implemented and tested)**
+
+- **Artifact authoring (US1):** discovery, GET/PATCH for every artifact kind
+  (spec, plan, tasks, checklists, research, data-model, contracts, quickstart,
+  constitution) with whole/section scope, conflict-checked writes (FR-020),
+  structural validation (FR-007), and rendered outlines (FR-006).
+- **Workflow controls (US2):** step catalog with derived readiness states
+  (FR-022), run configuration with staged/direct change modes (FR-010),
+  out-of-process agent execution via `joey` CLI subprocess (FR-011),
+  interaction streaming over WS (FR-012/013/014), project-level overrides
+  (FR-034).
+- **Change review (US3):** Git-backed staging area with temp worktree for
+  staged mode (FR-016), hunk-level accept/reject (FR-016/SC-016), recovery
+  with safe checkpoints (FR-017/033), re-run linking (FR-019).
+- **Workspace (US4):** resizable pane layout (FR-002), workspace preferences
+  (FR-026), cross-artifact search (FR-025), keyboard navigation + ARIA (FR-027).
+- **Readiness (US5):** dependency-graph-based stale propagation (FR-021),
+  traceability (FR-023/032), streamed JSONL history (FR-018/031).
+
+**Deliberate deviation:** the backend drives the agent **out-of-process**
+(spawns `joey` CLI as a subprocess, streams stdout/stderr/interactions over
+WS) rather than linking `joey-agent-core` in-process. This is Constitution
+Principle VI (depend only on the CLI contract) and matches the existing
+`specs/001` `/speckit-implement` wrapper pattern. An in-process reimplementation
+is explicitly rejected.
+
+**Dependencies added:** `gix 0.66` (pure-Rust git read/object side, ~50s
+compile-time delta), `which 7`, `dirs 6`. Frontend: `diff 5.2`, `split.js 1.6`.
+
+**New on-disk format:** JSONL history at
+`~/.joey/speckit-ui/history/<feature-id>.jsonl`, `schema_version: 1`
+mandatory. Round-trip + partial-line-tolerance + migration-stub tests in
+`tests/history_jsonl_roundtrip.rs`.
+
 ## Deferred (matches upstream's own "defer for a first port" guidance)
 
 - The 20 messaging platform adapters (Telegram, Discord, Slack, WhatsApp,
@@ -411,3 +484,33 @@ license and upstream attribution retained throughout. The `mcp__` wire prefix
 and `§` memory delimiter are kept identical for interoperability. Upstream
 attribution URLs (github.com/NousResearch/hermes-agent,
 hermes-agent.nousresearch.com) are intentionally left un-rebranded.
+
+## Dynamic LLM Model Selector (feature 011, 2026-08-04)
+
+**Status**: Complete (Rust-native implementation; multi-provider generalization).
+
+Upstream's `specs/003-dynamic-llm-selector` is GitHub-Copilot-specific. Joey
+generalizes the candidate pool to *any provider exposing a live catalog*
+(Copilot, OpenRouter, ZAI, Anthropic, …) while keeping Copilot as the canonical
+source. The implementation lives in a new dedicated crate `joey-llm-selector`
+(Constitution I/VI).
+
+**Deliberate deviation**: upstream's `auto` cost-scorer (`agent/model_metadata.py`,
+`model_cost_guard.py`) was deliberately NOT ported — it is tightly coupled to
+the GitHub-Copilot-specific Python runtime. Joey builds a clean-room capability
++ cost scorer (`ColdStartScorer`) that is multi-provider and has no external
+dependency. This is documented in `specs/011-dynamic-llm-selector/research.md §1`.
+
+**On-disk format**: `~/.joey/llm-selector/allocations.json` (schema_version 1,
+versioned public format, atomic write via `atomic_json_write`). Machine-global
+across profiles via `process_joey_home()` (FR-014).
+
+**Implemented**: cold-start scorer, catalog consolidation (Copilot + models.dev),
+per-module allocation at 3 intercepts (main turn, compression, subagent pending),
+detached tokio diagnoser with heuristic performance estimator, learning loop
+with budget bounds, pin/unpin, `/llm-selector` slash + CLI command, auto-disable
+on empty catalog, degraded fallback chain, cross-profile map sharing.
+
+**Deferred**: subagent intercept (T028 — threading allocator through
+orchestration layer); real LLM-based diagnoser call (heuristic estimator used
+for now — future enhancement via `joey-providers` chat client).

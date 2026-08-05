@@ -7,6 +7,8 @@
 use async_trait::async_trait;
 use joey_agent_core::{AgentConfig, AgentEvent};
 use joey_core::Config;
+#[allow(unused_imports)] // Used via the `dyn ModelAllocator` field + trait methods.
+use joey_llm_selector::ModelAllocator;
 use joey_tools::registry::{Tool, ToolResult};
 use joey_tools::{ToolContext, ToolRegistry};
 use serde_json::{json, Value};
@@ -28,6 +30,12 @@ pub struct DelegateTask {
     /// Optional OMO category resolver (None = raw delegate_task without
     /// category/subagent_type support).
     resolver: Option<Arc<dyn CategoryResolver>>,
+    /// Optional dynamic model allocator (feature 011, T028). When the resolved
+    /// subagent model is `auto`, the tool consults the allocator's
+    /// `resolve(ModuleId::Subagent, …)` to pick a concrete model id before
+    /// dispatch. None when the selector is inactive (byte-identical to
+    /// pre-feature-011).
+    model_allocator: Option<Arc<dyn joey_llm_selector::ModelAllocator>>,
 }
 
 impl DelegateTask {
@@ -46,7 +54,14 @@ impl DelegateTask {
             base_registry,
             event_tx,
             resolver,
+            model_allocator: None,
         }
+    }
+
+    /// Set the dynamic model allocator (feature 011, T028). Called by the CLI
+    /// after agent construction when the selector is active.
+    pub fn set_model_allocator(&mut self, allocator: Arc<dyn joey_llm_selector::ModelAllocator>) {
+        self.model_allocator = Some(allocator);
     }
 }
 
@@ -225,11 +240,36 @@ impl Tool for DelegateTask {
             }
         }
 
+        // Feature 011 (T028): when the resolved subagent model is `auto` (the
+        // activation sentinel) and a dynamic model allocator is wired, resolve
+        // a concrete model id for the Subagent module before dispatch. This is
+        // the third intercept point (research.md §2). When the allocator is
+        // None or inactive, `auto` falls through to the parent model
+        // (byte-identical to pre-feature-011).
+        let mut effective_model = resolved_model
+            .or_else(|| args.get("model").and_then(|v| v.as_str()).map(String::from));
+        if effective_model.as_deref().unwrap_or(&self.parent_config.model) == "auto" {
+            if let Some(allocator) = &self.model_allocator {
+                if allocator.is_active() {
+                    let alloc = allocator.resolve(
+                        joey_llm_selector::ModuleId::Subagent,
+                        false, // subagents don't carry images at dispatch time
+                        true,  // subagents need tools
+                        0,     // token_budget_hint: no hard gate
+                    );
+                    // Never send "auto" to the API (FR-020).
+                    if alloc.model_id != "auto" {
+                        effective_model = Some(alloc.model_id);
+                    }
+                }
+            }
+        }
+
         let req = DelegationRequest {
             goal: goal.clone(),
             context: args.get("context").and_then(|v| v.as_str()).map(String::from),
             tasks: Vec::new(),
-            model: resolved_model.or_else(|| args.get("model").and_then(|v| v.as_str()).map(String::from)),
+            model: effective_model,
             toolsets: args
                 .get("toolsets")
                 .and_then(|v| v.as_array())

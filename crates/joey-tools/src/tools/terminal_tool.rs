@@ -8,7 +8,7 @@
 //! marker, ANSI stripping, secret redaction, the exit-code-meaning table, and
 //! the timeout contract (default 180s, hard foreground max 600s).
 
-use std::io::Read;
+use std::os::unix::io::AsRawFd as _;
 use std::time::Duration;
 
 use crate::file_tracker::FileTracker;
@@ -248,7 +248,7 @@ impl Tool for Terminal {
         // Background mode: spawn the process, register in ProcessRegistry,
         // and return the session_id immediately (FR-012, T069).
         if background {
-            return self.execute_background(command, &cwd, args).await;
+            return self.execute_background(command, &cwd, args, ctx).await;
         }
         if pty {
             return ToolResult::Text(dumps(&json!({
@@ -278,8 +278,8 @@ impl Tool for Terminal {
         // command so we can detect terminal-caused mutations afterward.
         let pre_snapshot = snapshot_tracked_files();
 
-        let (raw_output, returncode, timed_out) =
-            run_bash(&command, &cwd, effective_timeout).await;
+        let (raw_output, returncode, timed_out, interrupted) =
+            run_bash(&command, &cwd, effective_timeout, ctx).await;
 
         // Spawn/exec failures surface in the error field (upstream:
         // {"output": "", "exit_code": -1, "error": "Command execution failed: ..."}).
@@ -302,6 +302,9 @@ impl Tool for Terminal {
 
         if timed_out {
             output.push_str(&format!("\n[Command timed out after {}s]", effective_timeout));
+        }
+        if interrupted {
+            output.push_str("\n[Command interrupted by user]");
         }
 
         // Truncate output if too long, keeping both head and tail.
@@ -343,12 +346,14 @@ impl Tool for Terminal {
 
 impl Terminal {
     /// Spawn a command in the background, register it in the global
-    /// ProcessRegistry, and return a session handle immediately (FR-012).
+    /// ProcessRegistry, launch a reaper to drain its pipes, and return a
+    /// session handle immediately (FR-012).
     async fn execute_background(
         &self,
         command: String,
         cwd: &std::path::Path,
         args: Value,
+        ctx: &ToolContext,
     ) -> ToolResult {
         let notify_on_complete = args
             .get("notify_on_complete")
@@ -368,7 +373,7 @@ impl Terminal {
             cmd.env(k, v);
         }
 
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 return ToolResult::Text(dumps(&json!({
@@ -379,6 +384,12 @@ impl Terminal {
                 })));
             }
         };
+
+        // Take the pipe readers so the reaper owns them. The stored `Child`
+        // keeps neither — this is the core fix for the "pipes never read" bug
+        // (the RingBuffer used to stay empty because nobody drained them).
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
 
         let session_id = format!("proc-{}", uuid::Uuid::new_v4().simple());
 
@@ -395,6 +406,22 @@ impl Terminal {
                 );
             session.notify_on_complete = notify_on_complete;
             reg.insert(session_id.clone(), session);
+        }
+
+        // Launch the reaper: it drains stdout/stderr into the ring buffers,
+        // awaits exit, records the outcome, and (if requested) fires a
+        // one-shot completion notice through the progress channel.
+        let reaper_handle = crate::tools::process_tool::spawn_reaper(
+            session_id.clone(),
+            stdout,
+            stderr,
+            ctx.clone(),
+        );
+        {
+            let mut reg = registry.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(session) = reg.get_mut(&session_id) {
+                session.reaper_handle = Some(reaper_handle);
+            }
         }
 
         ToolResult::Text(dumps(&json!({
@@ -426,9 +453,24 @@ fn extract_cwd_marker(raw: &str) -> (String, Option<String>) {
 }
 
 /// Run `command` under bash with stderr merged into stdout on a single pipe
-/// (os_pipe), a sanitized environment, and a timeout. Returns
-/// (combined_output, exit_code, timed_out).
-async fn run_bash(command: &str, cwd: &std::path::Path, timeout_secs: u64) -> (String, i64, bool) {
+/// (os_pipe), a sanitized environment, and a timeout. Streams progress via
+/// `ctx.emit_progress()`. Returns (combined_output, exit_code, timed_out).
+///
+/// Streaming architecture (feature 009):
+/// - The os_pipe reader FD is wrapped in `tokio::io::AsyncFd` for native async
+///   read-readiness (see research.md R2). This avoids `spawn_blocking` which
+///   stalled the turn-driving task.
+/// - Output chunks (≤ 64 KB) are written to an in-memory `String` for small
+///   outputs or a `tempfile::NamedTempFile` for large ones (threshold: 4 KB).
+/// - Each chunk emits a `ToolProgress` event (throttled to 50ms) so the user
+///   sees live output.
+/// - Silent commands (no output for ≥ 2s) get a "running… Ns" heartbeat.
+async fn run_bash(
+    command: &str,
+    cwd: &std::path::Path,
+    timeout_secs: u64,
+    ctx: &ToolContext,
+) -> (String, i64, bool, bool) {
     let bash = find_bash();
     // Wrapper: preserve $? of the user command, then print the live cwd.
     let script = format!(
@@ -439,11 +481,11 @@ async fn run_bash(command: &str, cwd: &std::path::Path, timeout_secs: u64) -> (S
 
     let (mut reader, writer) = match os_pipe::pipe() {
         Ok(p) => p,
-        Err(e) => return (format!("Failed to execute command: {}", e), -1, false),
+        Err(e) => return (format!("Failed to execute command: {}", e), -1, false, false),
     };
     let writer2 = match writer.try_clone() {
         Ok(w) => w,
-        Err(e) => return (format!("Failed to execute command: {}", e), -1, false),
+        Err(e) => return (format!("Failed to execute command: {}", e), -1, false, false),
     };
 
     let mut cmd = tokio::process::Command::new(&bash);
@@ -460,22 +502,62 @@ async fn run_bash(command: &str, cwd: &std::path::Path, timeout_secs: u64) -> (S
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return (format!("Failed to spawn command: {}", e), -1, false),
+        Err(e) => return (format!("Failed to spawn command: {}", e), -1, false, false),
     };
     // Parent must drop its writer ends or the reader never sees EOF.
     drop(cmd);
 
-    let read_task = tokio::task::spawn_blocking(move || {
+    // Wrap the os_pipe reader in AsyncFd for native async reads.
+    // The reader is a `std::process::ChildStdin`-like FD that impls `AsRawFd`.
+    let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&reader);
+    // SAFETY: the FD is owned by `reader` which stays alive for the duration
+    // of this function. We dup it so AsyncFd has its own owned FD.
+    let owned_fd = unsafe { libc::dup(raw_fd) };
+    if owned_fd < 0 {
+        // Fallback: blocking read (same as old behavior).
         let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+        let _ = std::io::Read::read_to_end(&mut reader, &mut buf);
+        let output = String::from_utf8_lossy(&buf).into_owned();
+        let timed_out = false;
+        let status = child.wait().await.ok();
+        let code = exit_code_from_status(status, timed_out);
+        return (output, code, timed_out, false);
+    }
+    let async_fd = match tokio::io::unix::AsyncFd::new(OwnedFd(owned_fd)) {
+        Ok(fd) => fd,
+        Err(_) => {
+            // Fallback: blocking read.
+            unsafe { libc::close(owned_fd) };
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut reader, &mut buf);
+            let output = String::from_utf8_lossy(&buf).into_owned();
+            let status = child.wait().await.ok();
+            let code = exit_code_from_status(status, false);
+            return (output, code, false, false);
+        }
+    };
 
+    // Stream output with progress, timeout, and heartbeat.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let (output, interrupted) = stream_output(async_fd, ctx, deadline).await;
+
+    // On cooperative interrupt, kill the child immediately and return the
+    // partial output captured so far. The agent's post-dispatch interrupt
+    // check closes the turn; here we just stop the command promptly.
+    if interrupted {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return (output, 124, false, true);
+    }
+
+    // Wait for the child to exit (it should already be done or about to be
+    // since the pipe is closed after stream_output returns).
     let mut timed_out = false;
-    let status = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-        Ok(Ok(status)) => Some(status),
+    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(Ok(s)) => Some(s),
         Ok(Err(_)) => None,
         Err(_) => {
+            // Child didn't exit within 5s of pipe EOF — kill it.
             timed_out = true;
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -483,13 +565,55 @@ async fn run_bash(command: &str, cwd: &std::path::Path, timeout_secs: u64) -> (S
         }
     };
 
-    let output = read_task.await.unwrap_or_default();
-    let code: i64 = match status {
+    // Check if the timeout fired during streaming (stream_output returns
+    // early with partial output).
+    if tokio::time::Instant::now() >= deadline {
+        timed_out = true;
+    }
+
+    let code = if timed_out {
+        124
+    } else {
+        exit_code_from_status(status, timed_out)
+    };
+
+    (output, code, timed_out, false)
+}
+
+/// Wrapper to give a raw FD the `AsRawFd` impl that `AsyncFd` requires.
+/// We own this FD (via `dup`) and must close it on drop.
+struct OwnedFd(std::os::unix::io::RawFd);
+
+impl std::os::unix::io::AsRawFd for OwnedFd {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.0
+    }
+}
+
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.0);
+        }
+    }
+}
+
+// SAFETY: OwnedFd is just a raw FD — safe to send/share across threads.
+// The FD is not shared (we dup'd it), and close-on-drop is the only mutation.
+unsafe impl Send for OwnedFd {}
+unsafe impl Sync for OwnedFd {}
+
+/// Extract the exit code from an `ExitStatus` using the same logic as the
+/// old `run_bash`.
+fn exit_code_from_status(status: Option<std::process::ExitStatus>, timed_out: bool) -> i64 {
+    match status {
         Some(s) => {
             #[cfg(unix)]
             {
                 use std::os::unix::process::ExitStatusExt;
-                s.code().map(|c| c as i64).unwrap_or_else(|| -(s.signal().unwrap_or(1) as i64))
+                s.code()
+                    .map(|c| c as i64)
+                    .unwrap_or_else(|| -(s.signal().unwrap_or(1) as i64))
             }
             #[cfg(not(unix))]
             {
@@ -498,8 +622,185 @@ async fn run_bash(command: &str, cwd: &std::path::Path, timeout_secs: u64) -> (S
         }
         None if timed_out => 124,
         None => -1,
+    }
+}
+
+/// Stream output from the `AsyncFd`, emitting progress events, with timeout
+/// and heartbeat. Returns the full accumulated output as a `String`.
+///
+/// This implements:
+/// - T006: temp-file capture (outputs > 4 KB spill to disk, bounded memory)
+/// - T007: chunk coalescing (50ms throttle window)
+/// - T008: elapsed-time heartbeat (2s interval for silent commands)
+/// - T012: cooperative interrupt (polls `ctx.is_interrupted()` and returns early)
+///
+/// Returns `(full_output, interrupted)` where `interrupted` is true when the
+/// loop broke early because the user requested cancellation.
+async fn stream_output(
+    async_fd: tokio::io::unix::AsyncFd<OwnedFd>,
+    ctx: &ToolContext,
+    deadline: tokio::time::Instant,
+) -> (String, bool) {
+    const CHUNK_SIZE: usize = 64 * 1024;
+    const SMALL_THRESHOLD: usize = 4096;
+    const THROTTLE_MS: u64 = 50;
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+    // Interrupt polling cadence: well under the ~3s cancellation target.
+    const INTERRUPT_POLL: Duration = Duration::from_millis(100);
+
+    // Output capture: start in-memory, spill to temp file if large.
+    let mut mem_buf: Vec<u8> = Vec::new();
+    let mut total_bytes: usize = 0;
+    let mut temp_file: Option<tempfile::NamedTempFile> = None;
+
+    // Throttling state. `last_emit = None` initially so the first chunk
+    // emits immediately (the 50ms window only coalesces true bursts, not the
+    // very first delta which otherwise gets glued to the next one).
+    let mut last_emit: Option<tokio::time::Instant> = None;
+    let mut pending_chunk: Vec<u8> = Vec::new();
+
+    // Heartbeat state.
+    let start = tokio::time::Instant::now();
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.tick().await; // consume the immediate first tick
+    // Interrupt polling timer.
+    let mut interrupt_tick = tokio::time::interval(INTERRUPT_POLL);
+    interrupt_tick.tick().await; // consume the immediate first tick
+
+    let mut interrupted = false;
+
+    let mut buf = vec![0u8; CHUNK_SIZE];
+
+    loop {
+        tokio::select! {
+            biased;
+
+            // Cooperative interrupt (Ctrl-C): checked first so cancellation
+            // takes priority over reading more output.
+            _ = interrupt_tick.tick() => {
+                if ctx.is_interrupted() {
+                    flush_chunk(&pending_chunk, ctx, &mut last_emit);
+                    interrupted = true;
+                    break;
+                }
+            }
+
+            _ = tokio::time::sleep_until(deadline) => {
+                // Timeout: flush pending, break.
+                flush_chunk(&pending_chunk, ctx, &mut last_emit);
+                break;
+            }
+
+            _ = heartbeat.tick() => {
+                // Silent-command heartbeat: emit elapsed time if no output
+                // has been seen recently.
+                if pending_chunk.is_empty() {
+                    let elapsed = start.elapsed().as_secs();
+                    ctx.emit_progress(format!("running… {}s", elapsed));
+                }
+            }
+
+            guard = async_fd.readable() => {
+                let mut guard = match guard {
+                    Ok(g) => g,
+                    Err(_) => break, // FD error — treat as EOF.
+                };
+                // Try a non-blocking read.
+                let n = match guard.try_io(|inner| {
+                    let fd = inner.get_ref().as_raw_fd();
+                    let ret = unsafe {
+                        libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len())
+                    };
+                    if ret < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(ret as usize)
+                    }
+                }) {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(_)) => break, // EOF or error
+                    Err(_would_block) => {
+                        // Spurious readiness — loop and try again.
+                        continue;
+                    }
+                };
+                drop(guard);
+
+                if n == 0 {
+                    // EOF: flush pending and stop.
+                    flush_chunk(&pending_chunk, ctx, &mut last_emit);
+                    break;
+                }
+
+                let chunk = &buf[..n];
+
+                // Write to output capture.
+                total_bytes += n;
+                if total_bytes > SMALL_THRESHOLD {
+                    // Spill to temp file.
+                    if temp_file.is_none() {
+                        let mut existing = std::mem::take(&mut mem_buf);
+                        match tempfile::NamedTempFile::new() {
+                            Ok(mut f) => {
+                                use std::io::Write;
+                                let _ = f.write_all(&existing);
+                                let _ = f.write_all(chunk);
+                                temp_file = Some(f);
+                                existing.clear();
+                            }
+                            Err(_) => {
+                                // Can't create temp file — keep in memory.
+                                mem_buf.extend_from_slice(chunk);
+                            }
+                        }
+                    } else if let Some(ref mut f) = temp_file {
+                        use std::io::Write;
+                        let _ = f.write_all(chunk);
+                    }
+                } else {
+                    mem_buf.extend_from_slice(chunk);
+                }
+
+                // Throttle progress events: emit when 50ms have elapsed
+                // since the last emit (or the pending buffer is full). The
+                // first chunk emits immediately because `last_emit` is None.
+                pending_chunk.extend_from_slice(chunk);
+                let now = tokio::time::Instant::now();
+                let throttle_elapsed = last_emit
+                    .map_or(true, |t| now.duration_since(t) >= Duration::from_millis(THROTTLE_MS));
+                if throttle_elapsed || pending_chunk.len() >= CHUNK_SIZE {
+                    flush_chunk(&pending_chunk, ctx, &mut last_emit);
+                    pending_chunk.clear();
+                }
+            }
+        }
+    }
+
+    // Read back the full output.
+    let output = if let Some(mut f) = temp_file {
+        use std::io::{Seek, SeekFrom};
+        let _ = f.seek(SeekFrom::Start(0));
+        let mut full = String::new();
+        let _ = std::io::Read::read_to_string(&mut f, &mut full);
+        // Add any remaining bytes from mem_buf (shouldn't happen normally).
+        full.push_str(&String::from_utf8_lossy(&mem_buf));
+        full
+    } else {
+        String::from_utf8_lossy(&mem_buf).into_owned()
     };
-    (output, code, timed_out)
+    (output, interrupted)
+}
+
+/// Emit a progress event for a chunk (decodes as lossy UTF-8). The
+/// `last_emit` timestamp is stamped to `Some(now)` so the throttle window
+/// starts ticking from this emit.
+fn flush_chunk(chunk: &[u8], ctx: &ToolContext, last_emit: &mut Option<tokio::time::Instant>) {
+    if chunk.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(chunk);
+    ctx.emit_progress(text.into_owned());
+    *last_emit = Some(tokio::time::Instant::now());
 }
 
 // ── Feature 005: terminal-mutation detection (T012) ──────────────────────

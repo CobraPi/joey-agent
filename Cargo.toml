@@ -11,6 +11,7 @@ members = [
     "crates/joey-tui",
     "crates/joey-cli",
     "crates/joey-speckit-ui",
+    "crates/joey-llm-selector",
     "crates/joey-orchestration",
     "crates/joey-omo",
 ]
@@ -31,6 +32,7 @@ joey-cron = { path = "crates/joey-cron" }
 joey-mcp = { path = "crates/joey-mcp" }
 joey-gateway = { path = "crates/joey-gateway" }
 joey-tui = { path = "crates/joey-tui" }
+joey-llm-selector = { path = "crates/joey-llm-selector" }
 joey-orchestration = { path = "crates/joey-orchestration" }
 joey-omo = { path = "crates/joey-omo" }
 

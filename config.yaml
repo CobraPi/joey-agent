@@ -2,6 +2,17 @@ model:
   default: glm-5.2
   provider: zai
   base_url: https://api.z.ai/api/coding/paas/v4
+  # ── Dynamic LLM Model Selector (feature 011) ────────────────────────────
+  # Engages when `default: auto` is set on a catalog-exposing provider
+  # (copilot / openrouter). Each LLM call site ("module") is routed to the
+  # best-suited model from the live /models catalog; an LLM diagnoser learns
+  # better allocations asynchronously. See `/llm-selector help` and
+  # specs/011-dynamic-llm-selector/spec.md. Off by default — selecting a
+  # concrete model above bypasses the selector entirely.
+  selector:
+    enabled: false            # bool — master switch; auto also engages it
+    budget: 8                 # int  — max diagnoser/model calls per learning cycle (0 = no learning)
+    diagnoser_model: ''       # str  — model id acting as LLM judge (empty = pick a versatile-tier candidate)
 agent:
   max_turns: 600000
   verbose: true

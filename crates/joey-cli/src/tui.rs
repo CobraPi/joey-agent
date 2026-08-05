@@ -414,13 +414,16 @@ async fn wait_for_action(tui: &mut Tui) -> TuiAction {
                     Ok(Event::Paste(s)) => tui.input.insert_str(&s),
                     Ok(Event::Resize(w, h)) => tui.resize(w, h),
                     Ok(Event::Mouse(m)) => {
-                        use crossterm::event::MouseEventKind;
+                        use crossterm::event::{MouseEventKind, MouseButton};
                         match m.kind {
                             MouseEventKind::ScrollUp => {
                                 tui.handle_mouse_scroll(m.row, m.column, true);
                             }
                             MouseEventKind::ScrollDown => {
                                 tui.handle_mouse_scroll(m.row, m.column, false);
+                            }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                tui.handle_mouse_click(m.row, m.column);
                             }
                             _ => {}
                         }
@@ -545,13 +548,16 @@ async fn run_turn(
                         Ok(Event::Paste(s)) => tui.input.insert_str(&s),
                         Ok(Event::Resize(w, h)) => tui.resize(w, h),
                         Ok(Event::Mouse(m)) => {
-                            use crossterm::event::MouseEventKind;
+                            use crossterm::event::{MouseEventKind, MouseButton};
                             match m.kind {
                                 MouseEventKind::ScrollUp => {
                                     tui.handle_mouse_scroll(m.row, m.column, true);
                                 }
                                 MouseEventKind::ScrollDown => {
                                     tui.handle_mouse_scroll(m.row, m.column, false);
+                                }
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    tui.handle_mouse_click(m.row, m.column);
                                 }
                                 _ => {}
                             }

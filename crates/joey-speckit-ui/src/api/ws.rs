@@ -19,6 +19,8 @@ pub fn routes() -> Router<AppState> {
             get(session_handler),
         )
         .route("/api/runs/:run_id", get(run_handler))
+        // Feature 010: attempt interaction/event stream (FR-012/013/014).
+        .route("/api/attempts/:attempt_id/stream", get(attempt_stream_handler))
 }
 
 #[tracing::instrument(skip(state, ws))]
@@ -62,6 +64,32 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, feature_id: Strin
                         });
                         if socket.send(Message::Text(payload.to_string())).await.is_err() {
                             break;
+                        }
+
+                        // FR-021/SC-007: stale propagation — when an upstream
+                        // artifact changes, walk the dependency graph and
+                        // notify downstream artifacts as stale (< 3 s budget).
+                        let repo_relative = evt
+                            .path
+                            .strip_prefix(&state.repo_root)
+                            .ok()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|| evt.file.clone());
+
+                        let artifacts = crate::parser::discovery::discover_artifacts(
+                            &feature_dir,
+                            &feature_id,
+                        );
+                        let links = crate::workflow::build_dependency_graph(&feature_id, &artifacts);
+                        let affected = crate::workflow::propagate_stale(&links, &repo_relative);
+
+                        if !affected.is_empty() {
+                            let stale_payload = json!({
+                                "type": "stale_propagated",
+                                "changed_path": repo_relative,
+                                "affected_paths": affected,
+                            });
+                            let _ = socket.send(Message::Text(stale_payload.to_string())).await;
                         }
                     }
                     None => break,
@@ -137,4 +165,16 @@ async fn stream_channel(mut socket: WebSocket, state: AppState, id: String) {
     }
 
     tracing::info!(id = %id, "channel stream ended");
+}
+
+/// `WS /api/attempts/{attempt_id}/stream`: streams the run/interaction
+/// envelope for a started attempt (research.md §1). Reuses the same
+/// broadcast-channel plumbing as `session_handler` / `run_handler`.
+#[tracing::instrument(skip(state, ws))]
+async fn attempt_stream_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    AxPath(attempt_id): AxPath<String>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| stream_channel(socket, state, attempt_id))
 }

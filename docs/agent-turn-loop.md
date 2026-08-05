@@ -48,8 +48,12 @@ Built from a loaded `Config` via `AgentConfig::from_config`:
 The `Agent` struct (agent.rs:223) owns:
 
 - `client: ProviderClient` — the resolved provider connection.
-- `system_prompt: String` — built once in `Agent::new`, never re-rendered
-  (see [system-prompt.md](system-prompt.md) for why).
+- `system_prompt: String` — built once in `Agent::new` and cached for the
+  life of the session (to keep provider prompt-prefix caches warm); it is
+  only ever rewritten in two narrow cases: `set_session_store` re-renders
+  it to splice in a `Session ID:` line when `pass_session_id` is set, and
+  `switch_model`/fallback activation patch the cached Model/Provider
+  identity lines in place. It is never rebuilt from scratch per-turn.
 - `history: Vec<Message>` — the running conversation (excludes the system
   prompt, which is injected fresh into each request).
 - `session_db` / `session_id` — optional SQLite persistence; every durable

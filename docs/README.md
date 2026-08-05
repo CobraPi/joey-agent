@@ -16,48 +16,46 @@ It complements the top-level `README.md` (quick start / user-facing) and
 ## How to read these docs
 
 Start with the **Architecture Overview**, then dive into whichever
-subsystem you're working on:
+subsystem you're working on. Docs that exist today:
 
-1. [`architecture.md`](architecture.md) — the Cargo workspace, crate
-   dependency graph, high-level data flow from user input to final answer.
+1. [`architecture.md`](architecture.md) — the Cargo workspace (13 crates),
+   crate dependency graph, high-level data flow from user input to final
+   answer.
 2. [`agent-turn-loop.md`](agent-turn-loop.md) — the heart of the project:
    `Agent::run_turn`, the iteration loop, tool dispatch, retries, fallback
    providers, interrupts, and persistence.
-3. [`system-prompt.md`](system-prompt.md) — how the system prompt is
-   assembled: identity (SOUL.md), guidance blocks, skills index, project
-   context files (AGENTS.md/.joey.md/CLAUDE.md/.cursorrules), environment
-   hints, and the volatile memory/user-profile tail.
-4. [`context-compression.md`](context-compression.md) — the automatic
-   context-window compaction engine: thresholds, protected zones,
-   summarization via an auxiliary model, feedback loop, and manual
-   `/compress`.
-5. [`tools.md`](tools.md) — the `Tool` trait, the registry, toolsets,
-   built-in tools, the fuzzy patch matcher, output persistence/truncation,
-   and the parallel-safe / untrusted-tool security model.
-6. [`providers.md`](providers.md) — the provider abstraction: profiles,
-   wire protocols (OpenAI Chat Completions, OpenAI Responses, Anthropic
-   Messages), streaming, retries/backoff, and the fallback chain.
-7. [`security.md`](security.md) — threat scanning of context files, tool
-   error sanitization, untrusted tool-result wrapping, MCP server
-   validation, secret redaction.
-8. [`cron.md`](cron.md) — the built-in scheduler: job store, schedule
-   grammar, ticker, job execution.
-9. [`mcp.md`](mcp.md) — the Model Context Protocol client: stdio
-   transport, handshake, tool discovery/naming, pagination, timeouts.
-10. [`gateway.md`](gateway.md) — the platform-neutral messaging spine
-    (session keys, message events, platform adapter trait).
-11. [`cli.md`](cli.md) — the `joey` binary: argument parsing, profiles,
-    REPL, one-shot mode, slash commands, subcommands.
-12. [`state-and-config.md`](state-and-config.md) — `~/.joey` layout,
-    layered configuration, the SQLite session store, logging, redaction.
-13. [`events.md`](events.md) — the `AgentEvent` stream consumed by UIs
-    (CLI renderer, gateway adapters).
+3. [`HOOKS.md`](HOOKS.md) — `PreToolUse` hooks: shell-command hooks
+   configured in `config.yaml`, the JSON stdin contract, exit-code
+   semantics (allow/deny/halt), and argument-rewriting via stdout.
+4. [`LSP.md`](LSP.md) — the Language Server Protocol integration: how to
+   configure a language server per file type, and the `lsp_diagnostics` /
+   `lsp_definition` / `lsp_references` / `lsp_symbols` tools that appear
+   only when one is configured.
+
+The following topics are referenced by the codebase's module layout but do
+not yet have a dedicated doc page — read the crate itself (or the relevant
+section of `architecture.md`) until these are written:
+
+- `system-prompt.md` — system prompt assembly (`joey-agent-core::prompt`)
+- `context-compression.md` — automatic context-window compaction
+  (`joey-agent-core::agent` compression path)
+- `tools.md` — the `Tool` trait, registry, and built-ins (`joey-tools`)
+- `providers.md` — provider wire protocols (`joey-providers`)
+- `security.md` — threat scanning, redaction, untrusted-content handling
+- `cron.md` — the scheduler (`joey-cron`)
+- `mcp.md` — the MCP stdio client (`joey-mcp`)
+- `gateway.md` — the messaging-platform-neutral spine (`joey-gateway`)
+- `cli.md` — the `joey` binary (`joey-cli`)
+- `state-and-config.md` — `~/.joey` layout, layered config, session store
+- `events.md` — the `AgentEvent` stream
+- `orchestration.md` — subagent delegation (`joey-orchestration`, `joey-omo`)
+- `tui.md` — the animated dashboard (`joey-tui`)
 
 ## Project layout
 
 ```
 joey-agent/
-├── Cargo.toml                 workspace manifest (8 member crates)
+├── Cargo.toml                 workspace manifest (13 member crates)
 ├── crates/
 │   ├── joey-core/             branding, config, SQLite state store, logging, redaction
 │   ├── joey-providers/        LLM provider wire protocols + client
@@ -66,7 +64,12 @@ joey-agent/
 │   ├── joey-cron/             built-in scheduler
 │   ├── joey-mcp/              MCP (Model Context Protocol) stdio client
 │   ├── joey-gateway/          messaging-platform-neutral spine
-│   └── joey-cli/              the `joey` binary (REPL + subcommands)
+│   ├── joey-cli/              the `joey` binary (REPL + subcommands)
+│   ├── joey-tui/              --tui animated ratatui dashboard
+│   ├── joey-llm-selector/     dynamic model allocator (model.default = auto)
+│   ├── joey-orchestration/    subagent manager + delegate_task tool
+│   ├── joey-omo/              multi-agent personas, routing, Atlas plan execution
+│   └── joey-speckit-ui/       standalone backend for the SpecKit Visual UI
 ├── docs/                      you are here
 ├── skills/                    Agent Skills bundled with the project
 ├── README.md                  user-facing quick start

@@ -251,18 +251,35 @@ async fn run_agent(
     let mgr_config = joey_orchestration::ManagerConfig::from_config(config);
     let manager = std::sync::Arc::new(joey_orchestration::SubagentManager::new(mgr_config));
     let base_registry = registry.clone();
-    joey_orchestration::register_orchestration(
+
+    // Feature 011: build the dynamic LLM model allocator when enabled or when
+    // `auto` is the configured model (FR-002). Off-by-default — returns None
+    // and leaves the agent byte-identical to pre-feature-011 (Constitution VII).
+    // Built before orchestration registration so it can be threaded into the
+    // delegate_task tool (T028 subagent intercept).
+    let allocator = crate::llm_selector::try_build_allocator(config);
+
+    joey_orchestration::register_orchestration_with_allocator(
         &mut registry,
         manager.clone(),
         agent_cfg.clone(),
         config.clone(),
         base_registry,
         None,
+        allocator
+            .clone()
+            .map(|a| a as std::sync::Arc<dyn joey_llm_selector::ModelAllocator>),
     );
 
     let mut agent = Agent::new(agent_cfg.clone(), registry, ctx)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     agent.set_provider_semaphore(manager.semaphore());
+
+    // Feature 011: install the allocator on the parent agent (main turn +
+    // compression intercepts).
+    if let Some(allocator) = allocator {
+        agent.install_model_allocator(allocator);
+    }
 
     if !agent.client().has_credentials() {
         anyhow::bail!(

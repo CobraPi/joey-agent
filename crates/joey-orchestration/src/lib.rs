@@ -49,14 +49,64 @@ pub fn register_orchestration(
     base_registry: joey_tools::ToolRegistry,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
 ) {
-    registry.register(std::sync::Arc::new(DelegateTask::new(
+    register_orchestration_inner(
+        registry,
+        manager,
+        parent_config,
+        parent_config_tree,
+        base_registry,
+        event_tx,
+        None,
+        None,
+    );
+}
+
+/// Register orchestration with a dynamic model allocator (feature 011, T028).
+/// The allocator is threaded into the delegate_task tool so subagent dispatch
+/// consults `ModuleId::Subagent` when the resolved model is `auto`.
+pub fn register_orchestration_with_allocator(
+    registry: &mut joey_tools::ToolRegistry,
+    manager: std::sync::Arc<SubagentManager>,
+    parent_config: joey_agent_core::AgentConfig,
+    parent_config_tree: joey_core::Config,
+    base_registry: joey_tools::ToolRegistry,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
+    allocator: Option<std::sync::Arc<dyn joey_llm_selector::ModelAllocator>>,
+) {
+    register_orchestration_inner(
+        registry,
+        manager,
+        parent_config,
+        parent_config_tree,
+        base_registry,
+        event_tx,
+        None,
+        allocator,
+    );
+}
+
+fn register_orchestration_inner(
+    registry: &mut joey_tools::ToolRegistry,
+    manager: std::sync::Arc<SubagentManager>,
+    parent_config: joey_agent_core::AgentConfig,
+    parent_config_tree: joey_core::Config,
+    base_registry: joey_tools::ToolRegistry,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
+    resolver: Option<std::sync::Arc<dyn CategoryResolver>>,
+    allocator: Option<std::sync::Arc<dyn joey_llm_selector::ModelAllocator>>,
+) {
+    let mut delegate = DelegateTask::new(
         manager.clone(),
         parent_config.clone(),
         parent_config_tree.clone(),
         base_registry.clone(),
         event_tx.clone(),
-        None, // no category resolver — delegate_task works in raw mode
-    )));
+        resolver,
+    );
+    if let Some(alloc) = allocator {
+        delegate.set_model_allocator(alloc);
+    }
+    registry.register(std::sync::Arc::new(delegate));
     // Register call_omo_agent without resolver (T153).
     registry.register(std::sync::Arc::new(CallOmoAgent::new(
         manager,
@@ -81,21 +131,39 @@ pub fn register_orchestration_with_resolver(
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
     resolver: std::sync::Arc<dyn CategoryResolver>,
 ) {
-    registry.register(std::sync::Arc::new(DelegateTask::new(
-        manager.clone(),
-        parent_config.clone(),
-        parent_config_tree.clone(),
-        base_registry.clone(),
-        event_tx.clone(),
+    register_orchestration_inner(
+        registry,
+        manager,
+        parent_config,
+        parent_config_tree,
+        base_registry,
+        event_tx,
         Some(resolver.clone()),
-    )));
-    // Register call_omo_agent (T153): research-only delegation for Junior.
-    registry.register(std::sync::Arc::new(CallOmoAgent::new(
+        None, // no allocator — use register_orchestration_with_resolver_and_allocator
+    );
+}
+
+/// Register with BOTH an OMO category resolver and a dynamic model allocator
+/// (feature 011, T028). This is the full-feature registration path used by
+/// the REPL when both OMO categories and the dynamic selector are active.
+pub fn register_orchestration_with_resolver_and_allocator(
+    registry: &mut joey_tools::ToolRegistry,
+    manager: std::sync::Arc<SubagentManager>,
+    parent_config: joey_agent_core::AgentConfig,
+    parent_config_tree: joey_core::Config,
+    base_registry: joey_tools::ToolRegistry,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
+    resolver: std::sync::Arc<dyn CategoryResolver>,
+    allocator: Option<std::sync::Arc<dyn joey_llm_selector::ModelAllocator>>,
+) {
+    register_orchestration_inner(
+        registry,
         manager,
         parent_config,
         parent_config_tree,
         base_registry,
         event_tx,
         Some(resolver),
-    )));
+        allocator,
+    );
 }

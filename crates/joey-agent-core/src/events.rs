@@ -85,6 +85,17 @@ pub enum AgentEvent {
         result_preview: String,
         /// Execution duration in seconds.
         duration_secs: f64,
+        /// Process exit code for `terminal` tool calls (feature 007).
+        /// `None` for non-terminal tools, errors, and any tool whose result
+        /// does not carry an exit code. Sourced by a guarded JSON parse at
+        /// the agent-loop boundary. Drives the `(exit N)` badge in the TUI.
+        exit_code: Option<i64>,
+        /// The full result text for the tool call (feature 007 convergence).
+        /// Backs the crush-style "expand to reveal full content" affordance:
+        /// the TUI stores this in the transcript item's `full_result` and
+        /// renders it when expanded, instead of the one-line `result_preview`.
+        /// `result_preview` stays as the always-shown collapsed summary.
+        full_result: String,
     },
 
     // ── File changes (feature 005) ────────────────────────────────────

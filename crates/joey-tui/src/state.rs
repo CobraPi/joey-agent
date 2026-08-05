@@ -6,7 +6,7 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use joey_agent_core::events::{AgentEvent, FileChangeKind};
 
@@ -81,6 +81,10 @@ pub enum TranscriptItem {
         /// (collapsed → tail-window → full → collapsed). See
         /// `contracts/expandable.md`.
         expand_state: ReasoningExpandState,
+        /// Feature 007: elapsed time from first `ReasoningDelta` to flush.
+        /// Drives the `Thought for Ns` footer. `None` when duration wasn't
+        /// tracked (e.g. short blocks where timing is meaningless).
+        thought_duration: Option<Duration>,
     },
     /// A tool call rendered inline with its result.
     /// Feature 005 (T026): carries `expanded` toggle + full args/result.
@@ -97,6 +101,10 @@ pub enum TranscriptItem {
         full_args: Option<String>,
         /// Feature 005 (T026): full result text for the expanded view.
         full_result: Option<String>,
+        /// Feature 007: whether this is a terminal/shell tool call.
+        is_terminal: bool,
+        /// Feature 007: process exit code (terminal tools only).
+        exit_code: Option<i64>,
     },
     /// Feature 005 (T018): an inline file-change diff block. Pushed when an
     /// `AgentEvent::FileChange` arrives, rendered as a path header + stat +
@@ -118,6 +126,12 @@ pub enum ToolStatus {
     Running,
     Done,
     Failed,
+}
+
+/// Feature 007 (T016, FR-017): classify whether a tool name is a terminal
+/// block (should render with crush's `$ command` layout).
+pub fn is_terminal_block(name: &str) -> bool {
+    name == "terminal"
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,6 +257,10 @@ pub struct App {
     /// Current streaming reasoning accumulator.
     pub streaming_reasoning: String,
     pub reasoning_open: bool,
+    /// Feature 007: timestamp of the first `ReasoningDelta` of the current
+    /// block. Reset to `None` when reasoning is flushed. Drives the
+    /// `Thought for Ns` footer.
+    pub reasoning_started: Option<Instant>,
     /// Concurrent agent activities. Length drives animation intensity.
     pub active_agents: Vec<ActiveAgent>,
     pub next_agent_id: usize,
@@ -261,6 +279,9 @@ pub struct App {
     /// time (the model doesn't know wrap widths). Cell: written during
     /// immutable rendering.
     pub last_max_scroll: Cell<usize>,
+    /// Feature 007 (T026): transcript text-area geometry recorded at render
+    /// time, used by click hit-testing. Stored as `(x, y, width, height)`.
+    pub last_text_area: Cell<(u16, u16, u16, u16)>,
     pub last_final_text: String,
     // ── OMO agent picker state (T028) ──
     /// Agent picker overlay is open.
@@ -307,6 +328,7 @@ impl App {
             streaming_assistant: String::new(),
             streaming_reasoning: String::new(),
             reasoning_open: false,
+            reasoning_started: None,
             active_agents: Vec::new(),
             next_agent_id: 1,
             tokens: TokenStats::default(),
@@ -319,6 +341,7 @@ impl App {
             show_reasoning: true,
             scroll: None,
             last_max_scroll: Cell::new(0),
+            last_text_area: Cell::new((0, 0, 0, 0)),
             last_final_text: String::new(),
             agent_picker_open: false,
             agent_picker_cursor: 0,
@@ -353,10 +376,13 @@ impl App {
     fn flush_reasoning(&mut self) {
         if self.reasoning_open {
             let text = std::mem::take(&mut self.streaming_reasoning);
+            // Feature 007: compute the thinking duration from the first delta.
+            let thought_duration = self.reasoning_started.take().map(|s| s.elapsed());
             if !text.is_empty() {
                 self.push_item(TranscriptItem::Reasoning {
                     text,
                     expand_state: ReasoningExpandState::Collapsed,
+                    thought_duration,
                 });
             }
             self.reasoning_open = false;
@@ -372,7 +398,7 @@ impl App {
     pub fn cycle_focused_reasoning_expand(&mut self) {
         // Find the last Reasoning item in the transcript.
         for i in (0..self.transcript.len()).rev() {
-            if let TranscriptItem::Reasoning { text, expand_state } = &mut self.transcript[i] {
+            if let TranscriptItem::Reasoning { text, expand_state, .. } = &mut self.transcript[i] {
                 let total_lines = text.lines().count();
                 *expand_state = expand_state.cycle(total_lines);
                 return;
@@ -389,6 +415,27 @@ impl App {
                 *expanded = !*expanded;
                 return;
             }
+        }
+    }
+
+    /// Feature 007 (T026): toggle the expand state of the transcript item at
+    /// the given index, dispatching to the type-appropriate expand method
+    /// (reasoning three-state cycle vs. tool boolean toggle). Called by the
+    /// mouse click handler after hit-testing resolves a click to an item.
+    pub fn toggle_item_expand_by_index(&mut self, index: usize) {
+        if index >= self.transcript.len() {
+            return;
+        }
+        match &mut self.transcript[index] {
+            TranscriptItem::Reasoning { text, expand_state, .. } => {
+                let total_lines = text.lines().count();
+                *expand_state = expand_state.cycle(total_lines);
+            }
+            TranscriptItem::Tool { expanded, .. } => {
+                *expanded = !*expanded;
+            }
+            // Other item types are not expandable; click is a no-op for them.
+            _ => {}
         }
     }
 
@@ -423,6 +470,7 @@ impl App {
                 self.streaming_assistant.clear();
                 self.streaming_reasoning.clear();
                 self.reasoning_open = false;
+                self.reasoning_started = None;
                 let id = self.next_agent_id;
                 self.next_agent_id += 1;
                 self.active_agents.push(ActiveAgent {
@@ -464,6 +512,8 @@ impl App {
                 if !self.reasoning_open {
                     self.reasoning_open = true;
                     self.streaming_reasoning.clear();
+                    // Feature 007: mark the start of this reasoning block.
+                    self.reasoning_started = Some(Instant::now());
                 }
                 if let Some(a) = self.active_agents.last_mut() {
                     a.phase = AgentPhase::Reasoning;
@@ -511,7 +561,7 @@ impl App {
                     }
                 }
                 self.push_item(TranscriptItem::Tool {
-                    name,
+                    name: name.clone(),
                     emoji,
                     summary,
                     status: ToolStatus::Running,
@@ -520,6 +570,8 @@ impl App {
                     expanded: false,
                     full_args: None,
                     full_result: None,
+                    is_terminal: is_terminal_block(&name),
+                    exit_code: None,
                 });
             }
             AgentEvent::ToolProgress { name, progress } => {
@@ -537,20 +589,25 @@ impl App {
                     }
                 }
             }
-            AgentEvent::ToolEnd { name, is_error, result_preview, duration_secs } => {
+            AgentEvent::ToolEnd { name, is_error, result_preview, duration_secs, exit_code, full_result } => {
                 for it in self.transcript.iter_mut().rev() {
                     if let TranscriptItem::Tool {
                         name: n,
                         status,
                         duration_secs: dur,
                         result_preview: rp,
+                        exit_code: ec,
+                        full_result: fr,
                         ..
                     } = it
                     {
                         if *status == ToolStatus::Running && *n == name {
                             *status = if is_error { ToolStatus::Failed } else { ToolStatus::Done };
                             *dur = Some(duration_secs);
-                            *rp = result_preview;
+                            *rp = result_preview.clone();
+                            // Feature 007: store exit code and full result.
+                            *ec = exit_code;
+                            *fr = Some(full_result);
                             break;
                         }
                     }
@@ -1265,6 +1322,8 @@ mod tests {
             expanded: false,
             full_args: None,
             full_result: None,
+            is_terminal: false,
+            exit_code: None,
         });
         app.push_item(TranscriptItem::Tool {
             name: "write_file".to_string(),
@@ -1276,6 +1335,8 @@ mod tests {
             expanded: false,
             full_args: None,
             full_result: None,
+            is_terminal: false,
+            exit_code: None,
         });
         // Toggle the most-recent (write_file) tool.
         app.toggle_focused_tool_expand();
@@ -1298,6 +1359,40 @@ mod tests {
         let last = app.transcript.back().unwrap();
         if let TranscriptItem::Tool { expanded, .. } = last {
             assert!(!*expanded, "most-recent tool should collapse on second toggle");
+        }
+    }
+
+    /// T032 (convergence regression): after `ToolEnd`, the transcript item's
+    /// `full_result` must hold the FULL result text (so expand reveals it),
+    /// NOT the one-line truncated `result_preview`. Guards the additive
+    /// `full_result` plumbing (FR-007 / FR-012 / FR-018 / SC-003).
+    #[test]
+    fn tool_end_stores_full_result_not_just_preview() {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::ToolStart {
+            name: "read_file".into(),
+            emoji: "📖".into(),
+            summary: "foo.rs".into(),
+        });
+        let multi_line = "line one\nline two\nline three\nline four";
+        app.apply(AgentEvent::ToolEnd {
+            name: "read_file".into(),
+            is_error: false,
+            result_preview: "line one".into(),
+            duration_secs: 0.1,
+            exit_code: None,
+            full_result: multi_line.into(),
+        });
+        let last = app.transcript.back().unwrap();
+        if let TranscriptItem::Tool { result_preview, full_result, .. } = last {
+            assert_eq!(result_preview, "line one", "preview stays as the one-line summary");
+            assert_eq!(
+                full_result.as_deref(),
+                Some(multi_line),
+                "full_result must hold the full multi-line text, not the preview"
+            );
+        } else {
+            panic!("expected Tool item");
         }
     }
 }

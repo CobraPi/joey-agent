@@ -167,7 +167,10 @@ pub(crate) fn build_agent(
     // Build OMO category resolver (T057/T135). Populated after agent construction
     // when the provider profile + active model are known.
     let resolver = crate::omo_resolver::build_omo_resolver();
-    joey_orchestration::register_orchestration_with_resolver(
+    // Feature 011: build the allocator before orchestration registration so it
+    // can be threaded into delegate_task (T028 subagent intercept).
+    let allocator = crate::llm_selector::try_build_allocator(config);
+    joey_orchestration::register_orchestration_with_resolver_and_allocator(
         &mut registry,
         manager.clone(),
         agent_cfg.clone(),
@@ -175,12 +178,21 @@ pub(crate) fn build_agent(
         base_registry,
         None, // events are emitted via the per-turn channel at runtime
         resolver.clone(),
+        allocator
+            .clone()
+            .map(|a| a as std::sync::Arc<dyn joey_llm_selector::ModelAllocator>),
     );
 
     let mut agent =
         Agent::new(agent_cfg, registry, ctx).map_err(|e| anyhow::anyhow!("{}", e))?;
     // Inject the shared concurrency limiter into the agent's transport path.
     agent.set_provider_semaphore(manager.semaphore());
+
+    // Feature 011: install the allocator on the parent agent (main turn +
+    // compression intercepts). Built above before orchestration registration.
+    if let Some(allocator) = allocator {
+        agent.install_model_allocator(allocator);
+    }
 
     // Populate the OMO category resolver with the now-available provider
     // profile + active model (T057/T135). This enables category/subagent_type
@@ -823,6 +835,12 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
             }
         }
         "model" => model_slash(st, args),
+        "llm-selector" => {
+            match crate::llm_selector::llm_selector_slash(args) {
+                Ok(()) => {}
+                Err(e) => render::error(&e),
+            }
+        }
         "reasoning" => reasoning_slash(st, args),
         "tools" => {
             let cfg = build_agent_config(&st.config, &st.overrides);

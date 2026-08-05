@@ -16,7 +16,7 @@ fn main() {
             app.apply(AgentEvent::ReasoningDelta("thinking ".repeat(20)));
             app.apply(AgentEvent::ContentDelta("partial content ".repeat(20)));
             app.apply(AgentEvent::ToolStart { name: "terminal".into(), emoji: "⚡".into(), summary: "ls".into() });
-            app.apply(AgentEvent::ToolEnd { name: "terminal".into(), is_error: false, result_preview: "output".repeat(50), duration_secs: 0.1 });
+            app.apply(AgentEvent::ToolEnd { name: "terminal".into(), is_error: false, result_preview: "output".repeat(50), duration_secs: 0.1, exit_code: Some(0), full_result: "output".repeat(50) });
             app.apply(AgentEvent::ApiCallEnd { usage: usage(100, 50) });
         }
         app.apply(AgentEvent::Done { final_text: format!("answer {turn}"), usage: usage(500, 250), iterations: 5 });

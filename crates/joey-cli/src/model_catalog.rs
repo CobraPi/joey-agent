@@ -443,6 +443,48 @@ pub fn list_agentic_models(provider: &str) -> Vec<String> {
     result
 }
 
+/// Return the raw models.dev entries for `provider` as a flat `Vec<Value>`
+/// (feature 011 dynamic selector — T070). Unlike `list_agentic_models`, this
+/// returns ALL models (no tool-call filter) so the selector's consolidator can
+/// apply its own capability derivation and the full chat-capable pool is
+/// considered (SC-005). Returns an empty vec when the provider is unknown to
+/// models.dev or the registry could not be fetched.
+pub fn models_dev_entries_for_provider(provider: &str) -> Vec<serde_json::Value> {
+    let Some(mdev_id) = models_dev_provider_id(provider) else {
+        return Vec::new();
+    };
+    let data = fetch_models_dev(false);
+    let Some(models) = data
+        .get(mdev_id)
+        .and_then(|p| p.get("models"))
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    // models.dev stores models as a map keyed by model id; the selector's
+    // consolidator expects an array of entries, so collect the values. Inject
+    // the id into each entry (the consolidator reads `entry["id"]`).
+    let mut out = Vec::new();
+    for (mid, entry) in models {
+        if !entry.is_object() {
+            continue;
+        }
+        if hidden_from_provider_catalog(provider, mid) {
+            continue;
+        }
+        if NOISE_PATTERNS.is_match(mid) {
+            continue;
+        }
+        // The selector's parse_models_dev_entry reads entry["id"]; inject it.
+        let mut e = entry.clone();
+        if let Some(obj) = e.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(mid.clone()));
+        }
+        out.push(e);
+    }
+    out
+}
+
 /// Per-million cost pair from models.dev for the expensive-model guard
 /// (models_dev.py `get_model_info` cost fields, exact + case-insensitive
 /// model match).

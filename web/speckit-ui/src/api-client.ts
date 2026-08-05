@@ -331,4 +331,337 @@ export class SpeckitApiClient {
     });
     return () => ws.close();
   }
+
+  // ===================================================================
+  // Feature 010: Spec-Kit Development IDE
+  // ===================================================================
+
+  async getArtifacts(id: string): Promise<Artifact[]> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/features/${encodeURIComponent(id)}/artifacts`,
+    );
+    const body = await parseJsonOrThrow<{ artifacts: Artifact[] }>(res);
+    return body.artifacts;
+  }
+
+  async getArtifact(id: string, path: string): Promise<ArtifactContent> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/features/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(path)}`,
+    );
+    return parseJsonOrThrow<ArtifactContent>(res);
+  }
+
+  async patchArtifact(
+    id: string,
+    path: string,
+    req: PatchArtifactRequest,
+  ): Promise<PatchResponse> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/features/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(path)}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req),
+      },
+    );
+    return parseJsonOrThrow<PatchResponse>(res);
+  }
+
+  async getWorkflow(id: string): Promise<WorkflowResponse> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/features/${encodeURIComponent(id)}/workflow`,
+    );
+    return parseJsonOrThrow<WorkflowResponse>(res);
+  }
+
+  async getOptions(): Promise<OptionsCatalog> {
+    const res = await this.fetchImpl(`${this.baseUrl}/api/options`);
+    return parseJsonOrThrow<OptionsCatalog>(res);
+  }
+
+  async getStepConfig(id: string, step: string): Promise<StepConfig> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/features/${encodeURIComponent(id)}/workflow/${encodeURIComponent(step)}/config`,
+    );
+    return parseJsonOrThrow<StepConfig>(res);
+  }
+
+  async putOverride(id: string, step: string, instructions: string): Promise<{ override_id: string }> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/features/${encodeURIComponent(id)}/workflow/${encodeURIComponent(step)}/override`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instructions }),
+      },
+    );
+    return parseJsonOrThrow(res);
+  }
+
+  async deleteOverride(id: string, step: string): Promise<void> {
+    await this.fetchImpl(
+      `${this.baseUrl}/api/features/${encodeURIComponent(id)}/workflow/${encodeURIComponent(step)}/override`,
+      { method: 'DELETE' },
+    );
+  }
+
+  async runWorkflowStep(id: string, step: string, req: RunRequest): Promise<RunStartResponse> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/features/${encodeURIComponent(id)}/workflow/${encodeURIComponent(step)}/run`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req),
+      },
+    );
+    return parseJsonOrThrow<RunStartResponse>(res);
+  }
+
+  async answerAttempt(attemptId: string, interactionId: string, answer: string): Promise<{ confirmed: boolean }> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/attempts/${encodeURIComponent(attemptId)}/answer`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ interaction_id: interactionId, answer }),
+      },
+    );
+    return parseJsonOrThrow(res);
+  }
+
+  async approveAttempt(attemptId: string, interactionId: string, decision: 'approve' | 'reject', note?: string): Promise<{ confirmed: boolean }> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/attempts/${encodeURIComponent(attemptId)}/approve`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ interaction_id: interactionId, decision, note }),
+      },
+    );
+    return parseJsonOrThrow(res);
+  }
+
+  async cancelAttempt(attemptId: string): Promise<void> {
+    await this.fetchImpl(
+      `${this.baseUrl}/api/attempts/${encodeURIComponent(attemptId)}/cancel`,
+      { method: 'POST' },
+    );
+  }
+
+  async getAttemptChanges(attemptId: string): Promise<ChangeSetResponse> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/attempts/${encodeURIComponent(attemptId)}/changes`,
+    );
+    return parseJsonOrThrow<ChangeSetResponse>(res);
+  }
+
+  async getHistory(id: string, limit?: number, before?: string): Promise<HistoryResponse> {
+    const params = new URLSearchParams();
+    if (limit) params.set('limit', String(limit));
+    if (before) params.set('before', before);
+    const qs = params.toString();
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/features/${encodeURIComponent(id)}/history${qs ? `?${qs}` : ''}`,
+    );
+    return parseJsonOrThrow<HistoryResponse>(res);
+  }
+
+  async getPreferences(id: string): Promise<WorkspacePreference> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/features/${encodeURIComponent(id)}/preferences`,
+    );
+    return parseJsonOrThrow<WorkspacePreference>(res);
+  }
+
+  async putPreferences(id: string, prefs: WorkspacePreference): Promise<WorkspacePreference> {
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/api/features/${encodeURIComponent(id)}/preferences`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(prefs),
+      },
+    );
+    return parseJsonOrThrow<WorkspacePreference>(res);
+  }
+
+  async getHealth(): Promise<HealthStatus> {
+    const res = await this.fetchImpl(`${this.baseUrl}/api/health`);
+    return parseJsonOrThrow<HealthStatus>(res);
+  }
+
+  /** Subscribe to an attempt's live run/interaction event stream. */
+  watchAttempt(attemptId: string, onEvent: (evt: RunnerEvent) => void): () => void {
+    const ws = new this.WebSocketImpl(
+      `${this.wsBaseUrl}/api/attempts/${encodeURIComponent(attemptId)}/stream`,
+    );
+    ws.addEventListener('message', (ev: MessageEvent) => {
+      const data = JSON.parse(String(ev.data)) as RunnerEvent;
+      onEvent(data);
+    });
+    return () => ws.close();
+  }
 }
+
+// --- Feature 010 types ---
+
+export type ArtifactKind = 'spec' | 'plan' | 'tasks' | 'checklist' | 'research' | 'data_model' | 'contract' | 'quickstart' | 'constitution' | 'supporting';
+export type SaveState = 'clean' | 'dirty' | 'saving' | 'saved' | 'invalid' | 'externally_changed' | 'read_only';
+export type StepState = 'ready' | 'blocked' | 'running' | 'attention_needed' | 'succeeded' | 'failed' | 'stale' | 'unavailable';
+export type ChangeMode = 'staged' | 'direct';
+
+export interface ValidationFinding {
+  finding_id: string;
+  severity: 'Info' | 'Warning' | 'Critical';
+  code: string;
+  description: string;
+  location: { path: string; line_or_section: string };
+  remediation?: string;
+}
+
+export interface Artifact {
+  path: string;
+  kind: ArtifactKind;
+  exists: boolean;
+  content_hash: string | null;
+  dirty: boolean;
+  save_state: SaveState;
+  validity: ValidationFinding[];
+  workflow_phase: string;
+  stale: boolean;
+  stale_reason?: string;
+}
+
+export interface OutlineEntry {
+  title: string;
+  line: number;
+  level: number;
+}
+
+export interface ArtifactContent {
+  path: string;
+  kind: ArtifactKind;
+  text: string;
+  content_hash: string;
+  outline: OutlineEntry[];
+  save_state: SaveState;
+  validity: ValidationFinding[];
+}
+
+export interface PatchArtifactRequest {
+  new_text: string;
+  based_on_hash: string;
+  scope?: { whole?: boolean } | { section: string };
+}
+
+export interface WorkflowStep {
+  id: string;
+  order: number;
+  purpose: string;
+  inputs: { path: string; kind?: ArtifactKind }[];
+  outputs: { path: string; kind?: ArtifactKind }[];
+  prerequisites: string[];
+  available: boolean;
+  state: StepState;
+  blocking_reason: string | null;
+  latest_attempt_id: string | null;
+  installed_definition_ref: string;
+}
+
+export interface WorkflowResponse {
+  steps: WorkflowStep[];
+}
+
+export interface OptionsCatalog {
+  revision: string;
+  models: string[];
+  reasoning_efforts: string[];
+  max_iterations: { min: number; max: number; default: number };
+}
+
+export interface StepConfig {
+  step_id: string;
+  installed: { instructions: string };
+  override: { override_id: string; instructions: string } | null;
+  effective_instructions: string;
+}
+
+export interface RunRequest {
+  effective_instructions?: string;
+  scope?: { targets: { path: string }[]; task_ids?: string[] };
+  options?: { model?: string; reasoning_effort?: string; max_iterations?: number };
+  option_catalog_rev: string;
+  change_mode?: ChangeMode;
+  override_id?: string;
+  prior_attempt_id?: string;
+}
+
+export interface RunStartResponse {
+  attempt_id: string;
+  ws: string;
+}
+
+export interface ChangeSetResponse {
+  attempt_id: string;
+  mode: ChangeMode;
+  recovery_action: string | null;
+  files: ChangedFile[];
+}
+
+export interface ChangedFile {
+  path: string;
+  status: 'added' | 'modified' | 'removed';
+  additions: number;
+  removals: number;
+  why?: string;
+  accept_state: 'pending' | 'accepted' | 'rejected';
+  hunks: Hunk[];
+}
+
+export interface Hunk {
+  hunk_id: string;
+  old_range: string;
+  new_range: string;
+  accept_state: 'pending' | 'accepted' | 'rejected';
+  depends_on: string[];
+}
+
+export interface HistoryAttempt {
+  attempt_id: string;
+  step_id: string;
+  status: string;
+  started_at: string;
+  ended_at: string | null;
+  prior_attempt_id: string | null;
+  changes_count: number;
+}
+
+export interface HistoryResponse {
+  attempts: HistoryAttempt[];
+  next_cursor: string | null;
+}
+
+export interface WorkspacePreference {
+  last_feature_id?: string;
+  open_artifacts?: string[];
+  active_view?: string;
+  pane_layout?: unknown;
+  filters?: unknown;
+}
+
+export interface HealthStatus {
+  backend_reachable: boolean;
+  agent_binary_discovered: boolean;
+  credentials_present: boolean;
+  repo_writable: boolean;
+  read_only: boolean;
+}
+
+export type RunnerEvent =
+  | { type: 'progress'; attempt_id: string; text: string }
+  | { type: 'tool'; attempt_id: string; name: string; summary: string }
+  | { type: 'question'; attempt_id: string; interaction_id: string; prompt: string; choices?: string[] }
+  | { type: 'approval'; attempt_id: string; interaction_id: string; impact: string; boundary: string }
+  | { type: 'output'; attempt_id: string; file: string; added: number; removed: number }
+  | { type: 'status'; attempt_id: string; terminal: 'succeeded' | 'failed' | 'cancelled'; duration_ms: number }
+  | { type: 'error'; attempt_id: string; message: string; recoverable: boolean };

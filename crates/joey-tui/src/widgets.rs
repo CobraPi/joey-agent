@@ -30,6 +30,25 @@ const MAX_COLLAPSED_LINES: usize = 10;
 /// Feature 005 (T022): max lines in the tail-window reasoning view.
 /// Must match `state::MAX_TAIL_WINDOW_LINES`.
 const MAX_TAIL_WINDOW_LINES_TUI: usize = 200;
+/// Feature 007: max output lines shown collapsed for terminal/tool blocks.
+/// Mirrors crush's `shellMaxCollapsedLines` / `responseContextHeight`.
+const MAX_TOOL_OUTPUT_LINES: usize = 10;
+
+/// Feature 007: shared helper — take the first `max` lines of a string and
+/// return the lines + an optional hidden-count affordance message.
+/// Used by terminal-command blocks (T019) and tool-call bodies (T023).
+fn bounded_lines_with_affordance(text: &str, max: usize) -> (Vec<String>, Option<String>) {
+    let all: Vec<&str> = text.lines().collect();
+    if all.len() <= max {
+        (all.iter().map(|s| s.to_string()).collect(), None)
+    } else {
+        let head = &all[..max];
+        (
+            head.iter().map(|s| s.to_string()).collect(),
+            Some(format!("… {} more lines", all.len() - max)),
+        )
+    }
+}
 
 /// Helper: build a Block with a gradient title.
 pub fn gradient_block(title: &str, theme: Theme) -> Block<'_> {
@@ -230,8 +249,8 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             }
             lines.push(Line::from(vec![Span::raw("")]));
         }
-        TranscriptItem::Reasoning { text, expand_state } => {
-            // Feature 005 (T022): three-state expandable reasoning render.
+        TranscriptItem::Reasoning { text, expand_state, thought_duration } => {
+            // Feature 007 (T012): crush-parity boxed reasoning render.
             use crate::state::ReasoningExpandState;
             let all_lines: Vec<&str> = text.lines().collect();
             let total = all_lines.len();
@@ -240,10 +259,16 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     if total <= MAX_COLLAPSED_LINES {
                         (all_lines.iter().map(|s| s.to_string()).collect(), None)
                     } else {
-                        let head = &all_lines[..MAX_COLLAPSED_LINES];
+                        // Feature 007 (T033): show the LAST (newest) N lines,
+                        // matching crush's tail-biased collapsed view (contracts/
+                        // block-layout.md §1, feature-005 contracts/expandable.md).
+                        let recent = &all_lines[total - MAX_COLLAPSED_LINES..];
                         (
-                            head.iter().map(|s| s.to_string()).collect(),
-                            Some(format!("… ({} more lines, press to expand)", total - MAX_COLLAPSED_LINES)),
+                            recent.iter().map(|s| s.to_string()).collect(),
+                            Some(format!(
+                                "… ({} lines hidden) [click or space to expand]",
+                                total - MAX_COLLAPSED_LINES
+                            )),
                         )
                     }
                 }
@@ -254,7 +279,10 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                         let tail = &all_lines[total - MAX_TAIL_WINDOW_LINES_TUI..];
                         (
                             tail.iter().map(|s| s.to_string()).collect(),
-                            Some(format!("… showing last {} of {} lines", MAX_TAIL_WINDOW_LINES_TUI, total)),
+                            Some(format!(
+                                "… {} earlier lines hidden [click or space for full view]",
+                                total - MAX_TAIL_WINDOW_LINES_TUI
+                            )),
                         )
                     }
                 }
@@ -262,20 +290,26 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     (all_lines.iter().map(|s| s.to_string()).collect(), None)
                 }
             };
-            let label = match expand_state {
-                ReasoningExpandState::Collapsed => "┄ reasoning ",
-                ReasoningExpandState::TailWindow => "┄ reasoning (tail) ",
-                ReasoningExpandState::Full => "┄ reasoning (full) ",
+            // State-aware bordered-box title.
+            let title = match expand_state {
+                ReasoningExpandState::Collapsed => "reasoning",
+                ReasoningExpandState::TailWindow => "reasoning (tail)",
+                ReasoningExpandState::Full => "reasoning (full)",
             };
+            let border_style = Style::default().fg(theme.fg_more_subtle.to_color());
             lines.push(Line::from(vec![Span::styled(
-                label,
-                Style::default().fg(theme.fg_more_subtle.to_color()),
+                format!(" ┌─ {} ", title),
+                border_style,
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                " │",
+                border_style,
             )]));
             for wl in &shown_lines {
-                let wrapped = wrap(wl, content_w.saturating_sub(2));
+                let wrapped = wrap(wl, content_w.saturating_sub(4));
                 for w in wrapped {
                     lines.push(Line::from(vec![Span::styled(
-                        format!("  {}", w),
+                        format!(" │ {}", w),
                         Style::default()
                             .fg(theme.fg_more_subtle.to_color())
                             .add_modifier(Modifier::DIM),
@@ -284,12 +318,115 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             }
             if let Some(msg) = affordance {
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  {}", msg),
+                    format!(" │ {}", msg),
                     Style::default().fg(theme.fg_most_subtle.to_color()),
                 )]));
             }
+            // Thought-for-Ns footer (only when duration > 0).
+            if let Some(dur) = thought_duration {
+                let secs = dur.as_secs_f64();
+                if secs > 0.0 {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!(" │"),
+                        border_style,
+                    )]));
+                    lines.push(Line::from(vec![Span::styled(
+                        format!(" └─ Thought for {:.1}s", secs),
+                        Style::default().fg(theme.fg_more_subtle.to_color()),
+                    )]));
+                }
+            } else {
+                lines.push(Line::from(vec![Span::styled(
+                    " └─",
+                    border_style,
+                )]));
+            }
+            lines.push(Line::from(vec![Span::raw("")]));
         }
-        TranscriptItem::Tool { name, emoji, summary, status, duration_secs, result_preview, expanded, full_args, full_result } => {
+        TranscriptItem::Tool { name, emoji, summary, status, duration_secs, result_preview, expanded, full_args, full_result, is_terminal, exit_code } => {
+            if *is_terminal {
+                // Feature 007 (T019): terminal-command block layout.
+                // Header: $ command  (exit N)  ⟳/✓/✗  ▸/▾
+                let expand_hint = if *expanded { "▾" } else { "▸" };
+                let mut spans = vec![
+                    Span::styled(
+                        "  $ ".to_string(),
+                        Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                // Command text (use summary which equals the command for terminal).
+                spans.push(Span::styled(
+                    one_line(summary, content_w.saturating_sub(20)),
+                    Style::default().fg(theme.fg_base.to_color()),
+                ));
+                // Running spinner or done icon.
+                let (status_icon, status_col) = match status {
+                    ToolStatus::Running => ("⟳", theme.busy),
+                    ToolStatus::Done => ("✓", theme.success),
+                    ToolStatus::Failed => ("✗", theme.error),
+                };
+                spans.push(Span::styled(
+                    format!("  {}", status_icon),
+                    Style::default().fg(status_col.to_color()).add_modifier(Modifier::BOLD),
+                ));
+                // Exit code badge (only when Some and non-zero).
+                if let Some(code) = exit_code {
+                    if *code != 0 {
+                        spans.push(Span::styled(
+                            format!(" (exit {})", code),
+                            Style::default().fg(theme.error.to_color()),
+                        ));
+                    }
+                }
+                // Duration.
+                if let Some(d) = duration_secs {
+                    spans.push(Span::styled(
+                        format!("  {:.1}s", d),
+                        Style::default().fg(theme.fg_more_subtle.to_color()),
+                    ));
+                }
+                spans.push(Span::styled(
+                    format!("  {}", expand_hint),
+                    Style::default().fg(theme.fg_most_subtle.to_color()),
+                ));
+                lines.push(Line::from(spans));
+                // Body: collapsed (first MAX_TOOL_OUTPUT_LINES) or expanded.
+                let output = result_preview.as_str();
+                if !output.is_empty() && !matches!(status, ToolStatus::Running) {
+                    if *expanded {
+                        for ol in output.lines() {
+                            for w in wrap(ol, content_w.saturating_sub(4)) {
+                                lines.push(Line::from(vec![Span::styled(
+                                    format!("    {}", w),
+                                    Style::default().fg(theme.fg_more_subtle.to_color()),
+                                )]));
+                            }
+                        }
+                    } else {
+                        let (shown, affordance) = bounded_lines_with_affordance(
+                            output,
+                            MAX_TOOL_OUTPUT_LINES,
+                        );
+                        for ol in &shown {
+                            for w in wrap(ol, content_w.saturating_sub(4)) {
+                                lines.push(Line::from(vec![Span::styled(
+                                    format!("    {}", w),
+                                    Style::default().fg(theme.fg_more_subtle.to_color()),
+                                )]));
+                            }
+                        }
+                        if let Some(msg) = affordance {
+                            lines.push(Line::from(vec![Span::styled(
+                                format!("    {}", msg),
+                                Style::default().fg(theme.fg_most_subtle.to_color()),
+                            )]));
+                        }
+                    }
+                }
+                lines.push(Line::from(vec![Span::raw("")]));
+                return lines;
+            }
+            // ── Generic (non-terminal) tool layout ──
             let (icon, col) = match status {
                 ToolStatus::Running => ("⟳", theme.busy),
                 ToolStatus::Done => ("✓", theme.success),
@@ -331,28 +468,50 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             ));
             lines.push(Line::from(spans));
             if !result_preview.is_empty() && !matches!(status, ToolStatus::Running) && !*expanded {
-                let preview = one_line(result_preview, 100);
+                // Feature 007 (T023): use the shared bounded-output helper.
+                let (shown, affordance) =
+                    bounded_lines_with_affordance(result_preview, MAX_TOOL_OUTPUT_LINES);
                 let col = if matches!(status, ToolStatus::Failed) {
                     theme.error
                 } else {
                     theme.fg_most_subtle
                 };
-                lines.push(Line::from(vec![Span::styled(
-                    format!("    └ {}", preview),
-                    Style::default().fg(col.to_color()),
-                )]));
-            }
-            // Feature 005 (T029): expanded view — full args + full result.
-            if *expanded {
-                if let Some(args) = full_args {
-                    if !args.is_empty() {
+                for ol in &shown {
+                    for w in wrap(ol, content_w.saturating_sub(4)) {
                         lines.push(Line::from(vec![Span::styled(
-                            "    args:".to_string(),
-                            Style::default().fg(theme.fg_more_subtle.to_color()),
+                            format!("    {}", w),
+                            Style::default().fg(col.to_color()),
                         )]));
-                        for arg_line in args.lines() {
+                    }
+                }
+                if let Some(msg) = affordance {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("    {} [click or space to expand]", msg),
+                        Style::default().fg(theme.fg_most_subtle.to_color()),
+                    )]));
+                }
+            }
+            // Feature 005 (T029) + Feature 007 (T023): expanded view —
+            // primary parameter + full result, bounded with affordance.
+            if *expanded {
+                // T034 (convergence): `full_args` is never populated (contracts/
+                // agent-event.md Approach A carries no args), so fall back to
+                // `summary` — the primary parameter — so the expand affordance
+                // is honest (block-layout.md §3: "expanded view uses `summary`
+                // for its param display").
+                let args_text = full_args
+                    .as_deref()
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or(summary);
+                if !args_text.is_empty() {
+                    lines.push(Line::from(vec![Span::styled(
+                        "    args:".to_string(),
+                        Style::default().fg(theme.fg_more_subtle.to_color()),
+                    )]));
+                    for arg_line in args_text.lines() {
+                        for w in wrap(arg_line, content_w.saturating_sub(8)) {
                             lines.push(Line::from(vec![Span::styled(
-                                format!("      {}", arg_line),
+                                format!("      {}", w),
                                 Style::default().fg(theme.fg_most_subtle.to_color()),
                             )]));
                         }
@@ -364,24 +523,22 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                             "    result:".to_string(),
                             Style::default().fg(theme.fg_more_subtle.to_color()),
                         )]));
-                        let result_lines: Vec<&str> = result.lines().collect();
-                        let max_result_lines = 50;
-                        let start = if result_lines.len() > max_result_lines {
-                            result_lines.len() - max_result_lines
-                        } else {
-                            0
-                        };
-                        if start > 0 {
+                        // Feature 007 (T023): use shared helper for consistency.
+                        let (shown, affordance) =
+                            bounded_lines_with_affordance(result, MAX_TAIL_WINDOW_LINES_TUI);
+                        if let Some(msg) = affordance {
                             lines.push(Line::from(vec![Span::styled(
-                                format!("      … ({} earlier lines hidden)", start),
+                                format!("      {}", msg),
                                 Style::default().fg(theme.fg_most_subtle.to_color()),
                             )]));
                         }
-                        for rl in &result_lines[start..] {
-                            lines.push(Line::from(vec![Span::styled(
-                                format!("      {}", rl),
-                                Style::default().fg(theme.fg_most_subtle.to_color()),
-                            )]));
+                        for rl in &shown {
+                            for w in wrap(rl, content_w.saturating_sub(6)) {
+                                lines.push(Line::from(vec![Span::styled(
+                                    format!("      {}", w),
+                                    Style::default().fg(theme.fg_most_subtle.to_color()),
+                                )]));
+                            }
                         }
                     }
                 }
@@ -499,6 +656,14 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
     );
     let text_area = Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height);
 
+    // Feature 007 (T026): record text-area geometry for click hit-testing.
+    app.last_text_area.set((
+        text_area.x,
+        text_area.y,
+        text_area.width,
+        text_area.height,
+    ));
+
     let content_w = content_width;
     let visible = text_area.height as usize;
     let offset = app.scroll.unwrap_or(0);
@@ -580,6 +745,95 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
             }
         }
     }
+}
+
+/// Feature 007 (T026): resolve which transcript item (if any) is at the given
+/// absolute screen `(row, col)`. Returns the item index in `app.transcript`
+/// (0-based from the oldest), or `None` if the click is outside the text area
+/// or on empty space (below all items).
+///
+/// This mirrors the line accounting in [`draw_transcript`]: items are built
+/// newest-last, the live streaming tail (if any) is the bottommost block, and
+/// the viewport is anchored to the bottom with an optional scroll offset.
+pub fn transcript_hit_test(app: &App, theme: Theme, row: u16, col: u16) -> Option<usize> {
+    let (tx, ty, tw, th) = app.last_text_area.get();
+    if th == 0 || tw == 0 {
+        return None;
+    }
+    // Click must be inside the text area (excluding the scrollbar column).
+    if row < ty || row >= ty + th || col < tx || col >= tx + tw {
+        return None;
+    }
+    let content_w = tw as usize;
+    let visible = th as usize;
+    let offset = app.scroll.unwrap_or(0);
+
+    // The click's row within the text area, measured from the TOP.
+    let click_row_from_top = (row - ty) as usize;
+
+    // Replicate draw_transcript's line accounting: build items newest-last,
+    // tracking per-item line counts.
+    let mut blocks_rev: Vec<(usize, usize)> = Vec::new(); // (item_index, line_count)
+    let mut built = 0usize;
+
+    // Live streaming assistant tail (renders as a block at the bottom).
+    let has_streaming = !app.streaming_assistant.is_empty();
+    if has_streaming {
+        let tail_lines = 1 + wrap(&app.streaming_assistant, content_w.saturating_sub(2)).len();
+        built += tail_lines;
+    }
+
+    let needed = visible + offset + 1;
+    for (i, item) in app.transcript.iter().enumerate().rev() {
+        if built >= needed {
+            break;
+        }
+        let ls = item_lines(item, content_w, theme);
+        let count = ls.len();
+        built += count;
+        blocks_rev.push((i, count));
+    }
+
+    // The items are now in reverse order (newest first). We need them oldest
+    // first to map screen rows top→down.
+    let items_fwd: Vec<(usize, usize)> = blocks_rev.into_iter().rev().collect();
+
+    // If there's a streaming tail, it sits AFTER all items (bottommost).
+    let streaming_line_count = if has_streaming {
+        1 + wrap(&app.streaming_assistant, content_w.saturating_sub(2)).len()
+    } else {
+        0
+    };
+
+    // Total lines we know about.
+    let total = items_fwd.iter().map(|(_, c)| *c).sum::<usize>() + streaming_line_count;
+
+    // The viewport scroll: draw_transcript anchors to the bottom (scroll=None
+    // means "live at bottom"). `scroll_rows` = how many lines the Paragraph is
+    // scrolled DOWN from the top of the content.
+    let clamped = offset.min(app.last_max_scroll.get().max(total.saturating_sub(visible)));
+    let scroll_rows = total.saturating_sub(visible + clamped).min(u16::MAX as usize);
+
+    // The visible content starts at content line `scroll_rows` and fills
+    // `visible` rows downward. Map the click's top-relative row to a content
+    // line index.
+    let content_line = scroll_rows + click_row_from_top;
+    if content_line >= total {
+        return None; // Click is below all content.
+    }
+
+    // Walk items oldest→newest, accumulating line counts, to find which item
+    // owns `content_line`.
+    let mut acc = 0usize;
+    for &(item_idx, count) in &items_fwd {
+        if content_line < acc + count {
+            return Some(item_idx);
+        }
+        acc += count;
+    }
+    // If we reach here, the click was on the streaming tail — no expandable
+    // item to toggle.
+    None
 }
 
 /// Draw a scrollbar on the right edge of the transcript.
@@ -1461,4 +1715,522 @@ pub fn build_agent_roster_from_registry(registry: &joey_omo::AgentRegistry) -> V
     }
 
     roster
+}
+
+// ── Feature 007 (T013): unit tests for boxed reasoning ────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{ReasoningExpandState};
+    use std::time::Duration;
+
+    /// Helper: convert a `Line` into its plain-text content.
+    fn line_text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+    }
+
+    /// Helper: collect all text from `item_lines` output.
+    fn render_text(item: &TranscriptItem, width: usize) -> Vec<String> {
+        let theme = Theme::aurora();
+        item_lines(item, width, theme)
+            .iter()
+            .map(line_text)
+            .collect()
+    }
+
+    #[test]
+    fn test_collapsed_reasoning_affordance() {
+        // 20 lines of text, collapsed state → should show affordance with
+        // (20 - MAX_COLLAPSED_LINES) = 10 hidden.
+        let long_text: String = (0..20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let item = TranscriptItem::Reasoning {
+            text: long_text,
+            expand_state: ReasoningExpandState::Collapsed,
+            thought_duration: None,
+        };
+        let rendered = render_text(&item, 80);
+        let affordance_line = rendered.iter().find(|l| l.contains("lines hidden"));
+        assert!(
+            affordance_line.is_some(),
+            "collapsed should emit a hidden-lines affordance; got: {:?}",
+            rendered
+        );
+        assert!(
+            affordance_line.unwrap().contains("10"),
+            "should show 10 hidden lines; got: {}",
+            affordance_line.unwrap()
+        );
+        // T033: collapsed shows the LAST (newest) N lines, tail-biased like crush.
+        assert!(
+            rendered.iter().any(|l| l.contains("line 19")),
+            "collapsed should show the newest line (line 19); got: {:?}",
+            rendered
+        );
+        assert!(
+            !rendered.iter().any(|l| l.contains("line 0")),
+            "collapsed should NOT show the oldest line (line 0); got: {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn test_tail_window_reasoning_affordance() {
+        // 250 lines, tail-window state → should show affordance with
+        // (250 - MAX_TAIL_WINDOW_LINES) = 50 hidden.
+        let long_text: String = (0..250).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let item = TranscriptItem::Reasoning {
+            text: long_text,
+            expand_state: ReasoningExpandState::TailWindow,
+            thought_duration: None,
+        };
+        let rendered = render_text(&item, 80);
+        let affordance = rendered.iter().find(|l| l.contains("earlier lines hidden"));
+        assert!(
+            affordance.is_some(),
+            "tail-window should emit an earlier-lines affordance; got: {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn test_footer_shows_duration_when_some() {
+        let item = TranscriptItem::Reasoning {
+            text: "some thought".into(),
+            expand_state: ReasoningExpandState::Full,
+            thought_duration: Some(Duration::from_secs(3)),
+        };
+        let rendered = render_text(&item, 80);
+        let footer = rendered.iter().find(|l| l.contains("Thought for"));
+        assert!(
+            footer.is_some(),
+            "footer should show 'Thought for' when duration is Some; got: {:?}",
+            rendered
+        );
+        assert!(footer.unwrap().contains("3.0s"));
+    }
+
+    #[test]
+    fn test_footer_omitted_when_duration_none() {
+        let item = TranscriptItem::Reasoning {
+            text: "some thought".into(),
+            expand_state: ReasoningExpandState::Full,
+            thought_duration: None,
+        };
+        let rendered = render_text(&item, 80);
+        assert!(
+            !rendered.iter().any(|l| l.contains("Thought for")),
+            "footer should be absent when duration is None; got: {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn test_short_reasoning_no_affordance() {
+        // 5 lines (≤ MAX_COLLAPSED_LINES), collapsed → no affordance.
+        let short_text: String = (0..5).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let item = TranscriptItem::Reasoning {
+            text: short_text,
+            expand_state: ReasoningExpandState::Collapsed,
+            thought_duration: None,
+        };
+        let rendered = render_text(&item, 80);
+        assert!(
+            !rendered.iter().any(|l| l.contains("lines hidden")),
+            "short reasoning should have no affordance; got: {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn test_box_borders_present() {
+        let item = TranscriptItem::Reasoning {
+            text: "hello".into(),
+            expand_state: ReasoningExpandState::Collapsed,
+            thought_duration: None,
+        };
+        let rendered = render_text(&item, 80);
+        assert!(
+            rendered.iter().any(|l| l.contains("┌─")),
+            "should have top border ┌─; got: {:?}",
+            rendered
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("└─")),
+            "should have bottom border └─; got: {:?}",
+            rendered
+        );
+    }
+
+    // ── Feature 007 (T020): terminal block tests ──────────────────────
+
+    use crate::state::{is_terminal_block, ToolStatus};
+
+    #[test]
+    fn test_is_terminal_block_classification() {
+        assert!(is_terminal_block("terminal"));
+        assert!(!is_terminal_block("read_file"));
+        assert!(!is_terminal_block("write_file"));
+        assert!(!is_terminal_block("search_files"));
+    }
+
+    #[test]
+    fn test_terminal_header_shows_prompt() {
+        let item = TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "⚡".into(),
+            summary: "ls -la crates".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.1),
+            result_preview: "drwxr-xr-x".into(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: true,
+            exit_code: Some(0),
+        };
+        let rendered = render_text(&item, 80);
+        let header = rendered.iter().find(|l| l.contains("$")).unwrap();
+        assert!(header.contains("ls -la crates"), "header should show command; got: {}", header);
+    }
+
+    #[test]
+    fn test_exit_badge_only_for_nonzero() {
+        let item_fail = TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "⚡".into(),
+            summary: "false".into(),
+            status: ToolStatus::Failed,
+            duration_secs: Some(0.01),
+            result_preview: String::new(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: true,
+            exit_code: Some(1),
+        };
+        let rendered = render_text(&item_fail, 80);
+        assert!(
+            rendered.iter().any(|l| l.contains("(exit 1)")),
+            "non-zero exit should show badge; got: {:?}",
+            rendered
+        );
+
+        let item_ok = TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "⚡".into(),
+            summary: "true".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.01),
+            result_preview: String::new(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: true,
+            exit_code: Some(0),
+        };
+        let rendered_ok = render_text(&item_ok, 80);
+        assert!(
+            !rendered_ok.iter().any(|l| l.contains("(exit")),
+            "zero exit should NOT show badge; got: {:?}",
+            rendered_ok
+        );
+    }
+
+    #[test]
+    fn test_terminal_collapsed_output_affordance() {
+        let long_output: String = (0..25).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let item = TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "⚡".into(),
+            summary: "echo".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.1),
+            result_preview: long_output,
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: true,
+            exit_code: Some(0),
+        };
+        let rendered = render_text(&item, 80);
+        assert!(
+            rendered.iter().any(|l| l.contains("more lines")),
+            "collapsed output should show affordance; got: {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn test_terminal_running_shows_spinner() {
+        let item = TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "⚡".into(),
+            summary: "sleep 5".into(),
+            status: ToolStatus::Running,
+            duration_secs: None,
+            result_preview: String::new(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: true,
+            exit_code: None,
+        };
+        let rendered = render_text(&item, 80);
+        assert!(
+            rendered.iter().any(|l| l.contains("⟳")),
+            "running terminal should show spinner; got: {:?}",
+            rendered
+        );
+    }
+
+    // ── Feature 007 (T024): generic tool header tests ─────────────────
+
+    #[test]
+    fn test_tool_header_composition() {
+        let item = TranscriptItem::Tool {
+            name: "read_file".into(),
+            emoji: "📖".into(),
+            summary: "src/main.rs".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.05),
+            result_preview: "fn main() {}".into(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: false,
+            exit_code: None,
+        };
+        let rendered = render_text(&item, 80);
+        let header = rendered.first().unwrap();
+        assert!(header.contains("✓"), "should show success icon; got: {}", header);
+        assert!(header.contains("read_file"), "should show bold name; got: {}", header);
+        assert!(header.contains("src/main.rs"), "should show primary param; got: {}", header);
+    }
+
+    #[test]
+    fn test_tool_collapsed_result_affordance() {
+        let long_result: String = (0..25).map(|i| format!("result line {}", i)).collect::<Vec<_>>().join("\n");
+        let item = TranscriptItem::Tool {
+            name: "search_files".into(),
+            emoji: "🔍".into(),
+            summary: "*.rs".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.3),
+            result_preview: long_result,
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: false,
+            exit_code: None,
+        };
+        let rendered = render_text(&item, 80);
+        assert!(
+            rendered.iter().any(|l| l.contains("more lines")),
+            "collapsed result should show affordance; got: {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn test_tool_expanded_shows_full_result() {
+        let item = TranscriptItem::Tool {
+            name: "read_file".into(),
+            emoji: "📖".into(),
+            summary: "foo.rs".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.1),
+            result_preview: "line1\nline2".into(),
+            expanded: true,
+            full_args: Some("path: foo.rs".into()),
+            full_result: Some("line1\nline2\nline3".into()),
+            is_terminal: false,
+            exit_code: None,
+        };
+        let rendered = render_text(&item, 80);
+        assert!(
+            rendered.iter().any(|l| l.contains("args:")),
+            "expanded should show args label; got: {:?}",
+            rendered
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("result:")),
+            "expanded should show result label; got: {:?}",
+            rendered
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("line3")),
+            "expanded should show full result; got: {:?}",
+            rendered
+        );
+    }
+
+    /// T034 (convergence): when `full_args` is `None` (the real production
+    /// case — Approach A carries no args), the expanded view falls back to
+    /// showing the primary parameter from `summary`, so the expand affordance
+    /// is not misleading (block-layout.md §3).
+    #[test]
+    fn test_tool_expanded_falls_back_to_summary_for_param() {
+        let item = TranscriptItem::Tool {
+            name: "read_file".into(),
+            emoji: "📖".into(),
+            summary: "src/lib.rs".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.1),
+            result_preview: "preview".into(),
+            expanded: true,
+            full_args: None,
+            full_result: Some("full body".into()),
+            is_terminal: false,
+            exit_code: None,
+        };
+        let rendered = render_text(&item, 80);
+        assert!(
+            rendered.iter().any(|l| l.contains("args:")),
+            "expanded should show args label even without full_args; got: {:?}",
+            rendered
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("src/lib.rs")),
+            "expanded should fall back to summary (src/lib.rs) for the param; got: {:?}",
+            rendered
+        );
+    }
+
+    // ── Feature 007 (T026): click hit-testing tests ───────────────────
+
+    /// Helper: build an App with two transcript items so we can verify
+    /// hit-testing resolves to the correct one.
+    fn app_with_two_items() -> App {
+        use crate::state::ToolStatus;
+        let mut app = App::new("s", "m");
+        app.push_item(TranscriptItem::User {
+            text: "hello".into(),
+        });
+        app.push_item(TranscriptItem::Tool {
+            name: "read_file".into(),
+            emoji: "📖".into(),
+            summary: "foo.rs".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.1),
+            result_preview: "line1".into(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: false,
+            exit_code: None,
+        });
+        app
+    }
+
+    #[test]
+    fn test_hit_test_outside_text_area() {
+        let app = app_with_two_items();
+        let theme = Theme::aurora();
+        // No geometry set (last_text_area defaults to 0,0,0,0).
+        assert_eq!(transcript_hit_test(&app, theme, 5, 5), None);
+    }
+
+    #[test]
+    fn test_hit_test_resolves_correct_item() {
+        let app = app_with_two_items();
+        let theme = Theme::aurora();
+        // Simulate a text area at (0, 0) with width 80, height 20.
+        app.last_text_area.set((0, 0, 80, 20));
+
+        // Item 0 (User "hello") renders as 2 lines: header "❯ " + body.
+        // Item 1 (Tool) renders after it.
+        // Clicking rows 0-1 should hit item 0.
+        assert_eq!(
+            transcript_hit_test(&app, theme, 0, 10),
+            Some(0),
+            "top row should resolve to item 0"
+        );
+        assert_eq!(
+            transcript_hit_test(&app, theme, 1, 10),
+            Some(0),
+            "row 1 (body of item 0) should still resolve to item 0"
+        );
+
+        // Clicking row 2+ should hit item 1 (the tool).
+        let hit = transcript_hit_test(&app, theme, 2, 10);
+        assert_eq!(hit, Some(1), "row 2 should resolve to item 1");
+    }
+
+    #[test]
+    fn test_hit_test_below_content_returns_none() {
+        let app = app_with_two_items();
+        let theme = Theme::aurora();
+        // Large text area, click far below content → None.
+        app.last_text_area.set((0, 0, 80, 40));
+        // Row 39 is near the bottom of the text area but well below the
+        // ~3 lines of actual content.
+        assert_eq!(
+            transcript_hit_test(&app, theme, 39, 10),
+            None,
+            "click below all content should return None"
+        );
+    }
+
+    #[test]
+    fn test_hit_test_click_outside_bounds() {
+        let app = app_with_two_items();
+        let theme = Theme::aurora();
+        app.last_text_area.set((5, 5, 80, 20));
+        // Click is at row 0, which is above the text area (starts at row 5).
+        assert_eq!(
+            transcript_hit_test(&app, theme, 0, 10),
+            None,
+            "click above text area should return None"
+        );
+    }
+
+    #[test]
+    fn test_toggle_item_expand_by_index_tool() {
+        let mut app = app_with_two_items();
+        // Item 1 is the tool, starts unexpanded.
+        assert_eq!(
+            matches!(&app.transcript[1], TranscriptItem::Tool { expanded: false, .. }),
+            true
+        );
+        app.toggle_item_expand_by_index(1);
+        assert_eq!(
+            matches!(&app.transcript[1], TranscriptItem::Tool { expanded: true, .. }),
+            true,
+            "toggle should expand the tool"
+        );
+        app.toggle_item_expand_by_index(1);
+        assert_eq!(
+            matches!(&app.transcript[1], TranscriptItem::Tool { expanded: false, .. }),
+            true,
+            "second toggle should collapse the tool"
+        );
+    }
+
+    #[test]
+    fn test_toggle_item_expand_by_index_reasoning() {
+        let mut app = App::new("s", "m");
+        app.push_item(TranscriptItem::Reasoning {
+            text: (0..20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n"),
+            expand_state: ReasoningExpandState::Collapsed,
+            thought_duration: None,
+        });
+        // Collapsed → cycle should advance (long text → TailWindow).
+        app.toggle_item_expand_by_index(0);
+        assert_eq!(
+            matches!(
+                &app.transcript[0],
+                TranscriptItem::Reasoning { expand_state: ReasoningExpandState::TailWindow, .. }
+            ),
+            true,
+            "reasoning should cycle from Collapsed to TailWindow"
+        );
+    }
+
+    #[test]
+    fn test_toggle_item_expand_non_expandable_is_noop() {
+        let mut app = app_with_two_items();
+        // Item 0 is User — not expandable. Should be a no-op (no panic).
+        app.toggle_item_expand_by_index(0);
+        assert!(matches!(&app.transcript[0], TranscriptItem::User { .. }));
+    }
 }

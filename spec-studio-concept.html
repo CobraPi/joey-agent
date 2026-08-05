@@ -1,0 +1,1791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spec Studio — Visual IDE Concept for Spec Kit</title>
+<link rel="icon" href="data:,">
+<script>
+  (() => {
+    const param = new URLSearchParams(window.location.search).get("scoutTheme");
+    const theme =
+      param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    document.documentElement.setAttribute("data-theme", theme);
+  })();
+</script>
+<style>
+:root {
+  color-scheme: light;
+  --cp-bg: #f7f4ef;
+  --cp-bg-elevated: #fcfbf8;
+  --cp-surface: #ffffff;
+  --cp-surface-soft: #f5f5f5;
+  --cp-border: #dedede;
+  --cp-border-strong: #919191;
+  --cp-text: #242424;
+  --cp-text-muted: #5c5c5c;
+  --cp-text-soft: #6f6f6f;
+  --cp-accent: #b11f4b;
+  --cp-accent-hover: #9a1a41;
+  --cp-accent-soft: rgba(177, 31, 75, 0.08);
+  --cp-accent-fg: #ffffff;
+  --cp-success: #16a34a;
+  --cp-success-text: #107c10;
+  --cp-danger: #dc2626;
+  --cp-warning: #f59e0b;
+  --cp-warning-text: #8a4b00;
+  --cp-warning-fg: #242424;
+  --cp-link: #0078d4;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
+  --cp-overlay: rgba(255, 255, 255, 0.8);
+  --cp-panel: rgba(255, 255, 255, 0.86);
+  --cp-panel-strong: rgba(255, 255, 255, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.55);
+  --cp-highlight: rgba(177, 31, 75, 0.12);
+}
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --cp-bg: #3d3b3a;
+  --cp-bg-elevated: #343231;
+  --cp-surface: #292929;
+  --cp-surface-soft: #2e2e2e;
+  --cp-border: #474747;
+  --cp-border-strong: #5f5f5f;
+  --cp-text: #dedede;
+  --cp-text-muted: #919191;
+  --cp-text-soft: #b0b0b0;
+  --cp-accent: #fd8ea1;
+  --cp-accent-hover: #fb7b91;
+  --cp-accent-soft: rgba(253, 142, 161, 0.14);
+  --cp-accent-fg: #1a1a1a;
+  --cp-success: #4ade80;
+  --cp-success-text: #4ade80;
+  --cp-danger: #f87171;
+  --cp-warning: #fbbf24;
+  --cp-warning-text: #fbbf24;
+  --cp-warning-fg: #1a1a1a;
+  --cp-link: #4da6ff;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+  --cp-overlay: rgba(41, 41, 41, 0.88);
+  --cp-panel: rgba(41, 41, 41, 0.72);
+  --cp-panel-strong: rgba(41, 41, 41, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.04);
+  --cp-highlight: rgba(253, 142, 161, 0.12);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: "Segoe UI", Aptos, Calibri, -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--cp-bg);
+  color: var(--cp-text);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+code, pre, .mono { font-family: Consolas, "Courier New", Courier, monospace; }
+code { overflow-wrap: anywhere; }
+button, input, textarea, select { font: inherit; }
+button { color: inherit; }
+a { color: inherit; }
+:focus-visible { outline: 3px solid var(--cp-link); outline-offset: 3px; }
+.skip-link {
+  position: fixed; left: 12px; top: 10px; z-index: 100;
+  padding: 8px 12px; border-radius: 0.625rem; background: var(--cp-surface);
+  color: var(--cp-link); border: 1px solid var(--cp-border-strong);
+  transform: translateY(-160%);
+}
+.skip-link:focus { transform: translateY(0); }
+
+/* ---------- Layout ---------- */
+.shell { display: flex; min-height: 100vh; }
+.sidebar {
+  width: 248px; flex-shrink: 0; position: sticky; top: 0; height: 100vh;
+  background: var(--cp-bg-elevated); border-right: 1px solid var(--cp-border);
+  padding: 20px 12px; overflow-y: auto;
+}
+.brand { padding: 0 10px 18px; border-bottom: 1px solid var(--cp-border); margin-bottom: 14px; }
+.brand h1 { font-size: 17px; font-weight: 650; letter-spacing: -0.02em; }
+.brand .sub { font-size: 11.5px; color: var(--cp-text-muted); margin-top: 3px; }
+.navgroup { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--cp-text-soft); padding: 14px 10px 6px; font-weight: 600; }
+.navitem {
+  display: flex; align-items: center; gap: 9px; padding: 7px 10px; border-radius: 0.625rem;
+  font-size: 13.5px; color: var(--cp-text-muted); cursor: pointer; border: 1px solid transparent;
+  text-decoration: none; transition: background .13s, color .13s;
+}
+.navitem:hover { background: var(--cp-surface-soft); color: var(--cp-text); }
+.navitem.active { background: var(--cp-accent-soft); color: var(--cp-accent); font-weight: 600;
+  border-color: color-mix(in srgb, var(--cp-accent) 22%, transparent); }
+.navitem .n { font-size: 10.5px; opacity: .6; min-width: 15px; }
+
+.main { flex: 1; min-width: 0; padding: 30px 40px 90px; max-width: 1280px; }
+.page { display: none; animation: fade .22s ease; }
+.page.active { display: block; }
+@keyframes fade { from { opacity: 0; transform: translateY(6px);} to {opacity:1; transform:none;} }
+
+/* ---------- Typography ---------- */
+h2.title { font-size: 26px; font-weight: 650; letter-spacing: -0.025em; margin-bottom: 6px; }
+p.lede { font-size: 15px; color: var(--cp-text-muted); max-width: 800px; margin-bottom: 26px; }
+h3.sec { font-size: 15.5px; font-weight: 650; margin: 34px 0 12px; letter-spacing: -0.01em;
+  display: flex; align-items: center; gap: 9px; }
+h3.sec::before { content:""; width: 3px; height: 15px; background: var(--cp-accent); border-radius: 2px; }
+h4.sub { font-size: 13px; font-weight: 650; margin: 20px 0 8px; color: var(--cp-text); }
+p.body { font-size: 14px; color: var(--cp-text-muted); max-width: 820px; margin-bottom: 12px; }
+strong { font-weight: 620; color: var(--cp-text); }
+
+/* ---------- Cards ---------- */
+.card { min-width: 0; background: var(--cp-surface); border: 1px solid var(--cp-border); border-radius: 16px;
+  padding: 18px; box-shadow: 0 0 2px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.14); }
+.grid { display: grid; gap: 14px; }
+.grid > * { min-width: 0; }
+.g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.g3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.g4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 1100px) { .g3,.g4 { grid-template-columns: repeat(2,1fr);} }
+
+/* ---------- Chips / badges ---------- */
+.chip { display: inline-flex; align-items: center; gap: 5px; padding: 2.5px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; border: 1px solid var(--cp-border); background: var(--cp-surface-soft);
+  color: var(--cp-text-muted); white-space: nowrap; }
+.chip.mono { font-family: Consolas, monospace; font-size: 10.5px; }
+.chip.accent { background: var(--cp-accent-soft); color: var(--cp-accent);
+  border-color: color-mix(in srgb, var(--cp-accent) 30%, transparent); }
+.chip.ok { background: color-mix(in srgb, var(--cp-success) 12%, transparent); color: var(--cp-success-text);
+  border-color: color-mix(in srgb, var(--cp-success) 32%, transparent); }
+.chip.warn { background: color-mix(in srgb, var(--cp-warning) 14%, transparent); color: var(--cp-warning-text);
+  border-color: color-mix(in srgb, var(--cp-warning) 36%, transparent); }
+.chip.bad { background: color-mix(in srgb, var(--cp-danger) 11%, transparent); color: var(--cp-danger);
+  border-color: color-mix(in srgb, var(--cp-danger) 30%, transparent); }
+.chip.link { background: color-mix(in srgb, var(--cp-link) 10%, transparent); color: var(--cp-link);
+  border-color: color-mix(in srgb, var(--cp-link) 28%, transparent); }
+
+/* ---------- Workflow rail ---------- */
+.rail { display: flex; width: 100%; max-width: 100%; align-items: stretch; gap: 0; overflow-x: auto; overflow-y: hidden; padding: 6px 2px 14px; }
+.step { flex: 1; min-width: 104px; position: relative; text-align: center; }
+.step .dot { width: 30px; height: 30px; border-radius: 50%; margin: 0 auto 8px; display: grid;
+  place-items: center; font-size: 12px; font-weight: 700; border: 2px solid var(--cp-border-strong);
+  background: var(--cp-surface); color: var(--cp-text-muted); position: relative; z-index: 2; }
+.step.done .dot { background: var(--cp-success-text); border-color: var(--cp-success-text); color: var(--cp-accent-fg); }
+.step.active .dot { background: var(--cp-accent); border-color: var(--cp-accent); color: var(--cp-accent-fg);
+  box-shadow: 0 0 0 4px var(--cp-accent-soft); }
+.step.blocked .dot { border-style: dashed; border-color: var(--cp-warning); color: var(--cp-warning-text); }
+.step.locked .dot { opacity: .42; }
+.step::after { content:""; position: absolute; top: 15px; left: 50%; width: 100%; height: 2px;
+  background: var(--cp-border); z-index: 1; }
+.step:last-child::after { display: none; }
+.step.done::after { background: var(--cp-success); }
+.step .lbl { font-size: 11.5px; font-weight: 600; }
+.step .cmd { font-size: 9.5px; color: var(--cp-text-soft); font-family: Consolas, monospace; margin-top: 1px; }
+.step .gate { font-size: 9px; margin-top: 5px; color: var(--cp-text-soft); }
+.step.legend { flex: 0 0 auto; min-width: auto; }
+.step.legend::after { display: none; }
+.stagebar { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: 12px; }
+.stage {
+  min-width: 0; padding: 9px 10px; border: 1px solid var(--cp-border); border-radius: 10px;
+  background: var(--cp-surface); font-size: 11.5px; font-weight: 650; text-align: center;
+}
+.stage.done { border-color: color-mix(in srgb, var(--cp-success) 44%, var(--cp-border)); }
+.stage.active { color: var(--cp-accent); border-color: var(--cp-accent); background: var(--cp-accent-soft); }
+.workflow-detail { max-width: 100%; overflow-x: clip; }
+.workflow-detail summary { cursor: pointer; color: var(--cp-link); font-size: 12px; font-weight: 650; margin: 10px 0; }
+
+/* ---------- Split raw/visual demo ---------- */
+.demo { border: 1px solid var(--cp-border); border-radius: 16px; overflow: hidden;
+  background: var(--cp-surface); margin-bottom: 18px; }
+.demo-head { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 11px 15px; border-bottom: 1px solid var(--cp-border); background: var(--cp-bg-elevated); }
+.demo-head .t { font-size: 13px; font-weight: 650; }
+.demo-head .d { font-size: 11.5px; color: var(--cp-text-muted); }
+.demo-body { display: grid; grid-template-columns: minmax(0,0.85fr) 30px minmax(0,1.15fr); }
+@media (max-width: 980px) { .demo-body { grid-template-columns: 1fr; } .arrowcol { display:none !important; } }
+.pane { padding: 15px; min-width: 0; }
+.pane.raw { background: var(--cp-surface-soft); border-right: 1px solid var(--cp-border); }
+.pane-lbl { font-size: 9.5px; text-transform: uppercase; letter-spacing: .08em; font-weight: 700;
+  color: var(--cp-text-soft); margin-bottom: 9px; }
+pre.md { font-size: 11.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word;
+  color: var(--cp-text-muted); }
+pre.md .h { color: var(--cp-accent); font-weight: 700; }
+pre.md .b { color: var(--cp-text); font-weight: 700; }
+pre.md .m { color: var(--cp-warning-text); font-weight: 700; }
+pre.md .g { color: var(--cp-success-text); }
+.arrowcol { display: grid; place-items: center; background: var(--cp-surface-soft);
+  border-right: 1px solid var(--cp-border); color: var(--cp-text-soft); font-size: 16px; }
+
+/* ---------- Story card ---------- */
+.story { display: flex; gap: 0; border: 1px solid var(--cp-border); border-radius: 12px;
+  overflow: hidden; background: var(--cp-surface); margin-bottom: 10px; }
+.story .rail-p { width: 5px; flex-shrink: 0; }
+.p1 { background: var(--cp-danger); } .p2 { background: var(--cp-warning); } .p3 { background: var(--cp-link); }
+.story .inner { padding: 11px 13px; flex: 1; min-width: 0; }
+.story .top { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 5px; }
+.story .name { font-size: 13.5px; font-weight: 650; }
+.story .desc { font-size: 12px; color: var(--cp-text-muted); margin-bottom: 8px; }
+.story .foot { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
+
+/* ---------- GWT flow ---------- */
+.gwt { display: flex; align-items: stretch; gap: 6px; flex-wrap: wrap; margin: 7px 0; }
+.gwt .node { flex: 1; min-width: 132px; border: 1px solid var(--cp-border); border-radius: 9px;
+  padding: 8px 10px; background: var(--cp-bg-elevated); position: relative; }
+.gwt .node .k { font-size: 9px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase;
+  margin-bottom: 3px; }
+.gwt .node.given .k { color: var(--cp-text-soft); }
+.gwt .node.when .k { color: var(--cp-link); }
+.gwt .node.then .k { color: var(--cp-success-text); }
+.gwt .node .v { font-size: 11.5px; color: var(--cp-text); line-height: 1.45; }
+.gwt .arw { display: grid; place-items: center; color: var(--cp-text-soft); font-size: 13px; }
+
+/* ---------- Metric card ---------- */
+.metric { border: 1px solid var(--cp-border); border-radius: 12px; padding: 12px 13px;
+  background: var(--cp-surface); }
+.metric .id { font-size: 9.5px; font-family: Consolas, monospace; color: var(--cp-text-soft); font-weight: 700; }
+.metric .val { font-size: 25px; font-weight: 700; letter-spacing: -0.03em; margin: 2px 0 1px;
+  color: var(--cp-accent); }
+.metric .val small { font-size: 12px; font-weight: 600; color: var(--cp-text-muted); margin-left: 2px; }
+.metric .cap { font-size: 11px; color: var(--cp-text-muted); line-height: 1.4; }
+.metric .evidence { font-size: 10px; color: var(--cp-text-soft); margin-top: 7px; }
+.bar { height: 4px; border-radius: 3px; background: var(--cp-surface-soft); margin-top: 8px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--cp-accent); border-radius: 3px; }
+
+/* ---------- Kanban ---------- */
+.kan { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 10px; }
+@media (max-width: 1150px) { .kan { grid-template-columns: repeat(3, 1fr);} }
+.kcol { background: var(--cp-bg-elevated); border: 1px solid var(--cp-border); border-radius: 12px; padding: 9px; }
+.kcol .kh { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; padding: 0 2px; }
+.kcol .kh .kt { font-size: 11.5px; font-weight: 700; }
+.kcol .kh .kc { font-size: 10px; color: var(--cp-text-soft); font-family: Consolas, monospace; }
+.tcard { background: var(--cp-surface); border: 1px solid var(--cp-border); border-radius: 9px;
+  padding: 8px 9px; margin-bottom: 6px; transition: transform .1s, box-shadow .1s; }
+.tcard:hover { transform: translateY(-1px); box-shadow: 0 3px 10px rgba(0,0,0,.09); }
+.tcard .tid { font-size: 9.5px; font-family: Consolas, monospace; font-weight: 700; color: var(--cp-text-soft); }
+.tcard .tt { font-size: 11.5px; line-height: 1.4; margin: 2px 0 5px; }
+.tcard .tf { display: flex; gap: 4px; flex-wrap: wrap; }
+.tcard.done { opacity: .58; }
+.tcard.done .tt { text-decoration: line-through; }
+.us1 { border-left: 3px solid var(--cp-danger); }
+.us2 { border-left: 3px solid var(--cp-warning); }
+.us3 { border-left: 3px solid var(--cp-link); }
+
+/* ---------- Traceability matrix ---------- */
+.matrix { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 11.5px; }
+.matrix th, .matrix td { padding: 6px 8px; text-align: center; border-bottom: 1px solid var(--cp-border); }
+.matrix th { font-size: 10px; font-weight: 700; color: var(--cp-text-soft); text-transform: uppercase;
+  letter-spacing: .05em; background: var(--cp-bg-elevated); position: sticky; top: 0; }
+.matrix td.rowh, .matrix th.rowh { text-align: left; font-family: Consolas, monospace; font-weight: 700;
+  font-size: 10.5px; white-space: nowrap; }
+.cellv { width: 19px; height: 19px; border-radius: 5px; display: inline-block; }
+.f0 { background: var(--cp-surface-soft); border: 1px dashed var(--cp-border-strong); }
+.f1 { background: color-mix(in srgb, var(--cp-success) 28%, transparent); }
+.f2 { background: color-mix(in srgb, var(--cp-success) 62%, transparent); }
+.f3 { background: var(--cp-success); }
+.forphan { background: color-mix(in srgb, var(--cp-danger) 55%, transparent); }
+
+/* ---------- File tree ---------- */
+.tree { font-family: Consolas, monospace; font-size: 11.5px; line-height: 1.85; }
+.tree .row { display: flex; align-items: center; gap: 7px; padding: 1px 5px; border-radius: 5px; }
+.tree .row:hover { background: var(--cp-surface-soft); }
+.tree .ind { color: var(--cp-text-soft); opacity: .55; }
+.tree .nm { color: var(--cp-text); }
+.tree .dir .nm { color: var(--cp-link); font-weight: 600; }
+
+/* ---------- Diff ---------- */
+.diff { border: 1px solid var(--cp-border); border-radius: 11px; overflow: hidden; font-family: Consolas, monospace;
+  font-size: 11.5px; }
+.diff .dh { padding: 8px 12px; background: var(--cp-bg-elevated); border-bottom: 1px solid var(--cp-border);
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; font-family: "Segoe UI", sans-serif; }
+.diff .dl { padding: 2.5px 12px; display: flex; gap: 10px; white-space: pre-wrap; word-break: break-word; }
+.diff .dl .ln { color: var(--cp-text-soft); opacity: .6; min-width: 26px; text-align: right; user-select: none; }
+.diff .add { background: color-mix(in srgb, var(--cp-success) 13%, transparent); }
+.diff .del { background: color-mix(in srgb, var(--cp-danger) 11%, transparent); }
+.diff .ctx { color: var(--cp-text-muted); }
+
+/* ---------- Gate rows ---------- */
+.gate-row { display: flex; align-items: center; gap: 11px; padding: 9px 11px; border-radius: 10px;
+  border: 1px solid var(--cp-border); background: var(--cp-surface); margin-bottom: 6px; }
+.gate-row .ic { width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 11px; font-weight: 800; flex-shrink: 0; color: var(--cp-accent-fg); }
+.gate-row .ic.ok { background: var(--cp-success-text); }
+.gate-row .ic.no { background: var(--cp-danger); }
+.gate-row .ic.wr { background: var(--cp-warning); color: var(--cp-warning-fg); }
+.gate-row .gt { font-size: 12.5px; font-weight: 600; flex: 1; }
+.gate-row .gd { font-size: 11.5px; color: var(--cp-text-muted); }
+
+/* ---------- Entity graph ---------- */
+.egraph { position: relative; height: 250px; background: var(--cp-bg-elevated);
+  border: 1px solid var(--cp-border); border-radius: 12px; overflow: hidden;
+  background-image: radial-gradient(var(--cp-border) 1px, transparent 1px); background-size: 17px 17px; }
+.enode { position: absolute; background: var(--cp-surface); border: 1.5px solid var(--cp-accent);
+  border-radius: 9px; padding: 7px 10px; min-width: 112px; box-shadow: 0 2px 8px rgba(0,0,0,.09);
+  text-align: left; cursor: pointer; }
+.enode .en { display: block; font-size: 11.5px; font-weight: 700; margin-bottom: 3px; }
+.enode .ef { display: block; font-size: 10px; color: var(--cp-text-muted); font-family: Consolas, monospace; line-height: 1.55; }
+.enode.sec { border-color: var(--cp-border-strong); }
+
+/* ---------- Bento ---------- */
+.bento { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 1050px) { .bento { grid-template-columns: repeat(2,1fr);} }
+.b-span2 { grid-column: span 2; }
+.b-span4 { grid-column: span 4; }
+@media (max-width: 1050px) { .b-span4 { grid-column: span 2; } }
+.bt { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--cp-text-soft); margin-bottom: 9px; }
+
+/* ---------- Misc ---------- */
+.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.tbl th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--cp-text-soft); padding: 8px 10px; border-bottom: 1.5px solid var(--cp-border); font-weight: 700; }
+.tbl td { padding: 9px 10px; border-bottom: 1px solid var(--cp-border); vertical-align: top;
+  color: var(--cp-text-muted); }
+.tbl td strong { color: var(--cp-text); }
+.tbl tr:last-child td { border-bottom: none; }
+.callout { border-left: 3px solid var(--cp-accent); background: var(--cp-accent-soft);
+  padding: 12px 15px; border-radius: 0 10px 10px 0; margin: 14px 0; font-size: 13.5px; }
+.callout .ct { font-weight: 700; margin-bottom: 3px; }
+.flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+.fbox { border: 1px solid var(--cp-border); background: var(--cp-surface); border-radius: 10px;
+  padding: 9px 12px; font-size: 12px; text-align: center; }
+.fbox .fl { font-size: 9.5px; color: var(--cp-text-soft); text-transform: uppercase; letter-spacing: .06em;
+  font-weight: 700; margin-bottom: 2px; }
+.fbox .fv { font-weight: 620; }
+.fbox .fm { font-size: 10px; color: var(--cp-text-muted); font-family: Consolas, monospace; margin-top: 2px; }
+.farr { color: var(--cp-text-soft); font-size: 15px; }
+.toggle { display: inline-flex; border: 1px solid var(--cp-border); border-radius: 8px; overflow: hidden; }
+.toggle button { border: none; background: var(--cp-surface); color: var(--cp-text-muted); font-size: 11px;
+  padding: 4px 11px; cursor: pointer; font-family: inherit; font-weight: 600; }
+.toggle button.on { background: var(--cp-accent); color: var(--cp-accent-fg); }
+.action {
+  min-height: 36px; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 7px 11px; border: 1px solid var(--cp-border-strong); border-radius: 9px;
+  background: var(--cp-surface); color: var(--cp-text); cursor: pointer; font-size: 12px; font-weight: 650;
+}
+.action:hover { border-color: var(--cp-accent); }
+.action.primary { background: var(--cp-accent); border-color: var(--cp-accent); color: var(--cp-accent-fg); }
+.action.danger { color: var(--cp-danger); border-color: color-mix(in srgb, var(--cp-danger) 55%, var(--cp-border)); }
+.action:disabled { cursor: not-allowed; opacity: .58; }
+.choice {
+  display: flex; align-items: flex-start; gap: 8px; width: 100%; padding: 9px 10px;
+  border: 1px solid var(--cp-border); border-radius: 8px; background: var(--cp-surface);
+  font-size: 12px; text-align: left; cursor: pointer;
+}
+.choice:has(input:checked) { border-color: var(--cp-accent); background: var(--cp-accent-soft); }
+.choice input { margin-top: 2px; accent-color: var(--cp-accent); }
+.origin {
+  display: inline-flex; padding: 2px 6px; border: 1px solid var(--cp-border); border-radius: 5px;
+  font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase;
+}
+.origin.source { color: var(--cp-link); }
+.origin.derived { color: var(--cp-success-text); }
+.origin.overlay { color: var(--cp-warning-text); }
+.wizard { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+.wizard-step {
+  min-width: 0; padding: 12px; border: 1px solid var(--cp-border); border-radius: 12px;
+  background: var(--cp-surface);
+}
+.wizard-step .num { font: 700 10px Consolas, monospace; color: var(--cp-accent); }
+.wizard-step .wt { font-size: 12.5px; font-weight: 700; margin: 3px 0; }
+.wizard-step .wd { font-size: 11px; color: var(--cp-text-muted); }
+.status-region { min-height: 18px; color: var(--cp-success-text); font-size: 11px; font-weight: 650; margin-top: 7px; }
+.mobile-note { display: none; }
+.toast {
+  position: fixed; right: 16px; bottom: 16px; z-index: 50; max-width: min(420px, calc(100vw - 32px));
+  padding: 10px 12px; border: 1px solid var(--cp-border-strong); border-radius: 10px;
+  background: var(--cp-panel-strong); color: var(--cp-text); box-shadow: var(--cp-shadow);
+  font-size: 12px; transform: translateY(150%); transition: transform .18s ease;
+}
+.toast.show { transform: translateY(0); }
+ul.clean { list-style: none; }
+ul.clean li { font-size: 13.5px; color: var(--cp-text-muted); padding: 5px 0 5px 20px; position: relative; }
+ul.clean li::before { content: "▸"; position: absolute; left: 3px; color: var(--cp-accent); font-size: 11px; top: 6px; }
+ul.clean li strong { color: var(--cp-text); }
+.kbd { display: inline-block; font-family: Consolas, monospace; font-size: 10.5px; padding: 1px 6px;
+  border: 1px solid var(--cp-border-strong); border-bottom-width: 2px; border-radius: 5px;
+  background: var(--cp-surface); color: var(--cp-text); }
+.hr { height: 1px; background: var(--cp-border); margin: 30px 0; border: none; }
+@media (max-width: 760px) {
+  .shell { display: block; }
+  .sidebar {
+    width: 100%; height: auto; position: sticky; z-index: 20; display: flex; align-items: center;
+    gap: 5px; padding: 8px; border-right: 0; border-bottom: 1px solid var(--cp-border); overflow-x: auto;
+  }
+  .brand { min-width: 150px; padding: 0 8px; margin: 0; border: 0; }
+  .brand .sub, .navgroup { display: none; }
+  .navitem { min-width: max-content; min-height: 44px; padding: 9px 11px; }
+  .main { padding: 20px 16px 70px; }
+  .g2, .g3, .g4, .bento { grid-template-columns: minmax(0, 1fr); }
+  .b-span2, .b-span4 { grid-column: span 1; }
+  .wizard { grid-template-columns: 1fr; }
+  .stagebar { grid-template-columns: 1fr; }
+  .kan { grid-template-columns: repeat(5, minmax(240px, 1fr)); overflow-x: auto; padding-bottom: 8px; }
+  .tbl { display: block; overflow-x: auto; }
+  .grid > [style*="grid-column:span 2"] { grid-column: span 1 !important; }
+  .card [style*="grid-template-columns:1fr 1fr"] { grid-template-columns: 1fr !important; }
+  .action { min-height: 44px; }
+  .egraph { display: none; }
+  .mobile-note { display: block; }
+  .gate-row .gd { width: 100%; margin-left: 31px; }
+  .tree .row { flex-wrap: wrap; }
+  .tree .nm { overflow-wrap: anywhere; }
+  .run-head { align-items: flex-start !important; flex-wrap: wrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+  .tcard:hover { transform: none; }
+}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to concept content</a>
+<div class="shell">
+<nav class="sidebar" aria-label="Concept sections">
+  <div class="brand">
+    <h1>Spec Studio</h1>
+    <div class="sub">Visual IDE concept for Spec Kit</div>
+  </div>
+  <div class="navgroup">Start</div>
+  <a class="navitem active" href="#p-start" data-p="p-start" aria-current="page"><span class="n">01</span> First-run journey</a>
+  <a class="navitem" href="#p-atlas" data-p="p-atlas"><span class="n">02</span> Feature home</a>
+  <div class="navgroup">Define</div>
+  <a class="navitem" href="#p-spec" data-p="p-spec"><span class="n">03</span> Define the feature</a>
+  <a class="navitem" href="#p-map" data-p="p-map"><span class="n">04</span> Visual language</a>
+  <div class="navgroup">Design</div>
+  <a class="navitem" href="#p-plan" data-p="p-plan"><span class="n">05</span> Design the solution</a>
+  <div class="navgroup">Break down</div>
+  <a class="navitem" href="#p-tasks" data-p="p-tasks"><span class="n">06</span> Break down the work</a>
+  <a class="navitem" href="#p-trace" data-p="p-trace"><span class="n">07</span> Check coverage</a>
+  <div class="navgroup">Build &amp; review</div>
+  <a class="navitem" href="#p-review" data-p="p-review"><span class="n">08</span> Run agent &amp; review</a>
+  <div class="navgroup">System design</div>
+  <a class="navitem" href="#p-rail" data-p="p-rail"><span class="n">09</span> Workflow model</a>
+  <a class="navitem" href="#p-edit" data-p="p-edit"><span class="n">10</span> Editing safety</a>
+  <a class="navitem" href="#p-arch" data-p="p-arch"><span class="n">11</span> Architecture</a>
+  <a class="navitem" href="#p-tech" data-p="p-tech"><span class="n">12</span> UX principles</a>
+  <a class="navitem" href="#p-thesis" data-p="p-thesis"><span class="n">13</span> Product thesis</a>
+  <a class="navitem" href="#p-build" data-p="p-build"><span class="n">14</span> Delivery sequence</a>
+</nav>
+
+<main class="main" id="main-content" tabindex="-1">
+
+<!-- ============ 01 START ============ -->
+<section class="page active" id="p-start">
+  <h2 class="title">Start a feature without knowing Spec Kit</h2>
+  <p class="lede">The first-run experience is the product's front door. It translates repository setup, branch
+  binding, and <code class="mono">/speckit.specify</code> into one guided flow with safe defaults and a preview
+  before the agent runs.</p>
+
+  <h3 class="sec">Five-step setup</h3>
+  <div class="wizard" aria-label="First-run setup journey">
+    <div class="wizard-step"><div class="num">01</div><div class="wt">Choose repository</div>
+      <div class="wd">Recent workspaces first. Validate read/write access before continuing.</div></div>
+    <div class="wizard-step"><div class="num">02</div><div class="wt">Check Spec Kit</div>
+      <div class="wd">Detect templates, constitution, integration, and repairable setup gaps.</div></div>
+    <div class="wizard-step"><div class="num">03</div><div class="wt">Choose branch</div>
+      <div class="wd">Create a feature branch or bind an existing one; show every file this changes.</div></div>
+    <div class="wizard-step"><div class="num">04</div><div class="wt">Describe outcome</div>
+      <div class="wd">Plain-language brief with examples, constraints, evidence, and optional attachments.</div></div>
+    <div class="wizard-step"><div class="num">05</div><div class="wt">Preview &amp; start</div>
+      <div class="wd">Confirm slug, branch, generated paths, agent permissions, and estimated scope.</div></div>
+  </div>
+
+  <h3 class="sec">The decisive screen: preview before run</h3>
+  <div class="grid g2">
+    <div class="card">
+      <div class="bt">Your feature brief</div>
+      <label for="brief" style="display:block;font-size:12px;font-weight:650;margin-bottom:5px">What outcome should this feature deliver?</label>
+      <textarea id="brief" rows="5" style="width:100%;padding:10px;border:1px solid var(--cp-border-strong);border-radius:9px;background:var(--cp-surface);color:var(--cp-text)">Let developers complete the full Spec Kit workflow visually, while keeping markdown compatible with the CLI.</textarea>
+      <div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:10px">
+        <button class="action primary" type="button" data-action="preview-start">Preview feature setup</button>
+        <button class="action" type="button">Save draft</button>
+      </div>
+      <div class="status-region" id="start-status" role="status" aria-live="polite"></div>
+    </div>
+    <div class="card">
+      <div class="bt">Proposed setup — nothing written yet</div>
+      <table class="tbl">
+        <tr><td><strong>Repository</strong></td><td>hermes-agent</td></tr>
+        <tr><td><strong>Branch</strong></td><td><code class="mono">005-spec-studio-workspace</code></td></tr>
+        <tr><td><strong>Feature path</strong></td><td><code class="mono">specs/005-spec-studio-workspace/</code></td></tr>
+        <tr><td><strong>Agent access</strong></td><td>Read repository; propose writes for review</td></tr>
+        <tr><td><strong>First action</strong></td><td>Generate <code class="mono">spec.md</code> in staged mode</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3 class="sec">Every empty or failed state has one recovery action</h3>
+  <table class="tbl">
+    <tr><th>State</th><th>What the user sees</th><th>Primary recovery</th></tr>
+    <tr><td>No Spec Kit setup</td><td>What is missing and which repo files initialization creates</td><td><button class="action" type="button">Initialize with preview</button></td></tr>
+    <tr><td>No write permission</td><td>Read-only workspace; all analysis remains available</td><td><button class="action" type="button">Choose another repository</button></td></tr>
+    <tr><td>Gateway disconnected</td><td>Draft is preserved locally; agent actions disabled</td><td><button class="action" type="button">Reconnect agent</button></td></tr>
+    <tr><td>Unsupported markdown</td><td>Parseable blocks render visually; unsupported ranges stay editable as raw text</td><td><button class="action" type="button">Open affected ranges</button></td></tr>
+    <tr><td>Branch changed externally</td><td>Current edits freeze; changed nodes and impact are listed</td><td><button class="action" type="button">Review &amp; rebase</button></td></tr>
+  </table>
+
+  <div class="callout">
+    <div class="ct">The user navigates by intent, not artifact names</div>
+    The production workspace is organized as <strong>Overview → Define → Design → Break down → Build → Review</strong>.
+    <code class="mono">spec.md</code>, <code class="mono">plan.md</code>, and <code class="mono">tasks.md</code> appear
+    inside those stages as source indicators and escape hatches, not as knowledge the user must possess upfront.
+  </div>
+</section>
+
+<!-- ============ 13 THESIS ============ -->
+<section class="page" id="p-thesis">
+  <h2 class="title">The core thesis</h2>
+  <p class="lede">Spec Kit already produces excellent structured documents. The problem isn't the content —
+  it's that <strong>a wall of markdown hides its own structure</strong>. The IDE's job is not to replace markdown.
+  It's to make the structure that is <em>already</em> in the markdown visible, navigable, and editable.</p>
+
+  <div class="callout">
+    <div class="ct">Markdown is the database. The IDE is the query engine.</div>
+    Every file under <code class="mono">specs/###-feature/</code> stays the single source of truth, byte-for-byte
+    compatible with the CLI. The IDE parses it into a <strong>semantic graph</strong>, renders projections of that
+    graph, and writes reviewed patches back through verified byte anchors. CLI-compatible identity and binding
+    sidecars remain supported; private display preferences stay outside the repo. A teammate on the CLI never needs
+    the GUI to continue the workflow.
+  </div>
+
+  <h3 class="sec">Three pillars</h3>
+  <div class="grid g3">
+    <div class="card">
+      <div class="bt">Pillar 1</div>
+      <h4 class="sub" style="margin-top:0">The Stage Bar</h4>
+      <p class="body" style="font-size:13px;margin:0">One compact, always-visible stage indicator showing where the
+      feature is and what comes next. Command detail expands only when needed. It replaces “which slash command do
+      I run now?” with one deterministic next action and actionable gates.</p>
+    </div>
+    <div class="card">
+      <div class="bt">Pillar 2</div>
+      <h4 class="sub" style="margin-top:0">The Meaning Layer</h4>
+      <p class="body" style="font-size:13px;margin:0">Each markdown construct is rendered with the visual primitive
+      that matches its <em>semantics</em> — priorities become rails, Given/When/Then becomes a flow, success criteria
+      become metric cards, tasks become a board. Never a generic markdown blob.</p>
+    </div>
+    <div class="card">
+      <div class="bt">Pillar 3</div>
+      <h4 class="sub" style="margin-top:0">The Trace</h4>
+      <p class="body" style="font-size:13px;margin:0">Constitution → Story → Requirement → Task → File → Checklist
+      as one connected graph. Selecting any node highlights everything it touches. Orphans (a requirement no task
+      implements) become visually impossible to miss.</p>
+    </div>
+  </div>
+
+  <h3 class="sec">What "100% of the workflow in the UI" actually requires</h3>
+  <p class="body">Five capabilities must all be present, or the user drops back to the terminal and the IDE fails:</p>
+  <table class="tbl">
+    <tr><th style="width:150px">Capability</th><th>Why it's load-bearing</th></tr>
+    <tr><td><strong>Initiate</strong></td><td>Every one of the ten <code class="mono">speckit.*</code> commands is
+      launchable from the UI with typed inputs — no free-text command memorization.</td></tr>
+    <tr><td><strong>Observe</strong></td><td>Streaming agent output, tool calls, and file writes render live. A run
+      that looks frozen is the #1 reason users abandon a GUI for a terminal.</td></tr>
+    <tr><td><strong>Answer</strong></td><td>The agent asks clarifying questions mid-run. These must surface as
+      first-class interactive cards, not buried log lines. This is the <code class="mono">speckit.interaction.respond</code> path.</td></tr>
+    <tr><td><strong>Edit</strong></td><td>Direct manipulation of generated artifacts with round-trip safety. If the
+      user must open VS Code to fix a typo, the loop is broken.</td></tr>
+    <tr><td><strong>Approve</strong></td><td>Diff-first review with hunk-level accept/reject before anything touches
+      the working tree. Trust is the currency; staged-by-default buys it.</td></tr>
+  </table>
+
+  <h3 class="sec">The failure mode we are designing against</h3>
+  <div class="grid g2">
+    <div class="card" style="border-color:color-mix(in srgb, var(--cp-danger) 35%, transparent)">
+      <div class="bt" style="color:var(--cp-danger)">Anti-pattern</div>
+      <p class="body" style="margin:0;font-size:13px">A two-pane app: file tree on the left, rendered markdown on
+      the right, "Run" button on top. This is a <em>markdown viewer with a shell attached</em>. It renders markdown,
+      not meaning. Users still can't see coverage, priority, dependencies, or what to do next — so they keep the
+      terminal open beside it and the IDE becomes decoration.</p>
+    </div>
+    <div class="card" style="border-color:color-mix(in srgb, var(--cp-success) 35%, transparent)">
+      <div class="bt" style="color:var(--cp-success-text)">Target</div>
+      <p class="body" style="margin:0;font-size:13px">A tool where the <em>visual</em> is the primary artifact and
+      raw markdown is the escape hatch — available on <span class="kbd">⌥M</span> for any node, never required.
+      Users reason about the feature in boards, graphs, and metric cards, and only drop to text when they want to.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 02 ARCHITECTURE ============ -->
+<section class="page" id="p-arch">
+  <h2 class="title">Architecture</h2>
+  <p class="lede">The dashboard is a projection of CLI-compatible project files, driven by the agent over the
+  existing gateway. Three layers, one rule: <strong>repo state must remain readable and operable without the IDE.</strong></p>
+
+  <h3 class="sec">Data path</h3>
+  <div class="flow">
+    <div class="fbox"><div class="fl">Browser</div><div class="fv">Spec Studio SPA</div><div class="fm">React 19 · Vite · Tailwind 4</div></div>
+    <span class="farr">⇄</span>
+    <div class="fbox"><div class="fl">Transport</div><div class="fv">JSON-RPC over WS</div><div class="fm">gatewayClient.ts</div></div>
+    <span class="farr">⇄</span>
+    <div class="fbox"><div class="fl">Gateway</div><div class="fv">tui_gateway</div><div class="fm">speckit.run.*</div></div>
+    <span class="farr">⇄</span>
+    <div class="fbox"><div class="fl">Agent</div><div class="fv">Hermes</div><div class="fm">speckit.*.prompt.md</div></div>
+    <span class="farr">⇄</span>
+    <div class="fbox"><div class="fl">Truth</div><div class="fv">Working tree</div><div class="fm">specs/###-*/**.md</div></div>
+  </div>
+
+  <h3 class="sec">Three layers</h3>
+  <div class="grid g3">
+    <div class="card">
+      <div class="bt">Layer 1 — Truth</div>
+      <p class="body" style="font-size:12.5px">Markdown + CLI-compatible sidecars + git. Written only by the agent
+      through reviewed patches or by the user's accepted edits. The IDE preserves unknown syntax and never rewrites
+      an untouched range.</p>
+      <div style="display:flex;gap:4px;flex-wrap:wrap">
+        <span class="chip mono">spec.md</span><span class="chip mono">plan.md</span>
+        <span class="chip mono">tasks.md</span><span class="chip mono">research.md</span>
+        <span class="chip mono">data-model.md</span><span class="chip mono">contracts/</span>
+        <span class="chip mono">checklists/</span><span class="chip mono">constitution.md</span>
+        <span class="chip mono">.speckit-feature.yml</span><span class="chip mono">.specify/bindings.yml*</span>
+      </div>
+      <p class="body" style="font-size:10.5px;margin:7px 0 0">* Shared binding mode only; the UI previews this
+      working-tree change before enabling it.</p>
+    </div>
+    <div class="card">
+      <div class="bt">Layer 2 — Meaning</div>
+      <p class="body" style="font-size:12.5px">A lossless concrete syntax tree plus a derived semantic graph.
+      Every node keeps its UTF-8 byte range, expected source bytes, document revision hash, and a structural
+      fingerprint. Those checks—not reparsing alone—make visual editing safe.</p>
+      <pre class="md" style="font-size:10.5px"><span class="b">Node</span> {
+  id:      <span class="g">"FR-014"</span>
+  kind:    <span class="g">"requirement"</span>
+  file:    <span class="g">"spec.md"</span>
+  <span class="m">anchor:  { byteStart: 8172, byteEnd: 8268 }</span>
+  revision: <span class="g">"sha256:4d1…"</span>
+  expected: <span class="g">"- **FR-014**: Users MUST…"</span>
+  fingerprint: <span class="g">"requirements/FR-014"</span>
+  props:   { modality: <span class="g">"MUST"</span>, … }
+  edges:   [ <span class="g">"US2"</span>, <span class="g">"T034"</span>, <span class="g">"CHK007"</span> ]
+}</pre>
+    </div>
+    <div class="card">
+      <div class="bt">Layer 3 — Overlay</div>
+      <p class="body" style="font-size:12.5px">Private IDE state that must <em>never</em> dirty the working tree.
+      Lives in profile-scoped SQLite, keyed by repo + branch. Shared binding metadata is a separate, explicit
+      repo-sidecar mode. Losing the private overlay costs convenience, never authored work.</p>
+      <ul class="clean" style="font-size:12px">
+        <li>Run history &amp; attempt transcripts</li>
+        <li>Private feature ↔ branch bindings, drift state</li>
+        <li>Anchored comments &amp; review feedback</li>
+        <li>Board positions, filters, panel layout</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3 class="sec">Gateway surface (already implemented)</h3>
+  <p class="body">The concept binds to the methods that exist in
+  <code class="mono">tui_gateway/speckit_methods.py</code> today — no new transport is required.</p>
+  <table class="tbl">
+    <tr><th style="width:230px">Method</th><th>UI affordance it powers</th></tr>
+    <tr><td><code class="mono">speckit.run.prepare</code></td><td>Readiness check that decides which Rail steps unlock; renders the gate reasons.</td></tr>
+    <tr><td><code class="mono">speckit.run.start</code></td><td>The primary action button on any Rail step.</td></tr>
+    <tr><td><code class="mono">speckit.run.events</code></td><td>Streaming transcript, live tool-call timeline, progressive artifact preview.</td></tr>
+    <tr><td><code class="mono">speckit.interaction.respond</code></td><td>Clarify queue cards and mid-run approval gates.</td></tr>
+    <tr><td><code class="mono">speckit.run.cancel / retry / recover</code></td><td>Stop button, one-click retry, crash-recovery banner.</td></tr>
+    <tr><td><code class="mono">speckit.run.attach / get</code></td><td>Reconnect after tab close; resume a run already in flight.</td></tr>
+  </table>
+
+  <div class="callout">
+    <div class="ct">Hard constraint: staged by default</div>
+    Agent output lands in a staging area first. The working tree changes only after the user accepts hunks in the
+    review pane. This single decision is what makes a visual agent IDE trustworthy enough to use on real branches.
+  </div>
+</section>
+
+<!-- ============ 03 RAIL ============ -->
+<section class="page" id="p-rail">
+  <h2 class="title">The workflow model</h2>
+  <p class="lede">A compact five-stage bar stays in the feature header. It answers
+  <strong>where am I and what is next?</strong> Command-level detail appears only when the user expands the current stage.</p>
+
+  <div class="card">
+    <div class="stagebar" aria-label="Feature workflow stages">
+      <div class="stage done">✓ Define</div>
+      <div class="stage done">✓ Design</div>
+      <div class="stage active" aria-current="step">3 · Break down</div>
+      <div class="stage">4 · Build</div>
+      <div class="stage">5 · Review</div>
+    </div>
+    <details class="workflow-detail">
+      <summary>Show Spec Kit commands in this workflow</summary>
+      <div class="rail">
+        <div class="step done"><div class="dot">✓</div><div class="lbl">Constitution</div><div class="cmd">constitution</div><div class="gate">v3.0.0</div></div>
+        <div class="step done"><div class="dot">✓</div><div class="lbl">Specify</div><div class="cmd">specify</div><div class="gate">spec.md</div></div>
+        <div class="step done"><div class="dot">✓</div><div class="lbl">Clarify</div><div class="cmd">clarify</div><div class="gate">6 resolved</div></div>
+        <div class="step done"><div class="dot">✓</div><div class="lbl">Plan</div><div class="cmd">plan</div><div class="gate">plan.md</div></div>
+        <div class="step active"><div class="dot">5</div><div class="lbl">Tasks</div><div class="cmd">tasks</div><div class="gate" style="color:var(--cp-accent);font-weight:700">RUNNING</div></div>
+        <div class="step blocked"><div class="dot">!</div><div class="lbl">Analyze</div><div class="cmd">analyze</div><div class="gate">needs tasks.md</div></div>
+        <div class="step locked"><div class="dot">7</div><div class="lbl">Checklist</div><div class="cmd">checklist</div><div class="gate">optional</div></div>
+        <div class="step locked"><div class="dot">8</div><div class="lbl">Implement</div><div class="cmd">implement</div><div class="gate">gate: analyze</div></div>
+        <div class="step locked"><div class="dot">9</div><div class="lbl">Converge</div><div class="cmd">converge</div><div class="gate">optional</div></div>
+        <div class="step locked"><div class="dot">10</div><div class="lbl">Issues</div><div class="cmd">taskstoissues</div><div class="gate">optional</div></div>
+      </div>
+    </details>
+  </div>
+
+  <h3 class="sec">Step states are computed, never guessed</h3>
+  <p class="body">Readiness is derived deterministically from artifacts on disk plus run history — no LLM
+  involved. That makes the Rail reproducible and auditable, and it means the "next action" recommendation can
+  never hallucinate.</p>
+  <div class="grid g4">
+    <div class="card"><div style="display:flex;align-items:center;gap:8px;margin-bottom:7px"><span class="step legend done"><span class="dot" style="width:22px;height:22px;font-size:10px">✓</span></span><strong style="font-size:13px">Done</strong></div>
+      <p class="body" style="font-size:12px;margin:0">Output artifact exists, parses cleanly, and is newer than its inputs. Click to re-run or inspect.</p></div>
+    <div class="card"><div style="display:flex;align-items:center;gap:8px;margin-bottom:7px"><span class="step legend active"><span class="dot" style="width:22px;height:22px;font-size:10px">▶</span></span><strong style="font-size:13px">Active</strong></div>
+      <p class="body" style="font-size:12px;margin:0">The recommended next action, or a run in flight. Exactly one step carries this state at a time.</p></div>
+    <div class="card"><div style="display:flex;align-items:center;gap:8px;margin-bottom:7px"><span class="step legend blocked"><span class="dot" style="width:22px;height:22px;font-size:10px">!</span></span><strong style="font-size:13px">Blocked</strong></div>
+      <p class="body" style="font-size:12px;margin:0">Prerequisite missing or stale. Selecting the step names the exact blocker and offers the fix as a button.</p></div>
+    <div class="card"><div style="display:flex;align-items:center;gap:8px;margin-bottom:7px"><span class="step legend locked"><span class="dot" style="width:22px;height:22px;font-size:10px">·</span></span><strong style="font-size:13px">Locked</strong></div>
+      <p class="body" style="font-size:12px;margin:0">Reachable later. Shown greyed rather than hidden, so the whole journey is legible from step one.</p></div>
+  </div>
+
+  <h3 class="sec">Gate cards replace error text</h3>
+  <p class="body">When a step is blocked, the UI shows what failed and the button that fixes it — never a stack
+  trace, never "command failed".</p>
+  <div class="card">
+    <div class="gate-row"><span class="ic ok">✓</span><span class="gt">Constitution v3.0.0 loaded</span><span class="gd">10 principles active</span></div>
+    <div class="gate-row"><span class="ic ok">✓</span><span class="gt">spec.md parses — 3 stories, 27 requirements</span><span class="gd">updated 4m ago</span></div>
+    <div class="gate-row"><span class="ic wr">!</span><span class="gt">2 unresolved <code class="mono">[NEEDS CLARIFICATION]</code> markers</span><span class="gd"><button class="action" type="button">Open questions</button></span></div>
+    <div class="gate-row"><span class="ic no">✕</span><span class="gt">tasks.md not yet generated</span><span class="gd"><button class="action primary" type="button">Generate tasks</button></span></div>
+    <div class="gate-row"><span class="ic wr">!</span><span class="gt">Branch <code class="mono">004-visual-branch-ide</code> has drifted 3 commits from binding</span><span class="gd"><button class="action" type="button">Review drift</button></span></div>
+  </div>
+</section>
+
+<!-- ============ 04 MAPPING ============ -->
+<section class="page" id="p-map">
+  <h2 class="title">Markdown → Meaning: the mapping catalog</h2>
+  <p class="lede">This is the heart of the concept. Spec Kit's templates are highly regular — every construct
+  carries a specific semantic. The rule: <strong>pick the visual primitive that encodes that exact semantic</strong>,
+  never a generic paragraph. Below, the left pane is what's on disk; the right pane is what the user sees.</p>
+
+  <h3 class="sec">The complete mapping</h3>
+  <table class="tbl">
+    <tr><th style="width:250px">Markdown construct</th><th style="width:190px">Semantic</th><th>Visual primitive</th></tr>
+    <tr><td><code class="mono">### User Story N (Priority: P1)</code></td><td><span class="origin source">source</span> Prioritized journey</td><td><strong>Story card</strong> with priority label and move controls; reordering previews the source patch</td></tr>
+    <tr><td><code class="mono">**Given** … **When** … **Then** …</code></td><td><span class="origin source">source</span> Acceptance scenario</td><td><strong>Three-field flow</strong>: state → action → outcome, with complete prose expandable without hover</td></tr>
+    <tr><td><code class="mono">- **FR-001**: System MUST …</code></td><td><span class="origin source">source</span> Atomic requirement</td><td><strong>Requirement row</strong> plus <span class="origin derived">derived</span> coverage status from linked tasks</td></tr>
+    <tr><td><code class="mono">[NEEDS CLARIFICATION: …]</code></td><td><span class="origin source">source</span> Blocking unknown</td><td><strong>Question button</strong> → opens an answer card and previews the proposed patch</td></tr>
+    <tr><td><code class="mono">- **SC-001**: … under 2 minutes</code></td><td><span class="origin source">source</span> Measurable target</td><td><strong>Target card</strong>; current value appears only with a named <span class="origin overlay">evidence</span> source</td></tr>
+    <tr><td><code class="mono">### Key Entities</code></td><td><span class="origin source">source</span> Domain model</td><td><strong>Entity graph</strong>; inferred edges are labelled proposed until the user confirms them</td></tr>
+    <tr><td><code class="mono">- [ ] T012 [P] [US1] … in src/x.py</code></td><td><span class="origin source">source</span> Executable work</td><td><strong>Task card</strong>: native checkbox, parallel badge, story label, and target-file link</td></tr>
+    <tr><td><code class="mono">## Phase N: …</code></td><td><span class="origin source">source</span> Execution stage</td><td><strong>Board column</strong>; cross-phase moves require a semantic-change preview</td></tr>
+    <tr><td><code class="mono">**Checkpoint**: …</code></td><td><span class="origin source">source</span> Milestone</td><td><strong>Checkpoint gate</strong>; blocking behavior is derived from validated dependencies</td></tr>
+    <tr><td><code class="mono">**Language/Version**: …</code></td><td><span class="origin source">source</span> Technical decision</td><td><strong>Spec sheet</strong>; unresolved values are native buttons, not color-only text</td></tr>
+    <tr><td><code class="mono">## Constitution Check</code></td><td><span class="origin source">source</span> Governance gate</td><td><strong>Pass/fail rows</strong> with evidence and an accessible summary</td></tr>
+    <tr><td>Complexity Tracking table</td><td><span class="origin source">source</span> Justified violation</td><td><strong>Violation card</strong>: rule, need, and rejected alternative side by side</td></tr>
+    <tr><td>Project Structure <code class="mono">```text</code> tree</td><td><span class="origin source">source</span> Intended layout</td><td><strong>Tree diff</strong> with <span class="origin derived">derived</span> planned / exists / missing status</td></tr>
+    <tr><td><code class="mono">- [ ] CHK001 …</code></td><td><span class="origin source">source</span> Quality gate</td><td><strong>Checklist row</strong> with native checkbox and category grouping</td></tr>
+  </table>
+
+  <h3 class="sec">Demo 1 — User story block</h3>
+  <div class="demo">
+    <div class="demo-head"><div><div class="t">User Story → Story card + scenario flow</div>
+      <div class="d">Priority becomes color and order. Acceptance scenarios become readable flows.</div></div>
+      <span class="chip mono">spec.md</span></div>
+    <div class="demo-body">
+      <div class="pane raw"><div class="pane-lbl">On disk</div><pre class="md"><span class="h">### User Story 2 - Visual Task Board (Priority: P2)</span>
+
+Developers need to see task state without
+reading tasks.md top to bottom.
+
+<span class="b">**Why this priority**</span>: Unblocks parallel work
+once the P1 authoring loop exists.
+
+<span class="b">**Independent Test**</span>: Load a feature with
+40 tasks and confirm phase grouping renders.
+
+<span class="b">**Acceptance Scenarios**</span>:
+
+1. <span class="b">**Given**</span> a feature with tasks.md,
+   <span class="b">**When**</span> the user opens the Tasks view,
+   <span class="b">**Then**</span> tasks appear grouped by phase
+   with parallel markers visible.</pre></div>
+      <div class="arrowcol">→</div>
+      <div class="pane"><div class="pane-lbl">In Spec Studio</div>
+        <div class="story"><div class="rail-p p2"></div><div class="inner">
+          <div class="top"><span class="chip warn">P2</span>
+            <span class="name">Visual Task Board</span><span class="chip mono">US2</span></div>
+          <div class="desc">Developers need to see task state without reading tasks.md top to bottom.</div>
+          <div class="gwt">
+            <div class="node given"><div class="k">Given</div><div class="v">a feature with tasks.md</div></div>
+            <div class="arw">→</div>
+            <div class="node when"><div class="k">When</div><div class="v">user opens the Tasks view</div></div>
+            <div class="arw">→</div>
+            <div class="node then"><div class="k">Then</div><div class="v">tasks group by phase, parallel markers visible</div></div>
+          </div>
+          <div class="foot"><span class="chip ok">✓ 8 tasks</span><span class="chip link">4 requirements</span>
+            <span class="chip">1 scenario</span><span class="chip accent">Independent test defined</span></div>
+        </div></div>
+        <details class="workflow-detail">
+          <summary>Show rationale and independent test</summary>
+          <p class="body" style="font-size:11.5px;margin:5px 0 0"><strong>Why P2:</strong> unblocks parallel work
+          after the authoring loop exists. <strong>Independent test:</strong> load a 40-task feature and confirm
+          phase grouping renders. Full source prose remains keyboard and touch accessible.</p>
+        </details>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="sec">Demo 2 — Functional requirements</h3>
+  <div class="demo">
+    <div class="demo-head"><div><div class="t">FR list → coverage-aware requirement chips</div>
+      <div class="d">Modality drives color. Coverage from the task graph drives the dot. Unknowns become actionable.</div></div>
+      <span class="chip mono">spec.md</span></div>
+    <div class="demo-body">
+      <div class="pane raw"><div class="pane-lbl">On disk</div><pre class="md"><span class="h">### Functional Requirements</span>
+
+- <span class="b">**FR-012**</span>: System MUST render tasks.md
+  grouped by phase.
+- <span class="b">**FR-013**</span>: System MUST show parallel
+  markers on eligible tasks.
+- <span class="b">**FR-014**</span>: Users MUST be able to
+  toggle task completion from the board.
+- <span class="b">**FR-015**</span>: System SHOULD persist
+  board filter state per feature.
+- <span class="b">**FR-016**</span>: System MUST sync board
+  edits back within <span class="m">[NEEDS CLARIFICATION:
+  debounce interval not specified]</span></pre></div>
+      <div class="arrowcol">→</div>
+      <div class="pane"><div class="pane-lbl">In Spec Studio</div>
+        <div style="display:flex;flex-direction:column;gap:7px">
+          <div style="display:flex;align-items:center;gap:8px;padding:7px 9px;border:1px solid var(--cp-border);border-radius:9px;background:var(--cp-surface)">
+            <span class="chip mono accent">FR-012</span><span class="chip bad">MUST</span>
+            <span style="font-size:12px;flex:1">Render tasks.md grouped by phase</span>
+            <span class="chip ok">✓ T031, T032</span></div>
+          <div style="display:flex;align-items:center;gap:8px;padding:7px 9px;border:1px solid var(--cp-border);border-radius:9px;background:var(--cp-surface)">
+            <span class="chip mono accent">FR-013</span><span class="chip bad">MUST</span>
+            <span style="font-size:12px;flex:1">Show parallel markers on eligible tasks</span>
+            <span class="chip ok">✓ T033</span></div>
+          <div style="display:flex;align-items:center;gap:8px;padding:7px 9px;border:1px solid var(--cp-border);border-radius:9px;background:var(--cp-surface)">
+            <span class="chip mono accent">FR-014</span><span class="chip bad">MUST</span>
+            <span style="font-size:12px;flex:1">Toggle task completion from the board</span>
+            <span class="chip ok">✓ T034</span></div>
+          <div style="display:flex;align-items:center;gap:8px;padding:7px 9px;border:1px solid var(--cp-border);border-radius:9px;background:var(--cp-surface)">
+            <span class="chip mono accent">FR-015</span><span class="chip">SHOULD</span>
+            <span style="font-size:12px;flex:1">Persist board filter state per feature</span>
+            <span class="chip bad">⚠ no task</span></div>
+          <div style="display:flex;align-items:center;gap:8px;padding:7px 9px;border:1.5px solid var(--cp-warning);border-radius:9px;background:color-mix(in srgb,var(--cp-warning) 7%,transparent)">
+            <span class="chip mono accent">FR-016</span><span class="chip warn">BLOCKED</span>
+            <span style="font-size:12px;flex:1">Sync board edits back within</span>
+            <button class="action" type="button">Answer debounce question</button></div>
+        </div>
+        <p class="body" style="font-size:11.5px;margin:9px 0 0"><strong>FR-015</strong> is instantly visible as an
+        orphan — a requirement with no implementing task. In the CLI this is invisible until something ships broken.
+        <strong>FR-016</strong>'s unknown is a button, not a string.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 05 SPEC BOARD ============ -->
+<section class="page" id="p-spec">
+  <h2 class="title">Spec board</h2>
+  <p class="lede">The whole of <code class="mono">spec.md</code> as one scannable surface. A reader should
+  understand scope, priority, open questions, and measurable targets in under thirty seconds.</p>
+
+  <h3 class="sec">Success criteria → metric cards</h3>
+  <p class="body">Spec Kit mandates measurable outcomes. The parser extracts the <em>target, unit, and direction</em>.
+  Current values appear only when a named measurement source is configured; otherwise the card says “not measured.”</p>
+  <div class="demo">
+    <div class="demo-head"><div><div class="t">SC list → metric tiles</div><div class="d">Numeric targets become the visual anchor; the sentence becomes the caption.</div></div><span class="chip mono">spec.md</span></div>
+    <div class="demo-body">
+      <div class="pane raw"><div class="pane-lbl">On disk</div><pre class="md"><span class="h">### Measurable Outcomes</span>
+
+- <span class="b">**SC-001**</span>: Users complete the full
+  workflow without the terminal in under
+  <span class="g">10 minutes</span>.
+- <span class="b">**SC-002**</span>: Board renders a
+  <span class="g">200-task</span> feature in under
+  <span class="g">400 ms</span>.
+- <span class="b">**SC-003**</span>: <span class="g">100%</span> of requirements trace
+  to at least one task.
+- <span class="b">**SC-004**</span>: <span class="g">90%</span> of users complete
+  first spec on first attempt.</pre></div>
+      <div class="arrowcol">→</div>
+      <div class="pane"><div class="pane-lbl">In Spec Studio</div>
+        <div class="grid g2">
+          <div class="metric"><div class="id">SC-001 · TARGET</div><div class="val">≤10<small>min</small></div>
+            <div class="cap">Full workflow, no terminal</div>
+            <div class="evidence"><span class="origin overlay">evidence</span> Not measured · connect usability study</div></div>
+          <div class="metric"><div class="id">SC-002 · TARGET</div><div class="val">≤400<small>ms</small></div>
+            <div class="cap">200-task board render</div>
+            <div class="evidence"><span class="origin overlay">example</span> 318 ms · Playwright trace · 2m ago · passing</div></div>
+          <div class="metric"><div class="id">SC-003 · TARGET</div><div class="val">100<small>%</small></div>
+            <div class="cap">Requirement → task coverage</div>
+            <div class="evidence"><span class="origin derived">derived</span> 96.3% · semantic graph · 1 orphan</div></div>
+          <div class="metric"><div class="id">SC-004 · TARGET</div><div class="val">≥90<small>%</small></div>
+            <div class="cap">First-attempt spec success</div>
+            <div class="evidence"><span class="origin overlay">evidence</span> No data source configured</div></div>
+        </div>
+        <p class="body" style="font-size:11.5px;margin:9px 0 0">The card always distinguishes the markdown
+        <span class="origin source">target</span> from <span class="origin derived">derived</span> values and
+        <span class="origin overlay">external evidence</span>. No decorative progress bar implies data that does not exist.</p>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="sec">Key entities → interactive ER graph</h3>
+  <div class="demo">
+    <div class="demo-head"><div><div class="t">Entity list → node graph</div><div class="d">Explicit relationships become edges. Ambiguous prose becomes a proposed edge requiring confirmation.</div></div><span class="chip mono">data-model.md</span></div>
+    <div class="demo-body">
+      <div class="pane raw"><div class="pane-lbl">On disk</div><pre class="md"><span class="h">### Key Entities</span>
+
+- <span class="b">**Feature**</span>: A spec-kit feature dir.
+  Has many Artifacts, one Branch binding.
+- <span class="b">**Artifact**</span>: A markdown doc
+  (spec/plan/tasks). Belongs to a Feature.
+- <span class="b">**Node**</span>: A parsed semantic unit
+  with an anchor into an Artifact.
+- <span class="b">**Attempt**</span>: One execution of a
+  workflow step against a Feature.</pre></div>
+      <div class="arrowcol">→</div>
+      <div class="pane"><div class="pane-lbl">In Spec Studio</div>
+        <div class="egraph">
+          <svg style="position:absolute;inset:0;width:100%;height:100%" aria-hidden="true">
+            <line x1="105" y1="52" x2="105" y2="112" stroke="var(--cp-border-strong)" stroke-width="1.5"/>
+            <line x1="160" y1="40" x2="270" y2="52" stroke="var(--cp-border-strong)" stroke-width="1.5"/>
+            <line x1="150" y1="140" x2="262" y2="160" stroke="var(--cp-border-strong)" stroke-width="1.5"/>
+          </svg>
+          <button type="button" class="enode" style="left:36px;top:18px" aria-label="Feature entity: id, slug, branch, status"><span class="en">Feature</span><span class="ef">id · slug<br>branch · status</span></button>
+          <button type="button" class="enode" style="left:40px;top:112px" aria-label="Artifact entity: kind, path, parsed at"><span class="en">Artifact</span><span class="ef">kind · path<br>parsed_at</span></button>
+          <button type="button" class="enode sec" style="left:262px;top:24px" aria-label="Attempt entity: step, status, started at"><span class="en">Attempt</span><span class="ef">step · status<br>started_at</span></button>
+          <button type="button" class="enode sec" style="left:255px;top:140px" aria-label="Node entity: kind, anchor, edges"><span class="en">Node</span><span class="ef">kind · anchor<br>edges[]</span></button>
+          <span class="chip" style="position:absolute;left:112px;top:70px;font-size:9px">1 : n</span>
+          <span class="chip" style="position:absolute;left:195px;top:28px;font-size:9px">1 : n</span>
+          <span class="chip" style="position:absolute;left:190px;top:140px;font-size:9px">1 : n</span>
+        </div>
+        <p class="mobile-note body" style="font-size:11.5px">On narrow screens the relationship table is the primary
+        view; graph manipulation is reserved for tablet and desktop.</p>
+        <table class="tbl" aria-label="Entity relationships">
+          <tr><th>Source</th><th>Relationship</th><th>Target</th><th>Confidence</th></tr>
+          <tr><td>Feature</td><td>has many</td><td>Artifact</td><td><span class="origin source">explicit</span></td></tr>
+          <tr><td>Feature</td><td>has many</td><td>Attempt</td><td><span class="origin derived">proposed</span></td></tr>
+          <tr><td>Artifact</td><td>contains many</td><td>Node</td><td><span class="origin derived">proposed</span></td></tr>
+        </table>
+        <div class="status-region" id="graph-status" role="status" aria-live="polite"></div>
+        <p class="body" style="font-size:11.5px;margin:9px 0 0">Built on <code class="mono">@xyflow/react</code>,
+        already a dependency. Selecting a node opens its source bullet; proposed edges can be confirmed or rejected
+        before they affect traceability.</p>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="sec">Clarify queue — turning unknowns into a workflow</h3>
+  <p class="body">Every <code class="mono">[NEEDS CLARIFICATION]</code> marker across all artifacts is collected
+  into the persistent Agent Activity Center. Answering creates a proposed source patch; the user previews and
+  accepts it under the same staged-change policy as every other agent edit.</p>
+  <div class="grid g2">
+    <div class="card">
+      <div style="display:flex;align-items:center;gap:7px;margin-bottom:9px">
+        <span class="chip warn">OPEN</span><span class="chip mono">spec.md : 214</span><span class="chip mono">FR-016</span></div>
+      <div style="font-size:13.5px;font-weight:600;margin-bottom:5px">What debounce interval should board edits use before syncing to disk?</div>
+      <div style="font-size:12px;color:var(--cp-text-muted);margin-bottom:11px">Context: FR-016 requires write-back but leaves timing unspecified. Affects T034 and the drift detector.</div>
+      <fieldset style="display:flex;flex-direction:column;gap:5px;border:0">
+        <legend style="font-size:11px;color:var(--cp-text-soft);margin-bottom:5px">Choose an answer</legend>
+        <label class="choice"><input type="radio" name="debounce" value="300" checked><span><strong>300 ms</strong> — feels instant, ~3 writes/sec worst case <span class="chip accent" style="margin-left:6px">agent suggests</span></span></label>
+        <label class="choice"><input type="radio" name="debounce" value="1000"><span><strong>1000 ms</strong> — fewer writes, visible lag on fast edits</span></label>
+        <label class="choice"><input type="radio" name="debounce" value="blur"><span><strong>On blur only</strong> — zero intermediate writes</span></label>
+        <label class="choice"><input type="radio" name="debounce" value="custom"><span><strong>Custom answer</strong> — enter a different constraint</span></label>
+      </fieldset>
+      <label for="custom-debounce" style="display:block;font-size:11px;font-weight:650;margin:9px 0 4px">Custom constraint</label>
+      <input id="custom-debounce" type="text" disabled placeholder="For example: within 500 ms of the last keystroke"
+        style="width:100%;padding:8px 10px;border:1px solid var(--cp-border-strong);border-radius:8px;background:var(--cp-surface);color:var(--cp-text)">
+      <button class="action primary" type="button" data-action="preview-answer" style="margin-top:9px">Preview proposed patch</button>
+      <div class="status-region" id="clarify-status" role="status" aria-live="polite"></div>
+    </div>
+    <div class="card">
+      <div class="bt">Why this beats the CLI</div>
+      <ul class="clean">
+        <li><strong>Batched, not serial.</strong> The terminal asks one question at a time and blocks. The queue shows all open unknowns at once, so the user answers in one sitting.</li>
+        <li><strong>Contextual.</strong> Each card carries its source line, the requirement it belongs to, and what downstream work it blocks.</li>
+        <li><strong>Resumable.</strong> Close the tab mid-answer; the queue persists in the overlay store and the run reattaches via <code class="mono">speckit.run.attach</code>.</li>
+        <li><strong>Auditable.</strong> Accepted decisions are recorded with timestamp, author, and the reviewed patch.</li>
+        <li><strong>Zero-typing path.</strong> Multiple choice with an agent-recommended default means the common case is one click.</li>
+      </ul>
+      <div style="margin-top:12px;padding:10px 12px;border-radius:9px;background:var(--cp-surface-soft);font-size:12px;color:var(--cp-text-muted)">
+        <strong style="display:block;margin-bottom:3px">Proposed patch preview:</strong>
+        <code class="mono" id="clarify-patch" style="font-size:11px">- **FR-016**: System MUST sync board edits back within 300 ms of the last keystroke.</code>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 06 PLAN ============ -->
+<section class="page" id="p-plan">
+  <h2 class="title">Plan view</h2>
+  <p class="lede"><code class="mono">plan.md</code> is the densest artifact and the worst to read as prose — it
+  mixes configuration, governance gates, a file tree, and a justification table. Each gets its own native widget.</p>
+
+  <h3 class="sec">Technical Context → spec sheet</h3>
+  <div class="demo">
+    <div class="demo-head"><div><div class="t">Key/value run → labelled tiles</div><div class="d">Unresolved values render red and are directly clickable — the fastest path from "unknown" to "decided".</div></div><span class="chip mono">plan.md</span></div>
+    <div class="demo-body">
+      <div class="pane raw"><div class="pane-lbl">On disk</div><pre class="md"><span class="b">**Language/Version**</span>: TypeScript 5.6
+<span class="b">**Primary Dependencies**</span>: React 19,
+  @xyflow/react, CodeMirror 6
+<span class="b">**Storage**</span>: SQLite (profile-scoped)
+<span class="b">**Testing**</span>: Vitest + Playwright
+<span class="b">**Target Platform**</span>: Modern browsers
+<span class="b">**Project Type**</span>: Web application
+<span class="b">**Performance Goals**</span>: 60 fps board,
+  &lt;400 ms parse for 200 tasks
+<span class="b">**Constraints**</span>: <span class="m">NEEDS CLARIFICATION</span>
+<span class="b">**Scale/Scope**</span>: 50 features, 8 views</pre></div>
+      <div class="arrowcol">→</div>
+      <div class="pane"><div class="pane-lbl">In Spec Studio</div>
+        <div class="grid g2" style="gap:8px">
+          <div style="padding:9px 11px;border:1px solid var(--cp-border);border-radius:9px;background:var(--cp-surface)">
+            <div style="font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--cp-text-soft);font-weight:700">Language</div>
+            <div style="font-size:13px;font-weight:620">TypeScript 5.6</div></div>
+          <div style="padding:9px 11px;border:1px solid var(--cp-border);border-radius:9px;background:var(--cp-surface)">
+            <div style="font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--cp-text-soft);font-weight:700">Storage</div>
+            <div style="font-size:13px;font-weight:620">SQLite <span style="font-size:10px;color:var(--cp-text-muted)">profile-scoped</span></div></div>
+          <div style="padding:9px 11px;border:1px solid var(--cp-border);border-radius:9px;background:var(--cp-surface)">
+            <div style="font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--cp-text-soft);font-weight:700">Testing</div>
+            <div style="font-size:13px;font-weight:620">Vitest + Playwright</div></div>
+          <div style="padding:9px 11px;border:1px solid var(--cp-border);border-radius:9px;background:var(--cp-surface)">
+            <div style="font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--cp-text-soft);font-weight:700">Project type</div>
+            <div style="font-size:13px;font-weight:620">Web application</div></div>
+          <div style="padding:9px 11px;border:1px solid var(--cp-border);border-radius:9px;background:var(--cp-surface);grid-column:span 2">
+            <div style="font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--cp-text-soft);font-weight:700">Dependencies</div>
+            <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">
+              <span class="chip mono">React 19</span><span class="chip mono">@xyflow/react</span><span class="chip mono">CodeMirror 6</span></div></div>
+          <button class="action danger" type="button" style="grid-column:span 2;justify-content:flex-start;text-align:left">
+            <span><span style="display:block;font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;font-weight:700">Constraints — unresolved</span>
+            <span style="display:block;font-size:12.5px;font-weight:600">Open question in Activity Center</span></span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="sec">Constitution Check → governance gauge</h3>
+  <p class="body">The constitution is the one artifact that governs everything else. Rendering it as ten pass/fail
+  rows plus an aggregate ring makes compliance a glanceable state rather than something buried in a prose section.</p>
+  <div class="grid g2">
+    <div class="card">
+      <div class="bt">Gate results — plan.md</div>
+      <div class="gate-row"><span class="ic ok">✓</span><span class="gt">I. Rule purpose is obvious</span><span class="gd">naming reviewed</span></div>
+      <div class="gate-row"><span class="ic ok">✓</span><span class="gt">III. Reuse before creation</span><span class="gd">0 new deps</span></div>
+      <div class="gate-row"><span class="ic ok">✓</span><span class="gt">VII. Guardrails are mandatory</span><span class="gd">staged-by-default</span></div>
+      <div class="gate-row"><span class="ic wr">!</span><span class="gt">IX. Maintainability over cleverness</span><span class="gd">1 justified violation</span></div>
+      <div class="gate-row"><span class="ic ok">✓</span><span class="gt">X. Verification is required</span><span class="gd">Vitest + e2e</span></div>
+    </div>
+    <div class="card">
+      <div class="bt">Complexity Tracking → violation card</div>
+      <div style="border:1px solid var(--cp-warning);border-radius:10px;padding:11px 13px;background:color-mix(in srgb,var(--cp-warning) 6%,transparent)">
+        <div style="display:flex;align-items:center;gap:7px;margin-bottom:7px">
+          <span class="chip warn">VIOLATION</span><span style="font-size:12.5px;font-weight:650">Derived semantic cache layer</span></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:9px;font-size:11.5px">
+          <div><div style="font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--cp-text-soft);font-weight:700;margin-bottom:2px">Why needed</div>
+            <div style="color:var(--cp-text-muted)">Re-parsing 200-task tasks.md on every keystroke blows the 400 ms budget.</div></div>
+          <div><div style="font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--cp-text-soft);font-weight:700;margin-bottom:2px">Alternative rejected</div>
+            <div style="color:var(--cp-text-muted)">Parse-on-demand measured at 1.2 s p95 — 3× over budget.</div></div>
+        </div>
+      </div>
+      <p class="body" style="font-size:11.5px;margin:11px 0 0">A markdown table row is easy to skim past. A bordered
+      card with the tradeoff laid side by side forces the reviewer to actually weigh it.</p>
+    </div>
+  </div>
+
+  <h3 class="sec">Project Structure → filesystem-diffed tree</h3>
+  <p class="body">The planned tree is compared against what actually exists on disk. Three states make the gap between
+  intent and reality immediately obvious — and each missing node offers "scaffold this".</p>
+  <div class="card">
+    <div style="display:flex;gap:14px;margin-bottom:11px;flex-wrap:wrap">
+      <span class="chip ok">● exists &amp; matches</span><span class="chip warn">● exists, not in plan</span>
+      <span class="chip bad">● planned, missing</span></div>
+    <div class="tree">
+      <div class="row dir"><span class="ind">└─</span><span class="nm">web/src/components/speckit/</span><span class="chip ok">exists</span></div>
+      <div class="row dir"><span class="ind">&nbsp;&nbsp;&nbsp;├─</span><span class="nm">board/</span><span class="chip ok">exists</span></div>
+      <div class="row dir"><span class="ind">&nbsp;&nbsp;&nbsp;├─</span><span class="nm">canvas/</span><span class="chip ok">exists</span></div>
+      <div class="row dir"><span class="ind">&nbsp;&nbsp;&nbsp;├─</span><span class="nm">editor/</span><span class="chip ok">exists</span></div>
+      <div class="row dir"><span class="ind">&nbsp;&nbsp;&nbsp;├─</span><span class="nm">meaning/</span><span class="chip bad">missing — scaffold</span></div>
+      <div class="row"><span class="ind">&nbsp;&nbsp;&nbsp;│&nbsp;&nbsp;├─</span><span class="nm">StoryCard.tsx</span><span class="chip bad">planned</span></div>
+      <div class="row"><span class="ind">&nbsp;&nbsp;&nbsp;│&nbsp;&nbsp;├─</span><span class="nm">RequirementChip.tsx</span><span class="chip bad">planned</span></div>
+      <div class="row"><span class="ind">&nbsp;&nbsp;&nbsp;│&nbsp;&nbsp;└─</span><span class="nm">MetricCard.tsx</span><span class="chip bad">planned</span></div>
+      <div class="row dir"><span class="ind">&nbsp;&nbsp;&nbsp;├─</span><span class="nm">recovery/</span><span class="chip warn">not in plan</span></div>
+      <div class="row dir"><span class="ind">&nbsp;&nbsp;&nbsp;└─</span><span class="nm">workspace/</span><span class="chip ok">exists</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 07 TASKS ============ -->
+<section class="page" id="p-tasks">
+  <h2 class="title">Tasks board</h2>
+  <p class="lede"><code class="mono">tasks.md</code> is the artifact that suffers most in plain text — a 200-line
+  checklist where phase, story, parallelism and file targets are all encoded as inline syntax. It is, structurally,
+  already a board. Render it as one.</p>
+
+  <h3 class="sec">Anatomy of one task line</h3>
+  <div class="demo">
+    <div class="demo-head"><div><div class="t">Task syntax → card</div><div class="d">Four encoded dimensions become four visual channels.</div></div><span class="chip mono">tasks.md</span></div>
+    <div class="demo-body">
+      <div class="pane raw"><div class="pane-lbl">On disk</div><pre class="md">- [ ] <span class="b">T034</span> <span class="g">[P]</span> <span class="m">[US2]</span> Implement board
+  write-back debounce in
+  <span class="g">web/src/store/speckit/documents.ts</span>
+
+  ▲     ▲    ▲            ▲
+  │     │    │            └ target file
+  │     │    └ owning user story
+  │     └ safe to parallelize
+  └ stable task id</pre></div>
+      <div class="arrowcol">→</div>
+      <div class="pane"><div class="pane-lbl">In Spec Studio</div>
+        <div class="tcard us2" style="max-width:310px">
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" aria-label="Mark T034 complete"><span class="tid">T034</span></label>
+            <span style="display:flex;gap:3px"><span class="chip accent" style="font-size:9px">∥ parallel</span><span class="chip" style="font-size:9px">US2</span></span></div>
+          <div class="tt">Implement board write-back debounce</div>
+          <div class="tf"><button class="action" type="button" style="min-height:28px;padding:3px 7px"><span class="mono">documents.ts</span></button><span class="chip mono">FR-016</span>
+            <button class="action" type="button" style="min-height:28px;padding:3px 7px">Move…</button></div>
+        </div>
+        <ul class="clean" style="font-size:12px;margin-top:12px">
+          <li><strong>Checkbox</strong> — toggling writes <code class="mono">[x]</code> back to the exact line.</li>
+          <li><strong>Left border color</strong> — owning user story, consistent across every view.</li>
+          <li><strong>∥ badge</strong> — eligible for the parallel lane; the scheduler can batch these.</li>
+          <li><strong>File chip</strong> — its icon and text state whether the path exists; activating it opens the file.</li>
+          <li><strong>FR chip</strong> — derived, not in the source. Comes from the traceability graph.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="sec">Phases as columns</h3>
+  <p class="body">Each <code class="mono">## Phase N</code> becomes a column with a completion count. Reordering within
+  a phase previews a small source patch. Moving across phases first shows affected checkpoints, dependencies, and
+  the exact markdown change; keyboard users get the same Move menu. Nothing changes on drop alone.</p>
+  <div class="kan" aria-label="Static illustration of tasks grouped by phase">
+    <div class="kcol">
+      <div class="kh"><span class="kt">1 · Setup</span><span class="kc">3/3</span></div>
+      <div class="tcard done"><div class="tid">T001</div><div class="tt">Create project structure</div><div class="tf"><span class="chip mono link">web/</span></div></div>
+      <div class="tcard done"><div class="tid">T002</div><div class="tt">Init Vite + Tailwind 4</div><div class="tf"><span class="chip mono link">vite.config.ts</span></div></div>
+      <div class="tcard done"><div class="tid">T003</div><div class="tt">Configure eslint + vitest</div><div class="tf"><span class="chip accent" style="font-size:9px">∥</span></div></div>
+      <div style="text-align:center;font-size:10px;color:var(--cp-success-text);font-weight:700;padding:4px">◆ CHECKPOINT PASSED</div>
+    </div>
+
+    <div class="kcol">
+      <div class="kh"><span class="kt">2 · Foundation</span><span class="kc">4/5</span></div>
+      <div class="tcard done"><div class="tid">T004</div><div class="tt">Markdown parser → semantic graph</div><div class="tf"><span class="chip mono link">parser.ts</span></div></div>
+      <div class="tcard done"><div class="tid">T005</div><div class="tt">Anchor model + writeback</div><div class="tf"><span class="chip accent" style="font-size:9px">∥</span></div></div>
+      <div class="tcard done"><div class="tid">T006</div><div class="tt">Gateway client bindings</div><div class="tf"><span class="chip mono link">gatewayClient.ts</span></div></div>
+      <div class="tcard done"><div class="tid">T007</div><div class="tt">Overlay SQLite schema</div></div>
+      <div class="tcard"><div class="tid">T008</div><div class="tt">File-watch + drift detector</div><div class="tf"><span class="chip warn" style="font-size:9px">in progress</span></div></div>
+      <div style="text-align:center;font-size:10px;color:var(--cp-warning-text);font-weight:700;padding:4px">◇ CHECKPOINT PENDING</div>
+    </div>
+    <div class="kcol">
+      <div class="kh"><span class="kt">3 · US1 Authoring</span><span class="kc">1/6</span></div>
+      <div class="tcard us1 done"><div class="tid">T010</div><div class="tt">Story card component</div><div class="tf"><span class="chip accent" style="font-size:9px">∥</span><span class="chip" style="font-size:9px">US1</span></div></div>
+      <div class="tcard us1"><div class="tid">T011</div><div class="tt">Requirement chip + coverage dot</div><div class="tf"><span class="chip accent" style="font-size:9px">∥</span><span class="chip" style="font-size:9px">US1</span></div></div>
+      <div class="tcard us1"><div class="tid">T012</div><div class="tt">GWT scenario flow editor</div><div class="tf"><span class="chip" style="font-size:9px">US1</span></div></div>
+      <div class="tcard us1"><div class="tid">T013</div><div class="tt">Metric card parser</div><div class="tf"><span class="chip accent" style="font-size:9px">∥</span><span class="chip" style="font-size:9px">US1</span></div></div>
+      <div class="tcard us1"><div class="tid">T014</div><div class="tt">Clarify queue inbox</div><div class="tf"><span class="chip" style="font-size:9px">US1</span></div></div>
+    </div>
+    <div class="kcol">
+      <div class="kh"><span class="kt">4 · US2 Board</span><span class="kc">0/5</span></div>
+      <div class="tcard us2"><div class="tid">T031</div><div class="tt">Phase column layout</div><div class="tf"><span class="chip" style="font-size:9px">US2</span></div></div>
+      <div class="tcard us2"><div class="tid">T032</div><div class="tt">Task card + drag reorder</div><div class="tf"><span class="chip" style="font-size:9px">US2</span></div></div>
+      <div class="tcard us2"><div class="tid">T033</div><div class="tt">Parallel lane grouping</div><div class="tf"><span class="chip accent" style="font-size:9px">∥</span><span class="chip" style="font-size:9px">US2</span></div></div>
+      <div class="tcard us2"><div class="tid">T034</div><div class="tt">Write-back debounce</div><div class="tf"><span class="chip accent" style="font-size:9px">∥</span><span class="chip" style="font-size:9px">US2</span></div></div>
+    </div>
+    <div class="kcol">
+      <div class="kh"><span class="kt">5 · US3 Trace</span><span class="kc">0/4</span></div>
+      <div class="tcard us3"><div class="tid">T051</div><div class="tt">Coverage matrix view</div><div class="tf"><span class="chip" style="font-size:9px">US3</span></div></div>
+      <div class="tcard us3"><div class="tid">T052</div><div class="tt">Orphan detection pass</div><div class="tf"><span class="chip accent" style="font-size:9px">∥</span><span class="chip" style="font-size:9px">US3</span></div></div>
+      <div class="tcard us3"><div class="tid">T053</div><div class="tt">Cross-highlight on select</div><div class="tf"><span class="chip" style="font-size:9px">US3</span></div></div>
+      <div class="tcard us3"><div class="tid">T054</div><div class="tt">Atlas roll-up cards</div><div class="tf"><span class="chip" style="font-size:9px">US3</span></div></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px;border-color:color-mix(in srgb,var(--cp-warning) 42%,var(--cp-border))">
+    <div class="bt">Semantic-change preview — move T034</div>
+    <div class="grid g3">
+      <div><strong style="font-size:12px">Source</strong><p class="body" style="font-size:11.5px;margin:3px 0">Phase 4 · US2 Board</p></div>
+      <div><strong style="font-size:12px">Destination</strong><p class="body" style="font-size:11.5px;margin:3px 0">Phase 3 · US1 Authoring</p></div>
+      <div><strong style="font-size:12px">Impact</strong><p class="body" style="font-size:11.5px;margin:3px 0">T034 depends on T032 in Phase 4; move would invert dependency order.</p></div>
+    </div>
+    <div style="display:flex;gap:7px;margin-top:8px"><button class="action" type="button">Cancel move</button>
+      <button class="action danger" type="button" disabled aria-disabled="true">Move blocked</button></div>
+  </div>
+
+  <h3 class="sec">Three views over the same graph</h3>
+  <div class="grid g3">
+    <div class="card"><h4 class="sub" style="margin-top:0">Board <span class="chip accent">default</span></h4>
+      <p class="body" style="font-size:12.5px;margin:0">Phase columns, story colors, drag to reorder. Best for
+      "what's left in this phase" and for grooming.</p></div>
+    <div class="card"><h4 class="sub" style="margin-top:0">Timeline <span class="chip">later</span></h4>
+      <p class="body" style="font-size:12.5px;margin:0">Phases as horizontal bands, checkpoints as diamonds,
+      <code class="mono">[P]</code> tasks stacked in parallel lanes. Best for seeing the critical path and where
+      concurrency actually helps.</p></div>
+    <div class="card"><h4 class="sub" style="margin-top:0">Dependency graph <span class="chip">later</span></h4>
+      <p class="body" style="font-size:12.5px;margin:0">Nodes and edges from "(depends on T012, T013)" clauses.
+      Cycles render red. Best for debugging a plan that won't sequence.</p></div>
+  </div>
+
+  <div class="callout">
+    <div class="ct">Execution is the same surface</div>
+    During <code class="mono">/speckit.implement</code>, the agent's progress streams onto <em>this same board</em> —
+    the active task pulses, completed tasks check themselves off live, and failures turn the card red with the error
+    inline. The user never switches context to a log window to find out what's happening.
+  </div>
+</section>
+
+<!-- ============ 08 TRACE ============ -->
+<section class="page" id="p-trace">
+  <h2 class="title">Traceability</h2>
+  <p class="lede">The single highest-value thing a visual IDE can add. In the CLI, the chain from principle to
+  shipped file is <em>theoretically</em> present across five documents and <em>practically</em> invisible. Here it
+  is one clickable graph.</p>
+
+  <h3 class="sec">The spine</h3>
+  <div class="flow">
+    <div class="fbox"><div class="fl">Governs</div><div class="fv">Principle</div><div class="fm">constitution.md</div></div>
+    <span class="farr">→</span>
+    <div class="fbox"><div class="fl">Delivers value</div><div class="fv">User Story</div><div class="fm">spec.md · US2</div></div>
+    <span class="farr">→</span>
+    <div class="fbox"><div class="fl">Constrains</div><div class="fv">Requirement</div><div class="fm">spec.md · FR-016</div></div>
+    <span class="farr">→</span>
+    <div class="fbox"><div class="fl">Executes</div><div class="fv">Task</div><div class="fm">tasks.md · T034</div></div>
+    <span class="farr">→</span>
+    <div class="fbox"><div class="fl">Changes</div><div class="fv">File</div><div class="fm">documents.ts</div></div>
+    <span class="farr">→</span>
+    <div class="fbox"><div class="fl">Verifies</div><div class="fv">Check</div><div class="fm">CHK007</div></div>
+  </div>
+  <p class="body">Selecting any node in any view highlights its full chain in every other view simultaneously.
+  Click <code class="mono">FR-016</code> in the spec board and the Tasks board dims everything except T034, the
+  file tree highlights <code class="mono">documents.ts</code>, and the checklist scrolls to CHK007.</p>
+
+  <h3 class="sec">Coverage matrix</h3>
+  <p class="body">Requirements down the side, user stories across the top. Cell density shows how many tasks
+  implement that intersection. <strong>Red cells are orphans</strong> — the defects the CLI cannot show you.</p>
+  <div class="card" style="overflow-x:auto">
+    <table class="matrix">
+      <caption style="text-align:left;padding:0 0 10px;font-size:11px;color:var(--cp-text-muted)">Task coverage by requirement and user story</caption>
+      <thead><tr><th class="rowh" scope="col">Requirement</th><th scope="col">US1</th><th scope="col">US2</th><th scope="col">US3</th><th scope="col">Tasks</th><th scope="col">Checks</th><th scope="col">Status</th></tr></thead>
+      <tbody>
+        <tr><th class="rowh" scope="row">FR-012</th><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td><span class="cellv f2" role="img" aria-label="2 tasks" title="2 tasks"></span></td><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td>2</td><td>1</td><td><span class="chip ok">covered</span></td></tr>
+        <tr><th class="rowh" scope="row">FR-013</th><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td><span class="cellv f1" role="img" aria-label="1 task" title="1 task"></span></td><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td>1</td><td>1</td><td><span class="chip ok">covered</span></td></tr>
+        <tr><th class="rowh" scope="row">FR-014</th><td><span class="cellv f1" role="img" aria-label="1 task" title="1 task"></span></td><td><span class="cellv f3" role="img" aria-label="3 or more tasks" title="3+ tasks"></span></td><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td>4</td><td>2</td><td><span class="chip ok">covered</span></td></tr>
+        <tr><th class="rowh" scope="row">FR-015</th><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td><span class="cellv forphan" role="img" aria-label="orphan: no implementing task" title="orphan — no implementing task"></span></td><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td>0</td><td>0</td><td><span class="chip bad">orphan</span></td></tr>
+        <tr><th class="rowh" scope="row">FR-016</th><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td><span class="cellv f1" role="img" aria-label="1 task" title="1 task"></span></td><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td>1</td><td>0</td><td><span class="chip warn">unverified</span></td></tr>
+        <tr><th class="rowh" scope="row">FR-017</th><td><span class="cellv f2" role="img" aria-label="2 tasks" title="2 tasks"></span></td><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td><span class="cellv f1" role="img" aria-label="1 task" title="1 task"></span></td><td>3</td><td>1</td><td><span class="chip ok">covered</span></td></tr>
+        <tr><th class="rowh" scope="row">FR-018</th><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td><span class="cellv f0" role="img" aria-label="no tasks" title="0 tasks"></span></td><td><span class="cellv f3" role="img" aria-label="3 or more tasks" title="3+ tasks"></span></td><td>3</td><td>2</td><td><span class="chip ok">covered</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 class="sec">The four defect classes it exposes</h3>
+  <div class="grid g4">
+    <div class="card" style="border-color:color-mix(in srgb,var(--cp-danger) 30%,transparent)">
+      <span class="chip bad">Orphan requirement</span>
+      <p class="body" style="font-size:12px;margin:8px 0 0">An FR with zero implementing tasks. Ships as a silent
+      gap. <strong>Fix:</strong> one click generates the missing task.</p></div>
+    <div class="card" style="border-color:color-mix(in srgb,var(--cp-warning) 30%,transparent)">
+      <span class="chip warn">Rogue task</span>
+      <p class="body" style="font-size:12px;margin:8px 0 0">A task tracing to no requirement — scope creep, or a
+      missing FR. <strong>Fix:</strong> link it or promote it to a requirement.</p></div>
+    <div class="card" style="border-color:color-mix(in srgb,var(--cp-warning) 30%,transparent)">
+      <span class="chip warn">Unverified</span>
+      <p class="body" style="font-size:12px;margin:8px 0 0">Implemented but with no checklist item or test.
+      <strong>Fix:</strong> feed straight into <code class="mono">/speckit.checklist</code>.</p></div>
+    <div class="card" style="border-color:color-mix(in srgb,var(--cp-danger) 30%,transparent)">
+      <span class="chip bad">Constitution breach</span>
+      <p class="body" style="font-size:12px;margin:8px 0 0">A task that violates a principle with no entry in
+      Complexity Tracking. <strong>Fix:</strong> justify it or redesign.</p></div>
+  </div>
+
+  <div class="callout">
+    <div class="ct">This is what <code class="mono">/speckit.analyze</code> already computes</div>
+    The analyze command produces exactly this cross-artifact consistency report — today, as prose the user skims
+    once. Rendering it as a persistent, live matrix converts a one-shot report into an always-on quality gauge.
+  </div>
+</section>
+
+<!-- ============ 09 ATLAS ============ -->
+<section class="page" id="p-atlas">
+  <h2 class="title">Feature home</h2>
+  <p class="lede">The landing view. One screen that answers: where is this feature, what's healthy, what's blocked,
+  and what's the single next action. Every tile opens the relevant workflow stage without losing feature context.</p>
+
+  <div class="bento">
+    <div class="card b-span2">
+      <div class="bt">Next action</div>
+      <button class="action primary" type="button" style="width:100%;justify-content:flex-start;text-align:left;padding:10px 12px">
+        <span style="font-size:18px;flex-shrink:0" aria-hidden="true">▶</span>
+        <div><div style="font-size:15px;font-weight:650">Run /speckit.analyze</div>
+          <div style="font-size:12px;color:var(--cp-accent-fg);opacity:.84">tasks.md is newer than the last analysis. 1 orphan requirement detected.</div></div>
+      </button>
+      <p class="body" style="font-size:11.5px;margin:10px 0 0">Computed deterministically from artifact state — never
+      an LLM guess. Exactly one recommendation at a time.</p>
+    </div>
+    <div class="card">
+      <div class="bt">Progress</div>
+      <div style="font-size:31px;font-weight:700;letter-spacing:-0.03em">42<span style="font-size:15px;color:var(--cp-text-muted)">%</span></div>
+      <div style="font-size:11.5px;color:var(--cp-text-muted)">8 of 19 tasks complete</div>
+      <div class="bar" style="height:6px"><i style="width:42%"></i></div>
+    </div>
+    <div class="card">
+      <div class="bt">Health</div>
+      <div style="display:flex;flex-direction:column;gap:4px;margin-top:2px">
+        <span class="chip ok">✓ spec parses</span>
+        <span class="chip warn">⚠ 1 orphan FR</span>
+        <span class="chip bad">✕ 2 unknowns open</span>
+      </div>
+    </div>
+    <div class="card b-span2">
+      <div class="bt">Branch binding</div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:7px">
+        <span class="chip mono accent">004-speckit-visual-branch-ide</span>
+        <span class="chip ok">bound</span></div>
+      <div style="font-size:12px;color:var(--cp-text-muted)">Working tree clean · 3 commits ahead of main · last run 14m ago</div>
+      <p class="body" style="font-size:11.5px;margin:9px 0 0">If the branch changes underneath you, the Atlas warns
+      rather than silently showing another feature's data.</p>
+    </div>
+    <div class="card b-span2">
+      <div class="bt">Artifacts</div>
+      <div style="display:flex;gap:5px;flex-wrap:wrap">
+        <span class="chip ok mono">spec.md · 27 FR</span>
+        <span class="chip ok mono">plan.md</span>
+        <span class="chip ok mono">research.md</span>
+        <span class="chip ok mono">data-model.md</span>
+        <span class="chip ok mono">tasks.md · 19</span>
+        <span class="chip ok mono">contracts/ · 3</span>
+        <span class="chip warn mono">checklists/ · stale</span>
+        <span class="chip mono" style="opacity:.55">quickstart.md</span>
+      </div>
+    </div>
+    <div class="card b-span4">
+      <div class="bt">Recent activity</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;align-items:center;gap:9px;font-size:12px"><span class="chip mono">14m</span><span class="chip ok">tasks</span><span style="color:var(--cp-text-muted)">Generated 19 tasks across 5 phases</span></div>
+        <div style="display:flex;align-items:center;gap:9px;font-size:12px"><span class="chip mono">38m</span><span class="chip ok">plan</span><span style="color:var(--cp-text-muted)">Wrote plan.md, research.md, data-model.md, 3 contracts</span></div>
+        <div style="display:flex;align-items:center;gap:9px;font-size:12px"><span class="chip mono">1h</span><span class="chip ok">clarify</span><span style="color:var(--cp-text-muted)">Resolved 6 unknowns — 2 remain open</span></div>
+        <div style="display:flex;align-items:center;gap:9px;font-size:12px"><span class="chip mono">2h</span><span class="chip bad">specify</span><span style="color:var(--cp-text-muted)">Attempt 1 failed — recovered, attempt 2 succeeded</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 10 EDITING ============ -->
+<section class="page" id="p-edit">
+  <h2 class="title">Round-trip editing</h2>
+  <p class="lede">Visual editing is only safe if every widget knows exactly which bytes it owns. This is the
+  contract that makes the whole concept viable rather than a demo.</p>
+
+  <h3 class="sec">The lossless patch contract</h3>
+  <div class="grid g2">
+    <div class="card">
+      <div class="bt">Six rules</div>
+      <ul class="clean">
+        <li><strong>Parse losslessly.</strong> A concrete syntax tree preserves whitespace, comments, unknown extensions, and untouched bytes.</li>
+        <li><strong>Use one anchor contract.</strong> Each node records UTF-8 <code class="mono">{byteStart, byteEnd}</code>, expected source bytes, and a structural fingerprint.</li>
+        <li><strong>Guard every write.</strong> Before patching, verify the document revision hash and expected bytes still match the current file.</li>
+        <li><strong>Edits are surgical.</strong> Changing a story title rewrites only that heading line — never the whole file. Untouched bytes stay byte-identical.</li>
+        <li><strong>Apply transactionally.</strong> Patch a temporary buffer, parse and validate it, then atomically replace the file and retain undo history.</li>
+        <li><strong>Never guess through drift.</strong> Any revision or source mismatch routes to three-way merge instead of attempting write-back.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="bt">Three editing depths — always available</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div style="padding:9px 11px;border:1px solid var(--cp-border);border-radius:9px">
+          <div style="font-size:12.5px;font-weight:650">1 · Structured <span class="chip accent">default</span></div>
+          <div style="font-size:11.5px;color:var(--cp-text-muted)">Typed form fields per node kind. Priority is a
+          select, Given/When/Then are three inputs, modality is a toggle. Impossible to produce malformed markdown.</div></div>
+        <div style="padding:9px 11px;border:1px solid var(--cp-border);border-radius:9px">
+          <div style="font-size:12.5px;font-weight:650">2 · Inline markdown <span class="kbd">⌥M</span></div>
+          <div style="font-size:11.5px;color:var(--cp-text-muted)">CodeMirror on just that node's range, with
+          markdown highlighting. For when the structure doesn't fit what you want to say.</div></div>
+        <div style="padding:9px 11px;border:1px solid var(--cp-border);border-radius:9px">
+          <div style="font-size:12.5px;font-weight:650">3 · Whole file <span class="kbd">⌥⇧M</span></div>
+          <div style="font-size:11.5px;color:var(--cp-text-muted)">Full CodeMirror on the raw document. The escape
+          hatch that guarantees the IDE never becomes a cage.</div></div>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="sec">Conflict handling</h3>
+  <p class="body">Three writers can touch the same file: the user in the UI, the agent mid-run, and the outside
+  world (CLI/editor/git). The resolution order is fixed and never silent.</p>
+  <table class="tbl">
+    <tr><th style="width:220px">Situation</th><th>Behaviour</th></tr>
+    <tr><td><strong>User edits during a run</strong></td><td>The edited node locks. Agent output for that node is diverted to the review pane instead of applied — the user's intent is never clobbered mid-thought.</td></tr>
+    <tr><td><strong>External change on disk</strong></td><td>File-watch triggers reparse. A revision-hash mismatch blocks the write. If the user has unsaved edits, a three-way merge card compares base, current file, and proposed patch at semantic-block level.</td></tr>
+    <tr><td><strong>Anchor no longer resolves</strong></td><td>The node degrades to read-only with a "structure changed — reopen" prompt. It never guesses a new range.</td></tr>
+    <tr><td><strong>Malformed markdown</strong></td><td>Partial render: parseable nodes get widgets, the rest falls back to raw text. The view never blanks out on a bad file.</td></tr>
+    <tr><td><strong>Patch validation fails</strong></td><td>No file is replaced. The proposed buffer and parser diagnostics remain available for repair or raw review.</td></tr>
+    <tr><td><strong>User wants to reverse an edit</strong></td><td>Every accepted visual edit has an undo entry containing the verified inverse patch and originating semantic action.</td></tr>
+  </table>
+</section>
+
+<!-- ============ 11 AGENT + REVIEW ============ -->
+<section class="page" id="p-review">
+  <h2 class="title">Agent runs &amp; review</h2>
+  <p class="lede">The run experience is where trust is won or lost. Two principles: <strong>never look
+  frozen</strong>, and <strong>never touch the working tree without permission</strong>.</p>
+
+  <h3 class="sec">One persistent Agent Activity Center</h3>
+  <p class="body">Questions, requested permissions, proposed actions, live runs, failures, and review decisions share
+  one chronological surface. Each item states whether it is a <span class="origin overlay">draft</span>,
+  <span class="origin derived">derived event</span>, or <span class="origin source">proposed repo patch</span>.</p>
+  <div class="card">
+    <div class="grid g3">
+      <div><div class="bt">Before run</div>
+        <ul class="clean"><li>Objective and expected outputs</li><li>Allowed tools and file scope</li>
+          <li>Validation commands and stop conditions</li><li>Token/time budget</li></ul></div>
+      <div><div class="bt">During run</div>
+        <ul class="clean"><li>Current objective, tool, and affected file</li><li>Questions and permission requests</li>
+          <li>Checkpoint state and partial outputs</li><li>Cancel explains what is preserved</li></ul></div>
+      <div><div class="bt">After run</div>
+        <ul class="clean"><li>Outcome and validation summary</li><li>Unresolved failures and partial success</li>
+          <li>Semantic diffs ready for review</li><li>Retry from checkpoint or rollback</li></ul></div>
+    </div>
+  </div>
+
+  <h3 class="sec">Live run — progressive disclosure</h3>
+  <div class="grid g2">
+    <div class="card">
+      <div class="run-head" style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:11px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="width:8px;height:8px;border-radius:50%;background:var(--cp-accent);display:inline-block"></span>
+          <strong style="font-size:13.5px">/speckit.tasks</strong><span class="chip accent">running · 0:42</span></div>
+        <button class="action danger" type="button" data-action="cancel-run">Cancel run</button></div>
+      <div style="display:flex;flex-direction:column;gap:5px;font-size:12px">
+        <div style="display:flex;gap:8px;align-items:center"><span class="chip ok" style="font-size:9px">✓</span><span style="color:var(--cp-text-muted)">Read spec.md — 3 stories, 27 requirements</span></div>
+        <div style="display:flex;gap:8px;align-items:center"><span class="chip ok" style="font-size:9px">✓</span><span style="color:var(--cp-text-muted)">Read plan.md — web app structure</span></div>
+        <div style="display:flex;gap:8px;align-items:center"><span class="chip ok" style="font-size:9px">✓</span><span style="color:var(--cp-text-muted)">Read data-model.md — 4 entities</span></div>
+        <div style="display:flex;gap:8px;align-items:center"><span class="chip accent" style="font-size:9px">▶</span><span>Generating Phase 3 tasks for US1…</span></div>
+        <div style="display:flex;gap:8px;align-items:center;opacity:.45"><span class="chip" style="font-size:9px">·</span><span style="color:var(--cp-text-muted)">Write tasks.md</span></div>
+      </div>
+      <div class="status-region" id="run-status" role="status" aria-live="polite"></div>
+      <div style="margin-top:11px;padding:9px 11px;border-radius:9px;background:var(--cp-surface-soft)">
+        <div style="font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--cp-text-soft);font-weight:700;margin-bottom:4px">Live preview — 11 tasks so far</div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap">
+          <span class="chip mono">T001</span><span class="chip mono">T002</span><span class="chip mono">T003</span>
+          <span class="chip mono">T004</span><span class="chip mono">T005</span><span class="chip mono">T006</span>
+          <span class="chip mono">T007</span><span class="chip mono">T008</span><span class="chip mono">T009</span>
+          <span class="chip mono">T010</span><span class="chip mono accent">T011 ▌</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="bt">Anti-freeze techniques</div>
+      <ul class="clean">
+        <li><strong>Tool-call timeline</strong>, not a text log. Each read/write/search is a row with a state icon.</li>
+        <li><strong>Progressive artifact preview.</strong> Tasks appear as chips as they stream — the board builds itself in front of you.</li>
+        <li><strong>Elapsed time + phase label</strong> so a 90-second step reads as working, not hung.</li>
+        <li><strong>Optimistic skeletons</strong> for the boards that are about to populate.</li>
+        <li><strong>Reattach on reload.</strong> <code class="mono">speckit.run.attach</code> means closing the tab doesn't kill or lose the run.</li>
+        <li><strong>Crash recovery banner.</strong> <code class="mono">speckit.run.recover</code> surfaces an interrupted attempt with resume / retry / discard.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3 class="sec">Diff-first review</h3>
+  <p class="body">Everything the agent produces lands staged. The user accepts at hunk granularity — and because the
+  IDE knows the semantic graph, hunks are labelled by <em>what they mean</em>, not just line numbers.</p>
+  <div class="diff">
+    <div class="dh"><div><strong style="font-size:12.5px">specs/004-visual-branch-ide/spec.md</strong>
+      <span class="chip ok" style="margin-left:7px">+14</span><span class="chip bad">−2</span></div>
+      <div style="display:flex;gap:5px"><button class="action" type="button" data-action="reject-hunk">Reject hunk</button>
+        <button class="action primary" type="button" data-action="accept-hunk">Accept hunk</button></div></div>
+    <div style="padding:5px 12px;background:var(--cp-surface-soft);font-family:'Segoe UI',sans-serif;font-size:11px;color:var(--cp-text-muted);border-bottom:1px solid var(--cp-border)">
+      Hunk 2 of 4 — <strong>adds requirement FR-016</strong> under Functional Requirements</div>
+    <div class="dl ctx"><span class="ln">210</span><span>- **FR-014**: Users MUST be able to toggle task completion.</span></div>
+    <div class="dl ctx"><span class="ln">211</span><span>- **FR-015**: System SHOULD persist board filter state.</span></div>
+    <div class="dl del"><span class="ln">212</span><span>- **FR-016**: System MUST sync board edits back within [NEEDS CLARIFICATION]</span></div>
+    <div class="dl add"><span class="ln">212</span><span>- **FR-016**: System MUST sync board edits back within 300 ms of last keystroke.</span></div>
+    <div class="dl add"><span class="ln">213</span><span>- **FR-017**: System MUST reparse affected anchors after each write-back.</span></div>
+    <div class="dl ctx"><span class="ln">214</span><span></span></div>
+  </div>
+  <div class="status-region" id="review-status" role="status" aria-live="polite"></div>
+  <p class="body" style="margin-top:12px">The header "adds requirement FR-016" is the differentiator. Plain git
+  diffs make reviewers reconstruct intent from line noise; a semantic diff states it. Accepting this hunk also
+  clears the matching card from the Clarify queue and updates the coverage matrix — one action, consistent state.</p>
+</section>
+
+<!-- ============ 12 TECHNIQUES ============ -->
+<section class="page" id="p-tech">
+  <h2 class="title">Modern UI techniques in play</h2>
+  <p class="lede">Each technique below is chosen because it solves a specific problem this workflow has — not
+  because it's fashionable.</p>
+
+  <div class="grid g2">
+    <div class="card"><h4 class="sub" style="margin-top:0">Semantic zoom</h4>
+      <p class="body" style="font-size:12.5px;margin:0">Three altitudes: <strong>Atlas</strong> (whole feature) →
+      <strong>Board</strong> (one artifact) → <strong>Focus</strong> (one node + its markdown). Zooming changes
+      information density, not just scale — cards reveal more fields as you descend. Solves: a 28 KB spec.md is
+      unreadable at one altitude.</p></div>
+
+    <div class="card"><h4 class="sub" style="margin-top:0">Command palette <span class="kbd">⌘K</span></h4>
+      <p class="body" style="font-size:12.5px;margin:0">Every action, artifact, requirement, and task reachable by
+      typing. Keeps CLI muscle memory intact — power users never lose speed by moving to a GUI, which is the usual
+      reason they refuse to. Solves: GUIs feel slower than terminals.</p></div>
+
+    <div class="card"><h4 class="sub" style="margin-top:0">Direct manipulation + optimistic UI</h4>
+      <p class="body" style="font-size:12.5px;margin:0">Drag a task between phases, drag a story to re-prioritize,
+      or check a box. Local reorder is optimistic; any cross-boundary move pauses for a semantic-impact preview,
+      dependency validation, and explicit confirmation. Every drag also has a Move menu and undo entry.</p></div>
+
+    <div class="card"><h4 class="sub" style="margin-top:0">Progressive disclosure</h4>
+      <p class="body" style="font-size:12.5px;margin:0">Story cards show title + priority + coverage; a visible
+      disclosure button expands rationale and scenarios; ⌥M reveals raw markdown. Nothing depends on hover and
+      nothing is omitted—secondary detail is simply deferred.</p></div>
+
+    <div class="card"><h4 class="sub" style="margin-top:0">Streaming &amp; skeletons</h4>
+      <p class="body" style="font-size:12.5px;margin:0">Agent output renders token-by-token into the destination
+      widget, with shimmer skeletons where content is still arriving. Solves: multi-minute LLM steps that otherwise
+      look like a hang.</p></div>
+
+    <div class="card"><h4 class="sub" style="margin-top:0">Focus + context highlighting</h4>
+      <p class="body" style="font-size:12.5px;margin:0">Selecting a node dims unrelated content across every open
+      panel instead of navigating away. Solves: traceability requires seeing relationships, and navigation destroys
+      the mental model.</p></div>
+
+    <div class="card"><h4 class="sub" style="margin-top:0">Deterministic guidance</h4>
+      <p class="body" style="font-size:12.5px;margin:0">The "next action" is computed from artifact state by rules,
+      never generated by a model. Reproducible, auditable, instant, and free. Solves: users don't trust — and
+      shouldn't pay for — an LLM to tell them which button to press.</p></div>
+
+    <div class="card"><h4 class="sub" style="margin-top:0">Anchored comments</h4>
+      <p class="body" style="font-size:12.5px;margin:0">Figma/Docs-style threads pinned to a semantic node, stored
+      in the private overlay by default. Team sharing is an explicit server-backed mode, never implied by local
+      storage. Anchors use semantic identity plus structural fingerprints and visibly detach when confidence drops.</p></div>
+
+    <div class="card"><h4 class="sub" style="margin-top:0">Keyboard-first + a11y</h4>
+      <p class="body" style="font-size:12.5px;margin:0">Every drag has a Move menu equivalent; each graph has a
+      relationship-table view; status changes use live regions; controls use native semantics and 44px mobile
+      targets. State is always color + icon + text, with WCAG AA contrast tokens.</p></div>
+
+    <div class="card"><h4 class="sub" style="margin-top:0">Context continuity</h4>
+      <p class="body" style="font-size:12.5px;margin:0">Every feature, node, run, and review state has a deep link.
+      Selection, filters, scroll position, and staged status survive view changes and browser Back/Forward. Motion
+      is optional and disabled under reduced-motion preferences.</p></div>
+
+    <div class="card"><h4 class="sub" style="margin-top:0">Purpose-built responsive modes</h4>
+      <p class="body" style="font-size:12.5px;margin:0">Desktop supports graph authoring and multi-panel comparison.
+      Tablet prioritizes structured forms and board review. Mobile focuses on status, questions, approvals, and
+      diffs—not precision graph manipulation.</p></div>
+  </div>
+
+  <h3 class="sec">Deliberately rejected</h3>
+  <table class="tbl">
+    <tr><th style="width:230px">Tempting idea</th><th>Why it's rejected</th></tr>
+    <tr><td><strong>WYSIWYG rich-text editing</strong></td><td>Round-trips markdown lossily. The moment a save reformats
+      the whole file, CLI users get unreviewable diffs and abandon the tool.</td></tr>
+    <tr><td><strong>Proprietary project database</strong></td><td>Breaks the git-native contract. Markdown must stay the
+      single source of truth or the IDE forks the workflow instead of visualizing it.</td></tr>
+    <tr><td><strong>LLM-generated "next step" hints</strong></td><td>Non-deterministic, slow, costs tokens, and
+      occasionally wrong about something the app can compute exactly.</td></tr>
+    <tr><td><strong>Requiring terminal knowledge</strong></td><td>Raw markdown remains a complete escape hatch inside
+      the product, but users never need to know slash commands or leave the dashboard to finish the supported workflow.</td></tr>
+    <tr><td><strong>Auto-applying agent edits</strong></td><td>One bad overwrite on a real branch destroys trust
+      permanently. Staged-by-default is non-negotiable.</td></tr>
+  </table>
+</section>
+
+<!-- ============ 13 BUILD ============ -->
+<section class="page" id="p-build">
+  <h2 class="title">Build sequence</h2>
+  <p class="lede">Mapped against what already exists in <code class="mono">hermes-agent/web</code>. The dependency
+  stack needed for all of this is <strong>already installed</strong> — this is composition work, not a new platform.</p>
+
+  <h3 class="sec">Already in place</h3>
+  <div class="grid g2">
+    <div class="card">
+      <div class="bt">Dependencies present</div>
+      <div style="display:flex;gap:5px;flex-wrap:wrap">
+        <span class="chip mono ok">react 19.2</span><span class="chip mono ok">@xyflow/react 12.11</span>
+        <span class="chip mono ok">@uiw/react-codemirror</span><span class="chip mono ok">@codemirror/lang-markdown</span>
+        <span class="chip mono ok">react-markdown 10</span><span class="chip mono ok">remark-gfm</span>
+        <span class="chip mono ok">react-diff-view 3.3</span><span class="chip mono ok">react-resizable-panels</span>
+        <span class="chip mono ok">motion 12</span><span class="chip mono ok">@observablehq/plot</span>
+        <span class="chip mono ok">tailwindcss 4.2</span><span class="chip mono ok">nanostores</span>
+        <span class="chip mono ok">lucide-react</span><span class="chip mono ok">@xterm/xterm</span>
+      </div>
+      <p class="body" style="font-size:11.5px;margin:10px 0 0">Graph, editor, markdown, diff, panels, animation, and
+      charts are all covered. <strong>No new runtime dependency is required.</strong></p>
+    </div>
+    <div class="card">
+      <div class="bt">Components &amp; gateway present</div>
+      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:9px">
+        <span class="chip mono">ide/</span><span class="chip mono">board/</span><span class="chip mono">canvas/</span>
+        <span class="chip mono">editor/</span><span class="chip mono">review/</span><span class="chip mono">workflow/</span>
+        <span class="chip mono">execution/</span><span class="chip mono">recovery/</span><span class="chip mono">history/</span>
+        <span class="chip mono">assistant/</span><span class="chip mono">bootstrap/</span><span class="chip mono">workspace/</span>
+      </div>
+      <p class="body" style="font-size:11.5px;margin:0">~4.3k LOC of shell, stores, and run plumbing already exists,
+      plus the full <code class="mono">speckit.run.*</code> gateway surface. The gap is the <strong>Meaning
+      Layer</strong> — the parser and the semantic widgets that sit between them.</p>
+    </div>
+  </div>
+
+  <h3 class="sec">Phasing</h3>
+  <table class="tbl">
+    <tr><th style="width:78px">Phase</th><th style="width:210px">Deliverable</th><th>Content</th></tr>
+    <tr><td><span class="chip accent">P0</span></td><td><strong>Lossless parser + patch engine</strong></td>
+      <td>Concrete syntax tree, UTF-8 byte anchors, revision hashes, expected-source checks, transactional patches,
+      validation, three-way merge, and undo. Accessibility semantics are part of every primitive from this phase.</td></tr>
+    <tr><td><span class="chip accent">P1</span></td><td><strong>First run + stage model</strong></td>
+      <td>Repository validation, feature creation, preview-before-write, compact five-stage header, deterministic
+      readiness, and recoverable empty/error states.</td></tr>
+    <tr><td><span class="chip accent">P2</span></td><td><strong>Meaning widgets</strong></td>
+      <td>Story card, GWT flow, requirement chip, metric card, task card, spec sheet, gate row, entity graph. This
+      is the visible payoff — the moment markdown stops looking like markdown.</td></tr>
+    <tr><td><span class="chip accent">P3</span></td><td><strong>Boards</strong></td>
+      <td>Spec board, Plan view, and Tasks board with verified write-back. Timeline and dependency graph remain
+      deferred until the primary board proves insufficient.</td></tr>
+    <tr><td><span class="chip accent">P4</span></td><td><strong>Trace + Clarify</strong></td>
+      <td>Coverage matrix, orphan detection, cross-view highlighting, Clarify queue wired to
+      <code class="mono">interaction.respond</code>. The comprehension payoff.</td></tr>
+    <tr><td><span class="chip accent">P5</span></td><td><strong>Activity Center + review</strong></td>
+      <td>Unified questions, permissions, runs, semantic hunk labels, three-way merge, crash recovery, and history. The trust payoff —
+      what makes it safe on a real branch.</td></tr>
+    <tr><td><span class="chip accent">P6</span></td><td><strong>Polish</strong></td>
+      <td>Command palette, deep-link state restoration, optional transitions, shared comments, and virtualization for 200+ task features.</td></tr>
+  </table>
+
+  <div class="callout">
+    <div class="ct">The one thing to get right first</div>
+    <strong>P0.</strong> If the lossless parser and optimistic-concurrency patch engine are solid, every widget after it is a small, independent,
+    testable component and the phases can proceed in parallel. If P0 is shaky, every visual edit becomes a
+    file-corruption risk and the whole concept collapses back into "a markdown viewer with a Run button".
+  </div>
+
+  <h3 class="sec">Definition of done — the 100% test</h3>
+  <p class="body">The concept succeeds only if a user can do <em>all</em> of this without a terminal:</p>
+  <div class="card">
+    <div class="gate-row"><span class="ic ok">1</span><span class="gt">Connect a repository, validate access, and initialize missing Spec Kit setup with a file preview</span></div>
+    <div class="gate-row"><span class="ic ok">2</span><span class="gt">Create or bind a feature branch and preview every identity/binding sidecar change</span></div>
+    <div class="gate-row"><span class="ic ok">3</span><span class="gt">Create or amend the constitution and see principles as gates</span></div>
+    <div class="gate-row"><span class="ic ok">4</span><span class="gt">Describe an outcome in plain language and generate a staged spec.md</span></div>
+    <div class="gate-row"><span class="ic ok">5</span><span class="gt">Answer clarifications as cards and review the resulting patches</span></div>
+    <div class="gate-row"><span class="ic ok">6</span><span class="gt">Generate and edit the design, resolving unknowns inline</span></div>
+    <div class="gate-row"><span class="ic ok">7</span><span class="gt">Generate tasks, reorder safely, and preview semantic impact for cross-phase moves</span></div>
+    <div class="gate-row"><span class="ic ok">8</span><span class="gt">Run analysis and repair every orphan or unverified requirement from the matrix</span></div>
+    <div class="gate-row"><span class="ic ok">9</span><span class="gt">Generate and complete quality checklists</span></div>
+    <div class="gate-row"><span class="ic ok">10</span><span class="gt">Scope agent permissions, run implementation, and observe files, tools, tests, and checkpoints</span></div>
+    <div class="gate-row"><span class="ic ok">11</span><span class="gt">Review semantic hunks, accept selectively, undo edits, and resolve conflicts</span></div>
+    <div class="gate-row"><span class="ic ok">12</span><span class="gt">Recover from a failed or interrupted run without losing drafts, answers, or staged changes</span></div>
+  </div>
+</section>
+
+</main>
+</div>
+<div class="toast" id="global-status" role="status" aria-live="polite"></div>
+
+<script>
+  const items = Array.from(document.querySelectorAll(".navitem"));
+  const pages = Array.from(document.querySelectorAll(".page"));
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  let toastTimer;
+
+  function showToast(message) {
+    const toast = document.getElementById("global-status");
+    toast.textContent = message;
+    toast.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove("show"), 3200);
+  }
+
+  function activatePage(target, options = {}) {
+    const page = document.getElementById(target);
+    if (!page || !page.classList.contains("page")) return;
+    items.forEach(item => {
+      const active = item.dataset.p === target;
+      item.classList.toggle("active", active);
+      if (active) item.setAttribute("aria-current", "page");
+      else item.removeAttribute("aria-current");
+    });
+    pages.forEach(candidate => candidate.classList.toggle("active", candidate === page));
+    if (options.updateHistory) history.pushState({ page: target }, "", `#${target}`);
+    window.scrollTo({ top: 0, behavior: reduceMotion.matches ? "auto" : "smooth" });
+    if (options.focusMain) document.getElementById("main-content").focus({ preventScroll: true });
+  }
+
+  items.forEach(item => {
+    item.addEventListener("click", event => {
+      event.preventDefault();
+      activatePage(item.dataset.p, { updateHistory: true });
+    });
+  });
+
+  window.addEventListener("popstate", () => {
+    const target = location.hash.slice(1);
+    activatePage(target || "p-start");
+  });
+
+  document.addEventListener("keydown", event => {
+    if (!event.altKey || !["ArrowDown", "ArrowUp"].includes(event.key)) return;
+    event.preventDefault();
+    const current = items.findIndex(item => item.classList.contains("active"));
+    const next = event.key === "ArrowDown"
+      ? Math.min(current + 1, items.length - 1)
+      : Math.max(current - 1, 0);
+    items[next].focus();
+    activatePage(items[next].dataset.p, { updateHistory: true });
+  });
+
+  document.querySelector('[data-action="preview-start"]').addEventListener("click", () => {
+    document.getElementById("start-status").textContent =
+      "Preview ready: 1 branch and 2 files proposed; no repository changes have been made.";
+  });
+
+  const customDebounce = document.getElementById("custom-debounce");
+  const clarifyPatch = document.getElementById("clarify-patch");
+  const clarifyStatus = document.getElementById("clarify-status");
+
+  document.querySelectorAll('input[name="debounce"]').forEach(radio => {
+    radio.addEventListener("change", () => {
+      const customSelected = radio.value === "custom" && radio.checked;
+      customDebounce.disabled = !customSelected;
+      if (customSelected) customDebounce.focus();
+      clarifyStatus.textContent = "";
+    });
+  });
+
+  document.querySelector('[data-action="preview-answer"]').addEventListener("click", () => {
+    const answer = document.querySelector('input[name="debounce"]:checked').value;
+    const resolution = {
+      "300": "within 300 ms of the last keystroke",
+      "1000": "within 1000 ms of the last keystroke",
+      "blur": "when the editor loses focus"
+    }[answer] || customDebounce.value.trim();
+    if (!resolution) {
+      clarifyStatus.textContent = "Enter a custom constraint before previewing the patch.";
+      customDebounce.focus();
+      return;
+    }
+    clarifyPatch.textContent = `- **FR-016**: System MUST sync board edits back ${resolution}.`;
+    clarifyStatus.textContent =
+      `Proposed patch prepared for “${resolution}”; review is required before spec.md changes.`;
+  });
+
+  document.querySelectorAll(".enode").forEach(node => {
+    node.addEventListener("click", () => {
+      document.getElementById("graph-status").textContent =
+        `${node.querySelector(".en").textContent} selected; source bullet and relationships are ready for inspection.`;
+    });
+  });
+
+  document.querySelector('[data-action="cancel-run"]').addEventListener("click", () => {
+    document.getElementById("run-status").textContent =
+      "Cancel requested. Completed reads and the partial task draft will be preserved for review.";
+  });
+
+  document.querySelector('[data-action="reject-hunk"]').addEventListener("click", () => {
+    document.getElementById("review-status").textContent =
+      "Hunk rejected; the working tree remains unchanged.";
+  });
+
+  document.querySelector('[data-action="accept-hunk"]').addEventListener("click", () => {
+    document.getElementById("review-status").textContent =
+      "Hunk accepted into the staged patch; the working tree remains unchanged until final apply.";
+  });
+
+  document.querySelectorAll(".action:not([data-action])").forEach(button => {
+    button.addEventListener("click", () => {
+      showToast(`${button.textContent.trim()} selected. In production this opens the reviewed workflow action.`);
+    });
+  });
+
+  const initialPage = document.getElementById(location.hash.slice(1)) ? location.hash.slice(1) : "p-start";
+  activatePage(initialPage);
+</script>
+</body>
+</html>

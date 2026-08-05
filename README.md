@@ -70,17 +70,24 @@ is supported on all three.
 
 ```
 joey                       Start the interactive REPL
+joey --tui                 Launch the animated ratatui dashboard instead of the line REPL
 joey -z "<prompt>"         One-shot headless query (prints only the final answer)
 joey chat -q "<prompt>"    One-shot through the chat path (banner/session unless -Q)
 joey -m <model>            Override the model for this run
 joey -r <id-or-title>      Resume a past session · joey -c resumes the most recent
 joey -p <profile>          Use a named profile home (~/.joey/profiles/<name>)
+joey -s <skills>           Preload one or more Agent Skills for the session
+joey --yolo                Bypass all dangerous-command approval prompts
+joey --safe-mode           Disable all customizations (user config + MCP servers) for troubleshooting
 
 joey model                 Interactive provider + model picker (persists selection)
+joey auth <provider>       Manage provider authentication (e.g. `auth copilot login|status`)
 joey tools                 --summary | list | enable/disable <names> [--platform]
-joey skills list           List installed skills
+joey skills                Search, install, inspect, and manage skills
 joey config                show | edit | get | set | unset | path | env-path
 joey doctor [--fix]        Diagnose the environment (and fix what it can)
+joey discover              Discover local model servers (Ollama, LM Studio, llama.cpp, …)
+joey llm-selector <sub>    CLI mirror of `/llm-selector` (status | pool | pin | allocations | …)
 joey version               Show version + upstream attribution
 joey home                  Print the resolved ~/.joey directory (joey extension)
 
@@ -95,11 +102,22 @@ joey mcp add <name> --command …        Register a stdio MCP server (config.yam
 joey mcp list | test <name> | remove   Inspect, probe, or remove configured servers
 ```
 
-Inside the REPL the full upstream slash-command set is recognized (`/help` lists it);
-implemented today: `/help`, `/new [name]`, `/clear`, `/model`, `/reasoning`, `/tools`,
-`/toolsets`, `/skills`, `/compress` (`/compact`), `/history`, `/sessions`, `/resume`,
-`/config`, `/status`, `/usage`, `/queue` (`/q`), `/copy`, `/verbose`, `/timestamps`,
-`/version`, `/exit`.
+Inside the REPL the full upstream slash-command set is recognized (`/help` lists it,
+grouped by Session / Configuration / Tools & Skills / Info / Exit); implemented today:
+`/new` (`/reset`), `/clear`, `/history`, `/compress` (`/compact`), `/rollback`,
+`/checkpoint` (`/snap`), `/agents` (`/tasks`), `/start-work`, `/queue` (`/q`), `/goal`,
+`/status`, `/changes`, `/resume`, `/sessions`, `/config`, `/model`, `/llm-selector`,
+`/timestamps` (`/ts`), `/verbose`, `/reasoning`, `/tools`, `/toolsets`, `/skills`,
+`/help`, `/usage`, `/copy`, `/version` (`/v`), `/quit` (`/exit`). Everything else in
+the registry is recognized (so `/handoff`, `/undo`, etc. answer honestly) but not yet
+wired to a handler.
+
+`/agents` shows the live OMO (Oh My OpenAgent) roster — 11 built-in agent personas with
+per-agent model-family fallback chains — and `/start-work` activates the Atlas
+plan-execution loop against a `.omo/plans/<name>.md` file, delegating tasks to
+subagents via `delegate_task`. `/llm-selector` (and `joey llm-selector` at the top
+level) controls the dynamic model allocator: pool status, per-module pinning, and
+learned allocations, used when `model.default` is set to `auto`.
 
 Long sessions auto-compact like upstream: when context usage crosses the configured
 threshold (or the provider rejects an oversized request), older history is summarized
@@ -113,16 +131,22 @@ first turns are preserved verbatim, and archived rows remain searchable in `stat
 | `read_file` | Read a text file with line numbers + pagination |
 | `write_file` | Create/overwrite a file (atomic) |
 | `patch` | Targeted find/replace with a 9-strategy fuzzy matcher |
+| `multi_edit` | Apply several find/replace edits to a file in one call |
 | `search_files` | Regex content search / glob file search (gitignore-aware) |
 | `terminal` | Run a shell command (head/tail-bounded output, secret-redacted) |
+| `process` | Manage long-running background processes started by `terminal` |
 | `todo` | Track a plan for multi-step work |
 | `memory` | Persist notes (`MEMORY.md`) and a user profile (`USER.md`) |
 | `web_search` | Web search via Tavily |
 | `web_extract` | Fetch + extract page text (SSRF-guarded) |
 | `skills_list` / `skill_view` | Discover and load Agent Skills |
+| `session_search` | Full-text search over past session history (FTS5) |
+| `clarify` | Ask the user a structured clarifying question mid-turn |
+| `lsp_diagnostics` / `lsp_definition` / `lsp_references` / `lsp_symbols` | Language-server-backed code intelligence — registered only when a matching server is configured (see [`docs/LSP.md`](docs/LSP.md)) |
 
 Tools are grouped into toolsets (`file`, `terminal`, `web`, `coding`, `joey-cli`, …) and
-resolved exactly like upstream, including recursive `includes`.
+resolved exactly like upstream, including recursive `includes`. `PreToolUse` hooks can
+gate or rewrite any tool call before it runs — see [`docs/HOOKS.md`](docs/HOOKS.md).
 
 ## Configuration
 
@@ -134,7 +158,7 @@ State lives under `~/.joey/` (override with `JOEY_HOME`):
 ~/.joey/SOUL.md         the agent identity (seeded on first run; edit to customize)
 ~/.joey/state.db        SQLite session store (hermes-compatible schema + FTS5 search)
 ~/.joey/memories/       MEMORY.md, USER.md
-~/.joey/skills/         installed Agent Skills (73 upstream skills ship in-repo)
+~/.joey/skills/         installed Agent Skills (20 skills ship in-repo)
 ~/.joey/cron/jobs.json  scheduled jobs (hermes-compatible format)
 ~/.joey/logs/           size-rotated, secret-redacted logs
 ```
@@ -149,7 +173,10 @@ cron ticker 60 s.
 
 ## Architecture
 
-A Cargo workspace of focused crates:
+A Cargo workspace of 13 crates. The first eight are direct ports of Hermes Agent
+modules; the remaining five (`joey-tui`, `joey-llm-selector`, `joey-orchestration`,
+`joey-omo`, `joey-speckit-ui`) are joey-native additions layered on top, not described
+by the upstream Python project:
 
 | Crate | Ports | Responsibility |
 |-------|-------|----------------|
@@ -161,6 +188,16 @@ A Cargo workspace of focused crates:
 | `joey-mcp` | `tools/mcp_tool.py` (client) | Stdio JSON-RPC MCP client with the `mcp__server__tool` convention |
 | `joey-gateway` | `gateway/` (core) | Session-key builder, message/adapter types, `PlatformAdapter` trait |
 | `joey-cli` | `hermes_cli/`, `cli.py` | The `joey` binary: clap command tree + interactive REPL |
+| `joey-tui` | — (joey-native) | The `--tui` animated ratatui dashboard: theme, widgets, input editor, app state |
+| `joey-llm-selector` | — (joey-native) | Dynamic model allocator for `model.default = auto`: candidate pool, per-module allocation map, cold-start scoring, `/llm-selector` |
+| `joey-orchestration` | — (joey-native) | Subagent manager + `delegate_task`/`call_omo_agent` tools for multi-agent delegation |
+| `joey-omo` | — (joey-native) | "Oh My OpenAgent": 11-agent persona registry, category/subagent routing, Atlas plan execution, intent gating (ultrawork/hyperplan/team), goals, team mode |
+| `joey-speckit-ui` | — (joey-native) | Standalone HTTP+WebSocket backend for the SpecKit Visual UI (`specs/<feature>/{spec,plan,tasks}.md`); run separately with `cargo run -p joey-speckit-ui`, not embedded in the `joey` binary |
+
+`joey-tui`, `joey-llm-selector`, `joey-orchestration`, and `joey-omo` are all wired
+into the live `joey` binary (REPL, one-shot, and cron paths); `joey-speckit-ui` is an
+independent backend process for the separate `web/speckit-ui` frontend. See
+[`docs/architecture.md`](docs/architecture.md) for the full dependency graph.
 
 ## Relationship to Hermes Agent
 

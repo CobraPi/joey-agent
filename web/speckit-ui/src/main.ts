@@ -5,6 +5,7 @@ import { Board } from './board/board';
 import { SpecTaskCanvas } from './canvas/canvas';
 import { InitWizard } from './init-wizard';
 import { Workspace } from './workspace/workspace';
+import { WorkspaceApp } from './app';
 
 const client = new SpeckitApiClient();
 
@@ -62,6 +63,17 @@ async function init(): Promise<void> {
   if (detail?.tasks) board.setTasks(detail.tasks);
 
   new InitWizard({ container: qs('#view-init'), client });
+
+  // Feature 010: Spec-Kit Development IDE workspace.
+  // Mount the new unified workspace (explorer + editor + workflow + run panel)
+  // into the #view-ide container if it exists in the DOM.
+  const ideContainer = document.querySelector<HTMLElement>('#view-ide');
+  if (ideContainer) {
+    const ideApp = new WorkspaceApp(client, DEFAULT_FEATURE_ID, ideContainer);
+    await ideApp.init().catch((err) => {
+      console.error('IDE workspace init failed', err);
+    });
+  }
 }
 
 void init();

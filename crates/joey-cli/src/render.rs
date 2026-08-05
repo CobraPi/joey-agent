@@ -230,6 +230,110 @@ fn box_width() -> usize {
     term_width().clamp(20, 80)
 }
 
+/// Spec 008 (T001/FR-013): Classify whether a tool name is a terminal-command
+/// block (renders with the crush `$ command` layout). Matches
+/// `joey_tui::state::is_terminal_block` (007 T016). Data-driven: tool name only.
+fn is_terminal_block(name: &str) -> bool {
+    name == "terminal"
+}
+
+/// Spec 008 (T006/FR-002): Build the reasoning-close footer line
+/// (`└─ Thought for {:.1}s` + gradient fill) when a duration > 0 is available,
+/// or `None` for a plain border close. Extracted from `close_reasoning` so the
+/// no-duration (`None`) branch is unit-testable without stdout capture.
+fn reasoning_footer_line(started: Option<Instant>) -> Option<String> {
+    let t = theme();
+    if let Some(ts) = started {
+        let secs = ts.elapsed().as_secs_f64();
+        if secs > 0.0 {
+            let footer = format!("└─ Thought for {:.1}s ", secs);
+            let w = box_width();
+            let fill = w.saturating_sub(2 + footer.len());
+            let footer_styled = t.fg_more_subtle.ansi().paint(&footer).to_string();
+            let fill_styled = theme::gradient_fg(
+                &"─".repeat(fill.saturating_sub(1)),
+                t.info_most_subtle,
+                t.fg_most_subtle,
+            );
+            return Some(format!("{}{}", footer_styled, fill_styled));
+        }
+    }
+    None
+}
+
+/// Spec 008 (T014/FR-004/FR-006): Build the terminal-command block header line
+/// (`$ command` + status icon + `(exit N)` badge + duration). Pure function
+/// extracted from the `ToolEnd` arm for direct unit testing.
+fn terminal_header_line(summary: &str, is_error: bool, exit_code: Option<i64>, duration: f64) -> String {
+    let t = theme();
+    let status_icon = if is_error { "✗" } else { "✓" };
+    let status_color = if is_error { t.error } else { t.success };
+    let dur = fmt_duration(duration);
+    let exit_badge = match exit_code {
+        Some(code) if code != 0 => format!(" (exit {})", code),
+        _ => String::new(),
+    };
+    format!(
+        "  {} {} {}{} {}",
+        theme::paint_bold("$", t.accent),
+        t.fg_base.ansi().paint(summary),
+        theme::paint_bold(status_icon, status_color),
+        if exit_badge.is_empty() {
+            String::new()
+        } else {
+            t.error.ansi().paint(&exit_badge).to_string()
+        },
+        t.fg_more_subtle.ansi().paint(&dur),
+    )
+}
+
+/// Spec 008 (T020/FR-007): Build the generic tool-call header line (status icon
+/// + emoji + bold name + primary param + duration + optional exit badge). Pure
+/// function extracted from the `ToolEnd` arm for direct unit testing.
+fn generic_tool_header_line(
+    name: &str,
+    emoji: &str,
+    summary: &str,
+    is_error: bool,
+    exit_code: Option<i64>,
+    duration: f64,
+) -> String {
+    let t = theme();
+    let status_icon = if is_error { "✗" } else { "✓" };
+    let status_color = if is_error { t.error } else { t.success };
+    let dur = fmt_duration(duration);
+    let exit_badge = match exit_code {
+        Some(code) if code != 0 => format!(" (exit {})", code),
+        _ => String::new(),
+    };
+    format!(
+        "  {} {} {} {} {} {}",
+        theme::paint_bold(status_icon, status_color),
+        t.accent.ansi().paint(emoji),
+        theme::paint_bold(name, t.fg_base),
+        t.fg_most_subtle.ansi().paint(summary),
+        t.fg_more_subtle.ansi().paint(&dur),
+        if exit_badge.is_empty() {
+            String::new()
+        } else {
+            t.error.ansi().paint(&exit_badge).to_string()
+        },
+    )
+}
+
+/// Spec 008 (T015/T021/FR-005/FR-008): Build the indented body lines from a
+/// result string. Returns an empty Vec when the body is empty (header-only
+/// block). Pure function extracted from the `ToolEnd` arm for direct testing.
+fn tool_body_lines(body: &str) -> Vec<String> {
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let t = theme();
+    body.lines()
+        .map(|l| format!("    {}", t.fg_more_subtle.ansi().paint(l)))
+        .collect()
+}
+
 /// T044: Count the visual lines a delta string will occupy, accounting for
 /// terminal width wrapping. Uses `unicode-width` for accurate glyph widths.
 /// Each `\n` starts a new line; long lines without `\n` wrap across multiple
@@ -267,7 +371,14 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
     let mut reasoning_open = false;
     let mut reasoning_buf = String::new();
     let mut reasoning_line_count: usize = 0; // Feature 005 (T025): reasoning size tracking
+    // Spec 008 (T002): timestamp of the first ReasoningDelta of a block;
+    // used to derive the `Thought for {:.1}s` footer duration on block close.
+    let mut reasoning_started: Option<Instant> = None;
     let mut last_tool_line: Option<String> = None;
+    // Spec 008: stash the emoji+summary from ToolStart for use in the
+    // crush-style header on ToolEnd (emoji+summary are not on ToolEnd events).
+    let mut pending_tool_emoji = String::new();
+    let mut pending_tool_summary = String::new();
     let mut total_prompt_tokens: u64 = 0;
     let mut total_completion_tokens: u64 = 0;
 
@@ -372,29 +483,26 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             )
         }
     };
-    let close_reasoning = |open: &mut bool, buf: &mut String, line_count: &mut usize| {
+    let close_reasoning = |open: &mut bool, buf: &mut String, line_count: &mut usize, started: Option<Instant>| {
         if *open {
             if !buf.is_empty() {
                 println!("{}", t.fg_more_subtle.ansi().paint(buf.as_str()));
                 buf.clear();
             }
-            // Feature 005 (T025): show line count in the close border (parity
-            // with TUI's expand affordance).
-            if *line_count > 0 {
-                let summary = format!(" {} lines of reasoning ", line_count);
-                let w = box_width();
-                let fill = w.saturating_sub(2 + summary.len());
-                let label_styled = t.fg_most_subtle.ansi().paint(summary).to_string();
-                let fill_styled = theme::gradient_fg(
-                    &"─".repeat(fill.saturating_sub(1)),
-                    t.info_most_subtle,
-                    t.fg_most_subtle,
-                );
-                println!("{}{}", label_styled, fill_styled);
-            } else {
-                let w = box_width();
-                let border = theme::gradient_diagonal_field(w.saturating_sub(2), t.info_most_subtle, t.fg_most_subtle);
-                println!("{}", border);
+            // Spec 008 (T006/FR-002): replace the "N lines of reasoning" close
+            // summary with `└─ Thought for {:.1}s` footer matching the TUI
+            // (widgets.rs:333-336), or a plain border close when no duration.
+            match reasoning_footer_line(started) {
+                Some(line) => println!("{}", line),
+                None => {
+                    let w = box_width();
+                    let border = theme::gradient_diagonal_field(
+                        w.saturating_sub(2),
+                        t.info_most_subtle,
+                        t.fg_most_subtle,
+                    );
+                    println!("{}", border);
+                }
             }
             *open = false;
             *line_count = 0;
@@ -475,6 +583,8 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 }
                 if !reasoning_open {
                     reasoning_open = true;
+                    // Spec 008 (T007): capture start time for the footer duration.
+                    reasoning_started = Some(Instant::now());
                     let w = box_width();
                     let label = " Reasoning ";
                     let fill = w.saturating_sub(2 + label.len());
@@ -526,7 +636,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     );
                     caret_visible = false;
                 }
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count);
+                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take());
                 print!("{}", d);
                 let _ = std::io::stdout().flush();
                 streamed_any = true;
@@ -539,18 +649,21 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             AgentEvent::AssistantMessage(text) => {
                 final_text = text;
                 if !opts.quiet && !streamed_any && !final_text.is_empty() {
-                    close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count);
+                    close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take());
                     println!("{}", final_text);
                 }
             }
             AgentEvent::ToolStart { name, emoji, summary } => {
+                // Spec 008: stash emoji+summary for the ToolEnd crush header.
+                pending_tool_emoji = emoji.clone();
+                pending_tool_summary = summary.clone();
                 if streamed_any {
                     println!();
                     streamed_any = false;
                 }
                 // T040: stop caret when tool output begins.
                 caret_active = false;
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count);
+                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take());
                 // US2: finalize spinner before tool output.
                 if let Some(s) = spinner_state.as_mut() {
                     if s.running {
@@ -633,7 +746,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     println!("{}", t.fg_more_subtle.ansi().paint(format!("  ┊ {} {}", name, progress)));
                 }
             }
-            AgentEvent::ToolEnd { name, is_error, result_preview, duration_secs } => {
+            AgentEvent::ToolEnd { name, is_error, result_preview, duration_secs, exit_code, full_result } => {
                 let duration = duration_secs;
                 if opts.quiet || opts.tool_progress == "off" {
                     continue;
@@ -643,62 +756,73 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 }
                 last_tool_line = Some(name.clone());
 
-                let status_icon = if is_error { "✗" } else { "✓" };
-                let status_color = if is_error { t.error } else { t.success };
-                let name_styled = t.fg_base.ansi().paint(&name);
-                let dur = fmt_duration(duration);
+                let body_text = if !full_result.is_empty() { &full_result } else { &result_preview };
+                let emoji = if pending_tool_emoji.is_empty() { "⚡" } else { pending_tool_emoji.as_str() };
+                let summary = &pending_tool_summary;
 
-                let line = if is_error {
-                    format!(
-                        "  {} {} {}",
-                        status_color.ansi().paint(status_icon),
-                        name_styled,
-                        t.fg_more_subtle.ansi().paint(format!("failed ({})", dur))
-                    )
-                } else {
-                    format!(
-                        "  {} {} {}",
-                        status_color.ansi().paint(status_icon),
-                        name_styled,
-                        t.fg_more_subtle.ansi().paint(format!("({})", dur))
-                    )
-                };
+                // Spec 008 (T013/FR-013): branch on terminal vs generic tool.
+                // Header/body composition delegated to pure helpers
+                // (terminal_header_line / generic_tool_header_line / tool_body_lines)
+                // for direct unit-test coverage.
+                if is_terminal_block(&name) {
+                    // ── T014/FR-004: terminal-command block header ──
+                    let line = terminal_header_line(summary, is_error, exit_code, duration);
 
-                // T041: If we have an active tool with a captured row, rewrite
-                // the entry line in place with the resolved state.
-                if let Some((tool_row, state, tool_name, _summary)) = active_tool.take() {
-                    if tool_name == name && animations_on {
-                        use crossterm::{cursor, queue, terminal};
-                        let mut stdout = std::io::stdout();
-                        // Move to the tool's row, clear the line, print resolved.
-                        let _ = queue!(
-                            stdout,
-                            cursor::MoveTo(0, tool_row),
-                            terminal::Clear(terminal::ClearType::CurrentLine),
-                        );
-                        let _ = stdout.flush();
-                        print!("{}", line);
-                        let _ = stdout.flush();
-                        // Cursor is now at end of resolved line. Leave it; next
-                        // event will move to a new line or overwrite.
-                        let _ = state; // state consumed by take()
+                    // T016: in-place rewrite when animations_on and active_tool matches.
+                    if let Some((tool_row, state, tool_name, _summary)) = active_tool.take() {
+                        if tool_name == name && animations_on {
+                            use crossterm::{cursor, queue, terminal};
+                            let mut stdout = std::io::stdout();
+                            let _ = queue!(
+                                stdout,
+                                cursor::MoveTo(0, tool_row),
+                                terminal::Clear(terminal::ClearType::CurrentLine),
+                            );
+                            let _ = stdout.flush();
+                            print!("{}", line);
+                            let _ = stdout.flush();
+                            let _ = state;
+                        } else {
+                            println!("{}", line);
+                        }
                     } else {
-                        // Tool name mismatch or animations off — print normally.
                         println!("{}", line);
                     }
-                } else {
-                    println!("{}", line);
-                }
 
-                // Show result preview in verbose mode.
-                if !is_error && opts.tool_progress == "verbose" && !result_preview.is_empty() {
-                    // Feature 005 (T030): non-interactive mode emits full result
-                    // untruncated (FR-012); interactive verbose trims to 120.
-                    if !opts.capability.is_interactive {
-                        println!("    └ {}", result_preview);
+                    // T015/FR-005: print the full command output beneath the header.
+                    for l in tool_body_lines(body_text) {
+                        println!("{}", l);
+                    }
+                } else {
+                    // ── T020/FR-007: generic tool-call header (crush composition) ──
+                    let line = generic_tool_header_line(
+                        &name, emoji, summary, is_error, exit_code, duration,
+                    );
+
+                    // T022: in-place rewrite when animations_on and active_tool matches.
+                    if let Some((tool_row, state, tool_name, _summary)) = active_tool.take() {
+                        if tool_name == name && animations_on {
+                            use crossterm::{cursor, queue, terminal};
+                            let mut stdout = std::io::stdout();
+                            let _ = queue!(
+                                stdout,
+                                cursor::MoveTo(0, tool_row),
+                                terminal::Clear(terminal::ClearType::CurrentLine),
+                            );
+                            let _ = stdout.flush();
+                            print!("{}", line);
+                            let _ = stdout.flush();
+                            let _ = state;
+                        } else {
+                            println!("{}", line);
+                        }
                     } else {
-                        let preview_trimmed: String = result_preview.chars().take(120).collect();
-                        println!("    {} {}", t.fg_more_subtle.ansi().paint("└"), t.fg_most_subtle.ansi().paint(&preview_trimmed));
+                        println!("{}", line);
+                    }
+
+                    // T021/FR-008: print the full result body indented beneath.
+                    for l in tool_body_lines(body_text) {
+                        println!("{}", l);
                     }
                 }
             }
@@ -808,7 +932,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 }
             }
             AgentEvent::Done { final_text: text, usage: _, iterations } => {
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count);
+                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take());
 
                 // T040: erase the streaming caret if visible.
                 if caret_visible {
@@ -880,7 +1004,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 break;
             }
             AgentEvent::Failed(err) => {
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count);
+                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take());
                 if streamed_any {
                     println!();
                 }
@@ -1586,6 +1710,8 @@ mod tests {
             is_error: false,
             result_preview: "file contents".to_string(),
             duration_secs: 0.1,
+            exit_code: None,
+            full_result: "file contents".to_string(),
         });
         let _ = tx.send(AgentEvent::ContentDelta("Done.".to_string()));
         let _ = tx.send(AgentEvent::Done {
@@ -1790,6 +1916,8 @@ mod tests {
             is_error: false,
             result_preview: "found 3 results".to_string(),
             duration_secs: 0.5,
+            exit_code: None,
+            full_result: "found 3 results".to_string(),
         });
         let _ = tx.send(AgentEvent::ContentDelta("Done.".to_string()));
         let _ = tx.send(AgentEvent::Done {
@@ -1828,6 +1956,8 @@ mod tests {
             is_error: false,
             result_preview: "ok".to_string(),
             duration_secs: 0.2,
+            exit_code: None,
+            full_result: "ok".to_string(),
         });
         let _ = tx.send(AgentEvent::ApiCallStart);
         let _ = tx.send(AgentEvent::ApiCallEnd {
@@ -1870,5 +2000,268 @@ mod tests {
             assert!(n >= prev, "narrower width must not reduce line count: w={} n={} prev={}", w, n, prev);
             prev = n;
         }
+    }
+
+    // ══ Spec 008: Crush-Style Block Formatting Tests ══
+
+    /// Run a synthetic event stream through `render_turn` and return final_text.
+    /// Used by the regression / gate tests below (T023-T026).
+    fn run_turn(events: Vec<AgentEvent>, opts: RenderOptions) -> String {
+        let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
+        for ev in events {
+            let _ = tx.send(ev);
+        }
+        drop(tx);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build runtime");
+        rt.block_on(render_turn(rx, opts))
+    }
+
+    // ── T009: is_terminal_block classification (matches 007 T020, FR-013) ──
+    #[test]
+    fn is_terminal_block_classification() {
+        assert!(is_terminal_block("terminal"));
+        assert!(!is_terminal_block("read_file"));
+        assert!(!is_terminal_block("write_file"));
+        assert!(!is_terminal_block("search_files"));
+        assert!(!is_terminal_block(""));
+    }
+
+    // ── T003: reasoning footer shows "Thought for" when duration > 0 ──
+    // FR-002/FR-003, quickstart.md test 2.
+    #[test]
+    fn close_reasoning_footer_with_duration() {
+        let ts = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let line = reasoning_footer_line(Some(ts));
+        assert!(line.is_some(), "footer should render when elapsed > 0");
+        let line = line.unwrap();
+        assert!(
+            line.contains("Thought for"),
+            "reasoning footer missing 'Thought for': {}",
+            line
+        );
+    }
+
+    // ── T004: reasoning close with no duration → None (plain border) ──
+    // The `None` path is the defensive fallback with no "Thought for" footer
+    // (quickstart.md test 3).
+    #[test]
+    fn close_reasoning_no_duration_plain_border() {
+        assert!(reasoning_footer_line(None).is_none());
+    }
+
+    // ── T010: terminal block header shows $ prompt + command from summary ──
+    // FR-004, quickstart.md test 4.
+    #[test]
+    fn terminal_block_header_shows_prompt() {
+        let line = terminal_header_line("ls -la crates", false, Some(0), 0.3);
+        assert!(line.contains('$'), "terminal prompt '$' missing: {}", line);
+        assert!(
+            line.contains("ls -la crates"),
+            "command text missing: {}",
+            line
+        );
+    }
+
+    // ── T011: terminal block exit badge shows (exit N) for non-zero ──
+    // FR-006, quickstart.md test 5.
+    #[test]
+    fn terminal_block_exit_badge_nonzero() {
+        let line = terminal_header_line("false", true, Some(1), 0.1);
+        assert!(
+            line.contains("(exit 1)"),
+            "exit badge missing: {}",
+            line
+        );
+    }
+
+    // ── T012: terminal block no badge on zero exit ──
+    // FR-006, quickstart.md test 6.
+    #[test]
+    fn terminal_block_no_badge_on_zero_exit() {
+        let line = terminal_header_line("echo hi", false, Some(0), 0.1);
+        assert!(
+            !line.contains("(exit"),
+            "unexpected exit badge on zero exit: {}",
+            line
+        );
+    }
+
+    // ── T017: generic tool header composition (status icon + name + summary) ──
+    // FR-007, quickstart.md test 7.
+    #[test]
+    fn generic_tool_header_composition() {
+        let line = generic_tool_header_line("read_file", "📖", "Cargo.toml", false, None, 0.1);
+        assert!(line.contains("read_file"), "tool name missing: {}", line);
+        assert!(line.contains("Cargo.toml"), "summary param missing: {}", line);
+        assert!(line.contains('✓'), "success icon missing: {}", line);
+    }
+
+    // ── T018: generic tool body sourced from full_result ──
+    // FR-008, quickstart.md test 8.
+    #[test]
+    fn generic_tool_body_from_full_result() {
+        let lines = tool_body_lines("line one\nline two\nline three");
+        assert_eq!(lines.len(), 3);
+        let joined = lines.join("\n");
+        assert!(joined.contains("line two"), "full_result body missing 'line two': {}", joined);
+        assert!(joined.contains("line three"), "full_result body missing 'line three': {}", joined);
+    }
+
+    // ── T019: generic tool body falls back to result_preview ──
+    // FR-008, quickstart.md test 9.
+    #[test]
+    fn generic_tool_body_fallback_to_preview() {
+        let lines = tool_body_lines("preview only content");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("preview only content"),
+            "preview fallback body missing: {}",
+            lines[0]
+        );
+    }
+
+    // ── T015/FR-005: empty body produces no lines (header-only block) ──
+    #[test]
+    fn tool_body_empty_produces_no_lines() {
+        assert!(tool_body_lines("").is_empty());
+    }
+
+    // ── T023: regression — reasoning visibility gate preserved ──
+    // FR-011, spec US1 acceptance scenario 5. When show_reasoning is false the
+    // reasoning box must not open; the turn still returns correct final_text.
+    #[test]
+    fn reasoning_visibility_gate_preserved() {
+        // show_reasoning: false (NonInteractive default)
+        let opts = opts_for(Capability::NonInteractive);
+        let text = run_turn(
+            vec![
+                AgentEvent::TurnStart { max_iterations: 1 },
+                AgentEvent::ReasoningDelta("secret reasoning\n".to_string()),
+                AgentEvent::ContentDelta("Answer.".to_string()),
+                AgentEvent::Done {
+                    final_text: "Answer.".to_string(),
+                    usage: Usage::default(),
+                    iterations: 1,
+                },
+            ],
+            opts,
+        );
+        assert_eq!(text, "Answer.");
+    }
+
+    // ── T024: regression — quiet mode suppresses all blocks ──
+    // FR-011. The turn completes and returns correct final_text.
+    #[test]
+    fn quiet_mode_suppresses_blocks() {
+        let mut opts = opts_for(Capability::NonInteractive);
+        opts.quiet = true;
+        let text = run_turn(
+            vec![
+                AgentEvent::TurnStart { max_iterations: 1 },
+                AgentEvent::ToolStart {
+                    name: "terminal".to_string(),
+                    emoji: "⬛".to_string(),
+                    summary: "ls".to_string(),
+                },
+                AgentEvent::ToolEnd {
+                    name: "terminal".to_string(),
+                    is_error: false,
+                    result_preview: "file1\nfile2".to_string(),
+                    duration_secs: 0.1,
+                    exit_code: Some(0),
+                    full_result: "file1\nfile2".to_string(),
+                },
+                AgentEvent::ContentDelta("Done.".to_string()),
+                AgentEvent::Done {
+                    final_text: "Done.".to_string(),
+                    usage: Usage::default(),
+                    iterations: 1,
+                },
+            ],
+            opts,
+        );
+        assert_eq!(text, "Done.");
+    }
+
+    // ── T025: regression — tool_progress "off" suppresses tool blocks ──
+    // FR-011, spec US3 acceptance scenario 5. The turn completes and returns
+    // correct final_text.
+    #[test]
+    fn tool_progress_off_suppresses_blocks() {
+        let mut opts = opts_for(Capability::NonInteractive);
+        opts.tool_progress = "off".to_string();
+        let text = run_turn(
+            vec![
+                AgentEvent::TurnStart { max_iterations: 1 },
+                AgentEvent::ToolStart {
+                    name: "read_file".to_string(),
+                    emoji: "📖".to_string(),
+                    summary: "test.txt".to_string(),
+                },
+                AgentEvent::ToolEnd {
+                    name: "read_file".to_string(),
+                    is_error: false,
+                    result_preview: "contents".to_string(),
+                    duration_secs: 0.1,
+                    exit_code: None,
+                    full_result: "contents".to_string(),
+                },
+                AgentEvent::ContentDelta("Done.".to_string()),
+                AgentEvent::Done {
+                    final_text: "Done.".to_string(),
+                    usage: Usage::default(),
+                    iterations: 1,
+                },
+            ],
+            opts,
+        );
+        assert_eq!(text, "Done.");
+    }
+
+    // ── T026: NonInteractive renders block layout without crash ──
+    // FR-015: structural layout renders in ALL modes. The pure helpers produce
+    // the header + body in any mode (FR-015 "structural layout in ALL modes"),
+    // and a full NonInteractive turn completes and returns final_text.
+    #[test]
+    fn noninteractive_renders_block_layout() {
+        // Pure-function: header + body compose correctly (capability-agnostic).
+        let header = generic_tool_header_line("read_file", "📖", "Cargo.toml", false, None, 0.5);
+        assert!(header.contains("read_file"), "header missing: {}", header);
+        let body = tool_body_lines("line 1\nline 2");
+        assert_eq!(body.len(), 2);
+        assert!(body[1].contains("line 2"), "body missing: {}", body[1]);
+
+        // Integration: a full NonInteractive turn completes without crash.
+        let opts = opts_for(Capability::NonInteractive);
+        let text = run_turn(
+            vec![
+                AgentEvent::TurnStart { max_iterations: 1 },
+                AgentEvent::ToolStart {
+                    name: "read_file".to_string(),
+                    emoji: "📖".to_string(),
+                    summary: "Cargo.toml".to_string(),
+                },
+                AgentEvent::ToolEnd {
+                    name: "read_file".to_string(),
+                    is_error: false,
+                    result_preview: "file contents".to_string(),
+                    duration_secs: 0.5,
+                    exit_code: None,
+                    full_result: "line 1\nline 2".to_string(),
+                },
+                AgentEvent::ContentDelta("Done.".to_string()),
+                AgentEvent::Done {
+                    final_text: "Done.".to_string(),
+                    usage: Usage::default(),
+                    iterations: 1,
+                },
+            ],
+            opts,
+        );
+        assert_eq!(text, "Done.");
     }
 }

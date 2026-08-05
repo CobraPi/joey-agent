@@ -251,7 +251,50 @@ fn group<'a>(caps: &'a Captures<'_>, i: usize) -> &'a str {
 }
 
 fn sub_all(re: &Regex, text: &str, mut f: impl FnMut(&Captures) -> String) -> String {
-    re.replace_all(text, |caps: &Captures| f(caps)).into_owned()
+    // NOTE: do NOT use `re.replace_all(...)` here. Internally `replace_all`
+    // routes through `replacen`, which calls `try_replacen(...).unwrap()`.
+    // `try_replacen` can return a runtime error — most notably
+    // `RuntimeError::BacktrackLimitExceeded` (catastrophic backtracking) on
+    // pathological input. Redaction runs on arbitrary text (terminal output,
+    // tool results, streamed message lines, log lines), so an unwrap panic
+    // here takes down the whole process (e.g. the TUI).
+    //
+    // Instead we drive `captures_iter` ourselves — the same iterator
+    // `try_replacen` uses — so the success path is byte-for-byte identical
+    // (same non-overlapping match order, same capacity hint, same
+    // replacement assembly). On a runtime error we log once and return the
+    // text (partially accumulated so far) instead of unwrapping.
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    for m in re.captures_iter(text) {
+        match m {
+            Ok(caps) => {
+                // `captures_iter` only reports matches, so group 0 is always
+                // present — but guard defensively.
+                let start = caps.get(0).map(|m0| m0.start()).unwrap_or(last);
+                let end = caps.get(0).map(|m0| m0.end()).unwrap_or(last);
+                if start > last {
+                    out.push_str(&text[last..start]);
+                }
+                out.push_str(&f(&caps));
+                last = end;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "redaction regex `{}` hit a runtime error on input ({}); \
+                     leaving the remainder of this block unredacted",
+                    re.as_str(),
+                    e
+                );
+                out.push_str(&text[last..]);
+                return out;
+            }
+        }
+    }
+    if last < text.len() {
+        out.push_str(&text[last..]);
+    }
+    out
 }
 
 /// Mask a secret for display, preserving `head` and `tail` characters.
@@ -885,5 +928,31 @@ mod tests {
     #[test]
     fn leaves_plain_text() {
         assert_eq!(redact("hello world"), "hello world");
+    }
+
+    /// Regression: `sub_all` must never panic on a runtime regex error
+    /// (e.g. `BacktrackLimitExceeded`). Previously `sub_all` used
+    /// `re.replace_all`, which internally unwraps `try_replacen` and would
+    /// crash the whole process (TUI included). We build a regex that
+    /// deliberately pathologizes — `(a+)+$` over a long `a…a!` string is the
+    /// classic catastrophic-backtracking shape — and assert it returns text
+    /// instead of aborting. Both the matched and non-matched cases are
+    /// exercised: the matched case proves success-path parity still holds.
+    #[test]
+    fn sub_all_survives_backtrack_limit() {
+        // Success path parity: identical to `replace_all` output.
+        let re = rx(r"(secret)");
+        let out = sub_all(&re, "a secret here", |c| format!("[{}]", &c[1]));
+        assert_eq!(out, "a [secret] here");
+
+        // Pathological regex + input → fancy-regex's backtracking engine
+        // raises `BacktrackLimitExceeded`. `sub_all` must NOT panic; it must
+        // return the input (possibly partially accumulated) as a string.
+        let evil = rx(r"(a+)+$");
+        let bomb = "a".repeat(60) + "!";
+        let out = sub_all(&evil, &bomb, |_| "X".to_string());
+        // No crash. We don't assert exact contents (engine-dependent), only
+        // that we got a non-panicking `String` containing the prefix bytes.
+        assert!(out.starts_with(&"a".repeat(40)) || out.contains('a'));
     }
 }

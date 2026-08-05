@@ -638,7 +638,7 @@ pub struct ContextCompressor {
     pub awaiting_real_usage_after_compression: bool,
 
     pub summary_model: String,
-    configured_threshold_percent: f64,
+    pub(crate) configured_threshold_percent: f64,
 
     session_db: Option<Arc<Mutex<SessionDb>>>,
     session_id: String,

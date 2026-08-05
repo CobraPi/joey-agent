@@ -286,6 +286,11 @@ pub struct Agent {
     pub(crate) loop_detector: crate::loop_detection::LoopDetector,
     /// PreToolUse hooks runner (crush-style shell hooks).
     pub(crate) hooks: Option<crate::hooks::PreToolUseRunner>,
+    /// Optional dynamic LLM model allocator (feature 011). When set and active,
+    /// the main turn's model id is resolved per-module by the allocator instead
+    /// of using `config.model` verbatim. When None or inactive, behavior is
+    /// byte-identical to pre-feature-011 (Constitution VII).
+    pub(crate) model_allocator: Option<Arc<dyn joey_llm_selector::ModelAllocator>>,
 }
 
 impl Agent {
@@ -384,7 +389,42 @@ impl Agent {
             agent_identity: None,
             loop_detector: crate::loop_detection::LoopDetector::new(),
             hooks: None,
+            model_allocator: None,
         })
+    }
+
+    /// Set the dynamic LLM model allocator (feature 011). When set, the main
+    /// turn's model is resolved per-module by the allocator when it is active.
+    pub fn set_model_allocator(&mut self, allocator: Arc<dyn joey_llm_selector::ModelAllocator>) {
+        self.model_allocator = Some(allocator);
+    }
+
+    /// Install the dynamic LLM model allocator (feature 011) into BOTH the main
+    /// turn intercept AND the compression summary backend. This is the
+    /// production wiring path called by the CLI (`oneshot`/`repl`) after
+    /// `Agent::new`.
+    ///
+    /// When the existing compression backend is an `AuxSummaryBackend`, the
+    /// allocator is threaded into it so its `generate()` resolves the
+    /// compression model via the allocator when active (byte-identical when
+    /// inactive — Constitution VII).
+    pub fn install_model_allocator(&mut self, allocator: Arc<dyn joey_llm_selector::ModelAllocator>) {
+        // Rebuild the compression backend with the allocator wired in. The
+        // backend is stored as a `dyn SummaryBackend` trait object inside the
+        // compressor; we reconstruct an `AuxSummaryBackend` from config with
+        // the allocator set, preserving the same provider/model/timeout.
+        let backend = compression::AuxSummaryBackend::from_config(
+            self.ctx.config(),
+            &self.provider_name,
+            &self.config.model,
+            &self.config.base_url,
+            self.config.api_key.as_deref(),
+        );
+        let mut backend = backend;
+        backend.set_model_allocator(allocator.clone());
+        self.compressor.set_summary_backend(Arc::new(backend));
+        // Main-turn intercept.
+        self.model_allocator = Some(allocator);
     }
 
     /// The built-in context compressor (upstream `agent.context_compressor`).
@@ -832,12 +872,44 @@ impl Agent {
         // A one-shot output-cap override from the overflow handler wins
         // (upstream `_ephemeral_max_output_tokens`).
         let max_tokens = self.ephemeral_max_output_tokens.or(self.config.max_tokens);
-        ProviderRequest::new(self.config.model.clone(), self.history.clone())
+        // Feature 011: when a dynamic model allocator is wired and active,
+        // resolve the main-turn model per-module. When None or inactive,
+        // `config.model` is used verbatim (byte-identical to pre-feature-011).
+        let model = self.resolve_main_turn_model(!tools.is_empty());
+        ProviderRequest::new(model, self.history.clone())
             .with_system(Some(self.effective_system_prompt()))
             .with_tools(tools.to_vec())
             .with_reasoning(self.config.reasoning.clone())
             .with_max_tokens(max_tokens)
             .streaming(self.config.stream)
+    }
+
+    /// Resolve the model id for the main turn. When the dynamic allocator is
+    /// wired and active (feature 011), it picks the model; otherwise the
+    /// configured model is used verbatim (Constitution VII non-regression).
+    fn resolve_main_turn_model(&self, needs_tools: bool) -> String {
+        if let Some(allocator) = &self.model_allocator {
+            if allocator.is_active() {
+                let turn_has_images = self.history.iter().any(|m| {
+                    m.content_parts
+                        .as_ref()
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .any(|p| matches!(p, joey_providers::types::ContentPart::ImageUrl { .. }))
+                        })
+                        .unwrap_or(false)
+                });
+                let alloc = allocator.resolve(
+                    joey_llm_selector::ModuleId::MainTurn,
+                    turn_has_images,
+                    needs_tools,
+                    0, // token_budget_hint: 0 = no hard gate from the call site
+                );
+                return alloc.model_id;
+            }
+        }
+        self.config.model.clone()
     }
 
     async fn transport_call(
@@ -950,6 +1022,23 @@ impl Agent {
                         }
                     }
                     if !e.is_retryable() {
+                        // Feature 011 (T048, FR-015 acceptance 2): when the
+                        // selector is active and the model it chose returns a
+                        // permanent error (e.g. ModelNotFound), tell the
+                        // selector so it invalidates the dead allocation and
+                        // re-resolves a live model on the next turn. The
+                        // runtime fallback chain below handles substituting a
+                        // feasible model for THIS call.
+                        if matches!(e, ProviderError::ModelNotFound(_)) {
+                            if let Some(allocator) = &self.model_allocator {
+                                if allocator.is_active() {
+                                    allocator.report_permanent_error(
+                                        joey_llm_selector::ModuleId::MainTurn,
+                                        &req.model,
+                                    );
+                                }
+                            }
+                        }
                         // Non-retryable: try the fallback chain before
                         // aborting (conversation_loop.py:3918-3937).
                         if e.should_failover() {
@@ -999,6 +1088,18 @@ impl Agent {
                         error: e.to_string(),
                         wait_secs: wait.as_secs_f64(),
                     });
+                    // Feature 011: forward the retry signal to the dynamic
+                    // allocator's diagnoser (FR-009 observable failure). The
+                    // call is fire-and-forget — it enqueues to a channel and
+                    // never blocks. Non-failure turns produce no observation.
+                    if let Some(allocator) = &self.model_allocator {
+                        allocator.record_observation(
+                            joey_llm_selector::ModuleId::MainTurn,
+                            joey_llm_selector::FailureSignal::RetryTriggered,
+                            "",
+                            "",
+                        );
+                    }
                     if self.sleep_with_interrupt(wait).await {
                         return Err(TurnAbort::Interrupted(format!(
                             "Operation interrupted during retry ({}, attempt {}/{}).",
@@ -1297,6 +1398,34 @@ impl Agent {
         self.invalid_tool_strikes = 0;
         self.loop_detector.reset();
 
+        // Feature 011: refresh the per-turn allocation cache from the on-disk
+        // allocation map (FR-007). This applies any diagnoser-driven
+        // reallocations produced since the last turn so every module in this
+        // turn sees a consistent allocation map. No-op when the selector is
+        // disabled or not wired (byte-identical to pre-feature-011).
+        if let Some(allocator) = &self.model_allocator {
+            allocator.refresh_at_turn_start();
+            // FR-019: when the selector is active and has allocated a model for
+            // the main turn, update the compressor's context length to the
+            // allocated model's highest catalog window so compression triggers
+            // at the right threshold for the actually-selected model (not the
+            // originally-configured one).
+            if allocator.is_active() {
+                let allocated_ctx = allocator.context_window_for(
+                    joey_llm_selector::ModuleId::MainTurn,
+                ) as i64;
+                if allocated_ctx > 0 && allocated_ctx != self.compressor.context_length {
+                    self.compressor.context_length = allocated_ctx;
+                    // Re-apply the small-context floor for the new window.
+                    self.compressor.threshold_percent =
+                        compression::ContextCompressor::effective_threshold_percent(
+                            allocated_ctx,
+                            self.compressor.configured_threshold_percent,
+                        );
+                }
+            }
+        }
+
         let _ = tx.send(AgentEvent::TurnStart {
             max_iterations: self.config.max_turns,
         });
@@ -1313,6 +1442,27 @@ impl Agent {
         // A crashed/interrupted prior turn can leave an unanswered
         // assistant-with-tool_calls tail; repair before the user message.
         self.repair_dangling_tool_tail();
+
+        // ── Drain pending background-process completions (FR-007/FR-008) ──
+        // Inject any that finished in a prior turn into the conversation as
+        // non-interrupting context for THIS turn, and emit a visual notice.
+        // This is the cross-turn delivery path: the reaper pushed completions
+        // into the session-persistent queue on `ToolContext`, which survived
+        // the launching turn's (dropped) event channel. The injection happens
+        // BEFORE the user message so the model processes the completion as
+        // context, then the new request. It never preempts the prior turn.
+        for completion in self.ctx.drain_pending_completions() {
+            let notice = format!(
+                "[Background process {} completed: exit {}, {:.1}s]\n{}",
+                completion.session_id,
+                completion.exit_code,
+                completion.elapsed_secs,
+                completion.output_tail,
+            );
+            let _ = tx.send(AgentEvent::Notice(notice.clone()));
+            self.push_message(Message::user(notice), None);
+        }
+
         self.push_message(Message::user(user_input), None);
 
         let tools = self.tool_schemas();
@@ -1926,7 +2076,9 @@ impl Agent {
                     });
                     start_times.push(std::time::Instant::now());
                     let registry = self.registry.clone();
-                    let ctx = self.ctx.clone();
+                    // Create a per-call progress channel so streaming tools
+                    // (terminal) can emit ToolProgress events.
+                    let ctx = self.ctx_for_tool(&tc.function.name, tx.clone());
                     let name = tc.function.name.clone();
                     let id = tc.id.clone();
                     handles.push(tokio::spawn(async move {
@@ -1951,6 +2103,8 @@ impl Agent {
                         is_error,
                         result_preview: preview,
                         duration_secs: duration,
+                        exit_code: extract_exit_code(&tc.function.name, &content),
+                        full_result: content.clone(),
                     });
                     self.push_message(
                         Message::tool_result(&tc.id, &tc.function.name, wrapped),
@@ -1967,9 +2121,10 @@ impl Agent {
                         summary: summarize_args(&tc.function.name, &args),
                     });
                     let call_start = std::time::Instant::now();
+                    let ctx = self.ctx_for_tool(&tc.function.name, tx.clone());
                     let result = self
                         .registry
-                        .dispatch_call(&tc.function.name, args, &self.ctx, &tc.id)
+                        .dispatch_call(&tc.function.name, args, &ctx, &tc.id)
                         .await;
                     let duration = call_start.elapsed().as_secs_f64();
                     let is_error = result.is_error();
@@ -1982,6 +2137,8 @@ impl Agent {
                         is_error,
                         result_preview: preview,
                         duration_secs: duration,
+                        exit_code: extract_exit_code(&tc.function.name, &content_raw),
+                        full_result: content_raw.clone(),
                     });
                     let wrapped = maybe_wrap_untrusted(&tc.function.name, &content_raw);
                     self.push_message(
@@ -2053,6 +2210,35 @@ impl Agent {
             }
         }
         false
+    }
+
+    /// Build a per-tool-call [`ToolContext`] clone with a progress channel
+    /// and the cooperative-interrupt flag wired in. Creates a
+    /// `mpsc::unbounded_channel`, spawns a forwarding task that maps incoming
+    /// `String` progress → `AgentEvent::ToolProgress`, attaches the sender to
+    /// the context clone, and shares the agent's Ctrl-C `AtomicBool` so
+    /// streaming tools (e.g. `terminal`) can cancel mid-run. Tools that don't
+    /// use either are unaffected — the channel never receives anything and
+    /// the flag is simply never polled.
+    fn ctx_for_tool(
+        &self,
+        tool_name: &str,
+        tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> ToolContext {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+        let name = tool_name.to_string();
+        tokio::spawn(async move {
+            while let Some(delta) = progress_rx.recv().await {
+                let _ = tx.send(AgentEvent::ToolProgress {
+                    name: name.clone(),
+                    progress: delta,
+                });
+            }
+        });
+        self.ctx
+            .clone()
+            .with_progress_sender(Some(progress_tx))
+            .with_interrupt_flag(Some(self.interrupt.clone()))
     }
 }
 
@@ -2414,6 +2600,19 @@ fn preview_result(content: &str) -> String {
     }
 }
 
+/// Feature 007: Extract the process exit code from a terminal tool's result
+/// content. Returns `None` for non-terminal tools and on any parse failure
+/// (never panics). The terminal tool serializes `exit_code` into its JSON
+/// result; we parse it only for `terminal` tool calls.
+fn extract_exit_code(tool_name: &str, content: &str) -> Option<i64> {
+    if tool_name != "terminal" {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| v.get("exit_code")?.as_i64())
+}
+
 /// Feature 005 (T011): drain pending file changes from the `FileTracker` and
 /// emit one `AgentEvent::FileChange` per result. Called after each mutating
 /// tool call completes, **before** the matching `ToolEnd`, so the inline
@@ -2631,6 +2830,31 @@ mod tests {
         }
     }
 
+    /// Emits progress deltas via the context's progress channel, to verify the
+    /// agent forwards them as `AgentEvent::ToolProgress` events (feature 009:
+    /// progress channel + reaper completion wiring).
+    struct ProgressTool;
+    #[async_trait]
+    impl Tool for ProgressTool {
+        fn name(&self) -> &str {
+            "progress"
+        }
+        fn toolset(&self) -> &str {
+            "test"
+        }
+        fn description(&self) -> &str {
+            "emits progress"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: Value, ctx: &ToolContext) -> ToolResult {
+            ctx.emit_progress("delta-1");
+            ctx.emit_progress("delta-2");
+            ToolResult::Text("ok".to_string())
+        }
+    }
+
     struct Fixture {
         agent: Agent,
         transport: Arc<ScriptedTransport>,
@@ -2727,6 +2951,143 @@ mod tests {
         let events = drain(&mut rx);
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolStart { name, .. } if name == "echo")));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { final_text, .. } if final_text == "done")));
+    }
+
+    /// Feature 009: a tool's progress deltas are forwarded to the event
+    /// stream as `AgentEvent::ToolProgress` (the channel wired in `ctx_for_tool`).
+    /// This same path carries the background reaper's completion notice (T018).
+    #[tokio::test]
+    async fn tool_progress_forwarded_as_agent_event() {
+        let _l = lock();
+        let mut fx = fixture(
+            vec![
+                Ok(tool_resp(
+                    vec![ToolCall::new("call_1", "progress", "{}")],
+                    FinishReason::Stop,
+                )),
+                Ok(text_resp("done")),
+            ],
+            10,
+            3,
+            Some(Arc::new(ProgressTool)),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        // The progress→AgentEvent forwarder is a spawned task; let it flush
+        // its buffered deltas before we drain. Accumulate until delta-2 lands.
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            async {
+                let mut all = Vec::new();
+                loop {
+                    all.extend(drain(&mut rx));
+                    if all.iter().any(|e| matches!(
+                        e,
+                        AgentEvent::ToolProgress { progress, .. } if progress == "delta-2"
+                    )) {
+                        return all;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("progress events did not flush in time");
+        let progress_events: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolProgress { name, progress } => {
+                    Some((name.clone(), progress.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            progress_events
+                .iter()
+                .any(|(n, p)| n == "progress" && p == "delta-1"),
+            "expected ToolProgress(delta-1) forwarded, got {:?}",
+            progress_events
+        );
+        assert!(
+            progress_events
+                .iter()
+                .any(|(n, p)| n == "progress" && p == "delta-2"),
+            "expected ToolProgress(delta-2) forwarded, got {:?}",
+            progress_events
+        );
+    }
+
+    /// Feature 009 (T026): pending background completions queued in a prior
+    /// turn are drained at the start of the next turn — injected into the
+    /// conversation as a non-interrupting user-role message AND surfaced as a
+    /// visual `AgentEvent::Notice`. This is the cross-turn delivery path that
+    /// survives the launching turn's dropped event channel.
+    #[tokio::test]
+    async fn pending_completions_drained_and_injected_at_turn_start() {
+        let _l = lock();
+        let mut fx = fixture(
+            vec![Ok(text_resp("acknowledged"))],
+            10,
+            3,
+            None,
+        );
+        // Simulate a background job that completed in a prior turn.
+        fx.agent.ctx.push_background_completion(
+            joey_tools::context::BackgroundCompletion {
+                session_id: "proc-cross-turn".to_string(),
+                exit_code: 0,
+                output_tail: "build finished".to_string(),
+                elapsed_secs: 5.2,
+            },
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("what happened?", tx).await;
+        assert_eq!(result.final_text, "acknowledged");
+
+        // Visual: a Notice event carrying the completion details.
+        let events = drain(&mut rx);
+        let has_notice = events.iter().any(|e| {
+            matches!(e, AgentEvent::Notice(n)
+                if n.contains("proc-cross-turn")
+                && n.contains("build finished")
+                && n.contains("exit 0"))
+        });
+        assert!(
+            has_notice,
+            "expected a Notice with the completion, got: {:?}",
+            events
+                .iter()
+                .filter_map(|e| if let AgentEvent::Notice(n) = e { Some(n.clone()) } else { None })
+                .collect::<Vec<_>>()
+        );
+
+        // Conversation injection: a user-role message containing the completion,
+        // placed BEFORE the user's actual input (so the model processes it as
+        // context for this turn).
+        let history = fx.agent.history();
+        let completion_idx = history
+            .iter()
+            .position(|m| m.role == "user"
+                && m.content.as_deref().unwrap_or("").contains("proc-cross-turn"));
+        let input_idx = history
+            .iter()
+            .position(|m| m.role == "user"
+                && m.content.as_deref().unwrap_or("") == "what happened?");
+        assert!(completion_idx.is_some(), "completion injected into history");
+        assert!(input_idx.is_some(), "user input in history");
+        assert!(
+            completion_idx.unwrap() < input_idx.unwrap(),
+            "completion must appear BEFORE the user's input"
+        );
+
+        // Queue drained.
+        assert!(
+            fx.agent.ctx.drain_pending_completions().is_empty(),
+            "queue must be empty after turn-start drain"
+        );
     }
 
     /// Budget exhaustion appends the summary user message and makes one more
@@ -3229,5 +3590,139 @@ mod tests {
             .expect("idempotent switch");
         assert!(again.contains("Already on"));
         assert_eq!(agent.model(), "anthropic/claude-sonnet-4.6");
+    }
+
+    // ── Feature 007: extract_exit_code ───────────────────────────────
+
+    #[test]
+    fn test_extract_exit_code_non_terminal_returns_none() {
+        assert_eq!(extract_exit_code("read_file", r#"{"output":"hi"}"#), None);
+        assert_eq!(extract_exit_code("search_files", r#"{"exit_code": 0}"#), None);
+    }
+
+    #[test]
+    fn test_extract_exit_code_terminal_zero() {
+        let content = r#"{"output":"done\n","exit_code":0}"#;
+        assert_eq!(extract_exit_code("terminal", content), Some(0));
+    }
+
+    #[test]
+    fn test_extract_exit_code_terminal_nonzero() {
+        let content = r#"{"output":"err\n","exit_code":2}"#;
+        assert_eq!(extract_exit_code("terminal", content), Some(2));
+    }
+
+    #[test]
+    fn test_extract_exit_code_malformed_json_returns_none() {
+        assert_eq!(extract_exit_code("terminal", "not json at all"), None);
+        assert_eq!(extract_exit_code("terminal", "{broken"), None);
+    }
+
+    #[test]
+    fn test_extract_exit_code_missing_field_returns_none() {
+        let content = r#"{"output":"no exit here"}"#;
+        assert_eq!(extract_exit_code("terminal", content), None);
+    }
+
+    // ── Feature 011: dynamic LLM selector regression (Constitution VII) ────
+    //
+    // These tests pin the byte-identical-to-pre-feature-011 invariant: when
+    // no model allocator is wired (the default — `try_build_allocator` returns
+    // None unless `model.selector.enabled` or `model == "auto"`), the main-turn
+    // request uses the configured model verbatim and the turn-start hook is a
+    // no-op. This is the non-regression contract for the new public trait
+    // surface and the edited call sites (plan §VII regression table).
+
+    /// With no allocator wired, the main-turn request carries the configured
+    /// model id verbatim — byte-identical to pre-feature-011 behavior.
+    #[tokio::test]
+    async fn feature011_no_allocator_uses_configured_model_verbatim() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("hello", tx).await;
+        // The single scripted response means exactly one provider request was
+        // made for the main turn; its model must be the configured "test-model".
+        assert_eq!(fx.transport.request_count(), 1);
+        assert_eq!(fx.transport.request(0).model, "test-model");
+    }
+
+    /// The turn-start hook (refresh_at_turn_start + context_window_for) is a
+    /// guarded no-op when `model_allocator` is None. We verify the guard by
+    /// confirming the compressor's context_length is unchanged across a turn
+    /// with no allocator wired (the `if let Some(allocator)` branch is never
+    /// entered).
+    #[tokio::test]
+    async fn feature011_turn_start_hook_is_noop_without_allocator() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        let ctx_before = fx.agent.compressor.context_length;
+        // model_allocator must be None by default (Constitution VII off-by-default).
+        assert!(fx.agent.model_allocator.is_none());
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("hello", tx).await;
+        // No allocator wired → the hook never ran → context_length unchanged.
+        assert_eq!(fx.agent.compressor.context_length, ctx_before);
+    }
+
+    /// When an allocator IS wired but INACTIVE (selector disabled / model not
+    /// "auto"), `resolve_main_turn_model` still returns the configured model
+    /// verbatim. This proves the disabled-fallback path of the trait contract
+    /// (model-allocator-trait.md invariant 1) preserves the byte-identical
+    /// invariant even when the trait object is present.
+    #[tokio::test]
+    async fn feature011_inactive_allocator_falls_back_to_configured_model() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        // Wire a selector engine that is enabled=false and configured_model
+        // is NOT "auto" — so is_active() must return false and resolve() must
+        // return the configured model (DisabledFallback).
+        let engine = joey_llm_selector::SelectorEngine::new(joey_llm_selector::SelectorConfig {
+            enabled: false,
+            configured_model: "test-model".to_string(),
+            learning_budget: 8,
+            diagnoser_model: String::new(),
+        });
+        fx.agent.set_model_allocator(std::sync::Arc::new(engine));
+        // Sanity: the allocator is wired but reports inactive.
+        assert!(fx.agent.model_allocator.is_some());
+        assert!(!fx.agent.model_allocator.as_ref().unwrap().is_active());
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("hello", tx).await;
+        assert_eq!(fx.transport.request_count(), 1);
+        assert_eq!(fx.transport.request(0).model, "test-model");
+    }
+
+    /// T052 / FR-016 / SC-006: wiring an allocator, toggling it, and running a
+    /// turn NEVER mutates the conversation history or the byte-stable system
+    /// prompt. The system prompt is built once in `Agent::new` and must remain
+    /// identical before/after any selector action.
+    #[tokio::test]
+    async fn feature011_prompt_and_history_stable_across_toggle() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        // Capture the system prompt + history length BEFORE wiring the allocator.
+        let prompt_before = fx.agent.system_prompt().to_string();
+        let history_len_before = fx.agent.history.len();
+
+        // Wire an allocator (inactive — model is not "auto").
+        let engine = joey_llm_selector::SelectorEngine::new(joey_llm_selector::SelectorConfig {
+            enabled: false,
+            configured_model: "test-model".to_string(),
+            learning_budget: 8,
+            diagnoser_model: String::new(),
+        });
+        fx.agent.set_model_allocator(std::sync::Arc::new(engine));
+
+        // Run a turn.
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("hello", tx).await;
+
+        // The system prompt MUST be byte-identical (FR-016, SC-006).
+        assert_eq!(fx.agent.system_prompt(), prompt_before, "system prompt must be byte-stable");
+
+        // History grew by exactly the user message + assistant response (no
+        // synthetic injection from the selector).
+        assert_eq!(
+            fx.agent.history.len(),
+            history_len_before + 2,
+            "history grew only by user+assistant — no synthetic messages injected"
+        );
     }
 }

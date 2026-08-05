@@ -22,12 +22,23 @@ hex.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
+which.workspace = true
+dirs.workspace = true
+tokio-util.workspace = true
 
 axum = { version = "0.7", features = ["ws"] }
 notify = "6"
 notify-debouncer-mini = "0.4"
 pulldown-cmark = "0.12"
 tower = "0.5"
+
+# Git object/read-side for staging (T001/T028). The mutating side (worktree
+# add, git apply --reject) uses the git CLI subprocess via commands.rs, per
+# research.md §3. gix default-features=false + selective features to keep
+# compile time and binary size lean (Constitution VIII).
+gix = { version = "0.66", default-features = false, features = [
+    "basic", "blob-diff", "index", "revision", "status", "serde",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

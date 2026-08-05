@@ -766,6 +766,22 @@ impl Tui {
             }
         }
     }
+
+    /// Feature 007 (T026): handle a left-click on the transcript. Uses
+    /// per-item hit-testing (`transcript_hit_test`) to resolve the clicked
+    /// row to a transcript item index, then focuses the transcript and toggles
+    /// that item's expand state. Clicks outside the text area or on
+    /// non-expandable items are no-ops (focus still switches to Transcript).
+    pub fn handle_mouse_click(&mut self, row: u16, col: u16) {
+        // Focus the transcript on any click within it.
+        if self.focus == Focus::Input {
+            self.focus = Focus::Transcript;
+        }
+        // Resolve the clicked item via per-item hit-testing, then toggle.
+        if let Some(item_idx) = widgets::transcript_hit_test(&self.app, self.theme, row, col) {
+            self.app.toggle_item_expand_by_index(item_idx);
+        }
+    }
 }
 
 impl Drop for Tui {
