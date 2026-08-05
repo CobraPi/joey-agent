@@ -28,6 +28,7 @@ mod secret_prompt;
 mod setup_wizard;
 mod skills_cmd;
 mod slash;
+mod speckit_cmd;
 mod tools_cmd;
 mod tui;
 
@@ -61,6 +62,7 @@ Examples:
     joey cron list                List scheduled jobs
     joey mcp add gh --command npx --args -y @modelcontextprotocol/server-github
     joey doctor                   Check configuration and dependencies
+    joey speckit                  Launch SpecKit Visual UI (backend + frontend)
 
 For more help on a command:
     joey <command> --help";
@@ -190,6 +192,8 @@ enum Command {
     Home,
     /// Manage the dynamic LLM model selector (feature 011)
     LlmSelector(LlmSelectorArgs),
+    /// Launch the SpecKit Visual UI (backend + frontend)
+    Speckit(speckit_cmd::SpeckitArgs),
 }
 
 /// `joey model` (main.py `cmd_model`): the provider + model setup wizard.
@@ -544,6 +548,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 }
             }
         }
+        Some(Command::Speckit(args)) => speckit_cmd::speckit_command(args).await,
         Some(Command::Chat(chat)) => {
             wire_flag_env(chat.yolo, chat.ignore_user_config, chat.safe_mode);
             let opts = repl::ChatOptions {

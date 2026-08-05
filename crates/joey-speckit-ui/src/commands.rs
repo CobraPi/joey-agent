@@ -95,13 +95,42 @@ pub async fn run_implement_task(
     feature_id: &str,
     task_id: &str,
 ) -> anyhow::Result<CommandResult> {
-    run_script_or_cli(
-        repo_root,
-        "implement",
-        "implement",
-        &[feature_id, "--task", task_id],
-    )
-    .await
+    run_implement_task_with_instructions(repo_root, feature_id, task_id, None).await
+}
+
+/// Run a single implementation task with optional run-specific instructions.
+/// The instructions are passed through the subprocess environment so both the
+/// repository script and the `specify` CLI receive the same scoped prompt.
+async fn run_implement_task_with_instructions(
+    repo_root: &Path,
+    feature_id: &str,
+    task_id: &str,
+    instructions: Option<&str>,
+) -> anyhow::Result<CommandResult> {
+    let args = [feature_id, "--task", task_id];
+    let instructions = instructions.map(str::to_owned);
+
+    if let Some(script) = script_path(repo_root, "implement") {
+        let mut command = Command::new("bash");
+        command
+            .arg(script)
+            .args(args)
+            .current_dir(repo_root);
+        if let Some(instructions) = instructions.as_deref() {
+            command.env("SPEC_KIT_RUN_INSTRUCTIONS", instructions);
+        }
+        return Ok(command.output().await?.into());
+    }
+
+    let mut command = Command::new("specify");
+    command
+        .arg("implement")
+        .args(args)
+        .current_dir(repo_root);
+    if let Some(instructions) = instructions.as_deref() {
+        command.env("SPEC_KIT_RUN_INSTRUCTIONS", instructions);
+    }
+    Ok(command.output().await?.into())
 }
 
 /// Equivalent of `specify init --here --integration <agent> --script <type>`.
@@ -125,6 +154,56 @@ pub async fn run_init(
     Ok(output.into())
 }
 
+// =====================================================================
+// Feature 012: US4 convergence — generative defect-fix follow-on (T092).
+//
+// For defects whose fix benefits from agent generation (a real task body, a
+// real breach justification), spawn a scoped run through the existing runner
+// producing a staged patch per FR-023 clarification Q3.
+// =====================================================================
+
+/// Run a generative defect-fix: ask the agent to produce the real content for
+/// the defect's scaffold (a real task body, a real breach justification). The
+/// output lands in staging under the same staged-review policy as every other
+/// agent edit (FR-025/FR-029).
+///
+/// This is the genuinely-generative half of the hybrid one-click fix
+/// (clarification Q3). The deterministic scaffold was already applied by the
+/// `POST .../defects/{id}/fix` endpoint; this function fills in the real body.
+pub async fn run_generative_defect_fix(
+    repo_root: &Path,
+    feature_id: &str,
+    defect_id: &str,
+    prompt: &str,
+    target_artifact: &str,
+) -> anyhow::Result<CommandResult> {
+    // Compose a scoped prompt that asks the agent to produce the real content
+    // for the defect's scaffold. The agent runs with the same safety/approval
+    // boundaries and staging policy as every other run (FR-025 — staged by
+    // default).
+    let effective_prompt = format!(
+        "You are fixing traceability defect '{defect_id}' in feature '{feature_id}'.\n\
+         Target artifact: {target_artifact}\n\n\
+         {prompt}\n\n\
+         Write the real content (not a stub). Your changes will be staged for \
+         review — do not attempt to apply them directly. The deterministic \
+         scaffold has already been inserted; fill in the substantive body."
+    );
+
+    // Route through the existing implement-task runner (specs/010 contract).
+    // The run produces a staged patch that the developer reviews at hunk
+    // granularity (FR-029). We pass the defect id as the task id so the
+    // runner scopes to this defect and forwards the effective instructions to
+    // the implementation subprocess.
+    run_implement_task_with_instructions(
+        repo_root,
+        feature_id,
+        defect_id,
+        Some(&effective_prompt),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +222,32 @@ mod tests {
         std::fs::create_dir_all(&script_dir).unwrap();
         std::fs::write(script_dir.join("clarify.sh"), "#!/bin/bash\necho ok\n").unwrap();
         assert!(script_path(dir.path(), "clarify").is_some());
+    }
+
+    #[tokio::test]
+    async fn generative_fix_forwards_effective_prompt_to_script() {
+        let dir = tempdir().unwrap();
+        let script_dir = dir.path().join(".specify/scripts/bash");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::write(
+            script_dir.join("implement.sh"),
+            "#!/bin/bash\nprintf '%s' \"$SPEC_KIT_RUN_INSTRUCTIONS\"\n",
+        )
+        .unwrap();
+
+        let result = run_generative_defect_fix(
+            dir.path(),
+            "012-feature",
+            "defect:orphan:FR-001",
+            "Write a real task body.",
+            "tasks.md",
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success);
+        assert!(result.stdout.contains("defect:orphan:FR-001"));
+        assert!(result.stdout.contains("Target artifact: tasks.md"));
+        assert!(result.stdout.contains("Write a real task body."));
     }
 }

@@ -38,6 +38,7 @@ once_cell.workspace = true
 futures.workspace = true
 serde.workspace = true
 pulldown-cmark.workspace = true
+open = "5"
 
 [dev-dependencies]
 tempfile.workspace = true

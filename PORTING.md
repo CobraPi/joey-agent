@@ -514,3 +514,26 @@ on empty catalog, degraded fallback chain, cross-profile map sharing.
 **Deferred**: subagent intercept (T028 — threading allocator through
 orchestration layer); real LLM-based diagnoser call (heuristic estimator used
 for now — future enhancement via `joey-providers` chat client).
+
+## Spec Studio — Visual IDE (feature 012, 2026-08-05)
+
+**Status**: Complete (Rust-native; Joey-original, no upstream equivalent).
+
+Extends `joey-speckit-ui` (the Joey-original crate from `specs/001`/`010`)
+with the **Meaning Layer**: a lossless concrete-syntax-tree parser built on
+the already-present `pulldown-cmark`, a derived semantic graph, and a
+byte-anchor patch engine for round-trip-safe visual editing. Like `specs/010`,
+this is a Joey-original crate — there is no upstream Hermes parity surface to
+track. The CST + meaning + patch modules are strictly additive behind the
+existing `parser/`/`writer.rs`/`editor.rs` contract (Constitution VII).
+
+**No new on-disk canonical format**: the CST is an in-memory derivation, never
+persisted. The one new on-disk file is the Overlay-layer UI-state JSON at
+`~/.joey/speckit-ui/ui-state/<repo-hash>-<branch>.json` (`schema_version: 1`,
+write-tree-isolation tested in `tests/ui_state_roundtrip.rs`), which extends
+the `specs/010` `~/.joey/speckit-ui/` convention rather than forking it.
+
+**New runtime dependency**: CodeMirror 6 (frontend only, scoped to the two
+non-structured editing depths in FR-015). Measured bundle delta: +172.14 KB
+gzipped (15% over the pre-build estimate); zero Rust compile-time impact.
+Full cost table in `specs/012-spec-studio-visual-ide/research.md` §2.

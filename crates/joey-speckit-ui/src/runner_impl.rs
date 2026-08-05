@@ -14,8 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::model::RunConfiguration;
 use crate::runner::{
-    AttemptHandle, InteractionPayload, RunnerError, RunnerEvent, TerminalStatus,
-    WorkflowRunner, exit_code_to_status,
+    exit_code_to_status, AttemptHandle, InteractionPayload, RunnerError, RunnerEvent, WorkflowRunner,
 };
 use crate::staging::StagingArea;
 
@@ -186,9 +185,11 @@ impl WorkflowRunner for JoeyCliRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::TerminalStatus;
     use crate::staging::{StagingError, StagingRoot};
 
     /// A no-op staging area for testing the runner without git.
+    #[allow(dead_code)]
     struct NoopStaging;
 
     #[async_trait]

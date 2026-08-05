@@ -11,6 +11,10 @@
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
     "test:e2e": "playwright test"
   },
+  "dependencies": {
+    "codemirror": "^6.0.1",
+    "@codemirror/lang-markdown": "^6.3.0"
+  },
   "devDependencies": {
     "@playwright/test": "^1.47.0",
     "@typescript-eslint/eslint-plugin": "^7.18.0",

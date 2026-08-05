@@ -366,3 +366,244 @@ mod tests {
         assert!(json.contains("\"schema_version\":1"));
     }
 }
+
+// =====================================================================
+// Feature 012: Overlay Store extension — new JSONL record kinds
+// (AcceptedClarify, CommentThread). The existing WorkflowAttempt record
+// and `schema_version: 1` gate are preserved (Constitution VII).
+// =====================================================================
+
+use crate::ui_state::{AcceptedClarifyRecord, CommentThreadRecord};
+
+/// Append an accepted-clarify record to the feature's JSONL history.
+/// O(1) — a single `writeln!` to end-of-file (FR-024).
+pub fn append_accepted_clarify(
+    joey_home: &Path,
+    feature_id: &str,
+    record: AcceptedClarifyRecord,
+) -> Result<(), HistoryError> {
+    let path = history_file(joey_home, feature_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let line = serde_json::to_string(&record)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+/// Append a comment-thread record to the feature's JSONL history (FR-026).
+pub fn append_comment_thread(
+    joey_home: &Path,
+    feature_id: &str,
+    record: CommentThreadRecord,
+) -> Result<(), HistoryError> {
+    let path = history_file(joey_home, feature_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let line = serde_json::to_string(&record)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+/// A raw JSONL line as read from disk — used to deserialize mixed record
+/// types without knowing the variant upfront.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawRecord {
+    schema_version: u32,
+    record_type: Option<String>,
+    #[serde(flatten)]
+    rest: serde_json::Value,
+}
+
+/// One of the known overlay record kinds (additive over specs/010).
+#[derive(Debug, Clone)]
+pub enum OverlayRecord {
+    /// Existing, unchanged (specs/010).
+    Attempt(WorkflowAttempt),
+    /// NEW — accepted clarify answer (FR-024).
+    AcceptedClarify(AcceptedClarifyRecord),
+    /// NEW — anchored comment thread (FR-026).
+    CommentThread(CommentThreadRecord),
+    /// Unknown record type (forward-compatible — skipped with a warning).
+    Unknown,
+}
+
+/// Read all overlay records from a feature's JSONL history, newest-first.
+/// Records with unknown `record_type` or wrong `schema_version` are skipped
+/// with a warning (tolerant parser, Constitution VII).
+pub fn read_overlay_records(path: &Path) -> Result<Vec<OverlayRecord>, HistoryError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut records = Vec::new();
+
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(line = line_num, error = %e, "skipping malformed overlay line");
+                continue;
+            }
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let raw: RawRecord = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(line = line_num, error = %e, "skipping unparseable overlay line");
+                continue;
+            }
+        };
+
+        if raw.schema_version != SCHEMA_VERSION {
+            tracing::warn!(line = line_num, "skipping record with wrong schema_version");
+            continue;
+        }
+
+        let record = match raw.record_type.as_deref() {
+            None | Some("workflow_attempt") => {
+                // Legacy specs/010 records have no record_type field; treat
+                // them as workflow attempts.
+                match serde_json::from_str::<HistoryRecord>(trimmed) {
+                    Ok(r) => OverlayRecord::Attempt(r.attempt),
+                    Err(e) => {
+                        tracing::warn!(line = line_num, error = %e, "skipping malformed attempt");
+                        continue;
+                    }
+                }
+            }
+            Some("accepted_clarify") => {
+                match serde_json::from_str::<AcceptedClarifyRecord>(trimmed) {
+                    Ok(r) => OverlayRecord::AcceptedClarify(r),
+                    Err(e) => {
+                        tracing::warn!(line = line_num, error = %e, "skipping malformed accepted_clarify");
+                        continue;
+                    }
+                }
+            }
+            Some("comment_thread") => {
+                match serde_json::from_str::<CommentThreadRecord>(trimmed) {
+                    Ok(r) => OverlayRecord::CommentThread(r),
+                    Err(e) => {
+                        tracing::warn!(line = line_num, error = %e, "skipping malformed comment_thread");
+                        continue;
+                    }
+                }
+            }
+            Some(other) => {
+                tracing::warn!(line = line_num, record_type = other, "skipping unknown record_type");
+                OverlayRecord::Unknown
+            }
+        };
+        records.push(record);
+    }
+
+    records.reverse();
+    Ok(records)
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+
+    #[test]
+    fn append_and_read_accepted_clarify() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = AcceptedClarifyRecord::new(
+            "2026-08-05T10:00:00Z".to_string(),
+            "requirement:FR-016".to_string(),
+            "What about concurrency?".to_string(),
+            "Per-node locking.".to_string(),
+            "sha256:abc".to_string(),
+        );
+        append_accepted_clarify(dir.path(), "001-test", record).unwrap();
+
+        let path = history_file(dir.path(), "001-test");
+        let records = read_overlay_records(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            OverlayRecord::AcceptedClarify(r) => {
+                assert_eq!(r.marker_node, "requirement:FR-016");
+                assert_eq!(r.schema_version, 1);
+            }
+            other => panic!("expected AcceptedClarify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_and_read_comment_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = CommentThreadRecord::new(
+            "thread-1".to_string(),
+            "requirement:FR-016".to_string(),
+            "requirement/FR-016".to_string(),
+            vec![crate::ui_state::CommentMessage {
+                author: "joe".to_string(),
+                text: "Check this.".to_string(),
+                at: "2026-08-05T10:00:00Z".to_string(),
+            }],
+        );
+        append_comment_thread(dir.path(), "001-test", record).unwrap();
+
+        let path = history_file(dir.path(), "001-test");
+        let records = read_overlay_records(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            OverlayRecord::CommentThread(r) => {
+                assert_eq!(r.thread_id, "thread-1");
+                assert_eq!(r.messages.len(), 1);
+            }
+            other => panic!("expected CommentThread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_records_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        // A workflow attempt (specs/010 form).
+        let attempt = WorkflowAttempt {
+            attempt_id: "a1".to_string(),
+            feature_id: "001".to_string(),
+            step_id: "plan".to_string(),
+            initiator: "test".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            status: crate::model::AttemptStatus::Succeeded,
+            run_config: crate::model::RunConfiguration::default(),
+            expires_at: Some("2026-04-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        append(dir.path(), &attempt).unwrap();
+
+        // An accepted clarify (new).
+        let clarify = AcceptedClarifyRecord::new(
+            "2026-08-05T10:00:00Z".to_string(),
+            "requirement:FR-001".to_string(),
+            "Q?".to_string(),
+            "A.".to_string(),
+            "sha256:x".to_string(),
+        );
+        append_accepted_clarify(dir.path(), "001", clarify).unwrap();
+
+        let path = history_file(dir.path(), "001");
+        let records = read_overlay_records(&path).unwrap();
+        // Newest-first: clarify, then attempt.
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[0], OverlayRecord::AcceptedClarify(_)));
+        assert!(matches!(records[1], OverlayRecord::Attempt(_)));
+    }
+}

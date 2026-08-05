@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use joey_speckit_ui::{api::build_router, AppState};
 use tempfile::TempDir;
 
+#[allow(dead_code)]
 pub fn make_fixture_repo(feature_id: &str) -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     let feature_dir = dir.path().join("specs").join(feature_id);
@@ -32,6 +33,7 @@ pub fn make_fixture_repo(feature_id: &str) -> TempDir {
     dir
 }
 
+#[allow(dead_code)]
 pub fn router_for(dir: &TempDir) -> axum::Router {
     let repo_root: PathBuf = dir.path().to_path_buf();
     build_router(AppState::new(repo_root))

@@ -238,3 +238,41 @@ mod tests {
         );
     }
 }
+
+// =====================================================================
+// Feature 012: CST byte-range anchoring (T052, FR-016).
+// Extends validation findings to carry CST byte ranges so widgets can
+// highlight the exact location, not just line/section.
+// =====================================================================
+
+use crate::cst::parser::parse_bytes;
+use crate::cst::CstKind;
+
+/// Attach CST byte ranges to validation findings. For each finding that
+/// references a section or line, find the corresponding CST node and record
+/// its byte_start/byte_end. Findings that don't resolve keep their original
+/// location.
+pub fn anchor_to_cst(findings: &mut [ValidationFinding], artifact_path: &str, content: &str) {
+    let doc = parse_bytes(artifact_path, content.as_bytes());
+
+    for finding in findings.iter_mut() {
+        // Try to find a CST node whose text contains the finding's description
+        // or location reference.
+        let loc = &finding.location.line_or_section;
+        let matched = doc.iter_in_order().find(|n| {
+            let text = n.expected_bytes.as_str();
+            // Match by section heading or by text overlap.
+            text.contains(loc) || (loc.is_empty() && matches!(n.kind, CstKind::Heading { .. }))
+        });
+
+        if let Some(node) = matched {
+            finding.location = ArtifactLocation {
+                path: finding.location.path.clone(),
+                line_or_section: format!(
+                    "{}:{}:{}",
+                    finding.location.path, node.byte_start, node.byte_end
+                ),
+            };
+        }
+    }
+}

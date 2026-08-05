@@ -264,3 +264,70 @@ mod tests {
         }
     }
 }
+
+// =====================================================================
+// Feature 012: compose patch/ for the three editing depths (T051).
+// The PatchEngine composes writer.rs — it does not replace it (Constitution VII).
+// =====================================================================
+
+use crate::cst::parser::parse_bytes;
+use crate::patch::{self, PatchOp, PatchResult};
+
+/// Compose a patch-engine edit through the existing editor interface. This
+/// bridges the structured/inline/raw editing depths (FR-015) to the
+/// conflict-checked writer.
+pub fn apply_cst_patch(
+    repo_root: &Path,
+    feature_id: &str,
+    artifact: &str,
+    ops: Vec<PatchOp>,
+) -> EditorResult {
+    let artifact_path = format!("specs/{feature_id}/{artifact}");
+    let full_path = repo_root.join(&artifact_path);
+
+    let source = match std::fs::read_to_string(&full_path) {
+        Ok(s) => s,
+        Err(e) => return EditorResult::Error(e.to_string()),
+    };
+
+    let doc = parse_bytes(&artifact_path, source.as_bytes());
+    let result = patch::apply_in_memory(&doc, &source, &ops);
+
+    match result {
+        PatchResult::Applied { new_revision_hash, .. } => {
+            // Re-execute to get the bytes and write them.
+            let outcome = crate::patch::transaction::execute(&doc, &source, &ops);
+            if let crate::patch::transaction::TransactionOutcome::Applied { new_bytes, .. } = outcome {
+                if let Err(e) = crate::patch::transaction::atomic_write(&full_path, &new_bytes) {
+                    return EditorResult::Error(e.to_string());
+                }
+            }
+            EditorResult::Success { new_hash: new_revision_hash }
+        }
+        PatchResult::Conflict(_) => EditorResult::Conflict {
+            current_hash: content_hash(&source),
+        },
+        PatchResult::AnchorUnresolved { .. } => EditorResult::Error(
+            "anchor unresolved — node structure changed".to_string(),
+        ),
+        PatchResult::ValidationFailed { diagnostics, .. } => {
+            let path_for_findings = artifact_path.clone();
+            EditorResult::Invalid {
+                findings: diagnostics
+                    .into_iter()
+                    .map(|d| ValidationFinding {
+                        finding_id: uuid::Uuid::new_v4().to_string(),
+                        severity: crate::model::Severity::Warning,
+                        code: "cst_validation".to_string(),
+                        description: d,
+                        location: crate::model::ArtifactLocation {
+                            path: path_for_findings.clone(),
+                            line_or_section: String::new(),
+                        },
+                        remediation: None,
+                    })
+                    .collect(),
+            }
+        }
+    }
+}

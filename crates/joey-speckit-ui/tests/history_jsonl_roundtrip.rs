@@ -133,3 +133,139 @@ fn migration_stub_v1_to_future_version() {
     assert_eq!(record.schema_version, 1);
     // Future: assert_eq!(migrate(record).schema_version, 2);
 }
+
+// =====================================================================
+// Feature 012: Overlay-record extension coverage (T025).
+// The existing `WorkflowAttempt` record still round-trips unchanged
+// (Constitution VII); the two new variants (`AcceptedClarify`,
+// `CommentThread`) are added below.
+// =====================================================================
+
+use joey_speckit_ui::history::{append_accepted_clarify, append_comment_thread, read_overlay_records, OverlayRecord};
+use joey_speckit_ui::ui_state::{AcceptedClarifyRecord, CommentMessage, CommentThreadRecord};
+
+#[test]
+fn accepted_clarify_record_round_trips() {
+    let dir = tempdir().unwrap();
+    let record = AcceptedClarifyRecord::new(
+        "2026-08-05T10:00:00Z".to_string(),
+        "requirement:FR-016".to_string(),
+        "What about external changes?".to_string(),
+        "Three-way merge handles it.".to_string(),
+        "sha256:abc123".to_string(),
+    );
+    append_accepted_clarify(dir.path(), "012-feature", record).unwrap();
+
+    let path = history::history_file(dir.path(), "012-feature");
+    let records = read_overlay_records(&path).unwrap();
+    assert_eq!(records.len(), 1);
+    match &records[0] {
+        OverlayRecord::AcceptedClarify(r) => {
+            assert_eq!(r.schema_version, 1);
+            assert_eq!(r.record_type, "accepted_clarify");
+            assert_eq!(r.marker_node, "requirement:FR-016");
+            assert_eq!(r.question, "What about external changes?");
+            assert_eq!(r.patch_revision, "sha256:abc123");
+        }
+        other => panic!("expected AcceptedClarify, got {other:?}"),
+    }
+}
+
+#[test]
+fn comment_thread_record_round_trips() {
+    let dir = tempdir().unwrap();
+    let record = CommentThreadRecord::new(
+        "thread-42".to_string(),
+        "requirement:FR-016".to_string(),
+        "requirement/FR-016".to_string(),
+        vec![
+            CommentMessage {
+                author: "alice".to_string(),
+                text: "Is this still valid?".to_string(),
+                at: "2026-08-05T10:00:00Z".to_string(),
+            },
+            CommentMessage {
+                author: "bob".to_string(),
+                text: "Yes, per the merge contract.".to_string(),
+                at: "2026-08-05T10:05:00Z".to_string(),
+            },
+        ],
+    );
+    append_comment_thread(dir.path(), "012-feature", record).unwrap();
+
+    let path = history::history_file(dir.path(), "012-feature");
+    let records = read_overlay_records(&path).unwrap();
+    assert_eq!(records.len(), 1);
+    match &records[0] {
+        OverlayRecord::CommentThread(r) => {
+            assert_eq!(r.schema_version, 1);
+            assert_eq!(r.record_type, "comment_thread");
+            assert_eq!(r.thread_id, "thread-42");
+            assert_eq!(r.anchor_fingerprint, "requirement/FR-016");
+            assert_eq!(r.messages.len(), 2);
+            assert_eq!(r.messages[0].author, "alice");
+        }
+        other => panic!("expected CommentThread, got {other:?}"),
+    }
+}
+
+#[test]
+fn existing_workflow_attempt_record_unchanged() {
+    // Constitution VII regression: the existing specs/010 WorkflowAttempt
+    // record must round-trip unchanged alongside the new variants.
+    let dir = tempdir().unwrap();
+    let attempt = make_attempt("regress-1", "001", "plan");
+    history::append(dir.path(), &attempt).unwrap();
+
+    let path = history::history_file(dir.path(), "001");
+    let records = read_overlay_records(&path).unwrap();
+    assert_eq!(records.len(), 1);
+    match &records[0] {
+        OverlayRecord::Attempt(a) => {
+            assert_eq!(a.attempt_id, "regress-1");
+            assert_eq!(a.step_id, "plan");
+        }
+        other => panic!("expected Attempt, got {other:?}"),
+    }
+
+    // Also: the existing read_all path still works unchanged.
+    let legacy_records = history::read_all(&path).unwrap();
+    assert_eq!(legacy_records.len(), 1);
+    assert_eq!(legacy_records[0].attempt.attempt_id, "regress-1");
+}
+
+#[test]
+fn mixed_record_types_coexist_in_one_file() {
+    let dir = tempdir().unwrap();
+    let attempt = make_attempt("a1", "012", "plan");
+    history::append(dir.path(), &attempt).unwrap();
+
+    let clarify = AcceptedClarifyRecord::new(
+        "2026-08-05T10:00:00Z".to_string(),
+        "requirement:FR-001".to_string(),
+        "Q".to_string(),
+        "A".to_string(),
+        "sha256:x".to_string(),
+    );
+    append_accepted_clarify(dir.path(), "012", clarify).unwrap();
+
+    let thread = CommentThreadRecord::new(
+        "t1".to_string(),
+        "task:T001".to_string(),
+        "task/T001".to_string(),
+        vec![CommentMessage {
+            author: "x".to_string(),
+            text: "y".to_string(),
+            at: "2026-08-05T10:00:00Z".to_string(),
+        }],
+    );
+    append_comment_thread(dir.path(), "012", thread).unwrap();
+
+    let path = history::history_file(dir.path(), "012");
+    let records = read_overlay_records(&path).unwrap();
+    // Newest-first order.
+    assert_eq!(records.len(), 3);
+    assert!(matches!(records[0], OverlayRecord::CommentThread(_)));
+    assert!(matches!(records[1], OverlayRecord::AcceptedClarify(_)));
+    assert!(matches!(records[2], OverlayRecord::Attempt(_)));
+}

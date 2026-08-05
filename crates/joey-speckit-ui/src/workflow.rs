@@ -6,6 +6,9 @@
 //! traceability (FR-021/023/032).
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::model::{
     Artifact, ArtifactKind, ArtifactLocation, ArtifactRef, DependencyKind, DependencyLink,
@@ -368,10 +371,154 @@ pub fn detect_task_cycles(content: &str) -> Option<Vec<String>> {
     None
 }
 
+// =====================================================================
+// Feature 012: CST-aware readiness derivation (T027, FR-007).
+//
+// Extends the specs/010 step-state derivation so "Done" now requires the
+// output artifact's CST to parse cleanly and be newer than its inputs
+// (FR-007). Pure function over CST + run history; deterministic, no LLM
+// (FR-005).
+// =====================================================================
+
+use crate::cst::parser::parse_bytes;
+use crate::cst::parser_trait::CstMaterialize;
+
+/// Extended readiness check: a step is "Done" only if the output artifact's
+/// CST parses cleanly (round-trip identity holds) AND the output is newer
+/// than all inputs (FR-007). Returns `false` if any output fails this check.
+pub fn outputs_are_valid_and_fresh(
+    repo_root: &Path,
+    feature_id: &str,
+    inputs: &[ArtifactRef],
+    outputs: &[ArtifactRef],
+) -> bool {
+    let feature_dir = repo_root.join("specs").join(feature_id);
+
+    for output in outputs {
+        let out_path = feature_dir.join(&output.path);
+        if !out_path.exists() {
+            return false;
+        }
+        let Ok(bytes) = std::fs::read(&out_path) else {
+            return false;
+        };
+        // CST must parse cleanly and round-trip.
+        let doc = parse_bytes(&output.path, &bytes);
+        if doc.materialize().as_slice() != bytes.as_slice() {
+            return false;
+        }
+        // Output must be newer than all inputs.
+        let out_mtime = match std::fs::metadata(&out_path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        for input in inputs {
+            let in_path = feature_dir.join(&input.path);
+            if let Ok(in_meta) = std::fs::metadata(&in_path).and_then(|m| m.modified()) {
+                if in_meta > out_mtime {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Extended build_workflow that applies CST-aware freshness checks (T105,
+/// FR-007). A step's Done state now requires the output artifact's CST to
+/// parse cleanly and be newer than its inputs. This is additive — the
+/// existing `build_workflow` is preserved unchanged (Constitution VII).
+pub fn build_workflow_with_freshness(
+    repo_root: &Path,
+    feature_id: &str,
+    artifacts: &[Artifact],
+    active_step_ids: &HashSet<String>,
+) -> Vec<WorkflowStep> {
+    let mut steps = build_workflow(feature_id, artifacts, active_step_ids);
+
+    // For each step that is currently Succeeded, verify freshness via the CST.
+    // If the output is stale or fails to parse cleanly, downgrade to Stale.
+    for step in steps.iter_mut() {
+        if step.state != StepState::Succeeded {
+            continue;
+        }
+        let fresh = outputs_are_valid_and_fresh(
+            repo_root,
+            feature_id,
+            &step.inputs,
+            &step.outputs,
+        );
+        if !fresh {
+            step.state = StepState::Stale;
+            step.blocking_reason = Some(
+                "output artifact is stale or failed CST validation".to_string(),
+            );
+        }
+    }
+
+    steps
+}
+
+/// Compute the deterministic "next action" for a feature (FR-005). Pure
+/// function of the workflow steps + CST validity — no LLM recommendation.
+///
+/// Priority: the first blocking step (so the developer unblocks the chain),
+/// else the first stale step (refresh needed), else the first ready step
+/// (the obvious next thing to do), else "all done".
+pub fn next_action(steps: &[WorkflowStep]) -> NextAction {
+    for step in steps {
+        match step.state {
+            StepState::Blocked => {
+                return NextAction::Unblock {
+                    step_id: step.id.clone(),
+                    reason: step.blocking_reason.clone().unwrap_or_default(),
+                }
+            }
+            StepState::Stale => {
+                return NextAction::Refresh {
+                    step_id: step.id.clone(),
+                }
+            }
+            StepState::Failed => {
+                return NextAction::Recover {
+                    step_id: step.id.clone(),
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    // No blocker — find the first ready step.
+    for step in steps {
+        if step.state == StepState::Ready {
+            return NextAction::Run {
+                step_id: step.id.clone(),
+            };
+        }
+    }
+
+    NextAction::AllDone
+}
+
+/// The deterministic next action (FR-005).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum NextAction {
+    /// A step is blocked — unblock it first.
+    Unblock { step_id: String, reason: String },
+    /// A step's output is stale — re-run to refresh.
+    Refresh { step_id: String },
+    /// A step failed — recover.
+    Recover { step_id: String },
+    /// A step is ready to run — the obvious next thing.
+    Run { step_id: String },
+    /// All steps are done.
+    AllDone,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn workflow_has_all_lifecycle_steps() {

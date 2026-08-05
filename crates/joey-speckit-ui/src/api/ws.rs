@@ -21,6 +21,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:run_id", get(run_handler))
         // Feature 010: attempt interaction/event stream (FR-012/013/014).
         .route("/api/attempts/:attempt_id/stream", get(attempt_stream_handler))
+        // Feature 012: US2 — meaning stream (FR-040, live semantic-graph updates).
+        .route(
+            "/api/features/:id/meaning/stream",
+            get(meaning_stream_handler),
+        )
 }
 
 #[tracing::instrument(skip(state, ws))]
@@ -177,4 +182,61 @@ async fn attempt_stream_handler(
     AxPath(attempt_id): AxPath<String>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| stream_channel(socket, state, attempt_id))
+}
+
+// =====================================================================
+// Feature 012: US2 — meaning stream (T050, FR-040).
+// Pushes a refreshed semantic graph on cache recompute so widgets update
+// live after external file changes.
+// =====================================================================
+
+/// `WS /api/features/:id/meaning/stream` — pushes the semantic graph
+/// whenever the cache recomputes after a watcher event. The client receives
+/// the full graph JSON on each refresh (additive — doesn't affect existing
+/// watch handler).
+#[tracing::instrument(skip(state, ws))]
+async fn meaning_stream_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| meaning_stream_loop(socket, state, id))
+}
+
+/// Send the current semantic graph on connection, then keep the connection
+/// open responding to pings (a real deployment hooks the watcher for pushes).
+async fn meaning_stream_loop(mut socket: WebSocket, state: AppState, feature_id: String) {
+    // Send the initial graph.
+    let graph_json = build_meaning_json(&state, &feature_id);
+    let _ = socket
+        .send(Message::Text(graph_json.to_string().into()))
+        .await;
+
+    // Keep the connection open, responding to messages.
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = socket.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn build_meaning_json(state: &AppState, feature_id: &str) -> serde_json::Value {
+    let feature_dir = state.repo_root.join("specs").join(feature_id);
+    let mut docs = Vec::new();
+    for name in &["spec.md", "plan.md", "tasks.md", "data-model.md"] {
+        let p = feature_dir.join(name);
+        if let Ok(bytes) = std::fs::read(&p) {
+            docs.push(crate::cst::parser::parse_bytes(name, &bytes));
+        }
+    }
+    let graph = crate::meaning::graph::build_graph(feature_id, &docs);
+    serde_json::to_value(&graph).unwrap_or_else(|_| json!({ "error": "serialize_failed" }))
 }

@@ -188,6 +188,11 @@ export class SpeckitApiClient {
   private readonly fetchImpl: typeof fetch;
   private readonly WebSocketImpl: typeof WebSocket;
 
+  /** Public read-only access to the base URL (for extension clients). */
+  getBase_url(): string {
+    return this.baseUrl;
+  }
+
   constructor(options: SpeckitApiClientOptions = {}) {
     this.baseUrl = options.baseUrl ?? '';
     this.wsBaseUrl =
@@ -655,6 +660,126 @@ export interface HealthStatus {
   credentials_present: boolean;
   repo_writable: boolean;
   read_only: boolean;
+}
+
+// =====================================================================
+// Feature 012: Spec Studio — Atlas, stage-bar, setup, recovery (T037).
+// Additive over specs/001/010.
+// =====================================================================
+
+export interface RepoScan {
+  repo_root: string;
+  exists: boolean;
+  writable: boolean;
+  has_specs_dir: boolean;
+  has_specify_dir: boolean;
+  setup_gaps: string[];
+}
+
+export interface SetupPreview {
+  feature_id: string;
+  branch: string;
+  paths: string[];
+  staged_mode: boolean;
+  nothing_written: boolean;
+}
+
+export interface SetupCommitResult {
+  feature_id: string;
+  created_paths: string[];
+  staged: boolean;
+}
+
+export type NextAction =
+  | { action: 'unblock'; step_id: string; reason: string }
+  | { action: 'refresh'; step_id: string }
+  | { action: 'recover'; step_id: string }
+  | { action: 'run'; step_id: string }
+  | { action: 'all_done' };
+
+export interface AtlasResponse {
+  feature_id: string;
+  next_action: NextAction;
+  progress: { done_tasks: number; total_tasks: number; ratio: number };
+  health: { parsing_ok: boolean; open_unknowns: number; orphan_count: number };
+  branch: { name: string | null; drift: boolean };
+  artifacts: Array<{ path: string; exists: boolean }>;
+  recent_activity: Array<{ record_type: string; feature_id: string }>;
+}
+
+export interface StageBarResponse {
+  feature_id: string;
+  stages: Array<{
+    name: string;
+    state: 'pending' | 'ready' | 'active' | 'done' | 'blocked';
+    gate_reason: string | null;
+    step_ids: string[];
+  }>;
+}
+
+export interface RecoveryStatesResponse {
+  feature_id: string;
+  recovery_states: Array<{
+    state: string;
+    description: string;
+    primary_action: string;
+    step_id?: string;
+    touches_files: string[];
+  }>;
+}
+
+/** A patch operation compiled by an editing widget (FR-014). */
+export interface PatchOp {
+  op: 'replace' | 'insert_after' | 'delete';
+  node: number;
+  new_bytes?: string;
+}
+
+/** Extension methods for the Spec Studio (012) endpoints. */
+export class SpecStudioClient {
+  constructor(private base: SpeckitApiClient) {}
+
+  private url(path: string): string {
+    return `${this.base.getBase_url()}${path}`;
+  }
+
+  async scanRepo(): Promise<RepoScan> {
+    const res = await fetch(this.url('/api/setup/scan-repo'));
+    return parseJsonOrThrow<RepoScan>(res);
+  }
+
+  async previewSetup(brief: string): Promise<SetupPreview> {
+    const res = await fetch(this.url('/api/setup/preview'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ brief }),
+    });
+    return parseJsonOrThrow<SetupPreview>(res);
+  }
+
+  async commitSetup(featureId: string, brief: string): Promise<SetupCommitResult> {
+    const res = await fetch(this.url('/api/setup/commit'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ feature_id: featureId, brief }),
+    });
+    return parseJsonOrThrow<SetupCommitResult>(res);
+  }
+
+  async getAtlas(featureId: string): Promise<AtlasResponse> {
+    const res = await fetch(this.url(`/api/features/${featureId}/atlas`));
+    return parseJsonOrThrow<AtlasResponse>(res);
+  }
+
+  async getStageBar(featureId: string): Promise<StageBarResponse> {
+    const res = await fetch(this.url(`/api/features/${featureId}/stage-bar`));
+    return parseJsonOrThrow<StageBarResponse>(res);
+  }
+
+  async getRecoveryStates(featureId: string): Promise<RecoveryStatesResponse> {
+    const res = await fetch(this.url(`/api/features/${featureId}/recovery-states`));
+    return parseJsonOrThrow<RecoveryStatesResponse>(res);
+  }
 }
 
 export type RunnerEvent =

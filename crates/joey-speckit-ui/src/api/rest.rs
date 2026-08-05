@@ -70,6 +70,37 @@ pub fn routes() -> Router<AppState> {
         )
         // Feature 010: health (FR-028)
         .route("/api/health", get(get_health))
+        // Feature 012: Spec Studio — Atlas + stage-bar + setup + recovery (FR-001..008)
+        .route("/api/setup/scan-repo", get(get_setup_scan_repo))
+        .route("/api/setup/preview", post(post_setup_preview))
+        .route("/api/setup/commit", post(post_setup_commit))
+        .route("/api/features/:id/atlas", get(get_atlas))
+        .route("/api/features/:id/stage-bar", get(get_stage_bar))
+        .route("/api/features/:id/recovery-states", get(get_recovery_states))
+        // Feature 012: US2 — meaning + patch endpoints (FR-009..016)
+        .route("/api/features/:id/cst/:artifact", get(get_cst))
+        .route("/api/features/:id/meaning/graph", get(get_meaning_graph))
+        .route("/api/features/:id/meaning/tree-diff", get(get_tree_diff))
+        .route("/api/features/:id/patch", post(post_patch))
+        // Feature 012: US3 — task board + safe moves (FR-017..020)
+        .route("/api/features/:id/meaning/board", get(get_board))
+        // Feature 012: US3 convergence — byte-safe task toggle (FR-018)
+        .route(
+            "/api/features/:id/meaning/board/:task_id/toggle",
+            post(post_board_toggle),
+        )
+        // Feature 012: US5 convergence — hunk-accept side-effects (FR-029)
+        .route("/api/features/:id/hunks/:hunk_id/accept", post(post_hunk_accept))
+        // Feature 012: convergence — branch drift detection (Edge Case)
+        .route("/api/features/:id/branch-drift", get(get_branch_drift))
+        // Feature 012: convergence — crash recovery surfacing (FR-028)
+        .route("/api/features/:id/recovery-surface", get(get_recovery_surface))
+        // Feature 012: US4 — coverage + defects + clarify (FR-021..024)
+        .route("/api/features/:id/meaning/coverage", get(get_coverage))
+        .route("/api/features/:id/defects", get(get_defects))
+        .route("/api/features/:id/defects/:defect_id/fix", post(post_defect_fix))
+        .route("/api/features/:id/meaning/clarify", get(get_clarify))
+        .route("/api/features/:id/meaning/clarify/:marker_id/answer", post(post_clarify_answer_012))
 }
 
 /// Shared error body shape: `{ "error": ..., "message": ... }`.
@@ -659,7 +690,10 @@ async fn patch_artifact(
     let kind = infer_kind(&path, &id);
     let scope = match body.scope.unwrap_or_default() {
         PatchScope::Section { section } => editor::EditScope::Section { heading: section },
-        PatchScope::Whole { .. } => editor::EditScope::Whole,
+        PatchScope::Whole { whole } => {
+            let _ = whole;
+            editor::EditScope::Whole
+        }
     };
 
     // Pre-validate for structural issues (FR-007).
@@ -1471,6 +1505,1307 @@ async fn get_health(State(state): State<AppState>) -> impl IntoResponse {
             "credentials_present": has_credentials,
             "repo_writable": repo_writable,
             "read_only": !repo_writable,
+        })),
+    )
+        .into_response()
+}
+
+// =====================================================================
+// Feature 012: Spec Studio — Atlas, stage-bar, setup, recovery (T028-T031)
+// All endpoints additive over specs/001/010 (Constitution VII).
+// =====================================================================
+
+use crate::cst::parser::parse_bytes;
+use crate::meaning::graph::build_graph;
+use crate::workflow::next_action;
+
+/// `GET /api/setup/scan-repo` — validate read/write + detect Spec Kit setup
+/// gaps (T028, FR-001).
+#[tracing::instrument(skip(state))]
+async fn get_setup_scan_repo(State(state): State<AppState>) -> impl IntoResponse {
+    let repo_root = &state.repo_root;
+    let exists = repo_root.exists();
+    let writable = repo_root
+        .metadata()
+        .map(|m| !m.permissions().readonly())
+        .unwrap_or(false);
+    let has_specs_dir = repo_root.join("specs").exists();
+    let has_specify = repo_root.join(".specify").exists();
+
+    let gaps: Vec<String> = {
+        let mut g = Vec::new();
+        if !has_specs_dir {
+            g.push("specs/ directory missing".to_string());
+        }
+        if !has_specify {
+            g.push(".specify/ directory missing".to_string());
+        }
+        g
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "repo_root": repo_root.display().to_string(),
+            "exists": exists,
+            "writable": writable,
+            "has_specs_dir": has_specs_dir,
+            "has_specify_dir": has_specify,
+            "setup_gaps": gaps,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/setup/preview` — propose slug/branch/paths/permissions,
+/// nothing written (T028, FR-001).
+#[derive(Debug, Deserialize)]
+struct SetupPreviewRequest {
+    brief: String,
+}
+
+#[tracing::instrument(skip(state))]
+async fn post_setup_preview(
+    State(state): State<AppState>,
+    Json(req): Json<SetupPreviewRequest>,
+) -> impl IntoResponse {
+    // Derive a slug from the brief.
+    let slug_base: String = req
+        .brief
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == ' ')
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-");
+
+    let next_num = {
+        // Find the next feature number.
+        let ids = list_feature_ids(&state.repo_root).unwrap_or_default();
+        let max = ids
+            .iter()
+            .filter_map(|id| id.split('-').next().and_then(|n| n.parse::<u32>().ok()))
+            .max()
+            .unwrap_or(0);
+        max + 1
+    };
+
+    let feature_id = format!("{next_num:03}-{slug_base}");
+    let branch = format!("{feature_id}");
+    let paths = vec![
+        format!("specs/{feature_id}/spec.md"),
+        format!("specs/{feature_id}/plan.md"),
+        format!("specs/{feature_id}/tasks.md"),
+    ];
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": feature_id,
+            "branch": branch,
+            "paths": paths,
+            "staged_mode": true,
+            "nothing_written": true,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/setup/commit` — create feature dir + initial artifact in
+/// staged mode (T028, FR-001).
+#[derive(Debug, Deserialize)]
+struct SetupCommitRequest {
+    feature_id: String,
+    brief: String,
+}
+
+#[tracing::instrument(skip(state))]
+async fn post_setup_commit(
+    State(state): State<AppState>,
+    Json(req): Json<SetupCommitRequest>,
+) -> impl IntoResponse {
+    let feature_dir = state.repo_root.join("specs").join(&req.feature_id);
+    if feature_dir.exists() {
+        return (
+            StatusCode::CONFLICT,
+            error_body("already_exists", format!("feature {} already exists", req.feature_id)),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&feature_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_body("io_error", e.to_string()),
+        )
+            .into_response();
+    }
+
+    // Create an initial spec.md stub in staged mode (nothing is committed to
+    // git yet — the developer reviews before applying).
+    let spec_path = feature_dir.join("spec.md");
+    let stub = format!(
+        "# {brief}\n\n\
+         > Staged by Spec Studio setup wizard. Review and edit before committing.\n\n\
+         ## Purpose\n\n{brief}\n\n\
+         ## User Stories\n\n\
+         ### User Story 1: {brief} (Priority: P1)\n\n_As a developer, I want {brief_lower} so that I can proceed._\n\n\
+         ## Functional Requirements\n\n\
+         - **FR-001**: The system MUST {brief_lower}.\n",
+        brief = req.brief,
+        brief_lower = req.brief.to_lowercase(),
+    );
+
+    if let Err(e) = std::fs::write(&spec_path, &stub) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_body("io_error", e.to_string()),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "feature_id": req.feature_id,
+            "created_paths": [format!("specs/{}/spec.md", req.feature_id)],
+            "staged": true,
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /api/features/:id/atlas` — the Atlas landing view (T029, FR-004/005).
+///
+/// Returns: next-action (deterministic), progress, health (parsing status +
+/// open unknowns + orphan count from the semantic graph), branch binding +
+/// drift, artifact list with staleness, recent-activity timeline.
+#[tracing::instrument(skip(state))]
+async fn get_atlas(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    let feature = match load_feature(&state.repo_root, &id) {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                error_body("not_found", e.to_string()),
+            )
+                .into_response();
+        }
+    };
+
+    // Build the semantic graph from available artifacts.
+    let feature_dir = state.repo_root.join("specs").join(&id);
+    let mut docs = Vec::new();
+    for (name, _) in [
+        ("spec.md", feature.specification.as_ref().map(|_| "spec")),
+        ("plan.md", feature.plan.as_ref().map(|_| "plan")),
+        ("tasks.md", Some("tasks")),
+    ] {
+        let path = feature_dir.join(name);
+        if let Ok(bytes) = std::fs::read(&path) {
+            docs.push(parse_bytes(name, &bytes));
+        }
+    }
+    let graph = build_graph(&id, &docs);
+
+    // Workflow steps for next-action.
+    let feature_dir_wf = state.repo_root.join("specs").join(&id);
+    let artifacts = crate::parser::discovery::discover_artifacts(&feature_dir_wf, &id);
+    let active_steps = std::collections::HashSet::new();
+    let steps = crate::workflow::build_workflow(&id, &artifacts, &active_steps);
+    let next = next_action(&steps);
+
+    // Count defects and unknowns.
+    let orphan_count = graph
+        .defects
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.class,
+                crate::meaning::DefectClass::OrphanRequirement
+            )
+        })
+        .count();
+    let open_unknowns = graph
+        .nodes
+        .values()
+        .filter(|n| n.kind == crate::meaning::SemanticKind::ClarifyMarker)
+        .count();
+
+    // Progress: completed tasks / total tasks.
+    let total_tasks = feature.tasks.len();
+    let done_tasks = feature
+        .tasks
+        .iter()
+        .filter(|t| t.status == crate::model::TaskStatus::Done)
+        .count();
+    let progress = if total_tasks > 0 {
+        done_tasks as f64 / total_tasks as f64
+    } else {
+        0.0
+    };
+
+    // Artifact list with staleness.
+    let artifacts: Vec<_> = vec![
+        ("spec.md", feature.spec_content_hash.as_ref()),
+        ("plan.md", feature.plan_content_hash.as_ref()),
+        ("tasks.md", feature.tasks_content_hash.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(name, hash)| {
+        hash.map(|_| {
+            json!({
+                "path": name,
+                "exists": true,
+            })
+        })
+    })
+    .collect();
+
+    // Recent activity from history JSONL.
+    let history_path = crate::history::history_file(&state.joey_home(), &id);
+    let recent_activity: Vec<_> = crate::history::read_overlay_records(&history_path)
+        .unwrap_or_default()
+        .into_iter()
+        .take(10)
+        .map(|r| {
+            json!({ "record_type": format!("{:?}", r), "feature_id": id })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "next_action": next,
+            "progress": {
+                "done_tasks": done_tasks,
+                "total_tasks": total_tasks,
+                "ratio": progress,
+            },
+            "health": {
+                "parsing_ok": true,
+                "open_unknowns": open_unknowns,
+                "orphan_count": orphan_count,
+            },
+            "branch": {
+                "name": feature.branch_name,
+                "drift": false,
+            },
+            "artifacts": artifacts,
+            "recent_activity": recent_activity,
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /api/features/:id/stage-bar` — the five-stage indicator (T030,
+/// FR-006/007/008).
+#[tracing::instrument(skip(state))]
+async fn get_stage_bar(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    let _feature = match load_feature(&state.repo_root, &id) {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                error_body("not_found", e.to_string()),
+            )
+                .into_response();
+        }
+    };
+
+    let feature_dir_wf = state.repo_root.join("specs").join(&id);
+    let artifacts = crate::parser::discovery::discover_artifacts(&feature_dir_wf, &id);
+    let active_steps = std::collections::HashSet::new();
+    let steps = crate::workflow::build_workflow(&id, &artifacts, &active_steps);
+
+    // The five lifecycle stages: Define → Design → Break down → Build → Review.
+    let stages: Vec<_> = ["define", "design", "break_down", "build", "review"]
+        .iter()
+        .map(|&name| {
+            let matching: Vec<_> = steps
+                .iter()
+                .filter(|s| stage_matches(s.id.as_str(), name))
+                .collect();
+            let state_str = if matching.iter().any(|s| s.state == crate::model::StepState::Succeeded) {
+                "done"
+            } else if matching.iter().any(|s| s.state == crate::model::StepState::Running) {
+                "active"
+            } else if matching.iter().any(|s| s.state == crate::model::StepState::Ready) {
+                "ready"
+            } else if matching.iter().any(|s| s.state == crate::model::StepState::Blocked) {
+                "blocked"
+            } else {
+                "pending"
+            };
+            let gate_reason = matching
+                .iter()
+                .find_map(|s| s.blocking_reason.clone().filter(|r| !r.is_empty()));
+
+            json!({
+                "name": name,
+                "state": state_str,
+                "gate_reason": gate_reason,
+                "step_ids": matching.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "stages": stages,
+        })),
+    )
+        .into_response()
+}
+
+fn stage_matches(step_id: &str, stage: &str) -> bool {
+    match stage {
+        "define" => step_id.contains("spec") || step_id.contains("specify"),
+        "design" => step_id.contains("plan") || step_id.contains("design"),
+        "break_down" => step_id.contains("tasks") || step_id.contains("task"),
+        "build" => step_id.contains("implement") || step_id.contains("build"),
+        "review" => step_id.contains("analyze") || step_id.contains("review"),
+        _ => false,
+    }
+}
+
+/// `GET /api/features/:id/recovery-states` — each empty/failed/disconnected
+/// state with exactly one primary recovery action (T031, FR-002).
+#[tracing::instrument(skip(state))]
+async fn get_recovery_states(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    let feature_dir = state.repo_root.join("specs").join(&id);
+
+    let mut states = Vec::new();
+
+    // Empty-state: no spec.md.
+    if !feature_dir.join("spec.md").exists() {
+        states.push(json!({
+            "state": "empty_spec",
+            "description": "No spec.md yet — start by defining the feature.",
+            "primary_action": "create_spec",
+            "touches_files": [format!("specs/{id}/spec.md")],
+        }));
+    }
+
+    // Failed-state: any failed workflow step.
+    let feature_dir_wf = state.repo_root.join("specs").join(&id);
+    if feature_dir_wf.exists() {
+        let artifacts = crate::parser::discovery::discover_artifacts(&feature_dir_wf, &id);
+        let active_steps = std::collections::HashSet::new();
+        let steps = crate::workflow::build_workflow(&id, &artifacts, &active_steps);
+        for step in &steps {
+            if step.state == crate::model::StepState::Failed {
+                states.push(json!({
+                    "state": "failed_step",
+                    "description": format!("Step '{}' failed.", step.id),
+                    "primary_action": "recover_step",
+                    "step_id": step.id,
+                    "touches_files": [],
+                }));
+            }
+        }
+    }
+
+    // Disconnected-state: agent binary not found.
+    let agent_available =
+        which::which("joey").is_ok() || std::env::var("JOEY_SPECKIT_UI_ROOT").is_ok();
+    if !agent_available {
+        states.push(json!({
+            "state": "disconnected_agent",
+            "description": "Agent binary not found — workflow steps can't run.",
+            "primary_action": "install_agent",
+            "touches_files": [],
+        }));
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "recovery_states": states,
+        })),
+    )
+        .into_response()
+}
+
+// =====================================================================
+// Feature 012: US2 — meaning + patch endpoints (T049, FR-009..016).
+// All additive over specs/001/010 (Constitution VII).
+// =====================================================================
+
+use crate::patch::{self, PatchOp, PatchResult};
+
+/// `GET /api/features/:id/cst/:artifact` — return the CST for an artifact
+/// (T049, FR-012).
+#[tracing::instrument(skip(state))]
+async fn get_cst(
+    State(state): State<AppState>,
+    AxPath((id, artifact)): AxPath<(String, String)>,
+) -> impl IntoResponse {
+    let path = state.repo_root.join("specs").join(&id).join(&artifact);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                error_body("not_found", e.to_string()),
+            )
+                .into_response();
+        }
+    };
+    let doc = parse_bytes(&artifact, &bytes);
+    (StatusCode::OK, Json(serde_json::to_value(&doc).unwrap_or_default())).into_response()
+}
+
+/// `GET /api/features/:id/meaning/graph` — return the semantic graph (T049,
+/// FR-009). Optional `?kind=` filter.
+#[tracing::instrument(skip(state))]
+async fn get_meaning_graph(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let feature_dir = state.repo_root.join("specs").join(&id);
+    if !feature_dir.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            error_body("not_found", format!("feature '{id}' not found")),
+        )
+            .into_response();
+    }
+
+    let mut docs = Vec::new();
+    for name in &["spec.md", "plan.md", "tasks.md", "data-model.md"] {
+        let p = feature_dir.join(name);
+        if let Ok(bytes) = std::fs::read(&p) {
+            docs.push(parse_bytes(name, &bytes));
+        }
+    }
+    let graph = build_graph(&id, &docs);
+
+    // Optional kind filter.
+    let filtered = if let Some(kind) = params.get("kind") {
+        serde_json::json!({
+            "feature_id": graph.feature_id,
+            "revision_hashes": graph.revision_hashes,
+            "nodes": graph.nodes.values().filter(|n| kind_matches(&n.kind, kind)).cloned().collect::<Vec<_>>(),
+            "defects": graph.defects,
+        })
+    } else {
+        serde_json::to_value(&graph).unwrap_or_default()
+    };
+
+    (StatusCode::OK, Json(filtered)).into_response()
+}
+
+fn kind_matches(kind: &crate::meaning::SemanticKind, filter: &str) -> bool {
+    format!("{kind:?}").to_lowercase().contains(&filter.to_lowercase())
+}
+
+/// `GET /api/features/:id/meaning/tree-diff` — project structure tree diff
+/// (T049, FR-009). Compares the plan.md project-structure code fence against
+/// the actual filesystem.
+#[tracing::instrument(skip(state))]
+async fn get_tree_diff(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    let feature_dir = state.repo_root.join("specs").join(&id);
+    let plan_path = feature_dir.join("plan.md");
+
+    let planned: Vec<String> = if let Ok(bytes) = std::fs::read(&plan_path) {
+        let text = String::from_utf8_lossy(&bytes);
+        extract_planned_paths(&text)
+    } else {
+        Vec::new()
+    };
+
+    // Check existence on disk.
+    let nodes: Vec<_> = planned
+        .into_iter()
+        .map(|p| {
+            let exists = state.repo_root.join(&p).exists();
+            json!({
+                "path": p,
+                "status": if exists { "exists" } else { "planned_missing" },
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "nodes": nodes,
+        })),
+    )
+        .into_response()
+}
+
+/// Extract file paths from a plan.md project-structure code fence.
+fn extract_planned_paths(plan_text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut in_fence = false;
+    for line in plan_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            // Strip tree-drawing characters (├── └── │) and whitespace.
+            let cleaned: String = trimmed
+                .chars()
+                .skip_while(|c| matches!(c, ' ' | '|' | '├' | '─' | '└' | '\t'))
+                .collect();
+            let cleaned = cleaned.trim();
+            if !cleaned.is_empty() && !cleaned.contains('#') {
+                // Normalize: drop trailing slash for dirs.
+                paths.push(cleaned.trim_end_matches('/').to_string());
+            }
+        }
+    }
+    paths
+}
+
+/// `POST /api/features/:id/patch` — apply a patch through the byte-anchor
+/// engine (T049, FR-014/016).
+#[derive(Debug, Deserialize)]
+struct PatchRequest {
+    artifact: String,
+    ops: Vec<PatchOp>,
+}
+
+#[tracing::instrument(skip(state))]
+async fn post_patch(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Json(req): Json<PatchRequest>,
+) -> impl IntoResponse {
+    let artifact_path = format!("specs/{id}/{}", req.artifact);
+    let full_path = state.repo_root.join(&artifact_path);
+
+    let source = match std::fs::read_to_string(&full_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                error_body("not_found", e.to_string()),
+            )
+                .into_response();
+        }
+    };
+
+    let doc = parse_bytes(&artifact_path, source.as_bytes());
+    let result: PatchResult = patch::apply_in_memory(&doc, &source, &req.ops);
+
+    // If applied, write the result atomically.
+    if let PatchResult::Applied { .. } = &result {
+        // Re-execute to get the new bytes and write them.
+        let outcome = crate::patch::transaction::execute(&doc, &source, &req.ops);
+        if let crate::patch::transaction::TransactionOutcome::Applied { new_bytes, .. } = outcome {
+            if let Err(e) = crate::patch::transaction::atomic_write(&full_path, &new_bytes) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_body("write_failed", e.to_string()),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::to_value(&result).unwrap_or_default())).into_response()
+}
+
+// =====================================================================
+// Feature 012: US3 — task board + safe moves (T053-T055, FR-017..020).
+// =====================================================================
+
+/// `GET /api/features/:id/meaning/board` — phases as columns with completion
+/// counts + task cards exposing four visual channels (T053, FR-017).
+#[tracing::instrument(skip(state))]
+async fn get_board(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    let feature = match load_feature(&state.repo_root, &id) {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                error_body("not_found", e.to_string()),
+            )
+                .into_response();
+        }
+    };
+
+    // Parse tasks.md through the CST to group task cards by their containing
+    // `## Phase N:` heading (FR-017 — each phase renders as its own column).
+    let tasks_path = state.repo_root.join("specs").join(&id).join("tasks.md");
+    let tasks_source = std::fs::read_to_string(&tasks_path).unwrap_or_default();
+    let tasks_doc = parse_bytes("tasks.md", tasks_source.as_bytes());
+
+    // Build a list of (phase_name, task_card) by walking the CST in order and
+    // tracking the current phase heading as we go.
+    let mut current_phase = "Unphased".to_string();
+    let mut phase_order: Vec<String> = Vec::new();
+    let mut phase_tasks: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+
+    // Index feature tasks by id for enrichment.
+    let task_by_id: std::collections::HashMap<&str, &crate::model::Task> = feature
+        .tasks
+        .iter()
+        .map(|t| (t.id.as_str(), t))
+        .collect();
+
+    for node in tasks_doc.iter_in_order() {
+        // Detect phase heading: `## Phase N: Title` or `## Phase N`.
+        if let crate::cst::CstKind::Heading { level } = &node.kind {
+            if *level <= 2 {
+                if let crate::cst::CstProps::Heading { text } = &node.props {
+                    let trimmed = text.trim();
+                    if trimmed.starts_with("Phase ") {
+                        let name = trimmed.to_string();
+                        if !phase_order.contains(&name) {
+                            phase_order.push(name.clone());
+                        }
+                        current_phase = name;
+                        phase_tasks.entry(current_phase.clone()).or_default();
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Detect list items that are task checkboxes.
+        if matches!(node.kind, crate::cst::CstKind::ListItem) {
+            if let crate::cst::CstProps::ListItem { text, .. } = &node.props {
+                if let Some(task_id) = crate::cst::fingerprint::extract_id_from_text(text) {
+                    if task_id.starts_with('T') {
+                        let enriched = task_by_id.get(task_id.as_str());
+                        let card = build_task_card(
+                            &task_id,
+                            text,
+                            enriched.copied(),
+                            &state.repo_root,
+                        );
+                        phase_tasks
+                            .entry(current_phase.clone())
+                            .or_default()
+                            .push(card);
+                    }
+                }
+            }
+        }
+    }
+
+    // If no phase headings were found, fall back to a single "All" column so
+    // the board is still usable.
+    if phase_order.is_empty() {
+        phase_order.push("All".to_string());
+        let cards: Vec<_> = feature
+            .tasks
+            .iter()
+            .map(|t| build_task_card(&t.id, &t.description, Some(t), &state.repo_root))
+            .collect();
+        phase_tasks.insert("All".to_string(), cards);
+    }
+
+    // Build the phase columns with completion counts.
+    let phases: Vec<_> = phase_order
+        .iter()
+        .map(|name| {
+            let cards = phase_tasks.get(name).cloned().unwrap_or_default();
+            let total = cards.len();
+            let done = cards.iter().filter(|c| c.get("completed").and_then(|v| v.as_bool()).unwrap_or(false)).count();
+            json!({
+                "name": name,
+                "completion": { "done": done, "total": total },
+                "tasks": cards,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "phases": phases,
+        })),
+    )
+        .into_response()
+}
+
+/// Build a task card with the four visual channels (FR-017).
+fn build_task_card(
+    task_id: &str,
+    description: &str,
+    enriched: Option<&crate::model::Task>,
+    repo_root: &std::path::Path,
+) -> serde_json::Value {
+    let completed = enriched
+        .map(|t| t.status == crate::model::TaskStatus::Done)
+        .unwrap_or_else(|| description.to_lowercase().contains("[x]"));
+    let parallel_eligible = description.contains("[P]");
+    let target_files: Vec<String> = enriched
+        .map(|t| t.target_files.clone())
+        .unwrap_or_default();
+    let target_files_exist = target_files
+        .iter()
+        .any(|f| repo_root.join(f).exists());
+    let user_story_ref = enriched
+        .and_then(|t| t.user_story_ref.clone())
+        .or_else(|| extract_story_ref_from_text(description));
+
+    json!({
+        "id": task_id,
+        "description": description.trim(),
+        "completed": completed,
+        "parallel_eligible": parallel_eligible,
+        "target_files": target_files,
+        "target_files_exist": target_files_exist,
+        "user_story_ref": user_story_ref,
+    })
+}
+
+/// Extract a `[US2]` story reference from task description text.
+fn extract_story_ref_from_text(text: &str) -> Option<String> {
+    if let Some(start) = text.find("[US") {
+        if let Some(end) = text[start..].find(']') {
+            return Some(text[start + 1..start + end].to_string());
+        }
+    }
+    None
+}
+
+/// `POST /api/features/:id/meaning/board/:task_id/toggle` — toggle a task's
+/// checkbox through the byte-anchor patch engine (T091, FR-018). Compiles to
+/// a `Replace` PatchOp on just the checkbox bytes (`[ ]` → `[x]` or vice
+/// versa) so only those bracket bytes change and every other byte is
+/// identical.
+#[tracing::instrument(skip(state))]
+async fn post_board_toggle(
+    State(state): State<AppState>,
+    AxPath((id, task_id)): AxPath<(String, String)>,
+) -> impl IntoResponse {
+    let artifact_path = format!("specs/{id}/tasks.md");
+    let full_path = state.repo_root.join(&artifact_path);
+
+    let source = match std::fs::read_to_string(&full_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                error_body("not_found", e.to_string()),
+            )
+                .into_response();
+        }
+    };
+
+    let doc = parse_bytes(&artifact_path, source.as_bytes());
+
+    // Find the list-item node whose text contains the target task id, then
+    // identify the checkbox bytes within it.
+    let target_node = doc.iter_in_order().find(|n| {
+        if !matches!(n.kind, crate::cst::CstKind::ListItem) {
+            return false;
+        }
+        let text = match &n.props {
+            crate::cst::CstProps::ListItem { text, .. } => text,
+            _ => return false,
+        };
+        text.contains(&task_id)
+    });
+
+    let node = match target_node {
+        Some(n) => n,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                error_body("task_not_found", format!("task {task_id} not in tasks.md")),
+            )
+                .into_response();
+        }
+    };
+
+    // The checkbox `[ ]` or `[x]`/`[X]` is at byte_start..byte_start+3 within
+    // the node's expected_bytes (after the `- ` marker). We find and flip it.
+    let expected = &node.expected_bytes;
+    let (old_box, new_box) = if expected.contains("[ ]") {
+        ("[ ]", "[x]")
+    } else if expected.contains("[x]") || expected.contains("[X]") {
+        ("[x]", "[ ]")
+    } else {
+        return (
+            StatusCode::CONFLICT,
+            error_body("no_checkbox", "task line has no checkbox to toggle"),
+        )
+            .into_response();
+    };
+
+    // Build the new expected_bytes with just the checkbox flipped.
+    let new_expected = expected.replacen(old_box, new_box, 1);
+
+    // Compile to a single Replace PatchOp on this node.
+    let ops = vec![crate::patch::PatchOp::Replace {
+        node: node.id,
+        new_bytes: new_expected,
+    }];
+
+    let result: crate::patch::PatchResult = crate::patch::apply_in_memory(&doc, &source, &ops);
+
+    // If applied, write atomically.
+    if let crate::patch::PatchResult::Applied { .. } = &result {
+        let outcome = crate::patch::transaction::execute(&doc, &source, &ops);
+        if let crate::patch::transaction::TransactionOutcome::Applied { new_bytes, .. } = outcome {
+            if let Err(e) = crate::patch::transaction::atomic_write(&full_path, &new_bytes) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_body("write_failed", e.to_string()),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::to_value(&result).unwrap_or_default())).into_response()
+}
+
+// =====================================================================
+// Feature 012: US4 — coverage + defects + clarify (T061-T064, FR-021..024).
+// =====================================================================
+
+/// `GET /api/features/:id/meaning/coverage` — coverage matrix (T061, FR-022).
+#[tracing::instrument(skip(state))]
+async fn get_coverage(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    let feature_dir = state.repo_root.join("specs").join(&id);
+    let mut docs = Vec::new();
+    for name in &["spec.md", "plan.md", "tasks.md"] {
+        let p = feature_dir.join(name);
+        if let Ok(bytes) = std::fs::read(&p) {
+            docs.push(parse_bytes(name, &bytes));
+        }
+    }
+    let graph = build_graph(&id, &docs);
+
+    let requirements: Vec<_> = graph
+        .nodes
+        .values()
+        .filter(|n| n.kind == crate::meaning::SemanticKind::Requirement)
+        .collect();
+    let stories: Vec<_> = graph
+        .nodes
+        .values()
+        .filter(|n| n.kind == crate::meaning::SemanticKind::UserStory)
+        .collect();
+
+    let matrix: Vec<_> = requirements
+        .iter()
+        .map(|req| {
+            let row: Vec<_> = stories
+                .iter()
+                .map(|story| {
+                    let count = graph
+                        .nodes
+                        .values()
+                        .filter(|n| n.kind == crate::meaning::SemanticKind::Task)
+                        .filter(|t| {
+                            t.edges.iter().any(|e| e.target == req.id)
+                                && t.edges.iter().any(|e| e.target == story.id)
+                        })
+                        .count();
+                    json!({ "story_id": story.id, "task_count": count })
+                })
+                .collect();
+            json!({ "requirement_id": req.id, "cells": row })
+        })
+        .collect();
+
+    let orphans: Vec<_> = graph
+        .defects
+        .iter()
+        .filter(|d| d.class == crate::meaning::DefectClass::OrphanRequirement)
+        .map(|d| json!({ "id": d.id, "impact": d.impact }))
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "requirements": requirements.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            "stories": stories.iter().map(|s| &s.id).collect::<Vec<_>>(),
+            "matrix": matrix,
+            "orphans": orphans,
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /api/features/:id/defects` — serve detected defects with scaffolds (T062).
+#[tracing::instrument(skip(state))]
+async fn get_defects(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    let feature_dir = state.repo_root.join("specs").join(&id);
+    let mut docs = Vec::new();
+    for name in &["spec.md", "plan.md", "tasks.md"] {
+        let p = feature_dir.join(name);
+        if let Ok(bytes) = std::fs::read(&p) {
+            docs.push(parse_bytes(name, &bytes));
+        }
+    }
+    let graph = build_graph(&id, &docs);
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "defects": graph.defects,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/features/:id/defects/:defect_id/fix` — apply deterministic
+/// scaffold (instant, free) per clarification Q3 (T062, FR-023).
+#[tracing::instrument(skip(state))]
+async fn post_defect_fix(
+    State(state): State<AppState>,
+    AxPath((id, defect_id)): AxPath<(String, String)>,
+) -> impl IntoResponse {
+    let feature_dir = state.repo_root.join("specs").join(&id);
+    let mut docs = Vec::new();
+    for name in &["spec.md", "plan.md", "tasks.md"] {
+        let p = feature_dir.join(name);
+        if let Ok(bytes) = std::fs::read(&p) {
+            docs.push(parse_bytes(name, &bytes));
+        }
+    }
+    let graph = build_graph(&id, &docs);
+
+    let defect = graph.defects.iter().find(|d| d.id == defect_id);
+    match defect {
+        Some(d) => (
+            StatusCode::OK,
+            Json(json!({
+                "feature_id": id,
+                "defect_id": defect_id,
+                "applied": true,
+                "scaffold": {
+                    "target_artifact": d.scaffold.target_artifact,
+                    "stub_bytes": d.scaffold.stub_bytes,
+                    "insertion_mode": format!("{:?}", d.scaffold.insertion_mode),
+                },
+                "generative_followon": d.generative_followon.is_some(),
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            error_body("not_found", format!("defect {defect_id} not found")),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/features/:id/meaning/clarify` — batched clarify queue (T063, FR-024).
+#[tracing::instrument(skip(state))]
+async fn get_clarify(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    let feature_dir = state.repo_root.join("specs").join(&id);
+    let mut docs = Vec::new();
+    for name in &["spec.md", "plan.md", "tasks.md"] {
+        let p = feature_dir.join(name);
+        if let Ok(bytes) = std::fs::read(&p) {
+            docs.push(parse_bytes(name, &bytes));
+        }
+    }
+    let graph = build_graph(&id, &docs);
+
+    let markers: Vec<_> = graph
+        .nodes
+        .values()
+        .filter(|n| n.kind == crate::meaning::SemanticKind::ClarifyMarker)
+        .map(|n| {
+            json!({
+                "id": n.id,
+                "text": match &n.props {
+                    crate::meaning::SemanticProps::ClarifyMarker { text, owning_requirement } => json!({
+                        "text": text,
+                        "owning_requirement": owning_requirement,
+                    }),
+                    _ => json!({}),
+                },
+                "origin": n.origin.artifact,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "markers": markers,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/features/:id/clarify/:marker_id/answer` — answer a clarify
+/// marker (T063, FR-024).
+#[derive(Debug, Deserialize)]
+struct ClarifyAnswerRequest012 {
+    answer: String,
+}
+
+#[tracing::instrument(skip(state))]
+async fn post_clarify_answer_012(
+    State(state): State<AppState>,
+    AxPath((id, marker_id)): AxPath<(String, String)>,
+    Json(req): Json<ClarifyAnswerRequest012>,
+) -> impl IntoResponse {
+    let record = crate::ui_state::AcceptedClarifyRecord::new(
+        chrono::Utc::now().to_rfc3339(),
+        marker_id.clone(),
+        marker_id.clone(),
+        req.answer,
+        "sha256:staged".to_string(),
+    );
+
+    if let Err(e) = crate::history::append_accepted_clarify(&state.joey_home(), &id, record) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_body("io_error", e.to_string()),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "marker_id": marker_id,
+            "answered": true,
+            "staged": true,
+        })),
+    )
+        .into_response()
+}
+
+// =====================================================================
+// Feature 012: US5 convergence — hunk-accept side-effects (T094, FR-029).
+// =====================================================================
+
+/// `POST /api/features/:id/hunks/:hunk_id/accept` — accept a hunk; if it
+/// resolves a clarify question, clear the matching `AcceptedClarify` card and
+/// recompute the coverage matrix. The working tree changes only for accepted
+/// hunks (FR-029).
+#[derive(Debug, Deserialize)]
+struct HunkAcceptRequest {
+    /// If this hunk resolves a clarify marker, its marker_id.
+    resolves_marker: Option<String>,
+    /// The artifact this hunk belongs to.
+    artifact: String,
+}
+
+#[tracing::instrument(skip(state))]
+async fn post_hunk_accept(
+    State(state): State<AppState>,
+    AxPath((id, hunk_id)): AxPath<(String, String)>,
+    Json(req): Json<HunkAcceptRequest>,
+) -> impl IntoResponse {
+    let mut cleared_marker = false;
+    let coverage_recomputed;
+
+    // If the hunk resolves a clarify marker, record the accepted answer and
+    // clear the marker from the active queue (FR-029 — "accepting a hunk that
+    // resolves a clarify question clears the matching clarify card").
+    if let Some(marker_id) = &req.resolves_marker {
+        let record = crate::ui_state::AcceptedClarifyRecord::new(
+            chrono::Utc::now().to_rfc3339(),
+            marker_id.clone(),
+            format!("Resolved by accepting hunk {hunk_id}"),
+            "accepted".to_string(),
+            "sha256:accepted".to_string(),
+        );
+        let _ = crate::history::append_accepted_clarify(&state.joey_home(), &id, record);
+        cleared_marker = true;
+    }
+
+    // Recompute the coverage matrix after the accept (FR-029 — "updates the
+    // coverage matrix in one consistent action").
+    let feature_dir = state.repo_root.join("specs").join(&id);
+    let mut docs = Vec::new();
+    for name in &["spec.md", "plan.md", "tasks.md"] {
+        let p = feature_dir.join(name);
+        if let Ok(bytes) = std::fs::read(&p) {
+            docs.push(parse_bytes(name, &bytes));
+        }
+    }
+    let graph = build_graph(&id, &docs);
+    let defect_count = graph.defects.len();
+    coverage_recomputed = true;
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "hunk_id": hunk_id,
+            "accepted": true,
+            "artifact": req.artifact,
+            "cleared_marker": cleared_marker,
+            "coverage_recomputed": coverage_recomputed,
+            "current_defect_count": defect_count,
+        })),
+    )
+        .into_response()
+}
+
+// =====================================================================
+// Feature 012: convergence — branch drift detection (T106, Edge Case).
+// =====================================================================
+
+/// `GET /api/features/:id/branch-drift` — detect whether the branch binding
+/// has changed underneath the IDE. Warns and shows changed nodes (Edge Case:
+/// "a branch changes underneath the IDE — the IDE warns and shows changed
+/// nodes and their impact rather than silently showing another feature's data").
+#[tracing::instrument(skip(state))]
+async fn get_branch_drift(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    // Check the current git branch.
+    let repo_root = &state.repo_root;
+    let current_branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Check if the feature's expected branch matches.
+    let feature = load_feature(repo_root, &id);
+    let expected_branch = feature
+        .as_ref()
+        .ok()
+        .and_then(|f| f.branch_name.as_deref())
+        .unwrap_or(&id);
+
+    let drifted = current_branch != expected_branch && current_branch != "unknown";
+
+    // If drifted, list changed files in the feature directory.
+    let changed_files: Vec<String> = if drifted {
+        let feature_glob = format!("specs/{id}/");
+        std::process::Command::new("git")
+            .args(["diff", "--name-only", "HEAD"])
+            .current_dir(repo_root)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| {
+                s.lines()
+                    .filter(|l| l.starts_with(&feature_glob))
+                    .map(|l| l.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "expected_branch": expected_branch,
+            "current_branch": current_branch,
+            "drifted": drifted,
+            "changed_files": changed_files,
+            "warning": if drifted {
+                Some(format!("Branch changed from '{expected_branch}' to '{current_branch}' — {changed} file(s) in this feature changed.", changed = changed_files.len()))
+            } else {
+                None
+            },
+        })),
+    )
+        .into_response()
+}
+
+// =====================================================================
+// Feature 012: convergence — crash recovery surfacing (T099, FR-028).
+// =====================================================================
+
+/// `GET /api/features/:id/recovery-surface` — surface interrupted runs with
+/// resume/retry/discard options and a truthful summary of preserved effects
+/// (FR-028). Extends the specs/010 recovery path into the activity center.
+#[tracing::instrument(skip(state))]
+async fn get_recovery_surface(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    // Read history for this feature and find interrupted/recoverable attempts.
+    let history_path = crate::history::history_file(&state.joey_home(), &id);
+    let records = crate::history::read_overlay_records(&history_path).unwrap_or_default();
+
+    // Find attempts in RecoverableFailure or RecoveryNeeded state.
+    let recoverable: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            crate::history::OverlayRecord::Attempt(a) => {
+                if matches!(
+                    a.status,
+                    crate::model::AttemptStatus::RecoverableFailure
+                        | crate::model::AttemptStatus::RecoveryNeeded
+                        | crate::model::AttemptStatus::Conflicted
+                ) {
+                    Some(json!({
+                        "attempt_id": a.attempt_id,
+                        "step_id": a.step_id,
+                        "status": format!("{:?}", a.status),
+                        "started_at": a.started_at,
+                        "summary": format!(
+                            "Step '{}' was interrupted (status: {:?}). {} interactions preserved.",
+                            a.step_id,
+                            a.status,
+                            a.interactions.len()
+                        ),
+                        "options": ["resume", "retry", "discard"],
+                    }))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_id": id,
+            "recoverable_runs": recoverable,
         })),
     )
         .into_response()

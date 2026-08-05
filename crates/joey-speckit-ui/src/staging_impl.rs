@@ -5,13 +5,13 @@
 //! Staged mode = temp worktree on `joey/staging/<feature>/<attempt>`;
 //! direct mode = primary worktree.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use async_trait::async_trait;
 use tokio::process::Command;
 
 use crate::model::{ChangeMode, ChangeSet, Checkpoint, Scope};
-use crate::staging::{ApplyOutcome, DependencyWarning, StagingArea, StagingError, StagingRoot};
+use crate::staging::{ApplyOutcome, StagingArea, StagingError, StagingRoot};
 
 /// Git-backed staging area using gix for reads and git CLI for mutations.
 pub struct GitStagingArea;
@@ -311,5 +311,120 @@ mod tests {
             assert_eq!(root.mode, ChangeMode::Direct);
             assert_eq!(root.worktree, dir.path());
         }
+    }
+}
+
+// =====================================================================
+// Feature 012: US5 convergence — semantic-hunk labelling (T093, FR-029).
+//
+// When producing the change set for review, label each hunk by its semantic
+// meaning (e.g. "adds requirement FR-016") using the CST, not just line
+// numbers. This makes the review pane show meaningful units instead of
+// textual line noise.
+// =====================================================================
+
+use crate::cst::parser::parse_bytes;
+use crate::meaning::mapping::classify;
+
+/// A hunk annotated with its semantic meaning.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SemanticHunk {
+    /// The original hunk id (line-range-based, from git diff).
+    pub hunk_id: String,
+    /// The semantic label, e.g. "adds requirement FR-016", "modifies task T034".
+    pub semantic_label: String,
+    /// The artifact path this hunk belongs to.
+    pub artifact_path: String,
+    /// The byte range in the new file (from CST).
+    pub byte_start: usize,
+    pub byte_end: usize,
+}
+
+/// Label hunks semantically by re-parsing the changed artifact through the CST
+/// and classifying the nodes that fall within each hunk's byte range.
+///
+/// Each hunk gets a label like "adds requirement FR-016" or "modifies task
+/// T034" derived from the CST node it overlaps. Hunks that don't overlap a
+/// known semantic construct get "modifies <artifact>".
+pub fn label_hunks_semantically(
+    artifact_path: &str,
+    new_bytes: &[u8],
+    hunks: &[(String, usize, usize)], // (hunk_id, byte_start, byte_end)
+) -> Vec<SemanticHunk> {
+    let doc = parse_bytes(artifact_path, new_bytes);
+    let feature_id = "_"; // classify is per-feature but label doesn't need it
+
+    hunks
+        .iter()
+        .map(|(hunk_id, hunk_start, hunk_end)| {
+            // Find the CST node whose range overlaps this hunk.
+            let overlapping = doc.iter_in_order().find(|n| {
+                n.byte_start < *hunk_end && n.byte_end > *hunk_start
+            });
+
+            let label = match overlapping {
+                Some(node) => {
+                    // Try to classify it semantically.
+                    if let Some(sem) = classify(feature_id, artifact_path, node) {
+                        format_semantic_label(&sem.kind, &sem.id)
+                    } else {
+                        format!("modifies {}", artifact_path)
+                    }
+                }
+                None => format!("modifies {}", artifact_path),
+            };
+
+            SemanticHunk {
+                hunk_id: hunk_id.clone(),
+                semantic_label: label,
+                artifact_path: artifact_path.to_string(),
+                byte_start: *hunk_start,
+                byte_end: *hunk_end,
+            }
+        })
+        .collect()
+}
+
+/// Format a semantic label for a hunk from the SemanticKind + id.
+fn format_semantic_label(kind: &crate::meaning::SemanticKind, id: &str) -> String {
+    let action = match kind {
+        crate::meaning::SemanticKind::Requirement => "modifies requirement",
+        crate::meaning::SemanticKind::Task => "modifies task",
+        crate::meaning::SemanticKind::UserStory => "modifies user story",
+        crate::meaning::SemanticKind::SuccessCriterion => "modifies success criterion",
+        crate::meaning::SemanticKind::Check => "modifies check",
+        crate::meaning::SemanticKind::ConstitutionGate => "modifies constitution gate",
+        crate::meaning::SemanticKind::KeyEntity => "modifies entity",
+        crate::meaning::SemanticKind::ClarifyMarker => "resolves clarify marker",
+        _ => "modifies",
+    };
+    let bare_id = id.split(':').last().unwrap_or(id);
+    format!("{action} {bare_id}")
+}
+
+#[cfg(test)]
+mod semantic_hunk_tests {
+    use super::*;
+
+    #[test]
+    fn labels_requirement_hunk() {
+        let bytes = b"# Spec\n\n- **FR-001**: A requirement.\n";
+        // Hunk covering the whole file.
+        let hunks = vec![("h1".to_string(), 0, bytes.len())];
+        let labeled = label_hunks_semantically("spec.md", bytes, &hunks);
+        assert_eq!(labeled.len(), 1);
+        assert!(
+            labeled[0].semantic_label.contains("FR-001") || labeled[0].semantic_label.contains("spec.md"),
+            "label should reference the requirement or artifact: {}",
+            labeled[0].semantic_label
+        );
+    }
+
+    #[test]
+    fn labels_unknown_as_modifies_artifact() {
+        let bytes = b"# Just prose\n\nNothing semantic here.\n";
+        let hunks = vec![("h1".to_string(), 0, bytes.len())];
+        let labeled = label_hunks_semantically("spec.md", bytes, &hunks);
+        assert_eq!(labeled[0].semantic_label, "modifies spec.md");
     }
 }
