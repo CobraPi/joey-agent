@@ -181,6 +181,7 @@ fn cached_shell() -> Option<Shell> {
 /// exit code and emit the CWD marker. Generated per-call from `Shell` +
 /// user command; consumed immediately by the spawn path.
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // shell/body kept for debugging + future per-shell logic
 struct WrapperScript {
     /// Dialect that generated this script (drives arg shape).
     shell: Shell,
@@ -791,12 +792,85 @@ async fn run_command_unix(
     (output, code, timed_out, false)
 }
 
-/// Minimal Windows foreground command runner (feature 014 US1 stub).
-///
-/// For US1 this spawns the resolved shell and reads stdout+stderr to
-/// completion (blocking-style via `AsyncReadExt`), returning the combined
-/// output + exit code. Full streaming + PowerShell support lands in US2
-/// (T013–T015) which replaces this body with the streaming equivalent.
+/// Windows concrete `OutputChunkStream` impl (T013). Holds the child's
+/// `stdout` + `stderr` handles and merges them via `tokio::select!`.
+/// Merge order is not guaranteed (two pipes race), but the spec (FR-004)
+/// only requires that both streams appear in the single `output` field,
+/// not byte-order fidelity.
+#[cfg(not(unix))]
+struct WindowsPipeReader {
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+}
+
+#[cfg(not(unix))]
+#[async_trait]
+impl ChunkSource for WindowsPipeReader {
+    async fn next_chunk(&mut self) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+
+        let mut stdout_done = self.stdout.is_none();
+        let mut stderr_done = self.stderr.is_none();
+
+        loop {
+            // If both streams are EOF, signal completion.
+            if stdout_done && stderr_done {
+                return None;
+            }
+
+            let mut out_buf = vec![0u8; 64 * 1024];
+            let mut err_buf = vec![0u8; 64 * 1024];
+
+            // Race both reads. We take refs out of self to avoid overlapping
+            // borrows. Whichever is ready contributes a chunk.
+            let stdout_ref = self.stdout.as_mut();
+            let stderr_ref = self.stderr.as_mut();
+
+            tokio::select! {
+                biased;
+
+                n = async {
+                    match stdout_ref {
+                        Some(s) => s.read(&mut out_buf).await,
+                        None => Ok(0),
+                    }
+                } => {
+                    match n {
+                        Ok(0) | Err(_) => {
+                            self.stdout = None;
+                            stdout_done = true;
+                        }
+                        Ok(n) => {
+                            return Some(out_buf[..n].to_vec());
+                        }
+                    }
+                }
+
+                n = async {
+                    match stderr_ref {
+                        Some(s) => s.read(&mut err_buf).await,
+                        None => Ok(0),
+                    }
+                } => {
+                    match n {
+                        Ok(0) | Err(_) => {
+                            self.stderr = None;
+                            stderr_done = true;
+                        }
+                        Ok(n) => {
+                            return Some(err_buf[..n].to_vec());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Windows foreground command runner (feature 014 US2). Spawns the resolved
+/// shell, streams stdout+stderr via `WindowsPipeReader` + the shared
+/// `stream_output`, honors timeout + cooperative interrupt. Returns
+/// (combined_output, exit_code, timed_out, interrupted).
 #[cfg(not(unix))]
 async fn run_command_windows(
     command: &str,
@@ -804,8 +878,6 @@ async fn run_command_windows(
     timeout_secs: u64,
     ctx: &ToolContext,
 ) -> (String, i64, bool, bool) {
-    use tokio::io::AsyncReadExt;
-
     let shell = match cached_shell() {
         Some(s) => s,
         None => {
@@ -835,55 +907,47 @@ async fn run_command_windows(
         Err(e) => return (format!("Failed to spawn command: {}", e), -1, false, false),
     };
 
-    let mut stdout = child.stdout.take().unwrap_or_else(|| {
-        // Should not happen with Stdio::piped(), but guard anyway.
-        // tokio doesn't let us construct a closed ChildStdout easily; use
-        // the FD-less path by treating None as immediate EOF in the read loop.
-        unreachable!("Stdio::piped() guarantees Some(stdout)")
-    });
-    let mut stderr = child
-        .stderr
-        .take()
-        .unwrap_or_else(|| unreachable!("Stdio::piped() guarantees Some(stderr)"));
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
 
-    // US1 stub: read both streams to completion, then merge. US2 (T015)
-    // replaces this with the streaming WindowsPipeReader + stream_output.
-    let mut out_buf = Vec::new();
-    let mut err_buf = Vec::new();
-    let read_out = stdout.read_to_end(&mut out_buf);
-    let read_err = stderr.read_to_end(&mut err_buf);
+    let reader = WindowsPipeReader {
+        stdout,
+        stderr,
+    };
 
-    let (r1, r2) = tokio::join!(read_out, read_err);
-    let _ = (r1, r2);
+    // Stream output with progress, timeout, and heartbeat (shared body).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let (output, interrupted) = stream_output(Box::new(reader), ctx, deadline).await;
 
-    let mut combined = out_buf;
-    combined.extend_from_slice(&err_buf);
-    let output = String::from_utf8_lossy(&combined).into_owned();
+    // On cooperative interrupt, kill the child immediately.
+    if interrupted {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return (output, 124, false, true);
+    }
 
-    let status = match tokio::time::timeout(
-        Duration::from_secs(timeout_secs.max(1)),
-        child.wait(),
-    )
-    .await
-    {
+    // Wait for the child to exit.
+    let mut timed_out = false;
+    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
         Ok(Ok(s)) => Some(s),
         Ok(Err(_)) => None,
         Err(_) => {
+            timed_out = true;
             let _ = child.start_kill();
             let _ = child.wait().await;
             None
         }
     };
 
-    let timed_out = status.is_none();
+    if tokio::time::Instant::now() >= deadline {
+        timed_out = true;
+    }
+
     let code = if timed_out {
         124
     } else {
         exit_code_from_status(status, timed_out)
     };
-
-    // Suppress unused-warning for ctx (full streaming uses it in US2).
-    let _ = ctx;
 
     (output, code, timed_out, false)
 }
