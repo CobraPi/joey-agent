@@ -105,6 +105,52 @@ pub fn list_feature_ids(repo_root: &Path) -> anyhow::Result<Vec<String>> {
     Ok(ids)
 }
 
+/// Shape of `.specify/feature.json` as written by `specify` /
+/// `.specify/scripts/bash/create-new-feature.sh`. Only `feature_directory`
+/// (e.g. `"specs/012-spec-studio-visual-ide"`) is required; unknown keys are
+/// ignored so future spec-kit versions don't break this.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct FeatureJson {
+    feature_directory: String,
+}
+
+/// Read the project's currently active feature id from
+/// `.specify/feature.json` (written by spec-kit when a feature is created or
+/// switched to). Returns `None` when the file is absent or malformed — callers
+/// fall back to a UI-driven feature picker in that case.
+///
+/// The id returned here is the bare feature id (the last path component of
+/// `feature_directory`), not the `"specs/<id>"` prefix, so it is directly
+/// usable with `load_feature`.
+pub fn read_active_feature_id(repo_root: &Path) -> Option<String> {
+    let path = repo_root.join(".specify").join("feature.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let parsed: FeatureJson = serde_json::from_str(&content)
+        .map_err(|e| {
+            tracing::warn!(
+                file = %path.display(),
+                error = %e,
+                "could not parse .specify/feature.json — ignoring active feature",
+            );
+            e
+        })
+        .ok()?;
+
+    // `feature_directory` is a repo-relative path like
+    // "specs/012-spec-studio-visual-ide"; the id is the final component.
+    let id = parsed
+        .feature_directory
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()?
+        .to_string();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
 /// Shared application state passed to all API handlers.
 #[derive(Clone)]
 pub struct AppState {

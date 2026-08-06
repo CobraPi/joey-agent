@@ -237,6 +237,26 @@ fn is_terminal_block(name: &str) -> bool {
     name == "terminal"
 }
 
+/// Feature 013 (T032): pure drain helper for the `pending_separator` state
+/// machine. Returns `true` when a separator blank line should be printed
+/// (i.e. a previous element set the flag), and resets the flag to `false`.
+/// Extracted as a pure fn so the spacing state machine is directly unit-
+/// testable without stdout capture (contract `cli-render-spacing.md` §1).
+///
+/// Invariants enforced:
+/// - INV-1 (no double-blank): draining resets the flag, so two consecutive
+///   renderable elements produce exactly one blank.
+/// - Edge (no leading blank): at turn start the flag is `false`, so the first
+///   element renders with no preceding blank.
+fn drain_separator(pending: &mut bool) -> bool {
+    if *pending {
+        *pending = false;
+        true
+    } else {
+        false
+    }
+}
+
 /// Spec 008 (T006/FR-002): Build the reasoning-close footer line
 /// (`└─ Thought for {:.1}s` + gradient fill) when a duration > 0 is available,
 /// or `None` for a plain border close. Extracted from `close_reasoning` so the
@@ -382,6 +402,15 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
     let mut total_prompt_tokens: u64 = 0;
     let mut total_completion_tokens: u64 = 0;
 
+    // Feature 013 (US3): the pending_separator flag drives uniform one-blank-
+    // line spacing between every distinct CLI element (FR-009). Drained
+    // (one println!()) before the next renderable element's first line; set
+    // true after an element renders. INV-1: draining resets the flag, so two
+    // consecutive renderable elements produce exactly one blank — never two
+    // (Clarification Q1). FR-015: a suppressed element (quiet/gate-hidden)
+    // neither drains nor sets the flag, so it contributes no dangling blank.
+    let mut pending_separator: bool = false;
+
     // ── Animation state (FR-010: single interruptible tick loop) ──
     // When `!animations_enabled || !capability.is_interactive`, the tick arm
     // below is inert and behavior is identical to the pre-feature plain-text
@@ -483,7 +512,10 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             )
         }
     };
-    let close_reasoning = |open: &mut bool, buf: &mut String, line_count: &mut usize, started: Option<Instant>| {
+    // Feature 013 (T028): returns `true` when a reasoning block was actually
+    // closed (footer printed), so each call site can set `pending_separator`
+    // to insert the FR-010 blank before the next element.
+    let close_reasoning = |open: &mut bool, buf: &mut String, line_count: &mut usize, started: Option<Instant>| -> bool {
         if *open {
             if !buf.is_empty() {
                 println!("{}", t.fg_more_subtle.ansi().paint(buf.as_str()));
@@ -506,6 +538,9 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             }
             *open = false;
             *line_count = 0;
+            true
+        } else {
+            false
         }
     };
 
@@ -568,6 +603,10 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 total_prompt_tokens += usage.prompt_tokens;
                 total_completion_tokens += usage.completion_tokens;
                 if !opts.quiet && (usage.prompt_tokens > 0 || usage.completion_tokens > 0) {
+                    // Feature 013 (T027): TRAILING METADATA (Clarification Q3,
+                    // FR-012) — do NOT drain before the usage line (it attaches
+                    // tightly to whatever preceded it), but DO set the flag so
+                    // the next distinct element is preceded by one blank.
                     let stats = format!(
                         "  {} {} in · {} out",
                         t.fg_most_subtle.ansi().paint("↪"),
@@ -575,6 +614,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                         t.fg_more_subtle.ansi().paint(format_tokens(usage.completion_tokens)),
                     );
                     println!("{}", stats);
+                    pending_separator = true;
                 }
             }
             AgentEvent::ReasoningDelta(d) => {
@@ -636,7 +676,16 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     );
                     caret_visible = false;
                 }
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take());
+                // Feature 013 (T028): close reasoning first; if a footer was
+                // printed, set the flag so the drain below inserts the FR-010
+                // blank between the reasoning footer and the content.
+                if close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                    pending_separator = true;
+                }
+                // Feature 013 (T025): drain before the first streamed char so
+                // the content block is separated from the previous element
+                // (or from the reasoning footer per FR-010).
+                if drain_separator(&mut pending_separator) { println!(); }
                 print!("{}", d);
                 let _ = std::io::stdout().flush();
                 streamed_any = true;
@@ -649,21 +698,31 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             AgentEvent::AssistantMessage(text) => {
                 final_text = text;
                 if !opts.quiet && !streamed_any && !final_text.is_empty() {
-                    close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take());
+                    // Feature 013 (T028): close reasoning; set flag if closed.
+                    if close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                        pending_separator = true;
+                    }
+                    // Feature 013 (T025): drain before this distinct element.
+                    if drain_separator(&mut pending_separator) { println!(); }
                     println!("{}", final_text);
+                    // Feature 013 (T026): set after rendering.
+                    pending_separator = true;
                 }
             }
             AgentEvent::ToolStart { name, emoji, summary } => {
                 // Spec 008: stash emoji+summary for the ToolEnd crush header.
                 pending_tool_emoji = emoji.clone();
                 pending_tool_summary = summary.clone();
-                if streamed_any {
-                    println!();
-                    streamed_any = false;
-                }
+                // Feature 013 (T031): the old `if streamed_any { println!() }`
+                // ad-hoc blank is subsumed by the pending_separator flag.
+                // (Relied on INV-1 dedup — draining resets the flag.)
                 // T040: stop caret when tool output begins.
                 caret_active = false;
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take());
+                // Feature 013 (T028): close reasoning; set flag if closed so
+                // the drain below separates the footer from the tool header.
+                if close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                    pending_separator = true;
+                }
                 // US2: finalize spinner before tool output.
                 if let Some(s) = spinner_state.as_mut() {
                     if s.running {
@@ -678,6 +737,10 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 }
 
                 if !opts.quiet && opts.tool_progress != "off" {
+                    // Feature 013 (T025): drain BEFORE the tool_row capture so
+                    // the blank lands ABOVE the spinner row and tool_row points
+                    // at the post-blank spinner row (FR-014, contract §3).
+                    if drain_separator(&mut pending_separator) { println!(); }
                     let e = if emoji.is_empty() { "⚡" } else { &emoji };
                     let name_styled = theme::gradient_fg(&name, t.info, t.accent);
 
@@ -825,60 +888,93 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                         println!("{}", l);
                     }
                 }
+                // Feature 013 (T026): set after the tool block finishes
+                // rendering, so the next distinct element is preceded by one
+                // blank. NO drain here — the in-place rewrite path (above)
+                // targets tool_row and must not print a stray blank (FR-014,
+                // contract §3).
+                pending_separator = true;
             }
             AgentEvent::Notice(msg) => {
                 if !opts.quiet {
+                    // Feature 013 (T025/T026): drain before, set after.
+                    if drain_separator(&mut pending_separator) { println!(); }
                     println!("{}", t.warning.ansi().paint(format!("  · {}", msg)));
+                    pending_separator = true;
                 }
             }
             AgentEvent::RetryAttempt { attempt, max_retries, error, wait_secs } => {
                 if !opts.quiet {
+                    // Feature 013 (T025/T026): drain before, set after.
+                    if drain_separator(&mut pending_separator) { println!(); }
                     let label = format!("  ↻ Retry {}/{} in {:.1}s — {}", attempt, max_retries, wait_secs, error);
                     println!("{}", t.warning.ansi().paint(label));
+                    pending_separator = true;
                 }
             }
             AgentEvent::CompressionStart { reason, approx_tokens } => {
                 if !opts.quiet {
+                    // Feature 013 (T025/T026): drain before, set after.
+                    if drain_separator(&mut pending_separator) { println!(); }
                     let label = format!("  🗜️ Compressing (~{} tokens): {}", format_tokens(approx_tokens as u64), reason);
                     println!("{}", t.info.ansi().paint(label));
+                    pending_separator = true;
                 }
             }
             AgentEvent::CompressionEnd { original_msgs, new_msgs } => {
                 if !opts.quiet {
+                    // Feature 013 (T025/T026): drain before, set after.
+                    if drain_separator(&mut pending_separator) { println!(); }
                     let label = format!("  ✅ Compressed {} → {} messages", original_msgs, new_msgs);
                     println!("{}", t.success_more_subtle.ansi().paint(label));
+                    pending_separator = true;
                 }
             }
             AgentEvent::FallbackActivated { from_model, to_model } => {
                 if !opts.quiet {
+                    // Feature 013 (T025/T026): drain before, set after.
+                    if drain_separator(&mut pending_separator) { println!(); }
                     let label = format!("  🔄 Fallback: {} → {}", from_model, to_model);
                     println!("{}", t.warning.ansi().paint(label));
+                    pending_separator = true;
                 }
             }
             AgentEvent::SubagentSpawn { goal, model, toolset_summary, depth } => {
                 if !opts.quiet {
+                    // Feature 013 (T025/T026): drain before, set after.
+                    if drain_separator(&mut pending_separator) { println!(); }
                     let indent = "  ".repeat(depth);
                     let label = format!("{}🤖 Subagent: {} ({}) [{}]", indent, goal, model, toolset_summary);
                     println!("{}", t.info.ansi().paint(label));
+                    pending_separator = true;
                 }
             }
             AgentEvent::SubagentComplete { goal, success, summary_preview, token_usage, duration_secs } => {
                 if !opts.quiet {
+                    // Feature 013 (T025/T026): drain before, set after.
+                    if drain_separator(&mut pending_separator) { println!(); }
                     let status = if success { "✓" } else { "✗" };
                     let label = format!("  {} {} ({} tok, {:.1}s): {}", status, goal, token_usage.total_tokens, duration_secs, summary_preview);
                     println!("{}", t.success_more_subtle.ansi().paint(label));
+                    pending_separator = true;
                 }
             }
             AgentEvent::SubagentFailed { goal, error, duration_secs } => {
                 if !opts.quiet {
+                    // Feature 013 (T025/T026): drain before, set after.
+                    if drain_separator(&mut pending_separator) { println!(); }
                     let label = format!("  ✗ {} ({:.1}s): {}", goal, duration_secs, error);
                     println!("{}", t.error.ansi().paint(label));
+                    pending_separator = true;
                 }
             }
             AgentEvent::DelegationBatchComplete { total, succeeded, failed, total_duration_secs } => {
                 if !opts.quiet {
+                    // Feature 013 (T025/T026): drain before, set after.
+                    if drain_separator(&mut pending_separator) { println!(); }
                     let label = format!("  🤖 Batch: {}/{} succeeded, {} failed ({:.1}s)", succeeded, total, failed, total_duration_secs);
                     println!("{}", t.info_more_subtle.ansi().paint(label));
+                    pending_separator = true;
                 }
             }
             // Feature 005: inline file-change diff rendering (T014/T015/T016/T017).
@@ -887,6 +983,8 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     // --quiet: skip diffs entirely (only final response prints).
                     continue;
                 }
+                // Feature 013 (T025): drain before the diff block.
+                if drain_separator(&mut pending_separator) { println!(); }
                 let t = theme();
                 // Path header: "  ◆ path  +N -M" with kind label.
                 let kind_label = match kind {
@@ -900,6 +998,8 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 if is_binary {
                     // T017: binary-file placeholder (FR-016).
                     println!("{}", t.fg_most_subtle.ansi().paint("    binary file changed"));
+                    // Feature 013 (T026): set after the block rendered.
+                    pending_separator = true;
                     continue;
                 }
 
@@ -908,6 +1008,8 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     for line in diff.diff.lines() {
                         println!("{}", line);
                     }
+                    // Feature 013 (T026): set after the block rendered.
+                    pending_separator = true;
                     continue;
                 }
 
@@ -930,9 +1032,14 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     let affordance = format!("    … ({} earlier lines hidden)", hidden);
                     println!("{}", t.fg_most_subtle.ansi().paint(affordance));
                 }
+                // Feature 013 (T026): set after the block rendered.
+                pending_separator = true;
             }
             AgentEvent::Done { final_text: text, usage: _, iterations } => {
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take());
+                // Feature 013 (T028): close reasoning; set flag if closed.
+                if close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                    pending_separator = true;
+                }
 
                 // T040: erase the streaming caret if visible.
                 if caret_visible {
@@ -977,6 +1084,10 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 if !text.is_empty() {
                     final_text = text;
                 }
+                // Feature 013 (T025): drain before the turn summary so it is
+                // separated from the finalized text/previous element. NO set
+                // after — turn end; next turn starts fresh (Edge Case).
+                if drain_separator(&mut pending_separator) { println!(); }
                 // US5: Turn summary — printed on its own line below the
                 // finalized text. Uses plain println! (not cursor control),
                 // so it CANNOT overwrite streamed text. Includes turn duration
@@ -1004,51 +1115,79 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 break;
             }
             AgentEvent::Failed(err) => {
-                close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take());
-                if streamed_any {
-                    println!();
+                // Feature 013 (T028): close reasoning; set flag if closed.
+                if close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                    pending_separator = true;
                 }
+                // Feature 013 (T025/T031): drain before the error line. The
+                // old `if streamed_any { println!() }` ad-hoc blank is subsumed
+                // by the flag (INV-1 dedup). NO set after — turn end.
+                if drain_separator(&mut pending_separator) { println!(); }
                 println!("{}", t.error.ansi().paint(format!("Error: {}", err)));
                 break;
             }
             // ── OMO orchestration events (additive) ──
             AgentEvent::AgentModeChanged { agent_name, model: _ } => {
+                // Feature 013 (T025/T026): drain before, set after.
+                if drain_separator(&mut pending_separator) { println!(); }
                 println!("{} agent → {}",
                     t.fg_subtle.ansi().paint("◆"),
                     t.fg_base.ansi().paint(&agent_name));
+                pending_separator = true;
             }
             AgentEvent::CategoryDelegation { category, model } => {
+                // Feature 013 (T025/T026): drain before, set after.
+                if drain_separator(&mut pending_separator) { println!(); }
                 println!("{} [{}] → {}",
                     t.fg_subtle.ansi().paint("◇"),
                     category, model);
+                pending_separator = true;
             }
             AgentEvent::BoulderWorkStarted { plan_name, work_id: _ } => {
+                // Feature 013 (T025/T026): drain before, set after.
+                if drain_separator(&mut pending_separator) { println!(); }
                 println!("{} started work: {}",
                     t.success.ansi().paint("▶"),
                     plan_name);
+                pending_separator = true;
             }
             AgentEvent::BoulderWorkResumed { plan_name, work_id: _ } => {
+                // Feature 013 (T025/T026): drain before, set after.
+                if drain_separator(&mut pending_separator) { println!(); }
                 println!("{} resumed work: {}",
                     t.fg_subtle.ansi().paint("↻"),
                     plan_name);
+                pending_separator = true;
             }
             AgentEvent::BoulderWorkCompleted { plan_name, work_id: _ } => {
+                // Feature 013 (T025/T026): drain before, set after.
+                if drain_separator(&mut pending_separator) { println!(); }
                 println!("{} completed: {}",
                     t.success.ansi().paint("✓"),
                     plan_name);
+                pending_separator = true;
             }
             AgentEvent::GoalSet { objective } => {
+                // Feature 013 (T025/T026): drain before, set after.
+                if drain_separator(&mut pending_separator) { println!(); }
                 println!("{} goal set: {}",
                     t.success.ansi().paint("◎"),
                     objective);
+                pending_separator = true;
             }
             AgentEvent::GoalCleared => {
+                // Feature 013 (T025/T026): drain before, set after.
+                if drain_separator(&mut pending_separator) { println!(); }
                 println!("{} goal cleared", t.fg_subtle.ansi().paint("○"));
+                pending_separator = true;
             }
             AgentEvent::WisdomAccumulated { learnings_count } => {
+                // Feature 013 (T025/T026): drain before, set after.
+                if drain_separator(&mut pending_separator) { println!(); }
                 println!("{} {} learnings accumulated",
                     t.fg_subtle.ansi().paint("✦"),
                     learnings_count);
+                pending_separator = true;
             }
                 }
             }
@@ -2263,5 +2402,183 @@ mod tests {
             opts,
         );
         assert_eq!(text, "Done.");
+    }
+
+    // ── Feature 013 (US3): pending_separator spacing state machine ──
+
+    /// T032: the `drain_separator` state machine produces exactly one blank
+    /// between adjacent renderable elements and NO blank before the first
+    /// element (INV-1, Edge Case "no leading blank"). Simulates a sequence
+    /// of element renders over the flag.
+    #[test]
+    fn drain_separator_one_blank_between_elements() {
+        let mut pending = false;
+        let mut blanks_emitted = 0usize;
+
+        // Simulate N renderable elements: each drains (maybe prints blank),
+        // then sets the flag after rendering.
+        for _ in 0..5 {
+            if drain_separator(&mut pending) {
+                blanks_emitted += 1;
+            }
+            // ... element renders here ...
+            pending = true;
+        }
+
+        // 5 elements → 4 inter-element blanks (the first element drains
+        // nothing because the flag starts false).
+        assert_eq!(
+            blanks_emitted, 4,
+            "5 elements should produce exactly 4 inter-element blanks, not {}",
+            blanks_emitted
+        );
+    }
+
+    /// T032 (Edge): no leading blank at turn start (flag starts false).
+    #[test]
+    fn drain_separator_no_leading_blank() {
+        let mut pending = false;
+        // First element: drain should NOT fire (no previous element).
+        assert!(
+            !drain_separator(&mut pending),
+            "first element must not drain a blank (no leading blank)"
+        );
+    }
+
+    /// T032 (INV-1): draining resets the flag, so two consecutive drains
+    /// never both fire.
+    #[test]
+    fn drain_separator_reset_prevents_double_blank() {
+        let mut pending = true;
+        assert!(drain_separator(&mut pending), "first drain fires");
+        assert!(
+            !drain_separator(&mut pending),
+            "second drain must NOT fire (flag was reset) — no double-blank"
+        );
+    }
+
+    /// T033: trailing-metadata exception — `ApiCallEnd` does NOT drain before
+    /// itself (attaches tightly to its predecessor), but DOES set the flag so
+    /// the next element drains one blank (Clarification Q3, FR-012). We
+    /// simulate the pattern: previous element sets flag; ApiCallEnd does NOT
+    /// drain; ApiCallEnd sets flag; next element drains.
+    #[test]
+    fn trailing_metadata_no_drain_before_set_after() {
+        let mut pending = false;
+
+        // 1. Previous element (e.g. a tool block) renders and sets flag.
+        pending = true;
+
+        // 2. ApiCallEnd: does NOT drain (tight before). We model this by
+        //    simply NOT calling drain_separator here. It sets the flag.
+        //    (In render_turn the usage line prints immediately after the
+        //    predecessor, with no intervening blank.)
+        // pending stays true (was already true; ApiCallEnd would set it).
+
+        // 3. Next distinct element drains — should fire exactly once.
+        assert!(
+            drain_separator(&mut pending),
+            "next element after trailing-metadata must drain exactly one blank"
+        );
+        assert!(
+            !drain_separator(&mut pending),
+            "only one blank (flag reset by drain)"
+        );
+    }
+
+    /// T035 (FR-015): a suppressed element (quiet/gate skip) does NOT set
+    /// `pending_separator`, so no dangling blank is introduced where a block
+    /// was hidden. We model this: the element neither drains nor sets.
+    #[test]
+    fn suppressed_element_does_not_set_flag() {
+        let mut pending = false;
+
+        // First renderable element: drains nothing (flag false), sets flag.
+        assert!(!drain_separator(&mut pending));
+        pending = true;
+
+        // Suppressed element (e.g. quiet): skips both drain and set.
+        // (No call to drain_separator, no assignment to pending.)
+
+        // Next renderable element: drains exactly one (from the first element).
+        assert!(
+            drain_separator(&mut pending),
+            "suppressed element must not consume or duplicate the separator"
+        );
+    }
+
+    /// T034 (FR-014): the ToolStart→ToolEnd ordering invariant — the drain
+    /// occurs before `tool_row` capture (conceptually) and NOT during the
+    /// ToolEnd rewrite. This is a behavioral test on the drain helper covering
+    /// the tool-block sequence: drain (ToolStart) → no drain (ToolEnd) → set.
+    #[test]
+    fn tool_block_sequence_drain_before_set_after() {
+        let mut pending = true; // previous element set the flag.
+
+        // ToolStart: drain fires (blank lands above the tool line).
+        assert!(
+            drain_separator(&mut pending),
+            "ToolStart must drain before capturing tool_row (FR-014)"
+        );
+        // ToolStart does NOT set the flag (ToolEnd owns the block close).
+        assert_eq!(pending, false);
+
+        // ToolEnd: NO drain (the rewrite targets tool_row). We model this by
+        // NOT calling drain_separator here.
+        // ToolEnd sets the flag after the body prints.
+        pending = true;
+
+        // Next element drains exactly one.
+        assert!(
+            drain_separator(&mut pending),
+            "next element after tool block must drain one blank"
+        );
+    }
+
+    /// T036: integration — a multi-element NonInteractive turn (reasoning,
+    /// tool calls, content) completes and returns final_text under the new
+    /// spacing (constitution Principle VII: non-regression).
+    #[test]
+    fn spaced_turn_completes_and_returns_final_text() {
+        let opts = opts_for(Capability::NonInteractive);
+        let text = run_turn(
+            vec![
+                AgentEvent::TurnStart { max_iterations: 1 },
+                AgentEvent::ToolStart {
+                    name: "read_file".to_string(),
+                    emoji: "📖".to_string(),
+                    summary: "a.txt".to_string(),
+                },
+                AgentEvent::ToolEnd {
+                    name: "read_file".to_string(),
+                    is_error: false,
+                    result_preview: "content".to_string(),
+                    duration_secs: 0.1,
+                    exit_code: None,
+                    full_result: String::new(),
+                },
+                AgentEvent::ToolStart {
+                    name: "terminal".to_string(),
+                    emoji: "⚡".to_string(),
+                    summary: "echo hi".to_string(),
+                },
+                AgentEvent::ToolEnd {
+                    name: "terminal".to_string(),
+                    is_error: false,
+                    result_preview: "hi".to_string(),
+                    duration_secs: 0.1,
+                    exit_code: Some(0),
+                    full_result: String::new(),
+                },
+                AgentEvent::ContentDelta("Final answer.".to_string()),
+                AgentEvent::Done {
+                    final_text: "Final answer.".to_string(),
+                    usage: Usage::default(),
+                    iterations: 1,
+                },
+            ],
+            opts,
+        );
+        assert_eq!(text, "Final answer.");
     }
 }

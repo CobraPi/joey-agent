@@ -34,6 +34,19 @@ const MAX_TAIL_WINDOW_LINES_TUI: usize = 200;
 /// Mirrors crush's `shellMaxCollapsedLines` / `responseContextHeight`.
 const MAX_TOOL_OUTPUT_LINES: usize = 10;
 
+/// Feature 013: maximum column width at which body text wraps, regardless of
+/// panel width. Matches crush's `maxTextWidth` (messages.go:26). Body-text-
+/// only (Clarification Q2): headers, borders, and tool/terminal output are
+/// NOT capped (FR-005/007/008).
+const MAX_CONTENT_WIDTH: usize = 120;
+
+/// Feature 013: cap applied to BODY wrapping only (assistant/user/reasoning).
+/// Degrades gracefully: when `content_w` is below the cap, returns
+/// `content_w` unchanged (FR-007).
+fn capped_content_width(content_w: usize) -> usize {
+    content_w.min(MAX_CONTENT_WIDTH)
+}
+
 /// Feature 007: shared helper — take the first `max` lines of a string and
 /// return the lines + an optional hidden-count affordance message.
 /// Used by terminal-command blocks (T019) and tool-call bodies (T023).
@@ -227,12 +240,15 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                 "❯ ",
                 Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
             )]));
-            for wl in wrap(text, content_w.saturating_sub(2)) {
+            // Feature 013: cap body width (FR-005); body-text-only (Q2).
+            for wl in wrap(text, capped_content_width(content_w).saturating_sub(2)) {
                 lines.push(Line::from(vec![Span::styled(
                     format!("  {}", wl),
                     Style::default().fg(theme.fg_base.to_color()),
                 )]));
             }
+            // Feature 013 (T003): uniform trailing blank separator (FR-001).
+            lines.push(Line::from(vec![Span::raw("")]));
         }
         TranscriptItem::Assistant { text } => {
             lines.push(Line::from(vec![Span::styled(
@@ -241,7 +257,8 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     .fg(theme.info.to_color())
                     .add_modifier(Modifier::BOLD),
             )]));
-            for wl in wrap(text, content_w.saturating_sub(2)) {
+            // Feature 013: cap body width (FR-005); body-text-only (Q2).
+            for wl in wrap(text, capped_content_width(content_w).saturating_sub(2)) {
                 lines.push(Line::from(vec![Span::styled(
                     format!("  {}", wl),
                     Style::default().fg(theme.fg_base.to_color()),
@@ -306,7 +323,8 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                 border_style,
             )]));
             for wl in &shown_lines {
-                let wrapped = wrap(wl, content_w.saturating_sub(4));
+                // Feature 013: cap body width (FR-005); body-text-only (Q2).
+                let wrapped = wrap(wl, capped_content_width(content_w).saturating_sub(4));
                 for w in wrapped {
                     lines.push(Line::from(vec![Span::styled(
                         format!(" │ {}", w),
@@ -543,6 +561,9 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     }
                 }
             }
+            // Feature 013 (T004): uniform trailing blank separator (FR-001).
+            // (The terminal-tool early-return at line ~426-427 already has one.)
+            lines.push(Line::from(vec![Span::raw("")]));
         }
         TranscriptItem::FileDiff { path, stat, lines: diff_lines, is_binary } => {
             // Feature 005 (T019): render the inline diff block.
@@ -592,6 +613,8 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     )));
                 }
             }
+            // Feature 013 (T005): uniform trailing blank separator (FR-001).
+            lines.push(Line::from(vec![Span::raw("")]));
         }
         TranscriptItem::Notice { text, kind } => {
             let col = match kind {
@@ -607,6 +630,8 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     Style::default().fg(theme.fg_more_subtle.to_color()),
                 ),
             ]));
+            // Feature 013 (T006): uniform trailing blank separator (FR-001).
+            lines.push(Line::from(vec![Span::raw("")]));
         }
         TranscriptItem::Error { text } => {
             for wl in wrap(text, content_w.saturating_sub(4)) {
@@ -615,6 +640,8 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     Style::default().fg(theme.error.to_color()).add_modifier(Modifier::BOLD),
                 )]));
             }
+            // Feature 013 (T007): uniform trailing blank separator (FR-001).
+            lines.push(Line::from(vec![Span::raw("")]));
         }
     }
     lines
@@ -1721,7 +1748,7 @@ pub fn build_agent_roster_from_registry(registry: &joey_omo::AgentRegistry) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ReasoningExpandState};
+    use crate::state::{NoticeKind, ReasoningExpandState};
     use std::time::Duration;
 
     /// Helper: convert a `Line` into its plain-text content.
@@ -2137,9 +2164,9 @@ mod tests {
         // Simulate a text area at (0, 0) with width 80, height 20.
         app.last_text_area.set((0, 0, 80, 20));
 
-        // Item 0 (User "hello") renders as 2 lines: header "❯ " + body.
-        // Item 1 (Tool) renders after it.
-        // Clicking rows 0-1 should hit item 0.
+        // Feature 013: Item 0 (User "hello") now renders as 3 lines: header
+        // "❯ " + body + the uniform trailing blank separator (FR-001).
+        // Clicking rows 0-2 should hit item 0.
         assert_eq!(
             transcript_hit_test(&app, theme, 0, 10),
             Some(0),
@@ -2150,10 +2177,15 @@ mod tests {
             Some(0),
             "row 1 (body of item 0) should still resolve to item 0"
         );
+        assert_eq!(
+            transcript_hit_test(&app, theme, 2, 10),
+            Some(0),
+            "row 2 (trailing separator of item 0) should still resolve to item 0"
+        );
 
-        // Clicking row 2+ should hit item 1 (the tool).
-        let hit = transcript_hit_test(&app, theme, 2, 10);
-        assert_eq!(hit, Some(1), "row 2 should resolve to item 1");
+        // Clicking row 3+ should hit item 1 (the tool).
+        let hit = transcript_hit_test(&app, theme, 3, 10);
+        assert_eq!(hit, Some(1), "row 3 should resolve to item 1");
     }
 
     #[test]
@@ -2232,5 +2264,346 @@ mod tests {
         // Item 0 is User — not expandable. Should be a no-op (no panic).
         app.toggle_item_expand_by_index(0);
         assert!(matches!(&app.transcript[0], TranscriptItem::User { .. }));
+    }
+
+    // ── Feature 013 (US1): TUI vertical rhythm / trailing blank ──────
+
+    /// T009: every `item_lines` variant returns a Vec<Line> whose LAST
+    /// element is an empty line (the uniform trailing separator).
+    #[test]
+    fn test_all_variants_have_trailing_blank() {
+        let theme = Theme::aurora();
+        let w = 80usize;
+
+        let cases: Vec<(&str, TranscriptItem)> = vec![
+            ("User", TranscriptItem::User { text: "hi".into() }),
+            ("Assistant", TranscriptItem::Assistant { text: "hello".into() }),
+            (
+                "Reasoning",
+                TranscriptItem::Reasoning {
+                    text: "thinking".into(),
+                    expand_state: ReasoningExpandState::Full,
+                    thought_duration: Some(Duration::from_secs(2)),
+                },
+            ),
+            (
+                "Tool(terminal)",
+                TranscriptItem::Tool {
+                    name: "terminal".into(),
+                    emoji: "⚡".into(),
+                    summary: "echo hi".into(),
+                    status: ToolStatus::Done,
+                    duration_secs: Some(0.1),
+                    result_preview: "hi".into(),
+                    expanded: false,
+                    full_args: None,
+                    full_result: None,
+                    is_terminal: true,
+                    exit_code: Some(0),
+                },
+            ),
+            (
+                "Tool(generic)",
+                TranscriptItem::Tool {
+                    name: "read_file".into(),
+                    emoji: "📖".into(),
+                    summary: "foo.rs".into(),
+                    status: ToolStatus::Done,
+                    duration_secs: Some(0.1),
+                    result_preview: "fn main() {}".into(),
+                    expanded: false,
+                    full_args: None,
+                    full_result: None,
+                    is_terminal: false,
+                    exit_code: None,
+                },
+            ),
+            (
+                "FileDiff",
+                TranscriptItem::FileDiff {
+                    path: "a.txt".into(),
+                    stat: "+1 -0".into(),
+                    lines: vec!["+hello".into()],
+                    is_binary: false,
+                },
+            ),
+            (
+                "Notice",
+                TranscriptItem::Notice {
+                    text: "notice".into(),
+                    kind: NoticeKind::Info,
+                },
+            ),
+            (
+                "Error",
+                TranscriptItem::Error { text: "boom".into() },
+            ),
+        ];
+
+        for (label, item) in &cases {
+            let ls = item_lines(item, w, theme);
+            let last = ls.last().expect("variant must produce at least one line");
+            let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                text.is_empty(),
+                "T009 [{}]: last line must be an empty Span (trailing separator); got {:?}",
+                label,
+                text
+            );
+        }
+    }
+
+    /// T010: concatenating `item_lines` outputs of two adjacent items of
+    /// different type yields exactly ONE empty line between them — never
+    /// zero, never two (INV-1, FR-001).
+    #[test]
+    fn test_adjacent_items_have_exactly_one_blank() {
+        let theme = Theme::aurora();
+        let w = 80usize;
+
+        fn mk_user() -> TranscriptItem {
+            TranscriptItem::User { text: "u".into() }
+        }
+        fn mk_asst() -> TranscriptItem {
+            TranscriptItem::Assistant { text: "a".into() }
+        }
+        fn mk_reasoning() -> TranscriptItem {
+            TranscriptItem::Reasoning {
+                text: "r".into(),
+                expand_state: ReasoningExpandState::Full,
+                thought_duration: Some(Duration::from_secs(1)),
+            }
+        }
+        fn mk_tool(expanded: bool) -> TranscriptItem {
+            TranscriptItem::Tool {
+                name: "read_file".into(),
+                emoji: "📖".into(),
+                summary: "f".into(),
+                status: ToolStatus::Done,
+                duration_secs: Some(0.1),
+                result_preview: "x".into(),
+                expanded,
+                full_args: None,
+                full_result: None,
+                is_terminal: false,
+                exit_code: None,
+            }
+        }
+        fn mk_filediff() -> TranscriptItem {
+            TranscriptItem::FileDiff {
+                path: "a".into(),
+                stat: "+1".into(),
+                lines: vec!["+x".into()],
+                is_binary: false,
+            }
+        }
+        fn mk_notice() -> TranscriptItem {
+            TranscriptItem::Notice {
+                text: "n".into(),
+                kind: NoticeKind::Info,
+            }
+        }
+        fn mk_error() -> TranscriptItem {
+            TranscriptItem::Error { text: "e".into() }
+        }
+
+        // (label, a, b) — pairs to check.
+        let pairs: Vec<(&str, TranscriptItem, TranscriptItem)> = vec![
+            ("user→assistant", mk_user(), mk_asst()),
+            ("assistant→reasoning", mk_asst(), mk_reasoning()),
+            ("reasoning→assistant", mk_reasoning(), mk_asst()),
+            ("tool→tool", mk_tool(false), mk_tool(false)),
+            ("tool→filediff", mk_tool(false), mk_filediff()),
+            ("notice→notice", mk_notice(), mk_notice()),
+            ("error→notice", mk_error(), mk_notice()),
+            ("filediff→tool", mk_filediff(), mk_tool(false)),
+        ];
+
+        for (label, a, b) in &pairs {
+            let la = item_lines(a, w, theme);
+            let lb = item_lines(b, w, theme);
+            // Concatenate the rendered text.
+            let mut combined: Vec<String> =
+                la.iter().map(line_text).collect::<Vec<_>>();
+            combined.extend(lb.iter().map(line_text));
+
+            // Count trailing-blank region between a and b: the last line of
+            // a is a blank; the first line of b is NOT a blank (a header).
+            // So the gap is exactly one blank iff la's last line is empty
+            // and lb's first line is non-empty.
+            let a_last = combined[la.len() - 1].is_empty();
+            let b_first_nonempty = !combined[la.len()].is_empty();
+            assert!(
+                a_last && b_first_nonempty,
+                "T010 [{}]: expected exactly one blank between items; a_last_empty={}, b_first_nonempty={}",
+                label,
+                a_last,
+                b_first_nonempty
+            );
+            // Also assert the full sequence has no two consecutive blanks
+            // anywhere (INV-1).
+            for w2 in combined.windows(2) {
+                let both_blank = w2[0].is_empty() && w2[1].is_empty();
+                assert!(
+                    !both_blank,
+                    "T010 [{}]: found double-blank in sequence {:?}",
+                    label, combined
+                );
+            }
+        }
+    }
+
+    // ── Feature 013 (US2): TUI body width cap & indent ───────────────
+
+    /// T018: `capped_content_width` degrades gracefully (FR-007).
+    #[test]
+    fn test_capped_content_width_degrades() {
+        assert_eq!(capped_content_width(200), MAX_CONTENT_WIDTH);
+        assert_eq!(capped_content_width(120), MAX_CONTENT_WIDTH);
+        assert_eq!(capped_content_width(80), 80);
+        assert_eq!(capped_content_width(0), 0);
+    }
+
+    /// T019: with content_w = 200, an Assistant body wraps at ≤ MAX_CONTENT_WIDTH - 2.
+    #[test]
+    fn test_assistant_body_capped_on_wide_panel() {
+        let long: String = (0..40)
+            .map(|i| format!("word{} ", i))
+            .collect::<String>();
+        let item = TranscriptItem::Assistant { text: long };
+        let theme = Theme::aurora();
+        let ls = item_lines(&item, 200, theme);
+        // Body lines are all lines except the header (first) and the
+        // trailing separator (last). Check their display width.
+        let body = &ls[1..ls.len() - 1];
+        assert!(!body.is_empty(), "should have body lines");
+        for (i, l) in body.iter().enumerate() {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            let w = UnicodeWidthStr::width(text.as_str());
+            assert!(
+                w <= MAX_CONTENT_WIDTH,
+                "T019: body line {} width {} exceeds cap {} (text: {:?})",
+                i,
+                w,
+                MAX_CONTENT_WIDTH,
+                text
+            );
+        }
+    }
+
+    /// T020: with content_w = 80 (below cap), Assistant wraps at full
+    /// width (~78) — no premature wrap (FR-007).
+    #[test]
+    fn test_assistant_body_uses_full_width_below_cap() {
+        // 80-col panel, body wraps at ~78 (full minus 2-space indent).
+        // Construct a line that is exactly 76 chars wide; it should fit on
+        // ONE body line (proving no premature wrap below the cap).
+        let line76: String = "w".repeat(76);
+        let item = TranscriptItem::Assistant { text: line76 };
+        let theme = Theme::aurora();
+        let ls = item_lines(&item, 80, theme);
+        let body = &ls[1..ls.len() - 1];
+        assert_eq!(
+            body.len(),
+            1,
+            "T020: 76-char line at content_w=80 should fit on one body line (no premature wrap); got {} lines",
+            body.len()
+        );
+    }
+
+    /// T021: the Reasoning box border renders intact and is NOT affected by
+    /// the width cap (FR-008 border/header alignment). The border string is
+    /// a short fixed header (` ┌─ reasoning …`); the cap only shrinks the
+    /// BODY wrap width inside the box, never the border text itself.
+    #[test]
+    fn test_reasoning_border_not_capped_on_wide_panel() {
+        let item = TranscriptItem::Reasoning {
+            text: "thinking".into(),
+            expand_state: ReasoningExpandState::Full,
+            thought_duration: None,
+        };
+        let theme = Theme::aurora();
+        // The border line must be present and identical at both a wide panel
+        // (where the cap kicks in for body text) and a narrow one. This proves
+        // the cap does not corrupt/truncate the border (FR-008).
+        let ls_wide = item_lines(&item, 200, theme);
+        let ls_narrow = item_lines(&item, 80, theme);
+        let border_wide = ls_wide
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains("┌─"))
+            .expect("wide panel should have a top border");
+        let border_narrow = ls_narrow
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains("┌─"))
+            .expect("narrow panel should have a top border");
+        assert_eq!(
+            border_wide, border_narrow,
+            "T021: border text must be identical regardless of panel width (FR-008)"
+        );
+        assert!(
+            border_wide.contains("reasoning"),
+            "T021: border should contain the title; got {:?}",
+            border_wide
+        );
+    }
+
+    /// T022 (FR-006 codification): tool/terminal body lines indent by exactly
+    /// 4 spaces (`format!("    {}", ...)`).
+    #[test]
+    fn test_tool_body_indent_is_four_spaces() {
+        let theme = Theme::aurora();
+
+        // Generic tool with body output.
+        let generic = TranscriptItem::Tool {
+            name: "read_file".into(),
+            emoji: "📖".into(),
+            summary: "foo.rs".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.1),
+            result_preview: "body line one".into(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: false,
+            exit_code: None,
+        };
+        let ls_g = item_lines(&generic, 80, theme);
+        // Find the body line(s) (after the header, before the trailing blank).
+        for l in &ls_g[1..ls_g.len() - 1] {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                text.starts_with("    "),
+                "T022 generic: body line should indent 4 spaces; got {:?}",
+                text
+            );
+        }
+
+        // Terminal tool with body output.
+        let term = TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "⚡".into(),
+            summary: "echo hi".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.1),
+            result_preview: "hi".into(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: true,
+            exit_code: Some(0),
+        };
+        let ls_t = item_lines(&term, 80, theme);
+        // The terminal arm early-returns; the last line is the trailing blank.
+        // Body lines sit between the header (first) and the trailing blank (last).
+        for l in &ls_t[1..ls_t.len() - 1] {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                text.starts_with("    "),
+                "T022 terminal: body line should indent 4 spaces; got {:?}",
+                text
+            );
+        }
     }
 }

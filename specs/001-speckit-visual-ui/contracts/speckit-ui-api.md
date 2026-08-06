@@ -20,6 +20,34 @@ Response 200:
 }
 ```
 
+## GET /api/project
+
+Single-call bootstrap payload the frontend uses to auto-load the project's
+specs on startup instead of forcing the user to pick a feature. Folds
+together the feature list, the project's active feature id (read from
+`.specify/feature.json`, written by `specify` / create-new-feature.sh),
+the active feature's fully parsed model (when present), and coarse project
+flags used by the setup wizard.
+
+Response 200:
+```json
+{
+  "repo_root": "/abs/path/to/repo",
+  "has_specs_dir": true,
+  "has_specify_dir": true,
+  "features": [
+    { "id": "001-speckit-visual-ui", "title": "SpecKit Visual UI", "status": "Draft" }
+  ],
+  "active_feature_id": "001-speckit-visual-ui",
+  "active_feature": { "id": "001-speckit-visual-ui", "specification": { "...": "..." } }
+}
+```
+
+`active_feature_id` and `active_feature` are `null` when
+`.specify/feature.json` is absent/malformed or when the referenced feature
+directory does not exist under `specs/`; the frontend then falls back to
+its feature picker.
+
 ## GET /api/features/{id}
 
 Fetch the fully parsed Feature model (Specification + Plan + Tasks), per

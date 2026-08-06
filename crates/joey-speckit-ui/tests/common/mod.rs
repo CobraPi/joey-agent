@@ -38,3 +38,16 @@ pub fn router_for(dir: &TempDir) -> axum::Router {
     let repo_root: PathBuf = dir.path().to_path_buf();
     build_router(AppState::new(repo_root))
 }
+
+/// Write a `.specify/feature.json` pointing at `feature_id`, mirroring what
+/// `specify` / `.specify/scripts/bash/create-new-feature.sh` writes. Used by
+/// tests that exercise the auto-load path.
+#[allow(dead_code)]
+pub fn write_active_feature(dir: &TempDir, feature_id: &str) {
+    let specify_dir = dir.path().join(".specify");
+    std::fs::create_dir_all(&specify_dir).unwrap();
+    let json = format!(
+        "{{\n  \"feature_directory\": \"specs/{feature_id}\"\n}}\n"
+    );
+    std::fs::write(specify_dir.join("feature.json"), json).unwrap();
+}

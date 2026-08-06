@@ -11,13 +11,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    commands, conflict, editor, list_feature_ids, load_feature, runner, runner::WorkflowRunner,
-    staging::StagingArea, validation, writer, AppState,
+    commands, conflict, editor, list_feature_ids, load_feature, read_active_feature_id, runner,
+    runner::WorkflowRunner, staging::StagingArea, validation, writer, AppState,
 };
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/features", get(list_features))
+        .route("/api/project", get(get_project))
         .route("/api/features/:id", get(get_feature))
         .route("/api/features/:id/spec", patch(patch_spec))
         .route("/api/features/:id/tasks/:task_id", patch(patch_task))
@@ -149,6 +150,83 @@ async fn list_features(State(state): State<AppState>) -> impl IntoResponse {
     }
 
     (StatusCode::OK, Json(json!({ "features": features }))).into_response()
+}
+
+// ---------------------------------------------------------------------
+// GET /api/project
+// ---------------------------------------------------------------------
+//
+// Single-call bootstrap payload so the frontend can auto-load the
+// project's specs on startup instead of forcing the user to pick a
+// feature. It folds together three things the frontend previously had to
+// fetch/handle separately:
+//
+//   * all feature ids + titles under `specs/`  (same shape as GET /api/features)
+//   * the project's currently active feature id, read from
+//     `.specify/feature.json` (written by `specify`/create-new-feature.sh)
+//   * the fully parsed model for that active feature, when present, so the
+//     UI can render immediately without a second round-trip
+//
+// Plus coarse project flags (`has_specs_dir`, `has_specify_dir`) that the
+// setup wizard uses to decide whether to prompt for `specify init`.
+
+#[tracing::instrument(skip(state))]
+async fn get_project(State(state): State<AppState>) -> impl IntoResponse {
+    let repo_root = state.repo_root.clone();
+
+    // --- feature list (same payload as GET /api/features) ---
+    let ids = list_feature_ids(&repo_root).unwrap_or_default();
+    let mut features = Vec::with_capacity(ids.len());
+    for id in &ids {
+        match load_feature(&repo_root, id) {
+            Ok(feature) => {
+                let title = feature
+                    .specification
+                    .as_ref()
+                    .map(|s| s.title.clone())
+                    .unwrap_or_else(|| id.clone());
+                let status = feature
+                    .specification
+                    .as_ref()
+                    .map(|s| s.status.clone())
+                    .unwrap_or(crate::model::Status::Unparsed);
+                features.push(json!({ "id": id, "title": title, "status": status }));
+            }
+            Err(e) => {
+                tracing::warn!(feature = %id, error = %e, "skipping unloadable feature");
+            }
+        }
+    }
+
+    // --- active feature, from .specify/feature.json if present ---
+    let active_feature_id = read_active_feature_id(&repo_root);
+
+    // Eagerly load the active feature's full model so the frontend can paint
+    // without a follow-up GET /api/features/{id}. Falls back to null when the
+    // file is missing, the id isn't in `specs/`, or parsing fails — the UI
+    // then falls back to its feature picker.
+    let active_feature = active_feature_id
+        .as_deref()
+        .and_then(|id| match load_feature(&repo_root, id) {
+            Ok(feature) => Some(json!(feature)),
+            Err(e) => {
+                tracing::warn!(feature = %id, error = %e, "active feature listed in .specify/feature.json could not be loaded");
+                None
+            }
+        });
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "repo_root": repo_root.display().to_string(),
+            "has_specs_dir": repo_root.join("specs").exists(),
+            "has_specify_dir": repo_root.join(".specify").exists(),
+            "features": features,
+            "active_feature_id": active_feature_id,
+            "active_feature": active_feature,
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------
