@@ -8,6 +8,7 @@
 //! marker, ANSI stripping, secret redaction, the exit-code-meaning table, and
 //! the timeout contract (default 180s, hard foreground max 600s).
 
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd as _;
 use std::time::Duration;
 
@@ -42,23 +43,193 @@ fn default_timeout(ctx: &ToolContext) -> u64 {
     ctx.config().get_i64("terminal.timeout", 180).max(1) as u64
 }
 
-/// Port of `tools/environments/local._find_bash` (POSIX branch; the Windows
-/// Git-Bash candidate walk is reduced to a PATH probe).
-fn find_bash() -> String {
-    if cfg!(windows) {
-        return which::which("bash")
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "bash".to_string());
-    }
-    if let Ok(p) = which::which("bash") {
-        return p.to_string_lossy().into_owned();
-    }
-    for candidate in ["/usr/bin/bash", "/bin/bash"] {
-        if std::path::Path::new(candidate).is_file() {
-            return candidate.to_string();
+// ── Shell selection (feature 014: Windows platform support) ──────────────
+
+/// Which shell the terminal tool uses to execute a command. Resolved once
+/// per process and cached in `RESOLVED_SHELL` (FR-013).
+///
+/// On Unix, only `Bash` is ever produced (POSIX path). On Windows, `Bash`
+/// is preferred (Git Bash if installed); `PowerShell` is the fallback
+/// when bash is absent (FR-011).
+#[derive(Clone, Debug, PartialEq)]
+enum Shell {
+    /// POSIX shell (bash, Git Bash). Path to the executable.
+    Bash(String),
+    /// PowerShell. Path to pwsh.exe or powershell.exe.
+    PowerShell(String),
+}
+
+impl Shell {
+    /// The executable path to spawn.
+    fn argv0(&self) -> &str {
+        match self {
+            Shell::Bash(p) => p,
+            Shell::PowerShell(p) => p,
         }
     }
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
+/// Error returned when no usable shell is found on the system. Names the
+/// shells that were probed so the terminal tool can surface a clear message
+/// (FR-011: "no panic").
+#[derive(Debug)]
+struct ShellResolutionError {
+    /// Shell names probed, in resolution order.
+    tried: Vec<&'static str>,
+}
+
+impl std::fmt::Display for ShellResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No usable shell found. Tried: {}. Install Git Bash (recommended) or PowerShell.",
+            self.tried.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for ShellResolutionError {}
+
+/// Resolve which shell to use, following the platform-specific order
+/// (contracts/shell-discovery.md):
+///
+/// - **Unix**: `bash` on PATH → `/usr/bin/bash` → `/bin/bash` → `$SHELL`
+///   → `/bin/sh`. Always returns `Shell::Bash`.
+/// - **Windows**: `bash` (Git Bash) → `pwsh` (PowerShell 7+) → `powershell`
+///   (built-in Windows PowerShell). Returns `Shell::Bash` or
+///   `Shell::PowerShell`, or `Err` if none found.
+fn resolve_shell() -> Result<Shell, ShellResolutionError> {
+    #[cfg(unix)]
+    {
+        if let Ok(p) = which::which("bash") {
+            return Ok(Shell::Bash(p.to_string_lossy().into_owned()));
+        }
+        for candidate in ["/usr/bin/bash", "/bin/bash"] {
+            if std::path::Path::new(candidate).is_file() {
+                return Ok(Shell::Bash(candidate.to_string()));
+            }
+        }
+        // Final fallback — always succeed on Unix (sh is guaranteed).
+        Ok(Shell::Bash(
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Ok(p) = which::which("bash") {
+            return Ok(Shell::Bash(p.to_string_lossy().into_owned()));
+        }
+        if let Ok(p) = which::which("pwsh") {
+            return Ok(Shell::PowerShell(p.to_string_lossy().into_owned()));
+        }
+        if let Ok(p) = which::which("powershell") {
+            return Ok(Shell::PowerShell(p.to_string_lossy().into_owned()));
+        }
+        Err(ShellResolutionError {
+            tried: vec!["bash", "pwsh", "powershell"],
+        })
+    }
+}
+
+/// Per-process cache of the resolved shell (FR-013). Once a shell is
+/// chosen, the session reuses it on every subsequent terminal call without
+/// re-probing, so a session never flips between bash and PowerShell.
+static RESOLVED_SHELL: Lazy<std::sync::Mutex<Option<Shell>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
+
+/// Return the cached shell, resolving + caching it on first call. Maps a
+/// resolution failure to `None` (callers handle the absent-shell case).
+fn cached_shell() -> Option<Shell> {
+    let mut guard = RESOLVED_SHELL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(ref shell) = *guard {
+        return Some(shell.clone());
+    }
+    match resolve_shell() {
+        Ok(shell) => {
+            *guard = Some(shell.clone());
+            Some(shell)
+        }
+        Err(_) => None,
+    }
+}
+
+// ── OutputChunkStream boundary (feature 014, FR-005) ─────────────────────
+//
+// Conceptual interface (NOT a `dyn` trait — two concrete cfg-selected types):
+//
+//   async fn next_chunk(&mut self) -> Option<Vec<u8>>;
+//
+// Invariants (both concrete impls):
+//   - Returns Some(bytes) for each read chunk (≤ 64 KB).
+//   - Returns None exactly once at EOF.
+//   - Does NOT decode UTF-8 (caller does lossy decode) — bytes in, bytes out.
+//   - Does NOT throttle or spill to disk (that's stream_output's job).
+//
+// Concrete impls:
+//   - Unix  (`#[cfg(unix)]`):  UnixFdReader      — landed in US1 (T008)
+//   - Win   (`#[cfg(not(unix))]`): WindowsPipeReader — landed in US2 (T013)
+//
+// The shared `stream_output` body operates on this boundary, not on
+// AsyncFd directly, so it compiles cross-platform.
+
+// ── WrapperScript (feature 014, FR-012) ───────────────────────────────────
+
+/// A generated wrapper script that wraps the user's command to capture the
+/// exit code and emit the CWD marker. Generated per-call from `Shell` +
+/// user command; consumed immediately by the spawn path.
+#[derive(Clone, Debug)]
+struct WrapperScript {
+    /// Dialect that generated this script (drives arg shape).
+    shell: Shell,
+    /// Shell executable path (shorthand for `shell.argv0()`).
+    argv0: String,
+    /// Args to pass after argv0: bash → ["-c", body]; PowerShell →
+    /// ["-NoProfile", "-Command", body].
+    args: Vec<String>,
+    /// The full script text incl. user command + marker framing.
+    body: String,
+}
+
+/// Build the wrapper script for the resolved shell + user command.
+///
+/// - **Bash** (unchanged from the original `run_bash` wrapper,
+///   terminal_tool.rs:476–480): captures `$?`, prints `$PWD` between
+///   `CWD_MARKER` framing, exits with the captured code.
+/// - **PowerShell** (new, FR-012): captures `$LASTEXITCODE` (falling back
+///   to `$?`), prints `$PWD` between `CWD_MARKER` framing, exits with the
+///   code. `-NoProfile` avoids the multi-hundred-ms profile-load penalty.
+fn build_wrapper_script(shell: &Shell, command: &str, marker: &str) -> WrapperScript {
+    match shell {
+        Shell::Bash(path) => {
+            let body = format!(
+                "{command}\n__JOEY_STATUS=$?\nprintf '\\n{m}%s{m}' \"$PWD\"\nexit $__JOEY_STATUS",
+                command = command,
+                m = marker
+            );
+            WrapperScript {
+                shell: shell.clone(),
+                argv0: path.clone(),
+                args: vec!["-c".to_string(), body.clone()],
+                body,
+            }
+        }
+        Shell::PowerShell(path) => {
+            let body = format!(
+                "{command}\n$code = $LASTEXITCODE\nif ($code -eq $null) {{ $code = if ($?) {{ 0 }} else {{ 1 }} }}\nWrite-Output \"`n{m}$PWD{m}\"\nexit $code",
+                command = command,
+                m = marker
+            );
+            WrapperScript {
+                shell: shell.clone(),
+                argv0: path.clone(),
+                args: vec!["-NoProfile".to_string(), "-Command".to_string(), body.clone()],
+                body,
+            }
+        }
+    }
 }
 
 /// Tier-1 secrets stripped from EVERY spawned subprocess
@@ -279,7 +450,7 @@ impl Tool for Terminal {
         let pre_snapshot = snapshot_tracked_files();
 
         let (raw_output, returncode, timed_out, interrupted) =
-            run_bash(&command, &cwd, effective_timeout, ctx).await;
+            run_command(&command, &cwd, effective_timeout, ctx).await;
 
         // Spawn/exec failures surface in the error field (upstream:
         // {"output": "", "exit_code": -1, "error": "Command execution failed: ..."}).
@@ -360,11 +531,27 @@ impl Terminal {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let bash = find_bash();
-        let mut cmd = tokio::process::Command::new(&bash);
-        cmd.arg("-c")
-            .arg(&command)
-            .current_dir(cwd)
+        let shell = match cached_shell() {
+            Some(s) => s,
+            None => {
+                return ToolResult::Text(dumps(&json!({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": "No usable shell found. Tried: bash, pwsh, powershell.",
+                    "status": "error",
+                })));
+            }
+        };
+        let mut cmd = tokio::process::Command::new(shell.argv0());
+        match &shell {
+            Shell::Bash(_) => {
+                cmd.arg("-c").arg(&command);
+            }
+            Shell::PowerShell(_) => {
+                cmd.arg("-NoProfile").arg("-Command").arg(&command);
+            }
+        }
+        cmd.current_dir(cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -452,11 +639,25 @@ fn extract_cwd_marker(raw: &str) -> (String, Option<String>) {
     (raw.to_string(), None)
 }
 
-/// Run `command` under bash with stderr merged into stdout on a single pipe
-/// (os_pipe), a sanitized environment, and a timeout. Streams progress via
-/// `ctx.emit_progress()`. Returns (combined_output, exit_code, timed_out).
+/// Async source of output chunks — the cross-platform `OutputChunkStream`
+/// boundary (feature 014, FR-005). See the doc comment near the top of the
+/// file under "OutputChunkStream boundary".
 ///
-/// Streaming architecture (feature 009):
+/// Implementations:
+/// - `UnixFdReader` (`#[cfg(unix)]`): wraps `tokio::io::unix::AsyncFd<OwnedFd>`.
+/// - `WindowsPipeReader` (`#[cfg(not(unix))]`): wraps child stdout+stderr.
+#[async_trait]
+trait ChunkSource: Send {
+    /// Read the next chunk (≤ 64 KB). Returns `None` at EOF.
+    async fn next_chunk(&mut self) -> Option<Vec<u8>>;
+}
+
+/// Run `command` under the resolved shell with stderr merged into stdout on
+/// a single pipe (os_pipe), a sanitized environment, and a timeout. Streams
+/// progress via `ctx.emit_progress()`. Returns (combined_output, exit_code,
+/// timed_out, interrupted).
+///
+/// Streaming architecture (feature 009, preserved byte-for-byte by feature 014):
 /// - The os_pipe reader FD is wrapped in `tokio::io::AsyncFd` for native async
 ///   read-readiness (see research.md R2). This avoids `spawn_blocking` which
 ///   stalled the turn-driving task.
@@ -465,19 +666,25 @@ fn extract_cwd_marker(raw: &str) -> (String, Option<String>) {
 /// - Each chunk emits a `ToolProgress` event (throttled to 50ms) so the user
 ///   sees live output.
 /// - Silent commands (no output for ≥ 2s) get a "running… Ns" heartbeat.
-async fn run_bash(
+#[cfg(unix)]
+async fn run_command_unix(
     command: &str,
     cwd: &std::path::Path,
     timeout_secs: u64,
     ctx: &ToolContext,
 ) -> (String, i64, bool, bool) {
-    let bash = find_bash();
-    // Wrapper: preserve $? of the user command, then print the live cwd.
-    let script = format!(
-        "{command}\n__JOEY_STATUS=$?\nprintf '\\n{m}%s{m}' \"$PWD\"\nexit $__JOEY_STATUS",
-        command = command,
-        m = CWD_MARKER
-    );
+    let shell = match cached_shell() {
+        Some(s) => s,
+        None => {
+            return (
+                "No usable shell found. Install bash.".to_string(),
+                -1,
+                false,
+                false,
+            )
+        }
+    };
+    let wrapper = build_wrapper_script(&shell, command, CWD_MARKER);
 
     let (mut reader, writer) = match os_pipe::pipe() {
         Ok(p) => p,
@@ -488,9 +695,8 @@ async fn run_bash(
         Err(e) => return (format!("Failed to execute command: {}", e), -1, false, false),
     };
 
-    let mut cmd = tokio::process::Command::new(&bash);
-    cmd.arg("-c")
-        .arg(&script)
+    let mut cmd = tokio::process::Command::new(&wrapper.argv0);
+    cmd.args(&wrapper.args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(writer))
@@ -537,9 +743,14 @@ async fn run_bash(
         }
     };
 
+    let reader = UnixFdReader {
+        async_fd,
+        buf: vec![0u8; 64 * 1024],
+    };
+
     // Stream output with progress, timeout, and heartbeat.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    let (output, interrupted) = stream_output(async_fd, ctx, deadline).await;
+    let (output, interrupted) = stream_output(Box::new(reader), ctx, deadline).await;
 
     // On cooperative interrupt, kill the child immediately and return the
     // partial output captured so far. The agent's post-dispatch interrupt
@@ -580,16 +791,134 @@ async fn run_bash(
     (output, code, timed_out, false)
 }
 
+/// Minimal Windows foreground command runner (feature 014 US1 stub).
+///
+/// For US1 this spawns the resolved shell and reads stdout+stderr to
+/// completion (blocking-style via `AsyncReadExt`), returning the combined
+/// output + exit code. Full streaming + PowerShell support lands in US2
+/// (T013–T015) which replaces this body with the streaming equivalent.
+#[cfg(not(unix))]
+async fn run_command_windows(
+    command: &str,
+    cwd: &std::path::Path,
+    timeout_secs: u64,
+    ctx: &ToolContext,
+) -> (String, i64, bool, bool) {
+    use tokio::io::AsyncReadExt;
+
+    let shell = match cached_shell() {
+        Some(s) => s,
+        None => {
+            return (
+                "No usable shell found. Tried: bash, pwsh, powershell.".to_string(),
+                -1,
+                false,
+                false,
+            )
+        }
+    };
+    let wrapper = build_wrapper_script(&shell, command, CWD_MARKER);
+
+    let mut cmd = tokio::process::Command::new(&wrapper.argv0);
+    cmd.args(&wrapper.args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd.env_clear();
+    for (k, v) in sanitized_env() {
+        cmd.env(k, v);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return (format!("Failed to spawn command: {}", e), -1, false, false),
+    };
+
+    let mut stdout = child.stdout.take().unwrap_or_else(|| {
+        // Should not happen with Stdio::piped(), but guard anyway.
+        // tokio doesn't let us construct a closed ChildStdout easily; use
+        // the FD-less path by treating None as immediate EOF in the read loop.
+        unreachable!("Stdio::piped() guarantees Some(stdout)")
+    });
+    let mut stderr = child
+        .stderr
+        .take()
+        .unwrap_or_else(|| unreachable!("Stdio::piped() guarantees Some(stderr)"));
+
+    // US1 stub: read both streams to completion, then merge. US2 (T015)
+    // replaces this with the streaming WindowsPipeReader + stream_output.
+    let mut out_buf = Vec::new();
+    let mut err_buf = Vec::new();
+    let read_out = stdout.read_to_end(&mut out_buf);
+    let read_err = stderr.read_to_end(&mut err_buf);
+
+    let (r1, r2) = tokio::join!(read_out, read_err);
+    let _ = (r1, r2);
+
+    let mut combined = out_buf;
+    combined.extend_from_slice(&err_buf);
+    let output = String::from_utf8_lossy(&combined).into_owned();
+
+    let status = match tokio::time::timeout(
+        Duration::from_secs(timeout_secs.max(1)),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(s)) => Some(s),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            None
+        }
+    };
+
+    let timed_out = status.is_none();
+    let code = if timed_out {
+        124
+    } else {
+        exit_code_from_status(status, timed_out)
+    };
+
+    // Suppress unused-warning for ctx (full streaming uses it in US2).
+    let _ = ctx;
+
+    (output, code, timed_out, false)
+}
+
+/// Cross-platform dispatcher: selects the Unix or Windows implementation.
+#[allow(unused_variables)]
+async fn run_command(
+    command: &str,
+    cwd: &std::path::Path,
+    timeout_secs: u64,
+    ctx: &ToolContext,
+) -> (String, i64, bool, bool) {
+    #[cfg(unix)]
+    {
+        run_command_unix(command, cwd, timeout_secs, ctx).await
+    }
+    #[cfg(not(unix))]
+    {
+        run_command_windows(command, cwd, timeout_secs, ctx).await
+    }
+}
+
 /// Wrapper to give a raw FD the `AsRawFd` impl that `AsyncFd` requires.
 /// We own this FD (via `dup`) and must close it on drop.
+#[cfg(unix)]
 struct OwnedFd(std::os::unix::io::RawFd);
 
+#[cfg(unix)]
 impl std::os::unix::io::AsRawFd for OwnedFd {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         self.0
     }
 }
 
+#[cfg(unix)]
 impl Drop for OwnedFd {
     fn drop(&mut self) {
         unsafe {
@@ -600,8 +929,60 @@ impl Drop for OwnedFd {
 
 // SAFETY: OwnedFd is just a raw FD — safe to send/share across threads.
 // The FD is not shared (we dup'd it), and close-on-drop is the only mutation.
+#[cfg(unix)]
 unsafe impl Send for OwnedFd {}
+#[cfg(unix)]
 unsafe impl Sync for OwnedFd {}
+
+/// Unix concrete `OutputChunkStream` impl (T008). Wraps `AsyncFd<OwnedFd>`
+/// and implements the `ChunkSource` trait by reading via readiness + libc.
+/// This is a mechanical extraction of the read logic that previously lived
+/// inline in `stream_output` — byte-for-byte identical behavior (feature 014
+/// Principle VII).
+#[cfg(unix)]
+struct UnixFdReader {
+    async_fd: tokio::io::unix::AsyncFd<OwnedFd>,
+    buf: Vec<u8>,
+}
+
+#[cfg(unix)]
+#[async_trait]
+impl ChunkSource for UnixFdReader {
+    async fn next_chunk(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let guard = self.async_fd.readable().await;
+            let mut guard = match guard {
+                Ok(g) => g,
+                Err(_) => return None, // FD error — treat as EOF.
+            };
+            // Try a non-blocking read.
+            let n = match guard.try_io(|inner| {
+                let fd = inner.get_ref().as_raw_fd();
+                let ret =
+                    unsafe { libc::read(fd, self.buf.as_mut_ptr() as *mut _, self.buf.len()) };
+                if ret < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(ret as usize)
+                }
+            }) {
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) => return None, // EOF or error
+                Err(_would_block) => {
+                    // Spurious readiness — loop and try again.
+                    continue;
+                }
+            };
+            drop(guard);
+
+            if n == 0 {
+                // EOF
+                return None;
+            }
+            return Some(self.buf[..n].to_vec());
+        }
+    }
+}
 
 /// Extract the exit code from an `ExitStatus` using the same logic as the
 /// old `run_bash`.
@@ -625,10 +1006,10 @@ fn exit_code_from_status(status: Option<std::process::ExitStatus>, timed_out: bo
     }
 }
 
-/// Stream output from the `AsyncFd`, emitting progress events, with timeout
-/// and heartbeat. Returns the full accumulated output as a `String`.
+/// Stream output from a `ChunkSource`, emitting progress events, with
+/// timeout and heartbeat. Returns the full accumulated output as a `String`.
 ///
-/// This implements:
+/// This implements (feature 014, shared cross-platform body):
 /// - T006: temp-file capture (outputs > 4 KB spill to disk, bounded memory)
 /// - T007: chunk coalescing (50ms throttle window)
 /// - T008: elapsed-time heartbeat (2s interval for silent commands)
@@ -636,8 +1017,12 @@ fn exit_code_from_status(status: Option<std::process::ExitStatus>, timed_out: bo
 ///
 /// Returns `(full_output, interrupted)` where `interrupted` is true when the
 /// loop broke early because the user requested cancellation.
+///
+/// The platform-specific read logic lives in the `ChunkSource` impl
+/// (`UnixFdReader` on Unix, `WindowsPipeReader` on Windows). Everything in
+/// this function body is platform-neutral.
 async fn stream_output(
-    async_fd: tokio::io::unix::AsyncFd<OwnedFd>,
+    mut source: Box<dyn ChunkSource>,
     ctx: &ToolContext,
     deadline: tokio::time::Instant,
 ) -> (String, bool) {
@@ -669,9 +1054,13 @@ async fn stream_output(
 
     let mut interrupted = false;
 
-    let mut buf = vec![0u8; CHUNK_SIZE];
-
     loop {
+        // Pin the read future so we can race it in select!. `next_chunk`
+        // is cancellation-safe: re-creating it each iteration re-arms FD
+        // readiness without losing data (the FD is non-blocking + edge-trigged).
+        let read_fut = source.next_chunk();
+        tokio::pin!(read_fut);
+
         tokio::select! {
             biased;
 
@@ -683,6 +1072,12 @@ async fn stream_output(
                     interrupted = true;
                     break;
                 }
+                // Not interrupted — the read future is still pending; poll it
+                // by falling through. We need to await read_fut after this
+                // select arm fires, but select consumed the tick. Loop again
+                // to re-create the read future (cheap; next_chunk is
+                // cancellation-safe — it re-arms readiness on the FD).
+                continue;
             }
 
             _ = tokio::time::sleep_until(deadline) => {
@@ -692,85 +1087,63 @@ async fn stream_output(
             }
 
             _ = heartbeat.tick() => {
-                // Silent-command heartbeat: emit elapsed time if no output
-                // has been seen recently.
+                // Silent-command heartbeat.
                 if pending_chunk.is_empty() {
                     let elapsed = start.elapsed().as_secs();
                     ctx.emit_progress(format!("running… {}s", elapsed));
                 }
+                continue;
             }
 
-            guard = async_fd.readable() => {
-                let mut guard = match guard {
-                    Ok(g) => g,
-                    Err(_) => break, // FD error — treat as EOF.
-                };
-                // Try a non-blocking read.
-                let n = match guard.try_io(|inner| {
-                    let fd = inner.get_ref().as_raw_fd();
-                    let ret = unsafe {
-                        libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len())
-                    };
-                    if ret < 0 {
-                        Err(std::io::Error::last_os_error())
-                    } else {
-                        Ok(ret as usize)
+            chunk = &mut read_fut => {
+                match chunk {
+                    None => {
+                        // EOF: flush pending and stop.
+                        flush_chunk(&pending_chunk, ctx, &mut last_emit);
+                        break;
                     }
-                }) {
-                    Ok(Ok(n)) => n,
-                    Ok(Err(_)) => break, // EOF or error
-                    Err(_would_block) => {
-                        // Spurious readiness — loop and try again.
-                        continue;
-                    }
-                };
-                drop(guard);
+                    Some(bytes) => {
+                        let n = bytes.len();
+                        let chunk = &bytes[..];
 
-                if n == 0 {
-                    // EOF: flush pending and stop.
-                    flush_chunk(&pending_chunk, ctx, &mut last_emit);
-                    break;
-                }
-
-                let chunk = &buf[..n];
-
-                // Write to output capture.
-                total_bytes += n;
-                if total_bytes > SMALL_THRESHOLD {
-                    // Spill to temp file.
-                    if temp_file.is_none() {
-                        let mut existing = std::mem::take(&mut mem_buf);
-                        match tempfile::NamedTempFile::new() {
-                            Ok(mut f) => {
+                        // Write to output capture.
+                        total_bytes += n;
+                        if total_bytes > SMALL_THRESHOLD {
+                            // Spill to temp file.
+                            if temp_file.is_none() {
+                                let mut existing = std::mem::take(&mut mem_buf);
+                                match tempfile::NamedTempFile::new() {
+                                    Ok(mut f) => {
+                                        use std::io::Write;
+                                        let _ = f.write_all(&existing);
+                                        let _ = f.write_all(chunk);
+                                        temp_file = Some(f);
+                                        existing.clear();
+                                    }
+                                    Err(_) => {
+                                        // Can't create temp file — keep in memory.
+                                        mem_buf.extend_from_slice(chunk);
+                                    }
+                                }
+                            } else if let Some(ref mut f) = temp_file {
                                 use std::io::Write;
-                                let _ = f.write_all(&existing);
                                 let _ = f.write_all(chunk);
-                                temp_file = Some(f);
-                                existing.clear();
                             }
-                            Err(_) => {
-                                // Can't create temp file — keep in memory.
-                                mem_buf.extend_from_slice(chunk);
-                            }
+                        } else {
+                            mem_buf.extend_from_slice(chunk);
                         }
-                    } else if let Some(ref mut f) = temp_file {
-                        use std::io::Write;
-                        let _ = f.write_all(chunk);
-                    }
-                } else {
-                    mem_buf.extend_from_slice(chunk);
-                }
 
-                // Throttle progress events: emit when 50ms have elapsed
-                // since the last emit (or the pending buffer is full). The
-                // first chunk emits immediately because `last_emit` is None.
-                pending_chunk.extend_from_slice(chunk);
-                let now = tokio::time::Instant::now();
-                let throttle_elapsed = last_emit
-                    .map_or(true, |t| now.duration_since(t) >= Duration::from_millis(THROTTLE_MS));
-                if throttle_elapsed || pending_chunk.len() >= CHUNK_SIZE {
-                    flush_chunk(&pending_chunk, ctx, &mut last_emit);
-                    pending_chunk.clear();
+                        // Throttle progress events: emit when 50ms have elapsed
+                        // since the last emit (or the pending buffer is full).
+                        pending_chunk.extend_from_slice(chunk);
+                        let now = tokio::time::Instant::now();
+                        let throttle_elapsed = last_emit
+                            .map_or(true, |t| now.duration_since(t) >= Duration::from_millis(THROTTLE_MS));
+                        if throttle_elapsed || pending_chunk.len() >= CHUNK_SIZE {
+                            flush_chunk(&pending_chunk, ctx, &mut last_emit);
+                            pending_chunk.clear();
+                        }
+                    }
                 }
             }
         }
