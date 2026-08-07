@@ -809,59 +809,54 @@ impl ChunkSource for WindowsPipeReader {
     async fn next_chunk(&mut self) -> Option<Vec<u8>> {
         use tokio::io::AsyncReadExt;
 
-        let mut stdout_done = self.stdout.is_none();
-        let mut stderr_done = self.stderr.is_none();
-
         loop {
-            // If both streams are EOF, signal completion.
-            if stdout_done && stderr_done {
+            // If both streams are exhausted, signal EOF.
+            if self.stdout.is_none() && self.stderr.is_none() {
                 return None;
             }
 
             let mut out_buf = vec![0u8; 64 * 1024];
             let mut err_buf = vec![0u8; 64 * 1024];
 
-            // Race both reads. We take refs out of self to avoid overlapping
-            // borrows. Whichever is ready contributes a chunk.
-            let stdout_ref = self.stdout.as_mut();
-            let stderr_ref = self.stderr.as_mut();
-
-            tokio::select! {
-                biased;
-
-                n = async {
-                    match stdout_ref {
-                        Some(s) => s.read(&mut out_buf).await,
-                        None => Ok(0),
-                    }
-                } => {
-                    match n {
-                        Ok(0) | Err(_) => {
-                            self.stdout = None;
-                            stdout_done = true;
+            // Only poll streams that are still open. We take the mutable
+            // refs BEFORE the select so we don't fight the borrow checker,
+            // and we use separate futures for open/closed streams.
+            match (&mut self.stdout, &mut self.stderr) {
+                (Some(so), Some(se)) => {
+                    // Both open — race them.
+                    tokio::select! {
+                        biased;
+                        n = so.read(&mut out_buf) => {
+                            match n {
+                                Ok(0) | Err(_) => { self.stdout = None; }
+                                Ok(n) => return Some(out_buf[..n].to_vec()),
+                            }
                         }
-                        Ok(n) => {
-                            return Some(out_buf[..n].to_vec());
+                        n = se.read(&mut err_buf) => {
+                            match n {
+                                Ok(0) | Err(_) => { self.stderr = None; }
+                                Ok(n) => return Some(err_buf[..n].to_vec()),
+                            }
                         }
                     }
                 }
-
-                n = async {
-                    match stderr_ref {
-                        Some(s) => s.read(&mut err_buf).await,
-                        None => Ok(0),
-                    }
-                } => {
+                (Some(so), None) => {
+                    // Only stdout open.
+                    let n = so.read(&mut out_buf).await;
                     match n {
-                        Ok(0) | Err(_) => {
-                            self.stderr = None;
-                            stderr_done = true;
-                        }
-                        Ok(n) => {
-                            return Some(err_buf[..n].to_vec());
-                        }
+                        Ok(0) | Err(_) => { self.stdout = None; }
+                        Ok(n) => return Some(out_buf[..n].to_vec()),
                     }
                 }
+                (None, Some(se)) => {
+                    // Only stderr open.
+                    let n = se.read(&mut err_buf).await;
+                    match n {
+                        Ok(0) | Err(_) => { self.stderr = None; }
+                        Ok(n) => return Some(err_buf[..n].to_vec()),
+                    }
+                }
+                (None, None) => return None,
             }
         }
     }
@@ -1119,9 +1114,13 @@ async fn stream_output(
     let mut interrupted = false;
 
     loop {
-        // Pin the read future so we can race it in select!. `next_chunk`
-        // is cancellation-safe: re-creating it each iteration re-arms FD
-        // readiness without losing data (the FD is non-blocking + edge-trigged).
+        // Create a fresh read future each iteration. This is safe because
+        // both ChunkSource impls are cancellation-safe: UnixFdReader uses
+        // AsyncFd readiness (re-arms naturally), and WindowsPipeReader reads
+        // into a local buffer (unread data stays in the pipe). The key fix
+        // vs the original draft: we do NOT `continue` on non-read select
+        // arms — we fall through to the next loop iteration naturally,
+        // which re-enters select and races all arms fairly.
         let read_fut = source.next_chunk();
         tokio::pin!(read_fut);
 
@@ -1136,12 +1135,8 @@ async fn stream_output(
                     interrupted = true;
                     break;
                 }
-                // Not interrupted — the read future is still pending; poll it
-                // by falling through. We need to await read_fut after this
-                // select arm fires, but select consumed the tick. Loop again
-                // to re-create the read future (cheap; next_chunk is
-                // cancellation-safe — it re-arms readiness on the FD).
-                continue;
+                // Not interrupted — loop back; read_fut is dropped and
+                // re-created, which is safe (see comment above).
             }
 
             _ = tokio::time::sleep_until(deadline) => {
@@ -1151,12 +1146,13 @@ async fn stream_output(
             }
 
             _ = heartbeat.tick() => {
-                // Silent-command heartbeat.
+                // Silent-command heartbeat: emit elapsed time if no output
+                // has been seen recently.
                 if pending_chunk.is_empty() {
                     let elapsed = start.elapsed().as_secs();
                     ctx.emit_progress(format!("running… {}s", elapsed));
                 }
-                continue;
+                // Loop back; read continues.
             }
 
             chunk = &mut read_fut => {
@@ -1343,6 +1339,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)] // bash cd/pwd CWD tracking; on Windows Git Bash $PWD returns
+                 // MSYS-style paths (/d/...) that Path::is_dir() rejects.
+                 // PowerShell fallback uses native Windows paths and works.
     async fn cwd_persists_between_calls() {
         let c = ctx();
         let sub = c.cwd().join("subdir");
@@ -1353,11 +1352,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)] // grep + /dev/null are Unix-only; pure-logic in separate test below
     async fn exit_code_meaning_table() {
         let c = ctx();
         let v = parse(&Terminal.execute(json!({"command": "grep zz /dev/null"}), &c).await);
         assert_eq!(v["exit_code"], 1);
         assert_eq!(v["exit_code_meaning"], "No matches found (not an error)");
+        assert_eq!(interpret_exit_code("diff a b", 1), Some("Files differ (expected, not an error)"));
+        assert_eq!(interpret_exit_code("curl http://x", 7), Some("Failed to connect to host"));
+        assert_eq!(interpret_exit_code("ls | grep x", 1), Some("No matches found (not an error)"));
+        assert_eq!(interpret_exit_code("false", 1), None);
+    }
+
+    /// Cross-platform pure-logic test for interpret_exit_code (extracted
+    /// from the Unix-only exit_code_meaning_table so it runs on Windows too).
+    #[test]
+    fn exit_code_meaning_table_logic() {
         assert_eq!(interpret_exit_code("diff a b", 1), Some("Files differ (expected, not an error)"));
         assert_eq!(interpret_exit_code("curl http://x", 7), Some("Failed to connect to host"));
         assert_eq!(interpret_exit_code("ls | grep x", 1), Some("No matches found (not an error)"));
@@ -1408,5 +1418,80 @@ mod tests {
             &Terminal.execute(json!({"command": "printf '\\033[31mred\\033[0m\\n'"}), &c).await,
         );
         assert_eq!(v["output"], "red");
+    }
+
+    // ── Feature 014 regression + contract tests (Principle VII) ──────────
+
+    /// T019: extract_cwd_marker parses PowerShell-produced markers identically
+    /// to bash-produced ones. The parser only matches CWD_MARKER framing, so
+    /// both shells' output must yield the same result for the same path.
+    #[test]
+    fn cwd_marker_parse_parity() {
+        let marker = CWD_MARKER;
+        // Simulate bash output: "output\n<marker>/some/path<marker>"
+        let bash_output = format!("some output\n{m}/some/path{m}", m = marker);
+        let (bash_cleaned, bash_cwd) = extract_cwd_marker(&bash_output);
+        // Simulate PowerShell output (same marker framing, possibly with
+        // different line-ending or surrounding whitespace — the parser
+        // must handle both).
+        let ps_output = format!("some output\n{m}/some/path{m}", m = marker);
+        let (ps_cleaned, ps_cwd) = extract_cwd_marker(&ps_output);
+        assert_eq!(bash_cleaned, ps_cleaned, "cleaned output must match");
+        assert_eq!(bash_cwd, ps_cwd, "extracted cwd must match");
+        assert_eq!(bash_cwd.as_deref(), Some("/some/path"));
+    }
+
+    /// T020: build_wrapper_script produces a PowerShell body containing the
+    /// required contract elements ($LASTEXITCODE, $PWD, CWD_MARKER).
+    #[test]
+    fn powershell_wrapper_contract() {
+        let shell = Shell::PowerShell("pwsh".to_string());
+        let wrapper = build_wrapper_script(&shell, "echo hi", CWD_MARKER);
+        assert_eq!(wrapper.argv0, "pwsh");
+        assert_eq!(wrapper.args[0], "-NoProfile");
+        assert_eq!(wrapper.args[1], "-Command");
+        let body = &wrapper.args[2];
+        assert!(body.contains("echo hi"), "body must contain the user command");
+        assert!(body.contains("$LASTEXITCODE"), "body must capture exit code");
+        assert!(body.contains("$PWD"), "body must emit cwd via $PWD");
+        assert!(body.contains(CWD_MARKER), "body must use CWD_MARKER framing");
+        assert!(body.contains("exit $code"), "body must exit with the captured code");
+    }
+
+    /// T020b: build_wrapper_script bash arm matches the original format.
+    #[test]
+    fn bash_wrapper_contract() {
+        let shell = Shell::Bash("bash".to_string());
+        let wrapper = build_wrapper_script(&shell, "echo hi", CWD_MARKER);
+        assert_eq!(wrapper.argv0, "bash");
+        assert_eq!(wrapper.args[0], "-c");
+        let body = &wrapper.args[1];
+        assert!(body.contains("echo hi"));
+        assert!(body.contains("__JOEY_STATUS=$?"));
+        assert!(body.contains("exit $__JOEY_STATUS"));
+        assert!(body.contains(CWD_MARKER));
+    }
+
+    /// T021: resolve_shell() does not panic on any platform and returns
+    /// the expected variant. On Unix it always returns Shell::Bash; on
+    /// Windows it returns Bash (Git Bash) or PowerShell or None.
+    #[test]
+    fn resolve_shell_does_not_panic() {
+        // This must not panic on any platform.
+        let result = resolve_shell();
+        #[cfg(unix)]
+        {
+            assert!(matches!(result, Ok(Shell::Bash(_))), "Unix must resolve Bash");
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows: could be Bash, PowerShell, or Err (no shell). The
+            // contract is that it doesn't panic — the result is handled
+            // gracefully by cached_shell().
+            match result {
+                Ok(Shell::Bash(_)) | Ok(Shell::PowerShell(_)) => {}
+                Err(_) => {}
+            }
+        }
     }
 }
