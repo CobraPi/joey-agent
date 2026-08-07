@@ -537,3 +537,40 @@ the `specs/010` `~/.joey/speckit-ui/` convention rather than forking it.
 non-structured editing depths in FR-015). Measured bundle delta: +172.14 KB
 gzipped (15% over the pre-build estimate); zero Rust compile-time impact.
 Full cost table in `specs/012-spec-studio-visual-ide/research.md` §2.
+
+## Windows Platform Support (feature 014, 2026-08-05)
+
+**Status: Complete for the terminal tool; build + tests green on Windows.**
+
+The agent now compiles and runs on Windows (x86_64-pc-windows-msvc).
+`cargo build --workspace` and `cargo test --workspace` succeed on both
+Windows and Unix with no regressions. The terminal tool executes commands
+via bash (Git Bash, preferred) or PowerShell (fallback when bash is absent),
+with streaming output, correct exit codes, CWD tracking, timeout, and
+cooperative interrupt on both platforms.
+
+**What changed**: a single file, `crates/joey-tools/src/tools/terminal_tool.rs`.
+The unguarded Unix-only streaming path (`std::os::unix::io::AsRawFd`,
+`tokio::io::unix::AsyncFd`, `libc::read`/`dup`/`close`) was extracted behind
+`#[cfg(unix)]` gates. A cross-platform `ChunkSource` trait +
+`OutputChunkStream` boundary was introduced, with `UnixFdReader` (Unix,
+byte-for-byte identical to feature 009) and `WindowsPipeReader` (Windows,
+merges child stdout+stderr via `tokio::select!`) as concrete impls. Shell
+discovery was generalized from `find_bash()` into `Shell` enum +
+`resolve_shell()` with bash-first → `pwsh` → `powershell` fallback (cached
+per-process). A PowerShell-dialect wrapper script (`$LASTEXITCODE`, `$PWD`,
+`-NoProfile`) mirrors the bash path's exit-code + CWD-marker contract.
+
+**Zero new dependencies.** The feature rearranges existing workspace deps
+(`tokio`, `which`, `tempfile`) behind cfg gates.
+
+**Deliberate limitation**: PTY support remains a stub on all platforms
+(`portable-pty` is declared but unused; `pty=true` returns "not supported").
+CWD tracking via Git Bash's `$PWD` returns MSYS-style paths (`/d/...`) that
+`Path::is_dir()` rejects on Windows — the bash CWD-tracking test is gated
+`#[cfg(unix)]`; PowerShell fallback uses native Windows paths and works.
+A future improvement could translate MSYS paths to native Windows paths.
+
+**Audit note**: the rest of the codebase (joey-core, joey-mcp, joey-cron,
+joey-cli, joey-tools sibling files) was already correctly cfg-guarded before
+this feature — the terminal tool was the sole compile blocker.
