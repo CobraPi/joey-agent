@@ -45,6 +45,10 @@ redefinition of existing principles).
 
 ## Core Principles
 
+#### 0. Complete Cross-Platform Compatibility
+All code should be implemented with cross-platform compatibility in mind. Any windows-only code should have a unix alternative and vice versa.
+All features should be completely cross-platform compatible.
+
 ### I. Workspace-First Rust
 Every feature lives in a dedicated crate under `crates/` within the existing
 Cargo workspace; no code is added directly to the workspace root. Crates are
