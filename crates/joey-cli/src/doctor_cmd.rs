@@ -126,7 +126,7 @@ pub fn doctor_command(args: &DoctorArgs) -> Result<i32> {
     let provider_setting = config.get_str("model.provider", "auto");
     let base_url = config.get_str("model.base_url", "");
     let profile = joey_providers::resolve_profile(&provider_setting, &base_url, &model);
-    let has_credentials = if profile.name == "copilot" {
+    let has_credentials = if joey_providers::profile::is_copilot_wire(profile.name) {
         joey_providers::copilot::resolve_copilot_token()
             .map(|(token, _)| !token.is_empty())
             .unwrap_or(false)
@@ -137,7 +137,7 @@ pub fn doctor_command(args: &DoctorArgs) -> Result<i32> {
         check_ok("provider credentials found", &format!("(provider: {})", profile.name));
     } else {
         check_fail("no API key for the active provider", &format!("(provider: {})", profile.name));
-        if profile.name == "copilot" {
+        if joey_providers::profile::is_copilot_wire(profile.name) {
             issues.push("Authenticate with `joey auth copilot login`".to_string());
         } else {
             issues.push(format!(

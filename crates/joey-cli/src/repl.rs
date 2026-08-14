@@ -213,7 +213,7 @@ pub(crate) fn build_agent(
     // profile + active model (T057/T135). This enables category/subagent_type
     // delegation in the delegate_task tool.
     {
-        let available = joey_omo::AvailableModelSet::from_connected(
+        let available = joey_omo::AvailableModelSet::from_connected_with_catalog(
             agent.client().profile(),
             agent.model(),
         );
@@ -510,6 +510,34 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
                 "No API key found for provider '{}'. Set one with `joey model` or `joey config set <PROVIDER>_API_KEY <key>`.",
                 st.agent.client().profile().name
             ));
+        }
+    }
+
+    // NeuroCode multi-provider: when enabled and the ACTIVE provider has no
+    // tier models configured, prompt for frontier/economical picks from that
+    // provider's catalog before the first turn (interactive TTY only — never
+    // in quiet/piped/batch mode).
+    if !opts.quiet
+        && std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && opts.query.is_none()
+        && !crate::neurocode_wiring::tier_models_configured(&st.config)
+    {
+        let profile = st.agent.client().profile();
+        let mut model_list: Vec<String> =
+            crate::llm_selector::fetch_candidate_pool(profile.name)
+                .models
+                .iter()
+                .map(|m| m.id.clone())
+                .collect();
+        if model_list.is_empty() {
+            model_list = crate::model_catalog::provider_models(profile.name);
+        }
+        let _ = crate::setup_wizard::prompt_neurocode_tiers_if_needed(profile.name, &model_list);
+        // Rebuild the engine so the just-saved tier models take effect this
+        // session (try_build_engine reads config fresh).
+        let refreshed = joey_core::Config::load().unwrap_or_else(|_| st.config.clone());
+        if let Some(engine) = crate::neurocode_wiring::try_build_engine(&refreshed) {
+            st.agent.set_neurocode_engine(engine);
         }
     }
 
@@ -881,7 +909,15 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
             }
         }
         "neurocode" => {
-            let out = crate::commands::neurocode::neurocode_slash(args);
+            // Heavy subcommands (index/ingest) walk the whole tree — run the
+            // blocking handler off the async runtime (UI-freeze parity fix
+            // with the TUI; here it just keeps the runtime responsive).
+            let owned = args.to_string();
+            let out = tokio::task::spawn_blocking(move || {
+                crate::commands::neurocode::neurocode_slash(&owned)
+            })
+            .await
+            .unwrap_or_else(|e| format!("/neurocode task failed: {e}"));
             println!("{}", out);
         }
         "reasoning" => reasoning_slash(st, args),
@@ -972,7 +1008,7 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
 
 /// `/agents` — list all 11 OMO agents with resolved models, modes, availability.
 fn omo_agents_slash(st: &mut ReplState, args: &str) {
-    let available = joey_omo::AvailableModelSet::from_connected(
+    let available = joey_omo::AvailableModelSet::from_connected_with_catalog(
         st.agent.client().profile(),
         st.agent.model(),
     );

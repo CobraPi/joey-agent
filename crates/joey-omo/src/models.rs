@@ -39,6 +39,9 @@ fn billing_plan_aliases_for(canonical_provider: &str) -> &'static [&'static str]
         "xai" => &["github-copilot", "vercel", "opencode"],
         "deepseek" => &["github-copilot", "vercel", "opencode"],
         "nous" => &["github-copilot", "vercel", "opencode"],
+        // The HUD proxy fronts GitHub Copilot upstream (BC-010: chains that
+        // reference the github-copilot billing namespace resolve through it).
+        "ai-usage-hud" => &["github-copilot", "copilot", "usage-hud", "ai-usage"],
         _ => &[],
     }
 }
@@ -199,6 +202,39 @@ impl AvailableModelSet {
         let mut set = Self::new();
         for m in models {
             set.add_model(m);
+        }
+        set
+    }
+
+    /// Build from a connected profile, seeding EVERY model id from the active
+    /// provider's live catalog when one is exposed.
+    ///
+    /// When a custom Copilot-compatible endpoint is active
+    /// (`COPILOT_API_BASE_URL` pointing off githubcopilot.com — e.g. a local
+    /// reverse proxy serving the full Copilot catalog), the endpoint's
+    /// `/models` catalog is fetched and every chat-capable model id is added
+    /// to the set. This makes all proxy-served models visible to the OMO
+    /// agent registry (fallback-chain exact + family fuzzy resolution) and to
+    /// model switching, instead of only the active model + static fallbacks.
+    pub fn from_connected_with_catalog(
+        profile: &joey_providers::ProviderProfile,
+        active_model: &str,
+    ) -> Self {
+        let mut set = Self::from_connected(profile, active_model);
+        // The ai-usage-hud profile always fronts the proxy (its base URL IS
+        // the proxy); the copilot profile does so via COPILOT_API_BASE_URL.
+        let hud_active = profile.name == "ai-usage-hud"
+            || joey_providers::copilot::custom_endpoint().is_some();
+        if hud_active {
+            if let Ok(catalog) =
+                joey_providers::copilot::fetch_model_catalog(std::time::Duration::from_secs(10))
+            {
+                for entry in &catalog {
+                    if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+                        set.add_model(id.to_string());
+                    }
+                }
+            }
         }
         set
     }
@@ -445,5 +481,40 @@ mod tests {
         assert!(set.has_provider("moonshotai"));
         assert!(set.has_provider("ollama-cloud"));
         assert!(set.has_provider("aihubmix"));
+    }
+
+    /// from_connected_with_catalog() adds every catalog model id when a custom
+    /// Copilot-compatible endpoint is active, and degrades gracefully (same as
+    /// from_connected) when the catalog fetch fails or the endpoint is unset.
+    #[test]
+    fn from_connected_with_catalog_degrades_gracefully() {
+        let profile = joey_providers::profile::get_profile("copilot").unwrap();
+        // Endpoint unset: identical to from_connected (no catalog fetch).
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        let set = AvailableModelSet::from_connected_with_catalog(&profile, "gpt-5.4");
+        assert!(set.contains_exact("gpt-5.4"));
+        // Endpoint set but unreachable (nothing listening on this port):
+        // catalog fetch fails, set still contains the active model.
+        std::env::set_var("COPILOT_API_BASE_URL", "http://127.0.0.1:1");
+        let set = AvailableModelSet::from_connected_with_catalog(&profile, "gpt-5.4");
+        assert!(set.contains_exact("gpt-5.4"));
+        std::env::remove_var("COPILOT_API_BASE_URL");
+    }
+
+    /// The ai-usage-hud profile always fronts the proxy: its model set is
+    /// seeded from the proxy catalog (graceful degradation when unreachable)
+    /// and carries the copilot billing aliases for requiresProvider gating.
+    #[test]
+    fn ai_usage_hud_profile_seeds_catalog_and_billing_aliases() {
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:1");
+        let profile = joey_providers::profile::get_profile("ai-usage-hud").unwrap();
+        // Unreachable proxy: still contains the active model + static seeds.
+        let set = AvailableModelSet::from_connected_with_catalog(&profile, "gpt-5.4");
+        assert!(set.contains_exact("gpt-5.4"));
+        // BC-010 billing aliases registered.
+        assert!(set.has_provider("github-copilot"));
+        assert!(set.has_provider("usage-hud"));
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
     }
 }

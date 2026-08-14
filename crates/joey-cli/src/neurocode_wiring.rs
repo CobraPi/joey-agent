@@ -28,7 +28,33 @@ pub fn try_build_engine(config: &joey_core::Config) -> Option<Arc<DefaultEngine>
         return None;
     }
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    Some(Arc::new(DefaultEngine::new(nc_cfg, project_root)))
+    let mut engine = DefaultEngine::new(nc_cfg, project_root);
+    // Scope tier-model resolution to the active provider's per-provider tier
+    // config (`neurocode.tier.providers.<id>`), resolved the same way the
+    // agent resolves it (resolve_profile over provider/base_url/model).
+    let provider = config.get_str("model.provider", "auto");
+    let base_url = config.get_str("model.base_url", "");
+    let model = config.model();
+    let profile = joey_providers::resolve_profile(&provider, &base_url, &model);
+    engine.set_provider(profile.name);
+    Some(Arc::new(engine))
+}
+
+/// Whether the active provider's NeuroCode tier models are configured —
+/// either a per-provider entry (`neurocode.tier.providers.<id>`) or the flat
+/// legacy keys. When false and NeuroCode is enabled, callers should prompt
+/// the user to pick frontier/economical models from the provider's catalog.
+pub fn tier_models_configured(config: &joey_core::Config) -> bool {
+    let nc_cfg = NeuroCodeConfig::from_config(config);
+    if !nc_cfg.enabled {
+        return true; // nothing to configure when disabled
+    }
+    let provider = config.get_str("model.provider", "auto");
+    let base_url = config.get_str("model.base_url", "");
+    let model = config.model();
+    let profile = joey_providers::resolve_profile(&provider, &base_url, &model);
+    let tiers = nc_cfg.tier.tiers_for_provider(profile.name);
+    !tiers.frontier.is_empty() && !tiers.economical.is_empty()
 }
 
 /// Bridge `DefaultEngine` to the `NeuroCodeBackend` trait the joey-tools
@@ -127,5 +153,59 @@ mod tests {
         // status() returns the same text as the engine's status_text().
         let status = backend.status();
         assert!(status.contains("NeuroCode"));
+    }
+
+    #[test]
+    fn engine_scopes_tier_resolution_to_active_provider() {
+        // Per-provider tier entry for the resolved profile wins over the flat
+        // legacy keys, so provider switches can't leak another provider's
+        // models into the tier routing. ambiguous_default: frontier makes
+        // resolve_tier_model consult the frontier tier.
+        let model_yaml = "model:\n  provider: zai\n  default: glm-5.2\n";
+        let config = config_with_yaml(&format!(
+            "{}neurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    frontier:\n      model: legacy-frontier\n    providers:\n      zai:\n        frontier: glm-5.2\n",
+            model_yaml
+        ));
+        let engine = try_build_engine(&config).unwrap();
+        assert_eq!(engine.resolve_tier_model().as_deref(), Some("glm-5.2"));
+    }
+
+    #[test]
+    fn tier_models_configured_reflects_per_provider_entries() {
+        let model_yaml = "model:\n  provider: zai\n  default: glm-5.2\n";
+        // NeuroCode disabled → nothing to configure.
+        let config = config_with_yaml(model_yaml);
+        assert!(tier_models_configured(&config));
+        // Enabled, no tiers at all → needs prompting.
+        let config = config_with_yaml(&format!(
+            "{}neurocode:\n  enabled: true\n",
+            model_yaml
+        ));
+        assert!(!tier_models_configured(&config));
+        // Enabled, per-provider entry complete → configured.
+        let config = config_with_yaml(&format!(
+            "{}neurocode:\n  enabled: true\n  tier:\n    providers:\n      zai:\n        frontier: glm-5.2\n        economical: glm-4.5-flash\n",
+            model_yaml
+        ));
+        assert!(tier_models_configured(&config));
+        // Enabled, per-provider entry partial → still needs prompting.
+        let config = config_with_yaml(&format!(
+            "{}neurocode:\n  enabled: true\n  tier:\n    providers:\n      zai:\n        frontier: glm-5.2\n",
+            model_yaml
+        ));
+        assert!(!tier_models_configured(&config));
+        // Enabled, flat legacy keys complete → configured (backward compat).
+        let config = config_with_yaml(&format!(
+            "{}neurocode:\n  enabled: true\n  tier:\n    frontier:\n      model: f\n    economical:\n      model: e\n",
+            model_yaml
+        ));
+        assert!(tier_models_configured(&config));
+        // Tiers configured for a DIFFERENT provider only → still needs
+        // prompting for the active one.
+        let config = config_with_yaml(&format!(
+            "{}neurocode:\n  enabled: true\n  tier:\n    providers:\n      copilot:\n        frontier: gpt-5.4\n        economical: gpt-4o-mini\n",
+            model_yaml
+        ));
+        assert!(!tier_models_configured(&config));
     }
 }

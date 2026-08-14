@@ -37,6 +37,7 @@ const CANONICAL_ORDER: &[&str] = &[
     "anthropic",
     "openai-api",
     "copilot",
+    "ai-usage-hud",
     "gemini",
     "deepseek",
     "xai",
@@ -346,6 +347,7 @@ pub fn select_provider_and_model(refresh: bool) -> Result<bool> {
         "openrouter" => flow_openrouter(&current_model)?,
         "anthropic" => flow_anthropic(&current_model)?,
         "copilot" => flow_copilot(&current_model)?,
+        "ai-usage-hud" => flow_ai_usage_hud(&current_model)?,
         "custom" => flow_custom()?,
         "remove-custom" => {
             remove_custom_provider()?;
@@ -684,6 +686,9 @@ fn flow_api_key_provider(provider_id: &str, current_model: &str) -> Result<bool>
         auth_store::deactivate_provider();
         println!("Default model set to: {} (via {})", selected, profile.display_name);
         prompt_context_window(provider_id, &selected, None)?;
+        // NeuroCode multi-provider: prompt tier models for the new provider
+        // when enabled and unconfigured for it.
+        prompt_neurocode_tiers_if_needed(provider_id, &model_list)?;
         Ok(true)
     } else {
         println!("No change.");
@@ -776,6 +781,115 @@ fn flow_copilot(current_model: &str) -> Result<bool> {
     let _ = cfg.unset("model.api");
     auth_store::deactivate_provider();
     println!("Default model set to: {} (via GitHub Copilot)", selected);
+    prompt_neurocode_tiers_if_needed("copilot", &models)?;
+    Ok(true)
+}
+
+// AI Usage HUD flow (joey-specific — local reverse proxy at
+// http://127.0.0.1:8317 fronting GitHub Copilot).
+fn flow_ai_usage_hud(current_model: &str) -> Result<bool> {
+    use joey_providers::copilot;
+    use std::time::Duration;
+
+    let base_url = copilot::hud_endpoint()
+        .unwrap_or_else(|| {
+            get_profile("ai-usage-hud")
+                .map(|p| p.base_url.to_string())
+                .unwrap_or_else(|| "http://127.0.0.1:8317".to_string())
+        });
+
+    // Proxy health check — fail fast with a clear remediation instead of a
+    // confusing catalog/timeout error later in the flow.
+    match copilot::hud_health_check(&base_url, Duration::from_secs(3)) {
+        Ok(()) => println!("  AI Usage HUD proxy: ✓ ({base_url})"),
+        Err(e) => {
+            println!("  ⚠ {e}");
+            println!("    Start it with: cd ~/Development/ai-usage-hud && ./scripts/deploy.sh");
+            return Ok(false);
+        }
+    }
+
+    // Same GitHub credential resolution as the copilot flow — the proxy
+    // accepts the raw GitHub credential and owns the upstream exchange.
+    let (raw_token, source) = copilot::resolve_copilot_token()?;
+    if raw_token.is_empty() {
+        println!("No GitHub token configured for GitHub Copilot (the HUD proxy forwards it upstream).");
+        println!("  1. Login with GitHub (OAuth device code flow)");
+        println!("  2. Enter an OAuth/fine-grained token manually");
+        println!("  3. Cancel");
+        match read_line("  Choice [1-3]: ").as_deref() {
+            Some("1") => {
+                let token = copilot::device_code_login(Duration::from_secs(300))?;
+                save_env_value("COPILOT_GITHUB_TOKEN", &token)?;
+                std::env::set_var("COPILOT_GITHUB_TOKEN", token);
+            }
+            Some("2") => {
+                let token = masked_secret_prompt("  Token: ").unwrap_or_empty().trim().to_string();
+                if token.is_empty() { return Ok(false); }
+                if let Err(message) = copilot::validate_copilot_token(&token) {
+                    render::error(&message);
+                    return Ok(false);
+                }
+                save_env_value("COPILOT_GITHUB_TOKEN", &token)?;
+                std::env::set_var("COPILOT_GITHUB_TOKEN", token);
+            }
+            _ => return Ok(false),
+        }
+    } else if source == "gh auth token" {
+        println!("  GitHub token: ✓ (from `gh auth token`)");
+    } else {
+        println!("  GitHub token: {}... ✓ ({})", key_prefix(&raw_token, 8), source);
+    }
+
+    // The catalog comes from the proxy (custom-endpoint path of
+    // fetch_model_catalog) — set the env var for this process so the fetch
+    // targets the proxy rather than api.githubcopilot.com.
+    std::env::set_var("AI_USAGE_HUD_BASE_URL", &base_url);
+    let catalog = match copilot::fetch_model_catalog(Duration::from_secs(10)) {
+        Ok(entries) => entries,
+        Err(error) => {
+            println!("  ⚠ Live catalog via the proxy unavailable: {}", error);
+            Vec::new()
+        }
+    };
+    let models = if catalog.is_empty() {
+        copilot::fallback_models()
+    } else {
+        catalog.iter()
+            .filter_map(|v| v.get("id").and_then(serde_json::Value::as_str))
+            .map(str::to_string).collect()
+    };
+    let current = copilot::normalize_model_id(current_model);
+    let Some(selected) = prompt_model_selection(&models, &current, &Default::default(), "ai-usage-hud") else {
+        return Ok(false);
+    };
+    let selected = copilot::normalize_model_id(&selected);
+    let entry = catalog.iter().find(|v| {
+        v.get("id").and_then(serde_json::Value::as_str) == Some(selected.as_str())
+    });
+    let api_mode = copilot::model_api_mode(&selected, entry).as_str();
+
+    let copilot_ctx = entry.and_then(copilot::catalog_context_window).map(|v| v as i64);
+    prompt_context_window("ai-usage-hud", &selected, copilot_ctx)?;
+    let efforts = copilot::model_reasoning_efforts(&selected, entry);
+    if !efforts.is_empty() {
+        let chosen = read_line(&format!("Reasoning effort [{}]: ", efforts.join("/")))
+            .unwrap_or_default().to_lowercase();
+        if efforts.contains(&chosen) {
+            Config::load()?.set_and_save("agent.reasoning_effort", &chosen)?;
+        }
+    }
+
+    save_model_choice(&selected)?;
+    let mut cfg = Config::load()?;
+    cfg.set_and_save("model.provider", "ai-usage-hud")?;
+    cfg.set_and_save("model.base_url", &base_url)?;
+    cfg.set_and_save("model.api_mode", api_mode)?;
+    let _ = cfg.unset("model.api_key");
+    let _ = cfg.unset("model.api");
+    auth_store::deactivate_provider();
+    println!("Default model set to: {} (via AI Usage HUD proxy)", selected);
+    prompt_neurocode_tiers_if_needed("ai-usage-hud", &models)?;
     Ok(true)
 }
 
@@ -811,6 +925,7 @@ fn flow_openrouter(current_model: &str) -> Result<bool> {
         auth_store::deactivate_provider();
         println!("Default model set to: {} (via OpenRouter)", selected);
         prompt_context_window("openrouter", &selected, None)?;
+        prompt_neurocode_tiers_if_needed("openrouter", &openrouter_models)?;
         Ok(true)
     } else {
         println!("No change.");
@@ -934,6 +1049,7 @@ fn flow_anthropic(current_model: &str) -> Result<bool> {
         auth_store::deactivate_provider();
         println!("Default model set to: {} (via Anthropic)", selected);
         prompt_context_window("anthropic", &selected, None)?;
+        prompt_neurocode_tiers_if_needed("anthropic", &model_list)?;
         Ok(true)
     } else {
         println!("No change.");
@@ -1365,6 +1481,7 @@ fn flow_named_custom(info: &CustomProviderInfo, current_model: &str) -> Result<b
         save_custom_provider(&info.base_url, &info.api_key, &selected, None, &info.name, &info.api_mode)?;
         println!("Default model set to: {} (via {})", selected, info.name);
         prompt_context_window("custom", &selected, None)?;
+        prompt_neurocode_tiers_if_needed("custom", &model_list)?;
         Ok(true)
     } else {
         println!("No change.");
@@ -1595,6 +1712,78 @@ fn prompt_model_selection(
 fn save_model_choice(model_id: &str) -> Result<()> {
     let mut cfg = Config::load()?;
     cfg.set_and_save("model.default", model_id)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// NeuroCode tier-model prompt (multi-provider)
+// ---------------------------------------------------------------------------
+
+/// Check whether NeuroCode tier models need configuring for the ACTIVE
+/// provider, and if so prompt the user to pick a frontier and an economical
+/// model from `model_list` (the provider's own catalog).
+///
+/// Called after every provider/model switch (wizard flows) and at interactive
+/// startup when the active provider has no tier models configured. Skipped
+/// entirely when NeuroCode is disabled or both tier models exist for this
+/// provider (per-provider entry or legacy flat keys).
+pub fn prompt_neurocode_tiers_if_needed(
+    provider_id: &str,
+    model_list: &[String],
+) -> Result<()> {
+    let cfg = Config::load()?;
+    let nc_cfg = joey_neurocode::NeuroCodeConfig::from_config(&cfg);
+    if !nc_cfg.enabled {
+        return Ok(());
+    }
+    let tiers = nc_cfg.tier.tiers_for_provider(provider_id);
+    let need_frontier = tiers.frontier.is_empty();
+    let need_economical = tiers.economical.is_empty();
+    if !need_frontier && !need_economical {
+        return Ok(());
+    }
+
+    println!(
+        "\nNeuroCode is enabled but has no tier models configured for provider '{}'.",
+        provider_id
+    );
+    println!("Pick a frontier (complex tasks) and an economical (simple tasks) model.");
+
+    // Best-effort pricing display like prompt_model_selection.
+    let pricing = catalog::get_pricing_for_provider(provider_id);
+    let mut cfg = Config::load()?;
+    if need_frontier {
+        let Some(frontier) =
+            prompt_model_selection(model_list, tiers.frontier.as_str(), &pricing, provider_id)
+        else {
+            println!("  Skipped frontier tier — requests will fall back to the default model.");
+            return Ok(());
+        };
+        cfg.set_and_save(&format!("neurocode.tier.providers.{provider_id}.frontier"), &frontier)?;
+        println!("  NeuroCode frontier model for {provider_id}: {frontier}");
+    }
+    if need_economical {
+        // Pre-select the just-saved frontier as the current marker so the
+        // picker highlights something sensible (re-load: the frontier key was
+        // persisted after the first Config::load above).
+        let cfg_now = Config::load()?;
+        let current = if !tiers.economical.is_empty() {
+            tiers.economical.clone()
+        } else {
+            cfg_now.get_str(&format!("neurocode.tier.providers.{provider_id}.frontier"), "")
+        };
+        let Some(economical) =
+            prompt_model_selection(model_list, &current, &pricing, provider_id)
+        else {
+            println!("  Skipped economical tier — requests will fall back to the default model.");
+            return Ok(());
+        };
+        cfg.set_and_save(
+            &format!("neurocode.tier.providers.{provider_id}.economical"),
+            &economical,
+        )?;
+        println!("  NeuroCode economical model for {provider_id}: {economical}");
+    }
     Ok(())
 }
 

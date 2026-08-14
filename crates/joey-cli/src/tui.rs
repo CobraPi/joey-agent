@@ -247,7 +247,7 @@ fn end_session(agent: &Agent, session_id: &str, reason: &str) {
 /// always "Default" (the live joey-agent); followed by each available primary
 /// OMO agent in canonical Tab order.
 fn populate_agent_roster(tui: &mut Tui, agent: &Agent) {
-    let available = joey_omo::AvailableModelSet::from_connected(
+    let available = joey_omo::AvailableModelSet::from_connected_with_catalog(
         agent.client().profile(),
         agent.model(),
     );
@@ -286,7 +286,7 @@ fn switch_agent(tui: &mut Tui, agent: &mut Agent, agent_name: &str) {
     }
 
     // Rebuild a registry to read the agent's resolved model + provider.
-    let available = joey_omo::AvailableModelSet::from_connected(
+    let available = joey_omo::AvailableModelSet::from_connected_with_catalog(
         agent.client().profile(),
         agent.model(),
     );
@@ -419,7 +419,9 @@ async fn interactive_loop(tui: &mut Tui, agent: &mut Agent) -> anyhow::Result<()
                 // in-memory copy was already recorded by the input handler).
                 crate::history::record(&text);
                 if text.trim_start().starts_with('/') {
-                    if let SlashAction::Quit = handle_slash_tui(&text, tui, agent) {
+                    if let SlashAction::Quit =
+                        handle_slash_tui(&text, tui, agent, &mut queued).await
+                    {
                         return Ok(());
                     }
                     continue;
@@ -675,6 +677,153 @@ enum SlashAction {
     Quit,
 }
 
+/// Run `/neurocode <args>` off the UI task while the TUI keeps rendering.
+///
+/// NeuroCode subcommands like `index`/`ingest` walk the whole source tree
+/// (tree-sitter parses + SQLite bulk upserts) and can take seconds-to-minutes
+/// on large repos. Running that inline froze the GUI until completion. This
+/// mirrors `run_turn`'s skeleton: the work runs on `spawn_blocking`, and the
+/// loop pumps animation frames + terminal input (queued prompts, scroll,
+/// copy, Ctrl-C interrupt semantics) until the handler returns its text.
+///
+/// `queued` receives prompts submitted while the command runs; Ctrl-C can't
+/// cancel SQLite mid-upsert (the handler has no interrupt handle — a fresh
+/// engine is built per invocation), so a single press just shows the notice
+/// and a second press within 2s force-exits, matching `run_turn`.
+async fn run_neurocode_tui(
+    tui: &mut Tui,
+    args: &str,
+    queued: &mut VecDeque<String>,
+) -> String {
+    use crossterm::event::{self, Event};
+    use std::time::Duration;
+
+    let owned_args = args.to_string();
+    let job = tokio::task::spawn_blocking(move || {
+        crate::commands::neurocode::neurocode_slash(&owned_args)
+    });
+    tokio::pin!(job);
+
+    tui.app_mut().push_item(TranscriptItem::Notice {
+        text: "⧗ /neurocode running… (GUI stays live; press Ctrl-C twice to force exit)".into(),
+        kind: NoticeKind::Busy,
+    });
+
+    let mut last_ctrlc: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            res = &mut job => {
+                return res.unwrap_or_else(|e| format!("/neurocode task failed: {e}"));
+            }
+            _ = tokio::time::sleep(tui.frame_budget()) => {
+                while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+                    match event::read() {
+                        Ok(Event::Key(k)) => {
+                            if let Some(a) = tui.handle_key(k) {
+                                match a {
+                                    TuiAction::Interrupt | TuiAction::Quit => {
+                                        let now = Instant::now();
+                                        if last_ctrlc
+                                            .map(|t| now.duration_since(t).as_secs_f64() < 2.0)
+                                            .unwrap_or(false)
+                                        {
+                                            let _ = tui.leave();
+                                            std::process::exit(0);
+                                        }
+                                        last_ctrlc = Some(now);
+                                        tui.app_mut().push_item(TranscriptItem::Notice {
+                                            text: "indexing can't be interrupted mid-write — \
+                                                   press Ctrl-C again to force exit"
+                                                .into(),
+                                            kind: NoticeKind::Warning,
+                                        });
+                                    }
+                                    TuiAction::Submit(text) => {
+                                        queued.push_back(text.clone());
+                                        let preview: String = text.chars().take(48).collect();
+                                        tui.app_mut().push_item(TranscriptItem::Notice {
+                                            text: format!(
+                                                "⧗ queued for next turn ({}): {}",
+                                                queued.len(),
+                                                preview
+                                            ),
+                                            kind: NoticeKind::Busy,
+                                        });
+                                    }
+                                    TuiAction::CopyItem(idx) => {
+                                        let copied = tui
+                                            .app()
+                                            .transcript
+                                            .get(idx)
+                                            .and_then(|item| match item {
+                                                TranscriptItem::User { text }
+                                                | TranscriptItem::Assistant { text }
+                                                | TranscriptItem::Reasoning { text, .. } => {
+                                                    Some(text.clone())
+                                                }
+                                                TranscriptItem::Tool { full_result, result_preview, .. } => {
+                                                    full_result
+                                                        .clone()
+                                                        .or_else(|| Some(result_preview.clone()))
+                                                }
+                                                TranscriptItem::FileDiff { path, lines, .. } => Some(format!(
+                                                    "# {}\n{}",
+                                                    path,
+                                                    lines.join("\n")
+                                                )),
+                                                TranscriptItem::Notice { text, .. }
+                                                | TranscriptItem::Error { text } => Some(text.clone()),
+                                            });
+                                        if let Some(t) = copied {
+                                            if crate::clipboard::copy_to_clipboard(&t).is_ok() {
+                                                tui.app_mut().push_item(TranscriptItem::Notice {
+                                                    text: format!(
+                                                        "✓ Copied {} chars to clipboard",
+                                                        t.chars().count()
+                                                    ),
+                                                    kind: NoticeKind::Success,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    TuiAction::SwitchAgent(_) => {
+                                        // Agent switching isn't useful mid-index;
+                                        // the roster key is ignored here.
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Event::Paste(s)) => {
+                            tui.input.insert_str(&s);
+                            let text = tui.input.text();
+                            tui.app_mut().update_slash_menu(&text);
+                        }
+                        Ok(Event::Resize(w, h)) => tui.resize(w, h),
+                        Ok(Event::Mouse(m)) => {
+                            use crossterm::event::{MouseEventKind, MouseButton};
+                            match m.kind {
+                                MouseEventKind::ScrollUp => {
+                                    tui.handle_mouse_scroll(m.row, m.column, true);
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    tui.handle_mouse_scroll(m.row, m.column, false);
+                                }
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    tui.handle_mouse_click(m.row, m.column);
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        tui.tick_animations();
+        let _ = tui.draw();
+    }
+}
+
 /// T114: `@plan` prefix detection (CLI/TUI parity with repl.rs T108/T142).
 ///
 /// When the user's message starts with `@plan`, switch the active agent to
@@ -763,7 +912,17 @@ fn apply_intent_gate(tui: &mut Tui, agent: &mut Agent, message: &str) {
 
 /// Slash-command handling inside the TUI. A few commands work natively;
 /// the rest answer honestly instead of pretending to run.
-fn handle_slash_tui(input: &str, tui: &mut Tui, agent: &mut Agent) -> SlashAction {
+///
+/// Async so heavy subcommands (`/neurocode index` parses the whole tree and
+/// bulk-upserts to SQLite) can run on `spawn_blocking` while the UI keeps
+/// rendering (see `run_neurocode_tui`) — the GUI no longer freezes until the
+/// command completes.
+async fn handle_slash_tui(
+    input: &str,
+    tui: &mut Tui,
+    agent: &mut Agent,
+    queued: &mut VecDeque<String>,
+) -> SlashAction {
     match slash::resolve(input) {
         Resolution::Unknown => {
             tui.app_mut().push_item(TranscriptItem::Error {
@@ -915,8 +1074,11 @@ fn handle_slash_tui(input: &str, tui: &mut Tui, agent: &mut Agent) -> SlashActio
             "neurocode" => {
                 // The handler builds its own engine and returns plain text —
                 // perfect for the transcript (Constitution II parity).
+                // Heavy subcommands (index/ingest) parse the whole tree +
+                // bulk-upsert SQLite, so run the handler off the UI task and
+                // keep rendering until it finishes — the GUI must not freeze.
                 let args = slash_args_after(input, "neurocode");
-                let out = crate::commands::neurocode::neurocode_slash(args);
+                let out = run_neurocode_tui(tui, args, queued).await;
                 for line in out.lines() {
                     tui.app_mut().push_item(TranscriptItem::Notice {
                         text: line.to_string(),

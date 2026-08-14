@@ -633,3 +633,84 @@ injected, and the system prompt bytes are unchanged (FR-020, SC-008 — asserted
 
 Full design trail and every dependency decision against the constitution:
 `specs/015-neurocode-enterprise-java/research.md`.
+
+## Copilot reverse-proxy integration (2026-08-14)
+
+**Status**: Deliberate-deviation extension (Joey-original, no upstream
+equivalent). Uncommitted working-tree feature completed and verified 2026-08-14.
+
+`COPILOT_API_BASE_URL` pointing at a host **off** `githubcopilot.com` (e.g. a
+local AI Usage HUD reverse proxy on `127.0.0.1:8317` that owns upstream
+Copilot auth, token refresh, and usage capture) activates a "custom
+Copilot-compatible endpoint" mode (`joey-providers::copilot::custom_endpoint`):
+
+- **No GitHub token exchange**: `CopilotAuth::with_endpoint` pins the endpoint
+  and `credentials()` returns the raw GitHub credential (env var / `gh auth
+  token`) + the pinned base URL; `build_client` constructs the pinned auth
+  when the copilot profile's base URL is off-host. The proxy accepts the raw
+  credential and owns upstream auth.
+- **Routing magnet**: `resolve_profile` resolves EVERY `auto`-provider request
+  to the `copilot` profile (vendor prefixes, bare family names, and foreign
+  base_url hosts alike) so no request escapes the proxy — the proxy serves
+  every model family. Explicit non-`auto` provider settings still win.
+  `llm_selector::resolve_provider_name` mirrors the magnet so the Feature 011
+  candidate pool targets the proxy's `/models` catalog.
+- **Catalog via proxy**: `fetch_model_catalog` fetches `/models` from the
+  pinned endpoint with the raw credential (60 s in-process cache — consulted
+  per client build and by the OMO model set); `AvailableModelSet::
+  from_connected_with_catalog` seeds every proxy catalog model id into the OMO
+  model set (used by the REPL, TUI roster, and agent switching).
+- **On-disk formats unchanged**; no schema/version bumps. Graceful
+  degradation: unset var → identical to native behavior; unreachable proxy →
+  catalog fetch fails, active model + static fallbacks still used.
+
+Tests: `copilot.rs` (custom-endpoint detection, pinned-credential
+no-exchange, catalog filtering), `profile.rs` (magnet covers all auto paths,
+natively-routed otherwise — env-var tests share `TEST_ENV_LOCK`), `llm_
+selector.rs`, `joey-omo/src/models.rs` (degradation). Verified end-to-end
+against a live proxy: `-z` one-shot through `127.0.0.1:8317` logged
+`JoeyAgent/1.0` requests with exact model passthrough (`gpt-5.4 → gpt-5.4`).
+
+## `ai-usage-hud` first-class provider (2026-08-14)
+
+**Status**: Deliberate-deviation extension (Joey-original). Promotes the AI
+Usage HUD reverse proxy (~/Development/ai-usage-hud, `127.0.0.1:8317`) from
+an env-var-only mode to a named provider, on top of the custom-endpoint
+machinery above.
+
+- **Profile**: `ai-usage-hud` (aliases `usage-hud`, `ai-usage`) registered in
+  `joey-providers::profile` — Copilot wire semantics, base URL
+  `http://127.0.0.1:8317`, env override `AI_USAGE_HUD_BASE_URL`, same GitHub
+  credential resolution (`COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`
+  / `gh auth token`).
+- **Single source of truth for copilot-family dispatch**:
+  `profile::is_copilot_wire(name)` replaces every hardcoded
+  `name == "copilot"` check in `build_client`, `ProviderClient` (auth attach,
+  chat/responses/messages header paths), `wire_model_name`, `doctor`,
+  `llm_selector`, and `model_catalog` — new Copilot-wire providers can't
+  silently drift from the registry.
+- **Env-var magnet**: `AI_USAGE_HUD_BASE_URL` set (off githubcopilot.com)
+  magnetizes `auto` resolution to the `ai-usage-hud` profile (the existing
+  `COPILOT_API_BASE_URL` magnet keeps precedence for the copilot profile).
+  `copilot::hud_endpoint()` is the shared resolver; `custom_endpoint()`
+  falls through to it.
+- **Setup wizard**: `flow_ai_usage_hud` — proxy health check
+  (`copilot::hud_health_check` probing `/api/health`, fail-fast with the
+  deploy remediation), GitHub credential prompt (device flow or manual
+  token), catalog + model selection through the proxy, persists
+  `model.provider=ai-usage-hud` + the proxy base URL. Listed in
+  `CANONICAL_ORDER` for the `joey model` picker.
+- **OMO**: `AvailableModelSet::from_connected_with_catalog` always seeds from
+  the proxy catalog when the profile is `ai-usage-hud`; BC-010 billing
+  aliases (`github-copilot`, `copilot`, `usage-hud`, `ai-usage`) registered
+  for requiresProvider gating.
+- **On-disk formats unchanged**; no schema bumps. Explicit provider settings
+  (`--provider zai`) still win over the magnet.
+
+Tests: `profile.rs` (registration, aliases, is_copilot_wire, explicit + magnet
++ real-host-guard resolution), `client.rs` (pinned proxy client, no
+exchange, env override), `copilot.rs` (hud_endpoint, precedence, health
+check), `llm_selector.rs`, `joey-omo/src/models.rs` (catalog seeding +
+billing aliases). Verified live: `joey --model gpt-5.4 -z` served
+`gpt-5.4 → gpt-5.4` via `/responses` with usage recorded in the proxy's DB
+(neurocode tier override temporarily disabled for the clean-path check).

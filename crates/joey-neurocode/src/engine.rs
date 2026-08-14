@@ -70,6 +70,9 @@ pub struct DefaultEngine {
     graph: Mutex<Option<DependencyGraph>>,
     /// The project root the engine was initialized for.
     project_root: PathBuf,
+    /// The active provider id (from the resolved provider profile) — scopes
+    /// tier-model resolution to `neurocode.tier.providers.<id>` when present.
+    provider: String,
 }
 
 impl DefaultEngine {
@@ -81,7 +84,14 @@ impl DefaultEngine {
             classifier,
             graph: Mutex::new(None),
             project_root,
+            provider: String::new(),
         }
+    }
+
+    /// Scope tier-model resolution to `provider`'s per-provider tier config.
+    /// Mirrors how the agent snapshots its resolved provider at construction.
+    pub fn set_provider(&mut self, provider: &str) {
+        self.provider = provider.trim().to_string();
     }
 
     /// Open the graph for the project (or reuse the cached one).
@@ -155,11 +165,22 @@ impl DefaultEngine {
     }
 
     /// Get a snapshot of the graph for read-only queries (index, status, etc.).
+    ///
+    /// Opens the persisted per-project `graph.db` on first use (via
+    /// [`Self::ensure_graph`]) so command surfaces reflect an index built by
+    /// a *previous* engine instance. This matters because the `/neurocode`
+    /// command handler constructs a fresh engine per invocation: `/neurocode
+    /// index` writes the graph to disk, and the subsequent `/neurocode
+    /// status` must read that same graph back rather than reporting
+    /// "not initialized".
     pub fn with_graph<F, R>(&self, f: F) -> R
     where
         F: FnOnce(Option<&DependencyGraph>) -> R,
         R: Default,
     {
+        if !self.ensure_graph() {
+            return R::default();
+        }
         let guard = self.graph.lock().ok();
         match guard {
             Some(g) => match g.as_ref() {
@@ -712,7 +733,8 @@ impl NeuroCodeEngine for DefaultEngine {
         let resolver = crate::tier_resolver::TierModelResolver::new(
             self.config.clone(),
             String::new(), // no fallback here — return None if unconfigured
-        );
+        )
+        .with_provider(&self.provider);
         let resolution = resolver.resolve(tier);
         if resolution.fell_back {
             None

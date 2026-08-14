@@ -50,8 +50,10 @@ pub fn llm_selector_slash(args: &str) -> Result<(), String> {
 pub(crate) fn fetch_candidate_pool(provider: &str) -> CandidateModelPool {
     use joey_llm_selector::candidate::{CatalogSource, consolidate_copilot, consolidate_models_dev};
 
-    if provider == "copilot" {
+    if joey_providers::profile::is_copilot_wire(provider) {
         // Copilot's catalog fetch is the canonical source (research.md §6).
+        // Covers the ai-usage-hud reverse proxy too: it serves the same
+        // Copilot wire catalog from its own /models endpoint.
         match joey_providers::copilot::fetch_model_catalog(std::time::Duration::from_secs(10)) {
             Ok(raw) => {
                 let (models, _dropped) = consolidate_copilot(&raw);
@@ -153,6 +155,16 @@ fn resolve_provider_name(config: &joey_core::Config) -> String {
     let provider = config.get_str("model.provider", "");
     if !provider.is_empty() && provider != "auto" {
         return provider;
+    }
+    // Custom Copilot-compatible endpoint active: every model is served by the
+    // proxy through a copilot-wire profile, so the candidate-pool fetch must
+    // target the copilot catalog source regardless of the model's vendor
+    // prefix (mirrors the resolve_profile magnet in joey-providers).
+    if joey_providers::copilot::hud_endpoint().is_some() {
+        return "ai-usage-hud".to_string();
+    }
+    if joey_providers::copilot::custom_endpoint().is_some() {
+        return "copilot".to_string();
     }
     // Provider is "auto" or unset: derive from the model string's vendor
     // prefix (e.g. "anthropic/claude-..." → "anthropic").
@@ -435,6 +447,10 @@ fn cmd_help() {
 mod tests {
     use super::*;
 
+    /// Shared lock for tests that mutate COPILOT_API_BASE_URL (process-global
+    /// env; parallel test threads would race otherwise).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Constitution VII non-regression: `try_build_allocator` returns None when
     /// the selector is neither enabled nor engaged via the `auto` sentinel.
     /// This is the byte-identical-to-pre-feature-011 invariant — when None,
@@ -495,6 +511,8 @@ mod tests {
     #[test]
     fn resolve_provider_name_falls_back_to_model_vendor() {
         use tempfile::NamedTempFile;
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
@@ -503,5 +521,59 @@ mod tests {
         .unwrap();
         let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
         assert_eq!(resolve_provider_name(&cfg), "anthropic");
+    }
+
+    /// Custom Copilot-compatible endpoint active: the auto-derived provider
+    /// is magnetized to "copilot" so the candidate-pool fetch targets the
+    /// proxy's catalog regardless of the model's vendor prefix (mirrors the
+    /// resolve_profile magnet in joey-providers).
+    #[test]
+    fn resolve_provider_name_magnetizes_to_copilot_on_custom_endpoint() {
+        use tempfile::NamedTempFile;
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("COPILOT_API_BASE_URL", "http://127.0.0.1:8317");
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "model:\n  provider: auto\n  default: anthropic/claude-sonnet-4\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(resolve_provider_name(&cfg), "copilot");
+        std::env::remove_var("COPILOT_API_BASE_URL");
+    }
+
+    /// AI_USAGE_HUD_BASE_URL active: the auto-derived provider magnetizes to
+    /// "ai-usage-hud" (its own copilot-wire profile).
+    #[test]
+    fn resolve_provider_name_magnetizes_to_hud_on_hud_env_var() {
+        use tempfile::NamedTempFile;
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317");
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "model:\n  provider: auto\n  default: anthropic/claude-sonnet-4\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(resolve_provider_name(&cfg), "ai-usage-hud");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+    }
+
+    /// The copilot-wire catalog fetch covers ai-usage-hud: with the HUD env
+    /// var set, fetch_candidate_pool returns a pool from the proxy catalog
+    /// (empty is acceptable when the proxy is down — FR-017 auto-disable).
+    #[test]
+    fn candidate_pool_fetch_targets_hud_via_copilot_wire() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:1");
+        // is_copilot_wire dispatch — unreachable endpoint yields an empty
+        // pool, not a panic or a models.dev lookup.
+        let pool = fetch_candidate_pool("ai-usage-hud");
+        assert!(pool.is_empty());
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
     }
 }

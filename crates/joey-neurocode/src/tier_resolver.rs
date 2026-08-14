@@ -15,6 +15,10 @@ pub struct TierModelResolver {
     config: NeuroCodeConfig,
     /// The agent's default model id (fallback when a tier model is missing).
     agent_default_model: String,
+    /// The active provider id — selects the per-provider tier override
+    /// (`neurocode.tier.providers.<id>`) when present; the flat legacy keys
+    /// apply otherwise.
+    provider: String,
 }
 
 impl TierModelResolver {
@@ -22,7 +26,14 @@ impl TierModelResolver {
         Self {
             config,
             agent_default_model,
+            provider: String::new(),
         }
+    }
+
+    /// Scope resolution to `provider`'s per-provider tier models.
+    pub fn with_provider(mut self, provider: &str) -> Self {
+        self.provider = provider.trim().to_string();
+        self
     }
 
     /// Resolve the model id for a tier (Mode 2 — direct config lookup).
@@ -39,8 +50,25 @@ impl TierModelResolver {
                 return self.resolve(default_tier);
             }
         };
+        // Per-provider override wins when set for the active provider.
+        let per_provider = if self.provider.is_empty() {
+            None
+        } else {
+            let models = self.config.tier.tiers_for_provider(&self.provider);
+            match tier {
+                ComplexityTier::Frontier if !models.frontier.is_empty() => Some(models.frontier),
+                ComplexityTier::Economical if !models.economical.is_empty() => {
+                    Some(models.economical)
+                }
+                _ => None,
+            }
+        };
+        let (model, source) = match per_provider {
+            Some(m) => (m, format!("provider-scoped tier '{}'", self.provider)),
+            None => (resolved.clone(), "config".to_string()),
+        };
 
-        if resolved.is_empty() {
+        if model.is_empty() {
             TierModelResolution {
                 model_id: self.agent_default_model.clone(),
                 fell_back: true,
@@ -51,9 +79,9 @@ impl TierModelResolver {
             }
         } else {
             TierModelResolution {
-                model_id: resolved.clone(),
+                model_id: model,
                 fell_back: false,
-                reason: format!("tier '{}' resolved from config", tier),
+                reason: format!("tier '{}' resolved from {}", tier, source),
             }
         }
     }
@@ -100,5 +128,61 @@ mod tests {
         let resolver = TierModelResolver::new(cfg, "default".into());
         let res = resolver.resolve(ComplexityTier::AmbiguousDefault);
         assert_eq!(res.model_id, "economical-model");
+    }
+
+    #[test]
+    fn per_provider_tier_overrides_apply() {
+        let mut cfg = NeuroCodeConfig::default();
+        cfg.tier.frontier_model = "legacy-frontier".into();
+        cfg.tier.provider_tiers.insert(
+            "zai".into(),
+            crate::config::ProviderTierModels {
+                frontier: "glm-5.2".into(),
+                economical: "glm-4.5-flash".into(),
+            },
+        );
+        let resolver =
+            TierModelResolver::new(cfg, "default-model".into()).with_provider("zai");
+        let frontier = resolver.resolve(ComplexityTier::Frontier);
+        assert_eq!(frontier.model_id, "glm-5.2");
+        assert!(frontier.reason.contains("provider-scoped"));
+        let economical = resolver.resolve(ComplexityTier::Economical);
+        assert_eq!(economical.model_id, "glm-4.5-flash");
+        // A different provider scope keeps the legacy keys.
+        let other = TierModelResolver::new(
+            NeuroCodeConfig {
+                tier: crate::config::TierConfig {
+                    frontier_model: "legacy-frontier".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            "default".into(),
+        )
+        .with_provider("deepseek");
+        assert_eq!(
+            other.resolve(ComplexityTier::Frontier).model_id,
+            "legacy-frontier"
+        );
+    }
+
+    /// Without with_provider (legacy callers), behavior is unchanged: the
+    /// flat keys are the single source.
+    #[test]
+    fn unscoped_resolver_keeps_flat_keys() {
+        let mut cfg = NeuroCodeConfig::default();
+        cfg.tier.frontier_model = "flat-frontier".into();
+        cfg.tier.provider_tiers.insert(
+            "zai".into(),
+            crate::config::ProviderTierModels {
+                frontier: "glm-5.2".into(),
+                economical: String::new(),
+            },
+        );
+        let resolver = TierModelResolver::new(cfg, "default".into());
+        assert_eq!(
+            resolver.resolve(ComplexityTier::Frontier).model_id,
+            "flat-frontier"
+        );
     }
 }

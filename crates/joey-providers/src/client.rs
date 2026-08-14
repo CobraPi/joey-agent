@@ -43,8 +43,10 @@ impl ProviderClient {
         api_key: Option<String>,
     ) -> Result<Self, ProviderError> {
         // xAI's upstream wire is codex_responses, which is not ported. Copilot
-        // uses the Responses transport implemented in this client.
-        if profile.api_mode == ApiMode::CodexResponses && profile.name != "copilot" {
+        // (and the ai-usage-hud proxy) use the Responses transport in this client.
+        if profile.api_mode == ApiMode::CodexResponses
+            && !crate::profile::is_copilot_wire(profile.name)
+        {
             return Err(ProviderError::Other(format!(
                 "provider '{}' requires the codex_responses wire mode, not yet ported",
                 profile.name
@@ -66,14 +68,34 @@ impl ProviderClient {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| profile.base_url.to_string());
         let mut key = api_key.or_else(|| profile.resolve_api_key());
-        let copilot_auth = if profile.name == "copilot" {
+        let copilot_auth = if crate::profile::is_copilot_wire(profile.name) {
             let raw = if let Some(explicit) = key.take() {
                 copilot::validate_copilot_token(&explicit).map_err(ProviderError::Auth)?;
                 explicit
             } else {
                 copilot::resolve_copilot_token()?.0
             };
-            (!raw.is_empty()).then(|| Arc::new(CopilotAuth::new(raw)))
+            // A non-githubcopilot.com base-URL override on the copilot profile
+            // pins the endpoint: the proxy accepts the raw GitHub credential,
+            // so skip the exchange flow and serve all requests from it.
+            let pinned = {
+                let host =
+                    joey_core::utils::base_url_hostname(&base).to_ascii_lowercase();
+                !base.trim().is_empty()
+                    && host != "api.githubcopilot.com"
+                    && !host.ends_with(".githubcopilot.com")
+                    && !host.is_empty()
+            };
+            (!raw.is_empty()).then(|| {
+                if pinned {
+                    Arc::new(copilot::CopilotAuth::with_endpoint(
+                        raw,
+                        base.trim_end_matches('/').to_string(),
+                    ))
+                } else {
+                    Arc::new(copilot::CopilotAuth::new(raw))
+                }
+            })
         } else {
             None
         };
@@ -210,7 +232,7 @@ impl ProviderClient {
         let url = format!("{}/chat/completions", request_base);
         let body = self.build_openai_body(req);
 
-        let mut builder = if self.profile.name == "copilot" {
+        let mut builder = if crate::profile::is_copilot_wire(self.profile.name) {
             let token = request_key.as_deref().ok_or_else(|| {
                 ProviderError::Auth(
                     "No GitHub Copilot token found. Run `joey auth copilot login` or `joey model`."
@@ -508,7 +530,7 @@ impl ProviderClient {
         req: &ProviderRequest,
         tx: Option<&mpsc::UnboundedSender<StreamEvent>>,
     ) -> Result<NormalizedResponse, ProviderError> {
-        if self.profile.name != "copilot" {
+        if !crate::profile::is_copilot_wire(self.profile.name) {
             return Err(ProviderError::Other(
                 "codex_responses wire mode is only implemented for Copilot".into(),
             ));
@@ -691,7 +713,7 @@ impl ProviderClient {
         let base = strip_trailing_v1(&request_base);
         let url = format!("{}/v1/messages", base);
         let mut body = anthropic::build_anthropic_body(req, &request_base);
-        if self.profile.name == "copilot" {
+        if crate::profile::is_copilot_wire(self.profile.name) {
             body["model"] = json!(copilot::normalize_model_id(&req.model));
         }
         if req.stream {
@@ -706,7 +728,7 @@ impl ProviderClient {
             .post(&url)
             .header("anthropic-version", "2023-06-01")
             .json(&body);
-        if self.profile.name == "copilot" {
+        if crate::profile::is_copilot_wire(self.profile.name) {
             let token = request_key.as_deref().ok_or_else(|| {
                 ProviderError::Auth(
                     "No GitHub Copilot token found. Run `joey auth copilot login` or `joey model`."
@@ -1397,6 +1419,43 @@ fn ensure_block(blocks: &mut Vec<AnthropicBlockAccum>, idx: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_usage_hud_client_pins_proxy_and_skips_exchange() {
+        // Building a client from the ai-usage-hud profile must attach a
+        // CopilotAuth pinned to the proxy endpoint: credentials() then
+        // returns the raw GitHub token + the proxy base URL WITHOUT
+        // contacting GitHub's exchange endpoint.
+        let profile = crate::profile::get_profile("ai-usage-hud").unwrap();
+        let client = ProviderClient::new(profile, None, Some("ghu_test".into())).unwrap();
+        assert!(client.copilot_auth.is_some());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (base, token) = rt
+            .block_on(async { client.request_credentials().await })
+            .unwrap();
+        assert_eq!(base, "http://127.0.0.1:8317");
+        assert_eq!(token.as_deref(), Some("ghu_test"));
+    }
+
+    #[test]
+    fn ai_usage_hud_client_honors_env_base_override() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://10.0.0.5:9000/");
+        let profile = crate::profile::get_profile("ai-usage-hud").unwrap();
+        // build_client applies the env override through resolve_base_override.
+        let client = crate::build_client("ai-usage-hud", "", "gpt-4o", Some("ghu_test".into()))
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (base, _) = rt
+            .block_on(async { client.request_credentials().await })
+            .unwrap();
+        assert_eq!(base, "http://10.0.0.5:9000");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+    }
 
     #[test]
     fn copilot_initiator_tracks_user_vs_tool_loop() {

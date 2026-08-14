@@ -33,7 +33,6 @@ pub struct NeuroCodeConfig {
     pub classifier: ClassifierConfig,
     pub pega: PegaConfig,
 }
-
 impl Default for NeuroCodeConfig {
     fn default() -> Self {
         Self {
@@ -73,6 +72,19 @@ pub struct TierConfig {
     pub frontier_model: String,
     /// Which tier AmbiguousDefault resolves to ("economical" or "frontier").
     pub ambiguous_default: String,
+    /// Per-provider tier models (`neurocode.tier.providers.<provider>.model`):
+    /// frontier/economical overrides scoped to one provider, so switching
+    /// providers keeps each backend's tier models from drifting into another
+    /// provider's catalog. The flat `frontier_model`/`economical_model` keys
+    /// remain the fallback for unlisted providers (backward compatible).
+    pub provider_tiers: std::collections::HashMap<String, ProviderTierModels>,
+}
+
+/// Per-provider tier model pair.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderTierModels {
+    pub frontier: String,
+    pub economical: String,
 }
 
 impl Default for TierConfig {
@@ -81,16 +93,59 @@ impl Default for TierConfig {
             economical_model: String::new(),
             frontier_model: String::new(),
             ambiguous_default: "economical".into(),
+            provider_tiers: std::collections::HashMap::new(),
         }
     }
 }
 
 impl TierConfig {
     fn from_config(cfg: &joey_core::Config) -> Self {
+        let mut provider_tiers = std::collections::HashMap::new();
+        if let Some(serde_yaml::Value::Mapping(map)) =
+            cfg.get("neurocode.tier.providers").cloned()
+        {
+            for (key, value) in map.iter() {
+                let Some(provider) = key.as_str() else { continue };
+                let Some(inner) = value.as_mapping() else { continue };
+                let get = |field: &str| {
+                    inner
+                        .get(serde_yaml::Value::String(field.to_string()))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                };
+                let models = ProviderTierModels {
+                    frontier: get("frontier"),
+                    economical: get("economical"),
+                };
+                if !models.frontier.is_empty() || !models.economical.is_empty() {
+                    provider_tiers.insert(provider.to_string(), models);
+                }
+            }
+        }
         Self {
             economical_model: cfg.get_str("neurocode.tier.economical.model", ""),
             frontier_model: cfg.get_str("neurocode.tier.frontier.model", ""),
             ambiguous_default: cfg.get_str("neurocode.tier.ambiguous_default", "economical"),
+            provider_tiers,
+        }
+    }
+
+    /// The tier model pair for `provider`: per-provider values win per-field,
+    /// with the flat legacy keys filling any gap (so a provider entry that
+    /// only pins `frontier` still inherits the flat `economical`).
+    pub fn tiers_for_provider(&self, provider: &str) -> ProviderTierModels {
+        let entry = self.provider_tiers.get(provider.trim());
+        ProviderTierModels {
+            frontier: entry
+                .filter(|m| !m.frontier.is_empty())
+                .map(|m| m.frontier.clone())
+                .unwrap_or_else(|| self.frontier_model.clone()),
+            economical: entry
+                .filter(|m| !m.economical.is_empty())
+                .map(|m| m.economical.clone())
+                .unwrap_or_else(|| self.economical_model.clone()),
         }
     }
 }
@@ -238,5 +293,53 @@ mod tests {
         );
         cfg.tier.ambiguous_default = "frontier".into();
         assert_eq!(cfg.ambiguous_default_tier(), ComplexityTier::Frontier);
+    }
+
+    /// Per-provider tier models parse from `neurocode.tier.providers.<id>`.
+    #[test]
+    fn provider_tiers_parse_from_config() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "neurocode:\n  enabled: true\n  tier:\n    providers:\n      zai:\n        frontier: glm-5.2\n        economical: glm-4.5-flash\n      copilot:\n        frontier: gpt-5.4\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        assert_eq!(nc.tier.provider_tiers.len(), 2);
+        let zai = nc.tier.tiers_for_provider("zai");
+        assert_eq!(zai.frontier, "glm-5.2");
+        assert_eq!(zai.economical, "glm-4.5-flash");
+        // Partial entries are kept: copilot has frontier only.
+        let copilot = nc.tier.tiers_for_provider("copilot");
+        assert_eq!(copilot.frontier, "gpt-5.4");
+        assert_eq!(copilot.economical, "");
+        // Unlisted providers fall back to the flat legacy keys (empty here).
+        let other = nc.tier.tiers_for_provider("openrouter");
+        assert_eq!(other.frontier, "");
+        assert_eq!(other.economical, "");
+    }
+
+    /// Per-provider entries override the flat legacy keys; unlisted providers
+    /// still resolve through them (backward compatibility).
+    #[test]
+    fn provider_tiers_override_legacy_flat_keys() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "neurocode:\n  tier:\n    frontier:\n      model: legacy-frontier\n    economical:\n      model: legacy-economical\n    providers:\n      zai:\n        frontier: glm-5.2\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        // Listed provider: per-provider value wins.
+        assert_eq!(nc.tier.tiers_for_provider("zai").frontier, "glm-5.2");
+        // Economical unset for zai → flat key fallback applies within a listed
+        // provider too (per-field fallback).
+        assert_eq!(nc.tier.tiers_for_provider("zai").economical, "legacy-economical");
+        // Unlisted provider: full flat-key fallback.
+        let deepseek = nc.tier.tiers_for_provider("deepseek");
+        assert_eq!(deepseek.frontier, "legacy-frontier");
+        assert_eq!(deepseek.economical, "legacy-economical");
     }
 }

@@ -38,7 +38,7 @@ pub fn build_client(
     api_key: Option<String>,
 ) -> Result<ProviderClient, ProviderError> {
     let mut profile = resolve_profile(provider_setting, base_url, model);
-    if profile.name == "copilot" {
+    if profile::is_copilot_wire(profile.name) {
         // Hermes consults the live catalog for non-GPT models because Claude
         // may expose only /v1/messages while Gemini/older models use chat.
         let normalized = copilot::normalize_model_id(model);
