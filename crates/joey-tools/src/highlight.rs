@@ -20,7 +20,6 @@
 //! repo): py, json, yaml, toml, rust, go, js, ts, md, sh. This bounds
 //! binary size vs. syntect's full 100+ grammar set (Principle VIII).
 
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
@@ -56,18 +55,38 @@ const HIGHLIGHT_THEME: &str = "base16-ocean.dark";
 // Per-line cache (content_hash, language) -> escaped ANSI string.
 // ---------------------------------------------------------------------------
 
+/// Maximum number of cached highlighted lines. Each entry is a single line's
+/// ANSI-escaped string keyed by (hash, language). Without a cap this grows
+/// unbounded on long-horizon tasks that render many unique source lines
+/// (diffs, file reads, patches) — a real memory leak. 4K entries covers the
+/// working set of even large diffs while bounding memory to a few MB.
+const HIGHLIGHT_CACHE_MAX_ENTRIES: usize = 4096;
+
 struct HighlightCache {
     /// (hash, lang) -> highlighted ANSI string (or None marker for fallback).
     ///
     /// Stored as `Option<String>` so a negative result (unrecognized lang or
     /// parse error) is also cached and not recomputed.
-    entries: HashMap<(u64, &'static str), Option<String>>,
+    ///
+    /// Uses `IndexMap` so LRU-style eviction can drain the oldest entries when
+    /// the cap is exceeded (insertion order = recency; entries re-inserted on
+    /// access move to the back via `swap_remove` + `insert`).
+    entries: indexmap::IndexMap<(u64, &'static str), Option<String>>,
 }
 
 impl HighlightCache {
     fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: indexmap::IndexMap::new(),
+        }
+    }
+
+    /// Evict the oldest entries until the cache is at or below the cap. Called
+    /// after each insert so the map never exceeds the bound.
+    fn evict_to_cap(&mut self) {
+        while self.entries.len() > HIGHLIGHT_CACHE_MAX_ENTRIES {
+            // Remove the oldest entry (index 0 = least-recently-inserted).
+            self.entries.shift_remove_index(0);
         }
     }
 }
@@ -100,10 +119,13 @@ pub fn highlight_line(line: &str, path: &str, enabled: bool) -> Option<String> {
     let lang = language_for_path(path)?;
     let key = (hash_line(line), lang);
 
-    // Fast path: cache hit (the common case after first render).
-    if let Ok(cache) = CACHE.lock() {
-        if let Some(cached) = cache.entries.get(&key) {
-            return cached.clone();
+    // Fast path: cache hit (the common case after first render). On a hit we
+    // promote the entry to the back (most-recently-used) so frequently
+    // rendered lines survive eviction.
+    if let Ok(mut cache) = CACHE.lock() {
+        if let Some((k, v)) = cache.entries.swap_remove_entry(&key) {
+            cache.entries.insert(k, v.clone());
+            return v;
         }
     }
 
@@ -112,6 +134,7 @@ pub fn highlight_line(line: &str, path: &str, enabled: bool) -> Option<String> {
 
     if let Ok(mut cache) = CACHE.lock() {
         cache.entries.insert(key, highlighted.clone());
+        cache.evict_to_cap();
     }
 
     highlighted
@@ -250,5 +273,26 @@ mod tests {
             let cache = CACHE.lock().unwrap();
             assert!(cache.entries.is_empty(), "cache should be cleared");
         }
+    }
+
+    #[test]
+    fn cache_respects_max_entries_cap() {
+        clear_cache();
+        // Insert well beyond the cap with distinct lines (distinct hashes).
+        // Each line must differ so the hash key is unique.
+        for i in 0..(HIGHLIGHT_CACHE_MAX_ENTRIES + 200) {
+            let line = format!("let x_{} = {};", i, i);
+            let _ = highlight_line(&line, "a.rs", true);
+        }
+        {
+            let cache = CACHE.lock().unwrap();
+            assert!(
+                cache.entries.len() <= HIGHLIGHT_CACHE_MAX_ENTRIES,
+                "cache must not exceed the cap: got {} entries (cap {})",
+                cache.entries.len(),
+                HIGHLIGHT_CACHE_MAX_ENTRIES
+            );
+        }
+        clear_cache();
     }
 }

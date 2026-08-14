@@ -584,6 +584,9 @@ impl Terminal {
         // Register in the global ProcessRegistry.
         let registry = crate::tools::process_tool::process_registry();
         {
+            // Reap dead sessions before inserting so the registry doesn't
+            // grow unbounded on long-horizon tasks that spawn many bg procs.
+            crate::tools::process_tool::reap_completed_sessions();
             let mut reg = registry.lock().unwrap_or_else(|p| p.into_inner());
             let mut session =
                 crate::tools::process_tool::ProcessSession::new(

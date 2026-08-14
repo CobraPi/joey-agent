@@ -15,10 +15,23 @@ use once_cell::sync::Lazy;
 /// The global file tracker for the current session.
 static TRACKER: Lazy<Mutex<FileTracker>> = Lazy::new(|| Mutex::new(FileTracker::new()));
 
+/// Maximum number of file originals to retain for diff generation. Each entry
+/// holds the full first-seen content of a file; without a cap this is the
+/// single largest memory leak on long-horizon tasks (reading hundreds of large
+/// files pins all their content forever). 256 distinct files covers realistic
+/// per-session edit sets; evicted originals simply produce a "no prior version"
+/// diff (whole-file add) rather than crashing or leaking.
+const ORIGINALS_MAX_ENTRIES: usize = 256;
+
 /// A per-session file tracker that records read and write operations.
 pub struct FileTracker {
     /// path → first-seen content (the original, before any agent edits).
-    originals: HashMap<String, String>,
+    ///
+    /// Uses `IndexMap` so the oldest entries can be evicted once the cap is
+    /// reached (insertion order = recency of first read). Evicted entries lose
+    /// their diff baseline — a subsequent edit produces a whole-file-add diff
+    /// instead of a before/after diff, which is a graceful degradation.
+    originals: indexmap::IndexMap<String, String>,
     /// path → last-read timestamp.
     read_times: HashMap<String, SystemTime>,
     /// path → last-write timestamp.
@@ -37,7 +50,7 @@ pub struct FileTracker {
 impl FileTracker {
     fn new() -> Self {
         Self {
-            originals: HashMap::new(),
+            originals: indexmap::IndexMap::new(),
             read_times: HashMap::new(),
             write_times: HashMap::new(),
             modified_files: Vec::new(),
@@ -55,7 +68,13 @@ impl FileTracker {
         t.read_times.insert(key.clone(), SystemTime::now());
         // Snapshot original content on first read if not already tracked.
         if let Some(content) = content {
-            t.originals.entry(key).or_insert_with(|| content.to_string());
+            // only insert + evict when this is a genuinely new path.
+            if !t.originals.contains_key(&key) {
+                t.originals.insert(key, content.to_string());
+                while t.originals.len() > ORIGINALS_MAX_ENTRIES {
+                    t.originals.shift_remove_index(0);
+                }
+            }
         }
     }
 

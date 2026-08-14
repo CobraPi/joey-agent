@@ -18,6 +18,14 @@ const READ_HISTORY_CAP: usize = 500;
 const DEDUP_CAP: usize = 1000;
 const READ_TIMESTAMPS_CAP: usize = 1000;
 
+/// Maximum number of pending background-process completions queued for
+/// delivery at the next turn boundary. Each entry carries a bounded output
+/// tail (~1KB). The agent drains the queue every turn, so this cap is only
+/// reached when many background jobs finish simultaneously during a single
+/// very long turn. Without it, the queue grows unbounded if the reaper
+/// out-produces the turn drain rate.
+const PENDING_COMPLETIONS_MAX: usize = 64;
+
 /// Per-turn aggregate tool-output budget accumulator (layer 3 of the
 /// persistence pipeline; 200_000 chars by default, `DEFAULT_TURN_BUDGET_CHARS`).
 ///
@@ -304,6 +312,12 @@ impl ToolContext {
     /// the queue at the next turn boundary, emitting a visual notice and
     /// injecting the result into the conversation (non-interrupting). This
     /// survives the launching turn's event channel, unlike `emit_progress`.
+    ///
+    /// The queue is bounded ([`PENDING_COMPLETIONS_MAX`]): if a very long
+    /// turn produces more completions than the cap (many background jobs
+    /// finishing simultaneously), the oldest are dropped to prevent
+    /// unbounded memory growth. The agent drains the queue every turn, so
+    /// the cap is only reached in pathological scenarios.
     pub fn push_background_completion(&self, completion: BackgroundCompletion) {
         let mut queue = self
             .inner
@@ -311,6 +325,10 @@ impl ToolContext {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         queue.push(completion);
+        // Bound the queue: drop the oldest entries when over the cap.
+        while queue.len() > PENDING_COMPLETIONS_MAX {
+            queue.remove(0);
+        }
     }
 
     /// Drain all pending background-process completions from the queue.
@@ -557,5 +575,29 @@ mod tests {
         let drained = ctx.drain_pending_completions();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].session_id, "proc-y");
+    }
+
+    #[test]
+    fn pending_completions_queue_is_bounded() {
+        // Pushing well beyond the cap must not let the queue grow unbounded.
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        for i in 0..(PENDING_COMPLETIONS_MAX + 50) {
+            ctx.push_background_completion(BackgroundCompletion {
+                session_id: format!("proc-{}", i),
+                exit_code: 0,
+                output_tail: "x".into(),
+                elapsed_secs: 1.0,
+            });
+        }
+        let drained = ctx.drain_pending_completions();
+        assert!(
+            drained.len() <= PENDING_COMPLETIONS_MAX,
+            "queue must not exceed cap: got {} (cap {})",
+            drained.len(),
+            PENDING_COMPLETIONS_MAX
+        );
+        // The newest entries survive (oldest dropped).
+        let last = drained.last().unwrap();
+        assert_eq!(last.session_id, format!("proc-{}", PENDING_COMPLETIONS_MAX + 49));
     }
 }
