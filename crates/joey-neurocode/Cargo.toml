@@ -1,34 +1,26 @@
 [package]
-name = "joey-agent-core"
+name = "joey-neurocode"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 joey-core.workspace = true
-joey-providers.workspace = true
 joey-tools.workspace = true
-joey-llm-selector.workspace = true
-joey-neurocode.workspace = true
+tree-sitter.workspace = true
+tree-sitter-java.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+rusqlite.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
-futures-util.workspace = true
-async-trait.workspace = true
 tracing.workspace = true
 chrono.workspace = true
-uuid.workspace = true
-indexmap.workspace = true
-once_cell.workspace = true
-regex.workspace = true
-unicode-normalization.workspace = true
-shellexpand.workspace = true
+walkdir.workspace = true
 sha2.workspace = true
-hex.workspace = true
+shlex.workspace = true
+which.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

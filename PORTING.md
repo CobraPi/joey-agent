@@ -574,3 +574,54 @@ A future improvement could translate MSYS paths to native Windows paths.
 **Audit note**: the rest of the codebase (joey-core, joey-mcp, joey-cron,
 joey-cli, joey-tools sibling files) was already correctly cfg-guarded before
 this feature — the terminal tool was the sole compile blocker.
+
+## NeuroCode — Enterprise Java & Pega Rule System Coding Agent (feature 015, 2026-08-13)
+
+**Status**: Deliberate-deviation subsystem (Joey-original, no upstream
+equivalent).
+
+`joey-neurocode` is a new library crate (`crates/joey-neurocode/`, Constitution
+I) that gives the agent dependency-graph-aware context, complexity-tier
+routing that composes with `specs/011`'s `ModelAllocator`, and a build/verify
+feedback loop for enterprise Java and Pega Platform codebases. It consumes
+`joey-llm-selector`'s trait upward and is consumed by `joey-agent-core` via a
+narrow `NeuroCodeEngine` trait (Constitution VI) and by `joey-cli` for the
+`/neurocode` command.
+
+**Deliberate deviation — no Qdrant; SQLite + FTS5 instead.** The source plan
+proposed Qdrant (a separate vector database server). This is rejected for this
+workspace: Qdrant adds a second storage engine, a runtime server/dependency,
+and deployment complexity. The workspace already bundles SQLite with FTS5
+(`SCHEMA_VERSION = 22`; `joey-core::state` probes/uses FTS5), so the structural
+knowledge graph is stored in a per-project SQLite DB
+(`~/.joey/neurocode/<project-hash>/graph.db`). FTS5 with BM25 ranking and
+symbol-aware tokenization handles FR-007's retrieval, and the graph edges
+(implements/injects/references) are exact-match typed traversals — not
+nearest-neighbor searches — for which a vector store adds no value (Constitution
+VIII, lean deps). Embedding-model retrieval is deferred to a future trait
+extension (research.md §2, §6).
+
+**Deliberate deviation — tree-sitter for Java AST parsing.** Upstream's source
+plan uses a Python-based parsing approach. Joey adds `tree-sitter = "0.26"` +
+`tree-sitter-java = "0.23"` — the one new external dependency for this feature
+(~120KB + ~150KB compiled, no transitive runtime deps, C source bundled via
+`cc`) — to satisfy FR-006's mandate for deterministic, syntax-aware Java parsing
+(type/method/field boundaries, annotations, imports, injection points) that does
+not rely on the LLM to guess structure. Regex heuristics fail on
+generics/annotations/nested classes; a hand-written Rust parser is rejected as
+enormous and less correct than the maintained grammar (research.md §3).
+
+**On-disk format**: per-project SQLite DB at
+`~/.joey/neurocode/<project-hash>/graph.db` (machine-global across profiles via
+`process_joey_home()`), schema v1 (tables: `code_artifacts`, `graph_edges`,
+`code_artifacts_fts`, `patterns`, `anti_patterns`, `domain_knowledge`,
+`domain_knowledge_fts`, `schema_meta`). Round-trip + acyclic-DAG + disabled-state
+regression tests in `crates/joey-neurocode/tests/`.
+
+**Disabled state is byte-identical to today**: with `neurocode.enabled = false`
+the engine's `classify()`/`assemble_context()` are never called, no messages are
+injected, and the system prompt bytes are unchanged (FR-020, SC-008 — asserted in
+`tests/regression_disabled.rs`).
+
+Full design trail and every dependency decision against the constitution:
+`specs/015-neurocode-enterprise-java/research.md`.

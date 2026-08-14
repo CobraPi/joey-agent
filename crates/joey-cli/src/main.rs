@@ -7,6 +7,7 @@
 
 mod commands;
 mod llm_selector;
+mod neurocode_wiring;
 mod auth_cmd;
 mod config_cmd;
 mod cron_cmd;

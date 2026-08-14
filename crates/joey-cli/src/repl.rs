@@ -170,6 +170,14 @@ pub(crate) fn build_agent(
     // Feature 011: build the allocator before orchestration registration so it
     // can be threaded into delegate_task (T028 subagent intercept).
     let allocator = crate::llm_selector::try_build_allocator(config);
+    // Feature 015 (NeuroCode): build the engine when enabled and register the
+    // 4 NeuroCode tools on the registry (T056/T057). None when disabled —
+    // byte-identical to pre-feature-015 (FR-020).
+    let neurocode_engine = crate::neurocode_wiring::try_build_engine(config);
+    if let Some(engine) = &neurocode_engine {
+        let backend = crate::neurocode_wiring::backend_for_engine(engine);
+        joey_tools::builtins::register_neurocode_tools(&mut registry, Some(backend));
+    }
     joey_orchestration::register_orchestration_with_resolver_and_allocator(
         &mut registry,
         manager.clone(),
@@ -192,6 +200,13 @@ pub(crate) fn build_agent(
     // compression intercepts). Built above before orchestration registration.
     if let Some(allocator) = allocator {
         agent.install_model_allocator(allocator);
+    }
+
+    // Feature 015 (NeuroCode): install the engine on the parent agent so the
+    // turn-loop intercept classifies requests and assembles dependency-aware
+    // context before model dispatch (T056). None when disabled — no-op.
+    if let Some(engine) = neurocode_engine {
+        agent.set_neurocode_engine(engine);
     }
 
     // Populate the OMO category resolver with the now-available provider
@@ -840,6 +855,10 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
                 Ok(()) => {}
                 Err(e) => render::error(&e),
             }
+        }
+        "neurocode" => {
+            let out = crate::commands::neurocode::neurocode_slash(args);
+            println!("{}", out);
         }
         "reasoning" => reasoning_slash(st, args),
         "tools" => {

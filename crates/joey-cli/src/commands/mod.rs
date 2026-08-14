@@ -2,6 +2,8 @@
 //! model` picker (main.py:2925-2935 + model_setup_flows), the first-run
 //! guard (main.py:2497-2527), and toolset resolution shared by chat/oneshot.
 
+pub mod neurocode;
+
 use std::io::{IsTerminal, Write};
 
 use anyhow::Result;

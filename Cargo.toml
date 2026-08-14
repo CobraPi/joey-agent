@@ -14,6 +14,7 @@ members = [
     "crates/joey-llm-selector",
     "crates/joey-orchestration",
     "crates/joey-omo",
+    "crates/joey-neurocode",
 ]
 
 [workspace.package]
@@ -35,6 +36,13 @@ joey-tui = { path = "crates/joey-tui" }
 joey-llm-selector = { path = "crates/joey-llm-selector" }
 joey-orchestration = { path = "crates/joey-orchestration" }
 joey-omo = { path = "crates/joey-omo" }
+joey-neurocode = { path = "crates/joey-neurocode" }
+
+# NeuroCode (feature 015): deterministic Java AST parsing (FR-006).
+# Justified in specs/015-neurocode-enterprise-java/research.md §3/§10:
+# ~270KB compiled total, no transitive runtime deps, C via cc.
+tree-sitter = "0.26"
+tree-sitter-java = "0.23"
 
 anyhow = "1"
 thiserror = "2"

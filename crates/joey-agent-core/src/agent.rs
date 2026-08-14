@@ -291,6 +291,15 @@ pub struct Agent {
     /// of using `config.model` verbatim. When None or inactive, behavior is
     /// byte-identical to pre-feature-011 (Constitution VII).
     pub(crate) model_allocator: Option<Arc<dyn joey_llm_selector::ModelAllocator>>,
+    /// Optional NeuroCode engine (feature 015). When set and active, the main
+    /// turn's model id is resolved per-tier by the engine's classifier + the
+    /// configured tier model, and a dependency-aware context graph is assembled
+    /// and prepended to the request. When None or inactive, behavior is
+    /// byte-identical to pre-feature-015 (Constitution VII, FR-020).
+    pub(crate) neurocode_engine: Option<Arc<dyn joey_neurocode::NeuroCodeEngine>>,
+    /// One-shot NeuroCode context prepend for the current request (FR-007).
+    /// Set by the turn-loop intercept, consumed by build_request.
+    pub(crate) neurocode_context: std::sync::Mutex<Option<String>>,
 }
 
 impl Agent {
@@ -390,7 +399,17 @@ impl Agent {
             loop_detector: crate::loop_detection::LoopDetector::new(),
             hooks: None,
             model_allocator: None,
+            neurocode_engine: None,
+            neurocode_context: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Set the NeuroCode engine (feature 015). When set and active, the main
+    /// turn calls engine.classify() + engine.assemble_context() before model
+    /// dispatch. When None or inactive, behavior is byte-identical to
+    /// pre-feature-015 (Constitution VII, FR-020).
+    pub fn set_neurocode_engine(&mut self, engine: Arc<dyn joey_neurocode::NeuroCodeEngine>) {
+        self.neurocode_engine = Some(engine);
     }
 
     /// Set the dynamic LLM model allocator (feature 011). When set, the main
@@ -537,6 +556,17 @@ impl Agent {
             if !extra.is_empty() {
                 combined.push_str("\n\n");
                 combined.push_str(extra);
+            }
+        }
+        // Feature 015 (NeuroCode): prepend the assembled dependency-aware
+        // context graph when the engine is active. Only present when
+        // neurocode_engine.is_active() — byte-identical when off (FR-020).
+        if let Ok(ctx_guard) = self.neurocode_context.lock() {
+            if let Some(nc_ctx) = ctx_guard.as_ref() {
+                if !nc_ctx.is_empty() {
+                    combined.push_str("\n\n");
+                    combined.push_str(nc_ctx);
+                }
             }
         }
         combined
@@ -872,6 +902,12 @@ impl Agent {
         // A one-shot output-cap override from the overflow handler wins
         // (upstream `_ephemeral_max_output_tokens`).
         let max_tokens = self.ephemeral_max_output_tokens.or(self.config.max_tokens);
+
+        // Feature 015 (NeuroCode): when the engine is wired and active,
+        // classify the request's complexity, assemble dependency-aware context,
+        // and prepend it. When None or inactive, byte-identical (FR-020).
+        self.apply_neurocode_intercept();
+
         // Feature 011: when a dynamic model allocator is wired and active,
         // resolve the main-turn model per-module. When None or inactive,
         // `config.model` is used verbatim (byte-identical to pre-feature-011).
@@ -884,9 +920,70 @@ impl Agent {
             .streaming(self.config.stream)
     }
 
+    /// NeuroCode intercept (feature 015, FR-020). Before model dispatch, if
+    /// the engine is wired and active, classify the request, assemble context,
+    /// and stash the context string for prepending. No-op when None/inactive
+    /// (byte-identical to pre-feature-015 — Constitution VII).
+    fn apply_neurocode_intercept(&self) {
+        // Clear the previous request's context.
+        if let Ok(mut ctx) = self.neurocode_context.lock() {
+            *ctx = None;
+        }
+        let Some(engine) = &self.neurocode_engine else {
+            return;
+        };
+        if !engine.is_active() {
+            return;
+        }
+        // Build a CodingRequest from the latest user message.
+        let last_user_text = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let last_user_text = match last_user_text {
+            Some(t) if !t.is_empty() => t,
+            _ => return,
+        };
+        let request = joey_neurocode::CodingRequest {
+            text: last_user_text,
+            active_file: None,
+            active_symbols: Vec::new(),
+            project_root: self.ctx.cwd().to_path_buf(),
+            token_budget_hint: 0,
+        };
+        let route = engine.classify(&request);
+        // Tier transparency (FR-002/SC-002): the developer greps the log to see
+        // which tier served a request and why.
+        tracing::info!(
+            target: "neurocode",
+            tier = %route.tier,
+            overridden = route.overridden,
+            reasoning = %route.reasoning,
+            "neurocode routed request"
+        );
+        let assembled = engine.assemble_context(&request, route.tier);
+        if !assembled.formatted_context.is_empty() {
+            tracing::debug!(
+                target: "neurocode",
+                expanded_nodes = assembled.expanded_nodes.len(),
+                token_estimate = assembled.token_estimate,
+                cold_mode = assembled.cold_mode,
+                "neurocode context assembled"
+            );
+            if let Ok(mut ctx) = self.neurocode_context.lock() {
+                *ctx = Some(assembled.formatted_context);
+            }
+        }
+    }
+
     /// Resolve the model id for the main turn. When the dynamic allocator is
     /// wired and active (feature 011), it picks the model; otherwise the
     /// configured model is used verbatim (Constitution VII non-regression).
+    /// Feature 015 (NeuroCode): when the engine is active and classified a tier,
+    /// and 011 is not active, the tier model is resolved from config (Mode 2).
     fn resolve_main_turn_model(&self, needs_tools: bool) -> String {
         if let Some(allocator) = &self.model_allocator {
             if allocator.is_active() {
@@ -907,6 +1004,18 @@ impl Agent {
                     0, // token_budget_hint: 0 = no hard gate from the call site
                 );
                 return alloc.model_id;
+            }
+        }
+        // Feature 015 (NeuroCode Mode 2): when 011 is not active but NeuroCode
+        // is, resolve the tier model from config. Falls back to config.model
+        // when the tier model is unconfigured or NeuroCode is off.
+        if let Some(engine) = &self.neurocode_engine {
+            if engine.is_active() {
+                // The context was already assembled by apply_neurocode_intercept.
+                // Mode 2: NeuroCode resolves the tier model from its own config.
+                if let Some(model_id) = engine.resolve_tier_model() {
+                    return model_id;
+                }
             }
         }
         self.config.model.clone()
@@ -3723,6 +3832,178 @@ mod tests {
             fx.agent.history.len(),
             history_len_before + 2,
             "history grew only by user+assistant — no synthetic messages injected"
+        );
+    }
+
+    // ── Feature 015 (NeuroCode) regression tests (T067, FR-020/SC-008) ──
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Counting NeuroCode engine: counts classify()/assemble_context() calls
+    /// and reports a configurable active/inactive state (T067 test double).
+    struct CountingEngine {
+        active: bool,
+        classify_count: AtomicUsize,
+        assemble_count: AtomicUsize,
+    }
+
+    impl CountingEngine {
+        fn new(active: bool) -> Self {
+            Self {
+                active,
+                classify_count: AtomicUsize::new(0),
+                assemble_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl joey_neurocode::NeuroCodeEngine for CountingEngine {
+        fn classify(&self, _request: &joey_neurocode::CodingRequest) -> joey_neurocode::ComplexityRoute {
+            self.classify_count.fetch_add(1, AtomicOrdering::SeqCst);
+            joey_neurocode::ComplexityRoute {
+                tier: joey_neurocode::ComplexityTier::Economical,
+                reasoning: "counting-engine test route".to_string(),
+                overridden: false,
+                override_tier: None,
+                signals: Vec::new(),
+            }
+        }
+
+        fn assemble_context(
+            &self,
+            _request: &joey_neurocode::CodingRequest,
+            tier: joey_neurocode::ComplexityTier,
+        ) -> joey_neurocode::AssembledContext {
+            self.assemble_count.fetch_add(1, AtomicOrdering::SeqCst);
+            joey_neurocode::AssembledContext {
+                primary_nodes: Vec::new(),
+                expanded_nodes: Vec::new(),
+                formatted_context: if self.active {
+                    "## NeuroCode Test Context\n\ncounting-engine assembled context".to_string()
+                } else {
+                    String::new()
+                },
+                tier,
+                token_estimate: 64,
+                cold_mode: false,
+                notice: None,
+            }
+        }
+
+        fn is_active(&self) -> bool {
+            self.active
+        }
+    }
+
+    /// T067 / FR-020 / SC-008 case 1: with NO engine wired, the system prompt
+    /// is byte-identical before and after a full build_request path (run_turn),
+    /// and no NeuroCode context is ever stashed.
+    #[tokio::test]
+    async fn engine_absent_system_prompt_byte_identical() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        assert!(fx.agent.neurocode_engine.is_none(), "no engine wired by default");
+
+        let prompt_before = fx.agent.effective_system_prompt();
+        let base_before = fx.agent.system_prompt().to_string();
+
+        // Simulate the build_request path via the public turn surface.
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("refactor this", tx).await;
+
+        assert_eq!(
+            fx.agent.effective_system_prompt(),
+            prompt_before,
+            "effective system prompt must be byte-identical with no engine"
+        );
+        assert_eq!(
+            fx.agent.system_prompt(),
+            base_before,
+            "base system prompt must be byte-identical with no engine"
+        );
+        assert!(
+            fx.agent.neurocode_context.lock().unwrap().is_none(),
+            "no NeuroCode context may be stashed with no engine"
+        );
+    }
+
+    /// T067 / FR-020 / SC-008 case 2: an INSTALLED but INACTIVE engine is a
+    /// complete no-op — no classify, no assemble_context, no injected context,
+    /// system prompt bytes unchanged.
+    #[tokio::test]
+    async fn inactive_engine_is_noop() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        let prompt_before = fx.agent.effective_system_prompt();
+        let base_before = fx.agent.system_prompt().to_string();
+
+        let engine = Arc::new(CountingEngine::new(false));
+        fx.agent.set_neurocode_engine(engine.clone());
+
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("refactor this module", tx).await;
+
+        assert_eq!(engine.classify_count.load(AtomicOrdering::SeqCst), 0, "inactive engine must not classify");
+        assert_eq!(
+            engine.assemble_count.load(AtomicOrdering::SeqCst), 0,
+            "inactive engine must not assemble context"
+        );
+        assert!(
+            fx.agent.neurocode_context.lock().unwrap().is_none(),
+            "inactive engine must not stash context"
+        );
+        assert_eq!(
+            fx.agent.effective_system_prompt(),
+            prompt_before,
+            "inactive engine must leave the effective system prompt byte-identical"
+        );
+        assert_eq!(
+            fx.agent.system_prompt(),
+            base_before,
+            "inactive engine must never mutate the base system prompt"
+        );
+    }
+
+    /// T067 / FR-020 case 3: an ACTIVE engine intercepts exactly once —
+    /// classify + assemble each fire once, the context is stashed and appears
+    /// in effective_system_prompt(), while the byte-stable base system_prompt
+    /// field itself is NEVER mutated.
+    #[tokio::test]
+    async fn active_engine_intercepts() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        let base_before = fx.agent.system_prompt().to_string();
+        let prompt_before = fx.agent.effective_system_prompt();
+
+        let engine = Arc::new(CountingEngine::new(true));
+        fx.agent.set_neurocode_engine(engine.clone());
+
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("refactor this module", tx).await;
+
+        assert_eq!(engine.classify_count.load(AtomicOrdering::SeqCst), 1, "active engine classifies exactly once");
+        assert_eq!(
+            engine.assemble_count.load(AtomicOrdering::SeqCst), 1,
+            "active engine assembles context exactly once"
+        );
+        let ctx = fx
+            .agent
+            .neurocode_context
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            ctx,
+            Some("## NeuroCode Test Context\n\ncounting-engine assembled context".to_string()),
+            "active engine stashes the assembled context"
+        );
+        let effective = fx.agent.effective_system_prompt();
+        assert!(
+            effective.contains("## NeuroCode Test Context"),
+            "effective system prompt must contain the NeuroCode context"
+        );
+        assert_ne!(effective, prompt_before, "effective prompt gains the NeuroCode section");
+        assert_eq!(
+            fx.agent.system_prompt(),
+            base_before,
+            "the base system_prompt field must NEVER be mutated by the intercept"
         );
     }
 }

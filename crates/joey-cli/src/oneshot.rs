@@ -259,6 +259,15 @@ async fn run_agent(
     // delegate_task tool (T028 subagent intercept).
     let allocator = crate::llm_selector::try_build_allocator(config);
 
+    // Feature 015 (NeuroCode): build the engine when enabled and register the
+    // 4 NeuroCode tools (T056/T057). None when disabled — byte-identical
+    // to pre-feature-015 (FR-020).
+    let neurocode_engine = crate::neurocode_wiring::try_build_engine(config);
+    if let Some(engine) = &neurocode_engine {
+        let backend = crate::neurocode_wiring::backend_for_engine(engine);
+        joey_tools::builtins::register_neurocode_tools(&mut registry, Some(backend));
+    }
+
     joey_orchestration::register_orchestration_with_allocator(
         &mut registry,
         manager.clone(),
@@ -279,6 +288,12 @@ async fn run_agent(
     // compression intercepts).
     if let Some(allocator) = allocator {
         agent.install_model_allocator(allocator);
+    }
+
+    // Feature 015 (NeuroCode): install the engine on the parent agent
+    // (turn-loop intercept — T056). None when disabled — no-op.
+    if let Some(engine) = neurocode_engine {
+        agent.set_neurocode_engine(engine);
     }
 
     if !agent.client().has_credentials() {

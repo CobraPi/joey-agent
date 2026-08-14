@@ -4,6 +4,7 @@ pub mod clarify_tool;
 pub mod file_tools;
 pub mod lsp_tools;
 pub mod memory_tool;
+pub mod neurocode_tools;
 pub mod process_tool;
 pub mod session_search_tool;
 pub mod skills_tool;
