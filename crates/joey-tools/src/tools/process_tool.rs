@@ -245,10 +245,15 @@ pub fn spawn_reaper(
                 break;
             }
             tokio::select! {
+                // An exhausted stream must arm a NEVER-ready future, not one
+                // that resolves immediately — returning Ok(0) here made the
+                // select complete instantly in a tight loop (100% CPU) while
+                // the other pipe sat idle. The loop's top-of-iteration
+                // `both None` check handles final EOF.
                 n = async {
                     match stdout.as_mut() {
                         Some(s) => s.read(&mut sbuf).await,
-                        None => Ok(0),
+                        None => std::future::pending::<std::io::Result<usize>>().await,
                     }
                 } => {
                     match n {
@@ -260,11 +265,11 @@ pub fn spawn_reaper(
                 n = async {
                     match stderr.as_mut() {
                         Some(s) => s.read(&mut ebuf).await,
-                        None => Ok(0),
+                        None => std::future::pending::<std::io::Result<usize>>().await,
                     }
                 } => {
                     match n {
-                        Ok(0) => stderr = None,
+                        Ok(0) => stderr = None, // EOF
                         Ok(n) => push_to_session(&session_id, &ebuf[..n], false),
                         Err(_) => stderr = None,
                     }

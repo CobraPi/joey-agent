@@ -237,6 +237,11 @@ impl NeuroCodeCommands for DefaultEngine {
         } else {
             "auto-detected".to_string()
         };
+        let languages = crate::parse::registry::languages()
+            .iter()
+            .map(|l| l.id)
+            .collect::<Vec<_>>()
+            .join(", ");
 
         // Tier model ids.
         let eco_model = if self.config.tier.economical_model.is_empty() {
@@ -286,11 +291,12 @@ impl NeuroCodeCommands for DefaultEngine {
         format!(
             "NeuroCode: {}\n\
              {}\n\
+             Languages: {} (grammar) + heuristic fallback\n\
              Pega: {}\n\
              Tiers: economical={}, frontier={}\n\
              Patterns: {} successful, {} anti-patterns active\n\
              Domain: {} sources",
-            enabled, index_line, pega_version, eco_model, frontier_model, patterns, anti_patterns, domain_count
+            enabled, index_line, languages, pega_version, eco_model, frontier_model, patterns, anti_patterns, domain_count
         ) + &conflict_line(conflicts.as_slice())
     }
 
@@ -550,8 +556,8 @@ impl NeuroCodeCommands for DefaultEngine {
                 for s in &sources {
                     let ver = s.version_tag.as_deref().unwrap_or("-");
                     out.push_str(&format!(
-                        "  [{}] {} | {} | version={} | provenance={}\n        path: {}\n        ingested: {}\n",
-                        s.id, s.category, s.source_path, ver, s.provenance, s.source_path, s.ingested_at
+                        "  [{}] {} | version={} | provenance={}\n        path: {}\n        ingested: {}\n",
+                        s.id, s.category, ver, s.provenance, s.source_path, s.ingested_at
                     ));
                 }
                 out.trim_end().to_string()
@@ -657,15 +663,16 @@ impl NeuroCodeEngine for DefaultEngine {
         request: &CodingRequest,
         tier: ComplexityTier,
     ) -> AssembledContext {
-        // Non-Java/Pega fallback (T065, FR-015): when the target project has
-        // no Java/Pega artifacts, skip the structural machinery entirely and
-        // return an empty context with a clear notice — ordinary retrieval
-        // and generation proceed unmodified.
-        if !parse::project_has_java(&request.project_root) {
+        // Non-source fallback (T065, FR-015, generalized): when the target
+        // project has no ingestible source artifacts (any language), skip
+        // the structural machinery entirely and return an empty context
+        // with a clear notice — ordinary retrieval and generation proceed
+        // unmodified.
+        if !parse::project_has_source(&request.project_root) {
             return AssembledContext {
                 cold_mode: false,
                 notice: Some(
-                    "NeuroCode: project has no Java/Pega artifacts — structural graph disabled; \
+                    "NeuroCode: project has no supported source artifacts — structural graph disabled; \
                      using ordinary retrieval (FR-015)"
                         .to_string(),
                 ),

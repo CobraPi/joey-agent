@@ -22,7 +22,37 @@ lsp:
   go:
     command: "gopls"
     file_types: ["go"]
+  ruby:
+    command: "solargraph"
+    args: ["stdio"]
+    file_types: ["rb"]
+  php:
+    command: "intelephense"
+    args: ["--stdio"]
+    file_types: ["php"]
+  csharp:
+    command: "OmniSharp"
+    args: ["-lsp"]
+    file_types: ["cs"]
+  c:
+    command: "clangd"
+    file_types: ["c", "h"]
+  cpp:
+    command: "clangd"
+    file_types: ["cpp", "cc", "cxx", "hpp"]
+  haskell:
+    command: "haskell-language-server"
+    args: ["--lsp"]
+    file_types: ["hs"]
+  bash:
+    command: "bash-language-server"
+    args: ["start"]
+    file_types: ["sh", "bash"]
 ```
+
+Any language with a language-server implementation works — the entries above
+correspond to the languages joey parses with dedicated tree-sitter grammars
+(see `crates/joey-neurocode/src/parse/registry.rs`).
 
 ## Available Tools
 

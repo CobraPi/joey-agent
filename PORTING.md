@@ -601,15 +601,23 @@ nearest-neighbor searches — for which a vector store adds no value (Constituti
 VIII, lean deps). Embedding-model retrieval is deferred to a future trait
 extension (research.md §2, §6).
 
-**Deliberate deviation — tree-sitter for Java AST parsing.** Upstream's source
-plan uses a Python-based parsing approach. Joey adds `tree-sitter = "0.26"` +
-`tree-sitter-java = "0.23"` — the one new external dependency for this feature
-(~120KB + ~150KB compiled, no transitive runtime deps, C source bundled via
-`cc`) — to satisfy FR-006's mandate for deterministic, syntax-aware Java parsing
-(type/method/field boundaries, annotations, imports, injection points) that does
-not rely on the LLM to guess structure. Regex heuristics fail on
-generics/annotations/nested classes; a hand-written Rust parser is rejected as
-enormous and less correct than the maintained grammar (research.md §3).
+**Deliberate deviation — tree-sitter for AST parsing.** Upstream's source
+plan uses a Python-based parsing approach. Joey adds `tree-sitter = "0.26"`
+plus one grammar crate per supported language — every programming language
+with a grammar under the tree-sitter org
+(https://tree-sitter.github.io/tree-sitter/): Java, Python, JS/TS/TSX, Go,
+Rust, Ruby, PHP, C#, C, C++, Scala, Haskell, Julia, OCaml, Bash, Verilog,
+Agda (`crates/joey-neurocode/src/parse/registry.rs` is the authoritative
+list; long-tail languages fall back to the heuristic extractor) — each
+~150-300KB compiled, no transitive runtime deps, C source bundled via `cc`
+— to satisfy FR-006's mandate for deterministic, syntax-aware parsing
+(type/method/field boundaries, annotations, imports, injection points)
+that does not rely on the LLM to guess structure. Regex heuristics fail on
+generics/annotations/nested classes; a hand-written Rust parser is rejected
+as enormous and less correct than the maintained grammars (research.md §3).
+Markup/data grammars on the tree-sitter supported list (CSS, HTML, JSON,
+JSDoc, Regex, embedded-template) are deliberately not compiled in: they
+produce no type/method/import structure for the dependency graph.
 
 **On-disk format**: per-project SQLite DB at
 `~/.joey/neurocode/<project-hash>/graph.db` (machine-global across profiles via

@@ -2,52 +2,15 @@
 //!
 //! Parse a `.java` file, extract classes/interfaces/enums/methods/fields with
 //! their annotations, implemented interfaces, and declared dependencies
-//! (imports + `@Autowired`/injection points).
+//! (imports + `@Autowired`/injection points). Produces the shared
+//! language-neutral [`SourceExtraction`].
 
 use tree_sitter::{Node, Parser};
 
-/// Extracted structural metadata from a Java source file.
-#[derive(Debug, Clone, Default)]
-pub struct JavaExtraction {
-    pub package: String,
-    pub imports: Vec<String>,
-    pub types: Vec<ExtractedType>,
-}
-
-/// A type-level declaration (class, interface, or enum).
-#[derive(Debug, Clone)]
-pub struct ExtractedType {
-    pub name: String,
-    pub kind: String, // "class", "interface", "enum"
-    pub package: String,
-    pub implemented_interfaces: Vec<String>,
-    pub annotations: Vec<String>,
-    pub declared_dependencies: Vec<String>,
-    pub methods: Vec<ExtractedMethod>,
-    pub fields: Vec<ExtractedField>,
-    pub start_byte: u32,
-    pub end_byte: u32,
-}
-
-/// A method declaration.
-#[derive(Debug, Clone)]
-pub struct ExtractedMethod {
-    pub name: String,
-    pub annotations: Vec<String>,
-    pub start_byte: u32,
-    pub end_byte: u32,
-}
-
-/// A field declaration.
-#[derive(Debug, Clone)]
-pub struct ExtractedField {
-    pub name: String,
-    pub type_name: String,
-    pub annotations: Vec<String>,
-}
+use super::extract::{ExtractedField, ExtractedMethod, ExtractedType, SourceExtraction};
 
 /// Parse a Java source string and extract structural metadata.
-pub fn parse_java_file(source: &str) -> Result<JavaExtraction, String> {
+pub fn parse_java_file(source: &str) -> Result<SourceExtraction, String> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_java::LANGUAGE.into())
@@ -57,7 +20,10 @@ pub fn parse_java_file(source: &str) -> Result<JavaExtraction, String> {
         .ok_or_else(|| "failed to parse".to_string())?;
     let root = tree.root_node();
 
-    let mut extraction = JavaExtraction::default();
+    let mut extraction = SourceExtraction {
+        language: "java".into(),
+        ..Default::default()
+    };
 
     // Package declaration — the scoped_identifier is the first named child.
     for i in 0..root.named_child_count() {
@@ -105,7 +71,6 @@ pub fn parse_java_file(source: &str) -> Result<JavaExtraction, String> {
                         extraction.types.push(ext);
                     }
                 }
-                "program" | "package_declaration" | "import_declaration" => {}
                 _ => {}
             }
         }
@@ -196,6 +161,7 @@ fn extract_type<'a>(
         name,
         kind: kind.to_string(),
         package: package.to_string(),
+        fq_name: None,
         implemented_interfaces,
         annotations,
         declared_dependencies,
@@ -338,8 +304,6 @@ fn collect_injected_params<'a>(node: &Node<'a>, source: &str, out: &mut Vec<Stri
         }
     }
 }
-
-/// Helper: extract the type identifier text from a node (unused — kept for reference).
 
 #[cfg(test)]
 mod tests {

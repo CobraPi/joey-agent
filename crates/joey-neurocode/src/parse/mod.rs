@@ -1,8 +1,28 @@
-//! Tree-sitter ingestion pipeline (FR-006).
+//! Tree-sitter ingestion pipeline (FR-006) — multi-language.
+//!
+//! Walks a project source tree, parses each recognized source file with
+//! its dedicated tree-sitter grammar — every programming language with a
+//! grammar under the tree-sitter org (Java, Python, JS/TS/TSX, Go, Rust,
+//! Ruby, PHP, C#, C, C++, Scala, Haskell, Julia, OCaml, Bash, Verilog,
+//! Agda) — or the heuristic fallback extractor (Kotlin, Swift, Elixir,
+//! Lua, …), and upserts nodes + edges into the graph store (T011).
+//! Pega rule patterns are recognized during the same pass on Java
+//! extractions: matched types get `PegaMetadata` and
+//! `ArtifactKind::PegaRule`, and `ReferencesRule`/`InheritsRule` edges are
+//! emitted to the referenced/inherited rules (T058).
 
+pub mod extract;
+pub mod golang;
+pub mod grammars;
+pub mod heuristic;
 pub mod java;
+pub mod jsts;
 pub mod pega;
+pub mod python;
+pub mod registry;
+pub mod rustlang;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::graph::edge::EdgeKind;
@@ -22,47 +42,48 @@ pub struct IngestionResult {
     pub errors: Vec<String>,
 }
 
-/// Walk a project source tree, parse each `.java` file via tree-sitter, and
-/// upsert nodes + edges into the graph store (T011). Pega rule patterns are
-/// recognized during the same pass: matched types get `PegaMetadata` and
-/// `ArtifactKind::PegaRule`, and `ReferencesRule`/`InheritsRule` edges are
-/// emitted to the referenced/inherited rules (T058).
+/// Walk a project source tree, parse each supported source file, and
+/// upsert nodes + edges into the graph store (T011).
 pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> IngestionResult {
-    let mut result = IngestionResult {
-        files_scanned: 0,
-        artifacts_seen: 0,
-        edges_created: 0,
-        errors: Vec::new(),
-    };
+    let mut result = IngestionResult::default();
 
     // T058: detect the Pega version once per ingestion run. An empty string
     // (no version detected) still allows pattern-based rule extraction.
     let pega_version = detect_pega_version(project_root, "").unwrap_or_default();
 
-    // Pega rule-reference edges that can only be resolved after every node
-    // in the tree has been upserted: (from_id, reference, EdgeKind).
-    let mut pending_pega_edges: Vec<(NodeId, String, EdgeKind)> = Vec::new();
+    // Edges that can only be resolved after every node in the tree has been
+    // upserted: (from_id, target reference, EdgeKind).
+    let mut pending_edges: Vec<(NodeId, String, EdgeKind)> = Vec::new();
+    // Simple-name → node id index for cross-file edge resolution.
+    let mut name_index: HashMap<String, NodeId> = HashMap::new();
 
-    let src = project_root.join("src");
-    let scan_root: PathBuf = if src.is_dir() { src } else { project_root.to_path_buf() };
+    let scan_root = primary_source_root(project_root);
 
     for entry in walkdir::WalkDir::new(&scan_root)
         .max_depth(10)
         .into_iter()
         .filter_map(Result::ok)
     {
-        if !entry.path().extension().map_or(false, |e| e == "java") {
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let ext = ext.to_lowercase();
+        if !registry::is_supported_extension(&ext) {
+            continue;
+        }
+        // Skip vendored/generated trees — noise in the structural graph.
+        if is_vendor_path(path) {
             continue;
         }
         result.files_scanned += 1;
-        let rel_path = entry
-            .path()
+        let rel_path = path
             .strip_prefix(project_root)
-            .unwrap_or(entry.path())
+            .unwrap_or(path)
             .to_string_lossy()
             .to_string();
 
-        let content = match std::fs::read_to_string(entry.path()) {
+        let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
                 result.errors.push(format!("{}: {}", rel_path, e));
@@ -70,91 +91,101 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
             }
         };
 
-        let extraction = match java::parse_java_file(&content) {
-            Ok(ext) => ext,
-            Err(e) => {
+        let extraction = match registry::parse_any(path, &content) {
+            Some(Ok(ext)) => ext,
+            Some(Err(e)) => {
                 result.errors.push(format!("{}: {}", rel_path, e));
                 continue;
             }
+            None => continue, // unreachable for supported extensions
         };
 
-        // Upsert type-level nodes (classes, interfaces, enums).
-        let mut node_ids: Vec<(String, ArtifactKind, crate::graph::NodeId)> = Vec::new();
+        // Package: explicit (Java, Go) or derived from the file's directory
+        // path (Python modules, Rust mod paths, TS scopes, …).
+        let package = if !extraction.package.is_empty() {
+            extraction.package.clone()
+        } else {
+            derive_package(&rel_path)
+        };
+
+        // ── Type-level nodes ────────────────────────────────────────
+        // (fq name, kind, node id) for same-file edge resolution.
+        let mut node_ids: Vec<(String, ArtifactKind, NodeId)> = Vec::new();
+
         for type_node in &extraction.types {
-            let fqcn = if type_node.package.is_empty() {
-                type_node.name.clone()
-            } else {
-                format!("{}.{}", type_node.package, type_node.name)
-            };
-            let kind = match type_node.kind.as_str() {
+            let fqcn = extraction.fq_name(type_node);
+            let kind = match type_node.kind_class() {
                 "interface" => ArtifactKind::Interface,
                 "enum" => ArtifactKind::Enum,
                 _ => ArtifactKind::Class,
             };
-            let mut node = CodeArtifactNode::new(kind.clone(), fqcn.clone(), type_node.package.clone(), rel_path.clone());
+            let mut node = CodeArtifactNode::new(
+                kind.clone(),
+                fqcn.clone(),
+                package.clone(),
+                rel_path.clone(),
+            );
             node.implemented_interfaces = type_node.implemented_interfaces.clone();
             node.annotations = type_node.annotations.clone();
             node.declared_dependencies = type_node.declared_dependencies.clone();
             node.source_span = Some((type_node.start_byte, type_node.end_byte));
 
-            // T058: Pega rule extraction. The Java extractor surfaces
-            // `implements` names (not superclasses), so Pega-pattern
-            // interfaces are surfaced as `extends:<X>` pseudo-annotations
-            // to let extract_pega_metadata recognize directed inheritance.
-            // Simple dependency names are package-qualified so that rules in
-            // `com.pega.*` namespaces are recognized as rule references.
-            let mut pega_annotations = type_node.annotations.clone();
-            for iface in &type_node.implemented_interfaces {
-                // Prefer the bare name; otherwise try the package-qualified
-                // form (a plain Java identifier in a `com.pega.*` package is
-                // only recognizable as a rule when qualified).
-                let qualified = if type_node.package.is_empty() {
-                    None
-                } else {
-                    Some(format!("{}.{}", type_node.package, iface))
-                };
-                let pseudo = if is_pega_rule(iface) {
-                    Some(format!("extends:{}", iface))
-                } else {
-                    qualified
-                        .as_deref()
-                        .filter(|q| is_pega_rule(q))
-                        .map(|q| format!("extends:{}", q))
-                };
-                if let Some(p) = pseudo {
-                    if !pega_annotations.contains(&p) {
-                        pega_annotations.push(p);
+            // T058: Pega rule extraction (Java only — pattern matching is
+            // keyed on Java identifiers/annotations). The Java extractor
+            // surfaces `implements` names; Pega-pattern interfaces are
+            // surfaced as `extends:<X>` pseudo-annotations to let
+            // extract_pega_metadata recognize directed inheritance.
+            let mut kind = kind;
+            if extraction.language == "java" {
+                let mut pega_annotations = type_node.annotations.clone();
+                for iface in &type_node.implemented_interfaces {
+                    let qualified = if type_node.package.is_empty() {
+                        None
+                    } else {
+                        Some(format!("{}.{}", type_node.package, iface))
+                    };
+                    let pseudo = if is_pega_rule(iface) {
+                        Some(format!("extends:{}", iface))
+                    } else {
+                        qualified
+                            .as_deref()
+                            .filter(|q| is_pega_rule(q))
+                            .map(|q| format!("extends:{}", q))
+                    };
+                    if let Some(p) = pseudo {
+                        if !pega_annotations.contains(&p) {
+                            pega_annotations.push(p);
+                        }
                     }
                 }
-            }
-            let pega_deps: Vec<String> = type_node
-                .declared_dependencies
-                .iter()
-                .map(|d| {
-                    if is_pega_rule(d) {
-                        d.clone()
-                    } else if !type_node.package.is_empty() {
-                        let fq = format!("{}.{}", type_node.package, d);
-                        if is_pega_rule(&fq) {
-                            fq
+                let pega_deps: Vec<String> = type_node
+                    .declared_dependencies
+                    .iter()
+                    .map(|d| {
+                        if is_pega_rule(d) {
+                            d.clone()
+                        } else if !type_node.package.is_empty() {
+                            let fq = format!("{}.{}", type_node.package, d);
+                            if is_pega_rule(&fq) {
+                                fq
+                            } else {
+                                d.clone()
+                            }
                         } else {
                             d.clone()
                         }
-                    } else {
-                        d.clone()
-                    }
-                })
-                .collect();
-            let mut kind = kind;
-            if let Some(meta) = extract_pega_metadata(
-                &fqcn,
-                &pega_annotations,
-                &pega_deps,
-                &pega_version,
-            ) {
-                node.kind = ArtifactKind::PegaRule;
-                kind = ArtifactKind::PegaRule;
-                node.pega_metadata = Some(meta);
+                    })
+                    .collect();
+                if let Some(meta) = extract_pega_metadata(
+                    &fqcn,
+                    &pega_annotations,
+                    &pega_deps,
+                    &pega_version,
+                ) {
+                    node.kind = ArtifactKind::PegaRule;
+                    kind = ArtifactKind::PegaRule;
+                    node.pega_metadata = Some(meta);
+                }
             }
 
             let id = match graph.upsert_node(&node) {
@@ -165,45 +196,47 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
                 }
             };
             node_ids.push((type_node.name.clone(), kind, id));
+            name_index
+                .entry(type_node.name.clone())
+                .or_insert(id);
             result.artifacts_seen += 1;
 
-            // T058: queue ReferencesRule/InheritsRule edges for this rule
-            // node; they are resolved after the full tree is upserted.
+            // Pega rule-reference edges (T058), resolved post-walk.
             if let Some(meta) = &node.pega_metadata {
                 for reference in &meta.references_rules {
-                    pending_pega_edges.push((id, reference.clone(), EdgeKind::ReferencesRule));
+                    pending_edges.push((id, reference.clone(), EdgeKind::ReferencesRule));
                 }
                 if let Some(parent) = &meta.inherits_from {
-                    pending_pega_edges.push((id, parent.clone(), EdgeKind::InheritsRule));
+                    pending_edges.push((id, parent.clone(), EdgeKind::InheritsRule));
                 }
             }
 
-            // Upsert method nodes.
+            // Method nodes.
             for method in &type_node.methods {
-                let method_fqcn = format!("{}.{}()", fqcn, method.name);
+                let method_fqcn = member_fqcn(&extraction.language, &fqcn, &method.name, true);
                 let mut m_node = CodeArtifactNode::new(
                     ArtifactKind::Method,
                     method_fqcn,
-                    type_node.package.clone(),
+                    package.clone(),
                     rel_path.clone(),
                 );
                 m_node.enclosing_type = Some(type_node.name.clone());
                 m_node.annotations = method.annotations.clone();
                 m_node.source_span = Some((method.start_byte, method.end_byte));
                 if let Ok(mid) = graph.upsert_node(&m_node) {
-                    // Edge: method belongs to class (we use Injects for member-of).
+                    // Edge: method belongs to class (Injects doubles as member-of).
                     let _ = graph.upsert_edge(mid, id, EdgeKind::Injects);
                     result.edges_created += 1;
                 }
             }
 
-            // Upsert field nodes.
+            // Field nodes.
             for field in &type_node.fields {
-                let field_fqcn = format!("{}.{}", fqcn, field.name);
+                let field_fqcn = member_fqcn(&extraction.language, &fqcn, &field.name, false);
                 let mut f_node = CodeArtifactNode::new(
                     ArtifactKind::Field,
                     field_fqcn,
-                    type_node.package.clone(),
+                    package.clone(),
                     rel_path.clone(),
                 );
                 f_node.enclosing_type = Some(type_node.name.clone());
@@ -216,51 +249,64 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
             }
         }
 
-        // Create Implements edges between types in the same file.
-        for type_node in &extraction.types {
-            let _fqcn = if type_node.package.is_empty() {
-                type_node.name.clone()
+        // ── Module-level function nodes ─────────────────────────────
+        for func in &extraction.module_functions {
+            let fqcn = if package.is_empty() {
+                func.name.clone()
             } else {
-                format!("{}.{}", type_node.package, type_node.name)
+                format!("{}.{}()", package, func.name)
             };
-            let from = node_ids
+            let mut f_node =
+                CodeArtifactNode::new(ArtifactKind::Method, fqcn, package.clone(), rel_path.clone());
+            f_node.annotations = func.annotations.clone();
+            f_node.source_span = Some((func.start_byte, func.end_byte));
+            if graph.upsert_node(&f_node).is_ok() {
+                result.artifacts_seen += 1;
+            }
+        }
+
+        // ── Same-file Implements edges + cross-file pending deps ────
+        for type_node in &extraction.types {
+            let Some(from_id) = node_ids
                 .iter()
                 .find(|(name, _, _)| *name == type_node.name)
-                .map(|(_, _, id)| *id);
-            if let Some(from_id) = from {
-                for iface in &type_node.implemented_interfaces {
-                    // Try to find the interface node (same file first, then cross-file).
-                    let to_id = node_ids
-                        .iter()
-                        .find(|(name, _, _)| name == iface || name.ends_with(iface.as_str()))
-                        .map(|(_, _, id)| *id);
-                    if let Some(to_id) = to_id {
-                        let _ = graph.upsert_edge(from_id, to_id, EdgeKind::Implements);
-                        let _ = graph.upsert_edge(to_id, from_id, EdgeKind::IsImplementedBy);
-                        result.edges_created += 2;
-                    }
-                    // Even if the interface is not in the same file, we note
-                    // the dependency for later cross-file edge resolution.
+                .map(|(_, _, id)| *id)
+            else {
+                continue;
+            };
+            for iface in &type_node.implemented_interfaces {
+                if let Some(to_id) = node_ids
+                    .iter()
+                    .find(|(name, _, _)| name == iface || name.ends_with(iface.as_str()))
+                    .map(|(_, _, id)| *id)
+                {
+                    let _ = graph.upsert_edge(from_id, to_id, EdgeKind::Implements);
+                    let _ = graph.upsert_edge(to_id, from_id, EdgeKind::IsImplementedBy);
+                    result.edges_created += 2;
+                } else {
+                    // Cross-file: resolve post-walk by simple name.
+                    pending_edges.push((from_id, iface.clone(), EdgeKind::Implements));
                 }
-                // Injects edges for declared dependencies.
-                for dep in &type_node.declared_dependencies {
-                    let to_id = node_ids
-                        .iter()
-                        .find(|(name, _, _)| name == dep || name.ends_with(dep.as_str()))
-                        .map(|(_, _, id)| *id);
-                    if let Some(to_id) = to_id {
-                        let _ = graph.upsert_edge(from_id, to_id, EdgeKind::Injects);
-                        result.edges_created += 1;
-                    }
+            }
+            for dep in &type_node.declared_dependencies {
+                let dep_base = dep.rsplit('.').next().unwrap_or(dep).to_string();
+                if let Some(to_id) = node_ids
+                    .iter()
+                    .find(|(name, _, _)| name == dep || name.ends_with(&dep_base))
+                    .map(|(_, _, id)| *id)
+                {
+                    let _ = graph.upsert_edge(from_id, to_id, EdgeKind::Injects);
+                    result.edges_created += 1;
+                } else if !dep_base.is_empty() {
+                    pending_edges.push((from_id, dep_base, EdgeKind::Injects));
                 }
             }
         }
     }
 
-    // T058: resolve pending Pega rule edges now that every node in the tree
-    // has been upserted (cross-file references work regardless of walk order).
-    for (from_id, reference, kind) in pending_pega_edges {
-        if let Some(to_id) = find_node_by_reference(graph, &reference) {
+    // ── Post-walk edge resolution ───────────────────────────────────
+    for (from_id, reference, kind) in pending_edges {
+        if let Some(to_id) = resolve_reference(graph, &name_index, &reference) {
             if graph.upsert_edge(from_id, to_id, kind).is_ok() {
                 result.edges_created += 1;
             }
@@ -270,9 +316,65 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
     result
 }
 
-/// Resolve a Pega rule reference (FQCN, dotted name, or `Rule-*`-style name)
-/// to an ingested node id via FTS, requiring an exact FQCN/simple-name match.
-fn find_node_by_reference(graph: &DependencyGraph, reference: &str) -> Option<NodeId> {
+/// The directory to walk: `src/` when present (Java/Kotlin convention),
+/// otherwise the project root.
+fn primary_source_root(project_root: &Path) -> PathBuf {
+    let src = project_root.join("src");
+    if src.is_dir() {
+        src
+    } else {
+        project_root.to_path_buf()
+    }
+}
+
+/// Well-known vendored/generated directory names to skip.
+fn is_vendor_path(path: &Path) -> bool {
+    path.components().any(|c| {
+        matches!(
+            c.as_os_str().to_str().unwrap_or(""),
+            "node_modules" | "vendor" | "target" | "dist" | "build" | ".git" | "venv"
+                | ".venv" | "__pycache__" | ".tox" | "site-packages"
+        )
+    })
+}
+
+/// Derive a dotted package from the file's directory path:
+/// `src/com/foo/Bar.java` → `src.com.foo` is wrong, but callers pass the
+/// PROJECT-RELATIVE path; `app/models/user.py` → `app.models.user` module
+/// grouping → package `app.models`.
+fn derive_package(rel_path: &str) -> String {
+    let path = rel_path.replace('\\', "/");
+    let Some(slash) = path.rfind('/') else {
+        return String::new();
+    };
+    let dir = &path[..slash];
+    let dir = dir.split('/').filter(|s| !s.is_empty() && *s != "src");
+    dir.collect::<Vec<_>>().join(".")
+}
+
+/// Build the FQ name for a method/field member.
+fn member_fqcn(language: &str, type_fqcn: &str, member: &str, is_method: bool) -> String {
+    let sep = if language == "rust" || language == "go" { "::" } else { "." };
+    if is_method {
+        format!("{}{}{}()", type_fqcn, sep, member)
+    } else {
+        format!("{}{}{}", type_fqcn, sep, member)
+    }
+}
+
+/// Resolve a reference (FQCN, dotted name, or simple name) to an ingested
+/// node id — via the in-memory simple-name index first, then FTS with an
+/// exact-match check.
+fn resolve_reference(
+    graph: &DependencyGraph,
+    name_index: &HashMap<String, NodeId>,
+    reference: &str,
+) -> Option<NodeId> {
+    let simple = reference.rsplit('.').next().unwrap_or(reference);
+    let simple = simple.rsplit("::").next().unwrap_or(simple);
+    if let Some(id) = name_index.get(simple) {
+        return Some(*id);
+    }
     let results = graph.query_fts(reference, 10).ok()?;
     results
         .iter()
@@ -280,20 +382,21 @@ fn find_node_by_reference(graph: &DependencyGraph, reference: &str) -> Option<No
         .map(|n| n.id)
 }
 
-/// Whether the target project contains enterprise Java/Pega artifacts
-/// (T065, FR-015). Returns true when ANY `.java` file exists in the source
-/// tree (bounded like `ingest_project`'s walk: `src/` or the root, depth ≤
-/// 10, first ~500 entries) or when a Pega marker is present — a
-/// `build.gradle`/`pom.xml` mentioning `com.pega`, or any `Rule-*` file.
+/// Whether the target project contains source artifacts NeuroCode can
+/// ingest (generalized from the original Java-only `project_has_java`,
+/// T065/FR-015). Returns true when ANY supported source file exists in the
+/// source tree (bounded walk: `src/` or the root, depth ≤ 10, first ~500
+/// entries) or when a Pega marker is present — a `build.gradle`/`pom.xml`
+/// mentioning `com.pega`, or any `Rule-*` file.
 ///
 /// Designed to be fast enough for the assembly hot path: no file contents
 /// are read except the (bounded, at-most-two) build files.
-pub fn project_has_java(project_root: &Path) -> bool {
-    let src = project_root.join("src");
-    let scan_root: PathBuf = if src.is_dir() { src } else { project_root.to_path_buf() };
+pub fn project_has_source(project_root: &Path) -> bool {
+    let scan_root = primary_source_root(project_root);
 
-    // Bounded walk: stop as soon as a .java file or a Rule-* file is found,
-    // or after ~500 entries (a genuine Java/Pega project shows up quickly).
+    // Bounded walk: stop as soon as a supported source file or Rule-* file
+    // is found, or after ~500 entries (a genuine code project shows up
+    // quickly).
     let mut entries = 0usize;
     for entry in walkdir::WalkDir::new(&scan_root)
         .max_depth(10)
@@ -306,8 +409,10 @@ pub fn project_has_java(project_root: &Path) -> bool {
         }
         let path = entry.path();
         if entry.file_type().is_file() {
-            if path.extension().map_or(false, |e| e == "java") {
-                return true;
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if registry::is_supported_extension(&ext.to_lowercase()) && !is_vendor_path(path) {
+                    return true;
+                }
             }
             if path
                 .file_name()
@@ -329,4 +434,10 @@ pub fn project_has_java(project_root: &Path) -> bool {
         }
     }
     false
+}
+
+/// Backward-compatible alias: the original T065 gate was Java-only; it now
+/// answers "does this project have ingestible source of any language".
+pub fn project_has_java(project_root: &Path) -> bool {
+    project_has_source(project_root)
 }

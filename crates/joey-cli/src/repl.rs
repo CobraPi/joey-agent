@@ -766,8 +766,10 @@ async fn run_turn_interactive(st: &mut ReplState, input: &str) -> String {
     st.last_response = final_text.clone();
 
     // Auto-checkpoint: take a filesystem snapshot after each agent turn if
-    // enough time has passed.
-    maybe_auto_checkpoint(st);
+    // enough time has passed. Checkpointing shells out to git (blocking
+    // subprocess I/O), so run it on the blocking pool — doing it inline
+    // stalls this async task and the runtime's worker thread.
+    maybe_auto_checkpoint(st).await;
 
     final_text
 }
@@ -1701,16 +1703,30 @@ fn copy_last(st: &ReplState) {
 // Filesystem checkpoint commands (/checkpoint, /revert, /rollback)
 // ---------------------------------------------------------------------------
 
-/// Take an automatic checkpoint if the interval has elapsed.
-fn maybe_auto_checkpoint(st: &mut ReplState) {
+/// Take an automatic checkpoint if the interval has elapsed. The git
+/// subprocess work runs on the blocking pool (`spawn_blocking`) so the async
+/// runtime's worker threads are never stalled by disk/git I/O.
+async fn maybe_auto_checkpoint(st: &mut ReplState) {
     let elapsed = st.last_auto_checkpoint.elapsed().as_secs();
     if elapsed < AUTO_CHECKPOINT_INTERVAL_SECS {
         return;
     }
-    if let Some(cp) = &mut st.checkpoints {
-        if let Some(num) = cp.checkpoint("Auto-checkpoint") {
-            render::checkpoint_created(num, "Auto-checkpoint (periodic)");
-            st.last_auto_checkpoint = Instant::now();
+    if let Some(mut cp) = st.checkpoints.take() {
+        // Move the manager into the blocking task and back out, so the git
+        // subprocess work never runs on an async worker thread.
+        let joined = tokio::task::spawn_blocking(move || {
+            let num = cp.checkpoint("Auto-checkpoint");
+            (cp, num)
+        })
+        .await;
+        match joined {
+            Ok((mgr, Some(num))) => {
+                st.checkpoints = Some(mgr);
+                render::checkpoint_created(num, "Auto-checkpoint (periodic)");
+                st.last_auto_checkpoint = Instant::now();
+            }
+            Ok((mgr, None)) => st.checkpoints = Some(mgr),
+            Err(e) => render::error(&format!("auto-checkpoint task failed: {e}")),
         }
     }
 }

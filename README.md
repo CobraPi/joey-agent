@@ -108,7 +108,10 @@ grouped by Session / Configuration / Tools & Skills / Info / Exit); implemented 
 `/checkpoint` (`/snap`), `/agents` (`/tasks`), `/start-work`, `/queue` (`/q`), `/goal`,
 `/status`, `/changes`, `/resume`, `/sessions`, `/config`, `/model`, `/llm-selector`,
 `/timestamps` (`/ts`), `/verbose`, `/reasoning`, `/tools`, `/toolsets`, `/skills`,
-`/help`, `/usage`, `/copy`, `/version` (`/v`), `/quit` (`/exit`). Everything else in
+`/help`, `/usage`, `/copy`, `/version` (`/v`), `/quit` (`/exit`), and `/neurocode`
+(always recognized; reports a disabled status unless the engine is on — see the
+[NeuroCode](#neurocode-enterprise-java--pega-coding) section for the full subcommand
+surface). Everything else in
 the registry is recognized (so `/handoff`, `/undo`, etc. answer honestly) but not yet
 wired to a handler.
 
@@ -143,6 +146,10 @@ first turns are preserved verbatim, and archived rows remain searchable in `stat
 | `session_search` | Full-text search over past session history (FTS5) |
 | `clarify` | Ask the user a structured clarifying question mid-turn |
 | `lsp_diagnostics` / `lsp_definition` / `lsp_references` / `lsp_symbols` | Language-server-backed code intelligence — registered only when a matching server is configured (see [`docs/LSP.md`](docs/LSP.md)) |
+| `neurocode_index` | Build/refresh the NeuroCode structural dependency graph of a project directory (tree-sitter multi-language parse → artifacts + edges persisted to `graph.db`). Only offered when `neurocode.enabled = true` |
+| `neurocode_query` | Query the NeuroCode graph: `dependencies`, `dependents`, or FTS symbol search. Enabled-only, like all NeuroCode tools |
+| `neurocode_status` | Engine status overview: enabled state, index size, tiers, patterns, domain sources |
+| `neurocode_ingest` | Ingest a domain-knowledge source (file or directory) into the graph's FTS registry |
 
 Tools are grouped into toolsets (`file`, `terminal`, `web`, `coding`, `joey-cli`, …) and
 resolved exactly like upstream, including recursive `includes`. `PreToolUse` hooks can
@@ -160,6 +167,7 @@ State lives under `~/.joey/` (override with `JOEY_HOME`):
 ~/.joey/memories/       MEMORY.md, USER.md
 ~/.joey/skills/         installed Agent Skills (20 skills ship in-repo)
 ~/.joey/cron/jobs.json  scheduled jobs (hermes-compatible format)
+~/.joey/neurocode/      per-project NeuroCode graph databases (when enabled)
 ~/.joey/logs/           size-rotated, secret-redacted logs
 ```
 
@@ -171,12 +179,239 @@ first-run setup), OpenRouter base `https://openrouter.ai/api/v1`, `max_turns` 90
 reasoning left to the provider default, tool-output cap 50 000 chars (40/60 head-tail),
 cron ticker 60 s.
 
+## NeuroCode: Enterprise Java & Pega Coding
+
+NeuroCode (`crates/joey-neurocode/`, feature 015 — a joey-native addition with no
+upstream equivalent) turns Joey into a coding agent specialized for **enterprise Java
+and Pega Platform codebases**. When enabled, it:
+
+1. **Classifies every coding request by complexity** and routes it between two model
+   tiers — an *economical* tier for boilerplate work (getters, tests, DTOs, stubs)
+   and a *frontier* tier for architectural work (refactors, concurrency, migrations).
+   Classification is deterministic and O(1) — keyword, scope-fan-out, and graph-hub
+   signals; no extra LLM call on the hot path.
+2. **Maintains a structural dependency graph** of your project, parsed with
+   tree-sitter (real AST parsing for every tree-sitter-supported programming
+   language — Java, Python, JS/TS/TSX, Go, Rust, Ruby, PHP, C#, C, C++,
+   Scala, Haskell, Julia, OCaml, Bash, Verilog, Agda — types, methods,
+   fields, annotations, imports, injection points; heuristic fallback for
+   the long tail), stored in a per-project SQLite database with FTS5/BM25
+   symbol search. No Qdrant/vector server required.
+3. **Assembles dependency-aware context** per request: when you edit
+   `UserServiceImpl`, the `UserService` interface it implements and the
+   `UserRepository` it injects are pulled into context automatically — no referenced
+   type left absent. The economical tier gets a focused slice; the frontier tier gets
+   the fuller graph.
+4. **Understands the Pega Platform rule system** version-adaptively (auto-detects the
+   Pega version from the Gradle BOM, or takes an explicit override), with built-in
+   rule-type metadata (`Rule-Obj-*`, `Data-*`, `Work-*` families) and rule-to-rule
+   references.
+5. **Runs a build/verify feedback loop** (configurable steps, e.g. `mvn compile`)
+   that records verified successes as *patterns* and recurring failures as
+   *anti-patterns*, surfaced as warnings when you re-edit the same area.
+6. **Ingests domain knowledge** — framework docs, entity catalogs, postmortems —
+   from files or directories into the same searchable store.
+
+**Off by default, byte-identical when disabled.** With `neurocode.enabled = false`
+(the default), the engine is never invoked, no NeuroCode tools are offered to the
+model, no messages are injected, and the system prompt is bit-for-bit identical to a
+build without the feature.
+
+### Enabling NeuroCode
+
+Add the following to `~/.joey/config.yaml` (or use `joey config set` with the
+dotted keys shown below):
+
+```yaml
+neurocode:
+  enabled: true                                  # master switch (default: false)
+
+  tier:
+    economical:
+      model: "openrouter/anthropic/claude-haiku" # any model id your provider serves
+    frontier:
+      model: "openrouter/anthropic/claude-opus"  # the heavyweight tier
+    ambiguous_default: economical                # tier used when signals are tied
+
+  verify:                                        # optional build/verify loop
+    max_fix_iterations: 3                        # default: 3
+    steps:
+      - name: compile
+        command: "mvn -q compile"
+        parse: maven                              # plain | maven | compiler | checkstyle_xml
+        timeout_sec: 120                         # default: 120
+
+  classifier:                                    # optional classifier tuning
+    scope_fanout_frontier_threshold: 4           # default: 4
+    economical_keywords: []                      # empty = built-in defaults
+    frontier_keywords: []                        # empty = built-in defaults
+
+  pega:
+    version: ""                                  # empty = auto-detect from Gradle BOM
+```
+
+Only `neurocode.enabled: true` is required to start; everything else falls back to
+sane defaults. If a tier model is unset, the agent falls back to the configured
+default model for that tier's requests.
+
+Start the REPL from the root of the project you want indexed (the project root is
+taken from the current working directory, and each project gets its own graph):
+
+```bash
+cd ~/work/my-enterprise-service
+joey
+```
+
+### First-run workflow
+
+```
+/neurocode index          # parse the project, build the graph (~/.joey/neurocode/projects/<hash>/graph.db)
+/neurocode status         # verify: artifact count, tiers, Pega version, pattern counts
+```
+
+After indexing, everything else is automatic: normal coding requests are classified,
+routed to a tier, and dispatched with dependency-aware context prepended. You can
+always inspect or override what the engine is doing with the subcommands below.
+
+### The `/neurocode` command
+
+Available in the line REPL and the `--tui` dashboard. Bare `/neurocode` (or
+`/neurocode status`) shows the status overview. Subcommands:
+
+```
+/neurocode                               Status: enabled state, index size + last
+                                         indexed time, tier models, Pega version,
+                                         pattern/anti-pattern counts, domain sources,
+                                         and any domain-knowledge conflicts.
+
+/neurocode index [--force|-f]            (Re-)index the current project. Prints
+                                         files scanned / artifacts / edges / errors.
+
+/neurocode query symbol <name>           FTS symbol search — list artifacts (kind,
+                                         FQCN, source path) matching a name.
+/neurocode query dependencies <FQCN>     Outgoing edges: what <FQCN> implements/
+                                         injects/exchanges/references.
+/neurocode query dependents <FQCN>       Incoming edges: everything that depends on
+                                         <FQCN>. (alias: incoming)
+                                         (dependencies also answers to outgoing;
+                                          symbol also answers to fts)
+
+/neurocode tier                          Show tier routing: mode (automatic or
+                                         pinned), both tier models, ambiguous default.
+/neurocode tier economical               Pin the economical tier for this session.
+/neurocode tier frontier                 Pin the frontier tier for this session.
+/neurocode tier auto                     Unpin — back to automatic classification.
+/neurocode tier pin <economical|frontier>  Explicit pin form.
+/neurocode tier unpin                    Same as `tier auto`.
+
+/neurocode ingest <category> <path> [flags]
+                                         Ingest domain knowledge. <path> is a file or
+                                         a directory (capped: ≤32 files, ≤512 KiB,
+                                         binary content skipped). Categories:
+                                           FrameworkDocs   versioned framework docs
+                                           EntityCatalog   entity/DTO schemas
+                                           Postmortem      incident learnings
+                                           PegaRuleType    Pega rule-type metadata
+                                         Flags:
+                                           --version <v>    e.g. "3.2", "infinity-24.2"
+                                           --provenance <p> where it came from
+                                                            (URL / doc ref / note);
+                                                            defaults to the path
+
+/neurocode patterns                      List learned patterns (verified successes:
+                                         signature, tier, result, timestamp).
+/neurocode anti-patterns                 List active anti-patterns (error signature,
+                                         offending output, known resolution, hit
+                                         count). Alias: antipatterns.
+
+/neurocode domain list                   List ingested domain-knowledge sources
+                                         (id, category, version, provenance, path).
+/neurocode domain remove <id>            Remove a domain source by its numeric id.
+                                         (aliases: rm, delete)
+
+/neurocode --help | help | -h            Usage summary.
+```
+
+Unknown subcommands produce an error with a pointer to `--help`. Note that pins set
+via `/neurocode tier …` last for the current session only; the tier models themselves
+come from `config.yaml`.
+
+Example session:
+
+```
+> /neurocode index
+Indexing complete: 214 files scanned, 1,832 artifacts, 4,107 edges.
+0 error(s).
+
+> /neurocode query dependencies com.acme.user.UserServiceImpl
+Dependencies of com.acme.user.UserServiceImpl (3):
+  com.acme.user.UserServiceImpl --[Implements]--> com.acme.user.UserService
+  com.acme.user.UserServiceImpl --[Injects]--> com.acme.user.UserRepository
+  com.acme.user.UserServiceImpl --[ExchangesType]--> com.acme.user.UserDto
+
+> /neurocode ingest FrameworkDocs ./docs/spring-boot-3.2 --version 3.2 --provenance "spring.io/docs"
+Ingested FrameworkDocs source #1 from './docs/spring-boot-3.2' [category=FrameworkDocs].
+```
+
+### The four model-facing tools
+
+When enabled, four NeuroCode tools are registered in the `coding` toolset so the
+model itself can drive the engine mid-conversation (all of them return an error
+notice rather than executing when the engine is disabled):
+
+- **`neurocode_index`** — build or refresh the graph for a project path. Params:
+  `path` (required), `force` (bool, default false). The model uses this after
+  cloning or significantly changing a project, or when queries look stale.
+- **`neurocode_query`** — graph queries. Params: `query_type` (`dependencies`,
+  `dependents`, `definition`, or `references`), `symbol` (an FQCN or simple name,
+  required), `limit` (default 20).
+- **`neurocode_status`** — the same status overview as `/neurocode`.
+- **`neurocode_ingest`** — ingest knowledge. Params: `category` (`pattern`,
+  `antipattern`, `rule`, or `convention`), `path`, optional `version` and
+  `provenance`.
+
+### Where the data lives
+
+```
+~/.joey/neurocode/projects/<sha256-prefix-of-canonical-path>/graph.db
+```
+
+One SQLite database per indexed project (honours `JOEY_HOME`), shared across
+profiles and across parent/subagent sessions — a delegated subagent querying the
+graph reads the same `graph.db` the parent built, with no re-ingestion. The graph
+schema (v1) stores code artifacts, typed edges (`Implements`, `IsImplementedBy`,
+`Injects`, `ExchangesType`, `ReferencesRule`, `InheritsRule`), FTS indexes, learned
+patterns and anti-patterns, and domain-knowledge sources with conflict detection
+(overlapping category+version — newest source wins, and `/neurocode status` flags it).
+
+### Behavior on non-Java projects
+
+NeuroCode is a no-op on codebases with no Java/Pega artifacts: context assembly
+detects the absence and returns an empty context with a notice, and ordinary
+retrieval/generation proceed unmodified. You can leave `neurocode.enabled = true`
+globally without affecting Rust/Python/JS projects.
+
+### Design notes
+
+- **SQLite + FTS5 instead of a vector DB** (deliberate deviation from the original
+  design): the workspace already bundles SQLite with FTS5; symbol retrieval is
+  BM25-ranked keyword search and the graph edges are exact typed traversals —
+  nearest-neighbor search adds nothing here. Embedding-based retrieval is deferred.
+- **tree-sitter + per-language grammar crates** is the feature's set of new
+  external dependencies (~150-300 KB compiled each), chosen because
+  deterministic syntax-aware parsing (generics, annotations, nested classes)
+  cannot be done reliably with regexes. Covers every programming language
+  with a grammar under the tree-sitter org; see
+  `crates/joey-neurocode/src/parse/registry.rs`.
+- Full design trail, constitution compliance, and every dependency decision:
+  `specs/015-neurocode-enterprise-java/` (spec, plan, contracts, quickstart).
+
 ## Architecture
 
-A Cargo workspace of 13 crates. The first eight are direct ports of Hermes Agent
-modules; the remaining five (`joey-tui`, `joey-llm-selector`, `joey-orchestration`,
-`joey-omo`, `joey-speckit-ui`) are joey-native additions layered on top, not described
-by the upstream Python project:
+A Cargo workspace of 14 crates. The first eight are direct ports of Hermes Agent
+modules; the remaining six (`joey-tui`, `joey-llm-selector`, `joey-orchestration`,
+`joey-omo`, `joey-speckit-ui`, `joey-neurocode`) are joey-native additions layered
+on top, not described by the upstream Python project:
 
 | Crate | Ports | Responsibility |
 |-------|-------|----------------|
@@ -193,9 +428,12 @@ by the upstream Python project:
 | `joey-orchestration` | — (joey-native) | Subagent manager + `delegate_task`/`call_omo_agent` tools for multi-agent delegation |
 | `joey-omo` | — (joey-native) | "Oh My OpenAgent": 11-agent persona registry, category/subagent routing, Atlas plan execution, intent gating (ultrawork/hyperplan/team), goals, team mode |
 | `joey-speckit-ui` | — (joey-native) | Standalone HTTP+WebSocket backend for the SpecKit Visual UI (`specs/<feature>/{spec,plan,tasks}.md`); run separately with `cargo run -p joey-speckit-ui`, not embedded in the `joey` binary |
+| `joey-neurocode` | — (joey-native) | NeuroCode engine for enterprise codebases: complexity-tier routing, tree-sitter multi-language structural dependency graph in SQLite+FTS5 (all tree-sitter-supported languages; Pega-tuned for Java), dependency-aware context assembly, Pega rule awareness, verify-loop pattern memory. Consumed by `joey-agent-core` via the narrow `NeuroCodeEngine` trait; see the [NeuroCode](#neurocode-enterprise-java--pega-coding) section |
 
 `joey-tui`, `joey-llm-selector`, `joey-orchestration`, and `joey-omo` are all wired
-into the live `joey` binary (REPL, one-shot, and cron paths); `joey-speckit-ui` is an
+into the live `joey` binary (REPL, one-shot, and cron paths); `joey-neurocode` is
+wired into the REPL and one-shot paths (engine injection + the four NeuroCode tools
++ `/neurocode`); `joey-speckit-ui` is an
 independent backend process for the separate `web/speckit-ui` frontend. See
 [`docs/architecture.md`](docs/architecture.md) for the full dependency graph.
 

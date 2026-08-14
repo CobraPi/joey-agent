@@ -17,8 +17,10 @@
 //!   Grammar invocation is wrapped so a panic never reaches the render path.
 //!
 //! Curated grammar subset (the languages joey already lints / common in this
-//! repo): py, json, yaml, toml, rust, go, js, ts, md, sh. This bounds
-//! binary size vs. syntect's full 100+ grammar set (Principle VIII).
+//! repo): py, json, yaml, toml, rust, go, js, ts, md, sh — plus the
+//! additional tree-sitter supported languages joey parses structurally
+//! (rb, php, cs, c, cpp, scala, hs, jl, ml). This bounds binary size vs.
+//! syntect's full 100+ grammar set (Principle VIII).
 
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
@@ -32,10 +34,12 @@ use syntect::util::as_24_bit_terminal_escaped;
 /// Curated grammar subset shipped with this build. Languages outside this
 /// set fall back to plain coloring (highlight returns `None`).
 ///
-/// Keep this list small — each grammar adds to binary size (Principle VIII).
-/// Add a language here only when it appears in real diffs.
+/// Kept to syntect's default grammar set (no binary-size cost beyond the
+/// defaults syntect already ships). Add a language here only when it
+/// appears in real diffs.
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "py", "json", "yaml", "yml", "toml", "rs", "go", "js", "ts", "md", "sh",
+    "py", "json", "yaml", "yml", "toml", "rs", "go", "js", "ts", "md", "sh", "rb", "php", "cs",
+    "c", "cpp", "scala", "hs", "jl", "ml", "bash",
 ];
 
 // ---------------------------------------------------------------------------
@@ -155,7 +159,16 @@ fn language_for_path(path: &str) -> Option<&'static str> {
         "js" => "js",
         "ts" => "ts",
         "md" => "md",
-        "sh" => "sh",
+        "sh" | "bash" => "sh",
+        "rb" => "rb",
+        "php" => "php",
+        "cs" => "cs",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
+        "scala" => "scala",
+        "hs" => "hs",
+        "jl" => "jl",
+        "ml" => "ml",
         _ => return None,
     };
     if SUPPORTED_EXTENSIONS.contains(&lang) {

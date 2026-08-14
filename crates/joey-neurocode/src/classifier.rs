@@ -246,7 +246,9 @@ impl ComplexityClassifier {
 fn default_economical_keywords() -> Vec<String> {
     [
         "test", "getter", "setter", "boilerplate", "implement method", "junit", "mock",
-        "stub", "tostring", "equals", "hashcode", "builder", "dto", "create",
+        "stub", "tostring", "equals", "hashcode", "builder", "dto", "create", "unit test",
+        "pytest", "jest", "vitest", "unittest", "docstring", "comment", "scaffold",
+        "rename", "typo", "log statement", "constant",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -257,7 +259,11 @@ fn default_frontier_keywords() -> Vec<String> {
     [
         "refactor", "architecture", "concurrency", "redesign", "migrate", "debug",
         "transactional", "deadlock", "race condition", "streams", "optional",
-        "performance", "optimize", "thread-safe", "async",
+        "performance", "optimize", "thread-safe", "async", "await", "goroutine",
+        "channel", "unsafe", "borrow", "lifetime", "ownership", "move semantics",
+        "promise", "closure", "asyncio", "generator", "decorator", "middleware",
+        "hook", "observer", "callback hell", "middleware chain", "memory leak",
+        "circular dependency", "design pattern",
     ]
     .iter()
     .map(|s| s.to_string())

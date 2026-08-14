@@ -8,7 +8,6 @@
 //!   through joey-orchestration; at the engine layer this is the same
 //!   `NeuroCodeConfig::from_config` construction the parent used).
 
-use std::path::PathBuf;
 
 use joey_neurocode::graph::{project_graph_db_path, DependencyGraph};
 use joey_neurocode::parse::ingest_project;

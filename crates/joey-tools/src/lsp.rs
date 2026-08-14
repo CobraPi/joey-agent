@@ -5,7 +5,9 @@
 //!   - Diagnostics collection (publishes to the agent as a tool)
 //!   - Go-to-definition, references, document symbols, rename
 //!
-//! LSP servers are configured in `~/.joey/config.yaml`:
+//! LSP servers are configured in `~/.joey/config.yaml` — any language with
+//! a language server works; the examples below cover the languages joey
+//! parses with dedicated tree-sitter grammars:
 //!
 //! ```yaml
 //! lsp:
@@ -19,6 +21,35 @@
 //!     command: "typescript-language-server"
 //!     args: ["--stdio"]
 //!     file_types: ["ts", "tsx", "js", "jsx"]
+//!   go:
+//!     command: "gopls"
+//!     file_types: ["go"]
+//!   ruby:
+//!     command: "solargraph"
+//!     args: ["stdio"]
+//!     file_types: ["rb"]
+//!   php:
+//!     command: "intelephense"
+//!     args: ["--stdio"]
+//!     file_types: ["php"]
+//!   csharp:
+//!     command: "OmniSharp"
+//!     args: ["-lsp"]
+//!     file_types: ["cs"]
+//!   c:
+//!     command: "clangd"
+//!     file_types: ["c", "h"]
+//!   cpp:
+//!     command: "clangd"
+//!     file_types: ["cpp", "cc", "cxx", "hpp"]
+//!   haskell:
+//!     command: "haskell-language-server"
+//!     args: ["--lsp"]
+//!     file_types: ["hs"]
+//!   bash:
+//!     command: "bash-language-server"
+//!     args: ["start"]
+//!     file_types: ["sh", "bash"]
 //! ```
 //!
 //! The agent accesses LSP features via tools: `lsp_diagnostics`,

@@ -832,6 +832,34 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration, allowed: &[i32]) -> Res
     let mut child: Child = cmd.spawn().context("spawning git subprocess")?;
     let start = Instant::now();
 
+    // Drain both pipes on dedicated threads BEFORE polling for exit. Without
+    // this, a git invocation writing more than the OS pipe buffer (~64KB on
+    // macOS — e.g. `git status`/`git diff` on a large work tree) blocks on a
+    // full pipe, never exits, and the poll loop below spins until the kill
+    // timeout: a multi-second UI freeze on every such call.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .context("git subprocess stdout was not piped")?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .context("git subprocess stderr was not piped")?;
+    let out_handle = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let mut r = std::io::BufReader::new(stdout_pipe);
+        let _ = r.read_to_string(&mut buf);
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let mut r = std::io::BufReader::new(stderr_pipe);
+        let _ = r.read_to_string(&mut buf);
+        buf
+    });
+
     let status = loop {
         match child.try_wait().context("polling git subprocess")? {
             Some(status) => break status,
@@ -841,20 +869,22 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration, allowed: &[i32]) -> Res
                     let _ = child.wait();
                     anyhow::bail!("git subprocess timed out after {:?}", timeout);
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     };
 
-    let output = child
-        .wait_with_output()
-        .context("collecting git subprocess output")?;
+    let output_stdout = out_handle.join().unwrap_or_default();
+    let output_stderr = err_handle.join().unwrap_or_default();
     let code = status.code().unwrap_or(-1);
     if !allowed.contains(&code) {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git exited with code {}: {}", code, stderr.trim());
+        anyhow::bail!(
+            "git exited with code {}: {}",
+            code,
+            output_stderr.trim()
+        );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(output_stdout.trim().to_string())
 }
 
 #[cfg(test)]

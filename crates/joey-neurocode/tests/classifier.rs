@@ -6,7 +6,6 @@
 
 use std::path::PathBuf;
 
-use joey_neurocode::*;
 use joey_neurocode::classifier::{ComplexityClassifier, ComplexityTier};
 use joey_neurocode::engine::CodingRequest;
 

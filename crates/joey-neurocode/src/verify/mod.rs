@@ -14,6 +14,11 @@ use crate::graph::DependencyGraph;
 pub struct VerifyResult {
     pub step_name: String,
     pub passed: bool,
+    /// True when the step was skipped (tool absent / timed out — FR-012
+    /// graceful degradation) rather than executed and failed. A skipped
+    /// step is not counted as a failure and never triggers a fix
+    /// iteration or escalation.
+    pub skipped: bool,
     pub output: String,
     pub errors: Vec<crate::verify::parse::StructuredError>,
     pub duration_ms: u64,
@@ -117,6 +122,7 @@ impl VerifyLoop {
         VerifyResult {
             step_name: step_cfg.name.clone(),
             passed,
+            skipped: raw_output.skipped,
             output: raw_output.output,
             errors,
             duration_ms: raw_output.duration_ms,
@@ -138,8 +144,13 @@ impl VerifyLoop {
         let mut results = self.run_steps(project_root);
         let mut iterations: u32 = 0;
 
+        // A step only needs a correction pass when it actually RAN and
+        // failed; skipped steps (FR-012: tool absent / timeout) are neither
+        // failures nor fix targets.
+        let has_real_failure = |rs: &[VerifyResult]| rs.iter().any(|r| !r.passed && !r.skipped);
+
         loop {
-            if results.iter().all(|r| r.passed) || iterations >= self.config.max_fix_iterations {
+            if !has_real_failure(&results) || iterations >= self.config.max_fix_iterations {
                 break;
             }
             if !fix(&results) {
@@ -151,7 +162,7 @@ impl VerifyLoop {
             for step_cfg in &self.config.steps {
                 let needs_rerun = results
                     .iter()
-                    .any(|r| r.step_name == step_cfg.name && !r.passed);
+                    .any(|r| r.step_name == step_cfg.name && !r.passed && !r.skipped);
                 if needs_rerun {
                     let fresh = self.run_step(step_cfg, project_root);
                     if let Some(slot) = results.iter_mut().find(|r| r.step_name == step_cfg.name) {
@@ -161,7 +172,11 @@ impl VerifyLoop {
             }
         }
 
-        let all_passed = results.iter().all(|r| r.passed);
+        // All-passed means "every step that ran passed"; skipped steps are
+        // informative, not failing (FR-012).
+        let all_passed = results
+            .iter()
+            .all(|r| r.passed || r.skipped);
         let mut outcome = VerifyOutcome {
             results,
             all_passed,
@@ -221,6 +236,7 @@ impl VerifyLoop {
                                     results: vec![VerifyResult {
                                         step_name: "(detached-verify)".into(),
                                         passed: false,
+                                        skipped: true,
                                         output: format!(
                                             "detached verify task failed: {}",
                                             join_err
@@ -261,6 +277,7 @@ impl VerifyLoop {
                     results: vec![VerifyResult {
                         step_name: "(detached-verify)".into(),
                         passed: false,
+                        skipped: true,
                         output,
                         errors: Vec::new(),
                         duration_ms: 0,

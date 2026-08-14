@@ -6,7 +6,6 @@
 
 use std::path::PathBuf;
 
-use joey_neurocode::*;
 use joey_neurocode::graph::node::{ArtifactKind, ArtifactStatus, CodeArtifactNode};
 use joey_neurocode::graph::edge::EdgeKind;
 use joey_neurocode::graph::DependencyGraph;

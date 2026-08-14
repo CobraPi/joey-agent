@@ -56,6 +56,11 @@ enum Shell {
     /// POSIX shell (bash, Git Bash). Path to the executable.
     Bash(String),
     /// PowerShell. Path to pwsh.exe or powershell.exe.
+    ///
+    /// Only constructed on Windows (`cfg(not(unix))`); on Unix the variant
+    /// exists solely so `argv0` and tests stay platform-uniform, so dead-code
+    /// analysis on Unix targets is silenced.
+    #[cfg_attr(unix, allow(dead_code))]
     PowerShell(String),
 }
 

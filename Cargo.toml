@@ -38,11 +38,33 @@ joey-orchestration = { path = "crates/joey-orchestration" }
 joey-omo = { path = "crates/joey-omo" }
 joey-neurocode = { path = "crates/joey-neurocode" }
 
-# NeuroCode (feature 015): deterministic Java AST parsing (FR-006).
-# Justified in specs/015-neurocode-enterprise-java/research.md §3/§10:
-# ~270KB compiled total, no transitive runtime deps, C via cc.
+# NeuroCode (feature 015): deterministic multi-language AST parsing (FR-006).
+# Originally Java-only (specs/015, ~270KB); generalized to a language registry
+# with per-language grammars plus a heuristic fallback extractor for the long
+# tail. Each grammar is C via cc with no transitive runtime deps (~150-300KB
+# compiled each) — justified by the structural-graph ingestion pipeline.
 tree-sitter = "0.26"
 tree-sitter-java = "0.23"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-rust = "0.24"
+# Full tree-sitter supported-language coverage (tree-sitter.github.io):
+# every programming-language grammar under the tree-sitter org. Same
+# tree-sitter-language C ABI as above (~150-300KB compiled each).
+tree-sitter-bash = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-haskell = "0.23"
+tree-sitter-julia = "0.23"
+tree-sitter-ocaml = "0.25"
+tree-sitter-php = "0.24"
+tree-sitter-ruby = "0.23"
+tree-sitter-scala = "0.25"
+tree-sitter-verilog = "1.0"
+tree-sitter-agda = "1.3"
 
 anyhow = "1"
 thiserror = "2"

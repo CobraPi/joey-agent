@@ -498,10 +498,20 @@ impl<'a> ContextAssembler<'a> {
         if let Some(file) = &request.active_file {
             out.push_str(&format!("Active file: {}\n", file));
             if let Ok(content) = std::fs::read_to_string(file) {
-                // Include imports only (immediate context).
+                // Include import-ish lines only (immediate context), across
+                // the common language syntaxes.
                 for line in content.lines() {
                     let t = line.trim();
-                    if t.starts_with("import ") || t.starts_with("package ") {
+                    let is_import = t.starts_with("import ")
+                        || t.starts_with("from ")
+                        || t.starts_with("use ")
+                        || t.starts_with("using ")
+                        || t.starts_with("#include")
+                        || t.starts_with("require ")
+                        || t.starts_with("require_")
+                        || t == "package"
+                        || t.starts_with("package ");
+                    if is_import {
                         out.push_str(t);
                         out.push('\n');
                     }
