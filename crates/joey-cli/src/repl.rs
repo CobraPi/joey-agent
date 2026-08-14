@@ -550,8 +550,30 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         KeyCode::Enter,
         ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
     );
-    let mut editor = Reedline::create().with_edit_mode(Box::new(Emacs::new(keybindings)));
-    if let Ok(hist) = FileBackedHistory::with_file(1000, history_path) {
+    // Slash-command popup menu: Tab opens/advances a description menu fed by
+    // the slash registry (all names + aliases). While the menu is open, arrow
+    // keys navigate and Enter accepts, exactly like an IDE completion popup.
+    // (The menu's fixed name is "description_menu" — reedline 0.40 exposes no
+    // name builder on DescriptionMenu itself.)
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("description_menu".to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+    let completer = Box::new(crate::slash_menu::SlashCompleter);
+    let menu = Box::new(
+        reedline::DescriptionMenu::default()
+            .with_columns(1)
+            .with_selection_rows(8),
+    );
+    let mut editor = Reedline::create()
+        .with_completer(completer)
+        .with_menu(reedline::ReedlineMenu::EngineCompleter(menu))
+        .with_edit_mode(Box::new(Emacs::new(keybindings)));
+    if let Ok(hist) = FileBackedHistory::with_file(10_000, history_path) {
         editor = editor.with_history(Box::new(hist));
     }
     let prompt = JoeyPrompt;
@@ -1667,32 +1689,12 @@ fn copy_last(st: &ReplState) {
         render::info("Nothing to copy yet.");
         return;
     }
-    let candidates: &[(&str, &[&str])] = &[
-        ("pbcopy", &[]),
-        ("xclip", &["-selection", "clipboard"]),
-        ("wl-copy", &[]),
-    ];
-    for (cmd, args) in candidates {
-        if which::which(cmd).is_err() {
-            continue;
-        }
-        let mut child = match std::process::Command::new(cmd)
-            .args(*args)
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        if let Some(stdin) = child.stdin.as_mut() {
-            use std::io::Write;
-            let _ = stdin.write_all(st.last_response.as_bytes());
-        }
-        let _ = child.wait();
-        render::success("✓ Copied last response to clipboard.");
-        return;
+    // Shared clipboard chain (native tool + OSC 52 fallback) — same helper
+    // the TUI uses, so both surfaces behave identically.
+    match crate::clipboard::copy_to_clipboard(&st.last_response) {
+        Ok(()) => render::success("✓ Copied last response to clipboard."),
+        Err(e) => render::error(&format!("copy failed: {e}")),
     }
-    render::error("no clipboard command found (pbcopy/xclip/wl-copy)");
 }
 
 // ---------------------------------------------------------------------------

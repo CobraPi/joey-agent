@@ -317,6 +317,187 @@ pub struct App {
     pub search_query: String,
     /// Whether search found any matches (updated on each query change).
     pub search_has_match: bool,
+    // ── Slash-command popup ──
+    /// The command catalog the popup filters (injected by the host from the
+    /// shared slash registry — joey-tui cannot depend on joey-cli).
+    pub slash_commands: Vec<SlashCommandInfo>,
+    /// Whether the slash popup is currently shown.
+    pub slash_menu_open: bool,
+    /// Cursor row in the slash popup.
+    pub slash_menu_cursor: usize,
+    /// Scroll offset of the popup list (when matches exceed visible rows).
+    pub slash_menu_scroll: usize,
+    // ── Input history (shared with the CLI via ~/.joey/.joey_history) ──
+    /// Session input history (most recent last), loaded from the shared file.
+    pub input_history: Vec<String>,
+    /// Current position while recalling (None = not recalling; Some(0) = newest).
+    pub history_pos: Option<usize>,
+    /// Draft saved when the user first pressed Up (restored on Down past newest).
+    pub history_draft: String,
+}
+
+/// One entry of the slash-command catalog shown in the TUI popup. Injected by
+/// the host from the shared slash registry (single source of truth in
+/// joey-cli's `slash::REGISTRY`).
+#[derive(Debug, Clone)]
+pub struct SlashCommandInfo {
+    /// Canonical name without the leading slash (e.g. "help").
+    pub name: String,
+    /// Aliases without slashes.
+    pub aliases: Vec<String>,
+    /// One-line description.
+    pub description: String,
+    /// Argument hint (e.g. "[model] [--global]").
+    pub args_hint: String,
+    /// Whether this build has a handler.
+    pub implemented: bool,
+}
+
+impl App {
+    /// Update the slash popup from the current input-box text. Opens the
+    /// popup when the first line starts with `/` (auto-popup as you type);
+    /// closes and resets it otherwise.
+    pub fn update_slash_menu(&mut self, input_text: &str) {
+        let first_line = input_text.lines().next().unwrap_or("");
+        let eligible = first_line.starts_with('/')
+            && !first_line[1..].contains(' ')
+            && self.input_cursor_at_first_line();
+        if !eligible {
+            self.slash_menu_open = false;
+            self.slash_menu_cursor = 0;
+            self.slash_menu_scroll = 0;
+            return;
+        }
+        let typed = first_line.strip_prefix('/').unwrap_or("");
+        self.slash_menu_open = !self.slash_matches(typed).is_empty();
+        // Clamp cursor/scroll into range for the (possibly new) match set.
+        let len = self.slash_matches(typed).len();
+        if self.slash_menu_cursor >= len {
+            self.slash_menu_cursor = 0;
+            self.slash_menu_scroll = 0;
+        }
+    }
+
+    /// The current popup filter fragment derived from the input box.
+    /// (The host passes the input text to `update_slash_menu` /
+    /// `slash_fragment` — the App does not own the Input widget.)
+
+    /// Matching commands for a typed fragment (prefix match on names and
+    /// aliases; empty fragment matches all).
+    pub fn slash_matches(&self, typed: &str) -> Vec<&SlashCommandInfo> {
+        if typed.is_empty() {
+            return self.slash_commands.iter().collect();
+        }
+        self.slash_commands
+            .iter()
+            .filter(|c| c.name.starts_with(typed) || c.aliases.iter().any(|a| a.starts_with(typed)))
+            .collect()
+    }
+
+    /// The typed fragment for the popup given the raw input text.
+    pub fn slash_fragment<'a>(&self, input_text: &'a str) -> &'a str {
+        input_text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .strip_prefix('/')
+            .unwrap_or("")
+    }
+
+    /// Whether the input cursor is on the first line (popup eligibility).
+    fn input_cursor_at_first_line(&self) -> bool {
+        // The Input widget reports its cursor line; the App can't see it, so
+        // eligibility is approximated: multi-line drafts never open the popup
+        // (handled by the caller passing single-line-relevant text). Kept as a
+        // hook for future precision.
+        true
+    }
+
+    /// Move the slash popup cursor; returns the newly selected command name
+    /// (without slash) if the popup is open.
+    pub fn slash_menu_move(&mut self, input_text: &str, down: bool) -> Option<String> {
+        if !self.slash_menu_open {
+            return None;
+        }
+        let len = self.slash_matches(self.slash_fragment(input_text)).len();
+        if len == 0 {
+            return None;
+        }
+        if down {
+            self.slash_menu_cursor = (self.slash_menu_cursor + 1) % len;
+        } else {
+            self.slash_menu_cursor = (self.slash_menu_cursor + len - 1) % len;
+        }
+        self.slash_selected(input_text)
+    }
+
+    /// The currently selected command (name without slash), if the popup is open.
+    pub fn slash_selected(&self, input_text: &str) -> Option<String> {
+        if !self.slash_menu_open {
+            return None;
+        }
+        self.slash_matches(self.slash_fragment(input_text))
+            .get(self.slash_menu_cursor)
+            .map(|c| c.name.clone())
+    }
+
+    // ── Input history ──
+
+    /// Recall the previous (older) history entry. `current` is the live input
+    /// text (used to seed the draft on first Up). Returns the text to place
+    /// in the input box.
+    pub fn history_prev(&mut self, current: &str) -> Option<String> {
+        if self.input_history.is_empty() {
+            return None;
+        }
+        let pos = match self.history_pos {
+            None => {
+                self.history_draft = current.to_string();
+                self.input_history.len() - 1
+            }
+            Some(0) => return None, // already at the oldest entry
+            Some(p) => p - 1,
+        };
+        self.history_pos = Some(pos);
+        Some(self.input_history[pos].clone())
+    }
+
+    /// Recall the next (newer) history entry. Returns the text to place in
+    /// the input box (the saved draft when moving past the newest entry).
+    pub fn history_next(&mut self) -> Option<String> {
+        let pos = self.history_pos?;
+        let next = pos + 1;
+        if next >= self.input_history.len() {
+            // Past the newest — restore the draft and stop recalling.
+            self.history_pos = None;
+            let draft = self.history_draft.clone();
+            self.history_draft.clear();
+            return Some(draft);
+        }
+        self.history_pos = Some(next);
+        Some(self.input_history[next].clone())
+    }
+
+    /// Record a submitted input into history (dedup against the previous
+    /// entry, matching reedline's FileBackedHistory semantics).
+    pub fn history_record(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if self.input_history.last().map(|l| l.as_str()) == Some(text) {
+            return;
+        }
+        self.input_history.push(text.to_string());
+        // Bound the in-memory list to match the on-disk cap.
+        const CAP: usize = 10_000;
+        if self.input_history.len() > CAP {
+            let drop_n = self.input_history.len() - CAP;
+            self.input_history.drain(0..drop_n);
+        }
+        self.history_pos = None;
+        self.history_draft.clear();
+    }
 }
 
 impl App {
@@ -357,6 +538,13 @@ impl App {
             search_open: false,
             search_query: String::new(),
             search_has_match: false,
+            slash_commands: Vec::new(),
+            slash_menu_open: false,
+            slash_menu_cursor: 0,
+            slash_menu_scroll: 0,
+            input_history: Vec::new(),
+            history_pos: None,
+            history_draft: String::new(),
         }
     }
 
@@ -1394,5 +1582,155 @@ mod tests {
         } else {
             panic!("expected Tool item");
         }
+    }
+}
+
+#[cfg(test)]
+mod slash_menu_tests {
+    use super::*;
+
+    fn cmd(name: &str, aliases: &[&str], implemented: bool) -> SlashCommandInfo {
+        SlashCommandInfo {
+            name: name.to_string(),
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            description: format!("{} command", name),
+            args_hint: "[args]".to_string(),
+            implemented,
+        }
+    }
+
+    fn app_with_commands() -> App {
+        let mut app = App::new("s", "m");
+        app.slash_commands = vec![
+            cmd("help", &[], true),
+            cmd("history", &[], true),
+            cmd("neurocode", &["nc"], true),
+            cmd("queue", &["q"], true),
+            cmd("handoff", &[], false),
+        ];
+        app
+    }
+
+    #[test]
+    fn popup_opens_on_slash_prefix() {
+        let mut app = app_with_commands();
+        app.update_slash_menu("/ne");
+        assert!(app.slash_menu_open);
+        let names: Vec<String> = app.slash_matches("ne").iter().map(|c| c.name.clone()).collect();
+        assert!(names.contains(&"neurocode".to_string()));
+        assert!(!names.contains(&"help".to_string()));
+    }
+
+    #[test]
+    fn popup_closes_without_slash() {
+        let mut app = app_with_commands();
+        app.update_slash_menu("/ne");
+        assert!(app.slash_menu_open);
+        app.update_slash_menu("hello world");
+        assert!(!app.slash_menu_open);
+        // Closes once a space follows the command token.
+        app.update_slash_menu("/neurocode status");
+        assert!(!app.slash_menu_open);
+    }
+
+    #[test]
+    fn empty_fragment_matches_all() {
+        let app = app_with_commands();
+        assert_eq!(app.slash_matches("").len(), 5);
+    }
+
+    #[test]
+    fn alias_prefix_matches() {
+        let app = app_with_commands();
+        // "q" is queue's alias.
+        let m = app.slash_matches("q");
+        assert!(m.iter().any(|c| c.name == "queue"));
+    }
+
+    #[test]
+    fn cursor_navigation_wraps() {
+        let mut app = app_with_commands();
+        app.update_slash_menu("/");
+        assert_eq!(app.slash_menu_cursor, 0);
+        let sel = app.slash_menu_move("/", true);
+        assert_eq!(app.slash_menu_cursor, 1);
+        assert_eq!(sel.as_deref(), Some("history"));
+        // Wrap to the last entry from the first via Up.
+        let sel = app.slash_menu_move("/", false);
+        assert_eq!(app.slash_menu_cursor, 0);
+        assert_eq!(sel.as_deref(), Some("help"));
+    }
+
+    #[test]
+    fn no_matches_closes_popup() {
+        let mut app = app_with_commands();
+        app.update_slash_menu("/zzz");
+        assert!(!app.slash_menu_open);
+        assert!(app.slash_matches("zzz").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn record_dedups_consecutive() {
+        let mut app = App::new("s", "m");
+        app.history_record("first");
+        app.history_record("first");
+        assert_eq!(app.input_history.len(), 1);
+        app.history_record("second");
+        assert_eq!(app.input_history.len(), 2);
+    }
+
+    #[test]
+    fn record_skips_empty_and_whitespace() {
+        let mut app = App::new("s", "m");
+        app.history_record("");
+        app.history_record("   ");
+        assert!(app.input_history.is_empty());
+    }
+
+    #[test]
+    fn prev_then_next_walks_history() {
+        let mut app = App::new("s", "m");
+        app.history_record("one");
+        app.history_record("two");
+        app.history_record("three");
+
+        // First Up: newest ("three"), draft saved.
+        assert_eq!(app.history_prev("draf").as_deref(), Some("three"));
+        assert_eq!(app.history_draft, "draf");
+        // Older.
+        assert_eq!(app.history_prev("three").as_deref(), Some("two"));
+        assert_eq!(app.history_prev("two").as_deref(), Some("one"));
+        // At the oldest — stays.
+        assert_eq!(app.history_prev("one"), None);
+        // Back down.
+        assert_eq!(app.history_next().as_deref(), Some("two"));
+        assert_eq!(app.history_next().as_deref(), Some("three"));
+        // Past the newest — restores the draft and resets.
+        assert_eq!(app.history_next().as_deref(), Some("draf"));
+        assert!(app.history_pos.is_none());
+    }
+
+    #[test]
+    fn record_resets_recall_state() {
+        let mut app = App::new("s", "m");
+        app.history_record("one");
+        app.history_record("two");
+        let _ = app.history_prev("");
+        app.history_record("three");
+        assert!(app.history_pos.is_none());
+        // Next Up starts from the newest again.
+        assert_eq!(app.history_prev("").as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn empty_history_prev_is_none() {
+        let mut app = App::new("s", "m");
+        assert!(app.history_prev("").is_none());
+        assert!(app.history_next().is_none());
     }
 }

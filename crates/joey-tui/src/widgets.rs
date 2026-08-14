@@ -16,7 +16,8 @@ use ratatui::Frame;
 use crate::anim::{Equalizer, ParticleField, Pulse, Spinner};
 use crate::input::Input;
 use crate::state::{
-    AgentPhase, App, DisplayAgent, NoticeKind, RunMode, SubagentStatus, ToolStatus, TranscriptItem,
+    AgentPhase, App, DisplayAgent, NoticeKind, RunMode, SlashCommandInfo, SubagentStatus,
+    ToolStatus, TranscriptItem,
 };
 use crate::theme::{gradient_spans, Rgb, Theme};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1516,7 +1517,7 @@ fn shorten_path(p: &str, max: usize) -> String {
 pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
     // Centered modal.
     let w = 56.min(area.width);
-    let h = 21.min(area.height);
+    let h = 26.min(area.height);
     if w < 20 || h < 5 {
         return;
     }
@@ -1531,9 +1532,11 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
     let keymap = [
         ("Enter", "send · queues next prompt while busy"),
         ("Alt+Enter / Ctrl+J", "insert newline"),
-        ("Tab", "switch agent (opens picker; BC-013)"),
-        ("Shift+Tab", "reverse cycle agent picker"),
-        ("Up", "focus transcript (when single-line input)"),
+        ("Tab", "agent picker · slash-menu next when popup open"),
+        ("Shift+Tab", "reverse cycle picker / slash menu"),
+        ("/", "open slash-command popup (type to filter)"),
+        ("↑ / ↓ (input)", "input history recall (shared with CLI)"),
+        ("↑ / ↓ (popup)", "navigate slash commands · ⏎ select · Esc close"),
         ("Esc / Ctrl+C", "interrupt turn (idle: quit)"),
         ("Ctrl+C ×2", "force exit during a turn"),
         ("Ctrl+D", "quit (on empty input)"),
@@ -1542,7 +1545,9 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("Ctrl+B / Ctrl+F", "half-page scroll up/down"),
         ("j / k  ↑ / ↓", "scroll one line (in transcript focus)"),
         ("g / G", "top / bottom (transcript focus)"),
-        ("/ n N", "search history · next · previous match"),
+        ("y / Y", "copy last agent / user message to clipboard"),
+        ("/copy [n]", "copy nth assistant message (−n counts from last)"),
+        ("Ctrl+S", "search transcript · n/N cycle matches"),
         ("Ctrl+R", "toggle reasoning panel"),
         ("Ctrl+L", "clear transcript view"),
         ("Ctrl+A/E  Ctrl+U/K/W", "line start/end · kill line/word"),
@@ -2606,4 +2611,139 @@ mod tests {
             );
         }
     }
+}
+
+// ── Slash-command popup ─────────────────────────────────────────────────────
+
+/// Floating slash-command menu anchored above the input box (IDE-style).
+///
+/// Shows the commands matching the current `/fragment` (prefix match over
+/// names + aliases — same semantics as `App::slash_matches`), with the
+/// description of the highlighted command on a footer line. ↑/↓/Tab navigate,
+/// Enter accepts, Esc closes (handled in `Tui::handle_input_key`).
+pub fn draw_slash_popup(f: &mut Frame, area: Rect, app: &App, input_text: &str, theme: Theme) {
+    let fragment = app.slash_fragment(input_text);
+    let matches = app.slash_matches(fragment);
+    if matches.is_empty() || !app.slash_menu_open {
+        return;
+    }
+
+    // Keep the cursor visible when the list is taller than the popup.
+    const VISIBLE_ROWS: usize = 8;
+    let scroll = app
+        .slash_menu_cursor
+        .saturating_sub(VISIBLE_ROWS.saturating_sub(1));
+    let visible: Vec<&&SlashCommandInfo> = matches
+        .iter()
+        .skip(scroll)
+        .take(VISIBLE_ROWS)
+        .collect();
+
+    // Size: command column (fixed 22) + description; +2 borders, +1 footer.
+    let w = 66.min(area.width);
+    let content_rows = visible.len();
+    let h = ((content_rows + 3) as u16).min(area.height);
+    if w < 30 || h < 4 {
+        return;
+    }
+
+    // Anchor: bottom-left of the screen, directly above the input box area
+    // (input occupies roughly the last ~5 rows; the popup's bottom sits at
+    // area.height - 6 from the top).
+    let x = area.x + 1;
+    let bottom_margin = 6u16.min(area.height.saturating_sub(h));
+    let y = area.y + area.height - h - bottom_margin;
+    let modal = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, modal);
+    let title = if fragment.is_empty() {
+        " Commands ".to_string()
+    } else {
+        format!(" Commands matching /{} ", fragment)
+    };
+    let block = gradient_block_focused(&title, theme, 0.6);
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+    if inner.width < 10 || inner.height < 1 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(content_rows + 1);
+    for (row, cmd) in visible.iter().enumerate() {
+        let abs_idx = scroll + row;
+        let is_cursor = abs_idx == app.slash_menu_cursor;
+        let marker = if is_cursor { "► " } else { "  " };
+        let marker_col = if is_cursor { theme.accent } else { theme.fg_most_subtle };
+
+        // Command column: /name (+ dim " (alias)" when the fragment matches
+        // an alias rather than the canonical name).
+        let via_alias = !fragment.is_empty()
+            && !cmd.name.starts_with(fragment)
+            && cmd.aliases.iter().any(|a| a.starts_with(fragment));
+        let label = if via_alias {
+            format!("/{} ({})", cmd.name, cmd.aliases.iter().find(|a| a.starts_with(fragment)).unwrap_or(&String::new()))
+        } else {
+            format!("/{}", cmd.name)
+        };
+        let name_col = if is_cursor {
+            theme.fg_base
+        } else if cmd.implemented {
+            theme.fg_subtle
+        } else {
+            theme.fg_most_subtle
+        };
+        let name_mod = if is_cursor { Modifier::BOLD } else { Modifier::empty() };
+
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::styled(
+                marker.to_string(),
+                Style::default().fg(marker_col.to_color()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<20}", label),
+                Style::default().fg(name_col.to_color()).add_modifier(name_mod),
+            ),
+        ];
+
+        // Description column (truncated to fit).
+        let desc_width = (inner.width as usize).saturating_sub(24);
+        let desc: String = cmd
+            .description
+            .chars()
+            .take(desc_width)
+            .collect();
+        let dim = if cmd.implemented { theme.fg_subtle } else { theme.fg_most_subtle };
+        spans.push(Span::styled(
+            desc,
+            Style::default().fg(dim.to_color()),
+        ));
+        if !cmd.implemented {
+            spans.push(Span::styled(
+                " ·n/a".to_string(),
+                Style::default().fg(theme.fg_most_subtle.to_color()),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Footer: args hint of the highlighted command + navigation hint.
+    if let Some(cmd) = matches.get(app.slash_menu_cursor) {
+        let hint = if cmd.args_hint.is_empty() {
+            cmd.description.clone()
+        } else {
+            format!("args: {}", cmd.args_hint)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", hint),
+                Style::default().fg(theme.gold.to_color()),
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        " ↑↓ navigate · Tab cycle · ⏎ select · Esc close ".to_string(),
+        Style::default().fg(theme.fg_most_subtle.to_color()),
+    )));
+
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }

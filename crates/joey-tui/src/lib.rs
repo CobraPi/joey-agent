@@ -25,5 +25,5 @@ pub mod theme;
 pub mod widgets;
 
 pub use app::{Tui, TuiAction};
-pub use state::{App as AppState, RunMode, TranscriptItem};
+pub use state::{App as AppState, RunMode, SlashCommandInfo, TranscriptItem};
 pub use theme::{gradient_spans, Theme};

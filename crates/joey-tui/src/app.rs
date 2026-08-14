@@ -29,7 +29,7 @@ use ratatui::Terminal;
 
 use crate::anim::{Activity, Clock, Equalizer, ParticleField, Pulse, Spinner};
 use crate::input::Input;
-use crate::state::{App, RunMode};
+use crate::state::{App, RunMode, TranscriptItem};
 use crate::theme::Theme;
 use crate::widgets;
 
@@ -44,6 +44,9 @@ pub enum TuiAction {
     Quit,
     /// Switch to a different agent (T033, BC-015).
     SwitchAgent(String),
+    /// Copy the text of transcript item `usize` to the clipboard (the `y`
+    /// key in transcript mode). Host owns the clipboard access.
+    CopyItem(usize),
 }
 
 pub type FrameBackend = CrosstermBackend<Stdout>;
@@ -268,6 +271,11 @@ impl Tui {
             }
 
             widgets::draw_input(f, chunks[2], input, app, theme, *focus == Focus::Input, glow);
+
+            // Slash-command popup floats above the input box.
+            if app.slash_menu_open {
+                widgets::draw_slash_popup(f, area, app, &input.text(), theme);
+            }
 
             let elapsed = app.turn_started.map(|t| t.elapsed()).unwrap_or_default();
             widgets::draw_status(f, chunks[3], app, theme, elapsed);
@@ -562,6 +570,29 @@ impl Tui {
                         // Find previous match.
                         self.app.search_next(false);
                     }
+                    // `y` copies the last assistant message to the clipboard
+                    // (host handles the clipboard); `Y` copies the last user
+                    // message. Works regardless of scroll position.
+                    KeyCode::Char('y') => {
+                        let idx = self
+                            .app
+                            .transcript
+                            .iter()
+                            .rposition(|i| matches!(i, TranscriptItem::Assistant { .. }));
+                        if let Some(idx) = idx {
+                            return Some(TuiAction::CopyItem(idx));
+                        }
+                    }
+                    KeyCode::Char('Y') => {
+                        let idx = self
+                            .app
+                            .transcript
+                            .iter()
+                            .rposition(|i| matches!(i, TranscriptItem::User { .. }));
+                        if let Some(idx) = idx {
+                            return Some(TuiAction::CopyItem(idx));
+                        }
+                    }
                     // Any other printable character returns focus to input
                     // and is injected there, so the user doesn't have to
                     // press Ctrl+T before typing.
@@ -581,6 +612,33 @@ impl Tui {
     fn handle_input_key(&mut self, key: KeyEvent) -> Option<TuiAction> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Slash popup is open: navigation keys act on the menu first.
+        if self.app.slash_menu_open {
+            match key.code {
+                KeyCode::Down | KeyCode::Tab => {
+                    self.app.slash_menu_move(&self.input.text(), true);
+                    return None;
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.app.slash_menu_move(&self.input.text(), false);
+                    return None;
+                }
+                KeyCode::Enter => {
+                    // Accept the selected command into the input box.
+                    if let Some(name) = self.app.slash_selected(&self.input.text()) {
+                        self.input.set_text(&format!("/{}", name));
+                        self.app.slash_menu_cursor = 0;
+                        self.app.update_slash_menu(&self.input.text());
+                    }
+                    return None;
+                }
+                KeyCode::Esc => {
+                    self.app.slash_menu_open = false;
+                    return None;
+                }
+                _ => {} // fall through to normal editing
+            }
+        }
         match key.code {
             KeyCode::Enter if alt => {
                 self.input.insert_newline();
@@ -593,7 +651,11 @@ impl Tui {
             KeyCode::Enter => {
                 let text = self.input.text();
                 if !text.trim().is_empty() {
+                    // Record into history before clearing (the host also
+                    // persists to the shared history file on Submit).
+                    self.app.history_record(&text);
                     self.input.clear();
+                    self.app.slash_menu_open = false;
                     // The host records/queues; while busy this becomes a
                     // queued prompt for the next turn.
                     return Some(TuiAction::Submit(text));
@@ -602,6 +664,7 @@ impl Tui {
             }
             KeyCode::Char('h') if ctrl => {
                 self.input.backspace();
+                self.app.update_slash_menu(&self.input.text());
                 None
             }
             KeyCode::Char('a') if ctrl => {
@@ -622,14 +685,17 @@ impl Tui {
             }
             KeyCode::Char('k') if ctrl => {
                 self.input.kill_to_end();
+                self.app.update_slash_menu(&self.input.text());
                 None
             }
             KeyCode::Char('u') if ctrl => {
                 self.input.kill_to_start();
+                self.app.update_slash_menu(&self.input.text());
                 None
             }
             KeyCode::Char('w') if ctrl => {
                 self.input.delete_word_back();
+                self.app.update_slash_menu(&self.input.text());
                 None
             }
             KeyCode::Char('b') if alt => {
@@ -642,6 +708,7 @@ impl Tui {
             }
             KeyCode::Backspace if alt => {
                 self.input.delete_word_back();
+                self.app.update_slash_menu(&self.input.text());
                 None
             }
             KeyCode::Left if ctrl => {
@@ -660,22 +727,24 @@ impl Tui {
                 self.input.move_right();
                 None
             }
-            // On a single-line prompt, ↑/↓ scroll the transcript (there is
-            // nowhere for the cursor to go); in a multi-line draft they move
-            // the cursor.
+            // History recall on a single-line draft; cursor movement in a
+            // multi-line draft. While the slash popup is open these keys are
+            // consumed above (menu navigation).
             KeyCode::Up => {
                 if self.input.line_count() > 1 {
                     self.input.move_up();
-                } else {
-                    self.app.scroll_up(1);
+                } else if let Some(text) = self.app.history_prev(&self.input.text()) {
+                    self.input.set_text(&text);
+                    self.app.update_slash_menu(&self.input.text());
                 }
                 None
             }
             KeyCode::Down => {
                 if self.input.line_count() > 1 {
                     self.input.move_down();
-                } else {
-                    self.app.scroll_down(1);
+                } else if let Some(text) = self.app.history_next() {
+                    self.input.set_text(&text);
+                    self.app.update_slash_menu(&self.input.text());
                 }
                 None
             }
@@ -689,24 +758,35 @@ impl Tui {
             }
             KeyCode::Backspace => {
                 self.input.backspace();
+                self.app.update_slash_menu(&self.input.text());
                 None
             }
             KeyCode::Delete => {
                 self.input.delete();
+                self.app.update_slash_menu(&self.input.text());
+                None
+            }
+            KeyCode::Char('s') if ctrl => {
+                // Ctrl+S opens transcript search (the `/` key in input mode
+                // now opens the slash-command popup instead).
+                self.app.search_open = true;
+                self.app.search_query.clear();
                 None
             }
             KeyCode::Char('?') if self.input.is_empty() && !ctrl => {
                 self.show_help = true;
                 None
             }
-            // '/' on an empty input opens search-in-history (vim-style).
+            // '/' on an empty input opens the slash-command popup; a second
+            // '/' (already typed) is just a character.
             KeyCode::Char('/') if self.input.is_empty() && !ctrl => {
-                self.app.search_open = true;
-                self.app.search_query.clear();
+                self.input.insert_char('/');
+                self.app.update_slash_menu(&self.input.text());
                 None
             }
             KeyCode::Char(c) if !ctrl => {
                 self.input.insert_char(c);
+                self.app.update_slash_menu(&self.input.text());
                 None
             }
             _ => None,

@@ -6,8 +6,11 @@
 //! cron/mcp/skills/version. A rewrite of Hermes Agent (Nous Research, MIT).
 
 mod commands;
+mod clipboard;
+mod history;
 mod llm_selector;
 mod neurocode_wiring;
+mod slash_menu;
 mod auth_cmd;
 mod config_cmd;
 mod cron_cmd;

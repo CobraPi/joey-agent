@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use joey_agent_core::{Agent, AgentEvent};
 use joey_core::Config;
-use joey_tui::{state::NoticeKind, AppState, Theme, TranscriptItem, Tui, TuiAction};
+use joey_tui::{state::NoticeKind, AppState, SlashCommandInfo, Theme, TranscriptItem, Tui, TuiAction};
 use tokio::sync::mpsc;
 
 use crate::render;
@@ -117,6 +117,22 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     app_state.provider = provider_name.to_string();
     app_state.cwd = cwd.to_string_lossy().into_owned();
     app_state.show_reasoning = config.get_bool("display.show_reasoning", true);
+    // Slash-command popup catalog: inject the shared registry (single source
+    // of truth in crate::slash — the TUI crate cannot depend on joey-cli).
+    app_state.slash_commands = crate::slash::REGISTRY
+        .iter()
+        .map(|c| SlashCommandInfo {
+            name: c.name.to_string(),
+            aliases: c.aliases.iter().map(|a| a.to_string()).collect(),
+            description: c.description.to_string(),
+            args_hint: c.args_hint.to_string(),
+            implemented: c.implemented,
+        })
+        .collect();
+    // Shared input history with the CLI surface (~/.joey/.joey_history —
+    // reedline-compatible format, so entries made in either surface are
+    // recallable in both).
+    app_state.input_history = crate::history::load();
 
     let theme = Theme::aurora();
     let mut tui = match Tui::enter(app_state, theme) {
@@ -363,7 +379,45 @@ async fn interactive_loop(tui: &mut Tui, agent: &mut Agent) -> anyhow::Result<()
                 // T033/BC-015: rebuild the runtime onto the chosen agent's model.
                 switch_agent(tui, agent, &agent_name);
             }
+            TuiAction::CopyItem(idx) => {
+                // `y`/`Y` in transcript mode — copy that transcript item's
+                // text to the clipboard (native chain + OSC 52 fallback).
+                let text = tui.app().transcript.get(idx).and_then(|item| match item {
+                    TranscriptItem::User { text }
+                    | TranscriptItem::Assistant { text }
+                    | TranscriptItem::Reasoning { text, .. } => Some(text.clone()),
+                    TranscriptItem::Tool { full_result, result_preview, .. } => {
+                        full_result.clone().or_else(|| Some(result_preview.clone()))
+                    }
+                    TranscriptItem::FileDiff { path, lines, .. } => Some(format!(
+                        "# {}\n{}",
+                        path,
+                        lines.join("\n")
+                    )),
+                    TranscriptItem::Notice { text, .. } | TranscriptItem::Error { text } => {
+                        Some(text.clone())
+                    }
+                });
+                match text {
+                    Some(t) => match crate::clipboard::copy_to_clipboard(&t) {
+                        Ok(()) => tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: format!("✓ Copied {} chars to clipboard", t.chars().count()),
+                            kind: NoticeKind::Success,
+                        }),
+                        Err(e) => tui.app_mut().push_item(TranscriptItem::Error {
+                            text: format!("Copy failed: {e}"),
+                        }),
+                    },
+                    None => tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "Nothing to copy under the cursor.".into(),
+                        kind: NoticeKind::Warning,
+                    }),
+                }
+            }
             TuiAction::Submit(text) => {
+                // Persist to the shared CLI/TUI history file (the App's
+                // in-memory copy was already recorded by the input handler).
+                crate::history::record(&text);
                 if text.trim_start().starts_with('/') {
                     if let SlashAction::Quit = handle_slash_tui(&text, tui, agent) {
                         return Ok(());
@@ -411,7 +465,11 @@ async fn wait_for_action(tui: &mut Tui) -> TuiAction {
                             return a;
                         }
                     }
-                    Ok(Event::Paste(s)) => tui.input.insert_str(&s),
+                    Ok(Event::Paste(s)) => {
+                        tui.input.insert_str(&s);
+                        let text = tui.input.text();
+                        tui.app_mut().update_slash_menu(&text);
+                    }
                     Ok(Event::Resize(w, h)) => tui.resize(w, h),
                     Ok(Event::Mouse(m)) => {
                         use crossterm::event::{MouseEventKind, MouseButton};
@@ -542,10 +600,50 @@ async fn run_turn(
                                             kind: NoticeKind::Busy,
                                         });
                                     }
+                                    // Copy works while busy (clipboard access
+                                    // doesn't touch the agent borrow).
+                                    TuiAction::CopyItem(idx) => {
+                                        let copied = tui
+                                            .app()
+                                            .transcript
+                                            .get(idx)
+                                            .and_then(|item| match item {
+                                                TranscriptItem::User { text }
+                                                | TranscriptItem::Assistant { text }
+                                                | TranscriptItem::Reasoning { text, .. } => {
+                                                    Some(text.clone())
+                                                }
+                                                TranscriptItem::Tool { full_result, result_preview, .. } => {
+                                                    full_result
+                                                        .clone()
+                                                        .or_else(|| Some(result_preview.clone()))
+                                                }
+                                                TranscriptItem::FileDiff { path, lines, .. } => {
+                                                    Some(format!("# {}\n{}", path, lines.join("\n")))
+                                                }
+                                                TranscriptItem::Notice { text, .. }
+                                                | TranscriptItem::Error { text } => Some(text.clone()),
+                                            });
+                                        if let Some(t) = copied {
+                                            if crate::clipboard::copy_to_clipboard(&t).is_ok() {
+                                                tui.app_mut().push_item(TranscriptItem::Notice {
+                                                    text: format!(
+                                                        "✓ Copied {} chars to clipboard",
+                                                        t.chars().count()
+                                                    ),
+                                                    kind: NoticeKind::Success,
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                        Ok(Event::Paste(s)) => tui.input.insert_str(&s),
+                        Ok(Event::Paste(s)) => {
+                            tui.input.insert_str(&s);
+                            let text = tui.input.text();
+                            tui.app_mut().update_slash_menu(&text);
+                        }
                         Ok(Event::Resize(w, h)) => tui.resize(w, h),
                         Ok(Event::Mouse(m)) => {
                             use crossterm::event::{MouseEventKind, MouseButton};
@@ -779,6 +877,79 @@ fn handle_slash_tui(input: &str, tui: &mut Tui, agent: &mut Agent) -> SlashActio
                     });
                 }
             }
+            // /copy — copy the last agent response to the clipboard (with an
+            // optional 1-based message number, counting assistant messages
+            // oldest→newest; negative numbers count from the newest).
+            "copy" => {
+                let args = slash_args_after(input, "copy");
+                copy_in_tui(tui, args);
+            }
+            "history" => {
+                // Show conversation history summary in the transcript.
+                let count = tui.app().transcript_len();
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!(
+                        "{} transcript item(s) this session — scroll with ↑/↓ or PgUp/PgDn",
+                        count,
+                    ),
+                    kind: NoticeKind::Info,
+                });
+            }
+            "version" | "v" => {
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!("joey-agent {}", env!("CARGO_PKG_VERSION")),
+                    kind: NoticeKind::Info,
+                });
+            }
+            "llm-selector" => {
+                // Reuse the CLI handler, funneling its terminal output into
+                // the transcript (it prints; we capture by running the same
+                // underlying call when it returns Result, else we show a
+                // pointer to the CLI).
+                let args = slash_args_after(input, "llm-selector");
+                match crate::llm_selector::llm_selector_slash(args) {
+                    Ok(()) => {}
+                    Err(e) => tui.app_mut().push_item(TranscriptItem::Error { text: e }),
+                }
+            }
+            "neurocode" => {
+                // The handler builds its own engine and returns plain text —
+                // perfect for the transcript (Constitution II parity).
+                let args = slash_args_after(input, "neurocode");
+                let out = crate::commands::neurocode::neurocode_slash(args);
+                for line in out.lines() {
+                    tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: line.to_string(),
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "toolsets" => {
+                let names = joey_tools::toolsets::names();
+                tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!("Toolsets: {}", names.join(", ")),
+                    kind: NoticeKind::Info,
+                });
+            }
+            "skills" => {
+                let skills = joey_tools::tools::skills_tool::discover();
+                if skills.is_empty() {
+                    tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "No skills installed.".into(),
+                        kind: NoticeKind::Info,
+                    });
+                } else {
+                    let listing = skills
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: format!("Skills: {}", listing),
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
             name => {
                 tui.app_mut().push_item(TranscriptItem::Notice {
                     text: format!(
@@ -810,6 +981,61 @@ fn slash_args_after<'a>(input: &'a str, command: &str) -> &'a str {
     }
     // Fallback: anything after the first space.
     stripped.split_once(' ').map(|(_, r)| r).unwrap_or("")
+}
+
+/// `/copy [n]` in the TUI — copy an assistant message to the clipboard.
+///
+/// No argument: the most recent assistant message. A positive 1-based n:
+/// the nth assistant message (oldest→newest). A negative n: counting from
+/// the newest (-1 = last). Uses the native clipboard chain with an OSC 52
+/// fallback so it also works over SSH.
+fn copy_in_tui(tui: &mut Tui, args: &str) {
+    // Collect assistant message texts from the transcript.
+    let assistant_texts: Vec<String> = tui
+        .app()
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::Assistant { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let selected: Option<String> = if args.trim().is_empty() {
+        assistant_texts.last().cloned()
+    } else {
+        match args.trim().parse::<i64>() {
+            Ok(n) if n > 0 => assistant_texts.get((n - 1) as usize).cloned(),
+            Ok(n) if n < 0 => {
+                let idx = assistant_texts.len().checked_sub(n.unsigned_abs() as usize);
+                idx.and_then(|i| assistant_texts.get(i).cloned())
+            }
+            _ => None,
+        }
+    };
+
+    let Some(text) = selected else {
+        tui.app_mut().push_item(TranscriptItem::Notice {
+            text: if assistant_texts.is_empty() {
+                "Nothing to copy yet.".into()
+            } else {
+                format!("No assistant message matches '{}'.", args.trim())
+            },
+            kind: NoticeKind::Warning,
+        });
+        return;
+    };
+
+    let preview: String = text.chars().take(60).collect();
+    match crate::clipboard::copy_to_clipboard(&text) {
+        Ok(()) => tui.app_mut().push_item(TranscriptItem::Notice {
+            text: format!("✓ Copied to clipboard: {}…", preview),
+            kind: NoticeKind::Success,
+        }),
+        Err(e) => tui.app_mut().push_item(TranscriptItem::Error {
+            text: format!("Copy failed: {e}"),
+        }),
+    }
 }
 
 /// T114: `/start-work [plan-name]` in the TUI — mirrors the CLI handler
