@@ -1431,6 +1431,18 @@ pub fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: Theme, elapsed: 
             spans.push(Span::raw("  "));
         }
     }
+    // NeuroCode active badge (feature 015): shown whenever the engine is
+    // wired + active, so the user always knows context-graph injection is on.
+    if app.neurocode_active {
+        spans.push(Span::styled(
+            " ⚡NEUROCODE ",
+            Style::default()
+                .bg(theme.accent.to_color())
+                .fg(theme.bg_void.to_color())
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("  "));
+    }
     // cwd
     let cwd_short = shorten_path(&app.cwd, 28);
     spans.push(Span::styled(
@@ -1535,13 +1547,14 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("Tab", "agent picker · slash-menu next when popup open"),
         ("Shift+Tab", "reverse cycle picker / slash menu"),
         ("/", "open slash-command popup (type to filter)"),
+        ("/cmd arg", "subcommand suggestions (↑/↓ · ⏎ select)"),
+        ("@ / path word", "context refs · file & folder completions"),
         ("↑ / ↓ (input)", "input history recall (shared with CLI)"),
         ("↑ / ↓ (popup)", "navigate slash commands · ⏎ select · Esc close"),
         ("Esc / Ctrl+C", "interrupt turn (idle: quit)"),
         ("Ctrl+C ×2", "force exit during a turn"),
         ("Ctrl+D", "quit (on empty input)"),
-        ("Ctrl+T", "toggle focus: input ↔ transcript"),
-        ("PgUp / PgDn", "scroll transcript (enters scroll mode)"),
+        ("Shift+Up / Ctrl+T / PgUp·PgDn", "scroll transcript (enters scroll mode)"),
         ("Ctrl+B / Ctrl+F", "half-page scroll up/down"),
         ("j / k  ↑ / ↓", "scroll one line (in transcript focus)"),
         ("g / G", "top / bottom (transcript focus)"),
@@ -1549,6 +1562,7 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("/copy [n]", "copy nth assistant message (−n counts from last)"),
         ("Ctrl+S", "search transcript · n/N cycle matches"),
         ("Ctrl+R", "toggle reasoning panel"),
+        ("Alt+↑ / Alt+↓", "scroll NeuroCode context feed (when active)"),
         ("Ctrl+L", "clear transcript view"),
         ("Ctrl+A/E  Ctrl+U/K/W", "line start/end · kill line/word"),
         ("? / F1", "toggle this help"),
@@ -2622,6 +2636,60 @@ mod tests {
 /// description of the highlighted command on a footer line. ↑/↓/Tab navigate,
 /// Enter accepts, Esc closes (handled in `Tui::handle_input_key`).
 pub fn draw_slash_popup(f: &mut Frame, area: Rect, app: &App, input_text: &str, theme: Theme) {
+    // Subcommand stage: offer the command's pipe-hint subcommands.
+    if app.slash_subcommand_stage {
+        let subs = app.slash_subcommand_matches(input_text);
+        if subs.is_empty() || !app.slash_menu_open {
+            return;
+        }
+        const VISIBLE_ROWS: usize = 8;
+        let scroll = app.slash_menu_cursor.saturating_sub(VISIBLE_ROWS.saturating_sub(1));
+        let visible: Vec<&String> = subs.iter().skip(scroll).take(VISIBLE_ROWS).collect();
+
+        let w = 56.min(area.width);
+        let h = ((visible.len() + 3) as u16).min(area.height);
+        if w < 30 || h < 4 {
+            return;
+        }
+        let x = area.x + 1;
+        let bottom_margin = 6u16.min(area.height.saturating_sub(h));
+        let y = area.y + area.height - h - bottom_margin;
+        let modal = Rect::new(x, y, w, h);
+
+        f.render_widget(Clear, modal);
+        let first_line = input_text.lines().next().unwrap_or("");
+        let base = first_line.split(' ').next().unwrap_or("");
+        let title = format!(" Arguments for {base} ");
+        let block = gradient_block_focused(&title, theme, 0.6);
+        let inner = block.inner(modal);
+        f.render_widget(block, modal);
+        if inner.width < 10 || inner.height < 1 {
+            return;
+        }
+
+        let mut lines: Vec<Line> = Vec::with_capacity(visible.len() + 1);
+        for (row, sub) in visible.iter().enumerate() {
+            let abs_idx = scroll + row;
+            let is_cursor = abs_idx == app.slash_menu_cursor;
+            let marker = if is_cursor { "► " } else { "  " };
+            let col = if is_cursor { theme.accent } else { theme.fg_subtle };
+            let mod_ = if is_cursor { Modifier::BOLD } else { Modifier::empty() };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    marker.to_string(),
+                    Style::default().fg(col.to_color()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(sub.clone(), Style::default().fg(theme.fg_base.to_color()).add_modifier(mod_)),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            " ↑↓ navigate · ⏎ select · Esc close ".to_string(),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        )));
+        f.render_widget(Paragraph::new(Text::from(lines)), inner);
+        return;
+    }
+
     let fragment = app.slash_fragment(input_text);
     let matches = app.slash_matches(fragment);
     if matches.is_empty() || !app.slash_menu_open {
@@ -2744,6 +2812,168 @@ pub fn draw_slash_popup(f: &mut Frame, area: Rect, app: &App, input_text: &str, 
         " ↑↓ navigate · Tab cycle · ⏎ select · Esc close ".to_string(),
         Style::default().fg(theme.fg_most_subtle.to_color()),
     )));
+
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Generic completion popup (@-context refs / file paths). Host-fed items
+/// (`App::completion_items`); ↑/↓/Tab navigate, Enter accepts, Esc closes.
+pub fn draw_completion_popup(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    if !app.completion_menu_open || app.completion_items.is_empty() {
+        return;
+    }
+    const VISIBLE_ROWS: usize = 8;
+    let scroll = app.completion_menu_cursor.saturating_sub(VISIBLE_ROWS.saturating_sub(1));
+    let visible: Vec<&joey_tools::completion::CompletionItem> =
+        app.completion_items.iter().skip(scroll).take(VISIBLE_ROWS).collect();
+
+    let w = 72.min(area.width);
+    let h = ((visible.len() + 2) as u16).min(area.height);
+    if w < 30 || h < 3 {
+        return;
+    }
+    let x = area.x + 1;
+    let bottom_margin = 6u16.min(area.height.saturating_sub(h));
+    let y = area.y + area.height - h - bottom_margin;
+    let modal = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, modal);
+    let block = gradient_block_focused(" Completions ", theme, 0.6);
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+    if inner.width < 10 || inner.height < 1 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(visible.len() + 1);
+    for (row, item) in visible.iter().enumerate() {
+        let abs_idx = scroll + row;
+        let is_cursor = abs_idx == app.completion_menu_cursor;
+        let marker = if is_cursor { "► " } else { "  " };
+        let col = if is_cursor { theme.accent } else { theme.fg_subtle };
+        let mod_ = if is_cursor { Modifier::BOLD } else { Modifier::empty() };
+
+        // Display column (fixed 28) + meta column (truncated).
+        let display: String = item.display.chars().take(26).collect();
+        let meta_width = (inner.width as usize).saturating_sub(32);
+        let meta: String = item.meta.chars().take(meta_width).collect();
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker.to_string(),
+                Style::default().fg(col.to_color()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{display:<26}"),
+                Style::default().fg(theme.fg_base.to_color()).add_modifier(mod_),
+            ),
+            Span::styled(meta, Style::default().fg(theme.fg_most_subtle.to_color())),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        " ↑↓ navigate · ⏎ insert · Esc close ".to_string(),
+        Style::default().fg(theme.fg_most_subtle.to_color()),
+    )));
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// NeuroCode live context feed (bottom-right panel). Shown only when the
+/// engine is active (`app.neurocode_active`). Renders a header line
+/// (tier · tokens · nodes · cold badge) and a scrolling window over the
+/// exact context text NeuroCode assembled for the latest request — the same
+/// string prepended to the system prompt (`AgentEvent::NeuroCodeContext`).
+pub fn draw_neurocode_panel(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    if !app.neurocode_active || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let block = gradient_block(" neurocode · context feed ", theme);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 8 || inner.height < 2 {
+        return;
+    }
+
+    let cw = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header: tier + tokens + nodes (+ cold badge when degraded).
+    let mut header = vec![
+        Span::styled(
+            "⚡ ".to_string(),
+            Style::default().fg(theme.accent.to_color()),
+        ),
+        Span::styled(
+            app.neurocode_tier.clone(),
+            Style::default()
+                .fg(theme.accent.to_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  Σ{} tok", fmt_tokens(app.neurocode_tokens as u64)),
+            Style::default().fg(theme.info.to_color()),
+        ),
+        Span::styled(
+            format!("  ◇{} nodes", app.neurocode_nodes),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ),
+    ];
+    if app.neurocode_cold {
+        header.push(Span::styled(
+            "  COLD".to_string(),
+            Style::default().fg(theme.warning.to_color()).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(header));
+    lines.push(Line::styled(
+        "─".repeat(cw.saturating_sub(2)),
+        Style::default().fg(theme.fg_most_subtle.to_color()),
+    ));
+
+    // Body: the live context text, hard-wrapped, windowed by scroll.
+    if app.neurocode_context.is_empty() {
+        lines.push(Line::styled(
+            " (no context assembled yet — send a prompt)",
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        ));
+    } else {
+        let wrapped = textwrap::wrap(&app.neurocode_context, cw.saturating_sub(2).max(10));
+        let body_lines: Vec<Line> = wrapped
+            .iter()
+            .map(|w| {
+                Line::styled(
+                    format!(" {}", w),
+                    Style::default().fg(theme.fg_subtle.to_color()),
+                )
+            })
+            .collect();
+        // Window: tail-anchored by default (the latest context is what's
+        // being fed NOW); scroll moves the window up.
+        let visible_rows = (inner.height as usize).saturating_sub(lines.len() + 1);
+        let total = body_lines.len();
+        let max_scroll = total.saturating_sub(visible_rows);
+        let scroll = app.neurocode_scroll.min(max_scroll);
+        let window: Vec<Line> = if total <= visible_rows {
+            body_lines
+        } else {
+            // Tail-anchor: show the LAST visible_rows, offset by scroll.
+            let start = total.saturating_sub(visible_rows).saturating_sub(scroll);
+            let end = (start + visible_rows).min(total);
+            body_lines[start..end].to_vec()
+        };
+        if total > visible_rows {
+            let pct = if max_scroll == 0 {
+                100
+            } else {
+                ((scroll as f32 / max_scroll as f32) * 100.0) as u16
+            };
+            lines.extend(window);
+            lines.push(Line::styled(
+                format!(" ↑{} lines · {:>3}% ", total.saturating_sub(visible_rows), 100 - pct.min(100)),
+                Style::default().fg(theme.fg_most_subtle.to_color()),
+            ));
+        } else {
+            lines.extend(window);
+        }
+    }
 
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }

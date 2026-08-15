@@ -304,6 +304,23 @@ pub struct App {
     pub next_subagent_id: usize,
     /// Learnings counter for wisdom accumulation display.
     pub learnings_count: usize,
+    // ── NeuroCode (feature 015) ──
+    /// Whether the NeuroCode engine is wired + active (drives the status-bar
+    /// indicator and the bottom-right live context panel).
+    pub neurocode_active: bool,
+    /// Live feed of the context NeuroCode assembled for the CURRENT/latest
+    /// request (updated on every AgentEvent::NeuroCodeContext).
+    pub neurocode_context: String,
+    /// Tier that served the latest request (e.g. "Frontier").
+    pub neurocode_tier: String,
+    /// Estimated tokens in the latest assembled context.
+    pub neurocode_tokens: usize,
+    /// Graph-expanded node count in the latest assembled context.
+    pub neurocode_nodes: usize,
+    /// Cold-mode flag (project not indexed — degraded context).
+    pub neurocode_cold: bool,
+    /// Scroll offset (lines) for the context panel when the feed overflows.
+    pub neurocode_scroll: usize,
     /// T155: when true, the Atlas job board section renders in draw_omo_panel.
     /// Set on BoulderWorkStarted, cleared on BoulderWorkCompleted / turn Done.
     pub job_board_visible: bool,
@@ -327,6 +344,17 @@ pub struct App {
     pub slash_menu_cursor: usize,
     /// Scroll offset of the popup list (when matches exceed visible rows).
     pub slash_menu_scroll: usize,
+    /// Subcommand stage: when the input is `/cmd <first-arg-partial>`, the
+    /// popup offers the command's subcommands (derived from args_hint pipes)
+    /// instead of command names.
+    pub slash_subcommand_stage: bool,
+    // ── Generic completion popup (@-context / file paths) ──
+    /// Whether the completion popup is shown (host feeds the items).
+    pub completion_menu_open: bool,
+    /// Items offered by the completion popup (host-computed).
+    pub completion_items: Vec<joey_tools::completion::CompletionItem>,
+    /// Cursor row in the completion popup.
+    pub completion_menu_cursor: usize,
     // ── Input history (shared with the CLI via ~/.joey/.joey_history) ──
     /// Session input history (most recent last), loaded from the shared file.
     pub input_history: Vec<String>,
@@ -356,18 +384,56 @@ pub struct SlashCommandInfo {
 impl App {
     /// Update the slash popup from the current input-box text. Opens the
     /// popup when the first line starts with `/` (auto-popup as you type);
-    /// closes and resets it otherwise.
+    /// closes and resets it otherwise. Two stages:
+    ///
+    /// - `/par` — command-name/alias matches (as before).
+    /// - `/cmd arg` (first argument word only) — when the command is known
+    ///   and has pipe-encoded subcommands in its args_hint, the popup
+    ///   switches to subcommand matches (Hermes SUBCOMMANDS parity).
     pub fn update_slash_menu(&mut self, input_text: &str) {
         let first_line = input_text.lines().next().unwrap_or("");
-        let eligible = first_line.starts_with('/')
-            && !first_line[1..].contains(' ')
-            && self.input_cursor_at_first_line();
-        if !eligible {
+        self.slash_subcommand_stage = false;
+        if !first_line.starts_with('/') || !self.input_cursor_at_first_line() {
             self.slash_menu_open = false;
             self.slash_menu_cursor = 0;
             self.slash_menu_scroll = 0;
             return;
         }
+        // Subcommand stage: "/cmd partial" (cursor in the first argument
+        // word, no further spaces). An empty partial (trailing space) offers
+        // ALL subcommands — upstream shows the full list on `/cmd `.
+        if let Some((base, arg)) = first_line.split_once(' ') {
+            if !arg.contains(' ') {
+                if let Some(def) = self
+                    .slash_commands
+                    .iter()
+                    .find(|c| c.name == base[1..].to_lowercase() || c.aliases.iter().any(|a| *a == base[1..].to_lowercase()))
+                {
+                    if def.implemented {
+                        let arg_lower = arg.to_lowercase();
+                        let subs = joey_tools::completion::pipe_subcommands(&def.args_hint);
+                        let matches: Vec<&String> = subs
+                            .iter()
+                            .filter(|s| arg_lower.is_empty() || s.starts_with(arg_lower.as_str()))
+                            .filter(|s| s.as_str() != arg_lower)
+                            .collect();
+                        self.slash_menu_open = !matches.is_empty();
+                        self.slash_subcommand_stage = self.slash_menu_open;
+                        if self.slash_menu_cursor >= matches.len().max(1) {
+                            self.slash_menu_cursor = 0;
+                            self.slash_menu_scroll = 0;
+                        }
+                        return;
+                    }
+                }
+            }
+            // Args typed but not a subcommand-match case → close popup.
+            self.slash_menu_open = false;
+            self.slash_menu_cursor = 0;
+            self.slash_menu_scroll = 0;
+            return;
+        }
+        // Command-name stage.
         let typed = first_line.strip_prefix('/').unwrap_or("");
         self.slash_menu_open = !self.slash_matches(typed).is_empty();
         // Clamp cursor/scroll into range for the (possibly new) match set.
@@ -376,6 +442,64 @@ impl App {
             self.slash_menu_cursor = 0;
             self.slash_menu_scroll = 0;
         }
+    }
+
+    /// Subcommand matches for the subcommand stage (derived from the typed
+    /// `/cmd arg` input). Empty when not in the subcommand stage.
+    pub fn slash_subcommand_matches(&self, input_text: &str) -> Vec<String> {
+        if !self.slash_subcommand_stage {
+            return Vec::new();
+        }
+        let first_line = input_text.lines().next().unwrap_or("");
+        let Some((base, arg)) = first_line.split_once(' ') else {
+            return Vec::new();
+        };
+        let base_lower = base[1..].to_lowercase();
+        let Some(def) = self
+            .slash_commands
+            .iter()
+            .find(|c| c.name == base_lower || c.aliases.iter().any(|a| *a == base_lower))
+        else {
+            return Vec::new();
+        };
+        let arg_lower = arg.to_lowercase();
+        joey_tools::completion::pipe_subcommands(&def.args_hint)
+            .into_iter()
+            .filter(|s| s.starts_with(arg_lower.as_str()) && s.as_str() != arg_lower)
+            .collect()
+    }
+
+    // ── Generic completion popup (@-context / paths; host-fed items) ──
+
+    /// Set the completion-popup items from the host and open it (or close
+    /// when empty). Resets the cursor.
+    pub fn set_completion_items(&mut self, items: Vec<joey_tools::completion::CompletionItem>) {
+        self.completion_menu_open = !items.is_empty();
+        self.completion_items = items;
+        self.completion_menu_cursor = 0;
+    }
+
+    /// Move the completion-popup cursor (wrapping). Returns the selected
+    /// item's replacement when open.
+    pub fn completion_menu_move(&mut self, down: bool) -> Option<String> {
+        if !self.completion_menu_open || self.completion_items.is_empty() {
+            return None;
+        }
+        let len = self.completion_items.len();
+        if down {
+            self.completion_menu_cursor = (self.completion_menu_cursor + 1) % len;
+        } else {
+            self.completion_menu_cursor = (self.completion_menu_cursor + len - 1) % len;
+        }
+        self.completion_items.get(self.completion_menu_cursor).map(|i| i.replacement.clone())
+    }
+
+    /// The currently selected completion's replacement, when open.
+    pub fn completion_selected(&self) -> Option<String> {
+        if !self.completion_menu_open {
+            return None;
+        }
+        self.completion_items.get(self.completion_menu_cursor).map(|i| i.replacement.clone())
     }
 
     /// The current popup filter fragment derived from the input box.
@@ -533,6 +657,13 @@ impl App {
             subagent_entries: Vec::new(),
             next_subagent_id: 1,
             learnings_count: 0,
+            neurocode_active: false,
+            neurocode_context: String::new(),
+            neurocode_tier: String::new(),
+            neurocode_tokens: 0,
+            neurocode_nodes: 0,
+            neurocode_cold: false,
+            neurocode_scroll: 0,
             job_board_visible: false,
             pending_context_injection: None,
             search_open: false,
@@ -542,6 +673,10 @@ impl App {
             slash_menu_open: false,
             slash_menu_cursor: 0,
             slash_menu_scroll: 0,
+            slash_subcommand_stage: false,
+            completion_menu_open: false,
+            completion_items: Vec::new(),
+            completion_menu_cursor: 0,
             input_history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
@@ -918,6 +1053,28 @@ impl App {
                     text: format!("Agent: {}", agent_name),
                     kind: NoticeKind::Info,
                 });
+            }
+            // ── NeuroCode (feature 015): live context feed ──
+            AgentEvent::NeuroCodeContext {
+                tier,
+                token_estimate,
+                expanded_nodes,
+                cold_mode,
+                formatted_context,
+            } => {
+                self.neurocode_active = true;
+                self.neurocode_tier = tier;
+                self.neurocode_tokens = token_estimate;
+                self.neurocode_nodes = expanded_nodes;
+                self.neurocode_cold = cold_mode;
+                self.neurocode_context = formatted_context;
+                self.neurocode_scroll = 0;
+            }
+            AgentEvent::NeuroCodeActive { active } => {
+                self.neurocode_active = active;
+                if !active {
+                    self.neurocode_context.clear();
+                }
             }
             AgentEvent::CategoryDelegation { category, model } => {
                 // T065/T139: add a subagent entry with the category label.
@@ -1732,5 +1889,242 @@ mod history_tests {
         let mut app = App::new("s", "m");
         assert!(app.history_prev("").is_none());
         assert!(app.history_next().is_none());
+    }
+}
+
+#[cfg(test)]
+mod completion_menu_tests {
+    use super::*;
+
+    fn cmd(name: &str, aliases: &[&str], hint: &str, implemented: bool) -> SlashCommandInfo {
+        SlashCommandInfo {
+            name: name.to_string(),
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            description: format!("{name} command"),
+            args_hint: hint.to_string(),
+            implemented,
+        }
+    }
+
+    fn app_with_commands() -> App {
+        let mut app = App::new("s", "m");
+        app.slash_commands = vec![
+            cmd("help", &[], "", true),
+            cmd("timestamps", &["ts"], "[on|off|status]", true),
+            cmd("llm-selector", &[], "[status|pool|enable|disable|help]", true),
+            cmd("voice", &[], "[on|off|tts|status]", false),
+            cmd("model", &[], "[model] [--global]", true),
+        ];
+        app
+    }
+
+    #[test]
+    fn subcommand_stage_opens_after_command_space() {
+        let mut app = app_with_commands();
+        app.update_slash_menu("/timestamps o");
+        assert!(app.slash_menu_open);
+        assert!(app.slash_subcommand_stage);
+        let subs = app.slash_subcommand_matches("/timestamps o");
+        assert_eq!(subs, vec!["on".to_string(), "off".to_string()]);
+    }
+
+    #[test]
+    fn subcommand_stage_exact_arg_not_reoffered() {
+        let mut app = app_with_commands();
+        app.update_slash_menu("/timestamps on");
+        assert!(!app.slash_menu_open, "exact subcommand → nothing to add");
+    }
+
+    #[test]
+    fn subcommand_stage_closes_past_first_arg() {
+        let mut app = app_with_commands();
+        app.update_slash_menu("/timestamps on extra");
+        assert!(!app.slash_menu_open);
+    }
+
+    #[test]
+    fn subcommand_stage_via_alias() {
+        let mut app = app_with_commands();
+        // "ts" is timestamps' alias.
+        app.update_slash_menu("/ts st");
+        assert!(app.slash_subcommand_stage);
+        assert_eq!(app.slash_subcommand_matches("/ts st"), vec!["status".to_string()]);
+    }
+
+    #[test]
+    fn subcommand_stage_unimplemented_command_skipped() {
+        let mut app = app_with_commands();
+        app.update_slash_menu("/voice o");
+        assert!(!app.slash_menu_open);
+        assert!(!app.slash_subcommand_stage);
+    }
+
+    #[test]
+    fn no_pipe_hint_no_subcommand_stage() {
+        let mut app = app_with_commands();
+        // /model has no pipe run in its hint.
+        app.update_slash_menu("/model gp");
+        assert!(!app.slash_menu_open);
+    }
+
+    #[test]
+    fn command_name_stage_still_works() {
+        let mut app = app_with_commands();
+        app.update_slash_menu("/he");
+        assert!(app.slash_menu_open);
+        assert!(!app.slash_subcommand_stage);
+        assert!(app.slash_matches("he").iter().any(|c| c.name == "help"));
+    }
+
+    #[test]
+    fn completion_items_set_and_navigated() {
+        let mut app = App::new("s", "m");
+        app.set_completion_items(vec![
+            joey_tools::completion::CompletionItem { replacement: "@diff".into(), display: "@diff".into(), meta: "diff".into() },
+            joey_tools::completion::CompletionItem { replacement: "@file:src/main.rs".into(), display: "main.rs".into(), meta: "1K".into() },
+        ]);
+        assert!(app.completion_menu_open);
+        assert_eq!(app.completion_selected().as_deref(), Some("@diff"));
+        app.completion_menu_move(true);
+        assert_eq!(app.completion_selected().as_deref(), Some("@file:src/main.rs"));
+        app.completion_menu_move(true); // wraps
+        assert_eq!(app.completion_selected().as_deref(), Some("@diff"));
+        app.completion_menu_move(false); // wrap back
+        assert_eq!(app.completion_selected().as_deref(), Some("@file:src/main.rs"));
+        // Empty set closes.
+        app.set_completion_items(Vec::new());
+        assert!(!app.completion_menu_open);
+    }
+}
+
+#[cfg(test)]
+mod neurocode_panel_tests {
+    use super::*;
+    use crate::theme::Theme;
+    use joey_agent_core::AgentEvent;
+
+    #[test]
+    fn active_event_toggles_indicator() {
+        let mut app = App::new("s", "m");
+        assert!(!app.neurocode_active);
+        app.apply(AgentEvent::NeuroCodeActive { active: true });
+        assert!(app.neurocode_active);
+        app.apply(AgentEvent::NeuroCodeActive { active: false });
+        assert!(!app.neurocode_active);
+        assert!(app.neurocode_context.is_empty(), "feed cleared on deactivate");
+    }
+
+    #[test]
+    fn context_event_populates_feed() {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::NeuroCodeContext {
+            tier: "Frontier".into(),
+            token_estimate: 1234,
+            expanded_nodes: 7,
+            cold_mode: false,
+            formatted_context: "## NeuroCode Context\nTarget: TurnBudget::add()".into(),
+        });
+        assert!(app.neurocode_active, "context implies active");
+        assert_eq!(app.neurocode_tier, "Frontier");
+        assert_eq!(app.neurocode_tokens, 1234);
+        assert_eq!(app.neurocode_nodes, 7);
+        assert!(!app.neurocode_cold);
+        assert!(app.neurocode_context.contains("TurnBudget::add()"));
+        // A second event replaces the feed and resets scroll.
+        app.neurocode_scroll = 5;
+        app.apply(AgentEvent::NeuroCodeContext {
+            tier: "Economical".into(),
+            token_estimate: 100,
+            expanded_nodes: 2,
+            cold_mode: true,
+            formatted_context: "small".into(),
+        });
+        assert_eq!(app.neurocode_tier, "Economical");
+        assert!(app.neurocode_cold);
+        assert_eq!(app.neurocode_scroll, 0);
+    }
+
+    #[test]
+    fn panel_renders_without_panic_and_shows_feed() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = Theme::aurora();
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::NeuroCodeActive { active: true });
+        app.apply(AgentEvent::NeuroCodeContext {
+            tier: "Frontier".into(),
+            token_estimate: 4321,
+            expanded_nodes: 12,
+            cold_mode: false,
+            formatted_context: "UNIQUE_FEED_MARKER_XYZ target artifact".into(),
+        });
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                crate::widgets::draw_neurocode_panel(f, f.area(), &app, theme);
+            })
+            .unwrap();
+        let text = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_string()).collect::<String>();
+        assert!(text.contains("UNIQUE_FEED_MARKER_XYZ"), "feed text rendered");
+        assert!(text.contains("Frontier"), "tier shown");
+        assert!(text.contains("4.3K") || text.contains("4321"), "token estimate shown");
+    }
+
+    #[test]
+    fn panel_silent_when_inactive() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = Theme::aurora();
+        let app = App::new("s", "m"); // inactive
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                crate::widgets::draw_neurocode_panel(f, f.area(), &app, theme);
+            })
+            .unwrap();
+        let text = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_string()).collect::<String>();
+        assert!(!text.contains("context feed"), "no panel when inactive");
+    }
+
+    #[test]
+    fn cold_mode_badge_renders() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = Theme::aurora();
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::NeuroCodeContext {
+            tier: "Frontier".into(),
+            token_estimate: 10,
+            expanded_nodes: 0,
+            cold_mode: true,
+            formatted_context: "x".into(),
+        });
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::widgets::draw_neurocode_panel(f, f.area(), &app, theme)).unwrap();
+        let text = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_string()).collect::<String>();
+        assert!(text.contains("COLD"), "cold-mode badge shown");
+    }
+
+    #[test]
+    fn status_bar_shows_neurocode_badge_only_when_active() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = Theme::aurora();
+        let area = ratatui::layout::Rect::new(0, 0, 110, 1);
+
+        let mut app = App::new("s", "m");
+        let backend = TestBackend::new(110, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::widgets::draw_status(f, area, &app, theme, std::time::Duration::from_secs(1))).unwrap();
+        let text = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_string()).collect::<String>();
+        assert!(!text.contains("NEUROCODE"), "no badge when inactive");
+
+        app.apply(AgentEvent::NeuroCodeActive { active: true });
+        terminal.draw(|f| crate::widgets::draw_status(f, area, &app, theme, std::time::Duration::from_secs(1))).unwrap();
+        let text = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_string()).collect::<String>();
+        assert!(text.contains("NEUROCODE"), "badge shown when active");
     }
 }

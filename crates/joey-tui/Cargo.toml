@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 joey-agent-core.workspace = true
 joey-omo.workspace = true
+joey-tools.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true

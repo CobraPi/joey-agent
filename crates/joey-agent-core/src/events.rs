@@ -189,6 +189,28 @@ pub enum AgentEvent {
         agent_name: String,
         model: String,
     },
+    /// Feature 015 (NeuroCode): the pre-dispatch intercept assembled a
+    /// dependency-aware context graph for the upcoming request. Emitted
+    /// BEFORE the model call so UIs can show a live feed of exactly what
+    /// context NeuroCode is feeding the agent. Only fired when the engine
+    /// is wired AND active (byte-identical when off).
+    NeuroCodeContext {
+        /// The complexity tier that served the request (e.g. "frontier").
+        tier: String,
+        /// Estimated tokens in the assembled context.
+        token_estimate: usize,
+        /// Number of graph-expanded nodes included.
+        expanded_nodes: usize,
+        /// Whether the project was cold/un-indexed (degraded mode).
+        cold_mode: bool,
+        /// The full formatted context text fed to the model (the live feed
+        /// payload; UIs truncate for display).
+        formatted_context: String,
+    },
+    /// Feature 015 (NeuroCode): the engine's active/inactive state changed
+    /// (wired + enabled). Lets UIs show/hide the NeuroCode indicator without
+    /// polling config.
+    NeuroCodeActive { active: bool },
     /// A category-based delegation was dispatched (T059).
     CategoryDelegation {
         category: String,

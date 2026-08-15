@@ -76,7 +76,7 @@ the same specs/<feature>/*.md files joey-cli's speckit skills operate on.
 2. **Agent construction** (`joey-agent-core::Agent::new`): builds a
    `ProviderClient` from the resolved provider profile, snapshots the
    valid/checked tool names, assembles the session-stable system prompt
-   (see [system-prompt.md](system-prompt.md)), and wires up the context
+   (see [agent-core-reference.md](agent-core-reference.md)), and wires up the context
    compressor. `joey-cli` additionally registers the `delegate_task` tool
    (`joey-orchestration`) — bridged to `joey-omo`'s agent registry via a
    `CategoryResolver` — and, when `model.default = auto`, a

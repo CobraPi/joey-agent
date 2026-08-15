@@ -133,6 +133,16 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     // reedline-compatible format, so entries made in either surface are
     // recallable in both).
     app_state.input_history = crate::history::load();
+    // Feature 015 (NeuroCode): when the engine is enabled in config,
+    // build_agent wires it into the agent's turn loop. Surface the state in
+    // the TUI immediately (status badge + bottom-right live context panel).
+    if crate::neurocode_wiring::try_build_engine(&config).is_some() {
+        app_state.apply(joey_agent_core::AgentEvent::NeuroCodeActive { active: true });
+        app_state.push_item(TranscriptItem::Notice {
+            text: "⚡ NeuroCode active — dependency-aware context injection is ON (live feed: bottom-right panel)".into(),
+            kind: NoticeKind::Success,
+        });
+    }
 
     let theme = Theme::aurora();
     let mut tui = match Tui::enter(app_state, theme) {

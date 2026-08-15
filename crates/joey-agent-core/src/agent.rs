@@ -897,8 +897,7 @@ impl Agent {
             .filter_map(|d| serde_json::from_value::<ToolSchema>(d).ok())
             .collect()
     }
-
-    fn build_request(&self, tools: &[ToolSchema]) -> ProviderRequest {
+    fn build_request(&self, tools: &[ToolSchema], tx: Option<&mpsc::UnboundedSender<AgentEvent>>) -> ProviderRequest {
         // A one-shot output-cap override from the overflow handler wins
         // (upstream `_ephemeral_max_output_tokens`).
         let max_tokens = self.ephemeral_max_output_tokens.or(self.config.max_tokens);
@@ -906,7 +905,7 @@ impl Agent {
         // Feature 015 (NeuroCode): when the engine is wired and active,
         // classify the request's complexity, assemble dependency-aware context,
         // and prepend it. When None or inactive, byte-identical (FR-020).
-        self.apply_neurocode_intercept();
+        self.apply_neurocode_intercept(tx);
 
         // Feature 011: when a dynamic model allocator is wired and active,
         // resolve the main-turn model per-module. When None or inactive,
@@ -924,7 +923,7 @@ impl Agent {
     /// the engine is wired and active, classify the request, assemble context,
     /// and stash the context string for prepending. No-op when None/inactive
     /// (byte-identical to pre-feature-015 — Constitution VII).
-    fn apply_neurocode_intercept(&self) {
+    fn apply_neurocode_intercept(&self, tx: Option<&mpsc::UnboundedSender<AgentEvent>>) {
         // Clear the previous request's context.
         if let Ok(mut ctx) = self.neurocode_context.lock() {
             *ctx = None;
@@ -974,7 +973,18 @@ impl Agent {
                 "neurocode context assembled"
             );
             if let Ok(mut ctx) = self.neurocode_context.lock() {
-                *ctx = Some(assembled.formatted_context);
+                *ctx = Some(assembled.formatted_context.clone());
+            }
+            // Live feed (feature 015 follow-up): surface exactly what NeuroCode
+            // is feeding the model so UIs can render it (TUI context panel).
+            if let Some(tx) = tx {
+                let _ = tx.send(AgentEvent::NeuroCodeContext {
+                    tier: format!("{:?}", route.tier),
+                    token_estimate: assembled.token_estimate,
+                    expanded_nodes: assembled.expanded_nodes.len(),
+                    cold_mode: assembled.cold_mode,
+                    formatted_context: assembled.formatted_context,
+                });
             }
         }
     }
@@ -1098,9 +1108,9 @@ impl Agent {
         let mut retry_count: usize = 0;
         loop {
             let req = if with_tools {
-                self.build_request(tools)
+                self.build_request(tools, Some(tx))
             } else {
-                self.build_request(&[])
+                self.build_request(&[], Some(tx))
             };
             match self.transport_call(&req, tx).await {
                 Ok(resp) => return Ok(resp),

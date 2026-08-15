@@ -2896,6 +2896,7 @@ dependencies = [
  "joey-agent-core",
  "joey-omo",
  "joey-providers",
+ "joey-tools",
  "ratatui",
  "textwrap",
  "unicode-width",

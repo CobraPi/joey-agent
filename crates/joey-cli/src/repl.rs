@@ -19,7 +19,7 @@ use joey_tools::{ToolContext, ToolRegistry};
 use nu_ansi_term::Color;
 use reedline::{
     default_emacs_keybindings, EditCommand, Emacs, FileBackedHistory, KeyCode, KeyModifiers,
-    Reedline, ReedlineEvent, Signal,
+    MenuBuilder, Reedline, ReedlineEvent, Signal,
 };
 
 use crate::render::{self, RenderOptions};
@@ -591,15 +591,21 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
             ReedlineEvent::MenuNext,
         ]),
     );
-    let completer = Box::new(crate::slash_menu::SlashCompleter);
+    let completer = Box::new(crate::slash_menu::SmartCompleter::new(std::env::current_dir().unwrap_or_default()));
     let menu = Box::new(
         reedline::DescriptionMenu::default()
             .with_columns(1)
-            .with_selection_rows(8),
+            .with_selection_rows(8)
+            // Feed the completer the FULL line each time (not the delta vs
+            // the menu's opening input). The default `only_buffer_difference
+            // = true` breaks completion when the menu opens with no prior
+            // input diff (empty values → "TYPE TO START SEARCH" forever).
+            .with_only_buffer_difference(false),
     );
     let mut editor = Reedline::create()
         .with_completer(completer)
         .with_menu(reedline::ReedlineMenu::EngineCompleter(menu))
+        .with_hinter(Box::new(crate::slash_menu::SmartHinter))
         .with_edit_mode(Box::new(Emacs::new(keybindings)));
     if let Ok(hist) = FileBackedHistory::with_file(10_000, history_path) {
         editor = editor.with_history(Box::new(hist));
