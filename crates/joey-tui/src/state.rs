@@ -115,6 +115,9 @@ pub enum TranscriptItem {
         /// Pre-split diff lines (including `+`/`-`/` ` markers).
         lines: Vec<String>,
         is_binary: bool,
+        /// Expand toggle: collapsed shows the last MAX_DIFF_LINES lines;
+        /// expanded shows the whole diff.
+        expanded: bool,
     },
     /// A system notice / status line.
     Notice { text: String, kind: NoticeKind },
@@ -745,6 +748,17 @@ impl App {
     /// the given index, dispatching to the type-appropriate expand method
     /// (reasoning three-state cycle vs. tool boolean toggle). Called by the
     /// mouse click handler after hit-testing resolves a click to an item.
+    /// Whether the transcript item at `index` has an expand affordance
+    /// (tool calls, terminal blocks, file diffs, reasoning blocks).
+    pub fn item_is_expandable(&self, index: usize) -> bool {
+        match self.transcript.get(index) {
+            Some(TranscriptItem::Tool { .. })
+            | Some(TranscriptItem::FileDiff { .. })
+            | Some(TranscriptItem::Reasoning { .. }) => true,
+            _ => false,
+        }
+    }
+
     pub fn toggle_item_expand_by_index(&mut self, index: usize) {
         if index >= self.transcript.len() {
             return;
@@ -755,6 +769,9 @@ impl App {
                 *expand_state = expand_state.cycle(total_lines);
             }
             TranscriptItem::Tool { expanded, .. } => {
+                *expanded = !*expanded;
+            }
+            TranscriptItem::FileDiff { expanded, .. } => {
                 *expanded = !*expanded;
             }
             // Other item types are not expandable; click is a no-op for them.
@@ -1159,6 +1176,7 @@ impl App {
                     stat,
                     lines,
                     is_binary,
+                    expanded: false,
                 });
             }
             AgentEvent::Done { final_text, usage: _, iterations } => {

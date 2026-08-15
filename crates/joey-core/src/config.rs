@@ -1341,7 +1341,11 @@ pub fn remove_env_value(key: &str) -> Result<bool> {
         return Ok(false);
     }
     let raw = std::fs::read(&env_path).unwrap_or_default();
-    let text = String::from_utf8_lossy(&raw).to_string();
+    // Strip a UTF-8 BOM so the first KEY= line is recognized (save_env_value
+    // already does this; without it a BOM-prefixed key silently survived
+    // removal and the stale credential stayed on disk).
+    let body = raw.strip_prefix(b"\xef\xbb\xbf".as_slice()).unwrap_or(&raw);
+    let text = String::from_utf8_lossy(body).to_string();
     let lines: Vec<String> = text.split_inclusive('\n').map(|s| s.to_string()).collect();
     let kept: Vec<String> = lines
         .iter()
@@ -1695,6 +1699,30 @@ mod tests {
         let cfg = Config::load_from(path.clone()).unwrap();
         assert_eq!(cfg.get_i64("agent.max_turns", 0), 90, "exactly \"1\" ignores user config");
         std::env::remove_var("JOEY_IGNORE_USER_CONFIG");
+    }
+
+    #[test]
+    fn remove_env_value_strips_bom_and_removes_key() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home_lock = crate::constants::TEST_HOME_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _home = crate::constants::HomeOverrideGuard::new(std::env::temp_dir().join(format!(
+            "joey-core-audit-{}-{}",
+            std::process::id(),
+            line!()
+        )));
+        let envfile = crate::constants::env_path();
+        std::fs::create_dir_all(envfile.parent().unwrap()).unwrap();
+        // UTF-8 BOM before the first KEY (written by Windows editors);
+        // save_env_value strips it, remove_env_value previously did not, so
+        // the first line was never recognized and the key silently survived.
+        std::fs::write(&envfile, b"\xef\xbb\xbfJOEY_TEST_RM_TOKEN=supersecret\nOTHER=1\n").unwrap();
+        assert!(remove_env_value("JOEY_TEST_RM_TOKEN").unwrap());
+        let text = std::fs::read_to_string(&envfile).unwrap();
+        assert!(!text.contains("JOEY_TEST_RM_TOKEN"), "key removed: {}", text);
+        assert!(text.contains("OTHER=1"), "other keys survive: {}", text);
+        let _ = std::fs::remove_file(&envfile);
     }
 
     // -----------------------------------------------------------------

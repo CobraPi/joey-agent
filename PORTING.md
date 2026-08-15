@@ -714,3 +714,113 @@ check), `llm_selector.rs`, `joey-omo/src/models.rs` (catalog seeding +
 billing aliases). Verified live: `joey --model gpt-5.4 -z` served
 `gpt-5.4 → gpt-5.4` via `/responses` with usage recorded in the proxy's DB
 (neurocode tier override temporarily disabled for the clean-path check).
+
+## UX parity & robustness passes (2026-08-15)
+
+Four user-facing features plus a workspace-wide audit, all
+regression-tested; workspace 0 warnings, ~1,440 tests green.
+
+1. **TUI input history recall** — plain ↑/↓ in the TUI walks the shared
+   `~/.joey/.joey_history` (same reedline-format file as the CLI;
+   recall semantics ported from readline/reedline incl. draft
+   save/restore). Transcript scrolling moved to Shift+Up / Ctrl+T / PgUp.
+
+2. **Smart completions (port of `hermes_cli/commands.py::
+   SlashCommandCompleter` + `SlashCommandAutoSuggest`)** — shared engine
+   in `joey-tools::completion`: slash names/aliases, pipe-hint
+   subcommands (`SUBCOMMANDS` parity), @-context refs (`@diff/@staged/
+   @file:/@folder:/@git:/@url:` + fuzzy project file search with the
+   upstream scoring tiers), path completions, size labels. CLI: reedline
+   description menu (fixed a pre-existing `only_buffer_difference`
+   misconfig that left the menu empty) + fish-style ghost-text Hinter
+   (slash/subcommand remainder, history fallback). TUI: auto-popup +
+   subcommand stage + @/path completion popup, background-refreshed file
+   cache.
+
+3. **NeuroCode live context panel** — new `AgentEvent::NeuroCodeContext/
+   NeuroCodeActive` emitted from the turn-loop intercept; TUI renders a
+   bottom-right live feed (tier/tokens/nodes/COLD + full context text,
+   Alt+↑/↓ scroll) and a `⚡NEUROCODE` status badge.
+
+4. **TUI engine-actor decoupling** — `joey-cli/src/engine.rs`: the Agent
+   lives on a dedicated engine task; UI ↔ engine over EngineCommand/
+   EngineEvent channels; UI loop is one `select!` (events / input /
+   frames) and never awaits compute. Ctrl-C escalation: 1st press
+   interrupt, 2nd within 2s = force-kill (abandon the task, rebuild the
+   agent from the session DB, respawn). Heavy jobs (`/neurocode index`)
+   run on the engine's blocking pool under the same regime.
+
+5. **ai-usage-hud wire fixes** — Responses-wire input items now carry
+   `type:"message"` (typeless items are silently dropped by the Responses
+   API and the HUD proxy — every prompt previously got the same generic
+   greeting); new `AgentConfig.model_pinned` (`--model`, `/model`,
+   agent picker, delegation) blocks NeuroCode tier rewrites of explicit
+   model choices.
+
+6. **Workspace robustness audit** — 19 real bugs found and fixed across
+   all crates, highlights: inverted checkpoint-retention pruners (deleted
+   the NEWEST snapshots; rewritten via commit-tree chain rebuild),
+   PreToolUse-denied tools executed anyway, loop-nudge phantom
+   tool_call_id (Anthropic 400), engine busy-deadlock, completion-engine
+   pipe deadlock >64KB, concurrent history-file corruption (now
+   lock-guarded + atomic), presigned-S3 signature redaction gap, MCP
+   wire-prefix collisions (deterministic disambiguation registry),
+   unbounded MCP frame reads (32 MiB cap), OMO blind-first fallback-chain
+   resolution, non-atomic boulder.json writes, multibyte cursor-position
+   slice panics in the completer/hinter, hook-stdin timeout escape.
+
+## Mid-turn messaging: /steer, /queue, interrupt-with-message (2026-08-15)
+
+Hermes parity for user input while a turn is running:
+
+- **`Agent::steer`** (joey-agent-core, port of run_agent.py:2853-2886):
+  Arc-shared pending-steer slot (`steer_handle`/`steer_via_handle` so hosts
+  can steer from another task mid-borrow); concatenating; drained at TWO
+  injection points (conversation_loop.py:933-975 pre-API and the post-tool-
+  batch `apply_pending_steer_to_tool_results`), appended to the LAST tool
+  result wrapped in the verbatim upstream `[OUT-OF-BAND USER MESSAGE]`
+  markers; re-stashed when no tool message exists yet; DROPPED when a new
+  user turn starts (interrupted turns never see stale steers).
+- **STEER_CHANNEL_NOTE** (guidance.rs, verbatim) appended to the stable
+  system prompt when tools are loaded — teaches the model to trust only
+  the exact marker.
+- **Engine/TUI semantics** (busy_input_mode=interrupt, the upstream
+  default): plain Enter mid-turn = interrupt + the message runs as the
+  next turn; `/steer` = EngineCommand::Steer → agent steer slot (no
+  interrupt); `/queue` = queue for the next turn (never interrupts).
+  Read-only slash commands (/status, /help, /copy, /model, /version) still
+  answer inline while busy.
+- The line REPL dispatches between turns, so its `/steer` degrades to a
+  queued message with a hint (reedline input is blocking; concurrent input
+  reading is not portable).
+
+Tests: agent-core steer_tests (5: injection helper, restash, concat/empty,
+  new-turn drop, marker format), engine steer-command routing, live TUI
+  E2E (steer no-interrupt, plain-message interrupt+next-turn, queue).
+
+## Expandable tool/terminal/diff blocks in the TUI (2026-08-15)
+
+- Terminal-tool expanded view now shows the FULL result (tail-anchored
+  200-line window + "… N earlier lines hidden" affordance) instead of just
+  the one-line preview; generic tools keep args + full result.
+- FileDiff items gained an `expanded` toggle (collapsed = last 50 lines,
+  expanded = whole diff).
+- Keyboard expansion: Space / x in transcript focus resolves the item at
+  the viewport center via the mouse hit-test machinery (single source of
+  truth for click/key parity), falling back to the first expandable
+  visible item. Mouse clicks keep working via hit-testing.
+
+## Natural-language /neurocode ingest (2026-08-15)
+
+`/neurocode ingest` now accepts two forms: the strict
+`<category> <path> [--version] [--provenance]` (unchanged, direct engine
+call) and free text — anything whose first token isn't a category+path.
+The NL form composes a workflow prompt (`ingest_agent_prompt`: teaches the
+neurocode_ingest tool contract, file-location via read_file/search_files,
+pasted-knowledge → write `.neurocode/sources/<slug>.md` then ingest with
+provenance `user-provided`, honest failure over guessing) and runs it as a
+full agent turn: REPL via run_turn_interactive, TUI via engine Submit
+(strict form keeps the HeavyJob path). `neurocode_slash_outcome` returns
+NeurocodeOutcome::{Text, AgentIngest}; the plain-text wrapper (engine
+heavy jobs, tests) degrades to usage guidance. Tests: 5 routing + 2 tool
+integration (registry registration + backend ingest roundtrip).

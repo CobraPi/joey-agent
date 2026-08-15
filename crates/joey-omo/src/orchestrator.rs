@@ -102,12 +102,18 @@ pub fn route_delegation(
                 )
             })?;
 
-        // Resolve the category's model from the fallback chain.
-        let model = category
-            .model_requirement
-            .fallback_chain
-            .first()
-            .map(|e| e.model.clone());
+        // Resolve the category's model by walking the fallback chain against
+        // actually-available models — same logic as `categories::resolve_category`
+        // (`models::resolve_model`): exact match first, then family-level
+        // fuzzy match, falling through to later chain entries when earlier
+        // models are unavailable. (Previously this took `.first()` blindly,
+        // ignoring availability.) Falls back to `None` when nothing in the
+        // chain resolves.
+        let model = crate::models::resolve_model(
+            &category.model_requirement,
+            registry.available_models(),
+        )
+        .map(|(model, _variant)| model);
 
         // Junior's tool restrictions + category-specific.
         let junior = registry

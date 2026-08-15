@@ -279,7 +279,11 @@ impl Tool for ReadFile {
             display_lines.pop();
         }
         let start = offset - 1;
-        let end_line = offset + limit - 1;
+        // Saturating: a huge offset (e.g. 1e30 coerced to i64::MAX by
+        // arg_i64's float cast) must not overflow the `offset + limit - 1`
+        // arithmetic — in debug builds that panics inside the tool execute
+        // path, and in release it wraps to a nonsense "Use offset=..." hint.
+        let end_line = offset.saturating_add(limit).saturating_sub(1);
         let page: Vec<&str> = if start >= display_lines.len() {
             Vec::new()
         } else {
@@ -2132,6 +2136,26 @@ mod tests {
         let third = parse(&ReadFile.execute(args.clone(), &ctx).await);
         assert!(third["error"].as_str().unwrap().starts_with("BLOCKED:"));
         assert_eq!(third["already_read"], 3);
+    }
+
+    #[tokio::test]
+    async fn read_file_huge_offset_no_panic() {
+        // Regression: offset=1e30 (float→i64 saturating cast = i64::MAX) used
+        // to overflow `offset + limit - 1` — panicking in debug builds and
+        // emitting a garbage pagination hint in release.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big_off.txt"), "a\nb\nc\n").unwrap();
+        let ctx = ctx_in(dir.path());
+        let v = parse(
+            &ReadFile
+                .execute(json!({"path": "big_off.txt", "offset": 1e30 as i64, "limit": 500}), &ctx)
+                .await,
+        );
+        assert_eq!(v["content"], "");
+        assert_eq!(v["total_lines"], 3);
+        assert!(v.get("error").is_none());
+        assert_eq!(v["truncated"], false, "offset past EOF must not report truncated");
+        assert!(v.get("hint").is_none(), "no nonsense hint: {:?}", v.get("hint"));
     }
 
     #[tokio::test]

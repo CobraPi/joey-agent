@@ -78,7 +78,11 @@ subsystem you're working on:
     configure a language server per file type, and the `lsp_diagnostics` /
     `lsp_definition` / `lsp_references` / `lsp_symbols` tools that appear
     only when one is configured.
-18. [`speckit-ui-launcher.md`](speckit-ui-launcher.md) — launch recipe for
+18. [`speckit-workflow.md`](speckit-workflow.md) — the full spec-kit
+    lifecycle as native slash commands (`/speckit-specify` → … →
+    `/speckit-implement`): real `.specify/` scripts for pre-flight,
+    bundled skill workflows as agent turns, `/speckit-status` readiness.
+19. [`speckit-ui-launcher.md`](speckit-ui-launcher.md) — launch recipe for
     the SpecKit visual UI (`joey speckit`).
 
 All pages were verified against workspace source in August 2026. If code

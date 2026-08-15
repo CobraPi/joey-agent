@@ -181,8 +181,10 @@ pub async fn run_oneshot(opts: OneshotOptions) -> Result<i32> {
     let model_explicit = !arg_model.is_empty() || !env_model.is_empty();
     if !arg_model.is_empty() {
         agent_cfg.model = arg_model.clone();
+        agent_cfg.model_pinned = true;
     } else if !env_model.is_empty() {
         agent_cfg.model = env_model.clone();
+        agent_cfg.model_pinned = true;
     }
 
     // Resolve effective provider: explicit arg → auto-detect from an explicit

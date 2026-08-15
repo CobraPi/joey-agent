@@ -59,6 +59,16 @@ fn size_cap_bytes() -> u64 {
         .unwrap_or(MAX_TOTAL_STORE_SIZE_BYTES)
 }
 
+/// Effective per-project snapshot cap. Overridable in tests via
+/// `JOEY_TEST_MAX_SNAPSHOTS_PER_PROJECT` so the cap path can be exercised
+/// without creating 50+ real checkpoints.
+fn max_snapshots_per_project() -> usize {
+    std::env::var("JOEY_TEST_MAX_SNAPSHOTS_PER_PROJECT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_SNAPSHOTS_PER_PROJECT)
+}
+
 /// Max single tracked file size in bytes (FR-007 default: 50MB). Files
 /// exceeding this are unstaged before commit by `unstage_oversized_files`.
 /// Overridable in tests via `JOEY_TEST_MAX_FILE_SIZE_BYTES`.
@@ -560,7 +570,7 @@ impl CheckpointManager {
         any_deleted |= self.prune_per_project_cap()?;
         any_deleted |= self.prune_size_cap()?;
         if any_deleted {
-            let _ = self.run_git_with_timeout(&["gc", "--prune=now"], None);
+            self.reflog_expire_and_gc();
         }
         Ok(())
     }
@@ -616,24 +626,15 @@ impl CheckpointManager {
         Ok(deleted)
     }
 
-    /// Cap each project's checkpoint history at `MAX_SNAPSHOTS_PER_PROJECT`,
-    /// resetting the ref to a synthetic root beyond that many commits so
-    /// older commits become unreachable (and get swept by `git gc`).
+    /// Cap each project's checkpoint history at
+    /// `max_snapshots_per_project()` snapshots, keeping exactly the NEWEST
+    /// that many. See [`Self::truncate_ref_history`] for the mechanics.
     fn prune_per_project_cap(&self) -> Result<bool> {
+        let cap = max_snapshots_per_project();
         let mut deleted = false;
         for hash16 in self.all_project_hashes() {
-            let r = ref_name(&hash16);
-            let log = self
-                .run_git_with_timeout(&["log", &r, "--pretty=format:%H"], None)
-                .unwrap_or_default();
-            let hashes: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
-            if hashes.len() > MAX_SNAPSHOTS_PER_PROJECT {
-                // hashes[0] is newest; keep the newest N, reset ref to the
-                // Nth-newest commit as the new (unparented) tip lineage.
-                if let Some(new_tip) = hashes.get(MAX_SNAPSHOTS_PER_PROJECT - 1) {
-                    let _ = self.run_git_with_timeout(&["update-ref", &r, new_tip], None);
-                    deleted = true;
-                }
+            if self.truncate_ref_history(&ref_name(&hash16), cap) {
+                deleted = true;
             }
         }
         Ok(deleted)
@@ -644,40 +645,161 @@ impl CheckpointManager {
     fn prune_size_cap(&self) -> Result<bool> {
         let objects_dir = self.store.join("objects");
         let cap = size_cap_bytes();
-        let size = dir_size(&objects_dir);
-        if size <= cap {
+        if dir_size(&objects_dir) <= cap {
             return Ok(false);
         }
-        // Oldest-first across projects: repeatedly trim the project whose
-        // oldest reachable commit is oldest, one commit at a time, until
-        // under cap or nothing left to trim. Bounded iteration count to
-        // avoid pathological loops.
+        // Oldest-first across projects: repeatedly drop the single oldest
+        // checkpoint of whichever project owns the globally-oldest reachable
+        // commit, then gc + re-measure. (The `objects/` directory only
+        // shrinks after gc, so gc must run inside the loop for progress to
+        // be observable.) A project's last checkpoint is never dropped by
+        // the size cap. Bounded iteration count to avoid pathological loops.
         let mut deleted = false;
-        for _ in 0..10_000 {
+        for _ in 0..500 {
             if dir_size(&objects_dir) <= cap {
                 break;
             }
-            let mut trimmed_any = false;
+            // (hash16, oldest reachable commit timestamp, commit count)
+            let mut victim: Option<(String, i64, usize)> = None;
             for hash16 in self.all_project_hashes() {
                 let r = ref_name(&hash16);
                 let log = self
-                    .run_git_with_timeout(&["log", &r, "--pretty=format:%H"], None)
+                    .run_prune_git(&["log", &r, "--pretty=format:%ct"], &[])
                     .unwrap_or_default();
-                let hashes: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
-                if hashes.len() > 1 {
-                    // Drop the oldest commit by resetting ref to the
-                    // second-oldest (i.e. hashes[len-2]).
-                    let new_tip = hashes[hashes.len() - 2];
-                    let _ = self.run_git_with_timeout(&["update-ref", &r, new_tip], None);
-                    trimmed_any = true;
-                    deleted = true;
+                let timestamps: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
+                if timestamps.len() < 2 {
+                    continue; // nothing (extra) to drop for this project
+                }
+                let oldest: i64 = timestamps
+                    .last()
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(i64::MAX);
+                if victim.as_ref().map(|(_, v, _)| oldest < *v).unwrap_or(true) {
+                    victim = Some((hash16.clone(), oldest, timestamps.len()));
                 }
             }
-            if !trimmed_any {
-                break;
+            let Some((hash16, _oldest, count)) = victim else {
+                break; // nothing left to trim anywhere
+            };
+            if !self.truncate_ref_history(&ref_name(&hash16), count - 1) {
+                break; // trim failed; re-measuring would loop forever
             }
+            deleted = true;
+            // Realize the freed space before the next dir_size() check.
+            self.reflog_expire_and_gc();
         }
         Ok(deleted)
+    }
+
+    /// Rebuild `r`'s history so that only the newest `keep` commits remain
+    /// reachable. The oldest kept (boundary) commit is re-created via
+    /// `git commit-tree` as a parentless root — with its original tree,
+    /// message, and author/committer identity/timestamps — and every newer
+    /// commit is re-created on top, so content, checkpoint numbers, and
+    /// dates are preserved while the pre-boundary chain becomes
+    /// unreachable and is swept by the subsequent `reflog expire` +
+    /// `gc --prune=now` (see [`Self::reflog_expire_and_gc`]).
+    ///
+    /// A plain `update-ref` cannot do this: pointing the ref anywhere in
+    /// the chain still leaves all older commits reachable through parent
+    /// links (that was the retention inversion bug this replaces — the old
+    /// code reset the ref to the Nth-newest commit and gc kept the OLDEST
+    /// N reachable). `git replace --graft` does not help either: the
+    /// replace ref itself keeps the replaced history reachable to `gc`.
+    fn truncate_ref_history(&self, r: &str, keep: usize) -> bool {
+        if keep == 0 {
+            return false;
+        }
+        let log = self
+            .run_prune_git(
+                &[
+                    "log",
+                    r,
+                    // hash, tree, author ident+date, committer ident+date,
+                    // full raw message (%B); records NUL-separated, fields
+                    // unit-separated. splitn(9) keeps any stray unit bytes
+                    // inside the message (the final field) intact.
+                    "--pretty=format:%H%x01%T%x01%an%x01%ae%x01%aI%x01%cn%x01%ce%x01%cI%x01%B%x00",
+                ],
+                &[],
+            )
+            .unwrap_or_default();
+        let records: Vec<&str> = log
+            .split('\0')
+            .map(|rec| rec.trim_start_matches(['\n', '\r']))
+            .filter(|rec| !rec.is_empty())
+            .collect();
+        if records.len() <= keep {
+            return false; // already within the cap
+        }
+        // records[0] is the newest commit; rebuild oldest-kept-first so
+        // each re-created commit can point at the previous one.
+        let mut parent: Option<String> = None;
+        for rec in records[..keep].iter().rev() {
+            let fields: Vec<&str> = rec.splitn(9, '\u{1}').collect();
+            if fields.len() < 9 || fields[0].is_empty() || fields[1].is_empty() {
+                // Malformed record (exotic identity/message) — leave this
+                // project's history untouched rather than risk a bad rewrite.
+                return false;
+            }
+            let mut args: Vec<&str> = vec!["commit-tree", fields[1]]; // tree
+            if let Some(p) = &parent {
+                args.extend_from_slice(&["-p", p.as_str()]);
+            }
+            let message = fields[8].trim_end();
+            args.extend_from_slice(&["-m", message]);
+            let envs: &[(&str, &str)] = &[
+                ("GIT_AUTHOR_NAME", fields[2]),
+                ("GIT_AUTHOR_EMAIL", fields[3]),
+                ("GIT_AUTHOR_DATE", fields[4]),
+                ("GIT_COMMITTER_NAME", fields[5]),
+                ("GIT_COMMITTER_EMAIL", fields[6]),
+                ("GIT_COMMITTER_DATE", fields[7]),
+            ];
+            let Some(new_hash) = self.run_prune_git(&args, envs) else {
+                return false;
+            };
+            parent = Some(new_hash.trim().to_string());
+        }
+        let Some(new_tip) = parent else {
+            return false;
+        };
+        self.run_prune_git(&["update-ref", r, &new_tip], &[]).is_some()
+    }
+
+    /// Run a git command against the shared store only (no work tree, no
+    /// per-project index) with extra env vars — used by retention pruning.
+    /// Never errors to the caller: `None` means the command failed or
+    /// timed out, and pruning degrades gracefully.
+    fn run_prune_git(&self, args: &[&str], envs: &[(&str, &str)]) -> Option<String> {
+        let mut cmd = Command::new("git");
+        cmd.env("GIT_DIR", &self.store);
+        cmd.env_remove("GIT_WORK_TREE");
+        cmd.env_remove("GIT_INDEX_FILE");
+        apply_isolation_env(&mut cmd);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.args(args);
+        cmd.current_dir(&self.store);
+        run_with_timeout(cmd, GIT_TIMEOUT, &[0]).ok()
+    }
+
+    /// Make previously-unreachable objects actually leave the store:
+    /// expire all reflogs (reflog entries keep pruned chains reachable)
+    /// and then garbage-collect immediately.
+    fn reflog_expire_and_gc(&self) {
+        let _ = self.run_prune_git(
+            &[
+                "reflog",
+                "expire",
+                "--expire=now",
+                "--expire-unreachable=now",
+                "--all",
+            ],
+            &[],
+        );
+        let _ = self.run_prune_git(&["gc", "--prune=now", "--quiet"], &[]);
     }
 
     // -----------------------------------------------------------------
@@ -1206,15 +1328,30 @@ mod tests {
             after.len() < before,
             "size-cap pruning should drop at least the oldest checkpoint(s)"
         );
-        // Oldest-first: the lowest-numbered remaining checkpoint should not
-        // be #0 (the very first) if anything was trimmed at all.
-        let remaining_numbers: Vec<usize> = after.iter().map(|c| c.number).collect();
-        let min_remaining = remaining_numbers.iter().min().copied().unwrap_or(0);
+        let mut remaining_numbers: Vec<usize> =
+            after.iter().map(|c| c.number).collect();
+        remaining_numbers.sort_unstable();
         assert!(
-            min_remaining >= 1,
+            remaining_numbers.first().copied().unwrap_or(0) >= 1,
             "oldest checkpoints should be dropped first, remaining: {:?}",
             remaining_numbers
         );
+        // Retention must keep the NEWEST `after.len()` checkpoints: the
+        // surviving numbers are contiguous and end at the newest number
+        // (regression test for the retention inversion bug).
+        assert_eq!(
+            remaining_numbers.last().copied(),
+            Some(before),
+            "the newest checkpoint must survive size-cap pruning, remaining: {:?}",
+            remaining_numbers
+        );
+        assert!(
+            remaining_numbers.windows(2).all(|w| w[1] == w[0] + 1),
+            "surviving checkpoints must be the contiguous newest tail, got: {:?}",
+            remaining_numbers
+        );
+        // The pruned (oldest) commits must actually be gone from the store.
+        assert_pruned_commits_gone(&mgr, &after);
     }
 
     #[test]
@@ -1226,19 +1363,85 @@ mod tests {
         let (_home, dir, _guard) = test_setup();
         let work_tree = dir.path();
 
+        // Force a small test-only cap (default is 50) — 6 checkpoints,
+        // cap 3: exactly checkpoints #4, #5, #6 must survive.
+        std::env::set_var("JOEY_TEST_MAX_SNAPSHOTS_PER_PROJECT", "3");
+
         let mut mgr = CheckpointManager::new("cap-test", work_tree);
-        for i in 0..(MAX_SNAPSHOTS_PER_PROJECT + 3) {
+        let mut oldest_hash = String::new();
+        for i in 0..6 {
             std::fs::write(work_tree.join("f.txt"), format!("v{i}")).unwrap();
             mgr.checkpoint(&format!("cp {i}")).unwrap();
+            if i == 0 {
+                oldest_hash = mgr
+                    .list_internal()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c.commit_hash.clone())
+                    .max()
+                    .unwrap_or_default();
+            }
         }
+        assert!(!oldest_hash.is_empty(), "must capture the first commit");
 
         mgr.run_prune_pass().unwrap();
         let remaining = mgr.list_internal().unwrap();
+
+        std::env::remove_var("JOEY_TEST_MAX_SNAPSHOTS_PER_PROJECT");
+
+        assert_eq!(
+            remaining.len(),
+            3,
+            "expected exactly 3 checkpoints after capping, found {}: {:?}",
+            remaining.len(),
+            remaining.iter().map(|c| c.number).collect::<Vec<_>>()
+        );
+        // Newest-3 retention (regression test for the retention inversion
+        // bug where the OLDEST N survived instead).
+        let numbers: Vec<usize> = remaining.iter().map(|c| c.number).collect();
+        assert_eq!(numbers, vec![6, 5, 4], "newest-first order expected");
+        // Messages/dates survive the rebuild.
+        assert_eq!(remaining[0].message, "cp 5");
+        // The original first commit must be gone from the object store.
+        assert_pruned_commits_gone(&mgr, &remaining);
+
+        // Checkpointing must continue cleanly on the rebuilt chain.
+        std::fs::write(work_tree.join("f.txt"), "v-after").unwrap();
+        let cp7 = mgr.checkpoint("after prune");
+        assert_eq!(cp7, Some(7), "checkpoint numbering continues after prune");
+        let list = mgr.list_internal().unwrap();
+        assert_eq!(list.len(), 4);
+        assert_eq!(list[0].number, 7);
+    }
+
+    /// Regression-test helper: every commit hash from the pre-prune history
+    /// that is NOT in `remaining` must be absent from the object store
+    /// (`git cat-file -e` fails) — i.e. pruning really deleted them.
+    fn assert_pruned_commits_gone(mgr: &CheckpointManager, remaining: &[Checkpoint]) {
+        let kept: Vec<&str> = remaining.iter().map(|c| c.commit_hash.as_str()).collect();
+        let log = mgr
+            .run_prune_git(
+                &["log", "--all", "--pretty=format:%H"],
+                &[],
+            )
+            .unwrap_or_default();
+        for hash in log.lines().filter(|l| !l.is_empty()) {
+            assert!(
+                kept.contains(&hash),
+                "commit {} survived pruning but is not in the retained set {:?}",
+                hash,
+                kept
+            );
+        }
+        // Belt-and-suspenders: any dangling (unreachable) leftover objects
+        // would also be a bug — gc --prune=now must have swept them.
+        let fsck = mgr
+            .run_prune_git(&["fsck", "--no-progress", "--unreachable"], &[])
+            .unwrap_or_default();
         assert!(
-            remaining.len() <= MAX_SNAPSHOTS_PER_PROJECT,
-            "expected at most {} checkpoints, found {}",
-            MAX_SNAPSHOTS_PER_PROJECT,
-            remaining.len()
+            fsck.trim().is_empty(),
+            "no unreachable objects should remain after gc, fsck said: {}",
+            fsck
         );
     }
 

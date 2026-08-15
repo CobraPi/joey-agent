@@ -272,15 +272,30 @@ impl CompletionEngine {
             else {
                 continue;
             };
+            // Drain stdout on a dedicated thread BEFORE polling for exit.
+            // Without this, a listing larger than the OS pipe buffer (~64KB
+            // on macOS — e.g. `rg --files` on a large repo) blocks the child
+            // on a full pipe, it never exits, and the poll loop below spins
+            // until the kill deadline: the completion engine then silently
+            // returns nothing for every large project.
+            let stdout_pipe = match child.stdout.take() {
+                Some(s) => s,
+                None => continue,
+            };
+            let reader_handle = std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = String::new();
+                let _ = std::io::BufReader::new(stdout_pipe).read_to_string(&mut buf);
+                buf
+            });
             let deadline = Instant::now() + LIST_TIMEOUT;
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        if !status.success() {
+                        let text = reader_handle.join().unwrap_or_default();
+                        if !status.success() || text.is_empty() {
                             break;
                         }
-                        let Ok(out) = child.wait_with_output() else { break };
-                        let text = String::from_utf8_lossy(&out.stdout);
                         let files: Vec<String> = text
                             .lines()
                             .filter(|l| !l.is_empty())
@@ -296,11 +311,17 @@ impl CompletionEngine {
                         if Instant::now() >= deadline {
                             let _ = child.kill();
                             let _ = child.wait();
+                            // Killing the child closes the pipe; the reader
+                            // thread then sees EOF and terminates.
+                            let _ = reader_handle.join();
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        let _ = reader_handle.join();
+                        break;
+                    }
                 }
             }
         }
@@ -643,6 +664,36 @@ mod tests {
         let items = path_completions(&word, 30);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].display, "alpha.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_files_blocking_survives_pipe_buffer_overflow() {
+        // Regression: a listing larger than the OS pipe buffer (~64KB) used
+        // to deadlock rg on a full pipe — the poll loop never saw exit and
+        // the engine returned nothing for large repos. Generate ~250KB of
+        // path output and require the listing to come back populated well
+        // inside the timeout budget.
+        let dir = std::env::temp_dir().join("joey_completion_test_pipe_overflow");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let filler = "x".repeat(40);
+        for i in 0..4000 {
+            std::fs::write(dir.join(format!("f{i:06}_{filler}.txt")), "x").unwrap();
+        }
+        let engine = CompletionEngine::new();
+        let start = std::time::Instant::now();
+        let files = engine.project_files_blocking(&dir);
+        let elapsed = start.elapsed();
+        assert!(
+            files.iter().any(|f| f.contains("f000000_")),
+            "listing must be populated (pipe-buffer deadlock regression), got {} files",
+            files.len()
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "listing must not sit through the kill timeout, took {elapsed:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

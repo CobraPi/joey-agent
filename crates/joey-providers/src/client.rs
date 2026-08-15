@@ -471,10 +471,21 @@ impl ProviderClient {
                     })
                     .collect();
                 if !content.is_empty() {
-                    input.push(json!({"role": message.role, "content": content}));
+                    // Spec shape: every input item needs "type":"message" —
+                    // the Responses API (and the HUD proxy's translator)
+                    // drops typeless items, silently losing the prompt.
+                    input.push(json!({
+                        "type": "message",
+                        "role": message.role,
+                        "content": content,
+                    }));
                 }
             } else if !message.text_content().trim().is_empty() {
-                input.push(json!({"role": message.role, "content": message.text_content()}));
+                input.push(json!({
+                    "type": "message",
+                    "role": message.role,
+                    "content": message.text_content(),
+                }));
             }
             if message.role == "assistant" {
                 for call in &message.tool_calls {
@@ -1730,5 +1741,101 @@ mod tests {
         // Slot 0 was overwritten by "g" (both share raw_idx=0); slot 999 has "h".
         assert!(calls.iter().any(|c| c.function.name == "h"));
         assert!(calls.iter().all(|c| !c.function.name.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod responses_body_tests {
+    use super::*;
+    use crate::request::ProviderRequest;
+    use crate::types::{ContentPart, ImageUrl, Message};
+
+    fn client() -> ProviderClient {
+        let profile = crate::profile::get_profile("copilot").unwrap();
+        let mut profile = profile.clone();
+        profile.api_mode = ApiMode::CodexResponses;
+        ProviderClient::new(profile, None, Some("gho_test_1234567890".into())).unwrap()
+    }
+
+    #[test]
+    fn responses_input_items_have_message_type() {
+        // Regression: input items without "type":"message" are silently
+        // dropped by the Responses API (and the AI Usage HUD proxy's
+        // translator), losing the whole conversation — every prompt got the
+        // same generic greeting.
+        let c = client();
+        let req = ProviderRequest::new(
+            "gpt-5.4",
+            vec![Message::user("Reply with exactly: APPLE")],
+        );
+        let body = c.build_responses_body(&req);
+        let input = body["input"].as_array().unwrap();
+        assert!(!input.is_empty(), "user message must be present");
+        for item in input {
+            assert_eq!(
+                item["type"], "message",
+                "every message input item needs type=message (got {item})"
+            );
+            assert!(item["role"].is_string(), "role preserved");
+        }
+    }
+
+    #[test]
+    fn responses_system_goes_to_instructions_not_input() {
+        let c = client();
+        let req = ProviderRequest::new("gpt-5.4", vec![Message::user("hi")])
+            .with_system(Some("You are joey.".to_string()));
+        let body = c.build_responses_body(&req);
+        assert_eq!(body["instructions"], "You are joey.");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1, "only the user message in input");
+        assert_eq!(input[0]["role"], "user");
+    }
+
+    #[test]
+    fn responses_tool_roundtrip_shapes() {
+        let c = client();
+        let mut assistant = Message::assistant("calling");
+        assistant.tool_calls = vec![crate::types::ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: crate::types::FunctionCall {
+                name: "read_file".into(),
+                arguments: "{\"path\":\"/x\"}".into(),
+            },
+        }];
+        let mut tool_msg = crate::types::Message::tool_result("call_1", "read_file", "contents");
+        tool_msg.tool_call_id = Some("call_1".into());
+        let req = ProviderRequest::new(
+            "gpt-5.4",
+            vec![Message::user("read it"), assistant, tool_msg],
+        );
+        let body = c.build_responses_body(&req);
+        let input = body["input"].as_array().unwrap();
+        let types: Vec<&str> = input.iter().map(|i| i["type"].as_str().unwrap_or("")).collect();
+        assert!(types.contains(&"message"));
+        assert!(types.contains(&"function_call"));
+        assert!(types.contains(&"function_call_output"));
+        // tools flatten to the Responses shape
+        let _ = req.tools; // (none here; shape covered by translateTools on the proxy)
+    }
+
+    #[test]
+    fn responses_multimodal_parts() {
+        let c = client();
+        let mut msg = Message::user("look");
+        msg.content_parts = Some(vec![
+            ContentPart::Text { text: "look".into() },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl { url: "https://x/y.png".into() },
+            },
+        ]);
+        let req = ProviderRequest::new("gpt-5.4", vec![msg]);
+        let body = c.build_responses_body(&req);
+        let item = &body["input"][0];
+        assert_eq!(item["type"], "message");
+        let content = item["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[1]["type"], "input_image");
     }
 }

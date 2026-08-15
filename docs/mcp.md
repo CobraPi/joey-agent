@@ -8,10 +8,19 @@ pages), and calls them.
 
 ## Tool naming
 
-Discovered tools are exposed to the agent as `mcp__<server>__<tool>` (prefix
-identical to Claude Code/Codex/OpenCode; components sanitized to
-`[A-Za-z0-9_]`). Provenance is tracked in a registration-time map, never
-parsed back out of the name.
+Discovered tools are exposed to the agent as `mcp__<server>__<tool>`.
+Provenance is tracked in a per-client map, never parsed back out of the
+name. **Collision safety**: server names that sanitize identically
+(`my-server` vs `my_server` vs `my.server`) are deterministically
+disambiguated at connect time via a process-global wire-prefix registry —
+the first claimant keeps the plain prefix, later ones get `_2`, `_3`
+suffixes — with a retrievable warning (`McpClient::take_warnings`) so the
+CLI can surface the rename. Without this, colliding servers silently
+rerouted each other's tool calls.
+
+**Frame safety**: server-framed JSON-RPC lines are read with a 32 MiB cap
+(`read_line_bounded`) — a hostile or buggy server streaming an unbounded
+line fails the call cleanly instead of growing memory without limit.
 
 ## Configuration
 

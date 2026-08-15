@@ -87,8 +87,15 @@ enforcement, and wisdom accumulation.
 - `notepads/` — five append-only markdown wisdom files per plan: learnings,
   decisions, issues, verification, problems
 - `boulder.json` — BoulderState tracking active plan-execution work
-  (active/completed/abandoned)
+  (active/completed/abandoned); written ATOMICALLY (unique sibling temp
+  file + fsync + rename) so concurrent Atlas sessions can never interleave
+  or truncate it
 - `plan_parser.rs` — parses plan artifacts into ParsedTasks for execution
+
+Category routing (`route_delegation`) resolves the category's model by
+walking the fallback chain against actually-available models (exact then
+family-fuzzy match, same as `categories::resolve_category`) — not blindly
+taking the first chain entry, so unavailable models fall through.
 
 ### Team mode (`team.rs`, OFF by default)
 

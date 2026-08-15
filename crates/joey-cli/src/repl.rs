@@ -103,6 +103,9 @@ pub(crate) fn build_agent_config(config: &Config, ov: &Overrides) -> AgentConfig
     let mut cfg = AgentConfig::from_config(config);
     if let Some(m) = &ov.model {
         cfg.model = m.clone();
+        // An explicit --model pins the choice: dynamic model routing
+        // (NeuroCode tier Mode 2) must not rewrite it.
+        cfg.model_pinned = true;
         if ov.provider.is_none() {
             // An explicit model auto-detects its provider (oneshot.py:350-383).
             cfg.provider = "auto".to_string();
@@ -259,6 +262,16 @@ pub(crate) fn restore_history(db: &SessionDb, session_id: &str) -> Vec<Message> 
             _ => None,
         })
         .collect()
+}
+
+/// Open the default session DB and restore the given session's user/assistant
+/// history. Best-effort (empty on any failure) — used by the TUI engine to
+/// rebuild an agent after a force-kill.
+pub(crate) fn restore_history_from_db(session_id: &str) -> Vec<Message> {
+    match SessionDb::open_default() {
+        Ok(db) => restore_history(&db, session_id),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Find a session by exact title (case-insensitive), newest first.
@@ -915,16 +928,29 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
             }
         }
         "neurocode" => {
-            // Heavy subcommands (index/ingest) walk the whole tree — run the
-            // blocking handler off the async runtime (UI-freeze parity fix
-            // with the TUI; here it just keeps the runtime responsive).
+            // Natural-language ingest hands off to a full agent turn (the
+            // agent resolves category/path and calls neurocode_ingest);
+            // everything else is the plain blocking handler.
             let owned = args.to_string();
-            let out = tokio::task::spawn_blocking(move || {
-                crate::commands::neurocode::neurocode_slash(&owned)
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::commands::neurocode::neurocode_slash_outcome(&owned)
             })
             .await
-            .unwrap_or_else(|e| format!("/neurocode task failed: {e}"));
-            println!("{}", out);
+            .unwrap_or_else(|e| {
+                crate::commands::neurocode::NeurocodeOutcome::Text(format!(
+                    "/neurocode task failed: {e}"
+                ))
+            });
+            match outcome {
+                crate::commands::neurocode::NeurocodeOutcome::Text(out) => println!("{}", out),
+                crate::commands::neurocode::NeurocodeOutcome::AgentIngest(prompt) => {
+                    render::info(
+                        "natural-language ingest — the agent will locate the source and \
+                         call neurocode_ingest…",
+                    );
+                    let _ = run_turn_interactive(st, &prompt).await;
+                }
+            }
         }
         "reasoning" => reasoning_slash(st, args),
         "tools" => {
@@ -1000,12 +1026,87 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         "agents" | "agent" => omo_agents_slash(st, args),
         "goal" => omo_goal_slash(st, args),
         "start-work" => omo_start_work_slash(st, args).await,
+        "steer" => {
+            if args.trim().is_empty() {
+                render::info("Usage: /steer <message> — inject mid-turn after the next tool call");
+            } else {
+                // The line REPL dispatches slash commands between turns, so
+                // nothing is running here: a steer degrades to a queued
+                // message (the TUI's engine path does true mid-turn steering).
+                st.queued.push(args.to_string());
+                render::success("No turn running — queued for the next turn. (Mid-turn /steer works in the TUI.)");
+            }
+        }
+        // ── Spec-Kit workflow (speckit_slash.rs) ──
+        "speckit-constitution" | "speckit-specify" | "speckit-clarify" | "speckit-plan"
+        | "speckit-checklist" | "speckit-tasks" | "speckit-analyze" | "speckit-implement"
+        | "speckit-converge" | "speckit-taskstoissues" => {
+            speckit_step_slash(st, name, args).await;
+        }
+        "speckit-status" => speckit_status_slash(),
+        "speckit-help" => println!("{}", crate::speckit_slash::render_help()),
         other => {
             // Registry says implemented but no handler — treat as unported.
             println!("Command '/{}' is not available in joey-agent yet.", other);
         }
     }
     SlashOutcome::Continue
+}
+
+// ---------------------------------------------------------------------------
+// Spec-Kit workflow slash handlers
+// ---------------------------------------------------------------------------
+
+/// Shared lifecycle-step handler: resolve the repo, prepare the step
+/// (pre-flight script + skill workflow), then run it as one agent turn
+/// through the standard interactive turn path (streaming, tools,
+/// interrupts, auto-checkpoint).
+async fn speckit_step_slash(st: &mut ReplState, name: &str, args: &str) {
+    use crate::speckit_slash;
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let Some(root) = speckit_slash::find_repo_root(&cwd) else {
+        render::error(
+            "not a spec-kit repository — no .specify/ directory found here or in any parent. \
+             Initialize spec-kit first (github/spec-kit), then retry.",
+        );
+        return;
+    };
+    let Some(step) = speckit_slash::step_by_name(name) else {
+        render::error(&format!("unknown spec-kit step: {name}"));
+        return;
+    };
+
+    println!();
+    render::info(&format!("/{} — running pre-flight…", step.name));
+    let prep = match speckit_slash::prepare_step(step, &root, args, Some(step.skill)) {
+        Ok(p) => p,
+        Err(e) => {
+            render::error(&e);
+            return;
+        }
+    };
+    render::info(&format!(
+        "starting the {} workflow (the agent will author the artifacts)…",
+        step.skill
+    ));
+    println!();
+
+    let _final = run_turn_interactive(st, &prep.prompt).await;
+}
+
+/// `/speckit-status` — artifact readiness, no agent turn.
+fn speckit_status_slash() {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    match crate::speckit_slash::status(&cwd) {
+        Ok(s) => {
+            println!();
+            println!("{}", Color::Cyan.bold().paint("Spec-Kit Status"));
+            println!();
+            println!("{}", crate::speckit_slash::render_status(&s));
+        }
+        Err(e) => render::error(&e),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -29,6 +29,18 @@ impl SmartCompleter {
     }
 }
 
+
+/// Floor `pos` to the nearest UTF-8 char boundary in `line` (callers get
+/// `pos` from reedline, which can report mid-codepoint offsets when the
+/// cursor sits inside a multibyte cluster).
+fn floor_to_char_boundary(line: &str, pos: usize) -> usize {
+    let mut i = pos.min(line.len());
+    while i > 0 && !line.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Build a [`Suggestion`] for one registry command (span filled by caller).
 fn suggest(def: &slash::CommandDef, span: Span, value: String, extra: String) -> Suggestion {
     Suggestion {
@@ -51,7 +63,7 @@ fn subcommands_for(name: &str) -> Vec<String> {
 
 impl Completer for SmartCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
-        let head = &line[..pos.min(line.len())];
+        let head = &line[..floor_to_char_boundary(line, pos)];
 
         // ── Slash-command stages ──
         if head.starts_with('/') {
@@ -164,7 +176,7 @@ impl Hinter for SmartHinter {
             return hint;
         }
         // History fallback: newest matching entry's remainder (fish-style).
-        let head = &line[..pos.min(line.len())];
+        let head = &line[..floor_to_char_boundary(line, pos)];
         if head.is_empty() {
             return String::new();
         }
@@ -195,7 +207,7 @@ impl SmartHinter {
     /// Ghost hint for slash input: `/upd` → `ate` (rest of a unique command
     /// name), `/reasoning of` → `f` (rest of a unique subcommand).
     fn slash_hint(&self, line: &str, pos: usize) -> Option<String> {
-        let head = &line[..pos.min(line.len())];
+        let head = &line[..floor_to_char_boundary(line, pos)];
         if !head.starts_with('/') {
             return None;
         }
@@ -328,5 +340,33 @@ mod tests {
     fn hinter_no_hint_for_plain_text_directly() {
         let h = SmartHinter;
         assert_eq!(h.slash_hint("hello", 5), None);
+    }
+}
+
+#[cfg(test)]
+mod multibyte_tests {
+    use super::*;
+
+    /// Regression: `&line[..pos]` panicked when `pos` fell inside a multibyte
+    /// char (e.g. cursor reported mid-codepoint). Completion must degrade to
+    /// "no completions", never panic.
+    #[test]
+    fn complete_no_panic_on_non_boundary_pos() {
+        let mut c = SmartCompleter::new(PathBuf::from("."));
+        // "é" occupies bytes 1..3; pos=2 splits it.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.complete("é", 2);
+        }))
+        .expect("complete() must not panic on mid-char pos");
+        // Hinter path too ("/é", pos=2 splits the é).
+        let mut history = reedline::FileBackedHistory::with_file(
+            10,
+            std::env::temp_dir().join(format!("joey_mb_hist_{}", std::process::id())),
+        )
+        .unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SmartHinter.handle("/é", 2, &mut history, false, ".");
+        }))
+        .expect("handle() must not panic on mid-char pos");
     }
 }

@@ -51,6 +51,23 @@ fn capped_content_width(content_w: usize) -> usize {
 /// Feature 007: shared helper — take the first `max` lines of a string and
 /// return the lines + an optional hidden-count affordance message.
 /// Used by terminal-command blocks (T019) and tool-call bodies (T023).
+/// Tail-anchored bounded view: show the LAST `max` lines with a
+/// "… N earlier lines hidden" affordance (matches the reasoning expand
+/// tail-window semantics — for long command output the END is what
+/// matters).
+fn bounded_tail_lines_with_affordance(text: &str, max: usize) -> (Vec<String>, Option<String>) {
+    let all: Vec<&str> = text.lines().collect();
+    if all.len() <= max {
+        (all.iter().map(|s| s.to_string()).collect(), None)
+    } else {
+        let tail = &all[all.len() - max..];
+        (
+            tail.iter().map(|s| s.to_string()).collect(),
+            Some(format!("… {} earlier lines hidden", all.len() - max)),
+        )
+    }
+}
+
 fn bounded_lines_with_affordance(text: &str, max: usize) -> (Vec<String>, Option<String>) {
     let all: Vec<&str> = text.lines().collect();
     if all.len() <= max {
@@ -409,11 +426,26 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     Style::default().fg(theme.fg_most_subtle.to_color()),
                 ));
                 lines.push(Line::from(spans));
-                // Body: collapsed (first MAX_TOOL_OUTPUT_LINES) or expanded.
+                // Body: collapsed (first MAX_TOOL_OUTPUT_LINES) or expanded
+                // (the FULL result, bounded by the tail-window cap with an
+                // affordance — feature parity with the generic tool view).
                 let output = result_preview.as_str();
                 if !output.is_empty() && !matches!(status, ToolStatus::Running) {
                     if *expanded {
-                        for ol in output.lines() {
+                        // Full result when available; the preview otherwise.
+                        let full = full_result
+                            .as_deref()
+                            .filter(|f| !f.is_empty())
+                            .unwrap_or(output);
+                        let (shown, affordance) =
+                            bounded_tail_lines_with_affordance(full, MAX_TAIL_WINDOW_LINES_TUI);
+                        if let Some(msg) = affordance {
+                            lines.push(Line::from(vec![Span::styled(
+                                format!("    {}", msg),
+                                Style::default().fg(theme.fg_most_subtle.to_color()),
+                            )]));
+                        }
+                        for ol in &shown {
                             for w in wrap(ol, content_w.saturating_sub(4)) {
                                 lines.push(Line::from(vec![Span::styled(
                                     format!("    {}", w),
@@ -566,7 +598,7 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             // (The terminal-tool early-return at line ~426-427 already has one.)
             lines.push(Line::from(vec![Span::raw("")]));
         }
-        TranscriptItem::FileDiff { path, stat, lines: diff_lines, is_binary } => {
+        TranscriptItem::FileDiff { path, stat, lines: diff_lines, is_binary, expanded } => {
             // Feature 005 (T019): render the inline diff block.
             // Header: "  ◆ path  +N -M"
             lines.push(Line::from(vec![
@@ -583,8 +615,9 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     Style::default().fg(theme.fg_most_subtle.to_color()),
                 )));
             } else {
-                // E2 resolution: height-bound the diff block.
-                let max_height = MAX_DIFF_LINES;
+                // E2 resolution: height-bound the diff block; the bound
+                // lifts when expanded (click or Space/x).
+                let max_height = if *expanded { usize::MAX } else { MAX_DIFF_LINES };
                 let start = if diff_lines.len() > max_height {
                     diff_lines.len() - max_height
                 } else {
@@ -592,7 +625,7 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                 };
                 if start > 0 {
                     lines.push(Line::from(Span::styled(
-                        format!("    … ({} earlier lines hidden)", start),
+                        format!("    … ({} earlier lines hidden) [click or space to expand]", start),
                         Style::default().fg(theme.fg_most_subtle.to_color()),
                     )));
                 }
@@ -862,6 +895,64 @@ pub fn transcript_hit_test(app: &App, theme: Theme, row: u16, col: u16) -> Optio
     // If we reach here, the click was on the streaming tail — no expandable
     // item to toggle.
     None
+}
+
+/// Resolve the transcript item that owns the FIRST fully-visible content
+/// line of the viewport (the item at the top of the screen). Used by the
+/// keyboard expand toggle (Space/Enter/x in transcript focus) so expansion
+/// works without a mouse: scroll so the item you want is at the top, then
+/// toggle. Returns None when the viewport is empty or unrenderable.
+pub fn transcript_item_at_top(app: &App, theme: Theme) -> Option<usize> {
+    let (_tx, _ty, tw, th) = app.last_text_area.get();
+    if th == 0 || tw == 0 {
+        return None;
+    }
+    let content_w = tw as usize;
+    let visible = th as usize;
+    let offset = app.scroll.unwrap_or(0);
+
+    // Same line accounting as transcript_hit_test: items newest-last.
+    let mut blocks_rev: Vec<(usize, usize)> = Vec::new();
+    let mut built = 0usize;
+    let has_streaming = !app.streaming_assistant.is_empty();
+    if has_streaming {
+        let tail_lines = 1 + wrap(&app.streaming_assistant, content_w.saturating_sub(2)).len();
+        built += tail_lines;
+    }
+    let needed = visible + offset + 1;
+    for (i, item) in app.transcript.iter().enumerate().rev() {
+        if built >= needed {
+            break;
+        }
+        let ls = item_lines(item, content_w, theme);
+        let count = ls.len();
+        built += count;
+        blocks_rev.push((i, count));
+    }
+    let items_fwd: Vec<(usize, usize)> = blocks_rev.into_iter().rev().collect();
+    let streaming_line_count = if has_streaming {
+        1 + wrap(&app.streaming_assistant, content_w.saturating_sub(2)).len()
+    } else {
+        0
+    };
+    let total = items_fwd.iter().map(|(_, c)| *c).sum::<usize>() + streaming_line_count;
+    if total == 0 {
+        return None;
+    }
+    let clamped = offset.min(app.last_max_scroll.get().max(total.saturating_sub(visible)));
+    let scroll_rows = total.saturating_sub(visible + clamped).min(u16::MAX as usize);
+    if scroll_rows >= total {
+        return None;
+    }
+    // The item owning content line `scroll_rows` (the top visible line).
+    let mut acc = 0usize;
+    for (idx, count) in &items_fwd {
+        if scroll_rows < acc + count {
+            return Some(*idx);
+        }
+        acc += count;
+    }
+    items_fwd.last().map(|(idx, _)| *idx)
 }
 
 /// Draw a scrollbar on the right edge of the transcript.
@@ -1551,12 +1642,12 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("@ / path word", "context refs · file & folder completions"),
         ("↑ / ↓ (input)", "input history recall (shared with CLI)"),
         ("↑ / ↓ (popup)", "navigate slash commands · ⏎ select · Esc close"),
-        ("Esc / Ctrl+C", "interrupt turn (idle: quit)"),
-        ("Ctrl+C ×2", "force exit during a turn"),
-        ("Ctrl+D", "quit (on empty input)"),
+        ("Ctrl+C ×1 / ×2 (busy)", "interrupt turn / KILL & restart engine"),
+                ("Ctrl+D", "quit (on empty input)"),
         ("Shift+Up / Ctrl+T / PgUp·PgDn", "scroll transcript (enters scroll mode)"),
         ("Ctrl+B / Ctrl+F", "half-page scroll up/down"),
         ("j / k  ↑ / ↓", "scroll one line (in transcript focus)"),
+        ("Space / x (transcript)", "expand the tool/terminal item at the top of the view"),
         ("g / G", "top / bottom (transcript focus)"),
         ("y / Y", "copy last agent / user message to clipboard"),
         ("/copy [n]", "copy nth assistant message (−n counts from last)"),
@@ -2343,7 +2434,7 @@ mod tests {
                     path: "a.txt".into(),
                     stat: "+1 -0".into(),
                     lines: vec!["+hello".into()],
-                    is_binary: false,
+                    is_binary: false, expanded: false,
                 },
             ),
             (
@@ -2413,7 +2504,7 @@ mod tests {
                 path: "a".into(),
                 stat: "+1".into(),
                 lines: vec!["+x".into()],
-                is_binary: false,
+                is_binary: false, expanded: false,
             }
         }
         fn mk_notice() -> TranscriptItem {
@@ -2679,7 +2770,7 @@ pub fn draw_slash_popup(f: &mut Frame, area: Rect, app: &App, input_text: &str, 
                     marker.to_string(),
                     Style::default().fg(col.to_color()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(sub.clone(), Style::default().fg(theme.fg_base.to_color()).add_modifier(mod_)),
+                Span::styled(sub.to_string(), Style::default().fg(theme.fg_base.to_color()).add_modifier(mod_)),
             ]));
         }
         lines.push(Line::from(Span::styled(

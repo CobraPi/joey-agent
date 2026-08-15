@@ -63,6 +63,11 @@ use std::process::{Child, Command, Stdio};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Maximum accepted JSON-RPC message size (16MB). The Content-Length
+/// header is server-controlled; without a cap a malicious/buggy server
+/// could make us attempt an unbounded allocation.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
 /// LSP server configuration from config.yaml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspServerConfig {
@@ -576,6 +581,12 @@ impl LspClient {
             }
         }
         let len = content_length.ok_or_else(|| LspError::Io("no Content-Length".into()))?;
+        if len > MAX_MESSAGE_BYTES {
+            return Err(LspError::Io(format!(
+                "LSP message too large: Content-Length {} exceeds cap of {} bytes",
+                len, MAX_MESSAGE_BYTES
+            )));
+        }
         let mut buf = vec![0u8; len];
         self.stdout
             .read_exact(&mut buf)

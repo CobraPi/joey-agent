@@ -7,6 +7,7 @@
 
 mod commands;
 mod clipboard;
+mod engine;
 mod history;
 mod llm_selector;
 mod neurocode_wiring;
@@ -33,6 +34,7 @@ mod setup_wizard;
 mod skills_cmd;
 mod slash;
 mod speckit_cmd;
+mod speckit_slash;
 mod tools_cmd;
 mod tui;
 

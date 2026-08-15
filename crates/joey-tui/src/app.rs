@@ -463,8 +463,15 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // Global keys.
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            // Ctrl+C always quits the program (busy or idle).
+            // Ctrl+C escalation (engine-actor model): when a turn is busy,
+            // the 1st press interrupts cooperatively and the 2nd (within 2s,
+            // host-side) force-kills + restarts the engine — the GUI never
+            // dies with the compute. When idle, Ctrl+C quits (parity with
+            // the line REPL).
             KeyCode::Char('c') if ctrl => {
+                if self.app.is_busy() {
+                    return Some(TuiAction::Interrupt);
+                }
                 self.app.mode = RunMode::Quitting;
                 return Some(TuiAction::Quit);
             }
@@ -638,6 +645,40 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                     KeyCode::Down | KeyCode::Char('j') => self.app.scroll_down(1),
                     KeyCode::Char('g') | KeyCode::Home => self.app.scroll_to_top(),
                     KeyCode::Char('G') | KeyCode::End => self.app.scroll_to_bottom(),
+                    // Space / x: expand-toggle the item at the TOP of the
+                    // viewport (mouse clicks also toggle, via hit-testing).
+                    // Scroll so the tool/terminal block you want is the top
+                    // visible item, then press Space/x.
+                    KeyCode::Char(' ') | KeyCode::Char('x') => {
+                        // Expand the item under the viewport — reuse the
+                        // mouse hit-test resolution at the CENTER row of
+                        // the transcript (same machinery clicks use, so
+                        // keyboard and mouse always agree). When the center
+                        // lands on a non-expandable item, fall back to the
+                        // first expandable item at or below the top of the
+                        // view (the common "whole transcript fits" case:
+                        // Space expands the tool output you can see).
+                        let (_tx, ty, _tw, th) = self.app.last_text_area.get();
+                        let center_row = ty + th / 2;
+                        let center_col = 4; // inside the text area
+                        let idx = widgets::transcript_hit_test(
+                            &self.app, self.theme, center_row, center_col,
+                        );
+                        let resolved = match idx {
+                            Some(i) if self.app.item_is_expandable(i) => Some(i),
+                            _ => {
+                                let top = widgets::transcript_item_at_top(&self.app, self.theme);
+                                match top {
+                                    Some(t0) => (t0..self.app.transcript.len())
+                                        .find(|&i| self.app.item_is_expandable(i)),
+                                    None => None,
+                                }
+                            }
+                        };
+                        if let Some(i) = resolved {
+                            self.app.toggle_item_expand_by_index(i);
+                        }
+                    }
                     KeyCode::Enter => {
                         self.focus = Focus::Input;
                         return None;
@@ -796,6 +837,28 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                             self.input.set_text(&format!("{base} {sel}"));
                             self.app.slash_menu_cursor = 0;
                             self.refresh_completion_menus();
+                        }
+                        return None;
+                    }
+                    // Exact command already typed (e.g. "/quit", "/help"):
+                    // submitting is what the user means — the popup's only
+                    // remaining value is argument hints, and re-offering
+                    // itself on every Enter would trap the input.
+                    let first_line = self.input.text().lines().next().unwrap_or("").to_string();
+                    let exact = first_line.starts_with('/')
+                        && !first_line.contains(' ')
+                        && self
+                            .app
+                            .slash_commands
+                            .iter()
+                            .any(|c| c.name == first_line[1..] || c.aliases.iter().any(|a| *a == &first_line[1..]));
+                    if exact {
+                        self.app.slash_menu_open = false;
+                        let text = self.input.text();
+                        if !text.trim().is_empty() {
+                            self.app.history_record(&text);
+                            self.input.clear();
+                            return Some(TuiAction::Submit(text));
                         }
                         return None;
                     }
@@ -1332,5 +1395,185 @@ mod completion_key_tests {
         }
         assert!(!t.app.completion_menu_open);
         assert!(!t.app.slash_menu_open);
+    }
+}
+
+#[cfg(test)]
+mod expand_tests {
+    //! Keyboard + render expansion of tool/terminal/diff items.
+    use super::*;
+    use crate::state::{ToolStatus, TranscriptItem};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::backend::TestBackend;
+
+    fn tui_with_tool(full_result: &str, is_terminal: bool) -> Tui<TestBackend> {
+        let mut app = App::new("s", "m");
+        app.push_item(TranscriptItem::Tool {
+            name: if is_terminal { "terminal".into() } else { "read_file".into() },
+            emoji: "💻".into(),
+            summary: if is_terminal { "seq 1 300".into() } else { "path=/tmp/x".into() },
+            status: ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: "1\n2\n3".into(),
+            expanded: false,
+            full_args: None,
+            full_result: Some(full_result.to_string()),
+            is_terminal,
+            exit_code: if is_terminal { Some(0) } else { None },
+        });
+        let terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        // Simulate the first frame recording the text-area geometry.
+        let theme = Theme::aurora();
+        let mut t = Tui::new_for_test(app, theme, terminal);
+        // (geometry recorded by new_for_test's initial size)
+        t
+    }
+
+
+    fn space() -> KeyEvent {
+        KeyEvent { code: KeyCode::Char(' '), modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE }
+    }
+
+
+    #[test]
+    fn space_in_transcript_focus_toggles_top_tool_item() {
+        let mut t = tui_with_tool("full output line 1\nfull output line 2", false);
+        // Geometry is recorded by a real draw; set it directly (established
+        // test pattern — see widgets hit-test tests).
+        t.app.last_text_area.set((0, 0, 98, 28));
+        // Enter transcript focus (Shift+Up), then Space toggles the top item.
+        t.handle_key(KeyEvent { code: KeyCode::Up, modifiers: KeyModifiers::SHIFT, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        let expanded_before = matches!(
+            t.app.transcript.back(),
+            Some(TranscriptItem::Tool { expanded: true, .. })
+        );
+        assert!(!expanded_before);
+        t.handle_key(space());
+        let expanded_after = matches!(
+            t.app.transcript.back(),
+            Some(TranscriptItem::Tool { expanded: true, .. })
+        );
+        assert!(expanded_after, "Space toggled the top tool item");
+        // Toggle back.
+        t.handle_key(space());
+        let collapsed = matches!(
+            t.app.transcript.back(),
+            Some(TranscriptItem::Tool { expanded: false, .. })
+        );
+        assert!(collapsed);
+    }
+
+    /// Render the transcript through the real widget into a TestBackend
+    /// and return the joined buffer text (smoke-test pattern).
+    fn render_transcript(app: &crate::state::App, theme: crate::theme::Theme) -> String {
+        use ratatui::Terminal;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                crate::widgets::draw_transcript(f, area, app, theme, false, 0.5);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn terminal_expanded_view_shows_full_result_not_preview() {
+        let full = (1..=300).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        let mut app = App::new("s", "m");
+        app.push_item(TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "seq 1 300".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: "1\n2\n3".into(),
+            expanded: true,
+            full_args: None,
+            full_result: Some(full),
+            is_terminal: true,
+            exit_code: Some(0),
+        });
+        let text = render_transcript(&app, crate::theme::Theme::aurora());
+        // The viewport shows the tail of the expanded block (which contains
+        // the FULL result — far more than the 3-line preview ever had).
+        assert!(text.contains("line-300"), "expanded terminal shows full result tail");
+    }
+
+    #[test]
+    fn top_item_resolver_finds_the_tool_when_scrolled_to_it() {
+        let full = (1..=300).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        let mut app = App::new("s".to_string(), "m".to_string());
+        app.record_user("run: seq 1 300");
+        app.push_item(TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "seq 1 300".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: "1\n2\n3".into(),
+            expanded: false,
+            full_args: None,
+            full_result: Some(full),
+            is_terminal: true,
+            exit_code: Some(0),
+        });
+        app.last_text_area.set((0, 0, 98, 28));
+        // Live mode (scroll None, bottom-anchored): the whole transcript
+        // fits, so the TOP item is the user message (index 0) — correct.
+        let idx = crate::widgets::transcript_item_at_top(&app, crate::theme::Theme::aurora());
+        assert_eq!(idx, Some(0), "top item is the user message, got {idx:?}");
+        // The Space handler's fallback then toggles the FIRST expandable
+        // item at or below the top — the tool (index 1).
+        assert!(app.item_is_expandable(1));
+        assert!(!app.item_is_expandable(0));
+    }
+
+    #[test]
+    fn terminal_collapsed_view_stays_bounded() {
+        let full = (1..=300).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        let mut app = App::new("s".to_string(), "m".to_string());
+        app.push_item(TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "seq 1 300".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: "1\n2\n3".into(),
+            expanded: false,
+            full_args: None,
+            full_result: Some(full),
+            is_terminal: true,
+            exit_code: Some(0),
+        });
+        let text = render_transcript(&app, crate::theme::Theme::aurora());
+        assert!(!text.contains("line-250"), "collapsed stays bounded");
+    }
+
+    #[test]
+    fn file_diff_toggle_expands_hidden_lines() {
+        let mut app = App::new("s", "m");
+        let diff_lines: Vec<String> = (0..120).map(|i| format!("+line {i}")).collect();
+        app.push_item(TranscriptItem::FileDiff {
+            path: "big.rs".into(),
+            stat: "+120 -0".into(),
+            lines: diff_lines,
+            is_binary: false,
+            expanded: false,
+        });
+        // Collapsed hides early lines; expanded shows them.
+        app.toggle_item_expand_by_index(0);
+        if let Some(TranscriptItem::FileDiff { expanded, .. }) = app.transcript.back() {
+            assert!(*expanded);
+        } else {
+            panic!("no diff item");
+        }
     }
 }

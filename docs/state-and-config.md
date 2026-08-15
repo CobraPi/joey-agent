@@ -52,7 +52,10 @@ Order: `~/.joey/.env` (override — beats shell env) → `~/.joey/.op.env`
 file (fill-only when user .env was loaded, override when it wasn't).
 Before parsing, `.env` files are sanitized: UTF-8 BOM strip, NUL strip,
 and **concatenated-line splitting** (`KEY1=vKEY2=v2` on one line is split at
-known `KEY=` needles; structured values like URLs are never split). After
+known `KEY=` needles; structured values like URLs are never split). Both
+`save_env_value` AND `remove_env_value` strip the BOM (a BOM-prefixed
+first key is now removable — historically it was skipped, leaving stale
+credentials on disk). After
 loading, credential values with non-ASCII characters (copy-paste artifacts)
 are stripped with a warning.
 
@@ -178,6 +181,9 @@ process-local override (profiles) → `JOEY_HOME` env → platform default
   auth.json            provider auth state (0600, atomic writes)
   auth.lock            advisory flock for auth.json
   active_profile       sticky profile name (at ROOT, not per-profile)
+  .joey_history        shared CLI+TUI input history (reedline format;
+                       lock-guarded read-modify-write, atomic rename
+                       commit, 10k-entry cap)
   skills/              user skills
   optional-skills/     packaged optional skills (env/packaging overrides)
   optional-mcps/       approved packaged MCP servers

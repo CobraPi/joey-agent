@@ -59,6 +59,9 @@ ghost-text hints (slash-name/subcommand remainder, history fallback).
 - `/quit` (`/exit`) — exit. `/help` — grouped help incl. not-yet-implemented commands.
 - `/new [name]` (`/reset`) — fresh session. `/clear` — clear screen+scrollback, new session.
 - `/queue <prompt>` (`/q`; bare lists queue) — queue for next turn.
+- `/steer <message>` — inject mid-turn after the next tool call, no
+  interrupt (full mid-turn steering works in the TUI; in the line REPL it
+  degrades to a queued message since input is read between turns).
 - `/model [name] [--global]` — switch model session-scoped, or persist `model.default`.
 - `/reasoning [none|minimal|low|medium|high|xhigh|max|ultra|on|off|show|hide] [--global]` — effort/display.
 - `/config [get <k> | set <k> <v> | path]` (bare = show).
@@ -71,8 +74,22 @@ ghost-text hints (slash-name/subcommand remainder, history fallback).
 - `/verbose` — cycle tool-progress off→new→all→verbose. `/timestamps [on|off|status]` (`/ts`).
 - `/version` (`/v`). `/agents` (`/tasks`, `/agent`) — OMO agent registry. `/goal set|pause|resume|clear|show`. `/start-work [plan]`.
 - `/llm-selector …` (subcommands as above). `/neurocode status|tier|index|query|patterns|anti-patterns|domain|ingest|help`.
+  `/neurocode ingest` also accepts natural language — a free-text
+  description hands off to an agent turn that locates (or writes) the
+  source and calls `neurocode_ingest` (REPL and TUI; the strict
+  `<category> <path>` form is unchanged).
+- **Spec-Kit workflow** (full lifecycle, runs the real `.specify/` scripts
+  for pre-flight + the bundled `speckit-*` skill workflow as one agent
+  turn that authors the artifacts):
+  `/speckit-constitution` · `/speckit-specify <description>` (scaffolds the
+  feature branch + authors spec.md; re-runs update in place) ·
+  `/speckit-clarify` · `/speckit-plan` · `/speckit-checklist` ·
+  `/speckit-tasks` · `/speckit-analyze` · `/speckit-implement` ·
+  `/speckit-converge` · `/speckit-taskstoissues` · `/speckit-status`
+  (artifact readiness, no turn) · `/speckit-help`. Requires a `.specify/`
+  directory in the repo (error explains how to init otherwise).
 
-**Registered but "not available in joey-agent yet":** /redraw /save /retry /prompt /undo /title /handoff /branch /snapshot /stop /background /journey /steer /moa /subgoal /whoami /profile /codex-runtime /personality /statusbar /footer /yolo /fast /skin /indicator /voice /busy /memory /bundles /pet /hatch /learn /cron /suggestions /blueprint /curator /kanban /reload /reload-mcp /reload-skills /browser /plugins /subscription /topup /insights /platforms /paste /image /update /debug.
+**Registered but "not available in joey-agent yet":** /redraw /save /retry /prompt /undo /title /handoff /branch /snapshot /stop /background /journey /moa /subgoal /whoami /profile /codex-runtime /personality /statusbar /footer /yolo /fast /skin /indicator /voice /busy /memory /bundles /pet /hatch /learn /cron /suggestions /blueprint /curator /kanban /reload /reload-mcp /reload-skills /browser /plugins /subscription /topup /insights /platforms /paste /image /update /debug.
 
 Prefix resolution: exact match → unique prefix → unique-shortest (so `/qui`→/quit, `/q`→/queue). Ambiguous → "Did you mean" list. Unknown → "Unknown command".
 

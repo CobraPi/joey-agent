@@ -7,15 +7,12 @@
 //! layer changes. Prompts submitted while a turn is running are queued and
 //! run in order once the agent is free.
 
-use std::collections::VecDeque;
 use std::io::IsTerminal;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use joey_agent_core::{Agent, AgentEvent};
+use joey_agent_core::Agent;
 use joey_core::Config;
 use joey_tui::{state::NoticeKind, AppState, SlashCommandInfo, Theme, TranscriptItem, Tui, TuiAction};
-use tokio::sync::mpsc;
 
 use crate::render;
 use crate::repl::ChatOptions;
@@ -106,7 +103,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     };
     let restored_count = history.len();
 
-    let mut agent = crate::repl::build_agent(&config, &cwd, &overrides, &session_id, history)?;
+    let agent = crate::repl::build_agent(&config, &cwd, &overrides, &session_id, history)?;
 
     let provider_name: &'static str = agent.client().profile().name;
     let model_name = crate::repl::build_agent_config(&config, &overrides).model;
@@ -194,15 +191,41 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     // empty picker that renders nothing — the visible "Tab does nothing" bug.
     populate_agent_roster(&mut tui, &agent);
 
-    // Single-query mode: run one turn, then hand the answer back to the
-    // normal terminal (the alternate screen vanishes on exit).
+    // ── Engine-actor decoupling ────────────────────────────────────────
+    // The agent moves into a dedicated engine task; this task only renders
+    // and dispatches commands. A hung turn or tool can never freeze the GUI
+    // (Ctrl-C escalation: interrupt ��� force-kill + fresh engine).
+    let engine_spec = crate::engine::EngineSpec {
+        config: config.clone(),
+        cwd: cwd.clone(),
+        overrides: overrides.clone(),
+        session_id: session_id.clone(),
+    };
+    let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<crate::engine::EngineEvent>();
+    let (engine, interrupt) = crate::engine::spawn_engine(agent, ev_tx);
+
+    // Single-query mode: submit, pump until done, hand the answer back.
     if let Some(query) = &opts.query {
-        let mut queued = VecDeque::new();
-        apply_intent_gate(&mut tui, &mut agent, query);
-        run_turn(&mut tui, &mut agent, query, &mut queued).await;
-        let final_text = tui.app().last_final_text.clone();
-        let _ = tui.leave();
-        drop(tui);
+        let mut session = TuiSession {
+            tui,
+            ev_rx,
+            engine: Some(engine),
+            interrupt,
+            engine_spec,
+            busy: false,
+            last_ctrlc: None,
+            queued_forwarded: 0,
+        };
+        session.submit(query.clone());
+        loop {
+            match pump_one(&mut session).await {
+                Some(PumpOutcome::TurnDone) | Some(PumpOutcome::EngineGone) => break,
+                _ => {}
+            }
+        }
+        let final_text = session.tui.app().last_final_text.clone();
+        let _ = session.tui.leave();
+        drop(session.tui);
         if !final_text.is_empty() {
             println!("{}", final_text);
         }
@@ -210,15 +233,22 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
             println!();
             println!("Session: {}", session_id);
         }
-        end_session(&agent, &session_id, "query_complete");
+        end_session_by_id(&session_id, "query_complete");
         return Ok(0);
     }
 
     // Interactive loop.
-    let result = interactive_loop(&mut tui, &mut agent).await;
-    let _ = tui.leave();
-    drop(tui);
-    end_session(&agent, &session_id, "user_exit");
+    let session = TuiSession {
+        tui,
+        ev_rx,
+        engine: Some(engine),
+        interrupt,
+        engine_spec,
+        busy: false,
+        last_ctrlc: None,
+        queued_forwarded: 0,
+    };
+    let (result, outro) = interactive_loop(session).await;
 
     if let Err(e) = result {
         render::error(&format!("TUI session error: {e}"));
@@ -226,20 +256,12 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     }
 
     // Exit outro — same shape as the line REPL's.
-    let history = agent.history();
-    let user_msgs = history.iter().filter(|m| m.role == "user").count();
-    let tool_calls =
-        history.iter().filter(|m| m.role == "tool" || !m.tool_calls.is_empty()).count();
-    let title = db
-        .as_ref()
-        .and_then(|d| d.get_session(&session_id).ok().flatten())
-        .and_then(|s| s.title);
     render::exit_outro(&render::OutroInfo {
         session_id: &session_id,
-        title,
-        message_count: history.len(),
-        user_messages: user_msgs,
-        tool_calls,
+        title: outro.title,
+        message_count: outro.message_count,
+        user_messages: outro.user_messages,
+        tool_calls: outro.tool_calls,
         started: session_start,
         profile: crate::active_profile(),
     });
@@ -248,6 +270,14 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
 
 fn end_session(agent: &Agent, session_id: &str, reason: &str) {
     if let Some(db) = agent.session_db() {
+        let _ = db.end_session(session_id, reason);
+    }
+}
+
+/// End a session by id when the Agent lives inside the engine task (the DB
+/// is reopened here on the UI side; SQLite WAL handles the concurrency).
+fn end_session_by_id(session_id: &str, reason: &str) {
+    if let Ok(db) = joey_core::SessionDb::open_default() {
         let _ = db.end_session(session_id, reason);
     }
 }
@@ -271,653 +301,471 @@ fn populate_agent_roster(tui: &mut Tui, agent: &Agent) {
     }
 }
 
-/// Look up the agent's model requirement in the OMO registry and switch the
-/// live runtime to it (T033/BC-015). Returns a human-readable notice.
-/// "Default" reverts to the model the session started with (saved on the App).
-fn switch_agent(tui: &mut Tui, agent: &mut Agent, agent_name: &str) {
-    // "Default" → restore the session's original model. We stash it in the
-    // App the first time we switch AWAY from it.
-    if agent_name == "default" {
-        let target = tui.app().default_model.clone();
-        let target = match target {
-            Some(m) if !m.is_empty() => m,
-            _ => {
-                // Nothing saved (shouldn't happen post-startup) — stay put.
-                tui.app_mut().push_item(TranscriptItem::Notice {
-                    text: "Already on the default agent".into(),
-                    kind: NoticeKind::Info,
+/// The interactive read → submit → render loop driven by the TUI.
+/// The decoupled TUI session: UI task state only. All compute lives in the
+/// engine task (see engine.rs); this struct owns the Tui, the engine handle,
+/// and the busy/kill bookkeeping.
+pub struct TuiSession {
+    pub tui: Tui,
+    pub ev_rx: tokio::sync::mpsc::UnboundedReceiver<crate::engine::EngineEvent>,
+    pub engine: Option<crate::engine::EngineHandle>,
+    pub interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub engine_spec: crate::engine::EngineSpec,
+    /// A turn or heavy job is running on the engine.
+    pub busy: bool,
+    pub last_ctrlc: Option<Instant>,
+    /// Prompts forwarded to a busy engine (queued engine-side). If the
+    /// engine is force-killed, those queued prompts die with it — the
+    /// engine owns its queue and they cannot be recovered. This counter
+    /// lets the UI report exactly how many were discarded (fix: silent
+    /// queue loss on ForceKill). Reset on every TurnFinished.
+    pub queued_forwarded: usize,
+}
+
+impl TuiSession {
+    /// Returns true when the app should quit (slash /quit).
+    pub fn submit(&mut self, prompt: String) -> bool {
+        if prompt.trim().is_empty() {
+            return false;
+        }
+        // Record to the shared CLI/TUI history file (the App's in-memory
+        // copy was already recorded by the input handler).
+        crate::history::record(&prompt);
+        if prompt.trim_start().starts_with('/') {
+            return self.handle_slash(&prompt);
+        }
+        let active_agent = self
+            .tui
+            .app()
+            .agent_roster
+            .get(self.tui.app().active_agent_index)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| "default".to_string());
+        // Pending OMO context (from /start-work) prepends once.
+        let turn_text = match self.tui.app_mut().pending_context_injection.take() {
+            Some(ctx) if !prompt.is_empty() => format!("{ctx}\n{prompt}"),
+            Some(ctx) => ctx,
+            None => prompt,
+        };
+        self.tui.app_mut().record_user(&turn_text);
+        // Only flip busy when there's actually an engine to run the turn —
+        // otherwise the app wedges in Busy with no TurnFinished coming.
+        if self.engine.is_some() {
+            self.busy = true;
+            // Flip the App to Busy immediately so is_busy()-gated keys
+            // (Ctrl-C escalation, input styling) apply before TurnStart
+            // arrives.
+            self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
+        }
+        if let Some(engine) = &self.engine {
+            engine.send(crate::engine::EngineCommand::Submit {
+                prompt: turn_text,
+                active_agent,
+            });
+        }
+        false
+    }
+
+    /// /start-work: activate Atlas on a plan. The OMO bookkeeping +
+    /// context injection stay UI-side; the Atlas identity switch goes to
+    /// the engine (it mutates the agent).
+    fn handle_start_work(&mut self, args: &str) {
+        let cwd = std::path::PathBuf::from(self.tui.app().cwd.clone());
+        let omo_dir = cwd.join(".omo");
+        let session_id = self.tui.app().session_id.clone();
+        let plan_name_opt: Option<&str> = if args.trim().is_empty() { None } else { Some(args.trim()) };
+        match joey_omo::start_work(&omo_dir, &session_id, plan_name_opt) {
+            Ok(result) => {
+                if let Some(engine) = &self.engine {
+                    engine.send(crate::engine::EngineCommand::SwitchAgent("atlas".into()));
+                }
+                self.tui.app_mut().pending_context_injection = Some(result.context_injection);
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!("🪨 Started work (agent: {}) — Atlas mode active", result.agent),
+                    kind: NoticeKind::Success,
                 });
+            }
+            Err(e) => {
+                self.tui.app_mut().push_item(TranscriptItem::Error {
+                    text: format!("start-work failed: {e}"),
+                });
+            }
+        }
+    }
+
+    /// Interrupt escalation: 1st press = cooperative interrupt; 2nd press
+    /// within 2s = FORCE KILL — abandon the engine task (it may be stuck in
+    /// a blocking tool; the interrupt flag is set but a truly hung tool
+    /// ignores it) and spawn a fresh engine with a rebuilt agent.
+    pub fn interrupt_pressed(&mut self) {
+        let now = Instant::now();
+        let second = self
+            .last_ctrlc
+            .map(|t| now.duration_since(t).as_secs_f64() < 2.0)
+            .unwrap_or(false);
+        if second {
+            self.force_kill_engine("user force-kill (double Ctrl-C)");
+            return;
+        }
+        self.last_ctrlc = Some(now);
+        self.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.tui.app_mut().push_item(TranscriptItem::Notice {
+            text: "⚡ Interrupting… (press Ctrl-C again to KILL & restart the engine)".into(),
+            kind: NoticeKind::Warning,
+        });
+    }
+
+    /// Abandon the current engine (its stuck task leaks until process exit —
+    /// deliberate: the GUI must survive no matter what) and build a fresh
+    /// engine around a rebuilt agent (history restored from the session DB).
+    pub fn force_kill_engine(&mut self, reason: &str) {
+        // Prompts forwarded while busy lived in the killed engine's queue
+        // and die with it — the honest fix is to tell the user (they can't
+        // be recovered; the engine owns its queue).
+        let discarded = self.queued_forwarded;
+        if let Some(engine) = self.engine.take() {
+            // Signal, then abandon: drop the command channel + detach task.
+            engine.send(crate::engine::EngineCommand::ForceKill);
+            engine.abandon();
+        }
+        self.queued_forwarded = 0;
+        // The fresh engine must not inherit a stale 2s Ctrl-C kill window
+        // (a second Ctrl-C right after restart would instantly kill it).
+        self.last_ctrlc = None;
+        // Flush any stale engine events so they can't leak into the new one.
+        while let Ok(_) = self.ev_rx.try_recv() {}
+        if discarded > 0 {
+            self.tui.app_mut().push_item(TranscriptItem::Error {
+                text: format!(
+                    "{discarded} queued prompt(s) discarded with the killed engine — resubmit them if still needed"
+                ),
+            });
+        }
+        // Fresh engine, fresh agent.
+        let agent = match self.engine_spec.build_agent() {
+            Ok(a) => a,
+            Err(e) => {
+                self.tui.app_mut().push_item(TranscriptItem::Error {
+                    text: format!("engine restart failed: {e}"),
+                });
+                self.engine = None;
+                self.busy = false;
+                self.tui.app_mut().mode = joey_tui::state::RunMode::Input;
                 return;
             }
         };
-        // Clear the OMO identity — Default uses the joey-agent base prompt.
-        apply_model_switch(tui, agent, "default", &target, "auto", None);
-        return;
-    }
-
-    // Rebuild a registry to read the agent's resolved model + provider.
-    let available = joey_omo::AvailableModelSet::from_connected_with_catalog(
-        agent.client().profile(),
-        agent.model(),
-    );
-    let overrides = joey_omo::agents::registry::ModelOverrides::new();
-    let registry = joey_omo::AgentRegistry::build(available, &overrides);
-    let Some(omo_agent) = registry.get(agent_name) else {
-        tui.app_mut().push_item(TranscriptItem::Notice {
-            text: format!("Unknown agent: {agent_name}"),
+        let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<crate::engine::EngineEvent>();
+        let (engine, interrupt) = crate::engine::spawn_engine(agent, ev_tx);
+        self.ev_rx = ev_rx;
+        self.engine = Some(engine);
+        self.interrupt = interrupt;
+        self.busy = false;
+        // The killed turn never sends Done — reset the RunMode ourselves.
+        self.tui.app_mut().mode = joey_tui::state::RunMode::Input;
+        self.tui.app_mut().push_item(TranscriptItem::Notice {
+            text: format!("☠ engine killed & restarted ({reason}) — GUI stayed live"),
             kind: NoticeKind::Warning,
         });
-        return;
-    };
-    let Some(model) = omo_agent.resolved_model.clone() else {
-        tui.app_mut().push_item(TranscriptItem::Notice {
-            text: format!(
-                "{} is unavailable with the current provider/model",
-                omo_agent.display_name
-            ),
-            kind: NoticeKind::Warning,
-        });
-        return;
-    };
-    // Build the OMO identity prompt for this agent (model-family-aware variant).
-    // This is what makes Tab-switching actually activate the agent's persona
-    // rather than just swapping the model (BC-004/FR-006).
-    let identity = joey_omo::dispatch_system_prompt(agent_name, &model);
-    // Let the provider auto-resolve from the model (provider="auto"), matching
-    // how an explicit `--model` is handled at startup.
-    apply_model_switch(
-        tui,
-        agent,
-        &omo_agent.display_name,
-        &model,
-        "auto",
-        Some(identity),
-    );
-}
-
-/// Apply the model swap, surfacing the result as a transcript notice and
-/// syncing the TUI's model label. When `identity` is Some, the OMO agent's
-/// system prompt is injected as the agent identity overlay (BC-004/FR-006);
-/// None clears it (reverting to the default joey-agent identity).
-fn apply_model_switch(
-    tui: &mut Tui,
-    agent: &mut Agent,
-    display_name: &str,
-    model: &str,
-    provider: &str,
-    identity: Option<String>,
-) {
-    // Stash the session's original model the first time we switch away.
-    if tui.app().default_model.is_none() {
-        tui.app_mut().default_model = Some(agent.model().to_string());
-    }
-    match agent.switch_model(provider, "", model, None) {
-        Ok(msg) => {
-            // Inject (or clear) the OMO agent identity AFTER switch_model
-            // succeeds. switch_model clears the ultrawork overlay (BC-016);
-            // the identity is a separate layer that persists until the next
-            // agent switch.
-            agent.set_agent_identity(identity);
-            tui.app_mut().model = agent.model().to_string();
-            tui.app_mut().provider = agent.provider_name().to_string();
-            tui.app_mut().push_item(TranscriptItem::Notice {
-                text: format!("{msg} — agent mode: {display_name}"),
-                kind: NoticeKind::Success,
-            });
-        }
-        Err(e) => {
-            tui.app_mut().push_item(TranscriptItem::Error {
-                text: format!("Could not switch to {display_name}: {e}"),
-            });
-        }
     }
 }
 
-/// The interactive read → submit → render loop driven by the TUI.
-async fn interactive_loop(tui: &mut Tui, agent: &mut Agent) -> anyhow::Result<()> {
-    let mut queued: VecDeque<String> = VecDeque::new();
-    loop {
-        // Prompts queued during the previous turn run first, in order.
-        let action = match queued.pop_front() {
-            Some(text) => TuiAction::Submit(text),
-            None => wait_for_action(tui).await,
-        };
-        match action {
-            TuiAction::Quit => return Ok(()),
-            TuiAction::Interrupt => continue,
-            TuiAction::SwitchAgent(agent_name) => {
-                // T033/BC-015: rebuild the runtime onto the chosen agent's model.
-                switch_agent(tui, agent, &agent_name);
-            }
-            TuiAction::CopyItem(idx) => {
-                // `y`/`Y` in transcript mode — copy that transcript item's
-                // text to the clipboard (native chain + OSC 52 fallback).
-                let text = tui.app().transcript.get(idx).and_then(|item| match item {
-                    TranscriptItem::User { text }
-                    | TranscriptItem::Assistant { text }
-                    | TranscriptItem::Reasoning { text, .. } => Some(text.clone()),
-                    TranscriptItem::Tool { full_result, result_preview, .. } => {
-                        full_result.clone().or_else(|| Some(result_preview.clone()))
-                    }
-                    TranscriptItem::FileDiff { path, lines, .. } => Some(format!(
-                        "# {}\n{}",
-                        path,
-                        lines.join("\n")
-                    )),
-                    TranscriptItem::Notice { text, .. } | TranscriptItem::Error { text } => {
-                        Some(text.clone())
-                    }
-                });
-                match text {
-                    Some(t) => match crate::clipboard::copy_to_clipboard(&t) {
-                        Ok(()) => tui.app_mut().push_item(TranscriptItem::Notice {
-                            text: format!("✓ Copied {} chars to clipboard", t.chars().count()),
-                            kind: NoticeKind::Success,
-                        }),
-                        Err(e) => tui.app_mut().push_item(TranscriptItem::Error {
-                            text: format!("Copy failed: {e}"),
-                        }),
-                    },
-                    None => tui.app_mut().push_item(TranscriptItem::Notice {
-                        text: "Nothing to copy under the cursor.".into(),
-                        kind: NoticeKind::Warning,
-                    }),
-                }
-            }
-            TuiAction::Submit(text) => {
-                // Persist to the shared CLI/TUI history file (the App's
-                // in-memory copy was already recorded by the input handler).
-                crate::history::record(&text);
-                if text.trim_start().starts_with('/') {
-                    if let SlashAction::Quit =
-                        handle_slash_tui(&text, tui, agent, &mut queued).await
-                    {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                // T114: @plan prefix detection (CLI/TUI parity with repl.rs).
-                // Switches the active agent to Prometheus and strips the prefix,
-                // so the rest of the message is treated as the planning goal.
-                let turn_text = handle_at_plan_prefix(tui, agent, &text);
-                // T114: prepend any pending OMO context (from /start-work) once,
-                // then clear it (mirrors repl.rs pending_context_injection).
-                let turn_text = match tui.app_mut().pending_context_injection.take() {
-                    Some(ctx) if !turn_text.is_empty() => format!("{ctx}\n{turn_text}"),
-                    Some(ctx) => ctx,
-                    None => turn_text,
-                };
-                apply_intent_gate(tui, agent, &turn_text);
-                run_turn(tui, agent, &turn_text, &mut queued).await;
-                // BC-016: honor an agent switch requested mid-turn, now that
-                // the turn's mutable borrow of `agent` has been released.
-                if let Some(agent_name) = tui.app_mut().pending_agent_switch.take() {
-                    switch_agent(tui, agent, &agent_name);
-                }
-            }
-        }
-    }
+/// Outcome of one pump step.
+pub enum PumpOutcome {
+    TurnDone,
+    HeavyDone,
+    EngineGone,
+    /// A terminal action fired (caller decides; only used by pump_one).
+    Action(TuiAction),
 }
 
-/// Pump crossterm events + animation ticks until the TUI emits an action.
-async fn wait_for_action(tui: &mut Tui) -> TuiAction {
+/// The unified UI pump: ONE select over engine events / terminal input /
+/// frame timer. The UI task never awaits engine compute — this is the core
+/// of the GUI/compute decoupling.
+async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
     use crossterm::event::{self, Event};
     use std::time::Duration;
 
-    loop {
-        tui.tick_animations();
-        let _ = tui.draw();
-        // One frame's worth of waiting, then drain everything pending so a
-        // fast typist never outruns the poll cadence.
-        if event::poll(tui.frame_budget()).unwrap_or(false) {
-            loop {
+    session.tui.tick_animations();
+    let _ = session.tui.draw();
+
+    let ev = tokio::select! {
+        ev = session.ev_rx.recv() => ev,
+        _ = tokio::time::sleep(session.tui.frame_budget()) => {
+            // Frame tick: drain all pending terminal input (non-blocking).
+            while event::poll(Duration::from_millis(0)).unwrap_or(false) {
                 match event::read() {
                     Ok(Event::Key(k)) => {
-                        if let Some(a) = tui.handle_key(k) {
-                            return a;
+                        if let Some(a) = session.tui.handle_key(k) {
+                            return Some(PumpOutcome::Action(a));
                         }
                     }
                     Ok(Event::Paste(s)) => {
-                        tui.input.insert_str(&s);
-                        let text = tui.input.text();
-                        tui.app_mut().update_slash_menu(&text);
+                        session.tui.input.insert_str(&s);
+                        let text = session.tui.input.text();
+                        session.tui.app_mut().update_slash_menu(&text);
                     }
-                    Ok(Event::Resize(w, h)) => tui.resize(w, h),
+                    Ok(Event::Resize(w, h)) => session.tui.resize(w, h),
                     Ok(Event::Mouse(m)) => {
                         use crossterm::event::{MouseEventKind, MouseButton};
                         match m.kind {
                             MouseEventKind::ScrollUp => {
-                                tui.handle_mouse_scroll(m.row, m.column, true);
+                                session.tui.handle_mouse_scroll(m.row, m.column, true);
                             }
                             MouseEventKind::ScrollDown => {
-                                tui.handle_mouse_scroll(m.row, m.column, false);
+                                session.tui.handle_mouse_scroll(m.row, m.column, false);
                             }
                             MouseEventKind::Down(MouseButton::Left) => {
-                                tui.handle_mouse_click(m.row, m.column);
+                                session.tui.handle_mouse_click(m.row, m.column);
                             }
                             _ => {}
                         }
                     }
                     _ => {}
                 }
-                if !event::poll(Duration::from_millis(0)).unwrap_or(false) {
+            }
+            return None;
+        }
+    };
+
+    match ev {
+        Some(crate::engine::EngineEvent::Agent(agent_ev)) => {
+            session.tui.app_mut().apply(agent_ev);
+            None
+        }
+        Some(crate::engine::EngineEvent::Notice(text)) => {
+            session.tui.app_mut().push_item(TranscriptItem::Notice {
+                text,
+                kind: NoticeKind::Info,
+            });
+            None
+        }
+        Some(crate::engine::EngineEvent::TurnFinished { .. }) => {
+            session.busy = false;
+            // Anything forwarded while busy has now been drained by the
+            // engine's internal queue — reset the loss counter.
+            session.queued_forwarded = 0;
+            // Honor a pending agent switch now that the turn is done.
+            if let Some(agent_name) = session.tui.app_mut().pending_agent_switch.take() {
+                if let Some(engine) = &session.engine {
+                    engine.send(crate::engine::EngineCommand::SwitchAgent(agent_name));
+                }
+            }
+            Some(PumpOutcome::TurnDone)
+        }
+        Some(crate::engine::EngineEvent::HeavyJobFinished { label: _, text }) => {
+            session.busy = false;
+            // A heavy job never sends AgentEvent::Done, so reset the
+            // RunMode ourselves — without this the status bar stays BUSY
+            // forever after /neurocode completes.
+            session.tui.app_mut().mode = joey_tui::state::RunMode::Input;
+            for line in text.lines() {
+                session.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: line.to_string(),
+                    kind: NoticeKind::Info,
+                });
+            }
+            Some(PumpOutcome::HeavyDone)
+        }
+        Some(crate::engine::EngineEvent::AgentSwitched { model, provider, notice, .. }) => {
+            session.tui.app_mut().model = model;
+            session.tui.app_mut().provider = provider;
+            session.tui.app_mut().push_item(TranscriptItem::Notice {
+                text: notice,
+                kind: NoticeKind::Success,
+            });
+            // Refresh the Default roster entry's model stamp.
+            let model_now = session.tui.app().model.clone();
+            if let Some(default) = session.tui.app_mut().agent_roster.first_mut() {
+                default.resolved_model = Some(model_now);
+            }
+            None
+        }
+        Some(crate::engine::EngineEvent::EngineGone(msg)) => {
+            session.busy = false;
+            // Engine death never sends Done — reset the RunMode ourselves
+            // or the status bar stays BUSY forever.
+            session.tui.app_mut().mode = joey_tui::state::RunMode::Input;
+            session.tui.app_mut().push_item(TranscriptItem::Error { text: msg });
+            Some(PumpOutcome::EngineGone)
+        }
+        None => {
+            session.busy = false;
+            session.tui.app_mut().mode = joey_tui::state::RunMode::Input;
+            Some(PumpOutcome::EngineGone)
+        }
+    }
+}
+
+/// Snapshot for the exit outro (counts gathered engine-side at quit).
+pub struct OutroSnapshot {
+    pub title: Option<String>,
+    pub message_count: usize,
+    pub user_messages: usize,
+    pub tool_calls: usize,
+}
+
+/// The interactive loop: pure UI. Pumps events, dispatches actions; all
+/// compute is engine-side. On quit it leaves the terminal, ends the
+/// session, and gathers the outro snapshot from the session DB.
+async fn interactive_loop(mut session: TuiSession) -> (anyhow::Result<()>, OutroSnapshot) {
+    loop {
+        match pump_one(&mut session).await {
+            Some(PumpOutcome::Action(TuiAction::Quit)) => break,
+            Some(PumpOutcome::Action(TuiAction::Interrupt)) => {
+                session.interrupt_pressed();
+            }
+            Some(PumpOutcome::Action(TuiAction::Submit(text))) => {
+                // Read-only slash commands are safe (and useful) while a
+                // turn runs — answer them inline instead of forwarding a
+                // raw "/status" prompt to the engine as if it were chat.
+                let light_slash = session.busy
+                    && text.trim_start().starts_with('/')
+                    && slash_is_light(&text);
+                if light_slash {
+                    session.handle_slash(&text);
+                } else if session.busy && text.trim_start().starts_with("/queue") {
+                    // Hermes /queue: queue for the NEXT turn — never
+                    // interrupts the running turn.
+                    let queued_text = text.trim_start_matches("/queue").trim().to_string();
+                    if queued_text.is_empty() {
+                        session.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: "Usage: /queue <prompt>".into(),
+                            kind: NoticeKind::Warning,
+                        });
+                    } else if let Some(engine) = &session.engine {
+                        let active_agent = session
+                            .tui
+                            .app()
+                            .agent_roster
+                            .get(session.tui.app().active_agent_index)
+                            .map(|a| a.name.clone())
+                            .unwrap_or_else(|| "default".to_string());
+                        engine.send(crate::engine::EngineCommand::Submit {
+                            prompt: queued_text.clone(),
+                            active_agent,
+                        });
+                        session.queued_forwarded += 1;
+                        let preview: String = queued_text.chars().take(48).collect();
+                        session.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: format!("⧗ queued for next turn: {preview}"),
+                            kind: NoticeKind::Busy,
+                        });
+                    }
+                } else if session.busy && text.trim_start().starts_with("/steer") {
+                    // Hermes parity: /steer mid-turn injects WITHOUT
+                    // interrupting — the message lands inside the marker on
+                    // the current turn's next tool result.
+                    let steer_text = text.trim_start_matches("/steer").trim().to_string();
+                    if steer_text.is_empty() {
+                        session.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: "Usage: /steer <message>".into(),
+                            kind: NoticeKind::Warning,
+                        });
+                    } else if let Some(engine) = &session.engine {
+                        engine.send(crate::engine::EngineCommand::Steer(steer_text));
+                    }
+                } else if session.busy {
+                    // Hermes parity (busy_input_mode: interrupt — the
+                    // upstream default): a plain message mid-turn
+                    // INTERRUPTS the running turn; the engine unwinds it
+                    // and runs the new message as the next turn.
+                    let preview: String = text.chars().take(48).collect();
+                    session.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: format!("⚡ interrupting — your message runs next: {preview}"),
+                        kind: NoticeKind::Warning,
+                    });
+                    session.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(engine) = &session.engine {
+                        // Queued AFTER the interrupt lands; the engine runs
+                        // it when the turn unwinds.
+                        let active_agent = session
+                            .tui
+                            .app()
+                            .agent_roster
+                            .get(session.tui.app().active_agent_index)
+                            .map(|a| a.name.clone())
+                            .unwrap_or_else(|| "default".to_string());
+                        engine.send(crate::engine::EngineCommand::Submit {
+                            prompt: text,
+                            active_agent,
+                        });
+                        // Still tracked: a force-kill before the turn
+                        // unwinds would drop this queued prompt too.
+                        session.queued_forwarded += 1;
+                    }
+                } else if session.submit(text) {
                     break;
                 }
             }
-        }
-    }
-}
-
-/// Run one agent turn inside the TUI, streaming events into the animated view
-/// with upstream Ctrl-C interrupt semantics (first press interrupts, second
-/// within 2s force-exits). Prompts submitted while busy are queued for the
-/// host loop to run next.
-async fn run_turn(
-    tui: &mut Tui,
-    agent: &mut Agent,
-    prompt: &str,
-    queued: &mut VecDeque<String>,
-) {
-    if !agent.client().has_credentials() {
-        tui.app_mut().push_item(TranscriptItem::Error {
-            text: format!(
-                "no API key for provider '{}' — run `joey model` outside the TUI.",
-                agent.client().profile().name
-            ),
-        });
-        return;
-    }
-
-    tui.app_mut().record_user(prompt);
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let interrupt = agent.interrupt_handle();
-
-    let turn = agent.run_turn(prompt, tx);
-    tokio::pin!(turn);
-
-    use crossterm::event::{self, Event};
-    use std::time::Duration;
-    let mut last_ctrlc: Option<Instant> = None;
-
-    loop {
-        // Drain agent events into the model.
-        while let Ok(ev) = rx.try_recv() {
-            tui.app_mut().apply(ev);
-        }
-        tokio::select! {
-            _res = &mut turn => {
-                while let Ok(ev) = rx.try_recv() {
-                    tui.app_mut().apply(ev);
+            Some(PumpOutcome::Action(TuiAction::SwitchAgent(name))) => {
+                if session.busy {
+                    session.tui.app_mut().pending_agent_switch = Some(name.clone());
+                    session.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: format!("⧗ will switch to {name} next turn"),
+                        kind: NoticeKind::Busy,
+                    });
+                } else if let Some(engine) = &session.engine {
+                    engine.send(crate::engine::EngineCommand::SwitchAgent(name));
                 }
-                tui.tick_animations();
-                let _ = tui.draw();
-                break;
             }
-            _ = tokio::time::sleep(tui.frame_budget()) => {
-                while event::poll(Duration::from_millis(0)).unwrap_or(false) {
-                    match event::read() {
-                        Ok(Event::Key(k)) => {
-                            if let Some(a) = tui.handle_key(k) {
-                                match a {
-                                    // Esc/Ctrl+C while busy. A second press
-                                    // within 2s force-exits.
-                                    TuiAction::Interrupt | TuiAction::Quit => {
-                                        let now = Instant::now();
-                                        if last_ctrlc
-                                            .map(|t| now.duration_since(t).as_secs_f64() < 2.0)
-                                            .unwrap_or(false)
-                                        {
-                                            let _ = tui.leave();
-                                            std::process::exit(0);
-                                        }
-                                        last_ctrlc = Some(now);
-                                        interrupt.store(true, Ordering::SeqCst);
-                                        if !queued.is_empty() {
-                                            queued.clear();
-                                            tui.app_mut().push_item(TranscriptItem::Notice {
-                                                text: "queued prompts discarded".into(),
-                                                kind: NoticeKind::Warning,
-                                            });
-                                        }
-                                        tui.app_mut().push_item(TranscriptItem::Notice {
-                                            text: "⚡ Interrupting… (press again to force exit)".into(),
-                                            kind: NoticeKind::Warning,
-                                        });
-                                    }
-                                    TuiAction::Submit(text) => {
-                                        queued.push_back(text.clone());
-                                        let preview: String = text.chars().take(48).collect();
-                                        tui.app_mut().push_item(TranscriptItem::Notice {
-                                            text: format!(
-                                                "⧗ queued for next turn ({}): {}",
-                                                queued.len(),
-                                                preview
-                                            ),
-                                            kind: NoticeKind::Busy,
-                                        });
-                                    }
-                                    TuiAction::SwitchAgent(agent_name) => {
-                                        // BC-016: a live turn holds a mutable
-                                        // borrow of the agent, and the switch
-                                        // targets the NEXT turn anyway. Stash
-                                        // it; applied once the turn ends.
-                                        tui.app_mut().pending_agent_switch =
-                                            Some(agent_name.clone());
-                                        tui.app_mut().push_item(TranscriptItem::Notice {
-                                            text: format!(
-                                                "⧗ will switch to {} next turn",
-                                                agent_name
-                                            ),
-                                            kind: NoticeKind::Busy,
-                                        });
-                                    }
-                                    // Copy works while busy (clipboard access
-                                    // doesn't touch the agent borrow).
-                                    TuiAction::CopyItem(idx) => {
-                                        let copied = tui
-                                            .app()
-                                            .transcript
-                                            .get(idx)
-                                            .and_then(|item| match item {
-                                                TranscriptItem::User { text }
-                                                | TranscriptItem::Assistant { text }
-                                                | TranscriptItem::Reasoning { text, .. } => {
-                                                    Some(text.clone())
-                                                }
-                                                TranscriptItem::Tool { full_result, result_preview, .. } => {
-                                                    full_result
-                                                        .clone()
-                                                        .or_else(|| Some(result_preview.clone()))
-                                                }
-                                                TranscriptItem::FileDiff { path, lines, .. } => {
-                                                    Some(format!("# {}\n{}", path, lines.join("\n")))
-                                                }
-                                                TranscriptItem::Notice { text, .. }
-                                                | TranscriptItem::Error { text } => Some(text.clone()),
-                                            });
-                                        if let Some(t) = copied {
-                                            if crate::clipboard::copy_to_clipboard(&t).is_ok() {
-                                                tui.app_mut().push_item(TranscriptItem::Notice {
-                                                    text: format!(
-                                                        "✓ Copied {} chars to clipboard",
-                                                        t.chars().count()
-                                                    ),
-                                                    kind: NoticeKind::Success,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(Event::Paste(s)) => {
-                            tui.input.insert_str(&s);
-                            let text = tui.input.text();
-                            tui.app_mut().update_slash_menu(&text);
-                        }
-                        Ok(Event::Resize(w, h)) => tui.resize(w, h),
-                        Ok(Event::Mouse(m)) => {
-                            use crossterm::event::{MouseEventKind, MouseButton};
-                            match m.kind {
-                                MouseEventKind::ScrollUp => {
-                                    tui.handle_mouse_scroll(m.row, m.column, true);
-                                }
-                                MouseEventKind::ScrollDown => {
-                                    tui.handle_mouse_scroll(m.row, m.column, false);
-                                }
-                                MouseEventKind::Down(MouseButton::Left) => {
-                                    tui.handle_mouse_click(m.row, m.column);
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ => {}
+            Some(PumpOutcome::Action(TuiAction::CopyItem(idx))) => {
+                let text = session.tui.app().transcript.get(idx).and_then(|item| match item {
+                    TranscriptItem::User { text }
+                    | TranscriptItem::Assistant { text }
+                    | TranscriptItem::Reasoning { text, .. } => Some(text.clone()),
+                    TranscriptItem::Tool { full_result, result_preview, .. } => {
+                        full_result.clone().or_else(|| Some(result_preview.clone()))
+                    }
+                    TranscriptItem::FileDiff { path, lines, .. } => {
+                        Some(format!("# {}\n{}", path, lines.join("\n")))
+                    }
+                    TranscriptItem::Notice { text, .. }
+                    | TranscriptItem::Error { text } => Some(text.clone()),
+                });
+                if let Some(t) = text {
+                    match crate::clipboard::copy_to_clipboard(&t) {
+                        Ok(()) => session.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: format!("✓ Copied {} chars to clipboard", t.chars().count()),
+                            kind: NoticeKind::Success,
+                        }),
+                        Err(e) => session.tui.app_mut().push_item(TranscriptItem::Error {
+                            text: format!("Copy failed: {e}"),
+                        }),
                     }
                 }
             }
+            _ => {}
         }
-        tui.tick_animations();
-        let _ = tui.draw();
     }
+
+    // Quit: leave the terminal, end the session, snapshot the outro.
+    let session_id = session.engine_spec.session_id.clone();
+    let _ = session.tui.leave();
+    end_session_by_id(&session_id, "user_exit");
+    let (message_count, user_messages, tool_calls, title) = outro_stats(&session_id);
+    (
+        Ok(()),
+        OutroSnapshot { title, message_count, user_messages, tool_calls },
+    )
 }
 
-enum SlashAction {
-    Handled,
-    Quit,
-}
-
-/// Run `/neurocode <args>` off the UI task while the TUI keeps rendering.
-///
-/// NeuroCode subcommands like `index`/`ingest` walk the whole source tree
-/// (tree-sitter parses + SQLite bulk upserts) and can take seconds-to-minutes
-/// on large repos. Running that inline froze the GUI until completion. This
-/// mirrors `run_turn`'s skeleton: the work runs on `spawn_blocking`, and the
-/// loop pumps animation frames + terminal input (queued prompts, scroll,
-/// copy, Ctrl-C interrupt semantics) until the handler returns its text.
-///
-/// `queued` receives prompts submitted while the command runs; Ctrl-C can't
-/// cancel SQLite mid-upsert (the handler has no interrupt handle — a fresh
-/// engine is built per invocation), so a single press just shows the notice
-/// and a second press within 2s force-exits, matching `run_turn`.
-async fn run_neurocode_tui(
-    tui: &mut Tui,
-    args: &str,
-    queued: &mut VecDeque<String>,
-) -> String {
-    use crossterm::event::{self, Event};
-    use std::time::Duration;
-
-    let owned_args = args.to_string();
-    let job = tokio::task::spawn_blocking(move || {
-        crate::commands::neurocode::neurocode_slash(&owned_args)
-    });
-    tokio::pin!(job);
-
-    tui.app_mut().push_item(TranscriptItem::Notice {
-        text: "⧗ /neurocode running… (GUI stays live; press Ctrl-C twice to force exit)".into(),
-        kind: NoticeKind::Busy,
-    });
-
-    let mut last_ctrlc: Option<Instant> = None;
-    loop {
-        tokio::select! {
-            res = &mut job => {
-                return res.unwrap_or_else(|e| format!("/neurocode task failed: {e}"));
-            }
-            _ = tokio::time::sleep(tui.frame_budget()) => {
-                while event::poll(Duration::from_millis(0)).unwrap_or(false) {
-                    match event::read() {
-                        Ok(Event::Key(k)) => {
-                            if let Some(a) = tui.handle_key(k) {
-                                match a {
-                                    TuiAction::Interrupt | TuiAction::Quit => {
-                                        let now = Instant::now();
-                                        if last_ctrlc
-                                            .map(|t| now.duration_since(t).as_secs_f64() < 2.0)
-                                            .unwrap_or(false)
-                                        {
-                                            let _ = tui.leave();
-                                            std::process::exit(0);
-                                        }
-                                        last_ctrlc = Some(now);
-                                        tui.app_mut().push_item(TranscriptItem::Notice {
-                                            text: "indexing can't be interrupted mid-write — \
-                                                   press Ctrl-C again to force exit"
-                                                .into(),
-                                            kind: NoticeKind::Warning,
-                                        });
-                                    }
-                                    TuiAction::Submit(text) => {
-                                        queued.push_back(text.clone());
-                                        let preview: String = text.chars().take(48).collect();
-                                        tui.app_mut().push_item(TranscriptItem::Notice {
-                                            text: format!(
-                                                "⧗ queued for next turn ({}): {}",
-                                                queued.len(),
-                                                preview
-                                            ),
-                                            kind: NoticeKind::Busy,
-                                        });
-                                    }
-                                    TuiAction::CopyItem(idx) => {
-                                        let copied = tui
-                                            .app()
-                                            .transcript
-                                            .get(idx)
-                                            .and_then(|item| match item {
-                                                TranscriptItem::User { text }
-                                                | TranscriptItem::Assistant { text }
-                                                | TranscriptItem::Reasoning { text, .. } => {
-                                                    Some(text.clone())
-                                                }
-                                                TranscriptItem::Tool { full_result, result_preview, .. } => {
-                                                    full_result
-                                                        .clone()
-                                                        .or_else(|| Some(result_preview.clone()))
-                                                }
-                                                TranscriptItem::FileDiff { path, lines, .. } => Some(format!(
-                                                    "# {}\n{}",
-                                                    path,
-                                                    lines.join("\n")
-                                                )),
-                                                TranscriptItem::Notice { text, .. }
-                                                | TranscriptItem::Error { text } => Some(text.clone()),
-                                            });
-                                        if let Some(t) = copied {
-                                            if crate::clipboard::copy_to_clipboard(&t).is_ok() {
-                                                tui.app_mut().push_item(TranscriptItem::Notice {
-                                                    text: format!(
-                                                        "✓ Copied {} chars to clipboard",
-                                                        t.chars().count()
-                                                    ),
-                                                    kind: NoticeKind::Success,
-                                                });
-                                            }
-                                        }
-                                    }
-                                    TuiAction::SwitchAgent(_) => {
-                                        // Agent switching isn't useful mid-index;
-                                        // the roster key is ignored here.
-                                    }
-                                }
-                            }
-                        }
-                        Ok(Event::Paste(s)) => {
-                            tui.input.insert_str(&s);
-                            let text = tui.input.text();
-                            tui.app_mut().update_slash_menu(&text);
-                        }
-                        Ok(Event::Resize(w, h)) => tui.resize(w, h),
-                        Ok(Event::Mouse(m)) => {
-                            use crossterm::event::{MouseEventKind, MouseButton};
-                            match m.kind {
-                                MouseEventKind::ScrollUp => {
-                                    tui.handle_mouse_scroll(m.row, m.column, true);
-                                }
-                                MouseEventKind::ScrollDown => {
-                                    tui.handle_mouse_scroll(m.row, m.column, false);
-                                }
-                                MouseEventKind::Down(MouseButton::Left) => {
-                                    tui.handle_mouse_click(m.row, m.column);
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        tui.tick_animations();
-        let _ = tui.draw();
-    }
-}
-
-/// T114: `@plan` prefix detection (CLI/TUI parity with repl.rs T108/T142).
-///
-/// When the user's message starts with `@plan`, switch the active agent to
-/// Prometheus (read-only planner) and strip the prefix so the remainder of the
-/// message becomes the planning goal. Execution is NOT started — the plan is
-/// produced, then the user decides whether to proceed.
-///
-/// Returns the text to actually send to the agent (prefix stripped). If the
-/// stripped text is empty, a notice is pushed and the caller should skip the
-/// turn; we return the empty string in that case and `run_turn` is a no-op on
-/// empty input.
-fn handle_at_plan_prefix(tui: &mut Tui, agent: &mut Agent, message: &str) -> String {
-    if !(message.starts_with("@plan ") || message == "@plan") {
-        return message.to_string();
-    }
-    let overlay = joey_omo::agents::prompts::dispatch_system_prompt("prometheus", agent.model());
-    agent.set_extra_instructions(Some(overlay));
-    tui.app_mut().push_item(TranscriptItem::Notice {
-        text: "📋 Switched to Prometheus (@plan) — create a plan, no execution.".into(),
-        kind: NoticeKind::Info,
-    });
-    message.trim_start_matches("@plan").trim().to_string()
-}
-
-/// IntentGate (FR-022/FR-024, T141): scan the user's message for OMO
-/// keyword triggers before the turn runs. When `ultrawork`/`ulw` is
-/// detected and the active agent supports it, inject the ultrawork
-/// instruction set as an overlay on the system prompt. Prometheus and
-/// unknown agents silently ignore ultrawork (BC-025).
-///
-/// The active agent name is resolved from the TUI's agent roster +
-/// active_agent_index (populated by `populate_agent_roster` / Tab cycling).
-/// When no roster entry exists (e.g. the default agent at startup), the
-/// agent is treated as "default", which is ultrawork-valid.
-fn apply_intent_gate(tui: &mut Tui, agent: &mut Agent, message: &str) {
-    let Some(keyword) = joey_omo::detect_keyword(message) else {
-        return;
+/// Gather exit-outro stats from the session DB (the Agent lives engine-side).
+fn outro_stats(session_id: &str) -> (usize, usize, usize, Option<String>) {
+    let Ok(db) = joey_core::SessionDb::open_default() else {
+        return (0, 0, 0, None);
     };
-
-    // Resolve the active agent's canonical name from the Tab picker state.
-    // Clone to release the immutable borrow of `tui` before we mutate it.
-    let active_agent_name = tui
-        .app()
-        .agent_roster
-        .get(tui.app().active_agent_index)
-        .map(|a| a.name.clone())
-        .unwrap_or_else(|| "default".to_string());
-
-    match keyword {
-        joey_omo::KeywordType::Ultrawork | joey_omo::KeywordType::HyperplanUltraworkCombo => {
-            if let Some(_announcement) =
-                joey_omo::check_ultrawork_activation(keyword, &active_agent_name)
-            {
-                // Inject the ultrawork overlay (model-family-aware variant).
-                let overlay = joey_omo::ultrawork_prompt(agent.model());
-                agent.set_extra_instructions(Some(overlay));
-                tui.app_mut().push_item(TranscriptItem::Notice {
-                    text: "⚡ ULTRAWORK MODE ENABLED!".into(),
-                    kind: NoticeKind::Success,
-                });
-            } else {
-                // Prometheus or other incompatible agent — silently ignored.
-                tui.app_mut().push_item(TranscriptItem::Notice {
-                    text: format!(
-                        "ultrawork ignored — {} is a read-only planner",
-                        active_agent_name
-                    ),
-                    kind: NoticeKind::Warning,
-                });
-            }
-        }
-        joey_omo::KeywordType::Hyperplan => {
-            tui.app_mut().push_item(TranscriptItem::Notice {
-                text: "⚡ HYPERPLAN MODE ENABLED!".into(),
-                kind: NoticeKind::Info,
-            });
-        }
-        joey_omo::KeywordType::Team => {
-            tui.app_mut().push_item(TranscriptItem::Notice {
-                text: "TEAM MODE ENABLED!".into(),
-                kind: NoticeKind::Info,
-            });
-        }
-    }
+    let msgs = db.messages(session_id).unwrap_or_default();
+    let user_messages = msgs.iter().filter(|m| m.role == joey_core::state::Role::User).count();
+    let tool_calls = msgs
+        .iter()
+        .filter(|m| m.role == joey_core::state::Role::Tool || m.tool_calls.is_some())
+        .count();
+    let title = db
+        .get_session(session_id)
+        .ok()
+        .flatten()
+        .and_then(|s| s.title);
+    (msgs.len(), user_messages, tool_calls, title)
 }
 
 /// Slash-command handling inside the TUI. A few commands work natively;
@@ -927,63 +775,63 @@ fn apply_intent_gate(tui: &mut Tui, agent: &mut Agent, message: &str) {
 /// bulk-upserts to SQLite) can run on `spawn_blocking` while the UI keeps
 /// rendering (see `run_neurocode_tui`) — the GUI no longer freezes until the
 /// command completes.
-async fn handle_slash_tui(
-    input: &str,
-    tui: &mut Tui,
-    agent: &mut Agent,
-    queued: &mut VecDeque<String>,
-) -> SlashAction {
+impl TuiSession {
+/// Slash-command handling on the UI side. Light commands render inline;
+/// heavy ones (neurocode index/ingest…) are dispatched to the engine task.
+/// Returns true when the app should quit.
+pub fn handle_slash(&mut self, input: &str) -> bool {
     match slash::resolve(input) {
         Resolution::Unknown => {
-            tui.app_mut().push_item(TranscriptItem::Error {
+            self.tui.app_mut().push_item(TranscriptItem::Error {
                 text: format!("Unknown command: {}", input),
             });
         }
         Resolution::Ambiguous(matches) => {
-            tui.app_mut().push_item(TranscriptItem::Notice {
+            self.tui.app_mut().push_item(TranscriptItem::Notice {
                 text: format!("Ambiguous: did you mean {}?", matches.join(", ")),
                 kind: NoticeKind::Warning,
             });
         }
         Resolution::Command { def, .. } if !def.implemented => {
-            tui.app_mut().push_item(TranscriptItem::Notice {
+            self.tui.app_mut().push_item(TranscriptItem::Notice {
                 text: format!("/{} is not available in joey-agent yet.", def.name),
                 kind: NoticeKind::Warning,
             });
         }
         Resolution::Command { def, .. } => match def.name {
-            "quit" | "exit" => return SlashAction::Quit,
-            "help" => tui.toggle_help(),
+            "quit" | "exit" => return true,
+            "help" => self.tui.toggle_help(),
             // T114: /start-work — activate Atlas on a plan (CLI/TUI parity).
             "start-work" => {
                 let args = slash_args_after(input, "start-work");
-                handle_start_work_tui(tui, agent, args);
+                self.handle_start_work(args);
             }
             // T114: /goal — persistent per-session objective (CLI/TUI parity).
             "goal" => {
                 let args = slash_args_after(input, "goal");
-                handle_goal_tui(tui, args);
+                handle_goal_tui(&mut self.tui, args);
             }
             "clear" => {
-                tui.app_mut().transcript.clear();
-                tui.app_mut().scroll = None;
-                tui.app_mut().push_item(TranscriptItem::Notice {
+                self.tui.app_mut().transcript.clear();
+                self.tui.app_mut().scroll = None;
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: "view cleared — conversation history is unchanged".into(),
                     kind: NoticeKind::Info,
                 });
             }
             "agents" => {
-                tui.app_mut().agent_picker_open = true;
+                self.tui.app_mut().agent_picker_open = true;
             }
             "model" => {
-                tui.app_mut().push_item(TranscriptItem::Notice {
-                    text: format!("Current model: {} — use `joey model` outside the TUI to change", agent.model()),
+                let model_now = self.tui.app().model.clone();
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!("Current model: {model_now} — use `joey model` outside the TUI to change"),
                     kind: NoticeKind::Info,
                 });
             }
             "status" => {
                 let (sid, mdl, tok_prompt, tok_comp, tok_iter, msg_count) = {
-                    let app = tui.app();
+                    let app = self.tui.app();
                     (
                         app.session_id.clone(),
                         app.model.clone(),
@@ -993,7 +841,7 @@ async fn handle_slash_tui(
                         app.transcript.len(),
                     )
                 };
-                tui.app_mut().push_item(TranscriptItem::Notice {
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: format!(
                         "session {} | model {} | tokens in:{} out:{} api:{} | messages {}",
                         sid, mdl, tok_prompt, tok_comp, tok_iter, msg_count,
@@ -1002,27 +850,27 @@ async fn handle_slash_tui(
                 });
             }
             "timestamps" | "ts" => {
-                tui.app_mut().push_item(TranscriptItem::Notice {
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: "Timestamps are always shown inline in the TUI transcript".into(),
                     kind: NoticeKind::Info,
                 });
             }
             "tools" => {
-                tui.app_mut().push_item(TranscriptItem::Notice {
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: "Use `joey tools list` outside the TUI to manage tools".into(),
                     kind: NoticeKind::Info,
                 });
             }
             "new" | "reset" => {
-                tui.app_mut().transcript.clear();
-                tui.app_mut().scroll = None;
-                tui.app_mut().push_item(TranscriptItem::Notice {
+                self.tui.app_mut().transcript.clear();
+                self.tui.app_mut().scroll = None;
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: "New session — history cleared (start a new joey session for a fresh ID)".into(),
                     kind: NoticeKind::Info,
                 });
             }
             "verbose" => {
-                tui.app_mut().push_item(TranscriptItem::Notice {
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: "Tool progress is always shown in the TUI transcript".into(),
                     kind: NoticeKind::Info,
                 });
@@ -1031,13 +879,13 @@ async fn handle_slash_tui(
                 use joey_tools::file_tracker::FileTracker;
                 let summary = FileTracker::change_summary();
                 if summary.files_modified == 0 {
-                    tui.app_mut().push_item(TranscriptItem::Notice {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
                         text: "No files changed in this session.".into(),
                         kind: NoticeKind::Info,
                     });
                 } else {
                     let paths = summary.modified_paths.join(", ");
-                    tui.app_mut().push_item(TranscriptItem::Notice {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
                         text: format!(
                             "{} file(s) read, {} modified: {}",
                             summary.files_read, summary.files_modified, paths,
@@ -1051,12 +899,12 @@ async fn handle_slash_tui(
             // oldest→newest; negative numbers count from the newest).
             "copy" => {
                 let args = slash_args_after(input, "copy");
-                copy_in_tui(tui, args);
+                copy_in_tui(&mut self.tui, args);
             }
             "history" => {
                 // Show conversation history summary in the transcript.
-                let count = tui.app().transcript_len();
-                tui.app_mut().push_item(TranscriptItem::Notice {
+                let count = self.tui.app().transcript_len();
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: format!(
                         "{} transcript item(s) this session — scroll with ↑/↓ or PgUp/PgDn",
                         count,
@@ -1065,7 +913,7 @@ async fn handle_slash_tui(
                 });
             }
             "version" | "v" => {
-                tui.app_mut().push_item(TranscriptItem::Notice {
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: format!("joey-agent {}", env!("CARGO_PKG_VERSION")),
                     kind: NoticeKind::Info,
                 });
@@ -1078,27 +926,130 @@ async fn handle_slash_tui(
                 let args = slash_args_after(input, "llm-selector");
                 match crate::llm_selector::llm_selector_slash(args) {
                     Ok(()) => {}
-                    Err(e) => tui.app_mut().push_item(TranscriptItem::Error { text: e }),
+                    Err(e) => self.tui.app_mut().push_item(TranscriptItem::Error { text: e }),
                 }
             }
-            "neurocode" => {
-                // The handler builds its own engine and returns plain text —
-                // perfect for the transcript (Constitution II parity).
-                // Heavy subcommands (index/ingest) parse the whole tree +
-                // bulk-upsert SQLite, so run the handler off the UI task and
-                // keep rendering until it finishes — the GUI must not freeze.
-                let args = slash_args_after(input, "neurocode");
-                let out = run_neurocode_tui(tui, args, queued).await;
-                for line in out.lines() {
-                    tui.app_mut().push_item(TranscriptItem::Notice {
+            // ── Spec-Kit workflow ──
+            "speckit-status" => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                match crate::speckit_slash::status(&cwd) {
+                    Ok(st) => {
+                        for line in crate::speckit_slash::render_status(&st).lines() {
+                            self.tui.app_mut().push_item(TranscriptItem::Notice {
+                                text: line.to_string(),
+                                kind: NoticeKind::Info,
+                            });
+                        }
+                    }
+                    Err(e) => self.tui.app_mut().push_item(TranscriptItem::Error { text: e }),
+                }
+            }
+            "speckit-help" => {
+                for line in crate::speckit_slash::render_help().lines() {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
                         text: line.to_string(),
                         kind: NoticeKind::Info,
                     });
                 }
             }
+            name if name.starts_with("speckit-") => {
+                // Lifecycle steps: pre-flight script + one full agent turn.
+                // The turn runs on the ENGINE (like any turn) — prepare the
+                // prompt on the UI side (scripts are fast) and submit.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let args = slash_args_after(input, name).to_string();
+                match (
+                    crate::speckit_slash::find_repo_root(&cwd),
+                    crate::speckit_slash::step_by_name(name),
+                ) {
+                    (Some(root), Some(step)) => {
+                        match crate::speckit_slash::prepare_step(step, &root, &args, Some(step.skill)) {
+                            Ok(prep) => {
+                                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                                    text: format!(
+                                        "🧭 /{} — starting {} workflow (agent turn)",
+                                        step.name, step.skill
+                                    ),
+                                    kind: NoticeKind::Info,
+                                });
+                                if let Some(engine) = &self.engine {
+                                    let active_agent = self
+                                        .tui
+                                        .app()
+                                        .agent_roster
+                                        .get(self.tui.app().active_agent_index)
+                                        .map(|a| a.name.clone())
+                                        .unwrap_or_else(|| "default".to_string());
+                                    engine.send(crate::engine::EngineCommand::Submit {
+                                        prompt: prep.prompt,
+                                        active_agent,
+                                    });
+                                    self.busy = true;
+                                    self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
+                                }
+                            }
+                            Err(e) => self.tui.app_mut().push_item(TranscriptItem::Error { text: e }),
+                        }
+                    }
+                    _ => {
+                        self.tui.app_mut().push_item(TranscriptItem::Error {
+                            text: "not a spec-kit repository (no .specify/ directory), or unknown step. See /speckit-help.".into(),
+                        });
+                    }
+                }
+            }
+            "neurocode" => {
+                // The handler builds its own engine and returns plain text —
+                // perfect for the transcript (Constitution II parity).
+                // Heavy subcommands (index/ingest strict form) parse the
+                // whole tree + bulk-upsert SQLite, so run the handler off
+                // the UI task — the GUI must not freeze. Natural-language
+                // ingest instead hands off to a full agent turn (submitted
+                // through the engine like any turn).
+                let args = slash_args_after(input, "neurocode").to_string();
+                match crate::commands::neurocode::neurocode_slash_outcome(&args) {
+                    crate::commands::neurocode::NeurocodeOutcome::AgentIngest(prompt) => {
+                        self.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: "🧭 natural-language ingest — the agent will locate the \
+                                   source and call neurocode_ingest"
+                                .into(),
+                            kind: NoticeKind::Info,
+                        });
+                        if let Some(engine) = &self.engine {
+                            let active_agent = self
+                                .tui
+                                .app()
+                                .agent_roster
+                                .get(self.tui.app().active_agent_index)
+                                .map(|a| a.name.clone())
+                                .unwrap_or_else(|| "default".to_string());
+                            engine.send(crate::engine::EngineCommand::Submit {
+                                prompt,
+                                active_agent,
+                            });
+                            self.busy = true;
+                            self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
+                        }
+                    }
+                    crate::commands::neurocode::NeurocodeOutcome::Text(_) => {
+                        self.busy = true;
+                        self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
+                        self.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: "⧗ /neurocode running on the engine… (GUI stays live)".into(),
+                            kind: NoticeKind::Busy,
+                        });
+                        if let Some(engine) = &self.engine {
+                            engine.send(crate::engine::EngineCommand::HeavyJob {
+                                label: "neurocode".into(),
+                                args,
+                            });
+                        }
+                    }
+                }
+            }
             "toolsets" => {
                 let names = joey_tools::toolsets::names();
-                tui.app_mut().push_item(TranscriptItem::Notice {
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: format!("Toolsets: {}", names.join(", ")),
                     kind: NoticeKind::Info,
                 });
@@ -1106,7 +1057,7 @@ async fn handle_slash_tui(
             "skills" => {
                 let skills = joey_tools::tools::skills_tool::discover();
                 if skills.is_empty() {
-                    tui.app_mut().push_item(TranscriptItem::Notice {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
                         text: "No skills installed.".into(),
                         kind: NoticeKind::Info,
                     });
@@ -1116,14 +1067,14 @@ async fn handle_slash_tui(
                         .map(|s| s.name.clone())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    tui.app_mut().push_item(TranscriptItem::Notice {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
                         text: format!("Skills: {}", listing),
                         kind: NoticeKind::Info,
                     });
                 }
             }
             name => {
-                tui.app_mut().push_item(TranscriptItem::Notice {
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: format!(
                         "/{} isn't wired into the TUI yet — run joey without --tui to use it.",
                         name
@@ -1133,7 +1084,18 @@ async fn handle_slash_tui(
             }
         },
     }
-    SlashAction::Handled
+    false
+}
+}
+
+/// True for slash commands that are pure UI-side reads/writes — safe to
+/// run while the engine is mid-turn (they never touch the agent). Anything
+/// else submitted while busy is queued (or, for unknown commands, answered
+/// by handle_slash as usual when idle).
+fn slash_is_light(input: &str) -> bool {
+    let stripped = input.trim_start().trim_start_matches('/').to_ascii_lowercase();
+    let name = stripped.split_whitespace().next().unwrap_or("");
+    matches!(name, "status" | "help" | "copy" | "model" | "version" | "v")
 }
 
 /// Extract the argument substring after `/command` in a slash input string.
@@ -1154,6 +1116,22 @@ fn slash_args_after<'a>(input: &'a str, command: &str) -> &'a str {
     // Fallback: anything after the first space.
     stripped.split_once(' ').map(|(_, r)| r).unwrap_or("")
 }
+
+#[cfg(test)]
+mod tui_tests {
+    /// Read-only slash commands are UI-safe while the engine is busy;
+    /// everything else (prompts, heavy commands) must queue.
+    #[test]
+    fn slash_is_light_classifies_read_only_commands() {
+        for ok in ["/status", "/help", "/copy", "/copy 2", "/model", "/version", "/v", "  /status"] {
+            assert!(super::slash_is_light(ok), "expected light: {ok}");
+        }
+        for heavy in ["/neurocode index", "/start-work", "/quit", "/clear", "hello", ""] {
+            assert!(!super::slash_is_light(heavy), "expected not light: {heavy}");
+        }
+    }
+}
+
 
 /// `/copy [n]` in the TUI — copy an assistant message to the clipboard.
 ///
@@ -1207,60 +1185,6 @@ fn copy_in_tui(tui: &mut Tui, args: &str) {
         Err(e) => tui.app_mut().push_item(TranscriptItem::Error {
             text: format!("Copy failed: {e}"),
         }),
-    }
-}
-
-/// T114: `/start-work [plan-name]` in the TUI — mirrors the CLI handler
-/// (`omo_start_work_slash`). Uses the OMO orchestrator runtime to resolve the
-/// plan / auto-resume, switch the agent to Atlas, and stash the context
-/// injection for the next submitted turn.
-fn handle_start_work_tui(tui: &mut Tui, agent: &mut Agent, args: &str) {
-    let cwd = std::path::PathBuf::from(tui.app().cwd.clone());
-    let omo_dir = cwd.join(".omo");
-    let session_id = tui.app().session_id.clone();
-    let plan_name_opt = if args.trim().is_empty() {
-        None
-    } else {
-        Some(args.trim())
-    };
-
-    match joey_omo::start_work(&omo_dir, &session_id, plan_name_opt) {
-        Ok(result) => {
-            let atlas_prompt = joey_omo::dispatch_system_prompt("atlas", agent.model());
-            agent.set_agent_identity(Some(atlas_prompt));
-            tui.app_mut().pending_context_injection = Some(result.context_injection);
-
-            if result.is_resume {
-                tui.app_mut().push_item(TranscriptItem::Notice {
-                    text: format!(
-                        "Resuming work on plan: {}",
-                        result
-                            .boulder
-                            .works
-                            .iter().rfind(|w| w.status == joey_omo::BoulderWorkStatus::Active)
-                            .map(|w| w.plan_name.as_str())
-                            .unwrap_or("unknown")
-                    ),
-                    kind: NoticeKind::Success,
-                });
-            } else {
-                tui.app_mut().push_item(TranscriptItem::Notice {
-                    text: "Started new work session. Atlas activated.".into(),
-                    kind: NoticeKind::Success,
-                });
-            }
-            tui.app_mut().push_item(TranscriptItem::Notice {
-                text: "Describe the work to begin, or just press Enter to start execution.".into(),
-                kind: NoticeKind::Info,
-            });
-        }
-        Err(msg) => {
-            tui.app_mut().push_item(TranscriptItem::Error { text: msg });
-            tui.app_mut().push_item(TranscriptItem::Notice {
-                text: "Use Prometheus (@plan) to create a plan first.".into(),
-                kind: NoticeKind::Info,
-            });
-        }
     }
 }
 

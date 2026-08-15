@@ -705,6 +705,7 @@ fn cli_flags_and_config_shapes_remain_valid() {
         max_tokens: None,
         stream: false,
         pass_session_id: false,
+        model_pinned: false,
     };
     assert_eq!(ac.model, "custom-flag-model");
 

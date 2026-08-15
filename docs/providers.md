@@ -189,8 +189,28 @@ entries exposing only `/v1/messages` route to the Anthropic wire.
   tool messages coalesced; tool ids sanitized.
 - Responses wire (Copilot): tools as `{type:"function", name, description,
   parameters, strict:false}` + `tool_choice:"auto"` +
-  `parallel_tool_calls:true`; history as `function_call` /
-  `function_call_output` items; args accumulated by item_id.
+  `parallel_tool_calls:true`; conversation history as
+  `{type:"message", role, content}` items (EVERY item carries
+  `type:"message"` — typeless items are silently dropped by the Responses
+  API and proxies, losing the whole conversation; regression-tested) plus
+  `function_call` / `function_call_output` items; the system prompt goes
+  to `instructions`, never the input array; args accumulated by item_id.
+
+## Model pinning (explicit choice wins)
+
+Dynamic model routing never rewrites an explicitly chosen model.
+`AgentConfig.model_pinned` is set by `--model` (REPL and oneshot),
+`/model` + `switch_model` at runtime, agent-picker switches, and
+delegation child configs (the delegation layer's resolution is
+authoritative). When pinned, NeuroCode tier routing (Mode 2) is skipped —
+it only applies to implicit/config-default models. The llm-selector
+(feature 011) is unaffected (it only engages on `model = "auto"`, which
+explicit flags replace).
+
+Note for the AI Usage HUD: GPT-5.6+ Copilot models only accept the
+`/responses` wire (400 on `/chat/completions`) — `model_api_mode`'s
+major-version routing (gpt-N with N≥5 → CodexResponses) handles this
+automatically.
 
 ## 8. `joey-llm-selector` — dynamic model allocation
 

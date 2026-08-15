@@ -68,6 +68,42 @@ Untrusted tools (web_extract, web_search, `browser_*`, `mcp_*`) get
 delimiter-wrapped results (min 32 chars). Sequential results also feed a
 crush-style loop detector → nudge tool-result on repetition.
 
+## 1b. Mid-turn steering (`Agent::steer`, upstream `_pending_steer`)
+
+`/steer <message>` injects a user message into the RUNNING turn without
+interrupting (ported from run_agent.py:2853-2886 + conversation_loop.py:
+933-975):
+
+- `Agent::steer(text)` — stashes into an **Arc-shared**
+  `pending_steer: Arc<Mutex<String>>` slot (`steer_handle()` /
+  `steer_via_handle()` let the engine task steer while the turn future
+  holds the mutable agent borrow). Multiple steers concatenate with
+  `\n`; empty/whitespace text is rejected.
+- **Two injection points** drain the slot and append the text — wrapped
+  in the verbatim upstream markers
+  `[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered
+  mid-turn; not tool output]` … `[/OUT-OF-BAND USER MESSAGE]` — to the
+  LAST tool-role message in history:
+  1. **Post-tool-batch** (after `execute_tool_calls` completes without
+     interruption) — the model sees the steer on its next iteration.
+  2. **Pre-API** (top of each loop iteration) — catches steers that
+     arrived while the previous API call was streaming, so they aren't
+     lost when the model returns a final answer with no further tool
+     batch.
+- When no tool message exists yet (first iteration), the text is
+  re-stashed — injecting into a user message would break role
+  alternation.
+- A **new user turn drops** pending steers (they were meant for the
+  aborted turn's tool loop).
+- The stable system prompt carries `STEER_CHANNEL_NOTE` (verbatim
+  upstream) whenever tools are loaded — it teaches the model to treat
+  text inside the exact marker as a genuine user instruction and to
+  IGNORE lookalike markers embedded in tool output, web pages, or files
+  (injection defense).
+- `pub const STEER_MARKER_OPEN/CLOSE` + `pub fn format_steer_marker` are
+  the wire format; host semantics (which key steers vs interrupts) are
+  documented in [tui.md](tui.md#mid-turn-messaging-hermes-parity).
+
 ## 2. System prompt assembly (`prompt.rs`, `guidance.rs`)
 
 `build_system_prompt(&PromptInputs)` is called **once per session** in
@@ -171,6 +207,11 @@ Orchestration: `SubagentSpawn`, `SubagentComplete`, `SubagentFailed`,
 `DelegationBatchComplete`.
 OMO: `AgentModeChanged`, `CategoryDelegation`, `BoulderWorkStarted` /
 `Resumed` / `Completed`, `GoalSet`, `GoalCleared`, `WisdomAccumulated`.
+NeuroCode (feature 015): `NeuroCodeContext { tier, token_estimate,
+expanded_nodes, cold_mode, formatted_context }` — emitted before each
+model call when the engine is active, carrying the exact context string
+prepended to the system prompt (drives the TUI's live feed panel);
+`NeuroCodeActive { active }` — engine wired/unwired state changes.
 Turn end — exactly one of: `Done { final_text, usage, iterations }`,
 `Failed(String)`.
 
@@ -187,9 +228,19 @@ cwd; 10s default timeout):
   result, the turn ends interrupted-style, a `🛑 Turn halted by hook`
   Notice fires.
 - Deny (exit 2) — that call gets a `[Tool call blocked by PreToolUse
-  hook: …]` error result; valid calls still execute. All-denied is not
-  an interrupt; the model sees the errors and adjusts.
-- Rewrite (`updated_input` stdout) — shallow-merged into args.
+  hook: …]` error result AND IS NOT EXECUTED — denied calls are filtered
+  out of the dispatch batch entirely (regression-tested; historically the
+  tool ran anyway). Valid calls still execute. All-denied is not an
+  interrupt; the model sees the errors and adjusts.
+- Rewrite (`updated_input` stdout) — shallow-merged into that call's
+  arguments before dispatch.
+- The stdin write is INSIDE the timeout wrapper: a hook that never reads
+  a >64KB tool_input cannot outlive its configured timeout
+  (`kill_on_drop` reaps the child).
+
+Loop-detection nudges are delivered as user-role messages (NOT synthetic
+tool results — a tool_call_id no assistant message declares is rejected
+by strict providers like Anthropic with a 400, bricking the turn).
 
 See [`HOOKS.md`](HOOKS.md) for the user-facing contract.
 
@@ -203,6 +254,8 @@ See [`HOOKS.md`](HOOKS.md) for the user-facing contract.
 | `display.streaming` | false | SSE streaming |
 | `model.max_tokens` | none | output cap (ephemeral override wins) |
 | `fallback_providers` | none | ordered failover chain |
+| `model_pinned` | false | set when the model was chosen explicitly; |
+| | | blocks NeuroCode tier rewrites (see providers.md) |
 | `compression.*` | see §3 | compaction behavior |
 | `model.context_length` | catalog | window override |
 

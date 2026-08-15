@@ -171,6 +171,10 @@ impl Subagent {
             max_tokens: parent_config.max_tokens,
             stream: parent_config.stream,
             pass_session_id: false,
+            // The child model was resolved by the delegation layer (per-task
+            // override or fallback chain) — that resolution is authoritative,
+            // so pin it against NeuroCode tier rewrites.
+            model_pinned: true,
         };
 
         let child_ctx = child_context(

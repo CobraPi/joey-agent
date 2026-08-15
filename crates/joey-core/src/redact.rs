@@ -440,11 +440,22 @@ fn canonical_url_param_name(name: &str) -> String {
     decoded.to_lowercase().replace('-', "_")
 }
 
+/// `SENSITIVE_QUERY_PARAMS` canonicalized exactly the way
+/// [`canonical_url_param_name`] canonicalizes live parameter names
+/// (lowercased, `-` → `_`), so dashed spellings like `x-amz-signature`
+/// match their underscored live form.
+static SENSITIVE_QUERY_PARAMS_CANON: Lazy<Vec<String>> = Lazy::new(|| {
+    SENSITIVE_QUERY_PARAMS
+        .iter()
+        .map(|p| p.to_lowercase().replace('-', "_"))
+        .collect()
+});
+
 /// Redact credentials from absolute, relative, and network URL references.
 /// Stricter than display/log redaction — used only at secret-egress boundaries.
 fn redact_strict_url_credentials(text: &str) -> String {
     let text = sub_all(&STRICT_URL_PARAM_RE, text, |caps| {
-        if !SENSITIVE_QUERY_PARAMS.contains(&canonical_url_param_name(group(caps, 2)).as_str()) {
+        if !SENSITIVE_QUERY_PARAMS_CANON.contains(&canonical_url_param_name(group(caps, 2))) {
             return group(caps, 0).to_string();
         }
         format!("{}{}=***", group(caps, 1), group(caps, 2))
@@ -928,6 +939,20 @@ mod tests {
     #[test]
     fn leaves_plain_text() {
         assert_eq!(redact("hello world"), "hello world");
+    }
+
+    #[test]
+    fn strict_url_redaction_handles_dashed_param_names() {
+        // `x-amz-signature` is declared sensitive, but
+        // `canonical_url_param_name` canonicalizes `-` to `_`, so the
+        // membership check compared "x_amz_signature" against a list that
+        // (before the fix) only contained the dashed spelling — the
+        // presigned-S3 signature leaked at strict-egress boundaries.
+        let opts = RedactOptions { force: true, redact_url_credentials: true, ..Default::default() };
+        let s = "https://s3.example.com/obj?X-Amz-Signature=abc123def456ghi789&X-Amz-Credential=AKIAABC";
+        let r = redact_sensitive_text_opts(s, opts);
+        assert!(!r.contains("abc123def456ghi789"), "signature must be redacted: {}", r);
+        assert!(r.contains("Signature=***") || r.contains("signature=***"), "param kept, value masked: {}", r);
     }
 
     /// Regression: `sub_all` must never panic on a runtime regex error

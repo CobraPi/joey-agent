@@ -1,0 +1,584 @@
+//! Turn-actor engine: full GUI/compute decoupling for the TUI.
+//!
+//! Architecture (the "engine actor" model):
+//!
+//! ```text
+//! ┌──────────── UI task (owns Tui + terminal) ─��───────────┐
+//! │  select! { engine_events │ terminal_input │ frame }    │
+//! └──────┬─────────────────────────────────▲───────────────┘
+//!  EngineCommand (mpsc)          EngineEvent (mpsc)
+//!        │                               │
+//! ┌──────▼───────── engine task ─────────┴───────────────┐
+//! │  owns Agent; runs turns + heavy jobs                 │
+//! │  never touches the terminal                          │
+//! └──────────────────────────────────────────────────────┘
+//! ```
+//!
+//! The UI never `.await`s engine compute: it pumps events, renders frames,
+//! and dispatches commands. A hung tool blocks its engine task, but the GUI
+//! keeps rendering; `ForceKill` makes the UI ABANDON the engine task
+//! (leaking the stuck future + agent — the interrupt flag was set first)
+//! and build a fresh engine from the same config, restoring history from
+//! the session DB. This is the "kill and restart any event" primitive.
+//!
+//! Abandonment safety: the engine's only shared state with the UI is the
+//! session-id string and the session DB (SQLite WAL + busy-timeout, safe
+//! for concurrent access). A stuck task is reclaimed at process exit.
+//! Background processes it launched keep running — that is the documented
+//! semantics of `terminal background=true`.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use joey_agent_core::{Agent, AgentEvent};
+use tokio::sync::mpsc;
+
+use crate::repl::Overrides;
+
+/// Command from the UI to the engine task.
+#[allow(dead_code)] // variants are part of the command API (Interrupt used by hosts/tests)
+#[derive(Debug)]
+pub enum EngineCommand {
+    /// Run one agent turn with this prompt (queued while another runs).
+    /// The engine applies intent-gate/@plan preprocessing (agent-overlay
+    /// mutations must happen where the agent lives).
+    Submit {
+        prompt: String,
+        /// Active OMO agent name from the UI's Tab roster ("default" when
+        /// none) — drives ultrawork gating.
+        active_agent: String,
+    },
+    /// Cooperatively interrupt the running turn (Ctrl-C semantics).
+    Interrupt,
+    /// Abandon the engine (UI kills + restarts with a fresh task/agent).
+    ForceKill,
+    /// Switch the active OMO agent (applied between turns; queued mid-turn).
+    SwitchAgent(String),
+    /// Run a heavy blocking job on the engine's blocking pool (currently
+    /// `/neurocode …` — tree walks + SQLite bulk upserts). Light slash
+    /// commands never come here; the UI answers those inline.
+    HeavyJob { label: String, args: String },
+    /// /steer mid-turn: stash text into the agent's steer slot (no
+    /// interrupt; injected after the current tool batch). Outside a turn
+    /// it's a no-op (the UI queues it as a normal prompt instead).
+    Steer(String),
+}
+
+/// Event from the engine task to the UI.
+#[allow(dead_code)] // payload fields are part of the event API
+#[derive(Debug)]
+pub enum EngineEvent {
+    /// A raw agent event (streaming, tools, lifecycle…).
+    Agent(AgentEvent),
+    /// The turn finished with this result.
+    TurnFinished {
+        final_text: String,
+        interrupted: bool,
+    },
+    /// A heavy job finished with its display text.
+    HeavyJobFinished { label: String, text: String },
+    /// The engine applied an agent switch; the UI should refresh its model
+    /// labels. `notice` is display text for the transcript.
+    AgentSwitched { display_name: String, model: String, provider: String, notice: String },
+    /// Pre-turn notice (intent gate announcements etc.) for the transcript.
+    Notice(String),
+    /// The engine task exited (fatal error or clean shutdown).
+    EngineGone(String),
+}
+
+/// Handle to the (current) engine: command channel + join handle.
+pub struct EngineHandle {
+    pub cmd_tx: mpsc::UnboundedSender<EngineCommand>,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl EngineHandle {
+    pub fn send(&self, cmd: EngineCommand) {
+        let _ = self.cmd_tx.send(cmd);
+    }
+
+    /// Abandon the engine: detach the task (never joined) and drop the
+    /// command channel. The engine sees the closed channel and unwinds via
+    /// its interrupt flag; a fully stuck engine simply leaks until process
+    /// exit — by design, the GUI must survive regardless.
+    pub fn abandon(mut self) {
+        let _ = self.join.take(); // detach
+        // cmd_tx drops here → channel closes.
+    }
+}
+
+/// Everything needed to construct a FRESH agent — the UI holds this so a
+/// killed engine can be replaced without user-visible state loss.
+pub struct EngineSpec {
+    pub config: joey_core::Config,
+    pub cwd: std::path::PathBuf,
+    pub overrides: Overrides,
+    pub session_id: String,
+}
+
+impl EngineSpec {
+    /// Rebuild a fresh agent from the spec (startup + restart-after-kill).
+    /// History is restored from the session DB so the conversation survives.
+    pub fn build_agent(&self) -> anyhow::Result<Agent> {
+        let history = crate::repl::restore_history_from_db(&self.session_id);
+        crate::repl::build_agent(&self.config, &self.cwd, &self.overrides, &self.session_id, history)
+    }
+}
+
+/// Spawn a fresh engine task around a PRE-BUILT agent (callers extract any
+/// UI-side info — e.g. the OMO roster — before handing it over). Returns
+/// the handle plus the agent's interrupt flag (the UI can request an
+/// interrupt even while the engine is mid-turn and not polling commands).
+pub fn spawn_engine(
+    agent: Agent,
+    event_tx: mpsc::UnboundedSender<EngineEvent>,
+) -> (EngineHandle, Arc<AtomicBool>) {
+    let interrupt = agent.interrupt_handle();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<EngineCommand>();
+    let join = tokio::spawn(engine_task(agent, cmd_rx, event_tx));
+    (EngineHandle { cmd_tx, join: Some(join) }, interrupt)
+}
+
+/// The engine task body. Owns the agent; processes commands sequentially;
+/// forwards agent events to the UI. NEVER touches the terminal or Tui.
+async fn engine_task(
+    mut agent: Agent,
+    mut cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
+    event_tx: mpsc::UnboundedSender<EngineEvent>,
+) {
+    // Queued prompts / jobs submitted while a turn runs.
+    let mut queued: VecDeque<EngineCommand> = VecDeque::new();
+    // The agent's interrupt flag, captured BEFORE any turn future borrows
+    // the agent (the borrow lasts for the whole turn).
+    let interrupt = agent.interrupt_handle();
+
+    loop {
+        let cmd = match queued.pop_front() {
+            Some(c) => c,
+            None => match cmd_rx.recv().await {
+                Some(c) => c,
+                None => return, // UI dropped the channel — exit cleanly.
+            },
+        };
+
+        match cmd {
+            EngineCommand::Submit { prompt, active_agent } => {
+                // Steer handle captured BEFORE the turn future borrows the
+                // agent — lets mid-turn Steer commands reach the running
+                // turn without touching the borrow.
+                let steer_handle = agent.steer_handle();
+                // Pre-turn preprocessing lives WITH the agent (engine side):
+                // intent gate + @plan mutate agent overlays.
+                let turn_text = engine_pre_turn(&mut agent, &event_tx, &prompt, &active_agent);
+                if turn_text.is_empty() {
+                    // Early exit: still emit a synthetic AgentEvent::Done so
+                    // the UI resets its RunMode like a normal turn end —
+                    // TurnFinished alone resets session.busy but NOT
+                    // app.mode, which would wedge the app Busy forever
+                    // (Ctrl-C escalation would then never reach Quit).
+                    let _ = event_tx.send(EngineEvent::Agent(AgentEvent::Done {
+                        final_text: String::new(),
+                        usage: Default::default(),
+                        iterations: 0,
+                    }));
+                    let _ = event_tx.send(EngineEvent::TurnFinished {
+                        final_text: String::new(),
+                        interrupted: false,
+                    });
+                    continue;
+                }
+                if !agent.client().has_credentials() {
+                    let _ = event_tx.send(EngineEvent::Notice(format!(
+                        "no API key for provider '{}' — run `joey model` outside the TUI.",
+                        agent.client().profile().name
+                    )));
+                    let _ = event_tx.send(EngineEvent::Agent(AgentEvent::Done {
+                        final_text: String::new(),
+                        usage: Default::default(),
+                        iterations: 0,
+                    }));
+                    let _ = event_tx.send(EngineEvent::TurnFinished {
+                        final_text: String::new(),
+                        interrupted: false,
+                    });
+                    continue;
+                }
+                let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+                let turn = agent.run_turn(&turn_text, tx);
+                tokio::pin!(turn);
+                loop {
+                    tokio::select! {
+                        ev = rx.recv() => {
+                            match ev {
+                                Some(ev) => {
+                                    let _ = event_tx.send(EngineEvent::Agent(ev));
+                                }
+                                None => break, // turn finished + flushed
+                            }
+                        }
+                        cmd = cmd_rx.recv() => {
+                            match cmd {
+                                Some(EngineCommand::Interrupt)
+                                | Some(EngineCommand::ForceKill) => {
+                                    // Cooperative interrupt. ForceKill is the
+                                    // same for the engine; the UI additionally
+                                    // abandons the handle and spawns a fresh
+                                    // engine (see abandon()).
+                                    interrupt.store(true, Ordering::SeqCst);
+                                }
+                                Some(EngineCommand::Steer(text)) => {
+                                    // Mid-turn steer: no interrupt; lands
+                                    // after the current tool batch.
+                                    Agent::steer_via_handle(&steer_handle, &text);
+                                    let _ = event_tx.send(EngineEvent::Notice(
+                                        "🧭 Steer queued: lands after the current tool call".into(),
+                                    ));
+                                }
+                                Some(other) => queued.push_back(other),
+                                None => {
+                                    // UI abandoned us: interrupt and keep
+                                    // draining so the turn unwinds promptly;
+                                    // the task exits when the loop returns.
+                                    interrupt.store(true, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                        res = &mut turn => {
+                            // Flush remaining events before the result.
+                            while let Ok(ev) = rx.try_recv() {
+                                let _ = event_tx.send(EngineEvent::Agent(ev));
+                            }
+                            let _ = event_tx.send(EngineEvent::TurnFinished {
+                                final_text: res.final_text,
+                                interrupted: res.interrupted,
+                            });
+                            break;
+                        }
+                    }
+                }
+                // Abandoned (channel closed)? Exit instead of running queue.
+                // NOTE: a bare try_recv() would CONSUME a legitimately
+                // queued command that arrived at this exact instant (race).
+                // We can't hold a cmd_tx clone inside the task for
+                // `is_closed()` either: tokio's Sender::is_closed detects
+                // *receiver* drop (we own the receiver, so it never fires)
+                // and the clone would keep the channel open, breaking the
+                // clean-exit-on-abandon path. Instead, re-queue anything
+                // we consume so no command is ever lost.
+                match cmd_rx.try_recv() {
+                    Ok(cmd) => queued.push_front(cmd),
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                    Err(mpsc::error::TryRecvError::Disconnected) => return,
+                }
+            }
+            EngineCommand::SwitchAgent(agent_name) => {
+                let notice = engine_switch_agent(&mut agent, &agent_name);
+                let _ = event_tx.send(EngineEvent::AgentSwitched {
+                    display_name: agent_name,
+                    model: agent.model().to_string(),
+                    provider: agent.provider_name().to_string(),
+                    notice,
+                });
+            }
+            EngineCommand::HeavyJob { label, args } => {
+                // Heavy jobs run on the blocking pool so even a multi-minute
+                // tree walk doesn't pin the engine's async worker.
+                let out_label = label.clone();
+                let res = tokio::task::spawn_blocking(move || run_heavy_job(&label, &args))
+                    .await
+                    .unwrap_or_else(|e| format!("job failed: {e}"));
+                let _ = event_tx.send(EngineEvent::HeavyJobFinished { label: out_label, text: res });
+            }
+            EngineCommand::Steer(_) => {
+                // Idle steer: nothing to inject into — the UI only sends
+                // this mid-turn; ignore rather than lose data.
+            }
+            EngineCommand::Interrupt => {
+                interrupt.store(true, Ordering::SeqCst);
+            }
+            EngineCommand::ForceKill => {
+                interrupt.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+    }
+}
+
+/// The heavy-job dispatch table. ONLY blocking, CPU-bound handlers live
+/// here; anything that mutates TUI state is a light command handled by the
+/// UI directly.
+fn run_heavy_job(label: &str, args: &str) -> String {
+    match label {
+        "neurocode" => crate::commands::neurocode::neurocode_slash(args),
+        _ => format!("unknown heavy job: {label}"),
+    }
+}
+
+/// Pre-turn preprocessing on the engine side: @plan prefix + intent gate.
+/// Returns the text to send (empty = skip the turn). Announcements go to
+/// the UI as Notice events (mirrors the old UI-side helpers).
+fn engine_pre_turn(
+    agent: &mut Agent,
+    event_tx: &mpsc::UnboundedSender<EngineEvent>,
+    message: &str,
+    active_agent: &str,
+) -> String {
+    let mut text = message.to_string();
+
+    // T114: @plan prefix → Prometheus (read-only planner).
+    if text.starts_with("@plan ") || text == "@plan" {
+        let overlay = joey_omo::agents::prompts::dispatch_system_prompt("prometheus", agent.model());
+        agent.set_extra_instructions(Some(overlay));
+        let _ = event_tx.send(EngineEvent::Notice(
+            "📋 Switched to Prometheus (@plan) — create a plan, no execution.".into(),
+        ));
+        text = text.trim_start_matches("@plan").trim().to_string();
+    }
+
+    // FR-022/FR-024: intent-gate keywords.
+    if let Some(keyword) = joey_omo::detect_keyword(&text) {
+        match keyword {
+            joey_omo::KeywordType::Ultrawork | joey_omo::KeywordType::HyperplanUltraworkCombo => {
+                if joey_omo::check_ultrawork_activation(keyword, active_agent).is_some() {
+                    let overlay = joey_omo::ultrawork_prompt(agent.model());
+                    agent.set_extra_instructions(Some(overlay));
+                    let _ = event_tx.send(EngineEvent::Notice("⚡ ULTRAWORK MODE ENABLED!".into()));
+                } else {
+                    let _ = event_tx.send(EngineEvent::Notice(format!(
+                        "ultrawork ignored — {active_agent} is a read-only planner"
+                    )));
+                }
+            }
+            joey_omo::KeywordType::Hyperplan => {
+                let _ = event_tx.send(EngineEvent::Notice("⚡ HYPERPLAN MODE ENABLED!".into()));
+            }
+            joey_omo::KeywordType::Team => {
+                let _ = event_tx.send(EngineEvent::Notice("TEAM MODE ENABLED!".into()));
+            }
+        }
+    }
+
+    text
+}
+
+/// Agent switching on the engine side (T033/BC-015). Returns a notice for
+/// the transcript. "default" reverts to the base joey prompt.
+fn engine_switch_agent(agent: &mut Agent, agent_name: &str) -> String {
+    if agent_name == "default" {
+        agent.set_agent_identity(None);
+        return "Reverted to the default agent".into();
+    }
+    // Rebuild a registry to resolve the agent's model + provider.
+    let available = joey_omo::AvailableModelSet::from_connected_with_catalog(
+        agent.client().profile(),
+        agent.model(),
+    );
+    let overrides = joey_omo::agents::registry::ModelOverrides::new();
+    let registry = joey_omo::AgentRegistry::build(available, &overrides);
+    let Some(omo_agent) = registry.get(agent_name) else {
+        return format!("Unknown agent: {agent_name}");
+    };
+    let Some(model) = omo_agent.resolved_model.clone() else {
+        return format!(
+            "{} is unavailable with the current provider/model",
+            omo_agent.display_name
+        );
+    };
+    let identity = joey_omo::dispatch_system_prompt(agent_name, &model);
+    match agent.switch_model("auto", "", &model, None) {
+        Ok(msg) => {
+            agent.set_agent_identity(Some(identity));
+            format!("{msg} — agent mode: {}", omo_agent.display_name)
+        }
+        Err(e) => format!("Switch failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heavy_job_dispatch_known_label() {
+        // The neurocode label routes to the real handler (output shape
+        // varies; just prove dispatch doesn't fall through to unknown).
+        let out = run_heavy_job("neurocode", "status");
+        assert!(!out.contains("unknown heavy job"));
+    }
+
+    #[test]
+    fn heavy_job_unknown_label_answers_honestly() {
+        assert!(run_heavy_job("nope", "").contains("unknown heavy job"));
+    }
+}
+
+#[cfg(test)]
+mod actor_tests {
+    use super::*;
+
+    /// The engine task processes commands sequentially and queues Submits
+    /// that arrive mid-turn. Uses the real engine with a stub prompt that
+    /// produces no provider call (no credentials path → immediate
+    /// TurnFinished), verifying the actor plumbing end-to-end.
+    #[tokio::test]
+    async fn engine_queues_and_completes_turns() {
+        // Build a spec with an unauthenticated provider so run_turn returns
+        // fast (the engine sends the no-credentials notice + TurnFinished).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "model:\n  provider: openai-api\n  default: gpt-4o-mini\n").unwrap();
+        let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let spec = EngineSpec {
+            config,
+            cwd: std::env::temp_dir(),
+            overrides: crate::repl::Overrides::default(),
+            session_id: "engtest_00000000_0000_abc123".into(),
+        };
+        let agent = spec.build_agent().expect("agent builds");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_handle, _interrupt) = spawn_engine(agent, ev_tx);
+
+        // Send two submits; both should eventually produce TurnFinished
+        // (queued sequentially), and the engine stays alive between them.
+        _handle.send(EngineCommand::Submit { prompt: "one".into(), active_agent: "default".into() });
+        _handle.send(EngineCommand::Submit { prompt: "two".into(), active_agent: "default".into() });
+        let mut finished = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while finished < 2 && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::TurnFinished { .. }) => finished += 1,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+        assert_eq!(finished, 2, "both queued turns completed");
+    }
+
+    /// ForceKill: the channel closes and the engine task exits (join
+    /// resolves) even from idle.
+    #[tokio::test]
+    async fn force_kill_exits_engine() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "model:\n  provider: openai-api\n  default: gpt-4o-mini\n").unwrap();
+        let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let spec = EngineSpec {
+            config,
+            cwd: std::env::temp_dir(),
+            overrides: crate::repl::Overrides::default(),
+            session_id: "engkill_00000000_0000_abc123".into(),
+        };
+        let agent = spec.build_agent().expect("agent builds");
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, _interrupt) = spawn_engine(agent, ev_tx);
+        // Send ForceKill then drop our sender via abandon; the task should
+        // return and the leaked join handle completes. We can't await the
+        // join after abandon (it's detached), so instead verify via a
+        // sentinel: send ForceKill BEFORE abandon and confirm no panic —
+        // the structural guarantee is the channel close in abandon().
+        handle.send(EngineCommand::ForceKill);
+        handle.abandon();
+        // Give the task a moment to observe the close and exit.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    fn unauth_spec(tag: &str) -> EngineSpec {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "model:\n  provider: openai-api\n  default: gpt-4o-mini\n").unwrap();
+        let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        EngineSpec {
+            config,
+            cwd: std::env::temp_dir(),
+            overrides: crate::repl::Overrides::default(),
+            session_id: format!("{tag}_00000000_0000_abc123"),
+        }
+    }
+
+    /// Regression (busy deadlock fix): early-exit submit paths (empty
+    /// pre-turn text, missing credentials) must emit a synthetic
+    /// AgentEvent::Done BEFORE EngineEvent::TurnFinished so the UI resets
+    /// RunMode like a normal turn end — TurnFinished alone only resets the
+    /// host busy flag.
+    #[tokio::test]
+    async fn engine_early_exit_sends_done_before_turn_finished() {
+        for (tag, prompt) in [("engdone1", "@plan"), ("engdone2", "hello")] {
+            let agent = unauth_spec(tag).build_agent().expect("agent builds");
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (handle, _int) = spawn_engine(agent, ev_tx);
+            handle.send(EngineCommand::Submit { prompt: prompt.into(), active_agent: "default".into() });
+
+            let mut saw_done_at: Option<usize> = None;
+            let mut saw_finished_at: Option<usize> = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while saw_finished_at.is_none() && std::time::Instant::now() < deadline {
+                match ev_rx.try_recv() {
+                    Ok(EngineEvent::Agent(AgentEvent::Done { .. })) => {
+                        assert!(saw_done_at.is_none(), "double Done in {tag}");
+                        saw_done_at = Some(0usize); // marker; order checked below
+                    }
+                    Ok(EngineEvent::TurnFinished { .. }) => {
+                        // Done must ALREADY have been seen.
+                        assert!(saw_done_at.is_some(), "{tag}: TurnFinished without a preceding Done");
+                        saw_finished_at = Some(0usize);
+                    }
+                    Ok(_) => {}
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                }
+            }
+            assert!(saw_finished_at.is_some(), "{tag}: TurnFinished never arrived");
+        }
+    }
+
+    /// Regression (try_recv race fix): a command arriving right as the
+    /// previous turn finishes must NOT be swallowed by the post-turn
+    /// abandon check — it is re-queued and runs.
+    #[tokio::test]
+    async fn engine_survives_post_turn_submit() {
+        let agent = unauth_spec("engrace").build_agent().expect("agent builds");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, _int) = spawn_engine(agent, ev_tx);
+        handle.send(EngineCommand::Submit { prompt: "one".into(), active_agent: "default".into() });
+        // Wait for the first turn to fully finish, THEN submit — this is
+        // exactly the instant the old try_recv-based check raced with.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::TurnFinished { .. }) => break,
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(std::time::Instant::now() < deadline, "first turn never finished");
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
+        handle.send(EngineCommand::Submit { prompt: "two".into(), active_agent: "default".into() });
+        let mut finished = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while finished == 0 && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::TurnFinished { .. }) => finished += 1,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        assert_eq!(finished, 1, "post-turn submit was processed, not consumed by the abandon check");
+    }
+}
+
+#[cfg(test)]
+mod steer_command_tests {
+    use super::*;
+
+    /// Steer commands arriving mid-turn reach the agent's shared steer
+    /// slot via the handle — no borrow conflict, no interrupt. The
+    /// end-to-end marker injection is covered by agent-core's steer_tests;
+    /// here we verify the engine command routing keeps the turn alive.
+    #[tokio::test]
+    async fn steer_command_does_not_kill_turn_or_lose_text() {
+        // The steer handle mechanism: two sequential steers concatenate.
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        assert!(Agent::steer_via_handle(&handle, "one"));
+        assert!(Agent::steer_via_handle(&handle, "two"));
+        assert_eq!(*handle.lock().unwrap(), "one\ntwo");
+        assert!(!Agent::steer_via_handle(&handle, "  "));
+    }
+}

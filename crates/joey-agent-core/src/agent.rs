@@ -31,6 +31,17 @@ use crate::compression::{self, ContextCompressor};
 use crate::events::AgentEvent;
 use crate::prompt::{build_system_prompt, PromptInputs};
 
+/// Mid-turn steer markers (upstream prompt_builder.py STEER_MARKER_OPEN/
+/// CLOSE). The wrapper attributes the text to the real user so the model
+/// treats it as a genuine instruction, not tool output / injection.
+pub const STEER_MARKER_OPEN: &str = "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered mid-turn; not tool output]";
+pub const STEER_MARKER_CLOSE: &str = "[/OUT-OF-BAND USER MESSAGE]";
+
+/// Wrap a mid-turn steer for appending to a tool result.
+pub fn format_steer_marker(steer_text: &str) -> String {
+    format!("\n\n{STEER_MARKER_OPEN}\n{steer_text}\n{STEER_MARKER_CLOSE}")
+}
+
 /// Retry-After cap: 600s (conversation_loop.py:4309-4317, #26293).
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(600);
 
@@ -97,6 +108,10 @@ pub struct AgentConfig {
     /// Include the `Session ID:` line in the system prompt (upstream
     /// `pass_session_id`, default off; `--pass-session-id`).
     pub pass_session_id: bool,
+    /// The model was chosen EXPLICITLY by the user (`--model` flag, `/model`
+    /// switch, agent picker). When true, dynamic model routing (NeuroCode
+    /// tier Mode 2) must NOT rewrite it — the user's choice always wins.
+    pub model_pinned: bool,
 }
 
 impl AgentConfig {
@@ -120,6 +135,7 @@ impl AgentConfig {
             max_tokens: None,
             stream: cfg.get_bool("display.streaming", false),
             pass_session_id: false,
+            model_pinned: false,
         }
     }
 }
@@ -243,6 +259,14 @@ pub struct Agent {
     synthetic_indices: std::collections::HashSet<usize>,
     /// Cooperative interrupt flag (upstream `_interrupt_requested`).
     interrupt: Arc<AtomicBool>,
+    /// Pending mid-turn /steer text (upstream `_pending_steer`): stashed by
+    /// the host, drained after the current tool batch and appended to the
+    /// last tool result wrapped in the out-of-band user-message marker.
+    /// Multiple steers concatenate with newlines; interrupts drop it.
+    /// Arc-shared so hosts can steer from another task while the turn
+    /// future holds the mutable agent borrow (steer is thread-safe by
+    /// design — upstream guards it with a lock for exactly this reason).
+    pending_steer: std::sync::Arc<std::sync::Mutex<String>>,
     fallback_chain: Vec<FallbackEntry>,
     fallback_index: usize,
     /// Consecutive turns whose tool calls were ALL invalid (3-strike abort).
@@ -380,6 +404,7 @@ impl Agent {
             session_id: None,
             synthetic_indices: std::collections::HashSet::new(),
             interrupt: Arc::new(AtomicBool::new(false)),
+            pending_steer: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             fallback_chain,
             fallback_index: 0,
             invalid_tool_strikes: 0,
@@ -525,6 +550,107 @@ impl Agent {
     /// (conversation_loop.py:726-731, 1707-1728, 3183-3196).
     pub fn interrupt_handle(&self) -> Arc<AtomicBool> {
         self.interrupt.clone()
+    }
+
+    /// Inject a user message into the next tool result WITHOUT interrupting
+    /// (upstream `steer`, run_agent.py:2853-2886). The text is stashed; the
+    /// turn loop appends it to the last tool result (wrapped in the
+    /// out-of-band marker) after the current tool batch / before the next
+    /// API call. Multiple steers concatenate with newlines. Empty text is
+    /// ignored (returns false).
+    pub fn steer(&self, text: &str) -> bool {
+        let cleaned = text.trim();
+        if cleaned.is_empty() {
+            return false;
+        }
+        let mut slot = self.pending_steer.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_empty() {
+            *slot = cleaned.to_string();
+        } else {
+            slot.push('\n');
+            slot.push_str(cleaned);
+        }
+        true
+    }
+
+    /// A shareable handle for hosts to call [`Agent::steer`] from another
+    /// task while a turn is running (the turn holds the agent borrow).
+    pub fn steer_handle(&self) -> std::sync::Arc<std::sync::Mutex<String>> {
+        self.pending_steer.clone()
+    }
+
+    /// Steer via a handle produced by [`Agent::steer_handle`] (same
+    /// semantics as [`Agent::steer`]).
+    pub fn steer_via_handle(handle: &std::sync::Arc<std::sync::Mutex<String>>, text: &str) -> bool {
+        let cleaned = text.trim();
+        if cleaned.is_empty() {
+            return false;
+        }
+        let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_empty() {
+            *slot = cleaned.to_string();
+        } else {
+            slot.push('\n');
+            slot.push_str(cleaned);
+        }
+        true
+    }
+
+    /// Drain and return the pending steer text (empty string when none).
+    /// Called by the turn loop at the injection points.
+    fn drain_pending_steer(&self) -> String {
+        let mut slot = self.pending_steer.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut *slot)
+    }
+
+    /// Drain any pending steer and append it (wrapped in the out-of-band
+    /// marker) to the LAST tool-role message in history. When no tool
+    /// message exists yet (first iteration), the text is re-stashed —
+    /// injecting into a user message would break role alternation
+    /// (upstream apply_pending_steer_to_tool_results + pre-API drain).
+    fn apply_pending_steer_to_last_tool_result(&mut self) {
+        let text = self.drain_pending_steer();
+        if text.is_empty() {
+            return;
+        }
+        // Find the last tool-role message.
+        let target = self.history.iter().rposition(|m| m.role == "tool");
+        match target {
+            Some(idx) => {
+                let marker = format_steer_marker(&text);
+                if let Some(m) = self.history.get_mut(idx) {
+                    let appended = match &m.content {
+                        Some(c) => format!("{c}{marker}"),
+                        None => marker,
+                    };
+                    m.content = Some(appended);
+                }
+                tracing::debug!(
+                    target: "joey_agent",
+                    "steer injected into tool result at index {idx}"
+                );
+            }
+            None => {
+                // No tool message to piggyback on — keep it pending for the
+                // post-tool-batch injection point.
+                self.restore_pending_steer(&text);
+            }
+        }
+    }
+
+    /// Put text back into the steer slot (injection point found no tool
+    /// message to piggyback on — upstream re-stashes for the next chance).
+    fn restore_pending_steer(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut slot = self.pending_steer.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_empty() {
+            *slot = text.to_string();
+        } else {
+            slot.push('\n');
+            slot.push_str(text);
+        }
     }
 
     fn interrupted(&self) -> bool {
@@ -829,6 +955,10 @@ impl Agent {
         }
         let client = build_client(provider, base_url, model, api_key.clone())?;
         let old_model = std::mem::replace(&mut self.config.model, model.to_string());
+        // An explicit runtime switch pins the model — dynamic routing
+        // (NeuroCode tier Mode 2) must not silently rewrite the user's
+        // choice on the next turn.
+        self.config.model_pinned = true;
         let old_provider =
             std::mem::replace(&mut self.provider_name, client.profile().name.to_string());
         self.config.provider = provider.to_string();
@@ -1018,13 +1148,18 @@ impl Agent {
         }
         // Feature 015 (NeuroCode Mode 2): when 011 is not active but NeuroCode
         // is, resolve the tier model from config. Falls back to config.model
-        // when the tier model is unconfigured or NeuroCode is off.
-        if let Some(engine) = &self.neurocode_engine {
-            if engine.is_active() {
-                // The context was already assembled by apply_neurocode_intercept.
-                // Mode 2: NeuroCode resolves the tier model from its own config.
-                if let Some(model_id) = engine.resolve_tier_model() {
-                    return model_id;
+        // when the tier model is unconfigured or NeuroCode is off. An
+        // EXPLICITLY chosen model (model_pinned: --model flag, /model switch,
+        // agent picker) always wins — tier routing only applies to implicit/
+        // config-default models.
+        if !self.config.model_pinned {
+            if let Some(engine) = &self.neurocode_engine {
+                if engine.is_active() {
+                    // The context was already assembled by apply_neurocode_intercept.
+                    // Mode 2: NeuroCode resolves the tier model from its own config.
+                    if let Some(model_id) = engine.resolve_tier_model() {
+                        return model_id;
+                    }
                 }
             }
         }
@@ -1513,6 +1648,13 @@ impl Agent {
         }
         // Per-turn resets.
         self.interrupt.store(false, Ordering::SeqCst);
+        // A turn interrupted by a NEW USER MESSAGE drops pending steers —
+        // they were meant for the interrupted turn's tool loop, which will
+        // no longer happen (run_agent.py:2845-2851).
+        {
+            let mut slot = self.pending_steer.lock().unwrap_or_else(|p| p.into_inner());
+            slot.clear();
+        }
         self.ctx.state().memory_consolidation_failures = 0;
         self.invalid_tool_strikes = 0;
         self.loop_detector.reset();
@@ -1608,6 +1750,14 @@ impl Agent {
                 });
                 return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true };
             }
+
+            // ── Pre-API /steer drain (conversation_loop.py:933-975) ────────
+            // A steer that arrived while the previous API call was streaming
+            // is injected now — before the next request — so the model sees
+            // it on THIS iteration. Without this, a steer sent during an API
+            // call would only land after the NEXT tool batch, which may
+            // never come if the model returns a final response.
+            self.apply_pending_steer_to_last_tool_result();
 
             // ── Pre-API pressure check (conversation_loop.py:1110-1185): a
             // single turn can grow by many large tool results and leave no
@@ -1849,6 +1999,14 @@ impl Agent {
                 // Successful tool round: re-arm the post-tool empty nudge
                 // (conversation_loop.py:4995).
                 post_tool_empty_retried = false;
+                if !batch_interrupted {
+                    // ── /steer injection (upstream apply_pending_steer_
+                    // to_tool_results): append pending steer text to the
+                    // LAST tool result so the model sees the user's mid-turn
+                    // message on the next iteration. Role alternation is
+                    // preserved — only existing tool content is modified.
+                    self.apply_pending_steer_to_last_tool_result();
+                }
                 if batch_interrupted {
                     self.close_interrupted_tool_sequence("");
                     let _ = tx.send(AgentEvent::Done {
@@ -2103,9 +2261,14 @@ impl Agent {
         // ── PreToolUse hooks (crush-style) ───────────────────────────────
         // Run hooks for each tool call before execution. Halt stops the turn;
         // Deny returns an error result to the model for that call.
+        // Last hook aggregate's input rewrite for this batch (applied to the
+        // executed calls below). Shared via a Mutex so the hooks loop can
+        // record it while borrowing `self.hooks`.
+        let hooks_last_updated_input: std::sync::Mutex<Option<Value>> =
+            std::sync::Mutex::new(None);
+        let mut denied_calls: Vec<(usize, String)> = Vec::new();
         if let Some(ref hooks) = self.hooks {
             if !hooks.is_empty() {
-                let mut denied_calls: Vec<(usize, String)> = Vec::new();
                 for (idx, tc) in tool_calls.iter().enumerate() {
                     let args: Value = serde_json::from_str(&tc.function.arguments)
                         .unwrap_or(Value::Null);
@@ -2145,6 +2308,10 @@ impl Agent {
                             agg.reasons.join("; ")
                         };
                         denied_calls.push((idx, reason));
+                    } else if agg.updated_input.is_some() {
+                        *hooks_last_updated_input
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = agg.updated_input.clone();
                     }
                 }
                 // Emit error results for denied calls.
@@ -2162,22 +2329,54 @@ impl Agent {
                         None,
                     );
                 }
-                if !denied_calls.is_empty() {
-                    // If all calls were denied, return false (not interrupted).
-                    // The model will see the error results and adjust.
-                    if denied_calls.len() == tool_calls.len() {
-                        return false;
-                    }
-                    // Otherwise, filter out denied calls and continue with the rest.
-                    // We can't mutate the slice, so we handle this below by
-                    // skipping denied indices during execution.
-                }
-                let _ = &denied_calls; // suppress unused warning if empty
             }
         }
 
-        let segments = plan_tool_segments(tool_calls);
-        let total = tool_calls.len();
+        // Filter hook-denied calls out of the executed batch (their error
+        // results were already pushed above) and apply input rewrites.
+        let denied_ids: std::collections::HashSet<&str> = denied_calls
+            .iter()
+            .map(|(idx, _)| tool_calls[*idx].id.as_str())
+            .collect();
+        let rewritten: Vec<ToolCall> = if let Some(ref hooks) = self.hooks {
+            if !hooks.is_empty() {
+                let patch = hooks_last_updated_input
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take();
+                tool_calls
+                    .iter()
+                    .filter(|tc| !denied_ids.contains(tc.id.as_str()))
+                    .map(|tc| {
+                        let mut tc = tc.clone();
+                        if let Some(patch) = &patch {
+                            if let Some(obj) = patch.as_object() {
+                                let mut args: Value =
+                                    serde_json::from_str(&tc.function.arguments)
+                                        .unwrap_or_else(|_| serde_json::json!({}));
+                                if let Some(args_obj) = args.as_object_mut() {
+                                    for (k, v) in obj {
+                                        args_obj.insert(k.clone(), v.clone());
+                                    }
+                                    tc.function.arguments = args.to_string();
+                                }
+                            }
+                        }
+                        tc
+                    })
+                    .collect()
+            } else {
+                tool_calls.to_vec()
+            }
+        } else {
+            tool_calls.to_vec()
+        };
+        if rewritten.is_empty() {
+            return false;
+        }
+
+        let segments = plan_tool_segments(&rewritten);
+        let total = rewritten.len();
         let mut executed = 0usize;
 
         for (parallel, calls) in segments {
@@ -2275,12 +2474,12 @@ impl Agent {
                         let _ = tx.send(AgentEvent::Notice(
                             "🔁 Loop detected — injecting nudge to change approach".into()
                         ));
-                        // Inject the nudge as a user-role tool result so the
-                        // model sees it on the next iteration.
+                        // Inject the nudge as a user-role message. It must NOT
+                        // be a tool result: its tool_call_id would be declared
+                        // by no assistant message, which strict providers
+                        // reject with a 400.
                         self.push_message(
-                            Message::tool_result(
-                                format!("{}_loop_nudge", tc.id),
-                                "loop_detection",
+                            Message::user(
                                 crate::loop_detection::LoopDetector::nudge_message().to_string(),
                             ),
                             None,
@@ -2289,7 +2488,7 @@ impl Agent {
 
                     // Interrupt between sequential calls: skip the rest
                     if self.interrupted() && executed < total {
-                        let remaining: Vec<&ToolCall> = tool_calls[executed..].iter().collect();
+                        let remaining: Vec<&ToolCall> = rewritten[executed..].iter().collect();
                         let _ = tx.send(AgentEvent::Notice(format!(
                             "⚡ Interrupt: skipping {} remaining tool call(s)",
                             remaining.len()
@@ -2312,7 +2511,7 @@ impl Agent {
                             .sleep_with_interrupt(Duration::from_secs_f64(self.config.tool_delay))
                             .await
                     {
-                            let remaining: Vec<&ToolCall> = tool_calls[executed..].iter().collect();
+                            let remaining: Vec<&ToolCall> = rewritten[executed..].iter().collect();
                             for skipped in remaining {
                                 let content = format!(
                                     "[Tool execution skipped — {} was not started. User sent a new message]",
@@ -3012,6 +3211,7 @@ mod tests {
             max_tokens: None,
             stream: false,
             pass_session_id: false,
+            model_pinned: false,
         };
         let mut agent = Agent::new(config, registry, ctx).expect("agent");
         let transport = ScriptedTransport::new(script);
@@ -3347,6 +3547,136 @@ mod tests {
         )));
     }
 
+
+    // ── Audit 2026-08: hook-denial + loop-nudge regressions ───────────
+
+    /// A PreToolUse hook Deny on a subset of a batch must prevent execution
+    /// of the denied call; only the error result the hook produced may be
+    /// recorded. (The old code pushed the deny result and then executed the
+    /// tool anyway.)
+    #[tokio::test]
+    async fn hook_denied_tool_is_not_executed() {
+        let _l = lock();
+        let exec_flag = Arc::new(Mutex::new(false));
+        struct FlagTool(Arc<Mutex<bool>>);
+        #[async_trait]
+        impl Tool for FlagTool {
+            fn name(&self) -> &str { "flager" }
+            fn toolset(&self) -> &str { "test" }
+            fn description(&self) -> &str { "records execution" }
+            fn parameters(&self) -> Value {
+                json!({"type": "object", "properties": {}})
+            }
+            async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
+                *self.0.lock().unwrap() = true;
+                ToolResult::Text("ran".to_string())
+            }
+        }
+        let mut fx = fixture(
+            vec![
+                Ok(tool_resp(
+                    vec![
+                        ToolCall::new("c1", "flager", "{}"),
+                        ToolCall::new("c2", "echo", r#"{"text": "ok"}"#),
+                    ],
+                    FinishReason::ToolCalls,
+                )),
+                Ok(text_resp("done")),
+            ],
+            10,
+            3,
+            Some(Arc::new(FlagTool(exec_flag.clone()))),
+        );
+        let hooks = crate::hooks::PreToolUseRunner::new(
+            vec![crate::hooks::HookConfig {
+                name: "deny-flager".into(),
+                event: crate::hooks::EVENT_PRE_TOOL_USE.into(),
+                matcher: "flager".into(),
+                command: "exit 2".into(),
+                timeout_secs: None,
+            }],
+            "/tmp",
+        );
+        fx.agent.set_hooks(Some(hooks));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        assert!(
+            !*exec_flag.lock().unwrap(),
+            "denied tool must NOT execute"
+        );
+        // The deny error result IS recorded for the model.
+        let deny_row = fx
+            .agent
+            .history()
+            .iter()
+            .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("c1"))
+            .expect("deny result recorded");
+        assert!(deny_row
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("blocked by PreToolUse hook"));
+        let _ = drain(&mut rx);
+    }
+
+    /// The loop-detection nudge must be delivered as a user-role message
+    /// (or another valid position), NOT a tool result whose tool_call_id was
+    /// never declared by any assistant message — strict providers reject
+    /// unknown tool_call_ids with a 400.
+    #[tokio::test]
+    async fn loop_nudge_is_not_a_phantom_tool_result() {
+        let _l = lock();
+        let exec_count = Arc::new(Mutex::new(0u32));
+        struct CountTool(Arc<Mutex<u32>>);
+        #[async_trait]
+        impl Tool for CountTool {
+            fn name(&self) -> &str { "counter" }
+            fn toolset(&self) -> &str { "test" }
+            fn description(&self) -> &str { "counts" }
+            fn parameters(&self) -> Value {
+                json!({"type": "object", "properties": {}})
+            }
+            async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
+                let mut n = self.0.lock().unwrap();
+                *n += 1;
+                // Identical output every call so the loop signature repeats.
+                ToolResult::Text("same output".to_string())
+            }
+        }
+        // 7 identical tool-call responses, then a final text answer. With
+        // window=10/max=5 defaults, the 6th identical call trips the nudge.
+        let mut script = Vec::new();
+        for i in 0..7 {
+            script.push(Ok(tool_resp(
+                vec![ToolCall::new(format!("c{}", i), "counter", "{}")],
+                FinishReason::ToolCalls,
+            )));
+        }
+        script.push(Ok(text_resp("done")));
+        let mut fx = fixture(script, 20, 3, Some(Arc::new(CountTool(exec_count.clone()))));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        // Every tool message must reference a tool_call_id declared by some
+        // assistant message.
+        let declared: std::collections::HashSet<String> = fx
+            .agent
+            .history()
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().map(|tc| tc.id.clone()))
+            .collect();
+        for m in fx.agent.history().iter().filter(|m| m.role == "tool") {
+            let id = m.tool_call_id.clone().unwrap_or_default();
+            assert!(
+                declared.contains(&id),
+                "tool result with undeclared id {:?} (loop nudge phantom)",
+                id
+            );
+        }
+        let _ = drain(&mut rx);
+    }
+
     /// Empty responses with no prior tool call retry 3x then fail honestly
     /// with "(empty)" (conversation_loop.py:5333-5433).
     #[tokio::test]
@@ -3667,6 +3997,7 @@ mod tests {
             max_tokens: None,
             stream: false,
             pass_session_id: false,
+            model_pinned: false,
         };
         let mut agent = Agent::new(config, registry, ctx).expect("agent");
         let transport = CyclingTransport::new();
@@ -4015,5 +4346,89 @@ mod tests {
             base_before,
             "the base system_prompt field must NEVER be mutated by the intercept"
         );
+    }
+
+    mod steer_tests {
+        use super::*;
+
+        /// The injection helper: pending steer -> appended to last tool msg
+        /// with the marker; original tool output preserved; applied once.
+        #[tokio::test]
+        async fn injection_helper_appends_marker_to_last_tool_result() {
+            let mut fx = fixture(
+                vec![
+                    Ok(tool_resp(
+                        vec![ToolCall::new("c1", "echo", r#"{"text":"hi"}"#)],
+                        FinishReason::ToolCalls,
+                    )),
+                    Ok(text_resp("done")),
+                ],
+                10,
+                3,
+                None,
+            );
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let _ = fx.agent.run_turn("start", tx).await;
+            fx.agent.steer("USE BLUE PAINT");
+            fx.agent.apply_pending_steer_to_last_tool_result();
+            let injected = fx
+                .agent
+                .history()
+                .iter()
+                .rev()
+                .find(|m| m.role == "tool")
+                .and_then(|m| m.content.clone())
+                .unwrap_or_default();
+            assert!(injected.contains(STEER_MARKER_OPEN), "marker present");
+            assert!(injected.contains("USE BLUE PAINT"));
+            assert!(injected.contains(STEER_MARKER_CLOSE));
+            assert!(injected.contains("hi"), "original tool output preserved");
+            fx.agent.apply_pending_steer_to_last_tool_result();
+            let count = fx
+                .agent
+                .history()
+                .iter()
+                .filter(|m| m.role == "tool" && m.content.as_deref().map(|c| c.contains("USE BLUE PAINT")).unwrap_or(false))
+                .count();
+            assert_eq!(count, 1, "steer applied exactly once");
+        }
+
+        /// Steer with no tool message in history: re-stashed, not dropped.
+        #[tokio::test]
+        async fn steer_without_tool_message_is_restashed() {
+            let mut fx = fixture(vec![Ok(text_resp("ok"))], 10, 3, None);
+            fx.agent.steer("LATER");
+            fx.agent.apply_pending_steer_to_last_tool_result();
+            assert_eq!(fx.agent.drain_pending_steer(), "LATER");
+        }
+
+        /// steer() API: empty rejected, multiple concatenate with newlines.
+        #[tokio::test]
+        async fn steer_api_concatenates_and_rejects_empty() {
+            let mut fx = fixture(vec![Ok(text_resp("ok"))], 10, 3, None);
+            assert!(!fx.agent.steer("   "));
+            assert!(fx.agent.steer("first"));
+            assert!(fx.agent.steer("second"));
+            assert_eq!(fx.agent.drain_pending_steer(), "first\nsecond");
+        }
+
+        /// A NEW user turn drops steers stashed for the aborted turn.
+        #[tokio::test]
+        async fn new_turn_clears_pending_steer() {
+            let mut fx = fixture(vec![Ok(text_resp("ok"))], 10, 3, None);
+            fx.agent.steer("STALE");
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let _ = fx.agent.run_turn("fresh", tx).await;
+            assert_eq!(fx.agent.drain_pending_steer(), "", "cleared on new turn");
+        }
+
+        /// The steer marker format matches upstream prompt_builder.py.
+        #[test]
+        fn steer_marker_format() {
+            let m = format_steer_marker("hello");
+            assert!(m.starts_with("\n\n[OUT-OF-BAND USER MESSAGE"));
+            assert!(m.contains("hello"));
+            assert!(m.ends_with("[/OUT-OF-BAND USER MESSAGE]"));
+        }
     }
 }

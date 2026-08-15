@@ -240,9 +240,15 @@ server availability and hidden otherwise. See `docs/LSP.md`.
 - Default excludes (build output, deps, VCS metadata, caches, virtualenvs,
   media, secrets, logs) via store `info/exclude`.
 - Every git subprocess isolated from global/system git config, 5s timeout.
-- Retention: ≤50 snapshots/project, 2GB total store cap (oldest-first),
-  90-day stale-project window, orphan pruning; legacy per-session shadow
-  repos discarded opportunistically.
+- Retention: ≤50 snapshots/project, 2GB total store cap, 90-day
+  stale-project window — pruning always keeps the **newest** N (per
+  project) / newest-tail (size cap), dropping the OLDEST via a
+  chain-rebuild (`git commit-tree` reconstruction of the kept chain +
+  `reflog expire` + `gc --prune=now`). The size-cap pruner drops the
+  globally-oldest checkpoint one at a time, never a project's last
+  snapshot, and runs gc inside the loop so progress is observable.
+  (Historical bug: both pruners were inverted, deleting the newest
+  snapshots — fixed with real-git regression tests.)
 - API: `checkpoint(msg)`, `list()`, `revert(number)`, `cleanup()`,
   `is_enabled()` (requires `git` on PATH), `repo_path()`.
 
@@ -253,7 +259,33 @@ and a `ChangeSummary` for session change detection and `/diff`-style display;
 
 ---
 
-## 8. Sanitizer, guards, and threat-scan integration
+## 8. Smart-completion engine (src/completion.rs)
+
+Shared by the CLI (reedline completer/hinter) and the TUI (popups), ported
+from upstream `hermes_cli/commands.py::SlashCommandCompleter`:
+
+- `pipe_subcommands` — extracts first-argument subcommands from a command's
+  pipe-encoded args_hint (`[on|off|status]`).
+- `extract_path_word` / `extract_context_word` — detect the word under the
+  cursor as a path-like token (./ ../ ~/ / or containing `/`, URLs
+  excluded) or an `@` token.
+- `path_completions` — directory listings, prefix-filtered
+  (case-insensitive), dirs first with trailing `/`, compact size labels
+  (`9B`/`4K`/`1.2M`).
+- `STATIC_CONTEXT_REFS` — `@diff`, `@staged`, `@file:`, `@folder:`,
+  `@git:`, `@url:`; `@file:`/`@folder:` delegate to filtered listings
+  (files-only / dirs-only).
+- `CompletionEngine` — Arc-backed, cloneable project-file cache (rg first,
+  fd fallback, 2s subprocess timeout with a dedicated stdout-drain thread —
+  listings >64KB pipe buffer can't deadlock it), 5s TTL, 5000-entry cap.
+  `project_files_blocking` (CLI Tab budget) vs `project_files_stale_ok`
+  (TUI: returns stale data instantly, refreshes on a background thread).
+- `fuzzy_file_completions` + `score_path` — upstream's exact scoring tiers
+  (exact=100, prefix=80, substring=60, path=40, boundary-initials=35/25).
+
+---
+
+## 9. Sanitizer, guards, and threat-scan integration
 
 - **Schema sanitizer** (src/sanitize.rs, port of schema_sanitizer.py): fixes
   constructs strict backends reject — bare-string schemas, missing

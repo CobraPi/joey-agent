@@ -50,7 +50,10 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
   Flash/Standard/Versatile/Frontier tiers, with a diagnoser, budgets, and
   persisted allocations. → [providers.md](providers.md)
 - NeuroCode tiered routing (`/neurocode` command family) for
-  code-aware context injection. → [providers.md](providers.md)
+  code-aware context injection, with a live context-feed panel and
+  active badge in the TUI, and **natural-language ingest**
+  (`/neurocode ingest <free text>` → agent turn locates/writes the
+  source and calls `neurocode_ingest`). → [providers.md](providers.md)
 
 ## Multi-agent
 
@@ -63,13 +66,44 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
 
 ## Interfaces
 
-- Line REPL with 80+ registered slash commands (~30 implemented), prefix
-  expansion, Tab completion. → [cli.md](cli.md)
+- Line REPL with 90+ registered slash commands (42 implemented incl. the
+  12 spec-kit ones), prefix expansion, smart Tab completion (see below).
+  → [cli.md](cli.md)
 - Animated ratatui TUI (`--tui`): synthwave theme, streaming transcript,
-  reasoning panel, agent picker, activity-scaled animations.
-  → [tui.md](tui.md)
+  reasoning panel, agent picker, activity-scaled animations, NeuroCode
+  live context panel. → [tui.md](tui.md)
+- **Smart completions on both surfaces** (Hermes parity): slash
+  command/subcommand popups, Claude-Code-style `@` context refs with fuzzy
+  project-wide file search, path completions, and CLI fish-style ghost-text
+  hints (slash remainders + history fallback). One shared engine
+  (`joey-tools::completion`), background-refreshed file cache.
+  → [tui.md](tui.md#smart-completions-hermes-parity)
+- **Full GUI/compute decoupling** (TUI engine-actor model): all compute —
+  turns, tool calls, heavy jobs — runs on a dedicated engine task; the GUI
+  never blocks on it. Ctrl-C escalation: 1st press interrupts, 2nd press
+  force-kills and restarts the engine with history restored — even a
+  hard-stuck tool can't freeze the UI. → [tui.md](tui.md#guicompute-decoupling-engine-actor-model)
+- **Mid-turn messaging (Hermes parity)**: plain message mid-turn
+  interrupts and runs next; `/steer` injects into the running turn
+  (out-of-band user-message marker, no interrupt); `/queue` defers to the
+  next turn.
+- **Shared input history**: `~/.joey/.joey_history` — one reedline-format
+  file for both CLI and TUI, lock-guarded and atomically written; ↑/↓
+  recall in both surfaces.
 - One-shot mode (`-z/--oneshot`) for scripting, with `--usage-file` JSON
-  reports.
+  reports. Explicit `--model`/`--provider` pin the choice — dynamic model
+  routing (NeuroCode tiers, llm-selector) never rewrites an explicit pick.
+- **Expandable transcript blocks**: every tool call, terminal command, and
+  file diff expands in place (collapsed = first 10 lines / last 50 diff
+  lines; expanded = full output tail with affordance). Toggle by mouse
+  click or **Space/x** in transcript focus. → [tui.md](tui.md#expandable-tool-terminal-and-diff-blocks)
+- **Spec-kit workflow slash commands**: the full lifecycle
+  (`/speckit-specify` → `/speckit-clarify` → `/speckit-plan` →
+  `/speckit-tasks` → `/speckit-analyze` → `/speckit-implement` →
+  `/speckit-converge`, plus constitution/checklist/taskstoissues/status/
+  help) as native commands — real `.specify/` pre-flight scripts + bundled
+  skill workflows executed as agent turns.
+  → [speckit-workflow.md](speckit-workflow.md)
 - SpecKit Visual UI (`joey speckit`): browser UI over `.specify/`
   artifacts, files stay source of truth. → [speckit-ui.md](speckit-ui.md)
 
@@ -101,7 +135,7 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
 
 Recognized but stubbed ("not available yet", exit 1): most `skills`
 subcommands (only `list` works), `mcp serve/catalog/...`, `config
-check/migrate`, `cron edit/runs/history`, ~50 REPL slash commands
+check/migrate`, `cron edit/runs/history`, ~49 REPL slash commands
 (/save, /retry, /undo, /title, /browser, /plugins, …), browser_* /
 vision_analyze / execute_code / computer_use / ha_* / kanban_* tools,
 Anthropic-OAuth subscription login (deliberately omitted), gateway

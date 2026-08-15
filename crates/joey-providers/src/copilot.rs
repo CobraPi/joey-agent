@@ -825,6 +825,49 @@ pub fn model_reasoning_efforts(model: &str, catalog_entry: Option<&Value>) -> Ve
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Test-env guard: serialize via TEST_ENV_LOCK, save the two endpoint env
+/// vars, clear them, and restore on drop. Prevents the DEVELOPER'S real
+/// environment (e.g. an exported AI_USAGE_HUD_BASE_URL) from leaking into
+/// endpoint-resolution assertions — the class of failure where tests pass
+/// on CI but fail on a configured machine (or vice versa). Field order
+/// matters: env restore happens in Drop BEFORE the lock releases.
+#[cfg(test)]
+pub(crate) struct EndpointEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    copilot: Option<String>,
+    hud: Option<String>,
+}
+
+#[cfg(test)]
+impl EndpointEnvGuard {
+    pub(crate) fn new() -> Self {
+        // TEST_ENV_LOCK is a static, so the guard's lifetime is 'static —
+        // no transmute needed. Held for the guard's life = env mutations
+        // stay serialized across tests.
+        let lock = TEST_ENV_LOCK.lock().unwrap();
+        let copilot = std::env::var("COPILOT_API_BASE_URL").ok();
+        let hud = std::env::var("AI_USAGE_HUD_BASE_URL").ok();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+        Self { _lock: lock, copilot, hud }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EndpointEnvGuard {
+    fn drop(&mut self) {
+        for (k, v) in [
+            ("COPILOT_API_BASE_URL", &self.copilot),
+            ("AI_USAGE_HUD_BASE_URL", &self.hud),
+        ] {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,7 +941,7 @@ mod tests {
 
     #[test]
     fn custom_endpoint_detects_off_githubcopilot_host() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = EndpointEnvGuard::new();
         std::env::set_var("COPILOT_API_BASE_URL", "http://127.0.0.1:8317");
         assert_eq!(
             custom_endpoint().as_deref(),
@@ -909,7 +952,7 @@ mod tests {
 
     #[test]
     fn custom_endpoint_ignores_real_copilot_host() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = EndpointEnvGuard::new();
         std::env::set_var("COPILOT_API_BASE_URL", "https://api.githubcopilot.com");
         assert_eq!(custom_endpoint(), None);
         std::env::set_var("COPILOT_API_BASE_URL", "https://proxy.enterprise.githubcopilot.com");
@@ -919,7 +962,7 @@ mod tests {
 
     #[test]
     fn custom_endpoint_ignores_empty_and_unset() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = EndpointEnvGuard::new();
         std::env::set_var("COPILOT_API_BASE_URL", "  ");
         assert_eq!(custom_endpoint(), None);
         std::env::remove_var("COPILOT_API_BASE_URL");
@@ -930,7 +973,7 @@ mod tests {
 
     #[test]
     fn hud_endpoint_resolves_off_githubcopilot_host() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = EndpointEnvGuard::new();
         std::env::remove_var("COPILOT_API_BASE_URL");
         std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317/");
         // Trailing slash trimmed; custom_endpoint() falls through to the HUD
@@ -945,7 +988,7 @@ mod tests {
 
     #[test]
     fn copilot_env_var_takes_precedence_over_hud() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = EndpointEnvGuard::new();
         std::env::set_var("COPILOT_API_BASE_URL", "http://127.0.0.1:9999");
         std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317");
         // custom_endpoint prefers COPILOT_API_BASE_URL.

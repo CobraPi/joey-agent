@@ -23,6 +23,11 @@ Pattern families:
   API_KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL/AUTH), dotted/line-anchored
   config keys, YAML `password: x`, JSON fields, Authorization headers (any
   scheme + Proxy-Authorization), x-api-key-style headers
+- Sensitive query params are matched against a canonicalized (lowercase,
+  dash→underscore) copy of both the live param name and the sensitive list
+  — catches `X-Amz-Signature`/`x-amz-signature` presigned-S3 signatures at
+  strict egress boundaries (regression-tested; a dash/underscore
+  canonicalization mismatch previously let them through)
 - Telegram bot tokens, PEM private-key blocks, DB connection strings
   (postgres/mysql/mongodb/redis/amqp user:pass@), URL bare tokens and
   userinfo, JWTs (eyJ...), E.164 phone numbers, sensitive query params

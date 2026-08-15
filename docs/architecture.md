@@ -56,13 +56,13 @@ the same specs/<feature>/*.md files joey-cli's speckit skills operate on.
 | `joey-cron` | `cron/` | Self-contained scheduler: job store (`~/.joey/cron/jobs.json`), croniter-compatible expression matcher, 60s ticker, job runner |
 | `joey-mcp` | `tools/mcp_tool.py` (client half) | Model Context Protocol stdio JSON-RPC client: handshake, tool discovery/naming, pagination, timeouts, safe-env subprocess spawning |
 | `joey-gateway` | `gateway/` (core) | Platform-neutral session-key builder, `MessageEvent`/`SendResult` types, send-error classification, the `PlatformAdapter` trait (concrete adapters like Telegram/Discord are added behind this trait) |
-| `joey-cli` | `hermes_cli/`, `cli.py` | The `joey` binary: clap argument tree, profile resolution, interactive REPL (reedline-based) or animated TUI (`--tui`), one-shot mode, slash commands, all subcommands (`model`, `config`, `doctor`, `cron`, `mcp`, `skills`, `tools`, `auth`, `discover`, `llm-selector`) |
+| `joey-cli` | `hermes_cli/`, `cli.py` | The `joey` binary: clap argument tree, profile resolution, interactive REPL (reedline-based) or animated TUI (`--tui`), one-shot mode, slash commands, smart completions (shared engine in `joey-tools::completion`), the TUI engine-actor runtime (`engine.rs` — GUI/compute decoupling with kill-and-restart), all subcommands (`model`, `config`, `doctor`, `cron`, `mcp`, `skills`, `tools`, `auth`, `discover`, `llm-selector`) |
 
 ### Joey-native additions (no upstream equivalent)
 
 | Crate | Responsibility |
 |---|---|
-| `joey-tui` | The `--tui` animated dashboard: `Tui` runtime, `Theme`/gradient rendering, an `App`/`AppState` model, widgets (including the agent-roster panel populated from `joey-omo`), and an input editor. Rendering/event-pump lifecycle is driven by `joey-cli`. |
+| `joey-tui` | The `--tui` animated dashboard: `Tui` runtime (generic over the ratatui backend for testability), `Theme`/gradient rendering, an `App`/`AppState` model, widgets (agent-roster panel, NeuroCode live context feed, completion/slash popups), and a UTF-8-safe input editor with shared-history recall. Rendering/event-pump lifecycle is driven by `joey-cli`'s engine-actor loop. |
 | `joey-llm-selector` | Dynamic per-module model allocation used when `model.default = auto`: a `CandidateModelPool`, a persisted `AllocationMap` (`~/.joey/…/allocations.json`), a cold-start `ColdStartScorer`, a diagnoser/learning loop, and the `ModelAllocator` trait consumed by `joey-orchestration` and the parent `Agent` so each call-site can ask "which model for module X". Exposed via the `/llm-selector` slash command and `joey llm-selector` top-level command. |
 | `joey-orchestration` | The subagent/multi-agent delegation engine: `SubagentManager`, the `delegate_task` and `call_omo_agent` tools, per-subagent isolated execution contexts, shared concurrency limits, and `register_orchestration*` helpers that install the delegation tool into a `ToolRegistry`. Depends on `joey-llm-selector::ModelAllocator` and a `CategoryResolver` trait (implemented by `joey-cli` to bridge into `joey-omo` without a circular dependency). |
 | `joey-omo` | "Oh My OpenAgent": an 11-agent persona registry (`AgentRegistry`, `OmoAgent`) with per-agent model-family fallback chains (`AvailableModelSet`, `resolve_model`), category/subagent delegation routing (`resolve_category`, `route_delegation`), plan parsing and Atlas-style plan execution (`prepare_plan_execution`, `start_work`), intent gating for ultrawork/hyperplan/team triggers (`detect_keyword`, `check_ultrawork_activation`), per-session `GoalState`, an accumulated-wisdom notepad, and team-mode primitives (`TeamSpec`, `TeamMailbox`, `TeamTaskList`, optional tmux visualizer). Wired into both the REPL and TUI paths of `joey-cli` (agent roster, `/agents`, `/start-work`, `/goal`, intent gating). |
@@ -80,7 +80,10 @@ the same specs/<feature>/*.md files joey-cli's speckit skills operate on.
    compressor. `joey-cli` additionally registers the `delegate_task` tool
    (`joey-orchestration`) — bridged to `joey-omo`'s agent registry via a
    `CategoryResolver` — and, when `model.default = auto`, a
-   `joey-llm-selector::ModelAllocator`.
+   `joey-llm-selector::ModelAllocator`. In the TUI, the constructed Agent
+   is then MOVED into a dedicated engine task (`joey-cli/src/engine.rs`);
+   the UI drives it purely via channels (see
+   [tui.md](tui.md#guicompute-decoupling-engine-actor-model)).
 3. **Turn execution** (`Agent::run_turn` in `agent.rs`): the user message
    is appended to history and persisted; the loop then:
    - Assembles the full message list (system prompt + history).
