@@ -99,6 +99,8 @@ pub fn neurocode_slash_outcome(args: &str) -> NeurocodeOutcome {
     let engine = build_engine();
 
     match sub {
+        "status" => NeurocodeOutcome::Text(engine.status_text()),
+
         "tier" => {
             let action = parts.get(1).copied().unwrap_or("show");
             let tier = parts.get(2).copied();
@@ -263,25 +265,24 @@ mod tests {
 
     #[test]
     fn status_works_with_disabled_engine() {
-        // With default config (disabled), status should still return a
-        // well-formed status string without panicking. NOTE: on a dev
-        // machine the REAL config may enable NeuroCode — both shapes are
-        // well-formed, so assert on the stable prefix only when the
-        // engine is disabled; otherwise accept any non-empty status.
+        // `status` must route to the engine's status_text(), NOT fall into
+        // the unknown-subcommand catch-all (regression: it used to).
         let out = neurocode_slash("status");
         assert!(
-            out.starts_with("NeuroCode:") || !out.is_empty(),
-            "well-formed status output, got: {out}"
+            !out.contains("Unknown subcommand"),
+            "status must not hit the catch-all, got: {out}"
         );
+        assert!(out.starts_with("NeuroCode:"), "status prefix, got: {out}");
     }
 
     #[test]
     fn no_args_defaults_to_status() {
         let out = neurocode_slash("");
         assert!(
-            out.starts_with("NeuroCode:") || !out.is_empty(),
-            "well-formed status output, got: {out}"
+            !out.contains("Unknown subcommand"),
+            "bare /neurocode defaults to status, got: {out}"
         );
+        assert!(out.starts_with("NeuroCode:"), "status prefix, got: {out}");
     }
 
     #[test]

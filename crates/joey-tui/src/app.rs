@@ -25,6 +25,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
+use ratatui::Frame;
 use ratatui::Terminal;
 
 use crate::anim::{Activity, Clock, Equalizer, ParticleField, Pulse, Spinner};
@@ -51,6 +52,105 @@ pub enum TuiAction {
 
 pub type FrameBackend = CrosstermBackend<Stdout>;
 pub type FrameTerminal = Terminal<FrameBackend>;
+
+/// Expanded-feed layout split (NeuroCode expanded mode): how the main body
+/// height divides between the transcript strip (top — keeps live streaming
+/// visible) and the expanded context feed (bottom, the majority). The
+/// transcript is bottom-anchored, so the strip always shows the newest
+/// lines including the in-flight streaming tail.
+///
+/// Returns `(transcript_rows, feed_rows)`. Caller guarantees `total >= 12`.
+fn split_expanded_feed(total: u16) -> (u16, u16) {
+    debug_assert!(total >= 12, "caller guards total >= 12");
+    let transcript = ((total as f32 * 0.3).round() as u16).clamp(4, 10);
+    (transcript, total - transcript)
+}
+
+/// Render the body region: transcript (left) + sidebar (right), including
+/// the NeuroCode expanded-mode takeover of the main area. Extracted from
+/// `Tui::draw` so tests can drive the REAL layout against a TestBackend
+/// (which `Tui::draw`'s io-bound excludes) and assert on the hit-test
+/// rects the user's mouse would actually see.
+///
+/// `glow` is the pulse animation value; `spinner`/`equalizer` are the
+/// shared animation widgets.
+fn render_body(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: Theme,
+    focused: bool,
+    glow: f32,
+    spinner: &crate::anim::Spinner,
+    equalizer: &crate::anim::Equalizer,
+) {
+    // Body: transcript (left, large) + sidebar (right). The sidebar
+    // yields entirely on narrow terminals.
+    let show_sidebar = area.width >= 72;
+    let body = if show_sidebar {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(40), Constraint::Length(34)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1)])
+            .split(area)
+    };
+
+    // When reasoning is live (and shown), split the transcript
+    // vertically: conversation + reasoning.
+    let show_reasoning_panel =
+        app.reasoning_open && app.show_reasoning && body[0].height >= 14;
+    // NeuroCode expanded mode (click the docked feed to toggle): the
+    // context feed takes over the main screen — the transcript (with its
+    // live streaming tail) keeps a strip at the top so streaming stays
+    // visible, and the expanded feed fills the rest.
+    if app.neurocode_expanded && app.neurocode_active && body[0].height >= 12 {
+        let (transcript_h, feed_h) = split_expanded_feed(body[0].height);
+        let main = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(transcript_h),
+                Constraint::Min(feed_h),
+            ])
+            .split(body[0]);
+        widgets::draw_transcript(f, main[0], app, theme, focused, glow);
+        widgets::draw_neurocode_panel(f, main[1], app, theme);
+    } else if show_reasoning_panel {
+        let convo_split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Length(8)])
+            .split(body[0]);
+        widgets::draw_transcript(f, convo_split[0], app, theme, focused, glow);
+        widgets::draw_reasoning(f, convo_split[1], app, theme, spinner);
+    } else {
+        widgets::draw_transcript(f, body[0], app, theme, focused, glow);
+    }
+
+    if show_sidebar {
+        // NeuroCode live feed (feature 015 follow-up): when the engine
+        // is active, split the sidebar vertically — OMO panel on top,
+        // context feed anchored at the BOTTOM of the sidebar. The feed
+        // gets up to 40% of the sidebar (min 6 rows) and yields
+        // entirely when the sidebar is too short. While the feed is
+        // EXPANDED onto the main screen, the docked copy is hidden
+        // (one live view at a time).
+        if app.neurocode_active && !app.neurocode_expanded && body[1].height >= 16 {
+            let feed_h =
+                ((body[1].height as f32 * 0.4).round() as u16).clamp(6, body[1].height - 8);
+            let side = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(8), Constraint::Length(feed_h)])
+                .split(body[1]);
+            widgets::draw_omo_panel(f, side[0], app, theme, spinner, equalizer);
+            widgets::draw_neurocode_panel(f, side[1], app, theme);
+        } else {
+            widgets::draw_omo_panel(f, body[1], app, theme, spinner, equalizer);
+        }
+    }
+}
 
 /// Restore the terminal even if we panic mid-frame: a raw-mode alternate
 /// screen would otherwise swallow the panic message and wreck the shell.
@@ -285,55 +385,17 @@ impl<B: ratatui::backend::Backend> Tui<B> {
 
             widgets::draw_header(f, chunks[0], app, theme, orbit_spinner, pulse);
 
-            // Body: transcript (left, large) + sidebar (right). The sidebar
-            // yields entirely on narrow terminals.
-            let show_sidebar = chunks[1].width >= 72;
-            let body = if show_sidebar {
-                Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Min(40), Constraint::Length(34)])
-                    .split(chunks[1])
-            } else {
-                Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Min(1)])
-                    .split(chunks[1])
-            };
-
             let transcript_focused = *focus == Focus::Transcript;
-            // When reasoning is live (and shown), split the transcript
-            // vertically: conversation + reasoning.
-            let show_reasoning_panel =
-                app.reasoning_open && app.show_reasoning && body[0].height >= 14;
-            if show_reasoning_panel {
-                let convo_split = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(4), Constraint::Length(8)])
-                    .split(body[0]);
-                widgets::draw_transcript(f, convo_split[0], app, theme, transcript_focused, glow);
-                widgets::draw_reasoning(f, convo_split[1], app, theme, spinner);
-            } else {
-                widgets::draw_transcript(f, body[0], app, theme, transcript_focused, glow);
-            }
-
-            if show_sidebar {
-                // NeuroCode live feed (feature 015 follow-up): when the engine
-                // is active, split the sidebar vertically — OMO panel on top,
-                // context feed anchored at the BOTTOM of the sidebar. The feed
-                // gets up to 40% of the sidebar (min 6 rows) and yields
-                // entirely when the sidebar is too short.
-                if app.neurocode_active && body[1].height >= 16 {
-                    let feed_h = ((body[1].height as f32 * 0.4).round() as u16).clamp(6, body[1].height - 8);
-                    let side = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Min(8), Constraint::Length(feed_h)])
-                        .split(body[1]);
-                    widgets::draw_omo_panel(f, side[0], app, theme, spinner, equalizer);
-                    widgets::draw_neurocode_panel(f, side[1], app, theme);
-                } else {
-                    widgets::draw_omo_panel(f, body[1], app, theme, spinner, equalizer);
-                }
-            }
+            render_body(
+                f,
+                chunks[1],
+                app,
+                theme,
+                transcript_focused,
+                glow,
+                spinner,
+                equalizer,
+            );
 
             widgets::draw_input(f, chunks[2], input, app, theme, *focus == Focus::Input, glow);
 
@@ -485,6 +547,12 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 }
                 if self.app.agent_picker_open {
                     self.app.agent_picker_open = false;
+                    return None;
+                }
+                // Dock the expanded NeuroCode feed back to its bottom-right
+                // panel before any lower-priority Esc behavior.
+                if self.app.neurocode_expanded {
+                    self.app.toggle_neurocode_expanded();
                     return None;
                 }
                 if self.focus == Focus::Transcript {
@@ -1075,8 +1143,19 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// Handle a mouse event for scroll wheel support.
     ///
     /// Call this from the host when a MouseEvent is received. Enables mouse
-    /// wheel scrolling in the transcript area.
-    pub fn handle_mouse_scroll(&mut self, _row: u16, _col: u16, delta_up: bool) {
+    /// wheel scrolling in the transcript area. When the pointer is over the
+    /// NeuroCode context panel (docked or expanded), the wheel scrolls the
+    /// feed instead of the transcript.
+    pub fn handle_mouse_scroll(&mut self, row: u16, col: u16, delta_up: bool) {
+        if self.neurocode_panel_hit(row, col) {
+            // Wheel over the context feed: scroll the feed itself.
+            if delta_up {
+                self.app.neurocode_scroll = self.app.neurocode_scroll.saturating_add(3);
+            } else {
+                self.app.neurocode_scroll = self.app.neurocode_scroll.saturating_sub(3);
+            }
+            return;
+        }
         if delta_up {
             self.app.scroll_up(3);
             if self.focus == Focus::Input {
@@ -1090,12 +1169,32 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         }
     }
 
+    /// True when `(row, col)` falls inside the NeuroCode context panel as
+    /// drawn by the last frame (docked bottom-right or expanded main view).
+    fn neurocode_panel_hit(&self, row: u16, col: u16) -> bool {
+        if !self.app.neurocode_active {
+            return false;
+        }
+        let (x, y, w, h) = self.app.last_neurocode_rect.get();
+        w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w
+    }
+
     /// Feature 007 (T026): handle a left-click on the transcript. Uses
     /// per-item hit-testing (`transcript_hit_test`) to resolve the clicked
     /// row to a transcript item index, then focuses the transcript and toggles
     /// that item's expand state. Clicks outside the text area or on
     /// non-expandable items are no-ops (focus still switches to Transcript).
+    ///
+    /// Clicking the NeuroCode context feed (docked bottom-right panel or the
+    /// expanded main-screen view) toggles it between the two — the content
+    /// moves onto the main screen, or docks back to its previous state.
     pub fn handle_mouse_click(&mut self, row: u16, col: u16) {
+        // NeuroCode feed first: a click inside the panel (any part of it,
+        // including borders) toggles docked ↔ expanded and is consumed.
+        if self.neurocode_panel_hit(row, col) {
+            self.app.toggle_neurocode_expanded();
+            return;
+        }
         // Focus the transcript on any click within it.
         if self.focus == Focus::Input {
             self.focus = Focus::Transcript;
@@ -1575,5 +1674,186 @@ mod expand_tests {
         } else {
             panic!("no diff item");
         }
+    }
+}
+
+#[cfg(test)]
+mod neurocode_expand_tests {
+    //! Click-to-expand behavior for the NeuroCode context feed (docked
+    //! bottom-right panel ↔ main-screen takeover). Drives the real draw
+    //! layout through `Tui::draw` on a TestBackend so hit-testing rects are
+    //! exactly what the user would see.
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use joey_agent_core::events::AgentEvent;
+    use ratatui::backend::TestBackend;
+
+    fn esc() -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    /// Draw the REAL body layout (render_body) for an 80x30 terminal
+    /// through a TestBackend, recording hit-test rects exactly as the
+    /// production draw does. Mirrors Tui::draw's chunk math: header(2) +
+    /// body(24) + input(3) + status(1) = 30.
+    fn draw_body(t: &mut Tui<TestBackend>) {
+        let area = Rect::new(0, 2, 80, 24);
+        let spinner = crate::anim::Spinner::dots();
+        let equalizer = crate::anim::Equalizer::new(28);
+        t.terminal
+            .draw(|f| {
+                render_body(
+                    f,
+                    area,
+                    &t.app,
+                    t.theme,
+                    false,
+                    0.5,
+                    &spinner,
+                    &equalizer,
+                );
+            })
+            .unwrap();
+    }
+
+    /// Build a Tui (80x30 — wide enough for the sidebar), NeuroCode active
+    /// with a recognizable context blob, and a streaming tail in flight.
+    fn tui_with_feed() -> Tui<TestBackend> {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::NeuroCodeActive { active: true });
+        app.apply(AgentEvent::NeuroCodeContext {
+            tier: "Frontier".into(),
+            token_estimate: 4321,
+            expanded_nodes: 12,
+            cold_mode: false,
+            formatted_context: "FEED_MARKER_ expand me".into(),
+        });
+        app.streaming_assistant = "STREAMING_MARKER_ still flowing".into();
+        let terminal = ratatui::Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut tui = Tui::new_for_test(app, Theme::aurora(), terminal);
+        draw_body(&mut tui); // records last_neurocode_rect (docked)
+        tui
+    }
+
+    fn buffer_text(t: &Tui<TestBackend>) -> String {
+        t.terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn click_on_docked_panel_expands_to_main_screen() {
+        let mut t = tui_with_feed();
+        assert!(!t.app.neurocode_expanded, "starts docked");
+
+        // Hit-test must resolve inside the docked panel first.
+        let (x, y, w, h) = t.app.last_neurocode_rect.get();
+        assert!(w > 0 && h > 0, "docked panel rect recorded by draw");
+        t.handle_mouse_click(y + h / 2, x + w / 2);
+        assert!(t.app.neurocode_expanded, "click expanded the feed");
+
+        // Re-draw: the feed now renders in the MAIN area (left of the
+        // sidebar), and live streaming is still visible.
+        draw_body(&mut t);
+        let text = buffer_text(&t);
+        assert!(text.contains("FEED_MARKER_"), "feed content on main screen");
+        assert!(
+            text.contains("STREAMING_MARKER_"),
+            "transcript streaming strip still live"
+        );
+
+        // The expanded rect should now be a wide main-area rect.
+        let (ex, _ey, ew, _eh) = t.app.last_neurocode_rect.get();
+        assert!(ew > w, "expanded feed is wider than the docked panel");
+        assert!(ex <= x, "expanded feed starts at/left of the old panel");
+    }
+
+    #[test]
+    fn second_click_docks_back() {
+        let mut t = tui_with_feed();
+        let (x, y, w, h) = t.app.last_neurocode_rect.get();
+        // Expand…
+        t.handle_mouse_click(y + h / 2, x + w / 2);
+        assert!(t.app.neurocode_expanded);
+        draw_body(&mut t);
+        // …then click the EXPANDED panel anywhere to dock back.
+        let (ex, ey, ew, eh) = t.app.last_neurocode_rect.get();
+        t.handle_mouse_click(ey + eh / 2, ex + ew / 2);
+        assert!(!t.app.neurocode_expanded, "second click docked the feed");
+        // Rect reverts to the sidebar width class after redraw.
+        draw_body(&mut t);
+        let (nx, _ny, nw, _nh) = t.app.last_neurocode_rect.get();
+        assert_eq!((nx, nw), (x, w), "docked rect restored");
+    }
+
+    #[test]
+    fn esc_docks_expanded_feed() {
+        let mut t = tui_with_feed();
+        t.app.toggle_neurocode_expanded();
+        assert!(t.app.neurocode_expanded);
+        let _ = t.handle_key(esc());
+        assert!(!t.app.neurocode_expanded, "Esc docks the feed");
+    }
+
+    #[test]
+    fn click_outside_panel_is_untouched() {
+        let mut t = tui_with_feed();
+        // Click the far top-left of the transcript area (never the panel).
+        t.handle_mouse_click(1, 1);
+        assert!(!t.app.neurocode_expanded, "transcript click does not expand");
+    }
+
+    #[test]
+    fn wheel_over_panel_scrolls_feed_not_transcript() {
+        let mut t = tui_with_feed();
+        let scroll_before = t.app.neurocode_scroll;
+        let (x, y, w, h) = t.app.last_neurocode_rect.get();
+        t.handle_mouse_scroll(y + h / 2, x + w / 2, true);
+        assert_eq!(
+            t.app.neurocode_scroll,
+            scroll_before + 3,
+            "wheel over feed scrolls the feed"
+        );
+        // Wheel far from the panel still scrolls the transcript (focus
+        // moves off input — the established signal).
+        t.focus = Focus::Input;
+        t.handle_mouse_scroll(1, 1, true);
+        assert!(
+            !matches!(t.focus, Focus::Input),
+            "wheel elsewhere hits transcript"
+        );
+    }
+
+    #[test]
+    fn deactivate_while_expanded_resets_state() {
+        let mut t = tui_with_feed();
+        t.app.toggle_neurocode_expanded();
+        assert!(t.app.neurocode_expanded);
+        t.app.apply(AgentEvent::NeuroCodeActive { active: false });
+        assert!(!t.app.neurocode_expanded, "expanded reset on deactivate");
+        assert_eq!(t.app.last_neurocode_rect.get(), (0, 0, 0, 0));
+        // Click where the panel used to be is now a plain transcript click.
+        t.handle_mouse_click(25, 70);
+        assert!(!t.app.neurocode_expanded);
+    }
+
+    #[test]
+    fn split_expanded_feed_bounds() {
+        // Caller guards >= 12; check the split for a range of heights.
+        assert_eq!(split_expanded_feed(12), (4, 8));
+        assert_eq!(split_expanded_feed(20), (6, 14));
+        assert_eq!(split_expanded_feed(40), (10, 30));
+        // Transcript strip is clamped at 10 even for tall terminals.
+        let (t40, _f40) = split_expanded_feed(60);
+        assert_eq!(t40, 10);
     }
 }

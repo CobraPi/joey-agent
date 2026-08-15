@@ -1130,7 +1130,9 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             // NeuroCode events are TUI-panel payloads; the line renderer has
             // no panel, so they're intentionally consumed silently here (the
             // tier/tokens summary already reaches the log via tracing).
-            AgentEvent::NeuroCodeContext { .. } | AgentEvent::NeuroCodeActive { .. } => {}
+            AgentEvent::NeuroCodeContext { .. }
+            | AgentEvent::NeuroCodeProgress { .. }
+            | AgentEvent::NeuroCodeActive { .. } => {}
             AgentEvent::AgentModeChanged { agent_name, model: _ } => {
                 // Feature 013 (T025/T026): drain before, set after.
                 if drain_separator(&mut pending_separator) { println!(); }

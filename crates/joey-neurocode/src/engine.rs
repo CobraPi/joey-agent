@@ -47,6 +47,21 @@ pub trait NeuroCodeEngine: Send + Sync {
         tier: ComplexityTier,
     ) -> AssembledContext;
 
+    /// Streaming variant of [`Self::assemble_context`]: `progress` is invoked
+    /// with short human-readable stage descriptions during assembly so UIs
+    /// can render a live feed (feature 015 follow-up: realtime context
+    /// display). Default impl ignores the callback and delegates — existing
+    /// engines stay source-compatible (Constitution V: non-breaking).
+    fn assemble_context_with_progress(
+        &self,
+        request: &CodingRequest,
+        tier: ComplexityTier,
+        progress: &dyn Fn(&str),
+    ) -> AssembledContext {
+        let _ = progress;
+        self.assemble_context(request, tier)
+    }
+
     /// Whether NeuroCode is enabled for the current session (FR-003).
     fn is_active(&self) -> bool;
 
@@ -708,6 +723,34 @@ impl NeuroCodeEngine for DefaultEngine {
             Some(graph) => {
                 let assembler = ContextAssembler::new(graph);
                 assembler.assemble(request, tier)
+            }
+            None => AssembledContext {
+                cold_mode: true,
+                notice: Some("NeuroCode: graph not initialized".into()),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Streaming assembly (feature 015 follow-up): forwards the stage
+    /// callback into [`ContextAssembler::assemble_with_progress`] so the
+    /// turn loop can emit `NeuroCodeProgress` events for the live UI feed.
+    fn assemble_context_with_progress(
+        &self,
+        request: &CodingRequest,
+        tier: ComplexityTier,
+        progress: &dyn Fn(&str),
+    ) -> AssembledContext {
+        // Non-source fallback: no stages to report — behave exactly like the
+        // non-streaming path.
+        if !parse::project_has_source(&request.project_root) {
+            return self.assemble_context(request, tier);
+        }
+        self.ensure_graph();
+        self.with_graph(|graph_opt| match graph_opt {
+            Some(graph) => {
+                let assembler = ContextAssembler::new(graph);
+                assembler.assemble_with_progress(request, tier, progress)
             }
             None => AssembledContext {
                 cold_mode: true,

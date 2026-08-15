@@ -93,14 +93,31 @@ impl<'a> ContextAssembler<'a> {
         request: &CodingRequest,
         tier: ComplexityTier,
     ) -> AssembledContext {
+        // No-progress delegate (byte-identical behavior to pre-streaming).
+        self.assemble_with_progress(request, tier, &|_| {})
+    }
+
+    /// Streaming variant of [`Self::assemble`]: `progress` is invoked with a
+    /// short human-readable stage description between assembly phases so UIs
+    /// can render live progress (feature 015 follow-up: realtime context
+    /// feed). The callback is synchronous and must be cheap; the assembled
+    /// result is identical to [`Self::assemble`].
+    pub fn assemble_with_progress(
+        &self,
+        request: &CodingRequest,
+        tier: ComplexityTier,
+        progress: &dyn Fn(&str),
+    ) -> AssembledContext {
         let budget = TierBudget::for_tier(tier);
 
         // Determine the primary target nodes.
+        progress("locating target nodes");
         let primary_nodes = self.find_primary_nodes(request);
 
         // Cold-mode check (FR-016): if the graph is empty, operate in degraded mode.
         let artifact_count = self.graph.artifact_count().unwrap_or(0);
         if artifact_count == 0 {
+            progress("cold mode — project not indexed");
             return AssembledContext {
                 primary_nodes: Vec::new(),
                 expanded_nodes: Vec::new(),
@@ -127,8 +144,14 @@ impl<'a> ContextAssembler<'a> {
 
         // Graph expansion (depth ≤ 2 edges).
         let expanded = self.expand_context(&primary_nodes, budget.max_expansion_depth);
+        progress(&format!(
+            "expanded graph: {} node{} pulled in",
+            expanded.len(),
+            if expanded.len() == 1 { "" } else { "s" }
+        ));
 
         // Format for the tier.
+        progress("formatting context for tier");
         let (mut formatted, token_est) =
             self.format_context(&primary_nodes, &expanded, tier, budget);
 
@@ -138,6 +161,7 @@ impl<'a> ContextAssembler<'a> {
         // failures in this area before regenerating.
         let anti_warning = self.anti_pattern_warnings(&primary_nodes);
         if !anti_warning.is_empty() {
+            progress("surfacing known anti-patterns");
             formatted.push_str(&anti_warning);
         }
         let mut token_est = token_est + anti_warning.len() / 4;
@@ -149,6 +173,7 @@ impl<'a> ContextAssembler<'a> {
         // postmortems before generating.
         let domain_section = self.domain_knowledge_section(&primary_nodes);
         if !domain_section.is_empty() {
+            progress("surfacing domain knowledge");
             formatted.push_str(&domain_section);
             token_est += domain_section.len() / 4;
         }

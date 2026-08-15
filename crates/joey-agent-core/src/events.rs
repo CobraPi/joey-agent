@@ -207,6 +207,16 @@ pub enum AgentEvent {
         /// payload; UIs truncate for display).
         formatted_context: String,
     },
+    /// Feature 015 (NeuroCode) follow-up: live assembly progress emitted
+    /// DURING `assemble_context_with_progress` (before the final
+    /// `NeuroCodeContext` blob) so UIs can stream the context feed in
+    /// realtime — one event per assembly stage (locate → expand → format →
+    /// anti-patterns → domain knowledge). Only fired when the engine is
+    /// wired AND active (byte-identical when off).
+    NeuroCodeProgress {
+        /// Short human-readable stage description (e.g. "expanded graph: 7 nodes pulled in").
+        stage: String,
+    },
     /// Feature 015 (NeuroCode): the engine's active/inactive state changed
     /// (wired + enabled). Lets UIs show/hide the NeuroCode indicator without
     /// polling config.

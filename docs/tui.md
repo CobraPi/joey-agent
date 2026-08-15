@@ -144,6 +144,12 @@ When the NeuroCode engine is active (`neurocode.enabled: true` in config):
   badge in degraded (un-indexed) mode, and the full context text
   (hard-wrapped, tail-anchored). **Alt+↑ / Alt+↓** scroll the feed without
   leaving the input box.
+- **Click to expand** — clicking the docked feed moves its content onto the
+  main screen: the transcript (including the live streaming tail) keeps a
+  strip at the top, and the expanded feed fills the rest. Clicking it again
+  (or pressing Esc) docks it back to the bottom-right panel. The mouse wheel
+  over the feed scrolls the feed itself in either mode; streaming updates
+  keep flowing live in both.
 - The panel yields entirely on narrow/short terminals or when NeuroCode is
   off — the layout is byte-identical to pre-feature when inactive.
 

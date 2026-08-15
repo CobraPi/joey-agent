@@ -2972,11 +2972,27 @@ pub fn draw_completion_popup(f: &mut Frame, area: Rect, app: &App, theme: Theme)
 /// (tier · tokens · nodes · cold badge) and a scrolling window over the
 /// exact context text NeuroCode assembled for the latest request — the same
 /// string prepended to the system prompt (`AgentEvent::NeuroCodeContext`).
+///
+/// In expanded mode (`app.neurocode_expanded`, toggled by clicking the
+/// docked panel) the same widget renders in the main screen area — same
+/// content, more rows. Either way the panel records its rect into
+/// `app.last_neurocode_rect` for mouse hit-testing.
 pub fn draw_neurocode_panel(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     if !app.neurocode_active || area.width == 0 || area.height == 0 {
         return;
     }
-    let block = gradient_block(" neurocode · context feed ", theme);
+    // Record geometry for mouse hit-testing (click toggles docked ↔
+    // expanded). Zeroed only on deactivate; stale-but-inactive rects are
+    // harmless because the guard above skips drawing.
+    app.last_neurocode_rect
+        .set((area.x, area.y, area.width, area.height));
+
+    let title = if app.neurocode_expanded {
+        " neurocode · context feed · click or Esc to dock "
+    } else {
+        " neurocode · context feed · click to expand "
+    };
+    let block = gradient_block(title, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width < 8 || inner.height < 2 {
@@ -3013,11 +3029,45 @@ pub fn draw_neurocode_panel(f: &mut Frame, area: Rect, app: &App, theme: Theme) 
             Style::default().fg(theme.warning.to_color()).add_modifier(Modifier::BOLD),
         ));
     }
+    // Realtime refresh stamp: how long ago the final context blob landed.
+    // Makes every re-assembly visibly "live" even when content is unchanged.
+    if let Some(at) = app.neurocode_updated_at {
+        let secs = at.elapsed().as_secs();
+        let ago = if secs < 1 {
+            "now".to_string()
+        } else if secs < 60 {
+            format!("{}s ago", secs)
+        } else {
+            format!("{}m ago", secs / 60)
+        };
+        header.push(Span::styled(
+            format!("  ↻ {}", ago),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ));
+    }
     lines.push(Line::from(header));
     lines.push(Line::styled(
         "─".repeat(cw.saturating_sub(2)),
         Style::default().fg(theme.fg_most_subtle.to_color()),
     ));
+
+    // Live assembly stage (feature 015 follow-up): while NeuroCode is
+    // assembling, stream the current stage with a time-animated spinner so
+    // the feed updates in realtime — BEFORE the final context lands.
+    if !app.neurocode_stage.is_empty() {
+        let elapsed = app
+            .neurocode_stage_at
+            .map(|t| t.elapsed().as_millis())
+            .unwrap_or(0) as usize;
+        const FRAMES: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
+        let frame = FRAMES[(elapsed / 120) % FRAMES.len()];
+        let stage_line = format!(" {} {}", frame, app.neurocode_stage);
+        let trunc: String = stage_line.chars().take(cw.saturating_sub(2)).collect();
+        lines.push(Line::styled(
+            trunc,
+            Style::default().fg(theme.accent.to_color()),
+        ));
+    }
 
     // Body: the live context text, hard-wrapped, windowed by scroll.
     if app.neurocode_context.is_empty() {

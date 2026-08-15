@@ -634,6 +634,27 @@ injected, and the system prompt bytes are unchanged (FR-020, SC-008 — asserted
 Full design trail and every dependency decision against the constitution:
 `specs/015-neurocode-enterprise-java/research.md`.
 
+**Follow-up (2026-08-15) — realtime assembly progress feed.** Assembly is now
+streamable: `ContextAssembler::assemble_with_progress(request, tier, progress)`
+invokes a callback with short stage descriptions ("locating artifacts" →
+"expanded graph: N nodes pulled in" → "surfacing known anti-patterns" →
+"surfacing domain knowledge", plus a "cold mode" notice), and the plain
+`assemble` delegates to it with a no-op callback (byte-identical result —
+asserted by `streaming_assembly_is_identical_and_reports_stages`). The
+`NeuroCodeEngine` trait gained a default `assemble_context_with_progress`
+(source-compatible; existing impls unchanged), overridden by `DefaultEngine`
+to forward through `with_graph`. The agent-core intercept emits a new
+`AgentEvent::NeuroCodeProgress { stage }` per stage live during assembly
+(before the final `NeuroCodeContext` blob), and the TUI context panel renders
+the current stage with an animated spinner plus a "↻ updated Ns ago" refresh
+stamp (`state.neurocode_stage` / `neurocode_stage_at` / `neurocode_updated_at`;
+cleared on deactivate). The line renderer consumes the new event silently
+(same treatment as `NeuroCodeContext`). Regression tests:
+`crates/joey-neurocode/tests/context_assembly.rs` (streaming parity + stage
+coverage), `joey-agent-core/src/agent.rs` (`active_engine_streams_progress_events`
+— streaming engine double verifies every stage forwards as a live event),
+`joey-tui/src/state.rs` (`live_stage_streams_into_panel` + refresh stamp).
+
 ## Copilot reverse-proxy integration (2026-08-14)
 
 **Status**: Deliberate-deviation extension (Joey-original, no upstream

@@ -267,3 +267,74 @@ fn formatted_context_contains_artifacts() {
     // The primary node's FQCN should appear in the output.
     assert!(ctx.formatted_context.contains("UserServiceImpl"));
 }
+
+/// Feature 015 follow-up (realtime feed): `assemble_with_progress` must
+/// produce a result IDENTICAL to `assemble` (streaming must not change
+/// bytes), and must invoke the progress callback at least for the
+/// locate + expand + format stages.
+#[test]
+fn streaming_assembly_is_identical_and_reports_stages() {
+    use std::sync::Mutex;
+
+    let graph = DependencyGraph::open_in_memory().unwrap();
+    seed_graph(&graph);
+    let assembler = ContextAssembler::new(&graph);
+    let request = make_request("UserServiceImpl");
+
+    let plain = assembler.assemble(&request, ComplexityTier::Frontier);
+    let stages: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let streamed = assembler.assemble_with_progress(
+        &request,
+        ComplexityTier::Frontier,
+        &|stage| stages.lock().unwrap().push(stage.to_string()),
+    );
+
+    // Byte-identical results (Constitution VII non-regression).
+    assert_eq!(
+        plain.formatted_context, streamed.formatted_context,
+        "streaming assembly must not change the assembled context"
+    );
+    assert_eq!(plain.token_estimate, streamed.token_estimate);
+    assert_eq!(plain.expanded_nodes.len(), streamed.expanded_nodes.len());
+
+    // Stage coverage: locate, expand, format all fire.
+    let stages = stages.into_inner().unwrap();
+    let joined = stages.join("\n");
+    assert!(
+        joined.contains("locating target nodes"),
+        "missing locate stage, got: {:?}",
+        stages
+    );
+    assert!(
+        joined.contains("expanded graph:"),
+        "missing expand stage, got: {:?}",
+        stages
+    );
+    assert!(
+        joined.contains("formatting context for tier"),
+        "missing format stage, got: {:?}",
+        stages
+    );
+}
+
+/// Cold mode must also stream (the degraded path reports itself).
+#[test]
+fn cold_mode_streams_stage() {
+    use std::sync::Mutex;
+
+    let graph = DependencyGraph::open_in_memory().unwrap(); // empty — cold
+    let assembler = ContextAssembler::new(&graph);
+    let stages: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let ctx = assembler.assemble_with_progress(
+        &make_request("Nothing"),
+        ComplexityTier::Frontier,
+        &|stage| stages.lock().unwrap().push(stage.to_string()),
+    );
+    assert!(ctx.cold_mode);
+    let stages = stages.into_inner().unwrap();
+    assert!(
+        stages.iter().any(|s| s.contains("cold mode")),
+        "cold mode should report a stage, got: {:?}",
+        stages
+    );
+}

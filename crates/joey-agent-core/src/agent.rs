@@ -1093,7 +1093,19 @@ impl Agent {
             reasoning = %route.reasoning,
             "neurocode routed request"
         );
-        let assembled = engine.assemble_context(&request, route.tier);
+        let assembled = if let Some(tx) = tx {
+            // Streaming path (feature 015 follow-up): emit one
+            // NeuroCodeProgress event per assembly stage so the TUI context
+            // feed updates in realtime as the graph is located, expanded,
+            // and formatted — not just once at the end.
+            engine.assemble_context_with_progress(&request, route.tier, &|stage| {
+                let _ = tx.send(AgentEvent::NeuroCodeProgress {
+                    stage: stage.to_string(),
+                });
+            })
+        } else {
+            engine.assemble_context(&request, route.tier)
+        };
         if !assembled.formatted_context.is_empty() {
             tracing::debug!(
                 target: "neurocode",
@@ -4345,6 +4357,110 @@ mod tests {
             fx.agent.system_prompt(),
             base_before,
             "the base system_prompt field must NEVER be mutated by the intercept"
+        );
+    }
+
+    /// Streaming engine double (feature 015 follow-up): implements
+    /// `assemble_context_with_progress` directly to verify the intercept
+    /// routes through it and forwards every stage as a live event.
+    struct StreamingEngine {
+        stages_emitted: Mutex<Vec<String>>,
+    }
+
+    impl StreamingEngine {
+        fn new() -> Self {
+            Self {
+                stages_emitted: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl joey_neurocode::NeuroCodeEngine for StreamingEngine {
+        fn classify(&self, _request: &joey_neurocode::CodingRequest) -> joey_neurocode::ComplexityRoute {
+            joey_neurocode::ComplexityRoute {
+                tier: joey_neurocode::ComplexityTier::Frontier,
+                reasoning: "streaming test".to_string(),
+                overridden: false,
+                override_tier: None,
+                signals: Vec::new(),
+            }
+        }
+
+        fn assemble_context(
+            &self,
+            _request: &joey_neurocode::CodingRequest,
+            tier: joey_neurocode::ComplexityTier,
+        ) -> joey_neurocode::AssembledContext {
+            joey_neurocode::AssembledContext {
+                formatted_context: "## streaming ctx".to_string(),
+                tier,
+                ..Default::default()
+            }
+        }
+
+        fn assemble_context_with_progress(
+            &self,
+            request: &joey_neurocode::CodingRequest,
+            tier: joey_neurocode::ComplexityTier,
+            progress: &dyn Fn(&str),
+        ) -> joey_neurocode::AssembledContext {
+            self.stages_emitted.lock().unwrap().extend([
+                "locating target nodes".to_string(),
+                "expanded graph: 3 nodes pulled in".to_string(),
+            ]);
+            progress("locating target nodes");
+            progress("expanded graph: 3 nodes pulled in");
+            self.assemble_context(request, tier)
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    /// Feature 015 follow-up (realtime feed): when an event channel is
+    /// present, the intercept must call `assemble_context_with_progress`
+    /// and forward each stage as `AgentEvent::NeuroCodeProgress` — emitted
+    /// BEFORE the final `NeuroCodeContext` blob.
+    #[tokio::test]
+    async fn active_engine_streams_progress_events() {
+        use std::sync::Mutex;
+
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        let engine = Arc::new(StreamingEngine::new());
+        fx.agent.set_neurocode_engine(engine.clone());
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("refactor this module", tx).await;
+
+        // Drain all events, find the NeuroCode ones.
+        let mut neuro_progress: Vec<String> = Vec::new();
+        let mut saw_context_blob = false;
+        while let Some(ev) = rx.try_recv().ok() {
+            match ev {
+                AgentEvent::NeuroCodeProgress { stage } => neuro_progress.push(stage),
+                AgentEvent::NeuroCodeContext { .. } => saw_context_blob = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            engine.stages_emitted.lock().unwrap().len(),
+            2,
+            "streaming path invoked"
+        );
+        assert!(
+            neuro_progress.contains(&"locating target nodes".to_string()),
+            "stage events forwarded, got: {:?}",
+            neuro_progress
+        );
+        assert!(
+            neuro_progress.contains(&"expanded graph: 3 nodes pulled in".to_string()),
+            "expand stage forwarded, got: {:?}",
+            neuro_progress
+        );
+        assert!(
+            saw_context_blob,
+            "final NeuroCodeContext blob still arrives after progress events"
         );
     }
 

@@ -322,8 +322,27 @@ pub struct App {
     pub neurocode_nodes: usize,
     /// Cold-mode flag (project not indexed — degraded context).
     pub neurocode_cold: bool,
+    /// Live assembly stage (feature 015 follow-up): the most recent
+    /// `AgentEvent::NeuroCodeProgress` description, shown while assembling.
+    pub neurocode_stage: String,
+    /// When the live stage was last updated — drives the animated
+    /// "assembling" indicator in the context panel.
+    pub neurocode_stage_at: Option<std::time::Instant>,
+    /// When the final context blob last arrived (`NeuroCodeContext`) —
+    /// rendered as "updated Ns ago" so refreshes are visible in realtime.
+    pub neurocode_updated_at: Option<std::time::Instant>,
     /// Scroll offset (lines) for the context panel when the feed overflows.
     pub neurocode_scroll: usize,
+    /// Expanded (main-screen) mode for the context feed: set by clicking the
+    /// docked bottom-right panel — its content takes over the main screen
+    /// (below the live transcript tail), and clicking again (or Esc) docks
+    /// it back. Live streaming keeps flowing in both modes.
+    pub neurocode_expanded: bool,
+    /// Screen rect of the NeuroCode context panel as drawn by the LAST frame
+    /// (docked or expanded). Used for mouse hit-testing, mirroring
+    /// `last_text_area`. Interior mutability so widgets can record it from
+    /// `&App` during render.
+    pub last_neurocode_rect: Cell<(u16, u16, u16, u16)>,
     /// T155: when true, the Atlas job board section renders in draw_omo_panel.
     /// Set on BoulderWorkStarted, cleared on BoulderWorkCompleted / turn Done.
     pub job_board_visible: bool,
@@ -666,7 +685,12 @@ impl App {
             neurocode_tokens: 0,
             neurocode_nodes: 0,
             neurocode_cold: false,
+            neurocode_stage: String::new(),
+            neurocode_stage_at: None,
+            neurocode_updated_at: None,
             neurocode_scroll: 0,
+            neurocode_expanded: false,
+            last_neurocode_rect: Cell::new((0, 0, 0, 0)),
             job_board_visible: false,
             pending_context_injection: None,
             search_open: false,
@@ -1072,6 +1096,13 @@ impl App {
                 });
             }
             // ── NeuroCode (feature 015): live context feed ──
+            AgentEvent::NeuroCodeProgress { stage } => {
+                // Feature 015 follow-up: live stage line during assembly.
+                // Arrives BEFORE the final NeuroCodeContext blob.
+                self.neurocode_active = true;
+                self.neurocode_stage = stage;
+                self.neurocode_stage_at = Some(std::time::Instant::now());
+            }
             AgentEvent::NeuroCodeContext {
                 tier,
                 token_estimate,
@@ -1086,11 +1117,20 @@ impl App {
                 self.neurocode_cold = cold_mode;
                 self.neurocode_context = formatted_context;
                 self.neurocode_scroll = 0;
+                // Assembly finished: clear the live stage, stamp the refresh.
+                self.neurocode_stage.clear();
+                self.neurocode_stage_at = None;
+                self.neurocode_updated_at = Some(std::time::Instant::now());
             }
             AgentEvent::NeuroCodeActive { active } => {
                 self.neurocode_active = active;
                 if !active {
                     self.neurocode_context.clear();
+                    self.neurocode_stage.clear();
+                    self.neurocode_stage_at = None;
+                    self.neurocode_updated_at = None;
+                    self.neurocode_expanded = false;
+                    self.last_neurocode_rect.set((0, 0, 0, 0));
                 }
             }
             AgentEvent::CategoryDelegation { category, model } => {
@@ -1260,6 +1300,22 @@ impl App {
     /// Resume auto-follow at the bottom.
     pub fn scroll_to_bottom(&mut self) {
         self.scroll = None;
+    }
+
+    // ── NeuroCode context feed ─────────────────────────────────────────
+
+    /// Toggle the NeuroCode context feed between its docked bottom-right
+    /// panel and expanded main-screen mode (and back). Invoked by clicking
+    /// the panel or pressing Esc while expanded. No-op when NeuroCode is
+    /// inactive.
+    pub fn toggle_neurocode_expanded(&mut self) {
+        if !self.neurocode_active {
+            return;
+        }
+        self.neurocode_expanded = !self.neurocode_expanded;
+        // Reset feed scroll so the expanded view opens at the tail (the
+        // live end) rather than wherever the docked view was scrolled to.
+        self.neurocode_scroll = 0;
     }
 
     // ── Search ─────────────���────────────────────────────────────────────
@@ -2124,6 +2180,60 @@ mod neurocode_panel_tests {
         terminal.draw(|f| crate::widgets::draw_neurocode_panel(f, f.area(), &app, theme)).unwrap();
         let text = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_string()).collect::<String>();
         assert!(text.contains("COLD"), "cold-mode badge shown");
+    }
+
+    #[test]
+    fn live_stage_streams_into_panel() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = Theme::aurora();
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::NeuroCodeActive { active: true });
+        // Progress events arrive BEFORE the final context blob.
+        app.apply(AgentEvent::NeuroCodeProgress {
+            stage: "expanded graph: 7 nodes pulled in".into(),
+        });
+        assert!(app.neurocode_active, "progress implies active");
+        assert!(!app.neurocode_stage.is_empty(), "stage tracked");
+        assert!(app.neurocode_stage_at.is_some(), "stage timestamp tracked");
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                crate::widgets::draw_neurocode_panel(f, f.area(), &app, theme);
+            })
+            .unwrap();
+        let text = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_string()).collect::<String>();
+        assert!(
+            text.contains("expanded graph: 7 nodes pulled in"),
+            "live stage rendered in panel, got: {}",
+            text
+        );
+
+        // The final blob clears the stage and stamps the refresh.
+        app.apply(AgentEvent::NeuroCodeContext {
+            tier: "Frontier".into(),
+            token_estimate: 900,
+            expanded_nodes: 7,
+            cold_mode: false,
+            formatted_context: "STAGE_CLEAR_MARKER".into(),
+        });
+        assert!(app.neurocode_stage.is_empty(), "stage cleared on context arrival");
+        assert!(app.neurocode_updated_at.is_some(), "refresh stamped");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                crate::widgets::draw_neurocode_panel(f, f.area(), &app, theme);
+            })
+            .unwrap();
+        let text = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_string()).collect::<String>();
+        assert!(text.contains("STAGE_CLEAR_MARKER"), "final context rendered");
+        assert!(text.contains("↻"), "refresh stamp rendered");
+        assert!(
+            !text.contains("expanded graph"),
+            "stale stage line removed once context lands"
+        );
     }
 
     #[test]
