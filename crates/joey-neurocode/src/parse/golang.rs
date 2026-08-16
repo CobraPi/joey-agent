@@ -56,6 +56,7 @@ pub fn parse_go_file(source: &str) -> Result<SourceExtraction, String> {
                             let method = ExtractedMethod {
                                 name: n.trim().to_string(),
                                 annotations: Vec::new(),
+                                signature: decl_signature(&child, source, "parameters"),
                                 start_byte: child.start_byte() as u32,
                                 end_byte: child.end_byte() as u32,
                             };
@@ -72,6 +73,7 @@ pub fn parse_go_file(source: &str) -> Result<SourceExtraction, String> {
                             extraction.module_functions.push(ExtractedMethod {
                                 name: n.trim().to_string(),
                                 annotations: Vec::new(),
+                                signature: decl_signature(&child, source, "parameters"),
                                 start_byte: child.start_byte() as u32,
                                 end_byte: child.end_byte() as u32,
                             });
@@ -186,6 +188,17 @@ fn extract_go_type_declaration<'a>(
     }
 }
 
+/// The declaration header of a Go func/method/interface-method: source text
+/// from the node start through the close of the `params_field` list,
+/// whitespace-collapsed, with the body cut off.
+fn decl_signature<'a>(node: &Node<'a>, source: &str, params_field: &str) -> Option<String> {
+    let end = node.child_by_field_name(params_field)?.end_byte();
+    if end <= node.start_byte() || end > source.len() {
+        return None;
+    }
+    Some(source[node.start_byte()..end].split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 /// Collect method signatures from an interface body.
 fn collect_interface_methods<'a>(
     iface: &Node<'a>,
@@ -200,6 +213,7 @@ fn collect_interface_methods<'a>(
                         methods.push(ExtractedMethod {
                             name: n.trim().to_string(),
                             annotations: Vec::new(),
+                            signature: decl_signature(&child, source, "parameters"),
                             start_byte: child.start_byte() as u32,
                             end_byte: child.end_byte() as u32,
                         });
@@ -242,6 +256,7 @@ fn collect_struct_fields<'a>(
                                     name: n,
                                     type_name: type_text.clone(),
                                     annotations: Vec::new(),
+                                    signature: Some(type_text.clone()),
                                 });
                             }
                         }

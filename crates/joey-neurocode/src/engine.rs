@@ -65,10 +65,41 @@ pub trait NeuroCodeEngine: Send + Sync {
     /// Whether NeuroCode is enabled for the current session (FR-003).
     fn is_active(&self) -> bool;
 
-    /// Resolve the tier model for the current request (Mode 2 — direct config
-    /// lookup). Returns None when no tier model is configured (caller falls
-    /// back to the agent default). Default impl returns None.
+    /// Resolve the tier model for the tier the CURRENT request was
+    /// classified into (Mode 2 — direct config lookup). Called by the
+    /// turn-loop intercept AFTER [`Self::classify`]; the default engine
+    /// caches the last classified tier. Returns None when no tier model is
+    /// configured (caller falls back to the agent default) or when no
+    /// request has been classified yet. Default impl returns None.
     fn resolve_tier_model(&self) -> Option<String> {
+        None
+    }
+
+    /// Record a source-file edit observed by the agent (feature 015
+    /// follow-up: dynamic context). The engine accumulates edits and
+    /// decides when they cross the "large edits" threshold. Default impl:
+    /// no-op (engines without an index ignore edits).
+    fn record_file_edit(&self, path: &str, added: usize, removed: usize) {
+        let _ = (path, added, removed);
+    }
+
+    /// True when the observed edits warrant an automatic re-index of the
+    /// structural graph. The agent asks this at turn end. Default: false.
+    fn should_reindex(&self) -> bool {
+        false
+    }
+
+    /// Rebuild the structural graph index now (automatic re-index after
+    /// large edits). Returns the ingestion stats on success. Blocking —
+    /// callers should run it off the turn loop's critical path (the agent
+    /// runs it via `spawn_blocking`). Default: None (unsupported).
+    fn reindex_now(&self) -> Option<crate::parse::IngestionResult> {
+        None
+    }
+
+    /// Progress toward the auto-reindex thresholds, for status display.
+    /// Default: None.
+    fn auto_index_progress(&self) -> Option<crate::auto_index::AutoIndexProgress> {
         None
     }
 }
@@ -88,18 +119,32 @@ pub struct DefaultEngine {
     /// The active provider id (from the resolved provider profile) — scopes
     /// tier-model resolution to `neurocode.tier.providers.<id>` when present.
     provider: String,
+    /// The tier the most recent `classify()` resolved to (resolved —
+    /// AmbiguousDefault mapped to the configured default tier). Used by
+    /// `resolve_tier_model` so the turn loop's tier routing follows the
+    /// actual classification result rather than always the default tier.
+    last_tier: Mutex<Option<ComplexityTier>>,
+    /// Auto-index state (feature 015 follow-up: dynamic context). Tracks
+    /// edits observed since the last index build so the agent can decide
+    /// when the structural graph is too stale to trust and re-index.
+    /// Mutex-wrapped: the engine is shared (`Arc<dyn NeuroCodeEngine>`)
+    /// while the tracker is inherently mutable.
+    auto_index: std::sync::Mutex<crate::auto_index::AutoIndexState>,
 }
 
 impl DefaultEngine {
     /// Create a new engine from config. The graph is opened lazily on first use.
     pub fn new(config: NeuroCodeConfig, project_root: PathBuf) -> Self {
         let classifier = ComplexityClassifier::from_config(&config);
+        let auto_index = crate::auto_index::AutoIndexState::new(&config.auto_index);
         Self {
             config,
             classifier,
             graph: Mutex::new(None),
             project_root,
             provider: String::new(),
+            last_tier: Mutex::new(None),
+            auto_index: Mutex::new(auto_index),
         }
     }
 
@@ -376,10 +421,49 @@ impl NeuroCodeCommands for DefaultEngine {
                     }
                     out.trim_end().to_string()
                 }
-                "dependents" | "incoming" => {
-                    // Resolve the node by FQCN prefix, then traverse edges to it.
-                    let nodes = graph.query_fts(symbol, 1).unwrap_or_default();
-                    let Some(node) = nodes.first() else {
+                "definition" => {
+                    // Where is the symbol declared? Kind, file, span, signature.
+                    let nodes = graph.query_fts(symbol, 10).unwrap_or_default();
+                    let matches: Vec<_> = nodes
+                        .iter()
+                        .filter(|n| {
+                            n.simple_name() == symbol
+                                || n.fqcn == symbol
+                                || n.fqcn.ends_with(&format!(".{}", symbol))
+                                || n.fqcn.ends_with(&format!("::{}", symbol))
+                        })
+                        .collect();
+                    if matches.is_empty() {
+                        return format!(
+                            "No exact definition for '{}' (use `symbol` for fuzzy matches).",
+                            symbol
+                        );
+                    }
+                    let mut out = format!("Definition(s) of '{}' ({}):\n", symbol, matches.len());
+                    for n in matches {
+                        out.push_str(&format!(
+                            "  [{}] {}\n    file: {}\n",
+                            n.kind.as_str(),
+                            n.fqcn,
+                            n.source_path
+                        ));
+                        if let Some((s, e)) = n.source_span {
+                            out.push_str(&format!("    span: bytes {}..{}\n", s, e));
+                        }
+                        if let Some(sig) = &n.signature {
+                            out.push_str(&format!("    signature: {}\n", sig));
+                        }
+                    }
+                    out.trim_end().to_string()
+                }
+                "dependents" | "incoming" | "references" => {
+                    // Resolve the node: prefer a type-level exact/qualified
+                    // match over member FQCNs that merely contain the symbol.
+                    let Some(node) = graph
+                        .query_fts(symbol, 20)
+                        .ok()
+                        .and_then(|results| resolve_query_node(symbol, results))
+                    else {
                         return format!("No artifact matching '{}' for dependency lookup.", symbol);
                     };
                     let edges = graph.traverse_to(node.id, None).unwrap_or_default();
@@ -400,8 +484,11 @@ impl NeuroCodeCommands for DefaultEngine {
                     out.trim_end().to_string()
                 }
                 "dependencies" | "outgoing" => {
-                    let nodes = graph.query_fts(symbol, 1).unwrap_or_default();
-                    let Some(node) = nodes.first() else {
+                    let Some(node) = graph
+                        .query_fts(symbol, 20)
+                        .ok()
+                        .and_then(|results| resolve_query_node(symbol, results))
+                    else {
                         return format!("No artifact matching '{}' for dependency lookup.", symbol);
                     };
                     let edges = graph.traverse_edges(node.id, None).unwrap_or_default();
@@ -422,7 +509,7 @@ impl NeuroCodeCommands for DefaultEngine {
                     out.trim_end().to_string()
                 }
                 _ => format!(
-                    "Unknown query type '{}'. Use: symbol | dependents | dependencies",
+                    "Unknown query type '{}'. Use: symbol | definition | dependencies | dependents | references",
                     query_type
                 ),
             },
@@ -650,6 +737,36 @@ impl NeuroCodeCommands for DefaultEngine {
     }
 }
 
+/// Resolve a query symbol to the best node from FTS results: prefer a
+/// type-level node whose simple name or FQCN matches the symbol exactly,
+/// then a qualified suffix match, then any exact member, then the first
+/// type-level hit, then the first hit. Shared by the `dependencies` /
+/// `dependents` query paths so member FQCNs that merely CONTAIN the symbol
+/// don't hijack the lookup.
+fn resolve_query_node(
+    symbol: &str,
+    results: Vec<crate::graph::node::CodeArtifactNode>,
+) -> Option<crate::graph::node::CodeArtifactNode> {
+    use crate::graph::node::{ArtifactKind, CodeArtifactNode};
+    let is_type_level = |n: &CodeArtifactNode| {
+        matches!(
+            n.kind,
+            ArtifactKind::Class | ArtifactKind::Interface | ArtifactKind::Enum | ArtifactKind::PegaRule
+        )
+    };
+    results
+        .iter()
+        .find(|n| is_type_level(n) && (n.simple_name() == symbol || n.fqcn == symbol))
+        .or_else(|| {
+            results
+                .iter()
+                .find(|n| is_type_level(n) && n.fqcn.ends_with(&format!(".{}", symbol)))
+        })
+        .or_else(|| results.iter().find(|n| n.simple_name() == symbol))
+        .or_else(|| results.iter().find(|n| is_type_level(n)))
+        .cloned()
+}
+
 /// Format the status line for domain-knowledge conflicts (T064): a summary
 /// count plus a compact listing of each conflict (category, version, ids).
 /// Returns an empty string when there are no conflicts.
@@ -691,7 +808,27 @@ fn thousands_sep(n: usize) -> String {
 
 impl NeuroCodeEngine for DefaultEngine {
     fn classify(&self, request: &CodingRequest) -> ComplexityRoute {
-        self.classifier.classify(request)
+        let route = self.classifier.classify(request);
+        // Cache the RESOLVED tier so resolve_tier_model (called right after
+        // by the turn loop) follows the actual classification: a Frontier
+        // classification routes to the frontier tier model, not the
+        // ambiguous default. Pinned routes cache their pinned tier.
+        let resolved = match route.tier {
+            ComplexityTier::AmbiguousDefault => {
+                // Only resolve ambiguous when the classifier genuinely
+                // landed there; overridden (pinned) routes keep their tier.
+                if route.overridden {
+                    route.tier
+                } else {
+                    self.config.ambiguous_default_tier()
+                }
+            }
+            other => other,
+        };
+        if let Ok(mut slot) = self.last_tier.lock() {
+            *slot = Some(resolved);
+        }
+        route
     }
 
     fn assemble_context(
@@ -765,14 +902,18 @@ impl NeuroCodeEngine for DefaultEngine {
     }
 
     fn resolve_tier_model(&self) -> Option<String> {
-        // Re-classify the last request to get the tier, then resolve.
-        // Since classify is O(1) and non-async, this is safe on the hot path.
-        // We use a synthetic request from the last user text (already consumed
-        // by the turn-loop intercept). For the default engine, we use the
-        // pinned tier or the ambiguous default tier.
-        let tier = self.classifier.pinned_tier().unwrap_or_else(|| {
-            self.config.ambiguous_default_tier()
-        });
+        // Follow the last classification (cached by classify). Fall back to
+        // the pinned tier / ambiguous default only when no request has been
+        // classified yet — e.g. a command-surface engine that never saw a
+        // turn. Mode 2: NeuroCode resolves the tier model from its own
+        // config, scoped to the active provider.
+        let tier = self
+            .last_tier
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .or_else(|| self.classifier.pinned_tier())
+            .unwrap_or_else(|| self.config.ambiguous_default_tier());
         let resolver = crate::tier_resolver::TierModelResolver::new(
             self.config.clone(),
             String::new(), // no fallback here — return None if unconfigured
@@ -784,6 +925,34 @@ impl NeuroCodeEngine for DefaultEngine {
         } else {
             Some(resolution.model_id)
         }
+    }
+
+    fn record_file_edit(&self, path: &str, added: usize, removed: usize) {
+        if let Ok(mut tracker) = self.auto_index.lock() {
+            tracker.record_edit(path, added, removed);
+        }
+    }
+
+    fn should_reindex(&self) -> bool {
+        self.auto_index.lock().map(|t| t.should_reindex()).unwrap_or(false)
+    }
+
+    fn reindex_now(&self) -> Option<crate::parse::IngestionResult> {
+        // Full re-ingestion of the project source tree. This is the same
+        // path `/neurocode index` takes (index_project), wrapped with the
+        // auto-index bookkeeping: trackers cleared + debounce window
+        // restarted on completion.
+        let result = self.index_project();
+        if result.errors.is_empty() || result.files_scanned > 0 {
+            if let Ok(mut tracker) = self.auto_index.lock() {
+                tracker.note_reindexed();
+            }
+        }
+        Some(result)
+    }
+
+    fn auto_index_progress(&self) -> Option<crate::auto_index::AutoIndexProgress> {
+        self.auto_index.lock().ok().map(|t| t.progress())
     }
 }
 
@@ -812,5 +981,76 @@ mod tests {
         };
         let route = engine.classify(&req);
         assert_eq!(route.tier, ComplexityTier::Economical);
+    }
+
+    // ── Auto re-index (feature 015 follow-up: dynamic context) ─────────
+
+    /// Edits accumulate toward the threshold via the trait surface, and
+    /// the tracker reports progress for UI display.
+    #[test]
+    fn auto_index_tracks_edits_via_trait() {
+        let cfg = NeuroCodeConfig::default();
+        let engine = DefaultEngine::new(cfg, PathBuf::from("/tmp/test-project"));
+        assert!(!engine.should_reindex(), "fresh engine: nothing edited");
+        engine.record_file_edit("src/a.rs", 10, 5);
+        engine.record_file_edit("src/b.rs", 20, 5);
+        let p = engine.auto_index_progress().unwrap();
+        assert_eq!((p.files, p.lines), (2, 40));
+        assert!(!engine.should_reindex());
+        engine.record_file_edit("src/c.rs", 1, 1);
+        assert!(
+            engine.should_reindex(),
+            "3 distinct files crossed the file threshold"
+        );
+    }
+
+    /// `reindex_now` on a project with no source is a no-op that still
+    /// resets the trackers (additive degradation — nothing to index, but
+    /// the edit pressure is consumed so we don't retry every turn).
+    #[test]
+    fn auto_index_reindex_on_empty_project_resets_tracker() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = NeuroCodeConfig::default();
+        let engine = DefaultEngine::new(cfg, dir.path().to_path_buf());
+        engine.record_file_edit("a.rs", 500, 0);
+        assert!(engine.should_reindex(), "line threshold crossed");
+        let stats = engine.reindex_now().expect("default engine supports reindex");
+        // Empty temp dir: nothing scanned, no errors beyond nothing-to-do.
+        assert_eq!(stats.files_scanned, 0);
+        assert!(!engine.should_reindex(), "trackers reset after the pass");
+    }
+
+    /// `reindex_now` on a real (tiny) source tree re-ingests it: nodes
+    /// land in the graph and the trackers clear.
+    #[test]
+    fn auto_index_reindex_ingests_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("svc.rs"),
+            "pub struct UserService;\nimpl UserService {\n    pub fn find(&self) -> u32 { 1 }\n}\n",
+        )
+        .unwrap();
+        let cfg = NeuroCodeConfig::default();
+        let engine = DefaultEngine::new(cfg, dir.path().to_path_buf());
+        engine.record_file_edit("svc.rs", 4, 0);
+        // Below both thresholds — but reindex_now is explicit.
+        let stats = engine.reindex_now().expect("reindex supported");
+        assert_eq!(stats.files_scanned, 1, "the .rs file was ingested");
+        assert!(stats.artifacts_seen >= 1, "at least the struct node");
+        assert!(!engine.should_reindex());
+        // The graph is now populated: assembly is no longer cold.
+        let req = CodingRequest {
+            text: "refactor UserService".into(),
+            active_file: Some("svc.rs".into()),
+            active_symbols: vec!["UserService".into()],
+            project_root: dir.path().to_path_buf(),
+            token_budget_hint: 0,
+        };
+        let ctx = engine.assemble_context(&req, ComplexityTier::Economical);
+        assert!(!ctx.cold_mode, "graph populated by the auto re-index");
+        assert!(
+            ctx.snapshot.is_some(),
+            "assembly carries a graph snapshot after re-index"
+        );
     }
 }

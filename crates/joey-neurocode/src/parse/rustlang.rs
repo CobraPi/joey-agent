@@ -89,6 +89,7 @@ pub fn parse_rust_file(source: &str) -> Result<SourceExtraction, String> {
                             extraction.module_functions.push(ExtractedMethod {
                                 name: n.trim().to_string(),
                                 annotations: Vec::new(),
+                                signature: rust_decl_signature(&child, source),
                                 start_byte: child.start_byte() as u32,
                                 end_byte: child.end_byte() as u32,
                             });
@@ -220,9 +221,10 @@ fn extract_struct<'a>(node: &Node<'a>, source: &str) -> Option<ExtractedType> {
                     continue;
                 }
                 fields.push(ExtractedField {
-                    name: fname,
+                    name: fname.clone(),
                     type_name: type_text.clone(),
                     annotations: Vec::new(),
+                    signature: Some(format!("{}: {}", fname, type_text)),
                 });
                 if let Some(dep) = rust_base_type(&type_text) {
                     if !is_builtin_rust_type(&dep) && !deps.contains(&dep) {
@@ -325,6 +327,7 @@ fn collect_impl_methods_named<'a>(
                     methods.push(ExtractedMethod {
                         name: n.trim().to_string(),
                         annotations: Vec::new(),
+                        signature: rust_decl_signature(&child, source),
                         start_byte: child.start_byte() as u32,
                         end_byte: child.end_byte() as u32,
                     });
@@ -332,6 +335,19 @@ fn collect_impl_methods_named<'a>(
             }
         }
     }
+}
+
+/// The declaration header of a Rust function: source text from the node
+/// start through the return type / before the body, whitespace-collapsed.
+fn rust_decl_signature<'a>(node: &Node<'a>, source: &str) -> Option<String> {
+    let end = match node.child_by_field_name("body") {
+        Some(body) => body.start_byte(),
+        None => node.end_byte(),
+    };
+    if end <= node.start_byte() || end > source.len() {
+        return None;
+    }
+    Some(source[node.start_byte()..end].split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// Strip Rust type wrappers to the base type: `Option<User>` → `User`,

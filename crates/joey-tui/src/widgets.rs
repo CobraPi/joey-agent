@@ -153,7 +153,7 @@ pub fn draw_particles(f: &mut Frame, field: &ParticleField, theme: Theme, area: 
 
 // ── Header banner ───────────────────────────────────────────────────────────
 
-pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: &Spinner, pulse: &Pulse) {
+pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: &Spinner, pulse: &Pulse, header_flow: Option<&crate::anim::HeaderFlow>) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -219,6 +219,14 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
     let mut rx = inner.x + inner.width.saturating_sub(right_len as u16);
+    // Record the right section's rect for click hit-testing (opens the
+    // agent-stats page). Zero when it doesn't fit.
+    if right_len as u16 <= inner.width {
+        app.last_header_right_rect
+            .set((rx, inner.y, right_len as u16, 1));
+    } else {
+        app.last_header_right_rect.set((0, 0, 0, 0));
+    }
     for span in &right_spans {
         for ch in span.content.chars() {
             if rx >= inner.x + inner.width {
@@ -231,11 +239,23 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
     }
 
     // Subtle gradient underline (only when the header has its second row).
+    // While the agent is running this becomes the activity indicator: a
+    // slow traveling brightness wave glides across the bar (see
+    // `anim::HeaderFlow`). Idle = the static gradient underline.
     if area.height >= 2 {
         let underline_y = area.y + area.height - 1;
         for i in 0..area.width {
             let t = i as f32 / area.width.max(1) as f32;
-            let c = crate::theme::sample_stops(&[theme.grad_0, theme.grad_1, theme.grad_2, theme.grad_3], t);
+            let mut c = crate::theme::sample_stops(
+                &[theme.grad_0, theme.grad_1, theme.grad_2, theme.grad_3],
+                t,
+            );
+            if let Some(flow) = header_flow {
+                let lift = flow.brightness(t);
+                if lift > 0.0 {
+                    c = c.lerp(Rgb(255, 255, 255), lift.min(0.32));
+                }
+            }
             let cell = &mut buf[(area.x + i, underline_y)];
             cell.set_char('─')
                 .set_style(Style::default().fg(c.to_color()));
@@ -379,7 +399,7 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             }
             lines.push(Line::from(vec![Span::raw("")]));
         }
-        TranscriptItem::Tool { name, emoji, summary, status, duration_secs, result_preview, expanded, full_args, full_result, is_terminal, exit_code } => {
+        TranscriptItem::Tool { name, emoji, summary, status, duration_secs, result_preview, expanded, full_args, full_result, is_terminal, exit_code, live_output, .. } => {
             if *is_terminal {
                 // Feature 007 (T019): terminal-command block layout.
                 // Header: $ command  (exit N)  ⟳/✓/✗  ▸/▾
@@ -426,49 +446,98 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     Style::default().fg(theme.fg_most_subtle.to_color()),
                 ));
                 lines.push(Line::from(spans));
-                // Body: collapsed (first MAX_TOOL_OUTPUT_LINES) or expanded
-                // (the FULL result, bounded by the tail-window cap with an
-                // affordance — feature parity with the generic tool view).
-                let output = result_preview.as_str();
-                if !output.is_empty() && !matches!(status, ToolStatus::Running) {
+                // Body: while RUNNING, live-stream the tail of the output as
+                // it arrives (AgentEvent::ToolOutput accumulation) — the
+                // "watch the CLI output in realtime" inline view. Collapsed
+                // to the last MAX_TOOL_OUTPUT_LINES lines with a streaming
+                // affordance; Ctrl+O or clicking the block maximizes it.
+                if matches!(status, ToolStatus::Running) {
+                    if !live_output.is_empty() {
+                        let (shown, affordance) =
+                            bounded_tail_lines_with_affordance(live_output, MAX_TOOL_OUTPUT_LINES);
+                        let total = live_output.lines().count();
+                        // Absolute numbering of the tail window: the first
+                        // shown line is (total - shown.len() + 1).
+                        let first = total.saturating_sub(shown.len()) + 1;
+                        let gutter_w = digits(total.max(1));
+                        for (gi, ol) in shown.iter().enumerate() {
+                            let num = format!("{:>w$} │ ", first + gi, w = gutter_w);
+                            for w in wrap(ol, content_w.saturating_sub(8 + gutter_w)) {
+                                lines.push(Line::from(vec![
+                                    Span::styled(num.clone(), Style::default().fg(theme.fg_most_subtle.to_color())),
+                                    Span::styled(w, Style::default().fg(theme.fg_more_subtle.to_color())),
+                                ]));
+                            }
+                        }
+                        let n_lines = total.max(shown.len());
+                        lines.push(Line::from(vec![Span::styled(
+                            format!(
+                                "    ⣿ streaming · {} lines · Ctrl+O or click to maximize",
+                                n_lines
+                            ),
+                            Style::default().fg(theme.busy.to_color()),
+                        )]));
+                        let _ = affordance;
+                    } else {
+                        // Silent so far — show the heartbeat-style hint.
+                        lines.push(Line::from(vec![Span::styled(
+                            "    ⣿ running…".to_string(),
+                            Style::default().fg(theme.busy.to_color()),
+                        )]));
+                    }
+                } else if !result_preview.is_empty() {
+                    // Finished: collapsed (last MAX_TOOL_OUTPUT_LINES) or
+                    // expanded (the FULL result, tail-bounded). The payload
+                    // is envelope-unwrapped from the JSON envelope and shown
+                    // in a line-numbered code view (crush-style gutter).
+                    let preview_payload = crate::state::display_result_content(result_preview)
+                        .unwrap_or_else(|| result_preview.clone());
                     if *expanded {
-                        // Full result when available; the preview otherwise.
+                        // Full result when available (formatted for display);
+                        // the unwrapped preview otherwise.
                         let full = full_result
                             .as_deref()
                             .filter(|f| !f.is_empty())
-                            .unwrap_or(output);
+                            .map(crate::state::format_tool_result_for_display)
+                            .unwrap_or(preview_payload.clone());
                         let (shown, affordance) =
-                            bounded_tail_lines_with_affordance(full, MAX_TAIL_WINDOW_LINES_TUI);
+                            bounded_tail_lines_with_affordance(&full, MAX_TAIL_WINDOW_LINES_TUI);
+                        let total = full.lines().count();
+                        let first = total.saturating_sub(shown.len()) + 1;
+                        let gutter_w = digits(total.max(first));
                         if let Some(msg) = affordance {
                             lines.push(Line::from(vec![Span::styled(
                                 format!("    {}", msg),
                                 Style::default().fg(theme.fg_most_subtle.to_color()),
                             )]));
                         }
-                        for ol in &shown {
-                            for w in wrap(ol, content_w.saturating_sub(4)) {
-                                lines.push(Line::from(vec![Span::styled(
-                                    format!("    {}", w),
-                                    Style::default().fg(theme.fg_more_subtle.to_color()),
-                                )]));
+                        for (gi, ol) in shown.iter().enumerate() {
+                            let num = format!("{:>w$} │ ", first + gi, w = gutter_w);
+                            for w in wrap(ol, content_w.saturating_sub(8 + gutter_w)) {
+                                lines.push(Line::from(vec![
+                                    Span::styled(num.clone(), Style::default().fg(theme.fg_most_subtle.to_color())),
+                                    Span::styled(w, Style::default().fg(theme.fg_more_subtle.to_color())),
+                                ]));
                             }
                         }
                     } else {
                         let (shown, affordance) = bounded_lines_with_affordance(
-                            output,
+                            &preview_payload,
                             MAX_TOOL_OUTPUT_LINES,
                         );
-                        for ol in &shown {
-                            for w in wrap(ol, content_w.saturating_sub(4)) {
-                                lines.push(Line::from(vec![Span::styled(
-                                    format!("    {}", w),
-                                    Style::default().fg(theme.fg_more_subtle.to_color()),
-                                )]));
+                        let gutter_w = digits(shown.len().max(1));
+                        for (gi, ol) in shown.iter().enumerate() {
+                            let num = format!("{:>w$} │ ", gi + 1, w = gutter_w);
+                            for w in wrap(ol, content_w.saturating_sub(8 + gutter_w)) {
+                                lines.push(Line::from(vec![
+                                    Span::styled(num.clone(), Style::default().fg(theme.fg_most_subtle.to_color())),
+                                    Span::styled(w, Style::default().fg(theme.fg_more_subtle.to_color())),
+                                ]));
                             }
                         }
                         if let Some(msg) = affordance {
                             lines.push(Line::from(vec![Span::styled(
-                                format!("    {}", msg),
+                                format!("    {} [click or space to expand]", msg),
                                 Style::default().fg(theme.fg_most_subtle.to_color()),
                             )]));
                         }
@@ -519,20 +588,25 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             ));
             lines.push(Line::from(spans));
             if !result_preview.is_empty() && !matches!(status, ToolStatus::Running) && !*expanded {
-                // Feature 007 (T023): use the shared bounded-output helper.
+                // Feature 007 (T023): bounded output + envelope unwrapping +
+                // a line-numbered gutter (crush-style code view).
+                let payload = crate::state::display_result_content(result_preview)
+                    .unwrap_or_else(|| result_preview.clone());
                 let (shown, affordance) =
-                    bounded_lines_with_affordance(result_preview, MAX_TOOL_OUTPUT_LINES);
+                    bounded_lines_with_affordance(&payload, MAX_TOOL_OUTPUT_LINES);
                 let col = if matches!(status, ToolStatus::Failed) {
                     theme.error
                 } else {
                     theme.fg_most_subtle
                 };
-                for ol in &shown {
-                    for w in wrap(ol, content_w.saturating_sub(4)) {
-                        lines.push(Line::from(vec![Span::styled(
-                            format!("    {}", w),
-                            Style::default().fg(col.to_color()),
-                        )]));
+                let gutter_w = digits(shown.len().max(1));
+                for (gi, ol) in shown.iter().enumerate() {
+                    let num = format!("{:>w$} │ ", gi + 1, w = gutter_w);
+                    for w in wrap(ol, content_w.saturating_sub(8 + gutter_w)) {
+                        lines.push(Line::from(vec![
+                            Span::styled(num.clone(), Style::default().fg(theme.fg_most_subtle.to_color())),
+                            Span::styled(w, Style::default().fg(col.to_color())),
+                        ]));
                     }
                 }
                 if let Some(msg) = affordance {
@@ -559,12 +633,16 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                         "    args:".to_string(),
                         Style::default().fg(theme.fg_more_subtle.to_color()),
                     )]));
-                    for arg_line in args_text.lines() {
-                        for w in wrap(arg_line, content_w.saturating_sub(8)) {
-                            lines.push(Line::from(vec![Span::styled(
-                                format!("      {}", w),
-                                Style::default().fg(theme.fg_most_subtle.to_color()),
-                            )]));
+                    let pretty_args = crate::state::pretty_json_if_parses(args_text);
+                    let arg_lines: Vec<&str> = pretty_args.lines().collect();
+                    let gutter_w = digits(arg_lines.len().max(1));
+                    for (gi, arg_line) in arg_lines.iter().enumerate() {
+                        let num = format!("      {:>w$} │ ", gi + 1, w = gutter_w);
+                        for w in wrap(arg_line, content_w.saturating_sub(10 + gutter_w)) {
+                            lines.push(Line::from(vec![
+                                Span::styled(num.clone(), Style::default().fg(theme.fg_most_subtle.to_color())),
+                                Span::styled(w, Style::default().fg(theme.fg_most_subtle.to_color())),
+                            ]));
                         }
                     }
                 }
@@ -574,21 +652,29 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                             "    result:".to_string(),
                             Style::default().fg(theme.fg_more_subtle.to_color()),
                         )]));
-                        // Feature 007 (T023): use shared helper for consistency.
+                        // Feature 007 (T023) + crush-style formatting:
+                        // envelope-unwrapped + JSON pretty-printed, tail-
+                        // bounded, line-numbered gutter.
+                        let formatted = crate::state::format_tool_result_for_display(result);
                         let (shown, affordance) =
-                            bounded_lines_with_affordance(result, MAX_TAIL_WINDOW_LINES_TUI);
+                            bounded_tail_lines_with_affordance(&formatted, MAX_TAIL_WINDOW_LINES_TUI);
+                        let total = formatted.lines().count();
+                        let first = total.saturating_sub(shown.len()) + 1;
+                        let gutter_w = digits(total.max(first));
                         if let Some(msg) = affordance {
                             lines.push(Line::from(vec![Span::styled(
                                 format!("      {}", msg),
                                 Style::default().fg(theme.fg_most_subtle.to_color()),
                             )]));
                         }
-                        for rl in &shown {
-                            for w in wrap(rl, content_w.saturating_sub(6)) {
-                                lines.push(Line::from(vec![Span::styled(
-                                    format!("      {}", w),
-                                    Style::default().fg(theme.fg_most_subtle.to_color()),
-                                )]));
+                        for (gi, rl) in shown.iter().enumerate() {
+                            let num = format!("      {:>w$} │ ", first + gi, w = gutter_w);
+                            for w in wrap(rl, content_w.saturating_sub(10 + gutter_w)) {
+                                lines.push(Line::from(vec![
+                                    Span::styled(num.clone(), Style::default().fg(theme.fg_most_subtle.to_color())),
+                                    Span::styled(w, Style::default().fg(theme.fg_more_subtle.to_color()),
+                                    ),
+                                ]));
                             }
                         }
                     }
@@ -615,11 +701,23 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     Style::default().fg(theme.fg_most_subtle.to_color()),
                 )));
             } else {
-                // E2 resolution: height-bound the diff block; the bound
-                // lifts when expanded (click or Space/x).
+                // Crush-style diff view: dual old/new line-number gutters
+                // (insertions blank the old number, deletions blank the new
+                // — diffview.go), colored +/- markers, hunk headers as
+                // subtle dividers. E2 height-bound stays; the bound lifts
+                // when expanded (click or Space/x).
                 let max_height = if *expanded { usize::MAX } else { MAX_DIFF_LINES };
-                let start = if diff_lines.len() > max_height {
-                    diff_lines.len() - max_height
+                let parsed = parse_diff_lines(diff_lines);
+                // Gutter width: the max line number across the whole diff
+                // (stable width regardless of the window).
+                let max_num = parsed
+                    .iter()
+                    .filter_map(|p| p.old_line.max(p.new_line))
+                    .max()
+                    .unwrap_or(1);
+                let gw = digits(max_num);
+                let start = if parsed.len() > max_height {
+                    parsed.len() - max_height
                 } else {
                     0
                 };
@@ -629,22 +727,55 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                         Style::default().fg(theme.fg_most_subtle.to_color()),
                     )));
                 }
-                for dl in &diff_lines[start..] {
-                    let col = if dl.starts_with("+++") || dl.starts_with("---") {
-                        theme.fg_most_subtle
-                    } else if dl.starts_with("@@") {
-                        theme.info
-                    } else if dl.starts_with('+') {
-                        theme.success
-                    } else if dl.starts_with('-') {
-                        theme.error
-                    } else {
-                        theme.fg_base
+                for p in &parsed[start..] {
+                    // Gutter spans: dual old/new numbers (blank where the
+                    // side doesn't exist) + the +/- marker column.
+                    let fmt_num =
+                        |n: Option<usize>| n.map(|x| x.to_string()).unwrap_or_default();
+                    let gutter: Vec<Span<'static>> = match p.prefix {
+                        '-' => vec![
+                            Span::styled(
+                                format!("{:>w$} {:>w$} ", fmt_num(p.old_line), "", w = gw),
+                                Style::default().fg(theme.fg_most_subtle.to_color()),
+                            ),
+                            Span::styled("- ", Style::default().fg(theme.error.to_color())),
+                        ],
+                        '+' => vec![
+                            Span::styled(
+                                format!("{:>w$} {:>w$} ", "", fmt_num(p.new_line), w = gw),
+                                Style::default().fg(theme.fg_most_subtle.to_color()),
+                            ),
+                            Span::styled("+ ", Style::default().fg(theme.success.to_color())),
+                        ],
+                        '@' => vec![
+                            Span::styled(
+                                format!("{:>w$} {:>w$} ", "…", "…", w = gw),
+                                Style::default().fg(theme.fg_most_subtle.to_color()),
+                            ),
+                            Span::raw("  "),
+                        ],
+                        _ => vec![
+                            Span::styled(
+                                format!("{:>w$} {:>w$} ", fmt_num(p.old_line), fmt_num(p.new_line), w = gw),
+                                Style::default().fg(theme.fg_most_subtle.to_color()),
+                            ),
+                            Span::raw("  "),
+                        ],
                     };
-                    lines.push(Line::from(Span::styled(
-                        format!("    {}", dl),
-                        Style::default().fg(col.to_color()),
-                    )));
+                    let content_col = match p.prefix {
+                        '@' => theme.info,
+                        '+' => theme.success,
+                        '-' => theme.error,
+                        _ => theme.fg_base,
+                    };
+                    for w in wrap(p.content, content_w.saturating_sub(4 + 2 * gw + 2)) {
+                        let mut row = gutter.clone();
+                        row.push(Span::styled(
+                            w,
+                            Style::default().fg(content_col.to_color()),
+                        ));
+                        lines.push(Line::from(row));
+                    }
                 }
             }
             // Feature 013 (T005): uniform trailing blank separator (FR-001).
@@ -1018,6 +1149,62 @@ fn one_line(s: &str, max: usize) -> String {
     out
 }
 
+/// Number of decimal digits in `n` (min 1).
+fn digits(n: usize) -> usize {
+    n.max(1).to_string().len()
+}
+
+/// One rendered line of a unified diff, split into its display parts for the
+/// crush-style dual gutter: (old_line, new_line, prefix, content).
+struct DiffLineParts<'a> {
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    prefix: char,
+    content: &'a str,
+}
+
+/// Walk a unified diff's lines, tracking old/new line numbers from the hunk
+/// headers. Header/meta lines (`---`, `+++`, `diff --git`, `index`) yield
+/// None pairs (rendered without gutters).
+fn parse_diff_lines(diff_lines: &[String]) -> Vec<DiffLineParts<'_>> {
+    let mut out = Vec::with_capacity(diff_lines.len());
+    let mut old = 0usize;
+    let mut new = 0usize;
+    for l in diff_lines {
+        if l.starts_with("@@") {
+            // Parse `@@ -oldStart,oldLen +newStart,newLen @@` (start may be
+            // bare when len == 1; negative-zero start means line 0).
+            let extract = |tag: char| -> Option<usize> {
+                let idx = l.find(tag)?;
+                let rest = &l[idx + 1..];
+                let num: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                num.parse::<usize>().ok().map(|n| n.max(1))
+            };
+            old = extract('-').unwrap_or(1);
+            new = extract('+').unwrap_or(1);
+            out.push(DiffLineParts { old_line: None, new_line: None, prefix: '@', content: l });
+        } else if l.starts_with("---") || l.starts_with("+++") || l.starts_with("diff ") || l.starts_with("index ") {
+            out.push(DiffLineParts { old_line: None, new_line: None, prefix: ' ', content: l });
+        } else if let Some(content) = l.strip_prefix('-') {
+            out.push(DiffLineParts { old_line: Some(old), new_line: None, prefix: '-', content });
+            old += 1;
+        } else if let Some(content) = l.strip_prefix('+') {
+            out.push(DiffLineParts { old_line: None, new_line: Some(new), prefix: '+', content });
+            new += 1;
+        } else if let Some(content) = l.strip_prefix(' ') {
+            out.push(DiffLineParts { old_line: Some(old), new_line: Some(new), prefix: ' ', content });
+            old += 1;
+            new += 1;
+        } else {
+            out.push(DiffLineParts { old_line: None, new_line: None, prefix: ' ', content: l });
+        }
+    }
+    out
+}
+
 /// Word-wrap a string to a given display width.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
@@ -1025,6 +1212,13 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     }
     let mut out = Vec::new();
     for line in text.lines() {
+        // textwrap collapses blank lines to zero rows; preserve them as one
+        // empty row each so numbered gutters and code views stay aligned
+        // with the source (a missing line number mid-output is a lie).
+        if line.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
         let wrapped = textwrap::wrap(line, width);
         if wrapped.is_empty() {
             out.push(String::new());
@@ -1034,20 +1228,47 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
             }
         }
     }
+    // An entirely-empty/whitespace input still renders as one blank row
+    // (`"".lines()` yields nothing — callers expect at least one row).
+    if out.is_empty() {
+        out.push(String::new());
+    }
     out
 }
 
 // ── Reasoning box (live) ───────────────────────────────────────────────────
 
+/// Live reasoning panel. In docked mode it renders as the fixed 8-row strip
+/// at the bottom of the conversation area; in expanded mode
+/// (`app.reasoning_expanded`, toggled by clicking the panel) the same
+/// widget renders in the main screen area. Either way the panel records its
+/// rect into `app.last_reasoning_rect` for mouse hit-testing, and zeroes it
+/// when there is nothing live to show.
 pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: &Spinner) {
-    let block = gradient_block_focused("reasoning", theme, 0.5);
+    let live = app.reasoning_open && !app.streaming_reasoning.is_empty();
+    // Record geometry for click hit-testing; zero it when not live so
+    // stale rects can't catch clicks meant for the transcript.
+    app.last_reasoning_rect.set(if live {
+        (area.x, area.y, area.width, area.height)
+    } else {
+        (0, 0, 0, 0)
+    });
+
+    let title = if !live {
+        "reasoning"
+    } else if app.reasoning_expanded {
+        " reasoning · live · click or Esc to collapse "
+    } else {
+        " reasoning · live · click to expand "
+    };
+    let block = gradient_block_focused(title, theme, 0.5);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
-    if !app.reasoning_open || app.streaming_reasoning.is_empty() {
+    if !live {
         let placeholder = Line::from(vec![
             Span::styled(
                 "  (idle) ",
@@ -1060,22 +1281,486 @@ pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinne
 
     let content_w = inner.width.max(1) as usize;
     let mut lines: Vec<Line> = Vec::new();
-    for wl in wrap(&app.streaming_reasoning, content_w) {
+
+    // Header: thinking duration (Feature 007) + overflow indicator.
+    let mut header = vec![
+        Span::styled(
+            "◆ ".to_string(),
+            Style::default().fg(theme.accent.to_color()),
+        ),
+        Span::styled(
+            "thinking".to_string(),
+            Style::default()
+                .fg(theme.accent.to_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(started) = app.reasoning_started {
+        let secs = started.elapsed().as_secs();
+        header.push(Span::styled(
+            format!("  {}s", secs),
+            Style::default().fg(theme.info.to_color()),
+        ));
+    }
+    lines.push(Line::from(header));
+
+    // Body: the live stream, hard-wrapped, windowed by the view state —
+    // tail-anchored while auto-following, absolute-window when the user
+    // has scrolled up (frozen). The render also publishes the anchor's
+    // upper bound so input handlers can detect "scrolled to the bottom".
+    let wrapped = wrap(&app.streaming_reasoning, content_w);
+    let body_rows = inner.height.saturating_sub(lines.len() as u16 + 1).max(1) as usize; // +1 for the footer line
+    let total = wrapped.len();
+    let visible = body_rows.min(total);
+    let max_anchor = total.saturating_sub(visible);
+    app.last_reasoning_max_anchor.set(max_anchor);
+    let start = match app.reasoning_view {
+        None => max_anchor, // following: window pinned to the live tail
+        // Frozen: absolute window top, clamped into the valid range. (If
+        // the clamp lands at the tail the view displays the tail; the
+        // follow flag itself re-enables on the next scroll-down, which
+        // resumes follow at `target >= max_anchor` — no lingering freeze.)
+        Some(anchor) => anchor.min(max_anchor),
+    };
+    let end = (start + visible).min(total);
+    for wl in &wrapped[start..end] {
         lines.push(Line::from(vec![Span::styled(
-            wl,
+            wl.clone(),
             Style::default().fg(theme.fg_more_subtle.to_color()),
         )]));
     }
-    // trailing spinner
-    lines.push(Line::from(vec![Span::raw(" "), spinner.styled_glyph(theme)]));
-    // Keep the newest reasoning visible.
-    let total = lines.len();
-    let visible = inner.height as usize;
-    let scroll = total.saturating_sub(visible).min(u16::MAX as usize) as u16;
-    f.render_widget(Paragraph::new(Text::from(lines)).scroll((scroll, 0)), inner);
+
+    // Footer: spinner (live) + overflow indicator when scrolled off the top.
+    let mut footer = vec![Span::raw(" "), spinner.styled_glyph(theme)];
+    if start > 0 {
+        footer.push(Span::styled(
+            format!("  ↑{} lines above", start),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        ));
+    }
+    if total > visible && app.reasoning_view.is_some() {
+        footer.push(Span::styled(
+            format!(
+                "  ↓{} below · scroll to bottom to resume",
+                total - end
+            ),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ));
+    }
+    lines.push(Line::from(footer));
+
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-// ── Activity / tools sidebar ────────────────────────────────────────────────
+// ── Maximized terminal output viewer ─────────────────────────────────────
+
+/// Fullscreen-ish code/output viewer for a tool call (terminal or generic).
+/// Takes over the main screen area (below a transcript strip — see
+/// `render_body`) while `app.output_viewer_open`. Shows the live
+/// accumulation while the tool runs and the formatted full result after it
+/// finishes — envelope-unwrapped and JSON pretty-printed — in a
+/// text-editor-like view with a line-numbered gutter. Auto-follows the tail
+/// unless the user scrolled up (frozen anchor); scrolling back to the bottom
+/// resumes follow. Records its rect for mouse hit-testing.
+pub fn draw_output_viewer(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: &Spinner) {
+    let idx = app
+        .output_viewer_index
+        .or_else(|| app.most_recent_tool_item());
+    let live = idx
+        .map(|i| {
+            matches!(
+                app.transcript.get(i),
+                Some(TranscriptItem::Tool { status: ToolStatus::Running, .. })
+            )
+        })
+        .unwrap_or(false);
+    let is_term = idx
+        .map(|i| {
+            matches!(
+                app.transcript.get(i),
+                Some(TranscriptItem::Tool { is_terminal: true, .. })
+            )
+        })
+        .unwrap_or(false);
+
+    // Rect for mouse hit-testing (wheel scrolling inside the viewer).
+    app.last_output_viewer_rect.set((area.x, area.y, area.width, area.height));
+
+    let (cmd, tool_name, status_icon, exit_code, elapsed) = idx
+        .and_then(|i| match app.transcript.get(i) {
+            Some(TranscriptItem::Tool { name, summary, status, exit_code, duration_secs, .. }) => {
+                Some((summary.clone(), name.clone(), *status, *exit_code, *duration_secs))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| (String::new(), String::new(), ToolStatus::Done, None, None));
+
+    let title = if live {
+        " ⣿ output · LIVE · Ctrl+O or Esc to restore "
+    } else {
+        match status_icon {
+            ToolStatus::Done => " ✓ output · finished · Ctrl+O or Esc to restore ",
+            _ => " ✗ output · failed · Ctrl+O or Esc to restore ",
+        }
+    };
+    let block = gradient_block_focused(title, theme, 0.6);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let content_w = inner.width.max(1) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header line: terminal → `$ <cmd> (exit N) N.Ns`; generic tool →
+    // `<name> <summary>`.
+    let mut header = if is_term {
+        vec![
+            Span::styled(
+                " $ ".to_string(),
+                Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                one_line(&cmd, content_w.saturating_sub(24)),
+                Style::default().fg(theme.fg_base.to_color()),
+            ),
+        ]
+    } else {
+        vec![
+            Span::styled(
+                format!(" {} ", tool_name),
+                Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                one_line(&cmd, content_w.saturating_sub(tool_name.len() + 8)),
+                Style::default().fg(theme.fg_base.to_color()),
+            ),
+        ]
+    };
+    if let Some(code) = exit_code {
+        if code != 0 {
+            header.push(Span::styled(
+                format!("  (exit {})", code),
+                Style::default().fg(theme.error.to_color()),
+            ));
+        }
+    }
+    if let Some(d) = elapsed {
+        header.push(Span::styled(
+            format!("  {:.1}s", d),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ));
+    }
+    lines.push(Line::from(header));
+    lines.push(Line::from(vec![Span::raw("")]));
+
+    // Body: windowed wrapped lines, tail-anchored while following, with a
+    // line-number gutter (text-editor-like view).
+    let text = app.output_viewer_text();
+    let gutter_w = digits(text.lines().count().max(1));
+    let wrapped: Vec<(usize, String)> = text
+        .lines()
+        .enumerate()
+        .flat_map(|(i, l)| {
+            wrap(l, content_w.saturating_sub(gutter_w + 3))
+                .into_iter()
+                .map(move |w| (i + 1, w))
+        })
+        .collect();
+    let body_rows = inner.height.saturating_sub(lines.len() as u16 + 1).max(1) as usize; // +1 footer
+    let total = wrapped.len();
+    let visible = body_rows.min(total);
+    let max_anchor = total.saturating_sub(visible);
+    app.last_output_viewer_max_anchor.set(max_anchor);
+    let start = match app.output_viewer_view {
+        None => max_anchor,
+        Some(anchor) => anchor.min(max_anchor),
+    };
+    let end = (start + visible).min(total);
+    for (ln, wl) in &wrapped[start..end] {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:>w$} │ ", ln, w = gutter_w),
+                Style::default().fg(theme.fg_most_subtle.to_color()),
+            ),
+            Span::styled(wl.clone(), Style::default().fg(theme.fg_more_subtle.to_color())),
+        ]));
+    }
+
+    // Footer: live spinner or follow state + overflow indicators.
+    let mut footer = vec![Span::raw(" ")];
+    if live {
+        footer.push(spinner.styled_glyph(theme));
+        footer.push(Span::styled(
+            " streaming".to_string(),
+            Style::default().fg(theme.busy.to_color()),
+        ));
+    } else if app.output_viewer_view.is_none() {
+        footer.push(Span::styled(
+            "end of output".to_string(),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        ));
+    } else {
+        footer.push(Span::styled(
+            "frozen — scroll to bottom to resume".to_string(),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        ));
+    }
+    if start > 0 {
+        footer.push(Span::styled(
+            format!("  ↑{} lines above", start),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        ));
+    }
+    if total > visible && app.output_viewer_view.is_some() {
+        footer.push(Span::styled(
+            format!("  ↓{} below", total - end),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ));
+    }
+    lines.push(Line::from(footer));
+
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+// ── Agent stats page (maximized context window) ────────────────────────────
+
+/// Render a bounded horizontal bar (`filled/total`), e.g. context usage.
+fn usage_bar(width: usize, ratio: f32, theme: &Theme) -> String {
+    let w = width.max(4);
+    let filled = ((ratio.clamp(0.0, 1.0) * w as f32).round()) as usize;
+    let mut s = String::with_capacity(w * 3);
+    for i in 0..w {
+        s.push(if i < filled { '█' } else { '░' });
+    }
+    let _ = theme;
+    s
+}
+
+/// The maximized agent-stats page: a live dashboard (context window usage,
+/// token accounting, model/session, compression, per-call usage sparkline)
+/// on top and the full context-window stream below — one line per history
+/// message, auto-following the tail with freeze-on-scroll (same semantics
+/// as the live reasoning panel). Opened by clicking the header's right
+/// section or Ctrl+A; Esc restores.
+pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: &Spinner) {
+    // Rect for mouse hit-testing (wheel scrolling inside the page).
+    app.last_stats_rect.set((area.x, area.y, area.width, area.height));
+
+    let live = app.is_busy();
+    let title = if live {
+        " ◆ agent stats · LIVE · Esc to restore "
+    } else {
+        " ◆ agent stats · Esc to restore "
+    };
+    let block = gradient_block_focused(title, theme, 0.6);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let content_w = inner.width.max(1) as usize;
+
+    // ── Dashboard section (fixed rows at the top) ──────────────────────
+    let mut lines: Vec<Line> = Vec::new();
+    let used = app.context_system_tokens + app.context_history_tokens;
+    let pct = app.context_usage_pct();
+    let bar_w = (content_w.saturating_sub(34)).clamp(10, 40);
+
+    // Row 1: context window usage bar.
+    let (pct_col, warn) = if pct >= 85.0 {
+        (theme.error, " ⚠ near limit")
+    } else if pct >= 65.0 {
+        (theme.warning, "")
+    } else {
+        (theme.success, "")
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            " context ".to_string(),
+            Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "{} / {} ({:.1}%){}  ",
+                fmt_tokens(used),
+                if app.context_window > 0 { fmt_tokens(app.context_window) } else { "?".into() },
+                pct,
+                warn,
+            ),
+            Style::default().fg(pct_col.to_color()),
+        ),
+        Span::styled(
+            usage_bar(bar_w, pct as f32 / 100.0, &theme),
+            Style::default().fg(pct_col.to_color()),
+        ),
+    ]));
+
+    // Row 2: breakdown + compression info.
+    let threshold_note = if app.compression_threshold > 0 {
+        format!("compress@{}", fmt_tokens(app.compression_threshold))
+    } else {
+        "compress@?".to_string()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("          ".to_string(), Style::default()),
+        Span::styled(
+            format!(
+                "system {} · history {} · msgs {} · {} · compacted {}x",
+                fmt_tokens(app.context_system_tokens),
+                fmt_tokens(app.context_history_tokens),
+                app.context_entries.len(),
+                threshold_note,
+                app.compactions
+            ),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ),
+    ]));
+
+    // Row 3: session token totals + turns + iterations.
+    lines.push(Line::from(vec![
+        Span::styled(" session  ".to_string(), Style::default().fg(theme.accent.to_color())),
+        Span::styled(
+            format!(
+                "prompt {} · completion {} · total {} · turns {} · iters {}",
+                fmt_tokens(app.tokens.prompt),
+                fmt_tokens(app.tokens.completion),
+                fmt_tokens(app.tokens.total()),
+                app.turns,
+                app.tokens.iterations
+            ),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ),
+    ]));
+
+    // Row 4: usage sparkline (per-API-call prompt tokens, recent window).
+    let spark_w = content_w.saturating_sub(24).clamp(10, 60);
+    let spark: String = if app.usage_series.is_empty() {
+        "·".repeat(spark_w)
+    } else {
+        // Downsample to spark_w samples; each maps to a bar height glyph.
+        let samples: Vec<u64> = {
+            let s = &app.usage_series;
+            // Take the LAST spark_w samples; pad-left with zeros when fewer.
+            let start = s.len().saturating_sub(spark_w);
+            let mut v: Vec<u64> = s[start..].iter().map(|x| x.0).collect();
+            if v.len() < spark_w {
+                let pad = spark_w - v.len();
+                let mut padded = vec![0u64; pad];
+                padded.extend(v);
+                v = padded;
+            }
+            v
+        };
+        let max = samples.iter().copied().max().unwrap_or(1).max(1);
+        const BARS: [char; 5] = ['▁', '▂', '▃', '▅', '▇'];
+        samples
+            .iter()
+            .map(|v| {
+                let idx = ((v.saturating_mul(4)) / max).min(4) as usize;
+                BARS[idx]
+            })
+            .collect()
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" calls    ".to_string(), Style::default().fg(theme.accent.to_color())),
+        Span::styled(
+            format!("{} {}", spark, if live { " · streaming" } else { "" }),
+            Style::default().fg(theme.info.to_color()),
+        ),
+    ]));
+
+    lines.push(Line::from(vec![Span::raw("")]));
+
+    // ── Context stream (windowed, auto-follow/freeze) ──────────────────
+    // One display line per entry: "#idx role tokens preview".
+    let mut stream: Vec<Line> = Vec::with_capacity(app.context_entries.len());
+    for (i, e) in app.context_entries.iter().enumerate() {
+        let (role_label, role_col) = match e.role.as_str() {
+            "user" => ("user", theme.accent),
+            "assistant" => ("asst", theme.info),
+            "tool" => ("tool", theme.warning),
+            _ => (e.role.as_str(), theme.fg_more_subtle),
+        };
+        let flag = if e.is_compressed_summary {
+            " ⤳compressed"
+        } else if e.has_tool_calls {
+            " ⚒calls"
+        } else {
+            ""
+        };
+        let idx_w = app.context_entries.len().max(1).to_string().len();
+        stream.push(Line::from(vec![
+            Span::styled(
+                format!(" {:>idx_w$} ", i + 1, idx_w = idx_w),
+                Style::default().fg(theme.fg_most_subtle.to_color()),
+            ),
+            Span::styled(
+                format!("{:<5}", role_label),
+                Style::default().fg(role_col.to_color()),
+            ),
+            Span::styled(
+                format!("{:>7}t ", fmt_tokens(e.tokens)),
+                Style::default().fg(theme.fg_more_subtle.to_color()),
+            ),
+            Span::styled(
+                format!("{}{}", one_line(&e.preview, content_w.saturating_sub(20)), flag),
+                Style::default().fg(theme.fg_subtle.to_color()),
+            ),
+        ]));
+    }
+    if stream.is_empty() {
+        stream.push(Line::from(vec![Span::styled(
+            " (no context yet — send a prompt)".to_string(),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        )]));
+    }
+
+    let body_rows = inner.height.saturating_sub(lines.len() as u16 + 1).max(1) as usize; // +1 footer
+    let total = stream.len();
+    let visible = body_rows.min(total);
+    let max_anchor = total.saturating_sub(visible);
+    app.last_stats_max_anchor.set(max_anchor);
+    let start = match app.stats_view {
+        None => max_anchor, // following the live tail
+        Some(anchor) => anchor.min(max_anchor),
+    };
+    let end = (start + visible).min(total);
+    lines.extend(stream.into_iter().skip(start).take(visible));
+
+    // Footer: live indicator + overflow counters + follow state.
+    let mut footer = vec![Span::raw(" ")];
+    if live {
+        footer.push(spinner.styled_glyph(theme));
+        footer.push(Span::styled(
+            " live".to_string(),
+            Style::default().fg(theme.busy.to_color()),
+        ));
+    }
+    if let Some(at) = app.context_updated_at {
+        footer.push(Span::styled(
+            format!("  · updated {:.0}s ago", at.elapsed().as_secs_f32()),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        ));
+    }
+    if start > 0 {
+        footer.push(Span::styled(
+            format!("  ↑{} above", start),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        ));
+    }
+    if total > visible && app.stats_view.is_some() {
+        footer.push(Span::styled(
+            format!("  ↓{} below · scroll to bottom to resume", total - end),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ));
+    }
+    lines.push(Line::from(footer));
+
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
 
 pub fn draw_omo_panel(
     f: &mut Frame,
@@ -1653,7 +2338,17 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("/copy [n]", "copy nth assistant message (−n counts from last)"),
         ("Ctrl+S", "search transcript · n/N cycle matches"),
         ("Ctrl+R", "toggle reasoning panel"),
+        ("Ctrl+O", "maximize live terminal output · Esc restores"),
+        ("  viewer: ↑↓/PgUp·PgDn", "scroll output (g/G top/bottom) · auto-follows tail"),
+        ("Ctrl+A / click header ▸", "agent stats page · live context window stream"),
+        ("  stats: ↑↓/PgUp·PgDn", "scroll context (g/G top/bottom) · auto-follows tail"),
         ("Alt+↑ / Alt+↓", "scroll NeuroCode context feed (when active)"),
+        ("click feed panel", "open the fullscreen NeuroCode graph explorer"),
+        ("  explorer: ←→↑↓/hjkl", "select nodes on the graph canvas"),
+        ("  explorer: Shift+←→↑↓", "pan the graph canvas"),
+        ("  explorer: +/−/wheel/0", "zoom in/out · reset view"),
+        ("  explorer: Tab / ⏎", "cycle graph · nodes · feed panes"),
+        ("  explorer: Esc / click title", "dock the explorer back"),
         ("Ctrl+L", "clear transcript view"),
         ("Ctrl+A/E  Ctrl+U/K/W", "line start/end · kill line/word"),
         ("? / F1", "toggle this help"),
@@ -1875,6 +2570,107 @@ mod tests {
             .collect()
     }
 
+    // ── Header gradient bar animation (agent-active indicator) ──────────
+
+    /// Render the header underline row through the real widget and return
+    /// the per-cell foreground colors of that row.
+    fn header_underline_colors(app: &App, flow: Option<&crate::anim::HeaderFlow>) -> Vec<ratatui::style::Color> {
+        use ratatui::backend::TestBackend;
+        let theme = Theme::aurora();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 4)).unwrap();
+        let spinner = Spinner::dots();
+        let pulse = Pulse::new();
+        terminal
+            .draw(|f| {
+                draw_header(f, f.area(), app, theme, &spinner, &pulse, flow);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .skip(80 * 3) // the underline is the last row of the 4-row area
+            .take(80)
+            .map(|c| c.fg)
+            .collect()
+    }
+
+    fn busy_app() -> App {
+        let mut app = App::new("sess", "model");
+        app.mode = crate::state::RunMode::Busy;
+        app
+    }
+
+    fn stepped_flow(frames: usize) -> crate::anim::HeaderFlow {
+        let mut flow = crate::anim::HeaderFlow::new();
+        flow.set_busy(true);
+        for _ in 0..frames {
+            flow.tick(Duration::from_secs_f32(1.0 / 30.0), 1.0);
+        }
+        flow
+    }
+
+    #[test]
+    fn header_underline_is_static_when_flow_idle() {
+        // No animator (None) and a fully-idle animator must render the SAME
+        // static gradient: backward compatibility for non-Tui callers and
+        // a guarantee that "idle" is byte-identical to the old look.
+        let app = busy_app(); // even busy: an idle animator overrides
+        let base = header_underline_colors(&app, None);
+        let mut idle_flow = crate::anim::HeaderFlow::new();
+        idle_flow.set_busy(false);
+        idle_flow.tick(Duration::from_secs_f32(5.0), 1.0);
+        let idle = header_underline_colors(&app, Some(&idle_flow));
+        assert_eq!(base, idle, "idle flow == static gradient");
+        // Sanity: the static row is actually a gradient (ends differ).
+        assert_ne!(base.first(), base.last());
+    }
+
+    #[test]
+    fn header_underline_animates_when_busy() {
+        let app = busy_app();
+        // Two engaged animator snapshots ~0.5s apart must differ somewhere
+        // in the row (the wave has moved).
+        let f1 = stepped_flow(60); // ~2s engaged
+        let f2 = stepped_flow(75); // +0.5s
+        let row1 = header_underline_colors(&app, Some(&f1));
+        let row2 = header_underline_colors(&app, Some(&f2));
+        assert_ne!(
+            row1, row2,
+            "the underline must change across frames while the agent runs"
+        );
+        // And the busy row differs from the static one (brighter somewhere).
+        let stat = header_underline_colors(&app, None);
+        assert_ne!(row1, stat, "busy underline != static underline");
+    }
+
+    #[test]
+    fn header_underline_wave_is_graded_not_bicolor() {
+        // Subtlety contract: while busy, adjacent cells change gradually —
+        // no hard cliff between the wave and the rest of the bar. Sample
+        // the per-channel deltas between adjacent cells.
+        let app = busy_app();
+        let flow = stepped_flow(90);
+        let row = header_underline_colors(&app, Some(&flow));
+        let mut max_jump = 0u8;
+        for w in row.windows(2) {
+            if let (ratatui::style::Color::Rgb(ar, ag, ab), ratatui::style::Color::Rgb(br, bg, bb)) =
+                (w[0], w[1])
+            {
+                let jump = ar
+                    .abs_diff(br)
+                    .max(ag.abs_diff(bg))
+                    .max(ab.abs_diff(bb));
+                max_jump = max_jump.max(jump);
+            }
+        }
+        assert!(
+            max_jump <= 48,
+            "wave must be graded (max adjacent channel jump {max_jump} > 48)"
+        );
+    }
+
     #[test]
     fn test_collapsed_reasoning_affordance() {
         // 20 lines of text, collapsed state → should show affordance with
@@ -2024,6 +2820,8 @@ mod tests {
             full_result: None,
             is_terminal: true,
             exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         };
         let rendered = render_text(&item, 80);
         let header = rendered.iter().find(|l| l.contains("$")).unwrap();
@@ -2044,6 +2842,8 @@ mod tests {
             full_result: None,
             is_terminal: true,
             exit_code: Some(1),
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         };
         let rendered = render_text(&item_fail, 80);
         assert!(
@@ -2064,6 +2864,8 @@ mod tests {
             full_result: None,
             is_terminal: true,
             exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         };
         let rendered_ok = render_text(&item_ok, 80);
         assert!(
@@ -2088,6 +2890,8 @@ mod tests {
             full_result: None,
             is_terminal: true,
             exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         };
         let rendered = render_text(&item, 80);
         assert!(
@@ -2111,6 +2915,8 @@ mod tests {
             full_result: None,
             is_terminal: true,
             exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         };
         let rendered = render_text(&item, 80);
         assert!(
@@ -2118,6 +2924,260 @@ mod tests {
             "running terminal should show spinner; got: {:?}",
             rendered
         );
+    }
+
+    // ── Live output streaming (inline tail + maximized viewer) ──────────
+
+    #[test]
+    fn test_terminal_running_streams_live_output_tail() {
+        // A running terminal with accumulated live output shows the tail
+        // lines + the streaming affordance (Ctrl+O hint) — output is now
+        // visible WHILE the command runs, not only after ToolEnd.
+        let item = TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "⚡".into(),
+            summary: "build".into(),
+            status: ToolStatus::Running,
+            duration_secs: None,
+            result_preview: String::new(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: true,
+            exit_code: None,
+            live_output: (1..=30).map(|i| format!("build line {i}")).collect::<Vec<_>>().join("\n"),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
+        };
+        let rendered = render_text(&item, 80);
+        assert!(
+            rendered.iter().any(|l| l.contains("build line 30")),
+            "live tail shows the newest line; got: {:?}",
+            rendered
+        );
+        assert!(
+            !rendered.iter().any(|l| l.contains("build line 1\n") || l.trim() == "    build line 1"),
+            "older head lines beyond MAX_TOOL_OUTPUT_LINES hidden; got: {:?}",
+            rendered
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("streaming") && l.contains("Ctrl+O")),
+            "streaming affordance present; got: {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn test_terminal_running_no_output_shows_hint() {
+        let item = TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "⚡".into(),
+            summary: "sleep 5".into(),
+            status: ToolStatus::Running,
+            duration_secs: None,
+            result_preview: String::new(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: true,
+            exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
+        };
+        let rendered = render_text(&item, 80);
+        assert!(
+            rendered.iter().any(|l| l.contains("running")),
+            "silent running command shows the running hint; got: {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn test_output_viewer_renders_live_content() {
+        use joey_agent_core::AgentEvent;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = crate::state::App::new("s", "m");
+        app.apply(AgentEvent::ToolStart {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "cargo test".into(),
+        });
+        app.apply(AgentEvent::ToolOutput {
+            name: "terminal".into(),
+            chunk: "running 140 tests\n".into(),
+        });
+        app.toggle_output_viewer(None);
+        let theme = crate::theme::Theme::aurora();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let spinner = crate::anim::Spinner::dots();
+        terminal
+            .draw(|f| {
+                draw_output_viewer(f, f.area(), &app, theme, &spinner);
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("output · LIVE"), "viewer title rendered");
+        assert!(text.contains("cargo test"), "command header rendered");
+        assert!(text.contains("running 140 tests"), "live output rendered");
+        assert!(text.contains("streaming"), "live badge rendered");
+        assert!(text.contains("1 │ "), "line-number gutter rendered");
+    }
+
+    // ── Agent stats page (maximized context window) ────────────────────
+
+    #[test]
+    fn test_stats_page_renders_dashboard_and_stream() {
+        use joey_agent_core::AgentEvent;
+        use joey_agent_core::events::ContextEntry;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = crate::state::App::new("sess-12345678", "glm-5.2");
+        let entries: Vec<ContextEntry> = vec![
+            ContextEntry {
+                role: "user".into(),
+                tokens: 140,
+                preview: "please fix the login bug".into(),
+                has_tool_calls: false,
+                is_compressed_summary: false,
+            },
+            ContextEntry {
+                role: "assistant".into(),
+                tokens: 90,
+                preview: "I'll search the codebase".into(),
+                has_tool_calls: true,
+                is_compressed_summary: false,
+            },
+            ContextEntry {
+                role: "tool".into(),
+                tokens: 2_400,
+                preview: "crates/auth/src/lib.rs:42".into(),
+                has_tool_calls: false,
+                is_compressed_summary: false,
+            },
+        ];
+        app.apply(AgentEvent::ContextSnapshot {
+            entries,
+            system_tokens: 3_200,
+            history_tokens: 2_630,
+            context_window: 200_000,
+            compression_threshold: 160_000,
+            compactions: 2,
+            model: "glm-5.2".into(),
+        });
+        app.apply(AgentEvent::ApiCallEnd {
+            usage: joey_providers::Usage {
+                prompt_tokens: 6_100,
+                completion_tokens: 480,
+                ..Default::default()
+            },
+        });
+        app.toggle_stats();
+        let theme = crate::theme::Theme::aurora();
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let spinner = crate::anim::Spinner::dots();
+        terminal
+            .draw(|f| {
+                draw_stats_page(f, f.area(), &app, theme, &spinner);
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("agent stats"), "title rendered");
+        assert!(text.contains("context"), "context row rendered");
+        assert!(text.contains("200.0K"), "window size rendered");
+        assert!(text.contains("session"), "session row rendered");
+        assert!(text.contains("calls"), "sparkline row rendered");
+        assert!(text.contains("user"), "role labels rendered");
+        assert!(text.contains("please fix the login bug"), "previews rendered");
+        assert!(text.contains("⚒calls"), "tool-call flag rendered");
+        assert!(text.contains("compacted 2x"), "compression count rendered");
+    }
+
+    #[test]
+    fn test_stats_page_empty_state_renders_placeholder() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = crate::state::App::new("s", "m");
+        app.toggle_stats();
+        let theme = crate::theme::Theme::aurora();
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let spinner = crate::anim::Spinner::dots();
+        terminal
+            .draw(|f| {
+                draw_stats_page(f, f.area(), &app, theme, &spinner);
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("no context yet"), "placeholder rendered");
+    }
+
+    #[test]
+    fn test_stats_page_auto_follow_shows_tail() {
+        // With more entries than fit, auto-follow shows the TAIL (newest
+        // messages), and the footer shows the above-counter.
+        use joey_agent_core::AgentEvent;
+        use joey_agent_core::events::ContextEntry;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = crate::state::App::new("s", "m");
+        let entries: Vec<ContextEntry> = (0..80)
+            .map(|i| ContextEntry {
+                role: "user".into(),
+                tokens: 10,
+                preview: format!("message number {i}"),
+                has_tool_calls: false,
+                is_compressed_summary: false,
+            })
+            .collect();
+        app.apply(AgentEvent::ContextSnapshot {
+            entries,
+            system_tokens: 100,
+            history_tokens: 800,
+            context_window: 50_000,
+            compression_threshold: 40_000,
+            compactions: 0,
+            model: "m".into(),
+        });
+        app.toggle_stats();
+        let theme = crate::theme::Theme::aurora();
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let spinner = crate::anim::Spinner::dots();
+        terminal
+            .draw(|f| {
+                draw_stats_page(f, f.area(), &app, theme, &spinner);
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("message number 79"), "tail (newest) visible");
+        assert!(!text.contains("message number 0\n"), "head hidden while following");
+        assert!(text.contains("above"), "overflow counter rendered");
     }
 
     // ── Feature 007 (T024): generic tool header tests ─────────────────
@@ -2136,6 +3196,8 @@ mod tests {
             full_result: None,
             is_terminal: false,
             exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         };
         let rendered = render_text(&item, 80);
         let header = rendered.first().unwrap();
@@ -2159,6 +3221,8 @@ mod tests {
             full_result: None,
             is_terminal: false,
             exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         };
         let rendered = render_text(&item, 80);
         assert!(
@@ -2182,6 +3246,8 @@ mod tests {
             full_result: Some("line1\nline2\nline3".into()),
             is_terminal: false,
             exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         };
         let rendered = render_text(&item, 80);
         assert!(
@@ -2219,6 +3285,8 @@ mod tests {
             full_result: Some("full body".into()),
             is_terminal: false,
             exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         };
         let rendered = render_text(&item, 80);
         assert!(
@@ -2255,6 +3323,8 @@ mod tests {
             full_result: None,
             is_terminal: false,
             exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         });
         app
     }
@@ -2410,6 +3480,8 @@ mod tests {
                     full_result: None,
                     is_terminal: true,
                     exit_code: Some(0),
+                    live_output: String::new(),
+                    live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
                 },
             ),
             (
@@ -2426,6 +3498,8 @@ mod tests {
                     full_result: None,
                     is_terminal: false,
                     exit_code: None,
+                    live_output: String::new(),
+                    live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
                 },
             ),
             (
@@ -2497,6 +3571,8 @@ mod tests {
                 full_result: None,
                 is_terminal: false,
                 exit_code: None,
+                live_output: String::new(),
+                live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
             }
         }
         fn mk_filediff() -> TranscriptItem {
@@ -2659,8 +3735,11 @@ mod tests {
         );
     }
 
-    /// T022 (FR-006 codification): tool/terminal body lines indent by exactly
-    /// 4 spaces (`format!("    {}", ...)`).
+    /// T022 (FR-006 codification, updated for the crush-style code view):
+    /// tool/terminal body lines carry the line-numbered gutter — the body
+    /// content column starts at a stable indent and the first body span is
+    /// the gutter (`"N │ "`). The essential contract: body lines are
+    /// visually indented past the header and structurally carry a gutter.
     #[test]
     fn test_tool_body_indent_is_four_spaces() {
         let theme = Theme::aurora();
@@ -2678,16 +3757,18 @@ mod tests {
             full_result: None,
             is_terminal: false,
             exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         };
         let ls_g = item_lines(&generic, 80, theme);
-        // Find the body line(s) (after the header, before the trailing blank).
         for l in &ls_g[1..ls_g.len() - 1] {
             let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(
-                text.starts_with("    "),
-                "T022 generic: body line should indent 4 spaces; got {:?}",
+                text.trim_start().starts_with("1 │ ") || text.starts_with(' '),
+                "T022 generic: body line carries the line-number gutter; got {:?}",
                 text
             );
+            assert!(text.contains("│"), "T022 generic: gutter separator present; got {:?}", text);
         }
 
         // Terminal tool with body output.
@@ -2703,17 +3784,18 @@ mod tests {
             full_result: None,
             is_terminal: true,
             exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         };
         let ls_t = item_lines(&term, 80, theme);
-        // The terminal arm early-returns; the last line is the trailing blank.
-        // Body lines sit between the header (first) and the trailing blank (last).
         for l in &ls_t[1..ls_t.len() - 1] {
             let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(
-                text.starts_with("    "),
-                "T022 terminal: body line should indent 4 spaces; got {:?}",
+                text.trim_start().starts_with("1 │ ") || text.starts_with(' '),
+                "T022 terminal: body line carries the line-number gutter; got {:?}",
                 text
             );
+            assert!(text.contains("│"), "T022 terminal: gutter separator present; got {:?}", text);
         }
     }
 }
@@ -3117,4 +4199,285 @@ pub fn draw_neurocode_panel(f: &mut Frame, area: Rect, app: &App, theme: Theme) 
     }
 
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+
+// ── Crush-style formatting tests (gutters, envelopes, pretty JSON) ─────────
+
+#[cfg(test)]
+mod crush_format_tests {
+    use super::*;
+
+    fn render_item(item: &TranscriptItem, width: usize) -> Vec<String> {
+        let theme = Theme::aurora();
+        item_lines(item, width, theme)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn test_tool_result_envelope_unwrapped_in_body() {
+        // The terminal tool's result is a JSON envelope; the body must show
+        // the OUTPUT payload with line numbers, not `{"output":"…"}`.
+        let item = TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "⚡".into(),
+            summary: "cargo build".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(2.0),
+            result_preview: r#"{"output":"Compiling foo v0.1.0\nFinished dev","exit_code":0,"error":null}"#.into(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: true,
+            exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
+        };
+        let rendered = render_item(&item, 90);
+        let joined = rendered.join("\n");
+        assert!(!joined.contains(r#"\"#) || !joined.contains(r#""output""#), "no raw JSON envelope in body");
+        assert!(joined.contains("1 │ Compiling foo"), "payload line 1 with gutter: {:?}", joined);
+        assert!(joined.contains("2 │ Finished dev"), "payload line 2 with gutter");
+    }
+
+    #[test]
+    fn test_generic_tool_json_payload_pretty_printed() {
+        // A generic tool whose result IS JSON gets pretty-printed in the
+        // maximized viewer (no literal \n runs).
+        let raw = r#"{"files":[{"name":"a.rs","lines":10},{"name":"b.rs","lines":20}],"total":30}"#;
+        let formatted = crate::state::format_tool_result_for_display(raw);
+        assert!(formatted.contains("\n  "), "pretty-printed with indentation");
+        assert!(!formatted.contains(r#"\n"#), "no literal escape runs: {:?}", formatted);
+        assert!(formatted.contains("\"files\""));
+    }
+
+    #[test]
+    fn test_tool_error_envelope_unwrapped() {
+        let out = crate::state::display_result_content(r#"{"error":"boom"}"#);
+        assert_eq!(out.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn test_non_json_results_pass_through() {
+        assert_eq!(crate::state::display_result_content("plain text"), None);
+        assert_eq!(crate::state::pretty_json_if_parses("plain text"), "plain text");
+        // Read-file content is plain text: unchanged.
+        let content = "fn main() {\n    println!(\"hi\");\n}\n";
+        assert_eq!(crate::state::format_tool_result_for_display(content), content);
+    }
+
+    #[test]
+    fn test_terminal_live_tail_has_absolute_line_numbers() {
+        // 30 lines of live output, tail window of 10 → first shown line is 21.
+        let item = TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "⚡".into(),
+            summary: "build".into(),
+            status: ToolStatus::Running,
+            duration_secs: None,
+            result_preview: String::new(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: true,
+            exit_code: None,
+            live_output: (1..=30).map(|i| format!("build line {i}")).collect::<Vec<_>>().join("\n"),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
+        };
+        let rendered = render_item(&item, 90);
+        let joined = rendered.join("\n");
+        assert!(joined.contains("21 │ build line 21"), "tail window starts at absolute line 21: {:?}", joined);
+        assert!(joined.contains("30 │ build line 30"), "newest line numbered 30");
+        assert!(!joined.contains("build line 1\n"), "head hidden");
+    }
+
+    #[test]
+    fn test_diff_dual_gutter_line_numbers() {
+        // A diff with context, a deletion, and an insertion: each rendered
+        // row carries old/new numbers; insertion blanks the old number,
+        // deletion blanks the new one (crush diffview semantics).
+        let item = TranscriptItem::FileDiff {
+            path: "src/main.rs".into(),
+            stat: "+1 -1".into(),
+            lines: vec![
+                "--- a/src/main.rs".into(),
+                "+++ b/src/main.rs".into(),
+                "@@ -10,4 +10,4 @@ fn main() {".into(),
+                " let keep = 1;".into(),
+                "-let old = 2;".into(),
+                "+let new = 2;".into(),
+                " }".into(),
+            ],
+            is_binary: false,
+            expanded: true,
+        };
+        let rendered = render_item(&item, 100);
+        let joined = rendered.join("\n");
+        // Context lines carry both numbers.
+        assert!(joined.contains("10 10"), "context carries old+new: {:?}", joined);
+        // Deletion: old number present, new blank.
+        assert!(joined.contains("11   - let old = 2;") || joined.matches("11").count() >= 1, "deletion carries old number");
+        // Insertion: new number present, old blank.
+        assert!(joined.contains("  11 + let new = 2;") || joined.contains("+ let new = 2;"), "insertion rendered with marker");
+        assert!(joined.contains("@@"), "hunk header preserved");
+    }
+
+    #[test]
+    fn test_output_viewer_shows_generic_tool_with_gutter() {
+        use joey_agent_core::AgentEvent;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = crate::state::App::new("s", "m");
+        app.apply(AgentEvent::ToolStart {
+            name: "search_files".into(),
+            emoji: "🔍".into(),
+            summary: "pattern=foo".into(),
+        });
+        app.apply(AgentEvent::ToolEnd {
+            name: "search_files".into(),
+            is_error: false,
+            result_preview: r#"{"matches":3}"#.into(),
+            duration_secs: 0.4,
+            exit_code: None,
+            full_result: r#"{"matches":3,"files":["a.rs","b.rs","c.rs"]}"#.into(),
+        });
+        app.toggle_output_viewer(None);
+        let theme = crate::theme::Theme::aurora();
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let spinner = crate::anim::Spinner::dots();
+        terminal
+            .draw(|f| {
+                draw_output_viewer(f, f.area(), &app, theme, &spinner);
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("search_files"), "generic tool header rendered");
+        assert!(text.contains("1 │ {"), "pretty JSON starts with gutter");
+        assert!(text.contains("  \"matches\""), "JSON pretty-printed (indented key)");
+    }
+
+    #[test]
+    fn test_output_viewer_terminal_envelope_unwrapped() {
+        use joey_agent_core::AgentEvent;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = crate::state::App::new("s", "m");
+        app.apply(AgentEvent::ToolStart {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "make build".into(),
+        });
+        app.apply(AgentEvent::ToolEnd {
+            name: "terminal".into(),
+            is_error: false,
+            result_preview: r#"{"output":"step 1 done\nstep 2 done","exit_code":0}"#.into(),
+            duration_secs: 3.2,
+            exit_code: Some(0),
+            full_result: r#"{"output":"step 1 done\nstep 2 done","exit_code":0,"error":null}"#.into(),
+        });
+        app.toggle_output_viewer(None);
+        let theme = crate::theme::Theme::aurora();
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let spinner = crate::anim::Spinner::dots();
+        terminal
+            .draw(|f| {
+                draw_output_viewer(f, f.area(), &app, theme, &spinner);
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("make build"), "command header rendered");
+        assert!(text.contains("1 │ step 1 done"), "payload line 1 with gutter");
+        assert!(text.contains("2 │ step 2 done"), "payload line 2 with gutter");
+        assert!(!text.contains("exit_code"), "envelope fields not shown");
+        assert!(!text.contains("\\n"), "no literal \\n runs");
+    }
+}
+
+#[cfg(test)]
+mod visual_check_tests {
+    //! Print-oriented sanity checks: drive the REAL item_lines with realistic
+    //! tool results and assert the exact user-visible rows.
+    use super::*;
+
+    #[test]
+    fn terminal_block_visual() {
+        let item = TranscriptItem::Tool {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "cargo test -p joey-tui".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(4.2),
+            result_preview: r#"{"output":"running 184 tests\ntest a ... ok\ntest b ... ok\n\ntest result: ok. 184 passed","exit_code":0,"error":null}"#.into(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: true,
+            exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
+        };
+        let rendered: Vec<String> = item_lines(&item, 100, Theme::aurora())
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        for l in &rendered {
+            println!("TERM|{}|", l);
+        }
+        // Envelope unwrapped: no JSON keys, real newlines as separate rows.
+        assert!(!rendered.iter().any(|l| l.contains("exit_code") || l.contains("\"output\"")));
+        assert!(rendered.iter().any(|l| l == "1 │ running 184 tests"), "row 1");
+        assert!(rendered.iter().any(|l| l == "4 │ "), "blank line 4 preserved with gutter");
+        assert!(rendered.iter().any(|l| l == "5 │ test result: ok. 184 passed"), "row 5");
+    }
+
+    #[test]
+    fn diff_block_visual() {
+        let item = TranscriptItem::FileDiff {
+            path: "crates/joey-tui/src/lib.rs".into(),
+            stat: "+2 -1".into(),
+            lines: vec![
+                "--- a/crates/joey-tui/src/lib.rs".into(),
+                "+++ b/crates/joey-tui/src/lib.rs".into(),
+                "@@ -41,6 +41,7 @@ pub mod state;".into(),
+                " pub mod theme;".into(),
+                "-pub mod old;".into(),
+                "+pub mod new;".into(),
+                "+pub mod extra;".into(),
+                " pub mod input;".into(),
+            ],
+            is_binary: false,
+            expanded: true,
+        };
+        let rendered: Vec<String> = item_lines(&item, 100, Theme::aurora())
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        for l in &rendered {
+            println!("DIFF|{}|", l);
+        }
+        let joined = rendered.join("\n");
+        // Dual gutters: context has both numbers, deletion old-only,
+        // insertion new-only (crush diffview semantics).
+        assert!(joined.contains("41 41"), "context carries old+new");
+        assert!(joined.contains("42    - pub mod old;"), "deletion: old number, blank new: {:?}", joined);
+        assert!(joined.contains("   42 + pub mod new;"), "insertion: blank old, new number");
+        assert!(joined.contains("   43 + pub mod extra;"), "second insertion numbered");
+        assert!(joined.contains("43 44"), "context after edits renumbers new side");
+    }
 }

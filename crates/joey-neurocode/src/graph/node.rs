@@ -98,6 +98,11 @@ pub struct CodeArtifactNode {
     pub source_path: String,
     /// Byte range in the source file (tree-sitter span).
     pub source_span: Option<(u32, u32)>,
+    /// Declaration header text for methods (e.g. `public User findById(Long id)`)
+    /// and full signatures for fields — the source text of the declaration up
+    /// to the body. `None` for type-level nodes and heuristic extractions
+    /// that couldn't capture one.
+    pub signature: Option<String>,
     /// Present only for Pega artifacts (FR-005, FR-009).
     pub pega_metadata: Option<PegaMetadata>,
     /// Detected framework version (e.g. `Spring Boot 3.2`).
@@ -121,11 +126,23 @@ impl CodeArtifactNode {
             declared_dependencies: Vec::new(),
             source_path,
             source_span: None,
+            signature: None,
             pega_metadata: None,
             framework_version: None,
             status: ArtifactStatus::default(),
             indexed_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    /// The simple (unqualified) name of this artifact: the last segment of
+    /// the FQCN, with `()` stripped from method names.
+    pub fn simple_name(&self) -> &str {
+        let base = self
+            .fqcn
+            .rsplit(['.', ':'])
+            .next()
+            .unwrap_or(&self.fqcn);
+        base.trim_end_matches("()")
     }
 }
 

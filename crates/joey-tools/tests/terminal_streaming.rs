@@ -155,6 +155,55 @@ async fn terminal_progress_arrives_before_completion() {
     run.abort();
 }
 
+// ── Live output channel (realtime terminal view) ─────────────────────────
+
+#[tokio::test]
+async fn terminal_emits_raw_output_chunks_during_long_command() {
+    // The dedicated output channel mirrors progress: raw chunks arrive
+    // DURING the run (not only at completion), carrying the same text.
+    let tool = terminal();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let ctx = ctx().with_output_sender(Some(tx));
+
+    let run = tokio::spawn(async move {
+        tool.execute(json!({ "command": "echo early; sleep 3; echo late" }), &ctx)
+            .await
+    });
+
+    // Within 1.5s we should have seen the "early" raw chunk.
+    let got_early = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        async {
+            loop {
+                match rx.recv().await {
+                    Some(msg) if msg.contains("early") => return true,
+                    Some(_) => continue,
+                    None => return false,
+                }
+            }
+        },
+    )
+    .await;
+    assert!(
+        got_early.unwrap_or(false),
+        "expected an 'early' raw output chunk before the command finished"
+    );
+
+    run.abort();
+}
+
+#[tokio::test]
+async fn terminal_output_channel_noop_without_sender() {
+    // Backward compatibility: no output sender wired → the tool still works.
+    let tool = terminal();
+    let result = tool
+        .execute(json!({ "command": "echo no_sender" }), &ctx())
+        .await;
+    let v = parse_result(&result.to_content_string());
+    assert_eq!(v["exit_code"], json!(0));
+    assert!(v["output"].as_str().unwrap().contains("no_sender"));
+}
+
 // ── T011: temp-file round-trip for > 4 KB output ─────────────────────────
 
 #[tokio::test]

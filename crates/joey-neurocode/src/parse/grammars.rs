@@ -70,6 +70,7 @@ fn method_node(name: String, node: &Node) -> ExtractedMethod {
     ExtractedMethod {
         name,
         annotations: Vec::new(),
+        signature: None,
         start_byte: node.start_byte() as u32,
         end_byte: node.end_byte() as u32,
     }
@@ -321,6 +322,7 @@ fn walk_php_toplevel<'a>(node: &Node<'a>, source: &str, extraction: &mut SourceE
                                                     name: fname,
                                                     type_name: type_name.clone(),
                                                     annotations: Vec::new(),
+                                                    signature: None,
                                                 });
                                                 if !type_name.is_empty() {
                                                     ty.declared_dependencies.push(type_name.clone());
@@ -505,6 +507,7 @@ fn collect_csharp_members<'a>(list: &Node<'a>, source: &str, ty: &mut ExtractedT
                                     name: fname,
                                     type_name: type_name.clone(),
                                     annotations: Vec::new(),
+                                    signature: None,
                                 });
                             }
                         }
@@ -694,6 +697,7 @@ fn collect_c_fields<'a>(list: &Node<'a>, source: &str, ty: &mut ExtractedType) {
             name: fname,
             type_name: type_text.clone(),
             annotations: Vec::new(),
+            signature: None,
         });
         if !type_text.is_empty() {
             ty.declared_dependencies.push(type_text);
@@ -863,6 +867,7 @@ fn walk_scala_toplevel<'a>(node: &Node<'a>, source: &str, extraction: &mut Sourc
                                 name: fname,
                                 type_name: type_name.clone(),
                                 annotations: Vec::new(),
+                                signature: None,
                             });
                             if !type_name.is_empty() {
                                 ty.declared_dependencies.push(type_name);
@@ -1070,6 +1075,7 @@ fn walk_julia<'a>(node: &Node<'a>, source: &str, package: &str, extraction: &mut
                                     name: fname,
                                     type_name: type_name.clone(),
                                     annotations: Vec::new(),
+                                    signature: None,
                                 });
                                 if !type_name.is_empty() {
                                     ty.declared_dependencies.push(type_name);
@@ -1281,6 +1287,7 @@ pub fn parse_verilog_file(source: &str) -> Result<SourceExtraction, String> {
                         name: pname,
                         type_name: String::new(),
                         annotations: Vec::new(),
+                        signature: None,
                     });
                 }
             }
@@ -1296,6 +1303,7 @@ pub fn parse_verilog_file(source: &str) -> Result<SourceExtraction, String> {
                         name: vname,
                         type_name: String::new(),
                         annotations: Vec::new(),
+                        signature: None,
                     });
                 }
             }

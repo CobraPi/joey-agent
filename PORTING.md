@@ -341,6 +341,120 @@ the observable contract is preserved:
 
 Feature spec/tracking: `specs/009-terminal-async-perf/`.
 
+## Live terminal output streaming + maximized TUI viewer (2026-08-16)
+
+Additive follow-up to feature 009: realtime in-GUI terminal output. While a
+`terminal` tool call runs, its output now live-streams into the TUI
+transcript (last-10-line tail per command block) and a maximized full-
+screen viewer shows the complete stream. Upstream Hermes streams terminal
+output through the same `tool_progress` callback; Joey originally did too,
+but the TUI could only show a one-line summary overwrite — raw output was
+invisible until `ToolEnd`. The fix adds a dedicated surface while keeping
+the upstream-visible one intact:
+
+- **`ToolContext`**: new additive `output_sender:
+  Option<UnboundedSender<String>>` (+ `with_output_sender` / `emit_output`,
+  no-op when unset — existing callers unaffected). The terminal tool's
+  `flush_chunk` now emits each throttled chunk on BOTH channels (progress
+  for upstream-parity consumers, output for live-view consumers).
+- **`AgentEvent::ToolOutput { name, chunk }`**: new additive variant,
+  forwarded by a per-dispatch task in `ctx_for_tool` alongside the
+  existing ToolProgress forwarder. The one-shot CLI renderer ignores it
+  (verbose mode already shows the chunks via ToolProgress); the TUI
+  accumulates it.
+- **TUI**: `TranscriptItem::Tool` carries a bounded live-output accumulator
+  (128 KB tail ring, line-boundary eviction); terminal items render a live
+  tail while Running; Ctrl+O / clicking a terminal block opens the
+  maximized viewer (takeover of the main screen below a transcript strip,
+  same pattern as the expanded reasoning panel / NeuroCode explorer —
+  explicit viewer wins precedence). Auto-follow tail pinning with
+  freeze-on-scroll (↑/PgUp/wheel-up), hjkl/g/G in transcript focus,
+  auto-retarget to each NEW terminal call while open, replay of finished
+  calls' full output, Esc/Ctrl+O restores. Terminal ToolProgress events
+  are ignored in the TUI (they'd duplicate the output stream).
+- **Untouched**: terminal result schema, timeouts, CWD markers, redaction,
+  background reaper, ToolProgress consumers (CLI verbose, gateway).
+  Tests: `context.rs` (7), `terminal_streaming.rs` (2),
+  `agent.rs` (2 incl. a real-bash end-to-end ordering test),
+  `state.rs` (10), `app.rs` key tests (4), `widgets.rs` render tests (3).
+
+## Animated header gradient bar (2026-08-16, TUI-only)
+
+Joey-native TUI feature (no upstream equivalent to port): the header's
+gradient underline is now an agent-active indicator. `anim::HeaderFlow`
+drives a slow traveling brightness wave across the bar while a turn runs
+(raised-cosine bump, ~8s traversal, breathing base lift; gradient colors
+fixed — only brightness moves), with an asymmetric eased busy envelope
+(~1s engage / ~0.8s settle, clamped to exactly-static when idle) and
+phase continuity across busy↔idle transitions. `draw_header` takes the
+animator as `Option<&HeaderFlow>` (None = the old static render,
+backward-compatible for non-Tui callers); `Tui::tick_animations[_with_dt]`
+latches `app.is_busy()` into it alongside the other animators, riding the
+shared activity speed. Contract tests: idle == static byte-identical,
+busy animates across frames, adjacent-cell color deltas stay graded.
+Purely additive; no state-schema, event, or config changes.
+
+## Agent stats page — live context-window stream (2026-08-16)
+
+Joey-native TUI feature (no upstream equivalent): clicking the header's
+right section (or Ctrl+A) maximizes an agent-stats page with a realtime
+stream of the full context window. Backing surface: new additive
+`AgentEvent::ContextSnapshot` (plus `ContextEntry` projection type) emitted
+by `Agent::emit_context_snapshot` at every history mutation the turn loop
+makes — user turn appended, each tool round flushed, pre-API and
+post-tool compactions, final assistant message. The payload carries
+per-message role/token/preview entries, system+history rough token
+estimates (`estimate_tokens`), and the compressor's context window /
+threshold / compression count. Purely observational: nothing about the
+request path, wire format, or persistence changes; the one-shot CLI
+renderer ignores it.
+
+TUI side: `App` stores the latest snapshot (entries + aggregates + a
+bounded 240-sample per-API-call usage series + turn count);
+`draw_stats_page` renders a dashboard (context-usage bar with
+green/amber/red thresholds, system-vs-history breakdown, session token
+totals, per-call usage sparkline) above a one-line-per-message context
+stream with the reasoning-panel scroll semantics (auto-follow tail,
+freeze-on-scroll-up, re-pin at bottom; ↑↓/PgUp·PgDn/Home/End + hjkl/g/G in
+transcript focus; wheel-over-page scrolls it). The header's right section
+records a hit-test rect (`last_header_right_rect`) — the click target —
+and the page takes main-screen precedence over the output viewer /
+NeuroCode explorer / reasoning panels. Tests: agent-core end-to-end
+(turn drives ≥3 snapshots with correct roles/growth), TUI state (5),
+key/mouse (5), render (3).
+
+## Crush-style tool output & diff formatting (2026-08-16, TUI-only)
+
+Ported Crush's tool-result display conventions (`internal/ui/chat/tools.go`,
+`unified_diff.go`, `ui/diffview/diffview.go`) onto Joey's transcript:
+
+- **Envelope unwrapping** (`state::display_result_content`): tool bodies and
+  the maximized viewer show the payload, never the JSON envelope —
+  `{"output":…,"exit_code":…}` → its `output` string, `{"error":…}` → the
+  message. Non-JSON results pass through unchanged.
+- **JSON pretty-printing** (`state::pretty_json_if_parses` /
+  `format_tool_result_for_display`): results that are themselves JSON
+  (MCP/list outputs, tool args) render with 2-space indent — no literal
+  `\n` escape runs. `serde_json` added to joey-tui (already a workspace dep).
+- **Line-numbered code gutters**: terminal live tails (absolute numbers
+  across the tail window), finished collapsed bodies, expanded tool
+  results/args, and the maximized viewer all render `N │ content` rows with
+  a dimmed separator; blank lines are preserved as numbered rows (fixed a
+  pre-existing `wrap()` bug that dropped them via textwrap collapse).
+- **Dual-gutter diffs** (`parse_diff_lines` + FileDiff rendering): unified
+  diffs carry old/new line numbers parsed from hunk headers — context shows
+  both, deletions old-only (new blank), insertions new-only (old blank),
+  hunk headers render as `… …` dividers with colored +/- markers, exactly
+  crush's diffview semantics.
+- **Viewer generalization**: the maximized viewer now handles ANY tool call
+  (terminal or generic), header adapting (`$ cmd (exit N)` vs
+  `tool summary`); clicking any tool block opens it; live-follow retargets
+  to each new tool call.
+
+Tests: formatting helpers (4), gutter/envelope render contracts (8),
+visual end-to-end rows (2); two legacy indent tests updated to the gutter
+contract. No event/schema/config changes — display-layer only.
+
 ## Deliberate deviations (not oversights)
 
 - **Anthropic OAuth "Claude Code" impersonation is NOT ported.** Upstream,
@@ -418,8 +532,12 @@ Feature spec/tracking: `specs/009-terminal-async-perf/`.
   `config check|migrate`, `doctor --ack`, `mcp serve/catalog/login/reauth`,
   `skills` beyond `list`, `tools post-setup`, and the version update check
   answer with honest not-available messages. `--image`, `-w/--worktree`,
-  `--accept-hooks`, `--checkpoints`, `--tui/--cli/--dev`, `--no-restore-cwd`
-  are not offered.
+  `--accept-hooks`, `--checkpoints`, `--no-restore-cwd` are not offered.
+  `--tui/--cli` exist but with joey-native semantics (upstream's trio also
+  includes `--dev`): the TUI is the DEFAULT interactive interface;
+  `--cli` selects the line REPL (`--cli` beats `--tui`; `JOEY_TUI=0|false`
+  env-opts-out, any other value or unset → TUI; non-terminal stdio falls
+  back to the line REPL). `--dev` is not offered.
 - **Skills self-improvement** (curator, `skill_manage` authoring/patching)
   is not ported; skills are discovered, indexed into the prompt, and viewable.
 
@@ -621,10 +739,13 @@ produce no type/method/import structure for the dependency graph.
 
 **On-disk format**: per-project SQLite DB at
 `~/.joey/neurocode/<project-hash>/graph.db` (machine-global across profiles via
-`process_joey_home()`), schema v1 (tables: `code_artifacts`, `graph_edges`,
-`code_artifacts_fts`, `patterns`, `anti_patterns`, `domain_knowledge`,
-`domain_knowledge_fts`, `schema_meta`). Round-trip + acyclic-DAG + disabled-state
-regression tests in `crates/joey-neurocode/tests/`.
+`process_joey_home()`), schema v2 (tables: `code_artifacts` with the additive
+`signature` column — declaration headers for methods/fields, migrated in place
+on open; `graph_edges` including the `MemberOf` edge kind for member→type
+membership, distinct from `Injects`; `code_artifacts_fts`, `patterns`,
+`anti_patterns`, `domain_knowledge`, `domain_knowledge_fts`, `schema_meta`).
+Round-trip + acyclic-DAG + disabled-state regression tests in
+`crates/joey-neurocode/tests/`.
 
 **Disabled state is byte-identical to today**: with `neurocode.enabled = false`
 the engine's `classify()`/`assemble_context()` are never called, no messages are
@@ -633,6 +754,62 @@ injected, and the system prompt bytes are unchanged (FR-020, SC-008 — asserted
 
 Full design trail and every dependency decision against the constitution:
 `specs/015-neurocode-enterprise-java/research.md`.
+
+**Follow-up (2026-08-16) — context-quality overhaul ("useful context for the
+LLM")**. The assembly pipeline was rebuilt around what the model actually
+receives:
+
+- **Request-text discovery** (`context::discovery`): backtick-quoted spans,
+  CamelCase/snake identifiers, dotted/`::` references, and file-path mentions
+  are extracted from the free-text request. Identifiers seed target lookup
+  (`CodingRequest.active_symbols`) and the classifier's scope-fanout signal;
+  file mentions become `active_file`. Previously the intercept passed empty
+  symbols and FTS-matched every ≥3-char word with AND semantics — mostly empty
+  or noisy results.
+- **Symbol-match ranking** (`best_symbol_match` / `resolve_query_node`): FTS
+  also indexes `declared_dependencies` text, so dependents' FQCNs crowd the
+  true node out of a small limit. Both lookups now fetch generously and
+  re-rank in Rust: type-level exact → qualified suffix → exact member → first
+  type-level → first hit.
+- **Ranked, budget-capped best-first expansion**: a `BinaryHeap` frontier
+  ordered by `ExpansionReason::rank` (inherits > implements > members >
+  injects > exchanges > references) replaces arbitrary `Vec::pop()` BFS — the
+  implemented interface always survives a tight budget ahead of dependents.
+  Members render inside their type's roster, not as separate artifacts. A
+  defensive pop cap (12× render budget) bounds hub-node traversal.
+- **Rendering with actionable detail**: file paths (model can `read_file`
+  directly), member rosters with captured declaration signatures
+  (`public User findById(Long id)`), fan-in blast-radius warnings (≥5
+  dependents), and an index-staleness note when a target file's mtime
+  postdates `indexed_at` (paths resolve against the project root).
+- **Schema v2** (`NEUROCODE_SCHEMA_VERSION = 2`): additive `signature` column
+  (migrated in place; rows keep NULL until re-indexed) + `MemberOf` edge kind.
+- **Signatures captured by every extractor**: Java/Python/JS-TS/Go/Rust
+  tree-sitter grammars emit declaration headers; the heuristic extractor
+  stores the trimmed source line.
+- **Spring ≥4.3 implicit constructor injection**: a single-constructor class
+  has its object-typed params recorded as declared dependencies (no
+  `@Autowired` needed — the dominant modern style).
+- **Tier routing follows classification**: `DefaultEngine` caches the last
+  classified tier; `resolve_tier_model` now returns the tier model for the
+  tier that actually served the request (previously always the ambiguous
+  default — the core premise of tier routing was broken).
+- **Per-turn assembly dedupe**: the agent-core intercept keys on the user
+  text; retries and tool-loop iterations reuse the stashed context instead of
+  re-running assembly (which also re-bumped anti-pattern hit counts). New
+  user turns clear the key.
+- **Query surface**: `definition` (exact declaration lookup with span +
+  signature) and `references` (alias of dependents) query types implemented —
+  previously advertised by the tool schema but rejected by the engine.
+- **Tier budgets raised**: economical depth 2 / 2 primaries / 8 expanded;
+  frontier depth 3 / 3 primaries / 24 expanded (was 1/1/5 and 2/3/20).
+- **Conservative token estimation** (`context::tokens`): ~3.5 chars/token
+  blended with a word-count floor (was `len()/4`, undercounting symbol-dense
+  text).
+
+Regression tests: `crates/joey-neurocode/tests/context_enrichment.rs` (9
+cases: discovery, rendering, ranking, tier routing, staleness, hub warnings,
+determinism).
 
 **Follow-up (2026-08-15) — realtime assembly progress feed.** Assembly is now
 streamable: `ContextAssembler::assemble_with_progress(request, tier, progress)`

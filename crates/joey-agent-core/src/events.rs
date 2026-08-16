@@ -33,6 +33,23 @@ pub enum FileChangeSource {
     Detected,
 }
 
+/// One message in a live context-window snapshot (see
+/// [`AgentEvent::ContextSnapshot`]). A display-oriented projection of a
+/// `Message`: role, rough size, and a bounded single-line preview.
+#[derive(Debug, Clone)]
+pub struct ContextEntry {
+    /// Message role: user / assistant / tool (provider-neutral string).
+    pub role: String,
+    /// Rough token estimate for this message.
+    pub tokens: u64,
+    /// Bounded preview (first line, ~80 chars).
+    pub preview: String,
+    /// Whether this message carries tool_calls (assistant tool-request).
+    pub has_tool_calls: bool,
+    /// Whether this entry is a context-compaction summary (compressed).
+    pub is_compressed_summary: bool,
+}
+
 /// An event emitted during a turn. The CLI/gateway renders these live.
 ///
 /// Ordering guarantees: `ContentDelta`/`ReasoningDelta` stream during a
@@ -77,6 +94,37 @@ pub enum AgentEvent {
     },
     /// Incremental progress from a running tool (upstream `tool_progress`).
     ToolProgress { name: String, progress: String },
+    /// A chunk of RAW output streamed live from a running tool (feature:
+    /// realtime terminal output). Emitted between `ToolStart` and `ToolEnd`
+    /// for the same tool name, carrying lossy-UTF-8 text chunks exactly as
+    /// the subprocess produced them (throttled to the same 50ms window as
+    /// `ToolProgress`). UIs that want a live terminal view accumulate these
+    /// per tool call; UIs that don't can ignore them (additive variant —
+    /// `ToolEnd.full_result` still carries the complete output).
+    ToolOutput { name: String, chunk: String },
+    /// A complete live snapshot of the agent's context window (feature:
+    /// realtime agent-stats page). Emitted at every history mutation the
+    /// turn loop makes (user message appended, assistant/tool messages
+    /// flushed, post-compaction) plus turn start, so a UI can render a
+    /// live-streaming view of exactly what will be sent to the model.
+    /// Additive: UIs that don't care can ignore it — nothing about the
+    /// request itself changes.
+    ContextSnapshot {
+        /// Entries in send order (oldest first), one per history message.
+        entries: Vec<ContextEntry>,
+        /// Rough token estimate for the system prompt (stable per session).
+        system_tokens: u64,
+        /// Rough token estimate for the whole history.
+        history_tokens: u64,
+        /// The compressor's context window (0 = unknown).
+        context_window: u64,
+        /// The effective compression threshold in tokens (0 = unknown).
+        compression_threshold: u64,
+        /// Number of prior compactions this session.
+        compactions: u32,
+        /// Model id the next request will use.
+        model: String,
+    },
     /// A tool call finished (name, whether it errored, result preview).
     ToolEnd {
         name: String,
@@ -217,10 +265,35 @@ pub enum AgentEvent {
         /// Short human-readable stage description (e.g. "expanded graph: 7 nodes pulled in").
         stage: String,
     },
+    /// Feature 015 follow-up (interactive context visualization): the
+    /// structured node/edge snapshot of the assembled context graph, emitted
+    /// right after [`AgentEvent::NeuroCodeContext`]. UIs use this to render
+    /// an interactive graph view of the expansion window. Only fired when
+    /// the engine produced a snapshot (populated graph); the CLI renderer
+    /// consumes it silently.
+    NeuroCodeGraph {
+        /// Pure-data projection of primary + expanded nodes and the edges
+        /// among them (no graph-store handle inside).
+        snapshot: joey_neurocode::ContextGraphSnapshot,
+    },
     /// Feature 015 (NeuroCode): the engine's active/inactive state changed
     /// (wired + enabled). Lets UIs show/hide the NeuroCode indicator without
     /// polling config.
     NeuroCodeActive { active: bool },
+    /// Feature 015 follow-up (auto re-index): the structural graph was
+    /// rebuilt after large edits, so subsequent assemblies reflect the
+    /// current codebase. Emitted after the re-index completes at turn end;
+    /// UIs show a brief notice. The turn's already-assembled context is
+    /// NOT retroactively rewritten — the next user turn re-assembles
+    /// against the fresh index.
+    NeuroCodeReindexed {
+        /// Distinct source files re-scanned.
+        files_scanned: usize,
+        /// Edit-pressure that triggered the pass (files / lines tracked
+        /// before the reset).
+        files_edited: usize,
+        lines_edited: usize,
+    },
     /// A category-based delegation was dispatched (T059).
     CategoryDelegation {
         category: String,

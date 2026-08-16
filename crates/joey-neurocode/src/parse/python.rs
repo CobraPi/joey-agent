@@ -194,12 +194,34 @@ fn extract_function<'a>(
         .ok()?
         .trim()
         .to_string();
+    // Signature: decorators + `def name(params) -> ret` — from the wrapper's
+    // first byte (so decorators ride along) through the `:` body marker.
+    let mut end = def.end_byte();
+    if let Some(body) = def.child_by_field_name("body") {
+        end = end.min(body.start_byte());
+    }
+    // Cut the trailing ':' between header and body.
+    let header = if end <= wrapper.start_byte() || end > source.len() {
+        None
+    } else {
+        source[wrapper.start_byte()..end]
+            .trim_end()
+            .strip_suffix(':')
+            .map(|s| s.trim_end())
+            .map(collapse_ws)
+    };
     Some(ExtractedMethod {
         name,
         annotations: decorators(wrapper, source),
+        signature: header,
         start_byte: wrapper.start_byte() as u32,
         end_byte: def.end_byte() as u32,
     })
+}
+
+/// Collapse runs of whitespace to single spaces.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Collect bare identifier names from an argument_list (base classes).
@@ -271,9 +293,10 @@ fn extract_typed_field<'a>(assign: &Node<'a>, source: &str) -> Option<ExtractedF
         return None;
     }
     Some(ExtractedField {
-        name,
-        type_name,
+        name: name.clone(),
+        type_name: type_name.clone(),
         annotations: Vec::new(),
+        signature: Some(format!("{}: {}", name, type_name)),
     })
 }
 

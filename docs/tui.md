@@ -1,7 +1,8 @@
 # joey-tui — Animated Terminal Dashboard
 
-The "busy yet elegant" synthwave-aurora terminal UI, enabled with `--tui`
-(or `JOEY_TUI=1`); falls back to the line REPL when stdio isn't a terminal.
+The "busy yet elegant" synthwave-aurora terminal UI — the DEFAULT interactive
+interface (piped/non-terminal stdio falls back to the line REPL). Opt out with
+`joey --cli` or `JOEY_TUI=0`; `--tui` forces it back on against the env var.
 
 ## Architecture
 
@@ -55,23 +56,142 @@ panel, OMO agent panel, multi-line input editor, status bar (token
 accounting, elapsed), help overlay, search bar, agent picker, and a
 slash-command popup.
 
+## Animated header gradient bar (agent-active indicator)
+
+The header's gradient underline doubles as the "agent is running" status
+indicator (`anim::HeaderFlow`, drawn by `draw_header`):
+
+- **Idle** — the static gradient underline, byte-identical to the old look.
+- **While a turn runs** — a soft brightness wave glides across the bar
+  (~8s per traversal, raised-cosine profile, one wave visible at a time)
+  over a slightly brighter, gently breathing base. Gradient colors stay
+  fixed; only brightness moves — subtle but noticeable in peripheral
+  vision. Wave pace scales with the shared activity signal (more agents ⇒
+  slightly faster).
+- **Turn boundaries never snap**: the busy envelope eases in (~1s) and
+  settles out (~0.8s, clamped to exactly static), and the wave phase is
+  continuous across busy↔idle transitions.
+- Contract-tested: idle render == static render; busy render changes
+  across frames; adjacent cells stay graded (no color cliffs).
+
+## Agent stats page (maximized live context window)
+
+Clicking the header's RIGHT section (model · session · activity/tokens) or
+pressing **Ctrl+A** opens a maximized agent-stats page — the same
+transcript-strip-plus-takeover layout as the other maximized panels. It
+contains everything an agentic engineer wants at a glance, updating in
+realtime:
+
+- **Dashboard rows** (top):
+  - `context` — used / window (% of the model's context window) with a
+    progress bar that shifts green → amber (≥65%) → red (≥85%, "near
+    limit" warning), plus the compression threshold and compaction count.
+  - breakdown — system vs history tokens, message count, `compress@N`
+    threshold, `compacted Nx`.
+  - `session` — cumulative prompt/completion/total tokens, turns,
+    iterations.
+  - `calls` — a per-API-call usage sparkline (▁▂▃▅▇, most recent ~240
+    calls, prompt-token magnitude).
+- **Context stream** (below): one line per history message in send order —
+  index, role (user/asst/tool, color-coded), per-message token estimate,
+  and a bounded preview, with `⚒calls` / `⤳compressed` flags. This is the
+  literal contents of the next request's context window.
+- **Scroll semantics** (identical to the live reasoning panel):
+  auto-follows the tail by default; ↑ / PgUp / wheel-up freezes the view
+  at an absolute anchor (streaming no longer moves it); scrolling back to
+  the very bottom (or G / End) re-pins. hjkl / g / G work in transcript
+  focus. Footer shows `↑N above` / `↓N below · scroll to bottom to resume`
+  plus the live spinner and "updated Ns ago" while a turn runs.
+- **Esc** or **Ctrl+A** (or clicking the header section again) restores.
+  Printable keys still reach the input box.
+
+Backing data: the agent emits `AgentEvent::ContextSnapshot` at every
+history mutation (user turn, tool results, compactions, final message),
+carrying per-message entries + system/history token estimates + the
+compressor's window/threshold/count. The snapshot replaces prior state
+wholesale — it is always a complete projection of what will be sent to
+the model next.
+
+### Live reasoning panel (click to expand)
+
+While the model is thinking, the live reasoning stream docks as an 8-row
+strip at the bottom of the conversation area (header with a live thinking
+timer, tail-pinned text, spinner + "↑N lines hidden" overflow footer).
+
+- **Click** the strip (anywhere, borders included) → the panel expands to
+  take over the main screen (a live transcript strip stays at the top so
+  assistant streaming remains visible); click again to dock it back.
+- **Esc** collapses the expanded view. The wheel over the panel scrolls it
+  (up walks away from the live tail, down re-pins); wheel elsewhere scrolls
+  the transcript as before.
+- When the reasoning block closes, an expanded panel auto-docks: the full
+  text is committed as a transcript item with its own three-state expand
+  affordance (collapsed → tail-window → full, Space/x or click).
+- No-op when nothing is live. NeuroCode's context feed (which can also
+  expand onto the main screen) keeps priority for the takeover slot: while
+  it is expanded, the reasoning strip isn't drawn and its click target is
+  disabled; dock the feed to get the reasoning strip back.
+
 ## Expandable tool, terminal, and diff blocks
 
 Every tool call, terminal command block, and inline file diff is
-expandable in place:
+expandable in place, all rendered in crush-style code views:
 
-- **Collapsed** — the first 10 lines of output (tools/terminal) or last 50
-  diff lines, with an affordance line ("… N more lines").
-- **Expanded** — the FULL result: generic tools show args + full result
-  (tail-anchored, 200-line window); terminal blocks show the full command
-  output tail (the END of long output is what matters) with exit code;
-  file diffs show the entire diff (the 50-line bound lifts).
+- **Tool output bodies** show the payload — never the raw JSON envelope
+  (`{"output":"…","exit_code":…}` is unwrapped to its `output`; error
+  envelopes to their message) — in a line-numbered gutter view
+  (`12 │ …`, dimmed `│` separator). Results that are themselves JSON
+  are pretty-printed (2-space indent): no literal `\n` runs, readable
+  structure.
+- **Collapsed** — the first 10 output lines (tools) or last 50 diff
+  lines, with an affordance line ("… N more lines"). Blank lines are
+  preserved as numbered rows (editor fidelity).
+- **Expanded** — the FULL formatted result (tail-anchored, 200-line
+  window); file diffs show the entire diff.
+- **File diffs** carry dual old/new line-number gutters (crush
+  diffview.go semantics): context lines show both numbers, deletions
+  show the old number with a blank new column, insertions the reverse;
+  hunk headers render as `… …` dividers. +/- markers are colored.
 - **Toggle**: mouse click on the block (hit-tested), or **Space / x** in
   transcript focus (Ctrl+T / Shift+Up / PgUp to focus) — the key resolves
   the item at the viewport center via the same hit-test machinery clicks
   use, falling back to the first expandable visible item when the center
   lands on a non-expandable line. Reasoning blocks keep their three-state
   cycle (collapsed → tail-window → full).
+- **Maximize**: clicking ANY tool block (or Ctrl+O) opens the maximized
+  code viewer (below) instead of the inline expand; diffs/reasoning keep
+  the inline toggle.
+
+## Live terminal output streaming + maximized viewer
+
+While a `terminal` tool call RUNS, its output streams into the transcript
+in realtime (no more waiting for the call to finish to see anything):
+
+- Each command block shows a **live tail** with absolute line numbers as
+  output arrives, plus a `⣿ streaming · N lines · Ctrl+O or click to
+  maximize` hint. Silent commands show `⣿ running…`.
+- Chunks flow `terminal` tool → `ToolContext::emit_output` →
+  `AgentEvent::ToolOutput` → per-item bounded accumulator (128 KB tail
+  ring, eviction at line boundaries). The `AgentEvent::ToolProgress`
+  path is unchanged (status/heartbeats) and is ignored for terminal
+  items to avoid duplication.
+- **Ctrl+O** (or clicking any tool block — terminal OR generic) opens the
+  **maximized code viewer**: the formatted output takes over the main
+  screen below a live transcript strip. It's a text-editor-like view:
+  line-numbered gutter, JSON pretty-printed (2-space indent), terminal
+  envelopes unwrapped to their payload — no literal `\n` runs anywhere.
+  - Header: `$ <command> (exit N) N.Ns` for terminal; `<tool> <summary>`
+    for generic tools.
+  - **Auto-follow**: the view is pinned to the live tail; ↑ / PgUp / wheel
+    up freezes it at an absolute anchor, scrolling back to the bottom
+    (or G / End) re-pins. hjkl / g / G work in transcript focus.
+  - While open and following, each NEW tool call retargets the viewer
+    automatically — consecutive calls keep streaming without re-opening.
+  - Works after completion too: opening the viewer on a finished tool
+    replays its formatted full output.
+  - **Esc** or **Ctrl+O** restores the normal layout. Printable keys
+    still reach the input box, so you can queue a message while
+    watching.
 
 ## Animations (anim.rs)
 

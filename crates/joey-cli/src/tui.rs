@@ -27,7 +27,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         || !IsTerminal::is_terminal(&std::io::stdin())
     {
         if !opts.quiet {
-            render::info("--tui needs an interactive terminal — using the line REPL.");
+            render::info("the TUI needs an interactive terminal — using the line REPL.");
         }
         return crate::repl::run_chat(opts).await;
     }
@@ -214,7 +214,8 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
             engine_spec,
             busy: false,
             last_ctrlc: None,
-            queued_forwarded: 0,
+            queued: Vec::new(),
+            engine_queued: Vec::new(),
         };
         session.submit(query.clone());
         loop {
@@ -246,7 +247,8 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         engine_spec,
         busy: false,
         last_ctrlc: None,
-        queued_forwarded: 0,
+        queued: Vec::new(),
+        engine_queued: Vec::new(),
     };
     let (result, outro) = interactive_loop(session).await;
 
@@ -314,12 +316,21 @@ pub struct TuiSession {
     /// A turn or heavy job is running on the engine.
     pub busy: bool,
     pub last_ctrlc: Option<Instant>,
-    /// Prompts forwarded to a busy engine (queued engine-side). If the
-    /// engine is force-killed, those queued prompts die with it — the
-    /// engine owns its queue and they cannot be recovered. This counter
-    /// lets the UI report exactly how many were discarded (fix: silent
-    /// queue loss on ForceKill). Reset on every TurnFinished.
-    pub queued_forwarded: usize,
+    /// The UI-side `/queue` stash. Owned HERE (not engine-side) so it
+    /// survives a force-kill — the engine can be killed and restarted
+    /// without losing what the user deliberately deferred.
+    /// - `/queue` while BUSY: entry runs as its own turn when the engine
+    ///   announces `Idle` (auto-drain, oldest first).
+    /// - `/queue` while IDLE: entries join the next submitted input,
+    ///   newline-separated (line-REPL parity, repl.rs process_input).
+    /// - Interrupt-with-message pushes to the FRONT (runs next).
+    pub queued: Vec<String>,
+    /// Mirror of prompts sitting in the ENGINE's queue (busy /queue,
+    /// interrupt-with-message). Display + force-kill accounting only —
+    /// the engine owns the real queue. Element removed when the engine
+    /// announces the submit started (QueuedSubmitStarted); on force-kill
+    /// the remainder is what gets discarded.
+    pub engine_queued: Vec<String>,
 }
 
 impl TuiSession {
@@ -341,13 +352,33 @@ impl TuiSession {
             .get(self.tui.app().active_agent_index)
             .map(|a| a.name.clone())
             .unwrap_or_else(|| "default".to_string());
+        // Line-REPL parity (repl.rs process_input): prompts stashed via
+        // /queue join the next submitted turn, separated by newlines.
+        // (The /queue-while-idle and engine-Idle drains bypass submit(),
+        // so this only fires when the user submits fresh input with a
+        // pending stash — same semantics as upstream.)
+        let turn_text = if self.queued.is_empty() {
+            prompt
+        } else {
+            let mut joined = std::mem::take(&mut self.queued);
+            joined.push(prompt);
+            joined.join("\n")
+        };
         // Pending OMO context (from /start-work) prepends once.
         let turn_text = match self.tui.app_mut().pending_context_injection.take() {
-            Some(ctx) if !prompt.is_empty() => format!("{ctx}\n{prompt}"),
+            Some(ctx) if !turn_text.is_empty() => format!("{ctx}\n{turn_text}"),
             Some(ctx) => ctx,
-            None => prompt,
+            None => turn_text,
         };
         self.tui.app_mut().record_user(&turn_text);
+        self.dispatch_turn(turn_text, active_agent);
+        false
+    }
+
+    /// Send an already-rendered turn text to the engine and flip busy.
+    /// Shared by the submit() funnel and the Idle auto-drain (which must
+    /// NOT re-join the remaining stash into the popped prompt).
+    fn dispatch_turn(&mut self, turn_text: String, active_agent: String) {
         // Only flip busy when there's actually an engine to run the turn —
         // otherwise the app wedges in Busy with no TurnFinished coming.
         if self.engine.is_some() {
@@ -361,9 +392,71 @@ impl TuiSession {
             engine.send(crate::engine::EngineCommand::Submit {
                 prompt: turn_text,
                 active_agent,
+                announce: false,
             });
         }
-        false
+    }
+
+    /// Interrupt-with-message: interrupt the running turn and run this
+    /// prompt next (busy_input_mode=interrupt, upstream default). The
+    /// submit is queued engine-side behind the interrupt; mirrored
+    /// locally for force-kill accounting, and announced with
+    /// QueuedSubmitStarted when the turn actually starts so the user
+    /// message renders in causal order.
+    fn send_queued_submit(&mut self, prompt: String) {
+        if let Some(engine) = &self.engine {
+            let active_agent = self
+                .tui
+                .app()
+                .agent_roster
+                .get(self.tui.app().active_agent_index)
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| "default".to_string());
+            engine.send(crate::engine::EngineCommand::Submit {
+                prompt: prompt.clone(),
+                active_agent,
+                announce: true,
+            });
+            self.engine_queued.push(prompt);
+        }
+    }
+
+    /// Queue a prompt for the next turn WITHOUT sending anything to the
+    /// engine — the UI-side stash survives force-kills. Used by /queue.
+    fn stash_ui_queue(&mut self, prompt: String) {
+        let preview: String = prompt.chars().take(48).collect();
+        let pos = self.queued.len() + 1;
+        self.tui.app_mut().push_item(TranscriptItem::Notice {
+            text: format!("⧗ queued (#{pos}) for the next turn: {preview}"),
+            kind: NoticeKind::Busy,
+        });
+        self.queued.push(prompt);
+    }
+
+    /// Render the queue listing (bare /queue — line-REPL parity, plus the
+    /// engine-side backlog mirror while a turn runs).
+    fn show_ui_queue(&mut self) {
+        let total = self.queued.len() + self.engine_queued.len();
+        if total == 0 {
+            self.tui.app_mut().push_item(TranscriptItem::Notice {
+                text: "No prompts queued. Usage: /queue <prompt>".into(),
+                kind: NoticeKind::Info,
+            });
+            return;
+        }
+        self.tui.app_mut().push_item(TranscriptItem::Notice {
+            text: format!("{} prompt(s) queued for the next turn:", total),
+            kind: NoticeKind::Info,
+        });
+        let mut i = 1;
+        for q in self.engine_queued.iter().chain(self.queued.iter()) {
+            let preview: String = q.chars().take(48).collect();
+            self.tui.app_mut().push_item(TranscriptItem::Notice {
+                text: format!("  {i}. {preview}"),
+                kind: NoticeKind::Info,
+            });
+            i += 1;
+        }
     }
 
     /// /start-work: activate Atlas on a plan. The OMO bookkeeping +
@@ -421,23 +514,29 @@ impl TuiSession {
     pub fn force_kill_engine(&mut self, reason: &str) {
         // Prompts forwarded while busy lived in the killed engine's queue
         // and die with it — the honest fix is to tell the user (they can't
-        // be recovered; the engine owns its queue).
-        let discarded = self.queued_forwarded;
+        // be recovered; the engine owns its queue). The UI-side stash
+        // survives (that's why /queue-while-idle stashes UI-side).
+        let discarded = std::mem::take(&mut self.engine_queued);
         if let Some(engine) = self.engine.take() {
             // Signal, then abandon: drop the command channel + detach task.
             engine.send(crate::engine::EngineCommand::ForceKill);
             engine.abandon();
         }
-        self.queued_forwarded = 0;
         // The fresh engine must not inherit a stale 2s Ctrl-C kill window
         // (a second Ctrl-C right after restart would instantly kill it).
         self.last_ctrlc = None;
         // Flush any stale engine events so they can't leak into the new one.
         while let Ok(_) = self.ev_rx.try_recv() {}
-        if discarded > 0 {
+        if !discarded.is_empty() {
+            let previews: Vec<String> = discarded
+                .iter()
+                .map(|p| p.chars().take(48).collect())
+                .collect();
             self.tui.app_mut().push_item(TranscriptItem::Error {
                 text: format!(
-                    "{discarded} queued prompt(s) discarded with the killed engine — resubmit them if still needed"
+                    "{} queued prompt(s) discarded with the killed engine — resubmit if still needed: {}",
+                    discarded.len(),
+                    previews.join(" | ")
                 ),
             });
         }
@@ -541,9 +640,10 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
         }
         Some(crate::engine::EngineEvent::TurnFinished { .. }) => {
             session.busy = false;
-            // Anything forwarded while busy has now been drained by the
-            // engine's internal queue — reset the loss counter.
-            session.queued_forwarded = 0;
+            // NOTE: queued_forwarded is NOT reset here anymore — the engine
+            // may still hold queued submits behind this TurnFinished (the
+            // flag only reaches zero as each QueuedSubmitStarted lands or
+            // at a force-kill, which reports the true discard count).
             // Honor a pending agent switch now that the turn is done.
             if let Some(agent_name) = session.tui.app_mut().pending_agent_switch.take() {
                 if let Some(engine) = &session.engine {
@@ -551,6 +651,45 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
                 }
             }
             Some(PumpOutcome::TurnDone)
+        }
+        Some(crate::engine::EngineEvent::QueuedSubmitStarted { prompt }) => {
+            // A busy-path submit (queue/interrupt-with-message) is starting
+            // now — render the user message we couldn't show at submit
+            // time, in causal order. Pop it from the mirror (by value, in
+            // order; a mismatch just clears the head defensively).
+            pop_engine_queued_head(&mut session.engine_queued, &prompt);
+            session.busy = true;
+            session.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
+            session.tui.app_mut().record_user(&prompt);
+            None
+        }
+        Some(crate::engine::EngineEvent::Idle) => {
+            // All engine work drained. Pop the UI-side /queue stash — one
+            // prompt per turn, oldest first, submitted through
+            // dispatch_turn (not the submit() funnel, which would re-join
+            // the remaining stash into this prompt).
+            if session.busy {
+                session.busy = false;
+                session.tui.app_mut().mode = joey_tui::state::RunMode::Input;
+            }
+            if let Some(next) = session.queued.first().cloned() {
+                session.queued.remove(0);
+                let active_agent = session
+                    .tui
+                    .app()
+                    .agent_roster
+                    .get(session.tui.app().active_agent_index)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| "default".to_string());
+                let preview: String = next.chars().take(48).collect();
+                session.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!("⧗ running queued prompt: {preview}"),
+                    kind: NoticeKind::Busy,
+                });
+                session.tui.app_mut().record_user(&next);
+                session.dispatch_turn(next, active_agent);
+            }
+            None
         }
         Some(crate::engine::EngineEvent::HeavyJobFinished { label: _, text }) => {
             session.busy = false;
@@ -582,6 +721,8 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
         }
         Some(crate::engine::EngineEvent::EngineGone(msg)) => {
             session.busy = false;
+            // Anything mirrored as engine-queued died with the engine.
+            session.engine_queued.clear();
             // Engine death never sends Done — reset the RunMode ourselves
             // or the status bar stays BUSY forever.
             session.tui.app_mut().mode = joey_tui::state::RunMode::Input;
@@ -590,6 +731,7 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
         }
         None => {
             session.busy = false;
+            session.engine_queued.clear();
             session.tui.app_mut().mode = joey_tui::state::RunMode::Input;
             Some(PumpOutcome::EngineGone)
         }
@@ -618,47 +760,26 @@ async fn interactive_loop(mut session: TuiSession) -> (anyhow::Result<()>, Outro
                 // Read-only slash commands are safe (and useful) while a
                 // turn runs — answer them inline instead of forwarding a
                 // raw "/status" prompt to the engine as if it were chat.
-                let light_slash = session.busy
-                    && text.trim_start().starts_with('/')
-                    && slash_is_light(&text);
+                // Resolution (not raw starts_with) so aliases (/q),
+                // prefixes (/qu), and case variants all classify the same.
+                let is_slash = text.trim_start().starts_with('/');
+                let light_slash = session.busy && is_slash && slash_is_light(&text);
+                let resolved_busy = session.busy && is_slash;
                 if light_slash {
                     session.handle_slash(&text);
-                } else if session.busy && text.trim_start().starts_with("/queue") {
-                    // Hermes /queue: queue for the NEXT turn — never
-                    // interrupts the running turn.
-                    let queued_text = text.trim_start_matches("/queue").trim().to_string();
-                    if queued_text.is_empty() {
-                        session.tui.app_mut().push_item(TranscriptItem::Notice {
-                            text: "Usage: /queue <prompt>".into(),
-                            kind: NoticeKind::Warning,
-                        });
-                    } else if let Some(engine) = &session.engine {
-                        let active_agent = session
-                            .tui
-                            .app()
-                            .agent_roster
-                            .get(session.tui.app().active_agent_index)
-                            .map(|a| a.name.clone())
-                            .unwrap_or_else(|| "default".to_string());
-                        engine.send(crate::engine::EngineCommand::Submit {
-                            prompt: queued_text.clone(),
-                            active_agent,
-                        });
-                        session.queued_forwarded += 1;
-                        let preview: String = queued_text.chars().take(48).collect();
-                        session.tui.app_mut().push_item(TranscriptItem::Notice {
-                            text: format!("⧗ queued for next turn: {preview}"),
-                            kind: NoticeKind::Busy,
-                        });
-                    }
-                } else if session.busy && text.trim_start().starts_with("/steer") {
+                } else if resolved_busy
+                    && matches!(
+                        slash::resolve(&text),
+                        Resolution::Command { def, .. } if def.name == "steer"
+                    )
+                {
                     // Hermes parity: /steer mid-turn injects WITHOUT
                     // interrupting — the message lands inside the marker on
                     // the current turn's next tool result.
-                    let steer_text = text.trim_start_matches("/steer").trim().to_string();
+                    let steer_text = slash::resolve(&text).rest_or_empty();
                     if steer_text.is_empty() {
                         session.tui.app_mut().push_item(TranscriptItem::Notice {
-                            text: "Usage: /steer <message>".into(),
+                            text: "Usage: /steer <message> — inject mid-turn after the next tool call".into(),
                             kind: NoticeKind::Warning,
                         });
                     } else if let Some(engine) = &session.engine {
@@ -675,24 +796,7 @@ async fn interactive_loop(mut session: TuiSession) -> (anyhow::Result<()>, Outro
                         kind: NoticeKind::Warning,
                     });
                     session.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
-                    if let Some(engine) = &session.engine {
-                        // Queued AFTER the interrupt lands; the engine runs
-                        // it when the turn unwinds.
-                        let active_agent = session
-                            .tui
-                            .app()
-                            .agent_roster
-                            .get(session.tui.app().active_agent_index)
-                            .map(|a| a.name.clone())
-                            .unwrap_or_else(|| "default".to_string());
-                        engine.send(crate::engine::EngineCommand::Submit {
-                            prompt: text,
-                            active_agent,
-                        });
-                        // Still tracked: a force-kill before the turn
-                        // unwinds would drop this queued prompt too.
-                        session.queued_forwarded += 1;
-                    }
+                    session.send_queued_submit(text);
                 } else if session.submit(text) {
                     break;
                 }
@@ -821,6 +925,36 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
             }
             "agents" => {
                 self.tui.app_mut().agent_picker_open = true;
+            }
+            // /queue — UI-side stash in BOTH modes: defers to the next
+            // turn, never interrupts, and survives force-kills. While a
+            // turn runs, slash_is_light routes here too; the engine's Idle
+            // event then auto-drains entries one turn each.
+            "queue" => {
+                let args = slash_args_after(input, "queue");
+                if args.trim().is_empty() {
+                    self.show_ui_queue();
+                } else {
+                    self.stash_ui_queue(args.trim().to_string());
+                }
+            }
+            // /steer while idle: nothing is running — degrade to a queued
+            // prompt (line-REPL parity; the busy path in interactive_loop
+            // does true mid-turn steering via EngineCommand::Steer).
+            "steer" => {
+                let args = slash_args_after(input, "steer");
+                if args.trim().is_empty() {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "Usage: /steer <message> — inject mid-turn after the next tool call".into(),
+                        kind: NoticeKind::Warning,
+                    });
+                } else {
+                    self.stash_ui_queue(args.trim().to_string());
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "No turn running — queued for the next turn. (Mid-turn /steer works while a turn is live.)".into(),
+                        kind: NoticeKind::Info,
+                    });
+                }
             }
             "model" => {
                 let model_now = self.tui.app().model.clone();
@@ -983,6 +1117,7 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                                     engine.send(crate::engine::EngineCommand::Submit {
                                         prompt: prep.prompt,
                                         active_agent,
+                                        announce: false,
                                     });
                                     self.busy = true;
                                     self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
@@ -1026,6 +1161,7 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                             engine.send(crate::engine::EngineCommand::Submit {
                                 prompt,
                                 active_agent,
+                                announce: false,
                             });
                             self.busy = true;
                             self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
@@ -1076,7 +1212,7 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
             name => {
                 self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: format!(
-                        "/{} isn't wired into the TUI yet — run joey without --tui to use it.",
+                        "/{} isn't wired into the TUI yet — run joey --cli to use it.",
                         name
                     ),
                     kind: NoticeKind::Warning,
@@ -1089,13 +1225,39 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
 }
 
 /// True for slash commands that are pure UI-side reads/writes — safe to
-/// run while the engine is mid-turn (they never touch the agent). Anything
-/// else submitted while busy is queued (or, for unknown commands, answered
-/// by handle_slash as usual when idle).
+/// run while the engine is mid-turn (they never touch the agent). Uses
+/// slash::resolve so aliases (/q), and case variants classify the same as
+/// the full name. Anything else submitted while busy is queued (or, for
+/// unknown commands, answered by handle_slash as usual when idle).
 fn slash_is_light(input: &str) -> bool {
-    let stripped = input.trim_start().trim_start_matches('/').to_ascii_lowercase();
-    let name = stripped.split_whitespace().next().unwrap_or("");
-    matches!(name, "status" | "help" | "copy" | "model" | "version" | "v")
+    if !input.trim_start().starts_with('/') {
+        return false;
+    }
+    match slash::resolve(input) {
+        // /queue is UI-side in BOTH modes: while busy it stashes into the
+        // kill-survivable UI queue (never interrupts); while idle the same
+        // stash joins the next submitted turn. Bare /queue lists the queue.
+        Resolution::Command { def, .. } => {
+            matches!(def.name, "status" | "help" | "copy" | "model" | "version" | "queue")
+        }
+        _ => false,
+    }
+}
+
+/// Pop the head of the engine-queue mirror when it matches the announced
+/// prompt (in-order drain). A mismatch clears the head defensively so the
+/// mirror can never grow stale.
+fn pop_engine_queued_head(mirror: &mut Vec<String>, announced: &str) {
+    if mirror.is_empty() {
+        return;
+    }
+    if mirror[0] == announced {
+        mirror.remove(0);
+    } else {
+        // Out-of-order announcement (shouldn't happen — the engine runs
+        // FIFO): drop the stale head so the count stays honest.
+        mirror.remove(0);
+    }
 }
 
 /// Extract the argument substring after `/command` in a slash input string.
@@ -1123,12 +1285,74 @@ mod tui_tests {
     /// everything else (prompts, heavy commands) must queue.
     #[test]
     fn slash_is_light_classifies_read_only_commands() {
-        for ok in ["/status", "/help", "/copy", "/copy 2", "/model", "/version", "/v", "  /status"] {
+        for ok in [
+            "/status", "/help", "/copy", "/copy 2", "/model", "/version", "/v",
+            "  /status", "/queue while busy stashes", "/q alias stashes",
+        ] {
             assert!(super::slash_is_light(ok), "expected light: {ok}");
         }
-        for heavy in ["/neurocode index", "/start-work", "/quit", "/clear", "hello", ""] {
+        // /qu is ambiguous (queue/quit) → unique-shortest → /quit (not
+        // light); /steer is a mid-turn engine command (not light).
+        for heavy in ["/neurocode index", "/start-work", "/quit", "/clear", "hello", "", "/steer x", "/qu x"] {
             assert!(!super::slash_is_light(heavy), "expected not light: {heavy}");
         }
+    }
+
+    /// The busy path must classify queue/steer via slash::resolve — the
+    /// old raw starts_with checks mis-routed the /q alias (→ interrupt!)
+    /// and case variants. This pins the exact resolution behavior the
+    /// interactive_loop branches rely on.
+    #[test]
+    fn busy_path_resolution_routes_queue_steer_correctly() {
+        use crate::slash::{self, Resolution};
+        // Every queue form resolves to the queue command with its args
+        // (`rest` preserves the tail exactly as typed — leading space).
+        for input in ["/queue do the thing", "/q do the thing", "/Queue do the thing"] {
+            match slash::resolve(input) {
+                Resolution::Command { def, rest } => {
+                    assert_eq!(def.name, "queue", "{input}");
+                    assert_eq!(rest.trim(), "do the thing", "{input}");
+                }
+                other => panic!("{input} resolved to {other:?}"),
+            }
+        }
+        // Steer forms likewise.
+        for input in ["/steer redirect here", "/Steer redirect here"] {
+            match slash::resolve(input) {
+                Resolution::Command { def, rest } => {
+                    assert_eq!(def.name, "steer", "{input}");
+                    assert_eq!(rest.trim(), "redirect here", "{input}");
+                }
+                other => panic!("{input} resolved to {other:?}"),
+            }
+        }
+        // Bare forms carry empty rest (after trim — rest_or_empty).
+        assert_eq!(slash::resolve("/queue").rest_or_empty(), "");
+        assert_eq!(slash::resolve("/q").rest_or_empty(), "");
+    }
+
+    /// The engine-queue mirror drains in order on announcements.
+    #[test]
+    fn engine_queued_mirror_drains_in_order() {
+        let mut mirror = vec!["one".to_string(), "two".to_string()];
+        super::pop_engine_queued_head(&mut mirror, "one");
+        assert_eq!(mirror, vec!["two".to_string()]);
+        super::pop_engine_queued_head(&mut mirror, "two");
+        assert!(mirror.is_empty());
+        // Empty mirror: no panic.
+        super::pop_engine_queued_head(&mut mirror, "anything");
+        assert!(mirror.is_empty());
+    }
+
+    /// slash_args_after must extract queue/steer arguments exactly,
+    /// including multi-word and edge forms (used by the idle handle_slash
+    /// arms).
+    #[test]
+    fn slash_args_extraction_for_queue_and_steer() {
+        assert_eq!(super::slash_args_after("/queue check the tests", "queue"), "check the tests");
+        assert_eq!(super::slash_args_after("/steer look at this instead", "steer"), "look at this instead");
+        assert_eq!(super::slash_args_after("/queue", "queue"), "");
+        assert_eq!(super::slash_args_after("/q check", "queue"), "check");
     }
 }
 

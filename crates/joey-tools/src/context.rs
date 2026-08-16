@@ -168,6 +168,12 @@ pub struct ToolContext {
     /// The agent sets this on a per-dispatch clone via [`with_progress_sender`]
     /// before passing the context to a tool that may emit streaming output.
     progress_sender: Option<ProgressSender>,
+    /// Optional channel for streaming RAW tool output (live terminal view).
+    /// `None` by default — additive, existing callers unaffected. The agent
+    /// sets this on a per-dispatch clone via [`with_output_sender`]; streaming
+    /// tools (e.g. `terminal`) push raw output chunks via [`emit_output`],
+    /// forwarded as `AgentEvent::ToolOutput` so UIs can live-render output.
+    output_sender: Option<OutputSender>,
     /// Optional cooperative-interrupt flag shared with the agent turn loop.
     /// `None` by default — existing callers are unaffected. When set (the
     /// agent wires its Ctrl-C `AtomicBool` here via [`with_interrupt_flag`]),
@@ -196,6 +202,14 @@ pub struct BackgroundCompletion {
 /// output (e.g. `terminal`) push `String` progress deltas through this channel;
 /// the agent loop forwards them as `AgentEvent::ToolProgress` events.
 pub type ProgressSender = tokio::sync::mpsc::UnboundedSender<String>;
+
+/// Type alias for the raw-output channel sender (live terminal streaming).
+/// Tools that stream incremental command OUTPUT (e.g. `terminal`) push raw
+/// text chunks through this channel; the agent loop forwards them as
+/// `AgentEvent::ToolOutput` events so UIs can render a live output view.
+/// Distinct from [`ProgressSender`], which carries short status/heartbeat
+/// lines (`AgentEvent::ToolProgress`).
+pub type OutputSender = tokio::sync::mpsc::UnboundedSender<String>;
 
 struct ContextInner {
     cwd: PathBuf,
@@ -233,6 +247,7 @@ impl ToolContext {
                 pending_completions: Arc::new(Mutex::new(Vec::new())),
             }),
             progress_sender: None,
+            output_sender: None,
             interrupt_flag: None,
         }
     }
@@ -252,7 +267,32 @@ impl ToolContext {
                 pending_completions: inner.pending_completions.clone(),
             }),
             progress_sender: None,
+            output_sender: None,
             interrupt_flag: None,
+        }
+    }
+
+    /// Set the raw-output channel sender (live terminal streaming). Called by
+    /// the agent turn loop on a per-dispatch clone, symmetric to
+    /// [`with_progress_sender`]. Additive: callers that never call this get
+    /// `None` and [`Self::emit_output`] is a no-op.
+    pub fn with_output_sender(mut self, sender: Option<OutputSender>) -> Self {
+        self.output_sender = sender;
+        self
+    }
+
+    /// Returns the raw-output sender, if one was set via [`with_output_sender`].
+    pub fn output_sender(&self) -> Option<&OutputSender> {
+        self.output_sender.as_ref()
+    }
+
+    /// Convenience: push a raw output chunk to the output channel, if a
+    /// sender is set. Silently does nothing otherwise (backward-compatible
+    /// no-op). Chunks are lossy-UTF-8 text; the UI is responsible for
+    /// accumulation and display.
+    pub fn emit_output(&self, chunk: impl Into<String>) {
+        if let Some(tx) = &self.output_sender {
+            let _ = tx.send(chunk.into());
         }
     }
 
@@ -466,6 +506,59 @@ mod tests {
         // This must not panic.
         ctx.emit_progress("should be a no-op");
         assert!(ctx.progress_sender().is_none());
+    }
+
+    // ── Regression: output_sender backward compatibility (live terminal) ──
+
+    #[test]
+    fn output_sender_defaults_to_none() {
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        assert!(ctx.output_sender().is_none());
+    }
+
+    #[test]
+    fn with_output_sender_attaches_and_emits() {
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ctx = ctx.with_output_sender(Some(tx));
+        assert!(ctx.output_sender().is_some());
+        ctx.emit_output("chunk-1\n");
+        ctx.emit_output("chunk-2\n");
+        assert_eq!(rx.try_recv().unwrap(), "chunk-1\n");
+        assert_eq!(rx.try_recv().unwrap(), "chunk-2\n");
+    }
+
+    #[test]
+    fn emit_output_noop_without_sender() {
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        ctx.emit_output("no-op"); // must not panic
+        assert!(ctx.output_sender().is_none());
+    }
+
+    #[test]
+    fn with_interactive_clears_output_sender() {
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ctx = ctx.with_output_sender(Some(tx));
+        assert!(ctx.output_sender().is_some());
+        let ctx = ctx.with_interactive(false);
+        assert!(ctx.output_sender().is_none());
+    }
+
+    #[test]
+    fn output_channel_is_independent_of_progress_channel() {
+        // The two channels are distinct surfaces: emitting output must not
+        // show up on the progress channel and vice versa.
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ctx = ctx.with_progress_sender(Some(ptx)).with_output_sender(Some(otx));
+        ctx.emit_output("OUT");
+        ctx.emit_progress("STATUS");
+        assert_eq!(orx.try_recv().unwrap(), "OUT");
+        assert!(orx.try_recv().is_err(), "no second output event");
+        assert_eq!(prx.try_recv().unwrap(), "STATUS");
+        assert!(prx.try_recv().is_err(), "no second progress event");
     }
 
     #[test]

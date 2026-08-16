@@ -20,6 +20,7 @@
 pub mod anim;
 pub mod app;
 pub mod input;
+pub mod neurocode_viz;
 pub mod state;
 pub mod theme;
 pub mod widgets;

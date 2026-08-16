@@ -165,8 +165,9 @@ fn cold_mode_on_empty_graph() {
 
 #[test]
 fn frontier_budget_expands_more_than_economical() {
-    // Build a richer graph so Frontier's depth-2 expansion can pull in more
-    // nodes than Economical's depth-1.
+    // Build a richer graph so Frontier's deeper expansion can pull in more
+    // nodes than Economical's. The chain is three levels deep:
+    // svc → repo → em → emFactory (plus audit → logsink at level 2).
     let graph = DependencyGraph::open_in_memory().unwrap();
 
     // Primary: UserServiceImpl.
@@ -199,17 +200,24 @@ fn frontier_budget_expands_more_than_economical() {
         "d.java".into(),
     );
     audit.declared_dependencies = vec!["LogSink".into()];
-    let em = CodeArtifactNode::new(
+    let mut em = CodeArtifactNode::new(
         ArtifactKind::Class,
         "app.EntityManager".into(),
         "app".into(),
         "e.java".into(),
     );
+    em.declared_dependencies = vec!["EmFactory".into()];
     let logsink = CodeArtifactNode::new(
         ArtifactKind::Class,
         "app.LogSink".into(),
         "app".into(),
         "f.java".into(),
+    );
+    let em_factory = CodeArtifactNode::new(
+        ArtifactKind::Class,
+        "app.EmFactory".into(),
+        "app".into(),
+        "g.java".into(),
     );
 
     let svc_id = graph.upsert_node(&svc).unwrap();
@@ -218,6 +226,7 @@ fn frontier_budget_expands_more_than_economical() {
     let audit_id = graph.upsert_node(&audit).unwrap();
     let em_id = graph.upsert_node(&em).unwrap();
     let logsink_id = graph.upsert_node(&logsink).unwrap();
+    let em_factory_id = graph.upsert_node(&em_factory).unwrap();
 
     graph.upsert_edge(svc_id, iface_id, EdgeKind::Implements).unwrap();
     graph.upsert_edge(svc_id, repo_id, EdgeKind::Injects).unwrap();
@@ -225,6 +234,8 @@ fn frontier_budget_expands_more_than_economical() {
     // depth-2 reachable: repo → em, audit → logsink.
     graph.upsert_edge(repo_id, em_id, EdgeKind::Injects).unwrap();
     graph.upsert_edge(audit_id, logsink_id, EdgeKind::Injects).unwrap();
+    // depth-3 reachable: em → emFactory.
+    graph.upsert_edge(em_id, em_factory_id, EdgeKind::Injects).unwrap();
 
     let assembler = ContextAssembler::new(&graph);
 
@@ -235,16 +246,16 @@ fn frontier_budget_expands_more_than_economical() {
     // Frontier should expand at least as many nodes as Economical.
     assert!(
         frontier_ctx.expanded_nodes.len() >= eco_ctx.expanded_nodes.len(),
-        "Frontier (depth 2, {}) should expand >= Economical (depth 1, {})",
+        "Frontier (depth 3, {}) should expand >= Economical (depth 2, {})",
         frontier_ctx.expanded_nodes.len(),
         eco_ctx.expanded_nodes.len()
     );
 
-    // With depth-2 edges (repo→em, audit→logsink), Frontier should reach
-    // strictly more nodes than Economical's depth-1 slice.
+    // With the depth-3 edge (em→emFactory), Frontier should reach
+    // strictly more nodes than Economical's depth-2 slice.
     assert!(
         frontier_ctx.expanded_nodes.len() > eco_ctx.expanded_nodes.len(),
-        "Frontier depth-2 should reach more nodes than Economical depth-1 \
+        "Frontier depth-3 should reach more nodes than Economical depth-2 \
          (frontier={}, economical={})",
         frontier_ctx.expanded_nodes.len(),
         eco_ctx.expanded_nodes.len()

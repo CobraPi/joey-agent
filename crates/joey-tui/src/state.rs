@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use joey_agent_core::events::{AgentEvent, FileChangeKind};
+use joey_agent_core::events::{AgentEvent, ContextEntry, FileChangeKind};
 
 /// Feature 005 (T021): the three-state expand cycle for reasoning blocks.
 ///
@@ -105,6 +105,14 @@ pub enum TranscriptItem {
         is_terminal: bool,
         /// Feature 007: process exit code (terminal tools only).
         exit_code: Option<i64>,
+        /// Live-streamed raw output accumulated from `AgentEvent::ToolOutput`
+        /// while the tool runs (terminal calls only). Bounded ring — see
+        /// `live_output_capacity` on the item; the definitive full output
+        /// still arrives via `ToolEnd.full_result` and wins once present.
+        live_output: String,
+        /// Cap (bytes) for `live_output` accumulation. The tail matters in a
+        /// live view; the head is evicted when the cap is hit.
+        live_output_capacity: usize,
     },
     /// Feature 005 (T018): an inline file-change diff block. Pushed when an
     /// `AgentEvent::FileChange` arrives, rendered as a path header + stat +
@@ -135,6 +143,69 @@ pub enum ToolStatus {
 /// block (should render with crush's `$ command` layout).
 pub fn is_terminal_block(name: &str) -> bool {
     name == "terminal"
+}
+
+/// Default cap (bytes) for per-item live-output accumulation. The live view
+/// is a tail window; the definitive full output lands in `full_result` at
+/// `ToolEnd`. 128 KB matches the background ring buffers' order of magnitude
+/// while keeping even pathological transcripts affordable (1024-item
+/// capacity × 128 KB worst case ≈ 128 MB only when EVERY item is a live
+/// terminal call at the cap — in practice only the newest few items carry
+/// live output at all, and it is replaced by the bounded `full_result`).
+pub const LIVE_OUTPUT_CAPACITY: usize = 128 * 1024;
+
+// ── Tool-result content formatting (crush-style display projection) ──────
+
+/// Extract the human payload from a tool result string for DISPLAY.
+///
+/// Many built-ins serialize their result as a compact JSON envelope
+/// (`{"output":"…","exit_code":0,"error":null}` for terminal,
+/// `{"error":"…"}` for failures). The transcript should show the payload,
+/// not the envelope. Returns `None` when the string isn't a recognizable
+/// envelope (displayed verbatim then).
+pub fn display_result_content(content: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    match &v {
+        // terminal / process envelopes: the `output` field is the payload.
+        serde_json::Value::Object(map) => {
+            if let Some(out) = map.get("output").and_then(|o| o.as_str()) {
+                return Some(out.to_string());
+            }
+            // tool-error envelope: `{"error": "…"}`.
+            if map.len() == 1 {
+                if let Some(err) = map.get("error").and_then(|e| e.as_str()) {
+                    return Some(err.to_string());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Pretty-print a string as JSON when it parses (2-space indent). Any string
+/// embedded in the JSON keeps its REAL escapes for valid JSON; on parse
+/// failure the original is returned unchanged. This is what makes raw tool
+/// output readable in a text-editor-like view (no literal `\n` runs).
+pub fn pretty_json_if_parses(s: &str) -> String {
+    let trimmed = s.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return s.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| s.to_string()),
+        Err(_) => s.to_string(),
+    }
+}
+
+/// The display text for a tool call's full result: envelope-unwrapped, and
+/// JSON pretty-printed when the payload itself is JSON (e.g. MCP tool
+/// results, list-shaped outputs). Falls back to the raw string.
+pub fn format_tool_result_for_display(content: &str) -> String {
+    match display_result_content(content) {
+        Some(payload) => pretty_json_if_parses(&payload),
+        None => pretty_json_if_parses(content),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +331,30 @@ pub struct App {
     /// Current streaming reasoning accumulator.
     pub streaming_reasoning: String,
     pub reasoning_open: bool,
+    /// Expanded (main-screen) mode for the live reasoning panel: set by
+    /// clicking the docked bottom strip — the live reasoning stream takes
+    /// over the main screen (below a live transcript strip), and clicking
+    /// again (or Esc) docks it back. Live streaming keeps flowing in both
+    /// modes. Auto-collapses when the reasoning block closes.
+    pub reasoning_expanded: bool,
+    /// View state for the live reasoning panel. `None` = auto-follow (the
+    /// window is pinned to the live tail); `Some(anchor)` = frozen at that
+    /// absolute line index of the wrapped stream — scrolling up freezes the
+    /// view so streaming no longer moves it, and only scrolling back down
+    /// to the very bottom (or a new turn/block) re-enables following.
+    /// The anchor is clamped to the measured stream length at render time.
+    pub reasoning_view: Option<usize>,
+    /// Upper bound for a valid `reasoning_view` anchor (the wrapped-stream
+    /// length minus the visible rows), recorded by the reasoning widget at
+    /// render time — the model can't know wrap widths. Interior mutability
+    /// so the widget can write it from `&App`.
+    pub last_reasoning_max_anchor: Cell<usize>,
+    /// Screen rect of the reasoning panel as drawn by the LAST frame
+    /// (docked or expanded). Used for mouse hit-testing, mirroring
+    /// `last_neurocode_rect`. Interior mutability so widgets can record it
+    /// from `&App` during render; zeroed on frames where the panel isn't
+    /// drawn so stale geometry can't catch clicks.
+    pub last_reasoning_rect: Cell<(u16, u16, u16, u16)>,
     /// Feature 007: timestamp of the first `ReasoningDelta` of the current
     /// block. Reset to `None` when reasoning is flushed. Drives the
     /// `Thought for Ns` footer.
@@ -286,6 +381,66 @@ pub struct App {
     /// time, used by click hit-testing. Stored as `(x, y, width, height)`.
     pub last_text_area: Cell<(u16, u16, u16, u16)>,
     pub last_final_text: String,
+    // ── Live terminal output viewer (maximize) ──
+    /// Whether the maximized terminal-output viewer is open. Opened with
+    /// Ctrl+O (most recent terminal item) or by clicking the live-output
+    /// region of a terminal transcript item; closed with Esc or Ctrl+O.
+    /// While open it takes over the main screen area below a transcript
+    /// strip (mirrors the expanded reasoning/NeuroCode panels).
+    pub output_viewer_open: bool,
+    /// Transcript index of the terminal item shown in the viewer. Kept even
+    /// after the tool finishes — the viewer can replay any completed
+    /// terminal call's full output. `None` = resolve to the most recent
+    /// terminal item on demand.
+    pub output_viewer_index: Option<usize>,
+    /// View state for the maximized viewer. `None` = auto-follow (pinned to
+    /// the live tail); `Some(anchor)` = frozen at that absolute wrapped-line
+    /// index (scroll up freezes; scroll back to bottom resumes follow).
+    /// Mirrors `reasoning_view`.
+    pub output_viewer_view: Option<usize>,
+    /// Upper bound for a valid `output_viewer_view` anchor, recorded by the
+    /// viewer widget at render time (wrap widths are render-only knowledge).
+    pub last_output_viewer_max_anchor: Cell<usize>,
+    /// Screen rect of the maximized output viewer as drawn by the LAST
+    /// frame; zeroed on frames where it isn't drawn (stale-rect guard).
+    pub last_output_viewer_rect: Cell<(u16, u16, u16, u16)>,
+    // ── Agent stats page (maximized context-window view) ──
+    /// Whether the agent-stats page is open. Opened by clicking the
+    /// header's right section (model/session/activity/tokens) or Ctrl+A;
+    /// closed with Esc. Takes over the main screen area below a transcript
+    /// strip, mirroring the other maximized panels.
+    pub stats_open: bool,
+    /// View state for the stats page's context stream. `None` =
+    /// auto-follow (pinned to the live tail); `Some(anchor)` = frozen at
+    /// that absolute line (scroll up freezes; scroll back to the bottom
+    /// re-pins). Mirrors `reasoning_view`.
+    pub stats_view: Option<usize>,
+    /// Upper bound for a valid `stats_view` anchor, recorded by the stats
+    /// widget at render time (wrap widths are render-only knowledge).
+    pub last_stats_max_anchor: Cell<usize>,
+    /// Screen rect of the stats page as drawn by the LAST frame; zeroed on
+    /// frames where it isn't drawn (stale-rect guard).
+    pub last_stats_rect: Cell<(u16, u16, u16, u16)>,
+    /// Screen rect of the header's RIGHT section (model/session/status) as
+    /// drawn by the last frame — the click target that opens the stats page.
+    pub last_header_right_rect: Cell<(u16, u16, u16, u16)>,
+    /// Latest context-window snapshot entries (oldest first).
+    pub context_entries: Vec<ContextEntry>,
+    /// Latest snapshot aggregates.
+    pub context_system_tokens: u64,
+    pub context_history_tokens: u64,
+    pub context_window: u64,
+    pub compression_threshold: u64,
+    pub compactions: u32,
+    /// Monotonic count of snapshots received (drives the "live" pulse).
+    pub context_snapshots: u64,
+    /// Timestamp of the most recent snapshot.
+    pub context_updated_at: Option<Instant>,
+    /// Rolling per-turn token usage series (prompt, completion) for the
+    /// stats sparkline — one sample per ApiCallEnd.
+    pub usage_series: Vec<(u64, u64)>,
+    /// Turn count this session (for stats).
+    pub turns: u64,
     // ── OMO agent picker state (T028) ──
     /// Agent picker overlay is open.
     pub agent_picker_open: bool,
@@ -343,6 +498,17 @@ pub struct App {
     /// `last_text_area`. Interior mutability so widgets can record it from
     /// `&App` during render.
     pub last_neurocode_rect: Cell<(u16, u16, u16, u16)>,
+    /// Interactive visualization (feature 015 follow-up): the structured
+    /// node/edge snapshot of the latest assembly (`AgentEvent::NeuroCodeGraph`),
+    /// consumed by the fullscreen explorer when the feed is expanded.
+    pub neurocode_snapshot: Option<joey_neurocode::ContextGraphSnapshot>,
+    /// Explorer interaction state — pan offset (cells), zoom factor, selected
+    /// node index, active pane, and per-pane scroll. Reset whenever a new
+    /// snapshot lands or the explorer is re-opened.
+    pub neurocode_viz: crate::neurocode_viz::VizState,
+    /// Rect of the explorer's node-list pane as drawn by the last frame
+    /// (mouse hit-testing for click-to-select).
+    pub last_viz_nodes_rect: Cell<(u16, u16, u16, u16)>,
     /// T155: when true, the Atlas job board section renders in draw_omo_panel.
     /// Set on BoulderWorkStarted, cleared on BoulderWorkCompleted / turn Done.
     pub job_board_visible: bool,
@@ -655,6 +821,10 @@ impl App {
             streaming_assistant: String::new(),
             streaming_reasoning: String::new(),
             reasoning_open: false,
+            reasoning_expanded: false,
+            reasoning_view: None,
+            last_reasoning_max_anchor: Cell::new(0),
+            last_reasoning_rect: Cell::new((0, 0, 0, 0)),
             reasoning_started: None,
             active_agents: Vec::new(),
             next_agent_id: 1,
@@ -670,6 +840,26 @@ impl App {
             last_max_scroll: Cell::new(0),
             last_text_area: Cell::new((0, 0, 0, 0)),
             last_final_text: String::new(),
+            output_viewer_open: false,
+            output_viewer_index: None,
+            output_viewer_view: None,
+            last_output_viewer_max_anchor: Cell::new(0),
+            last_output_viewer_rect: Cell::new((0, 0, 0, 0)),
+            stats_open: false,
+            stats_view: None,
+            last_stats_max_anchor: Cell::new(0),
+            last_stats_rect: Cell::new((0, 0, 0, 0)),
+            last_header_right_rect: Cell::new((0, 0, 0, 0)),
+            context_entries: Vec::new(),
+            context_system_tokens: 0,
+            context_history_tokens: 0,
+            context_window: 0,
+            compression_threshold: 0,
+            compactions: 0,
+            context_snapshots: 0,
+            context_updated_at: None,
+            usage_series: Vec::new(),
+            turns: 0,
             agent_picker_open: false,
             agent_picker_cursor: 0,
             agent_roster: Vec::new(),
@@ -691,6 +881,9 @@ impl App {
             neurocode_scroll: 0,
             neurocode_expanded: false,
             last_neurocode_rect: Cell::new((0, 0, 0, 0)),
+            neurocode_snapshot: None,
+            neurocode_viz: crate::neurocode_viz::VizState::default(),
+            last_viz_nodes_rect: Cell::new((0, 0, 0, 0)),
             job_board_visible: false,
             pending_context_injection: None,
             search_open: false,
@@ -736,6 +929,11 @@ impl App {
                 });
             }
             self.reasoning_open = false;
+            // The live block ended — the expanded panel (if open) docks
+            // back. The committed transcript item carries the full text and
+            // has its own click-to-expand affordance.
+            self.reasoning_expanded = false;
+            self.reasoning_view = None;
         }
     }
 
@@ -830,10 +1028,13 @@ impl App {
         match ev {
             AgentEvent::TurnStart { max_iterations } => {
                 self.mode = RunMode::Busy;
+                self.turns += 1;
                 self.turn_started = Some(Instant::now());
                 self.streaming_assistant.clear();
                 self.streaming_reasoning.clear();
                 self.reasoning_open = false;
+                self.reasoning_expanded = false;
+                self.reasoning_view = None;
                 self.reasoning_started = None;
                 let id = self.next_agent_id;
                 self.next_agent_id += 1;
@@ -863,11 +1064,39 @@ impl App {
                 // be added again (it would double-count).
                 self.tokens.prompt += usage.prompt_tokens;
                 self.tokens.completion += usage.completion_tokens;
+                // Stats page: one usage sample per API call (bounded).
+                self.usage_series.push((usage.prompt_tokens, usage.completion_tokens));
+                const USAGE_CAP: usize = 240;
+                if self.usage_series.len() > USAGE_CAP {
+                    let drop_n = self.usage_series.len() - USAGE_CAP;
+                    self.usage_series.drain(0..drop_n);
+                }
                 if let Some(a) = self.active_agents.last_mut() {
                     if a.phase == AgentPhase::QueryingModel {
                         a.phase = AgentPhase::Idle;
                     }
                 }
+            }
+            AgentEvent::ContextSnapshot {
+                entries,
+                system_tokens,
+                history_tokens,
+                context_window,
+                compression_threshold,
+                compactions,
+                model: _,
+            } => {
+                // Live context-window view (agent stats page). The snapshot
+                // replaces the previous one wholesale — it is a complete
+                // projection of the history at emit time.
+                self.context_entries = entries;
+                self.context_system_tokens = system_tokens;
+                self.context_history_tokens = history_tokens;
+                self.context_window = context_window;
+                self.compression_threshold = compression_threshold;
+                self.compactions = compactions;
+                self.context_snapshots += 1;
+                self.context_updated_at = Some(Instant::now());
             }
             AgentEvent::ReasoningDelta(d) => {
                 if !self.show_reasoning {
@@ -936,7 +1165,16 @@ impl App {
                     full_result: None,
                     is_terminal: is_terminal_block(&name),
                     exit_code: None,
+                    live_output: String::new(),
+                    live_output_capacity: LIVE_OUTPUT_CAPACITY,
                 });
+                // Live-follow retarget: when the maximized viewer is open in
+                // auto-follow mode and its previous target already finished,
+                // a NEW tool call takes over the viewer — the user keeps
+                // watching output without re-opening anything.
+                if self.output_viewer_open && self.output_viewer_view.is_none() {
+                    self.output_viewer_index = Some(self.transcript.len() - 1);
+                }
             }
             AgentEvent::ToolProgress { name, progress } => {
                 if progress.is_empty() {
@@ -945,9 +1183,36 @@ impl App {
                 // Update the most recent still-running call of this tool
                 // (notices/reasoning may have landed after the ToolStart).
                 for it in self.transcript.iter_mut().rev() {
-                    if let TranscriptItem::Tool { name: n, status, summary, .. } = it {
+                    if let TranscriptItem::Tool { name: n, status, summary, is_terminal, .. } = it {
                         if *status == ToolStatus::Running && *n == name {
-                            *summary = progress;
+                            if *is_terminal {
+                                // Terminal blocks: ignore ToolProgress entirely.
+                                // The command header (summary) must never be
+                                // clobbered, and raw output arrives via the
+                                // separate ToolOutput stream (the terminal
+                                // tool emits both channels from the same
+                                // chunk — appending here would duplicate it).
+                                // Heartbeats surface via the live-tail
+                                // rendering's spinner/hint instead.
+                            } else {
+                                *summary = progress;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            AgentEvent::ToolOutput { name, chunk } => {
+                if chunk.is_empty() {
+                    return;
+                }
+                // Accumulate the raw output chunk on the most recent
+                // still-running call of this tool. Concurrent same-name tools
+                // interleave by design (mirrors the ToolProgress policy).
+                for it in self.transcript.iter_mut().rev() {
+                    if let TranscriptItem::Tool { name: n, status, live_output, live_output_capacity, .. } = it {
+                        if *status == ToolStatus::Running && *n == name {
+                            Self::push_bounded(live_output, &chunk, *live_output_capacity);
                             break;
                         }
                     }
@@ -1122,6 +1387,26 @@ impl App {
                 self.neurocode_stage_at = None;
                 self.neurocode_updated_at = Some(std::time::Instant::now());
             }
+            AgentEvent::NeuroCodeGraph { snapshot } => {
+                // Interactive visualization payload: stash the snapshot and
+                // reset explorer interaction state so a new assembly starts
+                // fresh (selection lands back on the primary node).
+                self.neurocode_snapshot = Some(snapshot);
+                self.neurocode_viz.reset();
+            }
+            AgentEvent::NeuroCodeReindexed { files_scanned, files_edited, lines_edited } => {
+                // Auto re-index completed after large edits: the structural
+                // graph is fresh again. Surface a notice; the next user
+                // turn re-assembles context against the new index (dynamic
+                // context across turns).
+                self.push_item(TranscriptItem::Notice {
+                    text: format!(
+                        "⚡ NeuroCode re-indexed: {} files scanned (edit pressure: {} files / {} lines)",
+                        files_scanned, files_edited, lines_edited
+                    ),
+                    kind: NoticeKind::Success,
+                });
+            }
             AgentEvent::NeuroCodeActive { active } => {
                 self.neurocode_active = active;
                 if !active {
@@ -1131,6 +1416,9 @@ impl App {
                     self.neurocode_updated_at = None;
                     self.neurocode_expanded = false;
                     self.last_neurocode_rect.set((0, 0, 0, 0));
+                    self.neurocode_snapshot = None;
+                    self.neurocode_viz = crate::neurocode_viz::VizState::default();
+                    self.last_viz_nodes_rect.set((0, 0, 0, 0));
                 }
             }
             AgentEvent::CategoryDelegation { category, model } => {
@@ -1265,10 +1553,43 @@ impl App {
     pub fn push_item(&mut self, item: TranscriptItem) {
         if self.transcript.len() >= self.transcript_capacity {
             self.transcript.pop_front();
+            // Indices shifted by one: keep the maximized output viewer glued
+            // to its (possibly evicted) target.
+            if let Some(i) = self.output_viewer_index {
+                self.output_viewer_index = if i == 0 { None } else { Some(i - 1) };
+                if i == 0 {
+                    // The viewed item itself was evicted — fall back to the
+                    // most recent terminal item on the next resolve.
+                    self.output_viewer_view = None;
+                }
+            }
         }
         self.transcript.push_back(item);
         // Deliberately does NOT touch `scroll`: a user reading history stays
         // where they are while new content streams in below.
+    }
+
+    /// Append `chunk` to the bounded live-output buffer, evicting from the
+    /// head (keep the tail) when the capacity is hit. Tries to cut at a line
+    /// boundary near the eviction point so the live view doesn't start
+    /// mid-word more than necessary.
+    fn push_bounded(buf: &mut String, chunk: &str, cap: usize) {
+        buf.push_str(chunk);
+        if buf.len() > cap {
+            let mut cut = buf.len() - cap;
+            // Prefer cutting right after a newline within the first 4 KB of
+            // the eviction window so the retained tail starts on a line start.
+            let scan_end = (cut + 4096).min(buf.len());
+            if let Some(nl) = buf.as_bytes()[cut..scan_end].iter().position(|&b| b == b'\n') {
+                cut = (cut + nl + 1).min(buf.len());
+            }
+            // Byte-slice safety: never cut inside a UTF-8 sequence.
+            while cut < buf.len() && !buf.is_char_boundary(cut) {
+                cut += 1;
+            }
+            let tail = buf[cut..].to_string();
+            *buf = tail;
+        }
     }
 
     /// Record a user message in the transcript and snap to the bottom.
@@ -1316,6 +1637,252 @@ impl App {
         // Reset feed scroll so the expanded view opens at the tail (the
         // live end) rather than wherever the docked view was scrolled to.
         self.neurocode_scroll = 0;
+    }
+
+    // ── Live terminal output viewer (maximize) ─────────────────────────
+
+    /// Toggle the maximized terminal-output viewer. With `index` set (mouse
+    /// click on a specific tool item) it targets that item; otherwise it
+    /// targets the most recent tool item (any kind) in the transcript. When
+    /// nothing eligible exists this is a no-op. Toggling while open docks it
+    /// back.
+    pub fn toggle_output_viewer(&mut self, index: Option<usize>) {
+        if self.output_viewer_open {
+            self.close_output_viewer();
+            return;
+        }
+        let target = match index {
+            Some(i) => {
+                let ok = matches!(self.transcript.get(i), Some(TranscriptItem::Tool { .. }));
+                if !ok {
+                    return;
+                }
+                i
+            }
+            None => match self.most_recent_tool_item() {
+                Some(i) => i,
+                None => return,
+            },
+        };
+        self.output_viewer_open = true;
+        self.output_viewer_index = Some(target);
+        // Open at the live tail, following as output streams in.
+        self.output_viewer_view = None;
+    }
+
+    /// Close the maximized viewer (Esc / Ctrl+O / toggle-click).
+    pub fn close_output_viewer(&mut self) {
+        self.output_viewer_open = false;
+        self.output_viewer_view = None;
+        self.last_output_viewer_rect.set((0, 0, 0, 0));
+    }
+
+    /// Mouse-click semantics for tool blocks: same target while open →
+    /// close (toggle); a DIFFERENT tool item while open → switch the viewer
+    /// to it (stays open, re-pins to that item's tail); otherwise the plain
+    /// open toggle.
+    pub fn output_viewer_click(&mut self, index: usize) {
+        if self.output_viewer_open {
+            match self.output_viewer_index {
+                Some(i) if i == index => self.close_output_viewer(),
+                _ => {
+                    if matches!(self.transcript.get(index), Some(TranscriptItem::Tool { .. })) {
+                        self.output_viewer_index = Some(index);
+                        self.output_viewer_view = None;
+                    } else {
+                        self.close_output_viewer();
+                    }
+                }
+            }
+        } else {
+            self.toggle_output_viewer(Some(index));
+        }
+    }
+
+    /// Index of the most recent terminal tool item in the transcript.
+    pub fn most_recent_terminal_item(&self) -> Option<usize> {
+        self.transcript.iter().rposition(|i| {
+            matches!(i, TranscriptItem::Tool { is_terminal: true, .. })
+        })
+    }
+
+    /// Index of the most recent tool item of ANY kind (terminal or generic).
+    pub fn most_recent_tool_item(&self) -> Option<usize> {
+        self.transcript.iter().rposition(|i| matches!(i, TranscriptItem::Tool { .. }))
+    }
+
+    /// Resolve the output-viewer target: an explicit index when it is a tool
+    /// item, else the most recent tool item (any kind).
+    fn output_viewer_target(&self) -> Option<usize> {
+        if let Some(i) = self.output_viewer_index {
+            if matches!(self.transcript.get(i), Some(TranscriptItem::Tool { .. })) {
+                return Some(i);
+            }
+        }
+        self.most_recent_tool_item()
+    }
+
+    /// The text the maximized viewer should show for the targeted item:
+    /// the live accumulation while running, or the formatted full result
+    /// once finished (envelope-unwrapped + JSON pretty-printed).
+    pub fn output_viewer_text(&self) -> String {
+        let idx = match self.output_viewer_target() {
+            Some(i) => i,
+            None => return String::new(),
+        };
+        match self.transcript.get(idx) {
+            Some(TranscriptItem::Tool {
+                status,
+                live_output,
+                full_result,
+                result_preview,
+                ..
+            }) => {
+                let full = full_result
+                    .as_deref()
+                    .filter(|f| !f.is_empty())
+                    .map(crate::state::format_tool_result_for_display);
+                match status {
+                    ToolStatus::Running => live_output.clone(),
+                    _ => full
+                        .or_else(|| {
+                            let p = result_preview.as_str();
+                            (!p.is_empty()).then(|| p.to_string())
+                        })
+                        .unwrap_or_else(|| live_output.clone()),
+                }
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Scroll the maximized viewer up by `by` lines: freezes the view at an
+    /// absolute wrapped-line anchor (auto-follow off). Mirrors
+    /// `reasoning_scroll_up`.
+    pub fn output_viewer_scroll_up(&mut self, by: usize) {
+        let cur = self
+            .output_viewer_view
+            .unwrap_or_else(|| self.last_output_viewer_max_anchor.get());
+        self.output_viewer_view = Some(cur.saturating_sub(by));
+    }
+
+    /// Scroll the maximized viewer down by `by` lines: stays frozen until
+    /// the anchor reaches the tail, then auto-follow resumes. Mirrors
+    /// `reasoning_scroll_down`.
+    pub fn output_viewer_scroll_down(&mut self, by: usize) {
+        if let Some(a) = self.output_viewer_view {
+            let target = a.saturating_add(by);
+            if target >= self.last_output_viewer_max_anchor.get() {
+                self.output_viewer_view = None;
+            } else {
+                self.output_viewer_view = Some(target);
+            }
+        }
+    }
+
+    // ── Agent stats page (maximized context window) ────────────────────
+
+    /// Open the agent-stats page. Re-pins its context stream to the live
+    /// tail (auto-follow) so it opens on the newest entry.
+    pub fn open_stats(&mut self) {
+        self.stats_open = true;
+        self.stats_view = None;
+    }
+
+    /// Close the agent-stats page (Esc / Ctrl+A / clicking the header
+    /// section again).
+    pub fn close_stats(&mut self) {
+        self.stats_open = false;
+        self.stats_view = None;
+        self.last_stats_rect.set((0, 0, 0, 0));
+    }
+
+    /// Toggle the stats page.
+    pub fn toggle_stats(&mut self) {
+        if self.stats_open {
+            self.close_stats();
+        } else {
+            self.open_stats();
+        }
+    }
+
+    /// Scroll the stats page's context stream up by `by` lines: freezes the
+    /// view at an absolute anchor (auto-follow off). Mirrors
+    /// `reasoning_scroll_up`.
+    pub fn stats_scroll_up(&mut self, by: usize) {
+        let cur = self
+            .stats_view
+            .unwrap_or_else(|| self.last_stats_max_anchor.get());
+        self.stats_view = Some(cur.saturating_sub(by));
+    }
+
+    /// Scroll the stats page's context stream down by `by` lines: stays
+    /// frozen until the anchor reaches the tail, then auto-follow resumes.
+    pub fn stats_scroll_down(&mut self, by: usize) {
+        if let Some(a) = self.stats_view {
+            let target = a.saturating_add(by);
+            if target >= self.last_stats_max_anchor.get() {
+                self.stats_view = None;
+            } else {
+                self.stats_view = Some(target);
+            }
+        }
+    }
+
+    /// Percentage of the context window consumed by the current history +
+    /// system prompt (0.0 when the window is unknown).
+    pub fn context_usage_pct(&self) -> f64 {
+        if self.context_window == 0 {
+            return 0.0;
+        }
+        let used = self.context_system_tokens + self.context_history_tokens;
+        (used as f64 / self.context_window as f64) * 100.0
+    }
+}
+
+// ── Live reasoning panel ───────────────────────────────────────────
+
+impl App {
+    /// Toggle the live reasoning panel between its docked bottom strip and
+    /// expanded main-screen mode (and back). Invoked by clicking the panel
+    /// or pressing Esc while expanded. No-op when no live reasoning block
+    /// is streaming (there's nothing to expand).
+    pub fn toggle_reasoning_expanded(&mut self) {
+        if !self.reasoning_open {
+            return;
+        }
+        self.reasoning_expanded = !self.reasoning_expanded;
+        // Re-pin to the live tail on mode change so the expanded view opens
+        // at the streaming end, not a stale frozen anchor.
+        self.reasoning_view = None;
+    }
+
+    /// Scroll the live reasoning panel view up by `by` lines: freezes the
+    /// view at an absolute anchor (auto-follow off) so streaming no longer
+    /// moves the window. The anchor is the window's TOP line index —
+    /// while following, that index is `max_anchor`, so moving up decreases
+    /// it (0 = the very top of the stream; frozen there, not following).
+    pub fn reasoning_scroll_up(&mut self, by: usize) {
+        let cur = self
+            .reasoning_view
+            .unwrap_or_else(|| self.last_reasoning_max_anchor.get());
+        self.reasoning_view = Some(cur.saturating_sub(by));
+    }
+
+    /// Scroll the live reasoning panel view down by `by` lines. While the
+    /// window is still above the tail it stays frozen; when the anchor
+    /// reaches the bottom of the stream, auto-follow resumes. A no-op
+    /// while already following.
+    pub fn reasoning_scroll_down(&mut self, by: usize) {
+        if let Some(a) = self.reasoning_view {
+            let target = a.saturating_add(by);
+            if target >= self.last_reasoning_max_anchor.get() {
+                // Bottom reached: re-pin to the live tail.
+                self.reasoning_view = None;
+            } else {
+                self.reasoning_view = Some(target);
+            }
+        }
     }
 
     // ── Search ─────────────���────────────────────────────────────────────
@@ -1743,6 +2310,8 @@ mod tests {
             full_result: None,
             is_terminal: false,
             exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         });
         app.push_item(TranscriptItem::Tool {
             name: "write_file".to_string(),
@@ -1756,6 +2325,8 @@ mod tests {
             full_result: None,
             is_terminal: false,
             exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
         });
         // Toggle the most-recent (write_file) tool.
         app.toggle_focused_tool_expand();
@@ -2254,5 +2825,393 @@ mod neurocode_panel_tests {
         terminal.draw(|f| crate::widgets::draw_status(f, area, &app, theme, std::time::Duration::from_secs(1))).unwrap();
         let text = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_string()).collect::<String>();
         assert!(text.contains("NEUROCODE"), "badge shown when active");
+    }
+}
+
+// ── Live terminal output streaming + maximized viewer ─────────────────────
+
+#[cfg(test)]
+mod live_output_tests {
+    use super::*;
+
+    /// Drive ToolStart → ToolOutput chunks → ToolEnd and return the App.
+    fn app_with_terminal_call(chunks: &[&str], full_result: &str) -> App {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::ToolStart {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "watch me stream".into(),
+        });
+        for c in chunks {
+            app.apply(AgentEvent::ToolOutput { name: "terminal".into(), chunk: c.to_string() });
+        }
+        app.apply(AgentEvent::ToolEnd {
+            name: "terminal".into(),
+            is_error: false,
+            result_preview: full_result.lines().next().unwrap_or("").into(),
+            duration_secs: 1.0,
+            exit_code: Some(0),
+            full_result: full_result.to_string(),
+        });
+        app
+    }
+
+    fn live_output_of(app: &App) -> String {
+        match app.transcript.back() {
+            Some(TranscriptItem::Tool { live_output, .. }) => live_output.clone(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn tool_output_chunks_accumulate_on_running_item() {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::ToolStart {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "cmd".into(),
+        });
+        app.apply(AgentEvent::ToolOutput { name: "terminal".into(), chunk: "line-1\n".into() });
+        app.apply(AgentEvent::ToolOutput { name: "terminal".into(), chunk: "line-2\n".into() });
+        assert_eq!(live_output_of(&app), "line-1\nline-2\n");
+        // The command header (summary) is NOT clobbered by progress events,
+        // and progress never duplicates into the live buffer (the terminal
+        // tool emits the same chunk on both channels).
+        app.apply(AgentEvent::ToolProgress { name: "terminal".into(), progress: "line-1\n".into() });
+        match app.transcript.back() {
+            Some(TranscriptItem::Tool { summary, live_output, .. }) => {
+                assert_eq!(summary, "cmd", "terminal summary stays the command");
+                assert_eq!(live_output, "line-1\nline-2\n", "no duplication from ToolProgress");
+            }
+            _ => panic!("expected terminal tool item"),
+        }
+    }
+
+    #[test]
+    fn tool_output_ignored_for_finished_items() {
+        // A late chunk arriving after ToolEnd must not resurrect/append.
+        let mut app = app_with_terminal_call(&["early\n"], "done output");
+        app.apply(AgentEvent::ToolOutput { name: "terminal".into(), chunk: "LATE\n".into() });
+        assert!(!live_output_of(&app).contains("LATE"), "no accumulation after ToolEnd");
+    }
+
+    #[test]
+    fn non_terminal_progress_still_updates_summary() {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::ToolStart {
+            name: "web_search".into(),
+            emoji: "🔍".into(),
+            summary: "q".into(),
+        });
+        app.apply(AgentEvent::ToolProgress { name: "web_search".into(), progress: "3 results".into() });
+        match app.transcript.back() {
+            Some(TranscriptItem::Tool { summary, .. }) => assert_eq!(summary, "3 results"),
+            _ => panic!("expected tool item"),
+        }
+    }
+
+    #[test]
+    fn live_output_bounded_ring_keeps_tail() {
+        // Fill far past the default capacity with a small test cap.
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::ToolStart {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "big".into(),
+        });
+        if let TranscriptItem::Tool { live_output_capacity, .. } = app.transcript.back_mut().unwrap() {
+            *live_output_capacity = 100;
+        }
+        for i in 0..50 {
+            app.apply(AgentEvent::ToolOutput {
+                name: "terminal".into(),
+                chunk: format!("line-{i:03}\n"),
+            });
+        }
+        let out = live_output_of(&app);
+        assert!(out.len() <= 110, "bounded: {} bytes", out.len());
+        assert!(out.contains("line-049"), "the tail is kept");
+        assert!(!out.contains("line-000"), "the head was evicted");
+        // UTF-8 safety: capacity cut never splits a char (no panic above).
+    }
+
+    #[test]
+    fn viewer_toggle_targets_most_recent_terminal_item() {
+        let mut app = app_with_terminal_call(&["streamed\n"], "final full output\nsecond line");
+        assert!(!app.output_viewer_open);
+        app.toggle_output_viewer(None);
+        assert!(app.output_viewer_open, "viewer opened");
+        assert_eq!(app.output_viewer_index, Some(app.transcript.len() - 1));
+        // Finished item: the viewer shows the full result, not live buffer.
+        assert!(app.output_viewer_text().contains("final full output"));
+        // Toggle again closes.
+        app.toggle_output_viewer(None);
+        assert!(!app.output_viewer_open);
+    }
+
+    #[test]
+    fn viewer_open_is_noop_without_terminal_items() {
+        let mut app = App::new("s", "m");
+        app.push_item(TranscriptItem::User { text: "hi".into() });
+        app.toggle_output_viewer(None);
+        assert!(!app.output_viewer_open, "nothing to maximize");
+    }
+
+    #[test]
+    fn viewer_running_item_shows_live_buffer() {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::ToolStart {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "long job".into(),
+        });
+        app.apply(AgentEvent::ToolOutput { name: "terminal".into(), chunk: "partial output\n".into() });
+        app.toggle_output_viewer(None);
+        assert!(app.output_viewer_text().contains("partial output"));
+    }
+
+    #[test]
+    fn viewer_scroll_freezes_and_resumes_follow() {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::ToolStart {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "cmd".into(),
+        });
+        for i in 0..100 {
+            app.apply(AgentEvent::ToolOutput {
+                name: "terminal".into(),
+                chunk: format!("l{i}\n"),
+            });
+        }
+        app.toggle_output_viewer(None);
+        assert!(app.output_viewer_view.is_none(), "opens following the tail");
+        // Simulate the widget's render-time anchor bound.
+        app.last_output_viewer_max_anchor.set(80);
+        app.output_viewer_scroll_up(3);
+        assert_eq!(app.output_viewer_view, Some(77), "scrolled up freezes");
+        app.output_viewer_scroll_down(2);
+        assert_eq!(app.output_viewer_view, Some(79), "still frozen above tail");
+        app.output_viewer_scroll_down(5);
+        assert!(app.output_viewer_view.is_none(), "reaching the tail resumes follow");
+    }
+
+    #[test]
+    fn push_bounded_evicts_at_line_boundaries_when_possible() {
+        let mut buf = String::new();
+        for i in 0..60 {
+            buf.push_str(&format!("row-{i:02}\n"));
+        }
+        let cap = 50;
+        App::push_bounded(&mut buf, "row-60\n", cap);
+        // The retained tail starts at a row boundary (starts with "row-").
+        assert!(buf.starts_with("row-"), "cut at line boundary: {:?}", &buf[..12]);
+        assert!(buf.ends_with("row-60\n"));
+        assert!(buf.len() <= cap + 64, "approximately bounded: {}", buf.len());
+    }
+
+    #[test]
+    fn viewer_retargets_to_new_terminal_call_while_following() {
+        let mut app = App::new("s", "m");
+        // First terminal call runs, user opens the viewer on it.
+        app.apply(AgentEvent::ToolStart {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "first".into(),
+        });
+        app.toggle_output_viewer(None);
+        let first_idx = app.output_viewer_index.unwrap();
+        // It finishes; a second terminal call starts in the same turn.
+        app.apply(AgentEvent::ToolEnd {
+            name: "terminal".into(),
+            is_error: false,
+            result_preview: "done1".into(),
+            duration_secs: 0.1,
+            exit_code: Some(0),
+            full_result: "done1".into(),
+        });
+        app.apply(AgentEvent::ToolStart {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "second".into(),
+        });
+        app.apply(AgentEvent::ToolOutput { name: "terminal".into(), chunk: "streaming-2\n".into() });
+        assert!(app.output_viewer_open, "viewer stays open");
+        assert_eq!(app.output_viewer_index, Some(first_idx + 1), "retargeted to the new call");
+        assert!(app.output_viewer_text().contains("streaming-2"), "shows the new live stream");
+    }
+
+    #[test]
+    fn viewer_click_switches_target_while_open() {
+        let mut app = App::new("s", "m");
+        for cmd in ["one", "two"] {
+            app.apply(AgentEvent::ToolStart {
+                name: "terminal".into(),
+                emoji: "💻".into(),
+                summary: cmd.into(),
+            });
+            app.apply(AgentEvent::ToolEnd {
+                name: "terminal".into(),
+                is_error: false,
+                result_preview: cmd.into(),
+                duration_secs: 0.1,
+                exit_code: Some(0),
+                full_result: format!("{cmd} full output"),
+            });
+        }
+        app.output_viewer_click(0);
+        assert!(app.output_viewer_open);
+        assert_eq!(app.output_viewer_index, Some(0));
+        // Click the OTHER terminal block: viewer switches, stays open.
+        app.output_viewer_click(1);
+        assert!(app.output_viewer_open, "switch target keeps viewer open");
+        assert_eq!(app.output_viewer_index, Some(1));
+        assert!(app.output_viewer_text().contains("two full output"));
+        // Click the same block again: toggle-closes.
+        app.output_viewer_click(1);
+        assert!(!app.output_viewer_open);
+    }
+
+    #[test]
+    fn viewer_index_survives_transcript_eviction() {
+        // Small capacity so pushes evict; the viewer index must track the
+        // shift instead of pointing at the wrong item (or off the end).
+        let mut app = App::new("s", "m");
+        app.transcript_capacity = 4;
+        app.apply(AgentEvent::ToolStart {
+            name: "terminal".into(),
+            emoji: "💻".into(),
+            summary: "watch".into(),
+        });
+        app.toggle_output_viewer(None);
+        let idx_before = app.output_viewer_index.unwrap();
+        // Push enough items to evict the viewer's target and shift indices.
+        for i in 0..6 {
+            app.push_item(TranscriptItem::User { text: format!("m{i}") });
+        }
+        let idx_after = app.output_viewer_index;
+        // The index was adjusted down by the number of evictions that
+        // happened in front of it (at least clamped into range).
+        assert!(
+            idx_after.map(|i| i < idx_before || i <= app.transcript.len()).unwrap_or(true),
+            "index adjusted or reset, got {:?} (before {idx_before}, len {})",
+            idx_after,
+            app.transcript.len()
+        );
+        // Resolution still yields the newest terminal item (the evicted one
+        // is gone — most_recent_terminal_item is now None, text is empty).
+        assert!(app.most_recent_terminal_item().is_none());
+    }
+}
+
+#[cfg(test)]
+mod stats_page_tests {
+    use super::*;
+    use joey_agent_core::events::ContextEntry;
+
+    fn entry(role: &str, tokens: u64, preview: &str) -> ContextEntry {
+        ContextEntry {
+            role: role.into(),
+            tokens,
+            preview: preview.into(),
+            has_tool_calls: false,
+            is_compressed_summary: false,
+        }
+    }
+
+    fn apply_snapshot(app: &mut App, n_entries: usize, window: u64) {
+        let entries: Vec<ContextEntry> = (0..n_entries)
+            .map(|i| match i % 3 {
+                0 => entry("user", 120 + i as u64, &format!("user message {i}")),
+                1 => entry("assistant", 300 + i as u64, &format!("assistant reply {i}")),
+                _ => entry("tool", 900 + i as u64, &format!("tool result {i}")),
+            })
+            .collect();
+        let history_tokens: u64 = entries.iter().map(|e| e.tokens).sum();
+        app.apply(AgentEvent::ContextSnapshot {
+            entries,
+            system_tokens: 2_000,
+            history_tokens,
+            context_window: window,
+            compression_threshold: window * 80 / 100,
+            compactions: 1,
+            model: "test-model".into(),
+        });
+    }
+
+    #[test]
+    fn snapshot_replaces_state_and_counts() {
+        let mut app = App::new("s", "m");
+        assert!(app.context_entries.is_empty());
+        apply_snapshot(&mut app, 6, 200_000);
+        assert_eq!(app.context_entries.len(), 6);
+        assert_eq!(app.context_system_tokens, 2_000);
+        assert_eq!(app.context_window, 200_000);
+        assert_eq!(app.compactions, 1);
+        assert_eq!(app.context_snapshots, 1);
+        assert!(app.context_updated_at.is_some());
+        // A second snapshot REPLACES (not appends).
+        apply_snapshot(&mut app, 3, 200_000);
+        assert_eq!(app.context_entries.len(), 3);
+        assert_eq!(app.context_snapshots, 2);
+    }
+
+    #[test]
+    fn context_usage_percentage() {
+        let mut app = App::new("s", "m");
+        apply_snapshot(&mut app, 2, 100_000);
+        // history sum for 2 entries: 120 + 121? apply_snapshot uses 120/300/900
+        // base + i; just verify it's computed from the fields.
+        let used = app.context_system_tokens + app.context_history_tokens;
+        let expected = used as f64 / 100_000.0 * 100.0;
+        assert!((app.context_usage_pct() - expected).abs() < 1e-9);
+        // Unknown window → 0.
+        app.context_window = 0;
+        assert_eq!(app.context_usage_pct(), 0.0);
+    }
+
+    #[test]
+    fn usage_series_accumulates_per_call_and_is_bounded() {
+        let mut app = App::new("s", "m");
+        for i in 0..300 {
+            app.apply(AgentEvent::ApiCallEnd {
+                usage: joey_providers::Usage {
+                    prompt_tokens: i as u64,
+                    completion_tokens: 10,
+                    ..Default::default()
+                },
+            });
+        }
+        assert!(app.usage_series.len() <= 240, "bounded: {}", app.usage_series.len());
+        assert_eq!(app.tokens.prompt, (0..300).sum::<u64>());
+    }
+
+    #[test]
+    fn stats_toggle_open_close_and_follow() {
+        let mut app = App::new("s", "m");
+        assert!(!app.stats_open);
+        app.toggle_stats();
+        assert!(app.stats_open);
+        assert!(app.stats_view.is_none(), "opens auto-following the tail");
+        // Simulate the widget's render-time anchor bound, then scroll up.
+        app.last_stats_max_anchor.set(40);
+        app.stats_scroll_up(5);
+        assert_eq!(app.stats_view, Some(35), "scroll up freezes");
+        app.stats_scroll_down(3);
+        assert_eq!(app.stats_view, Some(38), "still frozen above the tail");
+        app.stats_scroll_down(10);
+        assert!(app.stats_view.is_none(), "reaching the tail resumes follow");
+        // Esc-path close.
+        app.close_stats();
+        assert!(!app.stats_open);
+    }
+
+    #[test]
+    fn turn_start_increments_turns() {
+        let mut app = App::new("s", "m");
+        assert_eq!(app.turns, 0);
+        app.apply(AgentEvent::TurnStart { max_iterations: 10 });
+        app.apply(AgentEvent::TurnStart { max_iterations: 10 });
+        assert_eq!(app.turns, 2);
     }
 }

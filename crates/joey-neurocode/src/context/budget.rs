@@ -1,7 +1,9 @@
 //! Tier context-budget sizing (FR-008, T016).
 //!
-//! Economical tier gets a focused slice (method + immediate interface + deps
-//! to mock). Frontier tier gets fuller graph (class + interface + repository + DTO).
+//! Economical tier gets a focused slice (target + interface + injected deps
+//! + member roster). Frontier tier gets the fuller graph (multiple targets,
+//! depth-2 expansion, transitive deps). Caps bind the assembled context so
+//! it stays a targeted briefing, not a file dump.
 
 use crate::classifier::ComplexityTier;
 
@@ -21,16 +23,19 @@ impl TierBudget {
     pub fn for_tier(tier: ComplexityTier) -> Self {
         match tier {
             ComplexityTier::Economical => Self {
-                // Focused slice: method + immediate interface + deps to mock.
-                max_expansion_depth: 1,
-                max_primary_nodes: 1,
-                max_expanded_nodes: 5,
+                // Focused slice: target + interface + deps to mock. Depth 2
+                // reaches the interface's own contract members and the
+                // injected repo's key types without exploding.
+                max_expansion_depth: 2,
+                max_primary_nodes: 2,
+                max_expanded_nodes: 8,
             },
             ComplexityTier::Frontier => Self {
-                // Fuller graph: class + interface + repository + DTO.
-                max_expansion_depth: 2,
+                // Fuller graph: class + interface + repository + DTO +
+                // implementors. Frontier models have the window to use it.
+                max_expansion_depth: 3,
                 max_primary_nodes: 3,
-                max_expanded_nodes: 20,
+                max_expanded_nodes: 24,
             },
             // AmbiguousDefault resolves to Economical (data-model.md Entity 1).
             ComplexityTier::AmbiguousDefault => Self::for_tier(ComplexityTier::Economical),
@@ -45,7 +50,7 @@ mod tests {
     #[test]
     fn economical_budget_is_focused() {
         let b = TierBudget::for_tier(ComplexityTier::Economical);
-        assert_eq!(b.max_expansion_depth, 1);
+        assert_eq!(b.max_expansion_depth, 2);
         assert!(b.max_expanded_nodes <= 10);
     }
 

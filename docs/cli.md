@@ -21,7 +21,9 @@ Verified against source (`crates/joey-cli/src/`, debug binary `--help` output).
 - `--pass-session-id` — include session ID in system prompt.
 - `--ignore-user-config` — ignore config.yaml (creds in .env still loaded).
 - `--safe-mode` — disable user config + MCP (implies --ignore-user-config).
-- `--tui` — animated ratatui dashboard instead of line REPL. `JOEY_TUI=1|true` enables implicitly; falls back to line REPL when stdio isn't a terminal.
+- `--cli` — line REPL instead of the TUI dashboard (the TUI is the default
+  interactive interface; `--tui` forces it back on, `JOEY_TUI=0|false` opts
+  out via env). Non-terminal stdio always falls back to the line REPL.
 - `-p, --profile <NAME>` / `--profile=NAME` — NOT a clap flag: pre-argparse scan strips it and sets `JOEY_HOME=<root>/profiles/<name>`. Name: 1–64 chars, `[a-z0-9_-]`, must start lowercase/digit. Missing profile (explicit flag) → error exit 1. Falls back to sticky `<root>/active_profile` file. Child `--profile` inside `mcp add --args …` is respected as the MCP server's own flag.
 
 ### Exit codes (main.rs)

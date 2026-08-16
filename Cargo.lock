@@ -2894,10 +2894,12 @@ version = "0.19.0"
 dependencies = [
  "crossterm 0.28.1",
  "joey-agent-core",
+ "joey-neurocode",
  "joey-omo",
  "joey-providers",
  "joey-tools",
  "ratatui",
+ "serde_json",
  "textwrap",
  "unicode-width",
 ]

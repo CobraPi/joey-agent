@@ -223,9 +223,10 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
                 m_node.enclosing_type = Some(type_node.name.clone());
                 m_node.annotations = method.annotations.clone();
                 m_node.source_span = Some((method.start_byte, method.end_byte));
+                m_node.signature = method.signature.clone();
                 if let Ok(mid) = graph.upsert_node(&m_node) {
-                    // Edge: method belongs to class (Injects doubles as member-of).
-                    let _ = graph.upsert_edge(mid, id, EdgeKind::Injects);
+                    // Edge: member belongs to its enclosing type.
+                    let _ = graph.upsert_edge(mid, id, EdgeKind::MemberOf);
                     result.edges_created += 1;
                 }
             }
@@ -242,8 +243,9 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
                 f_node.enclosing_type = Some(type_node.name.clone());
                 f_node.annotations = field.annotations.clone();
                 f_node.declared_dependencies = vec![field.type_name.clone()];
+                f_node.signature = field.signature.clone();
                 if let Ok(fid) = graph.upsert_node(&f_node) {
-                    let _ = graph.upsert_edge(fid, id, EdgeKind::Injects);
+                    let _ = graph.upsert_edge(fid, id, EdgeKind::MemberOf);
                     result.edges_created += 1;
                 }
             }
@@ -260,6 +262,7 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
                 CodeArtifactNode::new(ArtifactKind::Method, fqcn, package.clone(), rel_path.clone());
             f_node.annotations = func.annotations.clone();
             f_node.source_span = Some((func.start_byte, func.end_byte));
+            f_node.signature = func.signature.clone();
             if graph.upsert_node(&f_node).is_ok() {
                 result.artifacts_seen += 1;
             }

@@ -26,12 +26,18 @@ pub mod parse;
 pub mod pega;
 pub mod tier_resolver;
 pub mod verify;
+pub mod auto_index;
+
+pub use auto_index::{AutoIndexProgress, AutoIndexState};
 
 pub use classifier::{
     ClassificationSignal, ComplexityClassifier, ComplexityRoute, ComplexityTier, SignalKind,
 };
 pub use config::NeuroCodeConfig;
-pub use context::{AssembledContext, ContextAssembler, ExpansionReason};
+pub use context::{
+    AssembledContext, ContextAssembler, ContextGraphSnapshot, EdgeSnapshot, ExpandedNode,
+    ExpansionOutcome, ExpansionReason, MemberSnapshot, NodeSnapshot,
+};
 pub use engine::{CodingRequest, DefaultEngine, NeuroCodeCommands, NeuroCodeEngine};
 pub use graph::{DependencyGraph, EdgeKind, GraphEdge, NodeId};
 pub use graph::node::{ArtifactKind, ArtifactStatus, CodeArtifactNode};
@@ -45,4 +51,7 @@ pub use verify::parse::VerifyParseFormat;
 pub use verify::runner::VerifyStep;
 
 /// The on-disk NeuroCode schema version (contracts/graph-store-schema.md).
-pub const NEUROCODE_SCHEMA_VERSION: u32 = 1;
+/// v2: additive `signature` column on `code_artifacts` (declaration headers
+/// for methods/fields, surfaced in assembled context). v1 databases migrate
+/// in place on open; rows keep NULL signatures until re-indexed.
+pub const NEUROCODE_SCHEMA_VERSION: u32 = 2;

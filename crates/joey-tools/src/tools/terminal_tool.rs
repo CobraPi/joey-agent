@@ -1235,11 +1235,20 @@ async fn stream_output(
 /// Emit a progress event for a chunk (decodes as lossy UTF-8). The
 /// `last_emit` timestamp is stamped to `Some(now)` so the throttle window
 /// starts ticking from this emit.
+///
+/// Live-streaming: the chunk is ALSO forwarded on the raw-output channel
+/// (`ctx.emit_output`) when one is wired, so the UI can render a live
+/// terminal output view (maximized/streaming) in realtime. The output path
+/// shares the progress throttle (they fire together, both throttled to the
+/// same 50ms window).
 fn flush_chunk(chunk: &[u8], ctx: &ToolContext, last_emit: &mut Option<tokio::time::Instant>) {
     if chunk.is_empty() {
         return;
     }
     let text = String::from_utf8_lossy(chunk);
+    // Raw output stream first (live terminal view), then the legacy progress
+    // event — both throttled to the same 50ms window by the caller.
+    ctx.emit_output(text.clone());
     ctx.emit_progress(text.into_owned());
     *last_emit = Some(tokio::time::Instant::now());
 }

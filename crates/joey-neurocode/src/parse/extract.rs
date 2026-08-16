@@ -82,6 +82,11 @@ impl ExtractedType {
 pub struct ExtractedMethod {
     pub name: String,
     pub annotations: Vec<String>,
+    /// Declaration header: the source text from the start of modifiers to
+    /// the parameter-list close (e.g. `public User findById(Long id)`).
+    /// Rendered verbatim in the assembled context so the model sees real
+    /// parameter names and types without opening the file.
+    pub signature: Option<String>,
     pub start_byte: u32,
     pub end_byte: u32,
 }
@@ -92,4 +97,7 @@ pub struct ExtractedField {
     pub name: String,
     pub type_name: String,
     pub annotations: Vec<String>,
+    /// Full declaration text including annotations
+    /// (e.g. `@Autowired private UserRepository userRepository`).
+    pub signature: Option<String>,
 }

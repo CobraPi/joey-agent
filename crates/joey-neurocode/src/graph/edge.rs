@@ -17,6 +17,10 @@ pub enum EdgeKind {
     Injects,
     /// `from` exchanges a DTO/type with `to`.
     ExchangesType,
+    /// `from` is a method/field member of `to` (its enclosing type).
+    /// Kept distinct from `Injects` so membership never reads as a
+    /// dependency during expansion or dependent lookups.
+    MemberOf,
     /// Pega: `from` references/delegates to `to` (rule-to-rule).
     ReferencesRule,
     /// Pega: directed inheritance (rule class hierarchy).
@@ -40,6 +44,7 @@ impl EdgeKind {
             EdgeKind::IsImplementedBy => "IsImplementedBy",
             EdgeKind::Injects => "Injects",
             EdgeKind::ExchangesType => "ExchangesType",
+            EdgeKind::MemberOf => "MemberOf",
             EdgeKind::ReferencesRule => "ReferencesRule",
             EdgeKind::InheritsRule => "InheritsRule",
         }
@@ -52,6 +57,7 @@ impl EdgeKind {
             "IsImplementedBy" => Ok(EdgeKind::IsImplementedBy),
             "Injects" => Ok(EdgeKind::Injects),
             "ExchangesType" => Ok(EdgeKind::ExchangesType),
+            "MemberOf" => Ok(EdgeKind::MemberOf),
             "ReferencesRule" => Ok(EdgeKind::ReferencesRule),
             "InheritsRule" => Ok(EdgeKind::InheritsRule),
             other => Err(format!("unknown edge kind '{}'", other)),
@@ -76,6 +82,7 @@ mod tests {
             EdgeKind::IsImplementedBy,
             EdgeKind::Injects,
             EdgeKind::ExchangesType,
+            EdgeKind::MemberOf,
             EdgeKind::ReferencesRule,
             EdgeKind::InheritsRule,
         ] {

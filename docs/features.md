@@ -69,7 +69,8 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
 - Line REPL with 90+ registered slash commands (42 implemented incl. the
   12 spec-kit ones), prefix expansion, smart Tab completion (see below).
   → [cli.md](cli.md)
-- Animated ratatui TUI (`--tui`): synthwave theme, streaming transcript,
+- Animated ratatui TUI — the default interactive interface (`joey --cli`
+  for the line REPL): synthwave theme, streaming transcript,
   reasoning panel, agent picker, activity-scaled animations, NeuroCode
   live context panel. → [tui.md](tui.md)
 - **Smart completions on both surfaces** (Hermes parity): slash

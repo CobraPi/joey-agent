@@ -120,6 +120,9 @@ fn extract_type<'a>(
     let mut declared_dependencies = Vec::new();
     let mut methods = Vec::new();
     let mut fields = Vec::new();
+    // Constructors collected for single-constructor implicit injection
+    // (Spring ≥4.3: one constructor → no @Autowired needed).
+    let mut constructors: Vec<Node<'a>> = Vec::new();
 
     // The "body" field holds the class/interface body.
     if let Some(body) = node.child_by_field_name("body") {
@@ -146,12 +149,27 @@ fn extract_type<'a>(
                         if let Some(params) = member.child_by_field_name("parameters") {
                             collect_injected_params(&params, source, &mut declared_dependencies);
                         }
+                        constructors.push(member);
                     }
                     "annotation_type_declaration" | "interface_declaration"
                     | "class_declaration" | "enum_declaration" => {
                         // Nested types — skip for now (depth-1 extraction).
                     }
                     _ => {}
+                }
+            }
+        }
+    }
+
+    // Spring ≥4.3 implicit constructor injection: a class with exactly ONE
+    // constructor has all its parameters injected without any annotation —
+    // the dominant modern style. Only parameters with object-ish types
+    // (heuristic: start uppercase, not a primitive wrapper literal).
+    if constructors.len() == 1 {
+        if let Some(params) = constructors[0].child_by_field_name("parameters") {
+            for param_type in plain_param_types(&params, source) {
+                if !declared_dependencies.contains(&param_type) {
+                    declared_dependencies.push(param_type);
                 }
             }
         }
@@ -179,9 +197,13 @@ fn extract_method<'a>(node: &Node<'a>, source: &str) -> Option<ExtractedMethod> 
         .trim()
         .to_string();
     let annotations = collect_annotations(node, source);
+    // Declaration header: modifiers → parameter-list close. Includes
+    // annotations so Spring/Pega semantics stay visible in context.
+    let signature = declaration_header(node, source, Some("parameters"), Some("body"));
     Some(ExtractedMethod {
         name,
         annotations,
+        signature,
         start_byte: node.start_byte() as u32,
         end_byte: node.end_byte() as u32,
     })
@@ -206,11 +228,44 @@ fn extract_field<'a>(node: &Node<'a>, source: &str) -> Option<ExtractedField> {
         .unwrap_or("")
         .trim()
         .to_string();
+    let signature = declaration_header(node, source, None, None)
+        .map(|s| collapse_ws(&s));
     Some(ExtractedField {
         name,
         type_name: type_text,
         annotations,
+        signature,
     })
+}
+
+/// The source text of a declaration from its first token to (and including)
+/// the close of `close_field`'s list — annotations, modifiers, name, type,
+/// and parameters — with trailing initializer/body cut off. `None` when the
+/// node has no such list to anchor the cut.
+fn declaration_header<'a>(
+    node: &Node<'a>,
+    source: &str,
+    close_field: Option<&str>,
+    stop_field: Option<&str>,
+) -> Option<String> {
+    let mut end = node.end_byte();
+    if let Some(field) = close_field {
+        end = node.child_by_field_name(field)?.end_byte();
+    }
+    if let Some(field) = stop_field {
+        if let Some(stop) = node.child_by_field_name(field) {
+            end = end.min(stop.start_byte());
+        }
+    }
+    if end <= node.start_byte() || end > source.len() {
+        return None;
+    }
+    Some(collapse_ws(&source[node.start_byte()..end]))
+}
+
+/// Collapse runs of whitespace to single spaces.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Collect annotation names from a node's modifiers/annotations.
@@ -276,6 +331,51 @@ fn collect_type_list<'a>(node: &Node<'a>, source: &str, out: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Collect plain (unannotated) parameter base types from a formal_parameters
+/// node — the Spring-≥4.3 single-constructor injection heuristic. Skips
+/// primitives, wrappers, and JDK literals so `Long id` / `String name`
+/// don't pollute the dependency graph.
+fn plain_param_types<'a>(node: &Node<'a>, source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for i in 0..node.named_child_count() {
+        let Some(param) = node.named_child(i as u32) else { continue };
+        if param.kind() != "formal_parameter" {
+            continue;
+        }
+        let Some(type_node) = param.child_by_field_name("type") else {
+            continue;
+        };
+        let type_text = type_node
+            .utf8_text(source.as_bytes())
+            .unwrap_or("")
+            .trim()
+            .split('<')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // Object-ish types start uppercase; skip JDK noise.
+        if type_text.is_empty()
+            || !type_text.chars().next().map_or(false, |c| c.is_uppercase())
+            || matches!(
+                type_text.as_str(),
+                "String" | "Long" | "Integer" | "Boolean" | "Double" | "Float"
+                    | "Short" | "Byte" | "Character" | "Object" | "CharSequence"
+            )
+        {
+            continue;
+        }
+        if !out.contains(&type_text) {
+            out.push(type_text);
+        }
+    }
+    out
 }
 
 /// Collect injected parameters from a formal_parameters node.

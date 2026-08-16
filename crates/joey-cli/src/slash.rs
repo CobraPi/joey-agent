@@ -6,6 +6,7 @@
 //! has handlers in `repl.rs`.
 
 /// One slash command (commands.py `CommandDef`, gateway fields dropped).
+#[derive(Debug)]
 pub struct CommandDef {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
@@ -152,6 +153,7 @@ pub fn all_slash_names() -> Vec<String> {
 }
 
 /// The outcome of resolving typed input against the registry.
+#[derive(Debug)]
 pub enum Resolution {
     /// A command matched (exactly or via unique prefix). `rest` preserves the
     /// argument tail exactly as typed.
@@ -160,6 +162,17 @@ pub enum Resolution {
     Ambiguous(Vec<String>),
     /// `Unknown command: … / Type /help for available commands`.
     Unknown,
+}
+
+impl Resolution {
+    /// The trimmed argument tail of a `Command` resolution ("" for
+    /// Ambiguous/Unknown and for a bare command with no args).
+    pub fn rest_or_empty(&self) -> String {
+        match self {
+            Resolution::Command { rest, .. } => rest.trim().to_string(),
+            _ => String::new(),
+        }
+    }
 }
 
 /// Resolve `/cmd args…` with upstream prefix expansion (cli.py:9326-9364):

@@ -98,6 +98,7 @@ pub fn parse_heuristic_file(source: &str, ext: &str) -> Result<SourceExtraction,
             let m = ExtractedMethod {
                 name,
                 annotations: Vec::new(),
+                signature: Some(raw.trim().to_string()),
                 start_byte: prefix_len(source, idx) as u32,
                 end_byte: prefix_len(source, idx + 1) as u32,
             };

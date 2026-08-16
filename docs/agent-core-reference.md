@@ -194,11 +194,21 @@ under the same session id (`archive_and_compact`).
 
 Streaming: `ContentDelta`, `ReasoningDelta`.
 Lifecycle: `TurnStart`, `IterationStart`, `ApiCallStart`, `ApiCallEnd`.
-Tools: `ToolStart`, `ToolProgress`, `ToolEnd` (is_error, preview,
-duration, exit_code, full_result), `FileChange` (path, kind
-Create/Edit/Delete, before/after, unified `DiffResult`, is_binary,
+Tools: `ToolStart`, `ToolProgress`, `ToolOutput` (name, chunk — raw
+live-streamed output from streaming tools such as `terminal`, throttled to
+the same 50ms window as ToolProgress and bracketed by the same
+ToolStart/ToolEnd; UIs accumulate it per tool call for a realtime view;
+`ToolEnd.full_result` remains the definitive complete output), `ToolEnd`
+(is_error, preview, duration, exit_code, full_result), `FileChange` (path,
+kind Create/Edit/Delete, before/after, unified `DiffResult`, is_binary,
 source FileTool/Terminal/Detected — ordering: ToolStart → FileChange* →
 ToolEnd; produced only by the tool layer).
+Context: `ContextSnapshot` (entries: role/tokens/preview/has_tool_calls/
+is_compressed_summary per history message, system_tokens, history_tokens,
+context_window, compression_threshold, compactions, model) — emitted at
+every history mutation the turn loop makes (user turn, tool rounds,
+compactions, final message); additive observational event backing the
+TUI's live agent-stats page; never alters the request path.
 Messages: `AssistantMessage` (interim messages deduped against the
 previous interim).
 Status: `Notice`, `RetryAttempt`, `CompressionStart`, `CompressionEnd`,

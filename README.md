@@ -69,8 +69,8 @@ is supported on all three.
 ## Commands
 
 ```
-joey                       Start the interactive REPL
-joey --tui                 Launch the animated ratatui dashboard instead of the line REPL
+joey                       Start the interactive TUI dashboard (default interface)
+joey --cli                 Use the classic line-based REPL instead of the TUI
 joey -z "<prompt>"         One-shot headless query (prints only the final answer)
 joey chat -q "<prompt>"    One-shot through the chat path (banner/session unless -Q)
 joey -m <model>            Override the model for this run
@@ -289,10 +289,15 @@ Available in the line REPL and the `--tui` dashboard. Bare `/neurocode` (or
 
 /neurocode query symbol <name>           FTS symbol search — list artifacts (kind,
                                          FQCN, source path) matching a name.
+/neurocode query definition <name>       Exact-match declaration lookup — kind,
+                                         file, byte span, and captured
+                                         signature (when indexed).
 /neurocode query dependencies <FQCN>     Outgoing edges: what <FQCN> implements/
                                          injects/exchanges/references.
-/neurocode query dependents <FQCN>       Incoming edges: everything that depends on
-                                         <FQCN>. (alias: incoming)
+/neurocode query dependents <FQCN>       Incoming edges: everything that depends
+                                         on <FQCN>. (alias: incoming;
+                                          references also answers to this —
+                                          where is it used)
                                          (dependencies also answers to outgoing;
                                           symbol also answers to fts)
 

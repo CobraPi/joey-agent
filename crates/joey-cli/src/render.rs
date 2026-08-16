@@ -809,6 +809,19 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     println!("{}", t.fg_more_subtle.ansi().paint(format!("  ┊ {} {}", name, progress)));
                 }
             }
+            AgentEvent::ToolOutput { name: _, chunk } => {
+                // Live raw terminal output. The one-shot CLI renderer cannot
+                // rewrite lines it has already printed; in verbose mode the
+                // chunks are already visible via the ToolProgress arm (they
+                // fire together, throttled to the same window). Nothing else
+                // to do here — the maximized live view is a TUI feature.
+                let _ = chunk;
+            }
+            AgentEvent::ContextSnapshot { .. } => {
+                // Live context-window snapshots back the TUI agent-stats
+                // page. The one-shot CLI renderer prints linearly and has
+                // no stats page; ignore (additive event, no wire effect).
+            }
             AgentEvent::ToolEnd { name, is_error, result_preview, duration_secs, exit_code, full_result } => {
                 let duration = duration_secs;
                 if opts.quiet || opts.tool_progress == "off" {
@@ -1132,6 +1145,8 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             // tier/tokens summary already reaches the log via tracing).
             AgentEvent::NeuroCodeContext { .. }
             | AgentEvent::NeuroCodeProgress { .. }
+            | AgentEvent::NeuroCodeGraph { .. }
+            | AgentEvent::NeuroCodeReindexed { .. }
             | AgentEvent::NeuroCodeActive { .. } => {}
             AgentEvent::AgentModeChanged { agent_name, model: _ } => {
                 // Feature 013 (T025/T026): drain before, set after.
@@ -2470,7 +2485,9 @@ mod tests {
     /// drain; ApiCallEnd sets flag; next element drains.
     #[test]
     fn trailing_metadata_no_drain_before_set_after() {
-        let mut pending = false;
+        // Start uninitialized (models "no flag yet"); the first assignment
+        // below is the previous element setting the flag.
+        let mut pending;
 
         // 1. Previous element (e.g. a tool block) renders and sets flag.
         pending = true;

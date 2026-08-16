@@ -48,6 +48,14 @@ pub enum EngineCommand {
         /// Active OMO agent name from the UI's Tab roster ("default" when
         /// none) — drives ultrawork gating.
         active_agent: String,
+        /// True when the UI has NOT yet rendered this prompt as a user
+        /// message (busy-path /queue and interrupt-with-message). The
+        /// engine then emits `QueuedSubmitStarted` when the turn actually
+        /// starts, so the user message appears in causal order — after the
+        /// previous turn's final assistant message commits, before this
+        /// turn's output streams. Submits the UI already recorded (its
+        /// `submit()` funnel, speckit/neurocode scaffolding) pass false.
+        announce: bool,
     },
     /// Cooperatively interrupt the running turn (Ctrl-C semantics).
     Interrupt,
@@ -78,11 +86,23 @@ pub enum EngineEvent {
     },
     /// A heavy job finished with its display text.
     HeavyJobFinished { label: String, text: String },
+    /// The engine is starting a Submit that arrived while a previous turn
+    /// was still running (interrupt-with-message, or a steer that lost the
+    /// turn-end race). Carries the RAW prompt so the UI can render the user
+    /// message it couldn't record at submit time (the busy path never calls
+    /// record_user for engine-queued submits).
+    QueuedSubmitStarted { prompt: String },
     /// The engine applied an agent switch; the UI should refresh its model
     /// labels. `notice` is display text for the transcript.
     AgentSwitched { display_name: String, model: String, provider: String, notice: String },
     /// Pre-turn notice (intent gate announcements etc.) for the transcript.
     Notice(String),
+    /// The engine finished all work (turn + heavy-job queues empty) and is
+    /// about to block waiting for commands. The UI uses this to drain its
+    /// UI-side `/queue` as a visible next turn. NOT sent at startup, so a
+    /// freshly (re)spawned engine never auto-runs a queue the user meant
+    /// to review after a force-kill.
+    Idle,
     /// The engine task exited (fatal error or clean shutdown).
     EngineGone(String),
 }
@@ -149,6 +169,9 @@ async fn engine_task(
 ) {
     // Queued prompts / jobs submitted while a turn runs.
     let mut queued: VecDeque<EngineCommand> = VecDeque::new();
+    // True while a turn (or heavy job) is executing or commands sit in the
+    // local queue — drives QueuedSubmitStarted and Idle emission.
+    let mut busy_for_queue = false;
     // The agent's interrupt flag, captured BEFORE any turn future borrows
     // the agent (the borrow lasts for the whole turn).
     let interrupt = agent.interrupt_handle();
@@ -156,18 +179,35 @@ async fn engine_task(
     loop {
         let cmd = match queued.pop_front() {
             Some(c) => c,
-            None => match cmd_rx.recv().await {
-                Some(c) => c,
-                None => return, // UI dropped the channel — exit cleanly.
-            },
+            None => {
+                // Entering the blocking wait: all work drained. Announce
+                // idleness so the UI can drain its own /queue list (the
+                // engine never sees UI-side /queue entries as commands).
+                // (busy_for_queue stays true here; it's only false at
+                // startup — suppressing a startup Idle — and is re-set
+                // after every received command.)
+                if busy_for_queue {
+                    let _ = event_tx.send(EngineEvent::Idle);
+                }
+                match cmd_rx.recv().await {
+                    Some(c) => c,
+                    None => return, // UI dropped the channel — exit cleanly.
+                }
+            }
         };
+        busy_for_queue = true;
 
         match cmd {
-            EngineCommand::Submit { prompt, active_agent } => {
+            EngineCommand::Submit { prompt, active_agent, announce } => {
                 // Steer handle captured BEFORE the turn future borrows the
                 // agent — lets mid-turn Steer commands reach the running
                 // turn without touching the borrow.
                 let steer_handle = agent.steer_handle();
+                if announce {
+                    // This Submit was queued while busy (UI never rendered
+                    // it) — show the user message now, in causal order.
+                    let _ = event_tx.send(EngineEvent::QueuedSubmitStarted { prompt: prompt.clone() });
+                }
                 // Pre-turn preprocessing lives WITH the agent (engine side):
                 // intent gate + @plan mutate agent overlays.
                 let turn_text = engine_pre_turn(&mut agent, &event_tx, &prompt, &active_agent);
@@ -290,9 +330,23 @@ async fn engine_task(
                     .unwrap_or_else(|e| format!("job failed: {e}"));
                 let _ = event_tx.send(EngineEvent::HeavyJobFinished { label: out_label, text: res });
             }
-            EngineCommand::Steer(_) => {
-                // Idle steer: nothing to inject into — the UI only sends
-                // this mid-turn; ignore rather than lose data.
+            EngineCommand::Steer(text) => {
+                // Idle steer: nothing to inject into. Match the line REPL's
+                // degradation — queue the text as the next turn's prompt
+                // instead of silently dropping it (fix: silent data loss on
+                // the turn-end race). announce=true: the UI never rendered
+                // this as a user message (the busy path sends bare Steer).
+                let cleaned = text.trim().to_string();
+                if !cleaned.is_empty() {
+                    let _ = event_tx.send(EngineEvent::Notice(
+                        "🧭 no turn running — steer queued for the next turn.".into(),
+                    ));
+                    queued.push_back(EngineCommand::Submit {
+                        prompt: cleaned,
+                        active_agent: "default".into(),
+                        announce: true,
+                    });
+                }
             }
             EngineCommand::Interrupt => {
                 interrupt.store(true, Ordering::SeqCst);
@@ -440,8 +494,8 @@ mod actor_tests {
 
         // Send two submits; both should eventually produce TurnFinished
         // (queued sequentially), and the engine stays alive between them.
-        _handle.send(EngineCommand::Submit { prompt: "one".into(), active_agent: "default".into() });
-        _handle.send(EngineCommand::Submit { prompt: "two".into(), active_agent: "default".into() });
+        _handle.send(EngineCommand::Submit { prompt: "one".into(), active_agent: "default".into(), announce: false });
+        _handle.send(EngineCommand::Submit { prompt: "two".into(), active_agent: "default".into(), announce: false });
         let mut finished = 0;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while finished < 2 && std::time::Instant::now() < deadline {
@@ -504,7 +558,7 @@ mod actor_tests {
             let agent = unauth_spec(tag).build_agent().expect("agent builds");
             let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
             let (handle, _int) = spawn_engine(agent, ev_tx);
-            handle.send(EngineCommand::Submit { prompt: prompt.into(), active_agent: "default".into() });
+            handle.send(EngineCommand::Submit { prompt: prompt.into(), active_agent: "default".into(), announce: false });
 
             let mut saw_done_at: Option<usize> = None;
             let mut saw_finished_at: Option<usize> = None;
@@ -536,7 +590,7 @@ mod actor_tests {
         let agent = unauth_spec("engrace").build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let (handle, _int) = spawn_engine(agent, ev_tx);
-        handle.send(EngineCommand::Submit { prompt: "one".into(), active_agent: "default".into() });
+        handle.send(EngineCommand::Submit { prompt: "one".into(), active_agent: "default".into(), announce: false });
         // Wait for the first turn to fully finish, THEN submit — this is
         // exactly the instant the old try_recv-based check raced with.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -550,7 +604,7 @@ mod actor_tests {
                 }
             }
         }
-        handle.send(EngineCommand::Submit { prompt: "two".into(), active_agent: "default".into() });
+        handle.send(EngineCommand::Submit { prompt: "two".into(), active_agent: "default".into(), announce: false });
         let mut finished = 0;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while finished == 0 && std::time::Instant::now() < deadline {
@@ -561,6 +615,98 @@ mod actor_tests {
             }
         }
         assert_eq!(finished, 1, "post-turn submit was processed, not consumed by the abandon check");
+    }
+
+    /// Regression (idle-steer data loss): a Steer that arrives after the
+    /// turn ended (race between TurnFinished and the command) must NOT be
+    /// dropped — the engine queues it as the next turn and tells the UI.
+    #[tokio::test]
+    async fn idle_steer_degrades_to_queued_submit() {
+        let agent = unauth_spec("engsteer1").build_agent().expect("agent builds");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, _int) = spawn_engine(agent, ev_tx);
+        handle.send(EngineCommand::Steer("please also check the tests".into()));
+
+        let mut saw_notice = false;
+        let mut saw_turn_finished = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !(saw_notice && saw_turn_finished) && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::Notice(t)) if t.contains("no turn running") => saw_notice = true,
+                Ok(EngineEvent::TurnFinished { .. }) => saw_turn_finished = true,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        assert!(saw_notice, "idle steer must degrade with a notice, not vanish");
+        assert!(saw_turn_finished, "degraded steer must run as a turn");
+    }
+
+    /// QueuedSubmitStarted fires for announce=true submits (busy-path)
+    /// and not for announce=false ones (the normal UI funnel).
+    #[tokio::test]
+    async fn queued_submit_started_announces_only_marked_submits() {
+        let agent = unauth_spec("engqss1").build_agent().expect("agent builds");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, _int) = spawn_engine(agent, ev_tx);
+        handle.send(EngineCommand::Submit {
+            prompt: "marked".into(),
+            active_agent: "default".into(),
+            announce: true,
+        });
+        let mut saw_qss: Option<String> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while saw_qss.is_none() && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::QueuedSubmitStarted { prompt }) => saw_qss = Some(prompt),
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        assert_eq!(saw_qss.as_deref(), Some("marked"));
+
+        // Unmarked: no QueuedSubmitStarted before TurnFinished.
+        handle.send(EngineCommand::Submit {
+            prompt: "plain".into(),
+            active_agent: "default".into(),
+            announce: false,
+        });
+        let mut leaked_qss = false;
+        let mut finished = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !finished && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::QueuedSubmitStarted { .. }) => leaked_qss = true,
+                Ok(EngineEvent::TurnFinished { .. }) => finished = true,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        assert!(finished);
+        assert!(!leaked_qss, "unmarked submits must not announce");
+    }
+
+    /// The engine announces Idle once its queues drain (not at startup).
+    #[tokio::test]
+    async fn engine_announces_idle_after_drain() {
+        let agent = unauth_spec("engidle1").build_agent().expect("agent builds");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, _int) = spawn_engine(agent, ev_tx);
+        handle.send(EngineCommand::Submit {
+            prompt: "hello".into(),
+            active_agent: "default".into(),
+            announce: false,
+        });
+        let mut saw_idle = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !saw_idle && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::Idle) => saw_idle = true,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        assert!(saw_idle, "engine must announce Idle after the queue drains");
     }
 }
 

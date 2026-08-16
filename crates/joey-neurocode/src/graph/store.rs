@@ -69,6 +69,20 @@ impl GraphStore {
             CREATE INDEX IF NOT EXISTS idx_artifacts_status ON code_artifacts(status);
             "#,
         )?;
+        // v1 → v2 additive migration: declaration signatures for methods and
+        // fields (context assembly renders member rosters without file reads).
+        // Existing rows keep NULL signatures until the next re-index.
+        conn.execute_batch(
+            "ALTER TABLE code_artifacts ADD COLUMN signature TEXT",
+        )
+        .or_else(|e| {
+            // duplicate column name == already migrated; anything else is real.
+            if e.to_string().contains("duplicate column") {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })?;
 
         // graph_edges
         conn.execute_batch(
@@ -216,8 +230,8 @@ impl GraphStore {
                 (id, kind, fqcn, enclosing_type, package, implemented_interfaces,
                  annotations, declared_dependencies, source_path,
                  source_span_start, source_span_end, pega_metadata, framework_version,
-                 status, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 status, indexed_at, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(fqcn, kind, source_path) DO UPDATE SET
                 enclosing_type=excluded.enclosing_type,
                 implemented_interfaces=excluded.implemented_interfaces,
@@ -228,7 +242,8 @@ impl GraphStore {
                 pega_metadata=excluded.pega_metadata,
                 framework_version=excluded.framework_version,
                 status=excluded.status,
-                indexed_at=excluded.indexed_at",
+                indexed_at=excluded.indexed_at,
+                signature=excluded.signature",
             params![
                 if node.id == 0 { None } else { Some(node.id as i64) },
                 node.kind.as_str(),
@@ -245,6 +260,7 @@ impl GraphStore {
                 node.framework_version.as_deref(),
                 node.status.as_str(),
                 &node.indexed_at,
+                node.signature.as_deref(),
             ],
         )?;
         Ok(self.conn.last_insert_rowid() as NodeId)
@@ -380,12 +396,69 @@ impl GraphStore {
         Ok(rows)
     }
 
-    /// Count the total number of active artifacts.
+    /// Count active artifacts.
     pub fn artifact_count(&self) -> rusqlite::Result<usize> {
         self.conn
             .query_row("SELECT COUNT(*) FROM code_artifacts WHERE status='Active'", [], |row| {
                 row.get::<_, i64>(0).map(|n| n as usize)
             })
+    }
+
+    /// Look up the type-level nodes declared in a source file. Methods and
+    /// fields are excluded — the caller wants file→type seeds. Exact path
+    /// first; a trailing-component match (user wrote `src/Foo.java`, stored
+    /// path is `src/main/java/src/Foo.java`) fills in when exact misses.
+    pub fn nodes_by_source_path(&self, path: &str) -> rusqlite::Result<Vec<CodeArtifactNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM code_artifacts
+             WHERE source_path=?1 AND kind IN ('Class','Interface','Enum','PegaRule')
+               AND status='Active",
+        )?;
+        let exact: Vec<CodeArtifactNode> =
+            stmt.query_map(params![path], row_to_node)?.collect::<Result<_, _>>()?;
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        // Suffix match on path components, longest-path first for stability.
+        let like = format!("%{}", path.trim_start_matches("./"));
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM code_artifacts
+             WHERE source_path LIKE ?1
+               AND kind IN ('Class','Interface','Enum','PegaRule')
+               AND status='Active'
+             ORDER BY LENGTH(source_path) ASC LIMIT 20",
+        )?;
+        let fuzzy: Vec<CodeArtifactNode> =
+            stmt.query_map(params![like], row_to_node)?.collect::<Result<_, _>>()?;
+        Ok(fuzzy)
+    }
+
+    /// The method/field member nodes whose enclosing type is `enclosing`
+    /// (simple name), active only. Used to render a type's member roster in
+    /// the assembled context without loading whole files.
+    pub fn members_of_enclosing(
+        &self,
+        enclosing: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<CodeArtifactNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM code_artifacts
+             WHERE enclosing_type=?1 AND status='Active'
+             ORDER BY kind DESC, fqcn ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![enclosing, limit as i64], row_to_node)?;
+        rows.collect()
+    }
+
+    /// The number of distinct incoming edges (fan-in) for a node — how many
+    /// other artifacts depend on it. Hubs have high fan-in; expansion and
+    /// formatting use this to rank and to warn before wide edits.
+    pub fn dependents_count(&self, id: NodeId) -> rusqlite::Result<usize> {
+        self.conn.query_row(
+            "SELECT COUNT(DISTINCT from_id) FROM graph_edges WHERE to_id=?1",
+            params![id as i64],
+            |row| row.get::<_, i64>(0).map(|n| n as usize),
+        )
     }
 
     /// Access the raw connection (for advanced queries by other modules).
@@ -654,6 +727,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeArtifactNode> {
     let source_path: String = row.get("source_path")?;
     let span_start: Option<i64> = row.get("source_span_start")?;
     let span_end: Option<i64> = row.get("source_span_end")?;
+    let signature: Option<String> = row.get("signature")?;
     let pega_json: Option<String> = row.get("pega_metadata")?;
     let framework_version: Option<String> = row.get("framework_version")?;
     let status_str: String = row.get("status")?;
@@ -692,6 +766,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeArtifactNode> {
         declared_dependencies,
         source_path,
         source_span,
+        signature,
         pega_metadata,
         framework_version,
         status,

@@ -19,6 +19,19 @@
 //!     frontier_keywords: []
 //!   pega:
 //!     version: ""
+//!   auto_index:
+//!     # Re-index the structural graph after large edits so context stays
+//!     # current across turns (feature 015 follow-up: dynamic context).
+//!     enabled: true
+//!     # Re-index once this many source files have been edited since the
+//!     # last index build ("large edits").
+//!     file_threshold: 3
+//!     # Also trigger when cumulative edited lines (added+removed) cross
+//!     # this bound — a single huge rewrite counts as "large".
+//!     line_threshold: 200
+//!     # Minimum seconds between automatic re-index passes (debounce so a
+//!     # tool-loop burst of small patches doesn't re-index every turn).
+//!     min_interval_secs: 30.0
 //! ```
 
 use crate::classifier::ComplexityTier;
@@ -32,6 +45,10 @@ pub struct NeuroCodeConfig {
     pub verify: VerifyConfig,
     pub classifier: ClassifierConfig,
     pub pega: PegaConfig,
+    /// Automatic re-indexing after large edits (feature 015 follow-up:
+    /// dynamic context across turns). Default-on when NeuroCode itself is
+    /// enabled.
+    pub auto_index: AutoIndexConfig,
 }
 impl Default for NeuroCodeConfig {
     fn default() -> Self {
@@ -41,6 +58,46 @@ impl Default for NeuroCodeConfig {
             verify: VerifyConfig::default(),
             classifier: ClassifierConfig::default(),
             pega: PegaConfig::default(),
+            auto_index: AutoIndexConfig::default(),
+        }
+    }
+}
+
+/// Thresholds controlling automatic re-indexing of the structural graph.
+#[derive(Debug, Clone)]
+pub struct AutoIndexConfig {
+    pub enabled: bool,
+    /// Distinct edited source files needed to trigger a re-index.
+    pub file_threshold: usize,
+    /// Cumulative edited lines (added+removed) that trigger a re-index
+    /// even below the file threshold.
+    pub line_threshold: usize,
+    /// Minimum seconds between automatic passes (debounce).
+    pub min_interval_secs: f64,
+}
+
+impl Default for AutoIndexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            file_threshold: 3,
+            line_threshold: 200,
+            min_interval_secs: 30.0,
+        }
+    }
+}
+
+impl AutoIndexConfig {
+    pub fn from_config(cfg: &joey_core::Config) -> Self {
+        Self {
+            enabled: cfg.get_bool("neurocode.auto_index.enabled", true),
+            file_threshold: cfg.get_f64("neurocode.auto_index.file_threshold", 3.0).max(1.0) as usize,
+            line_threshold: cfg
+                .get_f64("neurocode.auto_index.line_threshold", 200.0)
+                .max(1.0) as usize,
+            min_interval_secs: cfg
+                .get_f64("neurocode.auto_index.min_interval_secs", 30.0)
+                .max(0.0),
         }
     }
 }
@@ -54,6 +111,7 @@ impl NeuroCodeConfig {
             verify: VerifyConfig::from_config(cfg),
             classifier: ClassifierConfig::from_config(cfg),
             pega: PegaConfig::from_config(cfg),
+            auto_index: AutoIndexConfig::from_config(cfg),
         }
     }
 

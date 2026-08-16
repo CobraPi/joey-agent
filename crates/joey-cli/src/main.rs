@@ -1,9 +1,11 @@
 //! `joey` — the joey-agent command-line interface.
 //!
 //! Port of the `hermes` CLI entrypoint (`hermes_cli/_parser.py` +
-//! `hermes_cli/main.py`). Bare `joey` starts the interactive REPL; `-z`
-//! runs one-shot mode; subcommands cover chat/model/config/tools/doctor/
-//! cron/mcp/skills/version. A rewrite of Hermes Agent (Nous Research, MIT).
+//! `hermes_cli/main.py`). Bare `joey` starts the interactive TUI dashboard
+//! (the default interface); `joey --cli` selects the classic line REPL;
+//! `-z` runs one-shot mode; subcommands cover chat/model/config/tools/
+//! doctor/cron/mcp/skills/version. A rewrite of Hermes Agent (Nous
+//! Research, MIT).
 
 mod commands;
 mod clipboard;
@@ -54,7 +56,8 @@ pub fn active_profile() -> &'static str {
 /// this port ships).
 const EPILOGUE: &str = "\
 Examples:
-    joey                          Start interactive chat
+    joey                          Start the interactive TUI dashboard (default)
+    joey --cli                    Use the classic line-based REPL instead
     joey chat -q \"Hello\"          Single query mode
     joey -c                       Resume the most recent session
     joey -c \"my project\"          Resume a session by name
@@ -158,11 +161,18 @@ pub struct Cli {
     #[arg(long = "safe-mode")]
     safe_mode: bool,
 
-    /// Launch the animated graphical TUI (ratatui) instead of the line-based
-    /// REPL. Shows a live multi-panel dashboard with particle backdrop,
-    /// gradient theme, spinners and an activity equalizer whose speed scales
-    /// with the number of active agents. JOEY_TUI=1 enables it by default;
-    /// non-terminal stdio falls back to the line REPL.
+    /// Launch the line-based REPL instead of the TUI dashboard. The TUI is
+    /// the default interactive interface; this flag (or JOEY_TUI=0) opts
+    /// back into the classic line REPL. Beats `--tui` when both are given.
+    #[arg(long = "cli")]
+    cli: bool,
+
+    /// Force the animated graphical TUI (ratatui) for this invocation —
+    /// the TUI is already the default, so this only matters to beat
+    /// JOEY_TUI=0. Shows a live multi-panel dashboard with particle
+    /// backdrop, gradient theme, spinners and an activity equalizer whose
+    /// speed scales with the number of active agents. Non-terminal stdio
+    /// falls back to the line REPL.
     #[arg(long = "tui")]
     tui: bool,
 
@@ -292,9 +302,16 @@ pub struct ChatArgs {
     #[arg(long = "safe-mode")]
     pub safe_mode: bool,
 
-    /// Launch the animated graphical TUI (ratatui) instead of the line-based
-    /// REPL. JOEY_TUI=1 enables it by default; non-terminal stdio falls back
-    /// to the line REPL.
+    /// Use the line-based REPL instead of the TUI dashboard for this chat.
+    /// The TUI is the default interactive interface; JOEY_TUI=0 also opts
+    /// out. Beats `--tui` when both are given.
+    #[arg(long = "cli")]
+    pub cli: bool,
+
+    /// Force the animated graphical TUI (ratatui) — the TUI is already the
+    /// default for interactive chat, so this only matters to beat
+    /// JOEY_TUI=0, or to render the dashboard for a `-q` single query.
+    /// Non-terminal stdio falls back to the line REPL.
     #[arg(long = "tui")]
     pub tui: bool,
 }
@@ -472,12 +489,35 @@ async fn main() {
     std::process::exit(code);
 }
 
-/// `JOEY_TUI=1` (or `true`) opts into the animated TUI without the flag.
-/// The TUI itself falls back to the line REPL when stdio isn't a terminal.
-fn tui_env_enabled() -> bool {
-    std::env::var("JOEY_TUI")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+/// Resolve the interactive interface. The TUI is the DEFAULT; the line
+/// REPL is opted into explicitly.
+///
+/// Precedence (highest wins):
+/// 1. `--cli` flag — force the line REPL (beats everything, including
+///    `--tui`, so scripts/users can always recover the classic UI).
+/// 2. `--tui` flag — force the TUI.
+/// 3. `JOEY_TUI` env: `0`/`false` → line REPL, anything else → TUI.
+/// 4. Default: TUI.
+///
+/// The TUI itself additionally falls back to the line REPL when stdio
+/// isn't a terminal (tui::run checks IsTerminal), so non-interactive pipes
+/// keep working without any flags.
+fn use_tui(cli_flag: bool, tui_flag: bool) -> bool {
+    use_tui_with_env(cli_flag, tui_flag, std::env::var("JOEY_TUI").ok())
+}
+
+/// Pure decision core of [`use_tui`] (env value passed in for testability).
+fn use_tui_with_env(cli_flag: bool, tui_flag: bool, env: Option<String>) -> bool {
+    if cli_flag {
+        return false;
+    }
+    if tui_flag {
+        return true;
+    }
+    match env {
+        Some(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+        None => true, // default: TUI
+    }
 }
 
 /// Wire the env-var-backed flags BEFORE any Config::load (config.rs reads
@@ -568,7 +608,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 max_turns: chat.max_turns.or(cli.max_turns),
                 pass_session_id: chat.pass_session_id || cli.pass_session_id,
                 skills: if chat.skills.is_empty() { cli.skills } else { chat.skills },
-                tui: chat.tui || cli.tui || tui_env_enabled(),
+                tui: use_tui(chat.cli || cli.cli, chat.tui || cli.tui),
             };
             if opts.tui {
                 tui::run(opts).await
@@ -588,7 +628,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 max_turns: cli.max_turns,
                 pass_session_id: cli.pass_session_id,
                 skills: cli.skills,
-                tui: cli.tui || tui_env_enabled(),
+                tui: use_tui(cli.cli, cli.tui),
             };
             if opts.tui {
                 tui::run(opts).await
@@ -708,6 +748,61 @@ mod tests {
     fn version_flag_parses() {
         let cli = Cli::try_parse_from(argv(&["-V"])).unwrap();
         assert!(cli.version);
+    }
+
+    // ── TUI-default interface selection ─────────────────────────────
+
+    #[test]
+    fn cli_flag_parses() {
+        let cli = Cli::try_parse_from(argv(&["--cli"])).unwrap();
+        assert!(cli.cli);
+        assert!(!cli.tui);
+        // `joey chat --cli` also parses.
+        let cli = Cli::try_parse_from(argv(&["chat", "--cli"])).unwrap();
+        match cli.command {
+            Some(Command::Chat(c)) => assert!(c.cli),
+            other => panic!("expected chat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tui_flag_still_parses() {
+        let cli = Cli::try_parse_from(argv(&["--tui"])).unwrap();
+        assert!(cli.tui);
+        assert!(!cli.cli);
+    }
+
+    /// The TUI is the default interface when neither flag is given and
+    /// JOEY_TUI is unset.
+    #[test]
+    fn tui_is_default_when_no_flags_and_no_env() {
+        assert!(use_tui_with_env(false, false, None));
+    }
+
+    /// `--cli` forces the line REPL and beats `--tui` and any env value.
+    #[test]
+    fn cli_flag_beats_tui_flag_and_env() {
+        assert!(!use_tui_with_env(true, false, None));
+        assert!(!use_tui_with_env(true, true, None));
+        assert!(!use_tui_with_env(true, false, Some("1".into())));
+    }
+
+    /// `--tui` forces the TUI even against a TUI-disabling env value.
+    #[test]
+    fn tui_flag_beats_env() {
+        assert!(use_tui_with_env(false, true, Some("0".into())));
+        assert!(use_tui_with_env(false, true, Some("false".into())));
+    }
+
+    /// JOEY_TUI=0/false opts out of the TUI; 1/true/anything else opts in.
+    #[test]
+    fn env_var_controls_when_no_flags() {
+        assert!(!use_tui_with_env(false, false, Some("0".into())));
+        assert!(!use_tui_with_env(false, false, Some("false".into())));
+        assert!(!use_tui_with_env(false, false, Some("FALSE".into())));
+        assert!(use_tui_with_env(false, false, Some("1".into())));
+        assert!(use_tui_with_env(false, false, Some("true".into())));
+        assert!(use_tui_with_env(false, false, Some("yes".into())));
     }
 
     #[test]

@@ -81,6 +81,9 @@ impl NeuroCodeBackend for EngineBackend {
     }
 
     fn query(&self, query_type: &str, symbol: &str, limit: usize) -> String {
+        if symbol.is_empty() {
+            return "Usage: neurocode_query <query_type> <symbol>".to_string();
+        }
         let mut out = self.engine.query_text(query_type, symbol);
         // The command surface has no limit param; note the requested limit for
         // the model when it asks for fewer/more than the default.

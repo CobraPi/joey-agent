@@ -335,9 +335,18 @@ fn extract_method<'a>(node: &Node<'a>, source: &str) -> Option<ExtractedMethod> 
         .ok()?
         .trim()
         .to_string();
+    // Signature: node start → close of `parameters`, body cut off.
+    let signature = (|| {
+        let end = node.child_by_field_name("parameters")?.end_byte();
+        if end <= node.start_byte() || end > source.len() {
+            return None;
+        }
+        Some(source[node.start_byte()..end].split_whitespace().collect::<Vec<_>>().join(" "))
+    })();
     Some(ExtractedMethod {
         name,
         annotations: Vec::new(),
+        signature,
         start_byte: node.start_byte() as u32,
         end_byte: node.end_byte() as u32,
     })
@@ -362,9 +371,14 @@ fn extract_field<'a>(node: &Node<'a>, source: &str) -> Option<ExtractedField> {
         .trim()
         .to_string();
     Some(ExtractedField {
-        name,
-        type_name,
+        name: name.clone(),
+        type_name: type_name.clone(),
         annotations: Vec::new(),
+        signature: if type_name.is_empty() {
+            None
+        } else {
+            Some(format!("{}: {}", name, type_name))
+        },
     })
 }
 
@@ -389,6 +403,18 @@ fn extract_const_functions<'a>(decl: &Node<'a>, source: &str) -> Vec<ExtractedMe
                 out.push(ExtractedMethod {
                     name: name.trim().to_string(),
                     annotations: Vec::new(),
+                    signature: (|| {
+                        let end = value.child_by_field_name("parameters")?.end_byte();
+                        if end <= v.start_byte() || end > source.len() {
+                            return None;
+                        }
+                        Some(
+                            source[v.start_byte()..end]
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        )
+                    })(),
                     start_byte: v.start_byte() as u32,
                     end_byte: v.end_byte() as u32,
                 });
