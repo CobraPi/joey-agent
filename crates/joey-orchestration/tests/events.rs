@@ -106,12 +106,30 @@ async fn batch_emits_all_lifecycle_events() {
     // Each spawn should carry a goal and model.
     for spawn in &spawns {
         if let AgentEvent::SubagentSpawn {
-            goal, model, depth, ..
+            id,
+            goal,
+            model,
+            depth,
+            ..
         } = spawn
         {
+            assert!(*id >= 1, "stable child ids start at 1");
             assert!(!goal.is_empty());
             assert!(!model.is_empty());
             assert_eq!(*depth, 0); // top-level parent depth
         }
     }
+
+    // Parallel-subagent feature: ids must be unique across the batch.
+    let ids: Vec<u64> = spawns
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::SubagentSpawn { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let mut uniq = ids.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    assert_eq!(ids.len(), uniq.len(), "spawn ids must be unique");
 }

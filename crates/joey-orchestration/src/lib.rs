@@ -5,11 +5,17 @@
 //! and structured lifecycle events. Ported from Hermes Agent's delegate_task
 //! and Crush's coordinator patterns.
 
+pub mod capacity;
 pub mod delegation_tool;
 pub mod manager;
 pub mod subagent;
+pub mod tap;
 pub mod types;
 
+pub use capacity::{
+    capacity_children, capacity_requests, SystemCapacity, DEFAULT_MEM_MAX_FRACTION,
+    DEFAULT_MEM_RESERVE_MB_PER_CHILD, HARD_CHILD_CEILING,
+};
 pub use delegation_tool::{CallOmoAgent, DelegateTask};
 pub use manager::{ManagerConfig, SubagentManager};
 pub use types::{DelegationRequest, DelegationResult, SubagentRole, TaskSpec};

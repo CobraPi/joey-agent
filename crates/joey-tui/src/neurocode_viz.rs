@@ -1051,10 +1051,14 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, theme: Theme, snapshot: &Co
 /// The radial graph canvas: edges first, then nodes + labels.
 fn draw_canvas(f: &mut Frame, area: Rect, app: &App, theme: Theme, snapshot: &ContextGraphSnapshot) {
     let buf = f.buffer_mut();
-    // Panel background so the particles don't bleed through.
+    // Panel background so the particles don't bleed through. `reset()`
+    // clears the symbol too — a style-only clear would leave glyphs from
+    // anything drawn into these cells earlier in the frame.
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
-            buf[(x, y)].set_style(Style::default().bg(theme.bg_panel.to_color()));
+            let cell = &mut buf[(x, y)];
+            cell.reset();
+            cell.set_style(Style::default().bg(theme.bg_panel.to_color()));
         }
     }
 
@@ -1180,23 +1184,43 @@ fn draw_canvas(f: &mut Frame, area: Rect, app: &App, theme: Theme, snapshot: &Co
             } else {
                 theme.fg_more_subtle.to_color()
             };
-            let cell = &mut buf[(lx, ly)];
-            cell.set_symbol(&label).set_style(
-                Style::default()
-                    .fg(label_color)
-                    .bg(theme.bg_panel.to_color()),
-            );
+            // One character per cell (set_char), NOT set_symbol(&whole_label):
+            // ratatui's diff renderer tracks one symbol per cell, so a
+            // multi-char symbol written into a single cell leaves the
+            // trailing cells untracked — when the label pans away, the diff
+            // doesn't invalidate them and the stale characters stay on
+            // screen until a full redraw.
+            for (i, ch) in label.chars().enumerate() {
+                let cx = lx + i as u16;
+                if cx >= area.x + area.width {
+                    break;
+                }
+                let cell = &mut buf[(cx, ly)];
+                cell.set_char(ch).set_style(
+                    Style::default()
+                        .fg(label_color)
+                        .bg(theme.bg_panel.to_color()),
+                );
+            }
         }
     }
 
-    // Zoom indicator (bottom-right corner of the canvas).
+    // Zoom indicator (bottom-right corner of the canvas). Same per-cell
+    // rule as labels.
     let zlabel = format!("{}×", viz.zoom);
     if area.width > 8 && area.height > 1 {
-        let x = area.x + area.width - zlabel.chars().count() as u16 - 1;
-        let y = area.y + area.height - 1;
-        let cell = &mut buf[(x, y)];
-        cell.set_symbol(&zlabel)
-            .set_style(Style::default().fg(theme.fg_most_subtle.to_color()).bg(theme.bg_panel.to_color()));
+        let zy = area.y + area.height - 1;
+        let zx = area.x + area.width - zlabel.chars().count() as u16 - 1;
+        for (i, ch) in zlabel.chars().enumerate() {
+            let cx = zx + i as u16;
+            if cx >= area.x + area.width {
+                break;
+            }
+            let cell = &mut buf[(cx, zy)];
+            cell.set_char(ch).set_style(
+                Style::default().fg(theme.fg_most_subtle.to_color()).bg(theme.bg_panel.to_color()),
+            );
+        }
     }
 }
 
@@ -1382,5 +1406,135 @@ mod tests {
             }
         }
         let _ = tui; // silence unused when JOEY_TUI_VISUAL unset
+    }
+
+    /// Regression (bug report: "panning left repeats characters that only
+    /// clear when re-opening another section"): labels were written with
+    /// `set_symbol(&whole_label)` into ONE buffer cell. Ratatui's diff
+    /// renderer tracks one symbol per cell, so the characters spilling
+    /// past that cell were invisible to the diff — after a pan, the screen
+    /// kept painting the old label characters at their old columns
+    /// (ghosting) until a full redraw. The fix writes one char per cell;
+    /// this test drives two diff-based frames with a pan between them and
+    /// asserts the SECOND painted screen contains no duplicated ghosts of
+    /// the pre-pan label content.
+    #[test]
+    fn pan_does_not_ghost_labels_on_diff_frames() {
+        use ratatui::backend::TestBackend;
+        let mut s = snap(9);
+        // Long, distinctive names so ghosts are unambiguous.
+        s.nodes[1].name = "GhAAAAx".into();
+        s.nodes[2].name = "GhBBBBx".into();
+        s.edges.push(joey_neurocode::EdgeSnapshot {
+            from: 0,
+            to: 3,
+            kind: "Implements".into(),
+        });
+        let mut app = App::new("s", "m");
+        app.neurocode_snapshot = Some(s);
+        app.neurocode_active = true;
+        app.neurocode_expanded = true;
+        // Zoom in past the 1.2 threshold so EVERY node draws its label
+        // (otherwise only primary/selected/neighbor labels render).
+        app.neurocode_viz.zoom = 1.5;
+
+        let area = Rect::new(0, 4, 100, 22);
+        let mut term = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        // Frame 1: un-panned.
+        term.draw(|f| draw_explorer(f, area, &app, Theme::aurora())).unwrap();
+        let painted1: Vec<String> = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        let text1: String = painted1.concat();
+        if std::env::var("DEBUG_GHOST").is_ok() {
+            for row in 0..30usize {
+                let line: String = term.backend().buffer().content[row * 100..row * 100 + 100]
+                    .iter()
+                    .map(|c| c.symbol().to_string())
+                    .collect();
+                let t = line.trim_end();
+                if !t.is_empty() { println!("{:2}|{}", row, t); }
+            }
+        }
+        assert!(text1.contains("GhAAAAx"), "label drawn at rest");
+
+        // Pan LEFT by a large amount (Shift+Left repeats).
+        let mut app2 = app;
+        app2.neurocode_viz.pan.0 -= 40;
+
+        // Frame 2: same terminal (diff-based, like the real screen).
+        term.draw(|f| draw_explorer(f, area, &app2, Theme::aurora()))
+            .unwrap();
+        let painted2: Vec<String> = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        let text2: String = painted2.concat();
+
+        // After panning far left, the labels moved (or left the canvas).
+        // Count occurrences: with per-cell writes the label appears at most
+        // ONCE per node; ghosting painted the old copy too (2+ occurrences
+        // of the distinctive tail).
+        let aaaa_count = text2.matches("GhAAAAx").count();
+        assert!(
+            aaaa_count <= 1,
+            "ghosted label on panned frame: 'GhAAAAx' seen {aaaa_count} times"
+        );
+        let bbbb_count = text2.matches("GhBBBBx").count();
+        assert!(
+            bbbb_count <= 1,
+            "ghosted label on panned frame: 'GhBBBBx' seen {bbbb_count} times"
+        );
+
+        // The core invariant the bug violated: no buffer cell may hold a
+        // multi-character symbol. A real terminal prints such a symbol
+        // across several columns while ratatui's diff thinks only ONE cell
+        // changed — the extra columns are never invalidated when the label
+        // pans away, which is exactly the reported ghosting.
+        for cell in term.backend().buffer().content.iter() {
+            assert!(
+                cell.symbol().chars().count() <= 1,
+                "multi-char symbol in buffer cell: {:?} — this ghosts on pan",
+                cell.symbol()
+            );
+        }
+    }
+
+    #[test]
+    fn no_multi_char_symbols_even_when_buggy_write_used() {
+        // Cross-check the invariant directly against the OLD write pattern:
+        // a set_symbol(&label) into one cell must be detectable. (This test
+        // documents WHY the per-cell loop exists; it exercises the buffer
+        // invariant through a fresh render at high zoom with long names.)
+        use ratatui::backend::TestBackend;
+        let mut s = snap(12);
+        for (i, nd) in s.nodes.iter_mut().enumerate() {
+            if !nd.primary {
+                nd.name = format!("VeryLongNodeName{:02}", i);
+            }
+        }
+        let mut app = App::new("s", "m");
+        app.neurocode_snapshot = Some(s);
+        app.neurocode_active = true;
+        app.neurocode_expanded = true;
+        app.neurocode_viz.zoom = 1.5;
+        let mut term = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let area = Rect::new(0, 4, 100, 22);
+        term.draw(|f| draw_explorer(f, area, &app, Theme::aurora())).unwrap();
+        for cell in term.backend().buffer().content.iter() {
+            assert!(
+                cell.symbol().chars().count() <= 1,
+                "multi-char symbol in buffer cell: {:?}",
+                cell.symbol()
+            );
+        }
     }
 }

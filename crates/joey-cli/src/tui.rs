@@ -204,11 +204,20 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<crate::engine::EngineEvent>();
     let (engine, interrupt) = crate::engine::spawn_engine(agent, ev_tx);
 
+    // Parallel-subagent feature: install the process-global delegation
+    // event tap. Every SubagentManager in this process (including engines
+    // rebuilt after a force-kill) mirrors subagent lifecycle + wrapped
+    // child events here, driving the right-rail panes.
+    let (tap_tx, tap_rx) =
+        tokio::sync::mpsc::unbounded_channel::<joey_agent_core::AgentEvent>();
+    joey_orchestration::tap::set_global_tap(Some(tap_tx));
+
     // Single-query mode: submit, pump until done, hand the answer back.
     if let Some(query) = &opts.query {
         let mut session = TuiSession {
             tui,
             ev_rx,
+            tap_rx,
             engine: Some(engine),
             interrupt,
             engine_spec,
@@ -242,6 +251,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     let session = TuiSession {
         tui,
         ev_rx,
+        tap_rx,
         engine: Some(engine),
         interrupt,
         engine_spec,
@@ -310,6 +320,11 @@ fn populate_agent_roster(tui: &mut Tui, agent: &Agent) {
 pub struct TuiSession {
     pub tui: Tui,
     pub ev_rx: tokio::sync::mpsc::UnboundedReceiver<crate::engine::EngineEvent>,
+    /// Parallel-subagent feature: delegation event tap receiver. The global
+    /// tap (joey-orchestration) sends orchestration + wrapped child events
+    /// here; pumped alongside engine events so per-subagent panes update
+    /// live even while the engine is mid-turn.
+    pub tap_rx: tokio::sync::mpsc::UnboundedReceiver<joey_agent_core::AgentEvent>,
     pub engine: Option<crate::engine::EngineHandle>,
     pub interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub engine_spec: crate::engine::EngineSpec,
@@ -589,6 +604,16 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
 
     let ev = tokio::select! {
         ev = session.ev_rx.recv() => ev,
+        tap_ev = session.tap_rx.recv() => {
+            // Parallel-subagent feature: delegation tap events (spawn /
+            // wrapped child stream / complete) update the App directly.
+            // They never carry the parent's turn lifecycle, so they cannot
+            // wedge the busy state.
+            if let Some(agent_ev) = tap_ev {
+                session.tui.app_mut().apply(agent_ev);
+            }
+            return None;
+        }
         _ = tokio::time::sleep(session.tui.frame_budget()) => {
             // Frame tick: drain all pending terminal input (non-blocking).
             while event::poll(Duration::from_millis(0)).unwrap_or(false) {

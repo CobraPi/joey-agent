@@ -16,6 +16,7 @@ chrono-tz.workspace = true
 dirs.workspace = true
 dotenvy.workspace = true
 regex.workspace = true
+rayon.workspace = true
 fancy-regex = "0.14"
 shlex.workspace = true
 tracing.workspace = true

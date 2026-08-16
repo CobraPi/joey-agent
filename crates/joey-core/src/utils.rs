@@ -229,6 +229,95 @@ pub fn estimate_tokens(text: &str) -> usize {
     n.div_ceil(4)
 }
 
+// ─── Display-oriented JSON formatting (expandable views) ───────────────────
+//
+// Text-editor-like views (the TUI's expanded tool args/results, the live
+// context stream's tool-call bodies, the maximized output viewer) want
+// pretty-printed JSON where embedded newlines inside STRING VALUES render
+// as REAL newlines — `serde_json::to_string_pretty` emits them as literal
+// two-character `\n` escapes, which reads as garbage in a code view. The
+// string has already been parsed once (the escapes were real newlines in
+// memory), so re-emitting them raw is lossless for display purposes.
+// Structural JSON remains valid except for those control characters inside
+// strings — acceptable because the output is for humans, never re-parsed.
+
+/// Pretty-print a JSON string for DISPLAY: 2-space indent, and string
+/// values keep their real control characters (newlines, tabs) instead of
+/// `\n`/`\t` escape runs. Non-JSON input returns None (caller keeps the
+/// original text).
+pub fn pretty_json_for_display(s: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(s.trim_start()).ok()?;
+    Some(json_value_to_display_string(&v, 0))
+}
+
+/// Render one JSON value at `indent` (spaces) in display form.
+fn json_value_to_display_string(v: &serde_json::Value, indent: usize) -> String {
+    use serde_json::Value;
+    use std::fmt::Write;
+    let pad = " ".repeat(indent);
+    let pad_in = " ".repeat(indent + 2);
+    match v {
+        Value::Object(map) => {
+            if map.is_empty() {
+                return "{}".to_string();
+            }
+            let mut out = String::from("{\n");
+            for (i, (k, val)) in map.iter().enumerate() {
+                let _ = write!(out, "{}{}: {}", pad_in, display_json_string(k), json_value_to_display_string(val, indent + 2));
+                if i + 1 < map.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            let _ = write!(out, "{}}}", pad);
+            out
+        }
+        Value::Array(items) => {
+            if items.is_empty() {
+                return "[]".to_string();
+            }
+            let mut out = String::from("[\n");
+            for (i, item) in items.iter().enumerate() {
+                let _ = write!(out, "{}{}", pad_in, json_value_to_display_string(item, indent + 2));
+                if i + 1 < items.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            let _ = write!(out, "{}]", pad);
+            out
+        }
+        // Scalars: strings keep real control characters; numbers/bools/null
+        // render as their JSON form.
+        Value::String(s) => display_json_string(s),
+        other => other.to_string(),
+    }
+}
+
+/// A JSON string rendered for display: quoted, but with REAL newlines and
+/// tabs instead of escape sequences. Other JSON escapes (quotes, backslash,
+/// unicode) stay escaped so structure remains readable.
+fn display_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\n' => out.push('\n'),
+            '\t' => out.push('\t'),
+            '\r' => {}
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => {
+                // Other control chars: keep as unicode-style escape.
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +395,57 @@ mod tests {
         atomic_replace(&link, b"new").unwrap();
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink(), "symlink survives");
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+    }
+
+    // ── pretty_json_for_display (expandable views) ─────────────────────
+
+    #[test]
+    fn display_json_renders_embedded_newlines_as_real_lines() {
+        let src = r#"{"output":"step 1 done\nstep 2 done","exit_code":0}"#;
+        let out = pretty_json_for_display(src).unwrap();
+        assert!(out.contains("step 1 done\nstep 2 done"), "real newline: {out:?}");
+        assert!(!out.contains("\\n"), "no literal escape runs: {out:?}");
+    }
+
+    #[test]
+    fn display_json_pretty_structure_matches_serde_indent() {
+        let src = r#"{"a":1,"b":{"c":[1,2]}}"#;
+        let out = pretty_json_for_display(src).unwrap();
+        let expect = serde_json::to_string_pretty(
+            &serde_json::from_str::<serde_json::Value>(src).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out, expect, "structure-only JSON identical to serde");
+    }
+
+    #[test]
+    fn display_json_keeps_quotes_and_backslashes_escaped() {
+        // `\\path` in the source = one real backslash in the parsed value.
+        let src = r#"{"s":"say \"hi\"\nC:\\path"}"#;
+        let out = pretty_json_for_display(src).unwrap();
+        // Quotes/backslashes stay JSON-escaped (readable structure), while
+        // the newline is real.
+        assert!(out.contains("say \\\"hi\\\""), "quotes stay escaped: {out:?}");
+        assert!(out.contains("C:\\\\path"), "backslash stays escaped: {out:?}");
+        assert!(out.contains("\nC:"), "newline real: {out:?}");
+    }
+
+    #[test]
+    fn display_json_non_json_returns_none() {
+        assert!(pretty_json_for_display("plain text").is_none());
+        assert!(pretty_json_for_display("").is_none());
+        // Leading whitespace tolerated.
+        assert!(pretty_json_for_display("  {\"a\":1}").is_some());
+    }
+
+    #[test]
+    fn display_json_empty_containers_and_nested() {
+        assert_eq!(pretty_json_for_display("{}").unwrap(), "{}");
+        assert_eq!(pretty_json_for_display("[]").unwrap(), "[]");
+        let nested = r#"{"list":["one\ntwo",null,true,3]}"#;
+        let out = pretty_json_for_display(nested).unwrap();
+        assert!(out.contains("one\ntwo"), "array strings expand too");
+        assert!(out.contains("null"));
+        assert!(out.contains("true"));
     }
 }

@@ -84,19 +84,36 @@ fn render_body(
     spinner: &crate::anim::Spinner,
     equalizer: &crate::anim::Equalizer,
 ) {
+    // Parallel-subagent feature: the subagent tab rail occupies the RIGHT
+    // edge whenever panes exist (each spawned child stacks a vertical tab
+    // there; the orchestrator is the implicit leftmost tab = focus None).
+    let show_rail = !app.subagent_panes.is_empty() && area.width >= 96;
+    let with_rail_area = if show_rail {
+        let rail_w = 19u16.min(area.width);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(rail_w)])
+            .split(area);
+        widgets::draw_subagent_rail(f, cols[1], app, theme);
+        cols[0]
+    } else {
+        app.last_subagent_tab_rects.borrow_mut().clear();
+        area
+    };
+
     // Body: transcript (left, large) + sidebar (right). The sidebar
     // yields entirely on narrow terminals.
-    let show_sidebar = area.width >= 72;
+    let show_sidebar = with_rail_area.width >= 72;
     let body = if show_sidebar {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(40), Constraint::Length(34)])
-            .split(area)
+            .split(with_rail_area)
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1)])
-            .split(area)
+            .split(with_rail_area)
     };
 
     // When reasoning is live (and shown), split the transcript
@@ -109,6 +126,26 @@ fn render_body(
     // hidden/closed, short terminals) must not leave stale geometry catching
     // clicks.
     app.last_reasoning_rect.set((0, 0, 0, 0));
+
+    // ── Pane-focused mode (parallel-subagent feature) ─────────────────
+    // A focused subagent takes over the main transcript area; the
+    // maximized panels (stats/output viewer) retarget to the child too.
+    if let Some(pane) = app.focused_pane() {
+        if app.stats_open && body[0].height >= 12 {
+            let (transcript_h, stats_h) = split_expanded_feed(body[0].height);
+            let main = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(transcript_h),
+                    Constraint::Min(stats_h),
+                ])
+                .split(body[0]);
+            widgets::draw_pane_transcript(f, main[0], app, pane, theme, focused, glow);
+            widgets::draw_pane_stats_page(f, main[1], app, pane, theme, spinner);
+        } else {
+            widgets::draw_pane_transcript(f, body[0], app, pane, theme, focused, glow);
+        }
+    } else
     // Maximized takeovers of the main screen area — the transcript (with
     // its live streaming tail) keeps a strip at the top so the conversation
     // stays visible. Precedence: stats page (most explicit, opened from the
@@ -193,6 +230,24 @@ fn render_body(
             widgets::draw_omo_panel(f, body[1], app, theme, spinner, equalizer);
         }
     }
+}
+
+/// Test-only entry into `render_body` with fresh animation widgets — lets
+/// integration tests (crates/joey-tui/tests/) drive the REAL body layout
+/// (rail + panes + sidebar) against a TestBackend without constructing the
+/// full `Tui`. Hidden from docs; not part of the public API surface.
+#[doc(hidden)]
+pub fn render_body_for_test(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: Theme,
+    focused: bool,
+    glow: f32,
+) {
+    let spinner = crate::anim::Spinner::dots();
+    let equalizer = crate::anim::Equalizer::new(28);
+    render_body(f, area, app, theme, focused, glow, &spinner, &equalizer);
 }
 
 /// Restore the terminal even if we panic mid-frame: a raw-mode alternate
@@ -556,48 +611,126 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // Agent-stats page: while open, navigation keys scroll its context
         // stream (arrows/PgUp/PgDn/Home/End + hjkl/g/G in transcript
         // focus). Esc (global handler above) restores. Printable keys fall
-        // through to the input box.
+        // through to the input box. When a subagent pane is focused, the
+        // same keys drive the PANE's stats stream (retargeted view).
         if self.app.stats_open {
             let vim = self.focus == Focus::Transcript;
+            let pane_focused = self.app.focused_subagent.is_some();
             match key.code {
                 KeyCode::Up => {
-                    self.app.stats_scroll_up(1);
+                    if pane_focused {
+                        self.app.pane_stats_scroll_up(1);
+                    } else {
+                        self.app.stats_scroll_up(1);
+                    }
                     return None;
                 }
                 KeyCode::Down => {
-                    self.app.stats_scroll_down(1);
+                    if pane_focused {
+                        self.app.pane_stats_scroll_down(1);
+                    } else {
+                        self.app.stats_scroll_down(1);
+                    }
                     return None;
                 }
                 KeyCode::PageUp => {
-                    self.app.stats_scroll_up(20);
+                    if pane_focused {
+                        self.app.pane_stats_scroll_up(20);
+                    } else {
+                        self.app.stats_scroll_up(20);
+                    }
                     return None;
                 }
                 KeyCode::PageDown => {
-                    self.app.stats_scroll_down(20);
+                    if pane_focused {
+                        self.app.pane_stats_scroll_down(20);
+                    } else {
+                        self.app.stats_scroll_down(20);
+                    }
                     return None;
                 }
                 KeyCode::Home => {
-                    self.app.stats_view = Some(0);
+                    if pane_focused {
+                        self.app.pane_stats_view = Some(0);
+                    } else {
+                        self.app.stats_view = Some(0);
+                    }
                     return None;
                 }
                 KeyCode::End => {
-                    self.app.stats_view = None;
+                    if pane_focused {
+                        self.app.pane_stats_view = None;
+                    } else {
+                        self.app.stats_view = None;
+                    }
                     return None;
                 }
                 KeyCode::Char('k') if vim => {
-                    self.app.stats_scroll_up(1);
+                    if pane_focused {
+                        self.app.pane_stats_scroll_up(1);
+                    } else {
+                        self.app.stats_scroll_up(1);
+                    }
                     return None;
                 }
                 KeyCode::Char('j') if vim => {
-                    self.app.stats_scroll_down(1);
+                    if pane_focused {
+                        self.app.pane_stats_scroll_down(1);
+                    } else {
+                        self.app.stats_scroll_down(1);
+                    }
                     return None;
                 }
                 KeyCode::Char('g') if vim => {
-                    self.app.stats_view = Some(0);
+                    if pane_focused {
+                        self.app.pane_stats_view = Some(0);
+                    } else {
+                        self.app.stats_view = Some(0);
+                    }
                     return None;
                 }
                 KeyCode::Char('G') if vim => {
-                    self.app.stats_view = None;
+                    if pane_focused {
+                        self.app.pane_stats_view = None;
+                    } else {
+                        self.app.stats_view = None;
+                    }
+                    return None;
+                }
+                // Expandable-stats: Space/x toggles the context entry at the
+                // center of the visible window (keyboard parity with clicks;
+                // same resolution strategy as the transcript's Space).
+                KeyCode::Char(' ') | KeyCode::Char('x') => {
+                    let (inner_y, _start) = if pane_focused {
+                        self.app.last_pane_stats_window.get()
+                    } else {
+                        self.app.last_stats_window.get()
+                    };
+                    let (x, y, w, h) = if pane_focused {
+                        self.app.last_pane_stats_rect.get()
+                    } else {
+                        self.app.last_stats_rect.get()
+                    };
+                    let center_row = if h > 0 { y + h / 2 } else { inner_y };
+                    let inside = w > 0
+                        && h > 0
+                        && center_row >= y
+                        && center_row < y + h
+                        && x > 0;
+                    if inside {
+                        let hit = if pane_focused {
+                            self.app.pane_stats_context_entry_hit(center_row)
+                        } else {
+                            self.app.stats_context_entry_hit(center_row)
+                        };
+                        if let Some(entry_idx) = hit {
+                            if pane_focused {
+                                self.app.toggle_pane_context_entry(entry_idx);
+                            } else {
+                                self.app.toggle_context_entry(entry_idx);
+                            }
+                        }
+                    }
                     return None;
                 }
                 _ => {}
@@ -723,6 +856,12 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                     self.app.agent_picker_open = false;
                     return None;
                 }
+                // Parallel-subagent feature: a focused pane releases the main
+                // view back to the orchestrator first.
+                if self.app.focused_subagent.is_some() {
+                    self.app.focus_subagent(None);
+                    return None;
+                }
                 // Close the agent-stats page before any lower-priority Esc
                 // behavior.
                 if self.app.stats_open {
@@ -787,6 +926,9 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             KeyCode::Char('l') if ctrl => {
                 self.app.transcript.clear();
                 self.app.scroll = None;
+                // Parallel-subagent feature: Ctrl+L also clears the panes +
+                // rail (full reset back to the orchestrator view).
+                self.app.clear_subagent_panes();
                 return None;
             }
             // ── Maximized terminal output viewer ──────────────────────
@@ -914,9 +1056,24 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // Focus-dependent keys.
         match self.focus {
             Focus::Transcript => {
+                // Parallel-subagent feature: when a pane is focused, j/k and
+                // PgUp/PgDn scroll the pane's transcript instead.
+                let pane_focused = self.app.focused_subagent.is_some();
                 match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => self.app.scroll_up(1),
-                    KeyCode::Down | KeyCode::Char('j') => self.app.scroll_down(1),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if pane_focused {
+                            self.app.pane_scroll_up(1);
+                        } else {
+                            self.app.scroll_up(1);
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if pane_focused {
+                            self.app.pane_scroll_down(1);
+                        } else {
+                            self.app.scroll_down(1);
+                        }
+                    }
                     KeyCode::Char('g') | KeyCode::Home => self.app.scroll_to_top(),
                     KeyCode::Char('G') | KeyCode::End => self.app.scroll_to_bottom(),
                     // Space / x: expand-toggle the item at the TOP of the
@@ -1353,6 +1510,33 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// NeuroCode context panel or the live reasoning panel (docked or
     /// expanded), the wheel scrolls that panel instead of the transcript.
     pub fn handle_mouse_scroll(&mut self, row: u16, col: u16, delta_up: bool) {
+        // Parallel-subagent feature: the pane stats page + pane transcript
+        // are the retargeted views when a pane is focused — check their
+        // rects before the main-screen equivalents.
+        if self.app.focused_subagent.is_some() {
+            {
+                let (x, y, w, h) = self.app.last_pane_stats_rect.get();
+                if w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w {
+                    if delta_up {
+                        self.app.pane_stats_scroll_up(3);
+                    } else {
+                        self.app.pane_stats_scroll_down(3);
+                    }
+                    return;
+                }
+            }
+            {
+                let (x, y, w, h) = self.app.last_pane_text_area.get();
+                if w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w {
+                    if delta_up {
+                        self.app.pane_scroll_up(3);
+                    } else {
+                        self.app.pane_scroll_down(3);
+                    }
+                    return;
+                }
+            }
+        }
         // Agent-stats page first: the wheel scrolls its context stream and
         // never leaks to the transcript while open.
         {
@@ -1462,6 +1646,20 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// Clicking the live reasoning panel (docked bottom strip or expanded
     /// main view) toggles it the same way.
     pub fn handle_mouse_click(&mut self, row: u16, col: u16) {
+        // Parallel-subagent feature: the right rail's tabs are the top
+        // click target. Clicking a pane's tab focuses it (retargeting the
+        // main transcript + stats window); clicking the focused tab again
+        // returns to the orchestrator view.
+        if let Some(idx) = self.app.subagent_tab_hit(row, col) {
+            let target = if self.app.focused_subagent == Some(idx) {
+                None
+            } else {
+                Some(idx)
+            };
+            self.app.focus_subagent(target);
+            self.app.pane_stats_view = None; // re-pin stats to the live tail
+            return;
+        }
         // Header right section (model/session/status): opens the maximized
         // agent-stats page. Checked first — it's at the very top of the
         // screen, above every other hit target.
@@ -1472,11 +1670,26 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 return;
             }
         }
-        // Stats page open: clicks inside it never leak to the transcript
-        // (scrolling is wheel/keys; a click on the title area is a no-op).
+        // Stats page open: clicks inside it never leak to the transcript.
+        // Expandable-stats: a click that resolves to a context-stream entry
+        // toggles that entry's expansion (main window parity — every row is
+        // expandable). Clicks on the dashboard header/footer are no-ops.
         {
             let (x, y, w, h) = self.app.last_stats_rect.get();
             if w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w {
+                let pane_focused = self.app.focused_subagent.is_some();
+                let hit = if pane_focused {
+                    self.app.pane_stats_context_entry_hit(row)
+                } else {
+                    self.app.stats_context_entry_hit(row)
+                };
+                if let Some(entry_idx) = hit {
+                    if pane_focused {
+                        self.app.toggle_pane_context_entry(entry_idx);
+                    } else {
+                        self.app.toggle_context_entry(entry_idx);
+                    }
+                }
                 return;
             }
         }
@@ -1505,6 +1718,32 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // Focus the transcript on any click within it.
         if self.focus == Focus::Input {
             self.focus = Focus::Transcript;
+        }
+        // Parallel-subagent feature: when a pane is focused, clicks in the
+        // main area hit the PANE's transcript — toggle its items' expansion
+        // (main window parity for the pane view). The hit-test shares the
+        // main transcript's line accounting (items + streaming tail,
+        // bottom-anchored), just reading from the pane.
+        if self.app.focused_subagent.is_some() {
+            let (tx, ty, tw, th) = self.app.last_pane_text_area.get();
+            if tw > 0 && th > 0 && row >= ty && row < ty + th && col >= tx && col < tx + tw {
+                if let Some(pane) = self.app.focused_pane() {
+                    if let Some(item_idx) = widgets::transcript_hit_test_core(
+                        &pane.transcript,
+                        &pane.streaming_assistant,
+                        pane.scroll,
+                        self.app.last_pane_max_scroll.get(),
+                        (tx, ty, tw, th),
+                        self.theme,
+                        row,
+                    ) {
+                        if let Some(p) = self.app.focused_pane_mut() {
+                            p.toggle_item_expand(item_idx);
+                        }
+                    }
+                }
+                return;
+            }
         }
         // Resolve the clicked item via per-item hit-testing. A TOOL item
         // click (terminal or generic) maximizes its formatted output in the
@@ -2183,6 +2422,7 @@ mod stats_page_key_tests {
                 preview: "hello".into(),
                 has_tool_calls: false,
                 is_compressed_summary: false,
+                full_content: String::new(),
             }],
             system_tokens: 100,
             history_tokens: 42,

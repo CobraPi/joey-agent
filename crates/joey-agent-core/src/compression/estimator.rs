@@ -3,6 +3,7 @@
 //! compressor's per-message budget estimator, context_compressor.py:360-446).
 
 use joey_providers::{ContentPart, Message, ToolSchema};
+use rayon::prelude::*;
 use serde_json::{json, Value};
 
 /// Chars per token rough estimate (context_compressor.py:281).
@@ -130,13 +131,36 @@ fn estimate_message_chars(msg: &Message) -> usize {
 
 /// Rough token estimate for a message list (`estimate_messages_tokens_rough`):
 /// serialized chars/4 (ceiling) + a flat ~1500 tokens per image.
+///
+/// Rayon: per-message shadow-JSON serialization is independent CPU work;
+/// the fan-out only engages above a small-message threshold (sequential
+/// otherwise — scheduling overhead would dominate short histories).
 pub fn estimate_messages_tokens_rough(messages: &[Message]) -> i64 {
-    let mut total_chars = 0usize;
-    let mut image_tokens = 0usize;
-    for msg in messages {
-        total_chars += estimate_message_chars(msg);
-        image_tokens += count_image_tokens(msg, REQUEST_IMAGE_TOKEN_COST);
-    }
+    /// Minimum messages before the parallel path pays for itself.
+    const PAR_THRESHOLD: usize = 24;
+    let chars_and_images: Vec<(usize, usize)> = if messages.len() >= PAR_THRESHOLD {
+        messages
+            .par_iter()
+            .map(|msg| {
+                (
+                    estimate_message_chars(msg),
+                    count_image_tokens(msg, REQUEST_IMAGE_TOKEN_COST),
+                )
+            })
+            .collect()
+    } else {
+        messages
+            .iter()
+            .map(|msg| {
+                (
+                    estimate_message_chars(msg),
+                    count_image_tokens(msg, REQUEST_IMAGE_TOKEN_COST),
+                )
+            })
+            .collect()
+    };
+    let total_chars: usize = chars_and_images.iter().map(|(c, _)| *c).sum();
+    let image_tokens: usize = chars_and_images.iter().map(|(_, i)| *i).sum();
     total_chars.div_ceil(4) as i64 + image_tokens as i64
 }
 

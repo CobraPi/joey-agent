@@ -48,6 +48,12 @@ pub struct ContextEntry {
     pub has_tool_calls: bool,
     /// Whether this entry is a context-compaction summary (compressed).
     pub is_compressed_summary: bool,
+    /// The FULL text content of the message (expandable-stats feature).
+    /// Populated from the message's text content; assistant tool-request
+    /// messages (empty text) carry the tool_calls rendered as indented
+    /// JSON instead. UIs that only need the one-line preview can ignore
+    /// this — it is purely additive.
+    pub full_content: String,
 }
 
 /// An event emitted during a turn. The CLI/gateway renders these live.
@@ -202,8 +208,11 @@ pub enum AgentEvent {
     },
 
     // ── Orchestration events ──────────────────────────────────────────
-    /// A subagent was spawned (per child).
+    /// A subagent was spawned (per child). `id` is stable for the child's
+    /// whole lifetime and correlates the [`AgentEvent::SubagentEvent`]
+    /// stream, completion, and the TUI's per-subagent pane.
     SubagentSpawn {
+        id: u64,
         goal: String,
         model: String,
         toolset_summary: String,
@@ -211,6 +220,7 @@ pub enum AgentEvent {
     },
     /// A subagent completed successfully.
     SubagentComplete {
+        id: u64,
         goal: String,
         success: bool,
         summary_preview: String,
@@ -219,6 +229,7 @@ pub enum AgentEvent {
     },
     /// A subagent failed with an error.
     SubagentFailed {
+        id: u64,
         goal: String,
         error: String,
         duration_secs: f64,
@@ -229,6 +240,21 @@ pub enum AgentEvent {
         succeeded: usize,
         failed: usize,
         total_duration_secs: f64,
+    },
+    /// A live event produced by a running subagent, tagged with the child's
+    /// stable id (parallel-subagent feature). The orchestration layer wraps
+    /// EVERY event the child `Agent` emits — `ContentDelta`, `ToolStart`,
+    /// `ContextSnapshot`, even the child's own `Done` — so a UI can render a
+    /// dedicated per-subagent view without those events contaminating the
+    /// parent's transcript or turn state. Consumers that don't care about
+    /// per-subagent detail can ignore this variant entirely; the plain
+    /// `SubagentSpawn`/`SubagentComplete`/`SubagentFailed` lifecycle events
+    /// still arrive unwrapped alongside it.
+    SubagentEvent {
+        /// Stable child id (matches `SubagentSpawn.id`).
+        id: u64,
+        /// The child's own event.
+        event: Box<AgentEvent>,
     },
 
     // ── OMO orchestration events ─────────────────────────────────────

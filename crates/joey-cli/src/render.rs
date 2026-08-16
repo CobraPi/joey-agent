@@ -952,7 +952,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     pending_separator = true;
                 }
             }
-            AgentEvent::SubagentSpawn { goal, model, toolset_summary, depth } => {
+            AgentEvent::SubagentSpawn { id: _, goal, model, toolset_summary, depth } => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
                     if drain_separator(&mut pending_separator) { println!(); }
@@ -962,7 +962,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     pending_separator = true;
                 }
             }
-            AgentEvent::SubagentComplete { goal, success, summary_preview, token_usage, duration_secs } => {
+            AgentEvent::SubagentComplete { id: _, goal, success, summary_preview, token_usage, duration_secs } => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
                     if drain_separator(&mut pending_separator) { println!(); }
@@ -972,7 +972,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     pending_separator = true;
                 }
             }
-            AgentEvent::SubagentFailed { goal, error, duration_secs } => {
+            AgentEvent::SubagentFailed { id: _, goal, error, duration_secs } => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
                     if drain_separator(&mut pending_separator) { println!(); }
@@ -980,6 +980,12 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     println!("{}", t.error.ansi().paint(label));
                     pending_separator = true;
                 }
+            }
+            AgentEvent::SubagentEvent { .. } => {
+                // Parallel-subagent feature: per-child live events are
+                // consumed by the TUI's panes; the line renderer keeps its
+                // compact summary output (lifecycle events below) and
+                // ignores the raw stream.
             }
             AgentEvent::DelegationBatchComplete { total, succeeded, failed, total_duration_secs } => {
                 if !opts.quiet {

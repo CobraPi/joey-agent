@@ -84,7 +84,12 @@ impl Tool for DelegateTask {
          subagent gets its own conversation history, toolset, and execution budget. \
          The parent receives only a concise summary from each child. By default, \
          subagent traces are ephemeral (discarded after summary); set persist=true \
-         to store the child session for later session_search recall."
+         to store the child session for later session_search recall. \
+         PARALLELISM: batch `tasks` all launch simultaneously (bounded only by \
+         system capacity) — for codebase exploration or multi-part implementation, \
+         ALWAYS fan out one task per concern in a single batch call instead of \
+         sequential single-goal calls; this cuts wall-clock time dramatically \
+         by parallelizing inference."
     }
 
     fn parameters(&self) -> Value {

@@ -54,12 +54,39 @@ impl Default for ManagerConfig {
 
 impl ManagerConfig {
     /// Build from a Config tree, reading `delegation.*` and `omo.background_task.*` keys.
+    ///
+    /// `delegation.max_concurrent_children = 0` (or `auto`) selects
+    /// capacity-driven sizing: the detected system (CPUs + available RAM)
+    /// determines how many children may run simultaneously, clamped to
+    /// `[capacity::FLOOR_CHILDREN, capacity::HARD_CHILD_CEILING]`. This is
+    /// the "use everything the host can support" posture for parallel
+    /// inference — the provider request semaphore, not CPU count, is the
+    /// real throttle once children are network-bound.
     pub fn from_config(cfg: &Config) -> Self {
-        let max_children = cfg.get_i64("delegation.max_concurrent_children", 3) as usize;
-        let max_requests = cfg.get_i64(
-            "delegation.max_concurrent_requests",
-            (max_children + 2) as i64,
-        ) as usize;
+        let raw_children = cfg.get_i64("delegation.max_concurrent_children", 0);
+        let max_children = if raw_children <= 0 {
+            crate::capacity::capacity_children(
+                &crate::capacity::SystemCapacity::detect(),
+                cfg.get_i64(
+                    "delegation.auto_mem_reserve_mb_per_child",
+                    crate::capacity::DEFAULT_MEM_RESERVE_MB_PER_CHILD as i64,
+                )
+                .max(1) as u64,
+                cfg.get_f64(
+                    "delegation.auto_mem_max_fraction",
+                    crate::capacity::DEFAULT_MEM_MAX_FRACTION,
+                )
+                .clamp(0.05, 0.95),
+            )
+        } else {
+            raw_children as usize
+        };
+        let max_requests = cfg.get_i64("delegation.max_concurrent_requests", 0) as usize;
+        let max_requests = if max_requests == 0 {
+            crate::capacity::capacity_requests(max_children)
+        } else {
+            max_requests
+        };
         let default_model = cfg.get_str("delegation.default_model", "").to_string();
 
         // OMO concurrency config (FR-031, T148).
@@ -113,6 +140,16 @@ pub struct SubagentManager {
     /// Cooperative interrupt signal shared with all spawned subagents (FR-015).
     /// When set to true, running subagents wind down cooperatively.
     interrupt: Arc<AtomicBool>,
+    /// Monotonic child-id generator (parallel-subagent feature). Ids are
+    /// stable for a child's whole lifetime and correlate the wrapped
+    /// `AgentEvent::SubagentEvent` stream with its lifecycle events.
+    next_child_id: std::sync::atomic::AtomicU64,
+    /// Optional live event tap (parallel-subagent feature). When set, every
+    /// orchestration + child event is forwarded here in addition to any
+    /// per-dispatch `event_tx`. The CLI uses this to wire delegation
+    /// events into the TUI without rebuilding the tool registry per turn
+    /// (the tool was constructed with `event_tx: None`).
+    event_tap: std::sync::Mutex<Option<mpsc::UnboundedSender<AgentEvent>>>,
 }
 
 impl SubagentManager {
@@ -124,7 +161,37 @@ impl SubagentManager {
             semaphore: Arc::new(Semaphore::new(permits)),
             depth: 0,
             interrupt: Arc::new(AtomicBool::new(false)),
+            next_child_id: std::sync::atomic::AtomicU64::new(1),
+            event_tap: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Install a live event tap (parallel-subagent feature). Every
+    /// orchestration event (spawn/complete/failed/batch) AND every wrapped
+    /// child event is mirrored to this channel. Setting a new tap replaces
+    /// the previous one; `None` removes it.
+    pub fn set_event_tap(&self, tap: Option<mpsc::UnboundedSender<AgentEvent>>) {
+        *self
+            .event_tap
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = tap;
+    }
+
+    /// The current event tap sender: the manager-local tap when set, else
+    /// the process-global tap (parallel-subagent feature).
+    pub fn event_tap(&self) -> Option<mpsc::UnboundedSender<AgentEvent>> {
+        let local = self
+            .event_tap
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        local.or_else(crate::tap::global_tap)
+    }
+
+    /// Allocate the next stable child id.
+    fn next_id(&self) -> u64 {
+        self.next_child_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The concurrency limiter semaphore (shared across parent + children).
@@ -200,15 +267,22 @@ impl SubagentManager {
             &parent_config.model,
         );
         let ts_sum = crate::subagent::toolset_summary(&req.toolsets);
+        let id = self.next_id();
+        let tap = self.event_tap();
 
-        // Emit SubagentSpawn event.
+        // Emit SubagentSpawn event (per-dispatch channel + live tap).
+        let spawn_ev = AgentEvent::SubagentSpawn {
+            id,
+            goal: req.goal.clone(),
+            model: model.clone(),
+            toolset_summary: ts_sum.clone(),
+            depth: self.depth,
+        };
         if let Some(tx) = event_tx {
-            let _ = tx.send(AgentEvent::SubagentSpawn {
-                goal: req.goal.clone(),
-                model: model.clone(),
-                toolset_summary: ts_sum.clone(),
-                depth: self.depth,
-            });
+            let _ = tx.send(spawn_ev.clone());
+        }
+        if let Some(tap) = &tap {
+            let _ = tap.send(spawn_ev);
         }
 
         let subagent = match Subagent::new(
@@ -226,12 +300,17 @@ impl SubagentManager {
             Ok(s) => s,
             Err(e) => {
                 let err_msg = format!("Failed to create subagent: {}", e);
+                let fail_ev = AgentEvent::SubagentFailed {
+                    id,
+                    goal: req.goal.clone(),
+                    error: err_msg.clone(),
+                    duration_secs: 0.0,
+                };
                 if let Some(tx) = event_tx {
-                    let _ = tx.send(AgentEvent::SubagentFailed {
-                        goal: req.goal.clone(),
-                        error: err_msg.clone(),
-                        duration_secs: 0.0,
-                    });
+                    let _ = tx.send(fail_ev.clone());
+                }
+                if let Some(tap) = &tap {
+                    let _ = tap.send(fail_ev);
                 }
                 return DelegationResult {
                     goal: req.goal.clone(),
@@ -248,36 +327,48 @@ impl SubagentManager {
         };
 
         let start = Instant::now();
-        let result = subagent.run(event_tx).await;
+        let result = subagent.run_with_tap(id, event_tx, tap.as_ref()).await;
         let elapsed = start.elapsed().as_secs_f64();
 
-        // Emit completion/failure event.
-        if let Some(tx) = event_tx {
-            if result.success {
-                let preview: String = result.summary.chars().take(100).collect();
-                let _ = tx.send(AgentEvent::SubagentComplete {
-                    goal: result.goal.clone(),
-                    success: true,
-                    summary_preview: preview,
-                    token_usage: result.token_usage.clone(),
-                    duration_secs: elapsed,
-                });
-            } else {
-                let _ = tx.send(AgentEvent::SubagentFailed {
-                    goal: result.goal.clone(),
-                    error: result.error.clone().unwrap_or_default(),
-                    duration_secs: elapsed,
-                });
+        // Emit completion/failure event (per-dispatch channel + live tap).
+        let done_ev = if result.success {
+            let preview: String = result.summary.chars().take(100).collect();
+            AgentEvent::SubagentComplete {
+                id,
+                goal: result.goal.clone(),
+                success: true,
+                summary_preview: preview,
+                token_usage: result.token_usage.clone(),
+                duration_secs: elapsed,
             }
+        } else {
+            AgentEvent::SubagentFailed {
+                id,
+                goal: result.goal.clone(),
+                error: result.error.clone().unwrap_or_default(),
+                duration_secs: elapsed,
+            }
+        };
+        if let Some(tx) = event_tx {
+            let _ = tx.send(done_ev.clone());
+        }
+        if let Some(tap) = &tap {
+            let _ = tap.send(done_ev);
         }
 
         result
     }
 
     /// Dispatch a batch of subagents in parallel (batch mode).
-    /// One failure does not cancel others. The parent's semaphore is shared
-    /// across all children (FR-018). Batches larger than max_concurrent_children
-    /// are chunked so at most that many run simultaneously (FR-018).
+    ///
+    /// PARALLEL-SUBAGENT FEATURE: all children in the batch are spawned as
+    /// ONE wave of tokio tasks — no `max_concurrent_children` chunking of
+    /// the waiting list. Admission to actually run is gated by the shared
+    /// provider-request `Semaphore` (each child's provider calls acquire
+    /// permits, FR-018), which is the correct throttle for network-bound
+    /// work; `max_concurrent_children` now only bounds how many children a
+    /// single batch may contain (excess tasks are chunked as before). One
+    /// failure does not cancel others.
     #[allow(clippy::too_many_arguments)] // deviation: domain-shaped batch dispatch, parameter bag would be speculative abstraction
     pub async fn dispatch_batch(
         &self,
@@ -307,12 +398,12 @@ impl SubagentManager {
         let depth = self.depth;
         let max_children = self.config.max_concurrent_children.max(1);
         let shared_semaphore = self.semaphore.clone();
+        let tap = self.event_tap();
 
         let mut all_results = Vec::with_capacity(total);
 
-        // Process in chunks of max_concurrent_children so excess tasks queue.
-        // Collect each chunk into an owned Vec to avoid lifetime issues with
-        // borrowed slice items moved into async blocks.
+        // Chunk only when the batch exceeds the children cap; within a
+        // chunk everything runs concurrently (semaphore-gated).
         let chunks: Vec<Vec<DelegationRequest>> = requests
             .into_iter()
             .collect::<Vec<_>>()
@@ -331,6 +422,11 @@ impl SubagentManager {
                 let tx = event_tx.cloned();
                 let sem = shared_semaphore.clone();
                 let interrupt = self.interrupt.clone();
+                let tap = tap.clone();
+                // Allocate the child's stable id from the PARENT manager so
+                // ids are unique + monotonic across the whole batch (the
+                // child manager below starts its counter here).
+                let child_id = self.next_id();
 
                 join_set.spawn(async move {
                     // Each child shares the PARENT's semaphore (FR-018).
@@ -339,6 +435,8 @@ impl SubagentManager {
                         semaphore: sem,
                         depth,
                         interrupt,
+                        next_child_id: std::sync::atomic::AtomicU64::new(child_id),
+                        event_tap: std::sync::Mutex::new(tap),
                     };
                     mgr.dispatch_single_with_overrides(
                         &req,
@@ -375,13 +473,17 @@ impl SubagentManager {
         let succeeded = ordered.iter().filter(|r| r.success).count();
         let failed = ordered.len().saturating_sub(succeeded);
 
+        let batch_ev = AgentEvent::DelegationBatchComplete {
+            total,
+            succeeded,
+            failed,
+            total_duration_secs: elapsed,
+        };
         if let Some(tx) = event_tx {
-            let _ = tx.send(AgentEvent::DelegationBatchComplete {
-                total,
-                succeeded,
-                failed,
-                total_duration_secs: elapsed,
-            });
+            let _ = tx.send(batch_ev.clone());
+        }
+        if let Some(tap) = &tap {
+            let _ = tap.send(batch_ev);
         }
 
         ordered
@@ -421,7 +523,14 @@ mod tests {
     fn config_from_config_tree() {
         let cfg = joey_core::Config::defaults();
         let c = ManagerConfig::from_config(&cfg);
-        assert_eq!(c.max_concurrent_children, 3);
+        // The schema default is `auto` → capacity-driven sizing (bounded by
+        // the detected host, not the old fixed 3).
+        assert!(
+            c.max_concurrent_children >= crate::capacity::FLOOR_CHILDREN
+                && c.max_concurrent_children <= crate::capacity::HARD_CHILD_CEILING,
+            "auto sizing within [floor, ceiling], got {}",
+            c.max_concurrent_children
+        );
         assert_eq!(c.default_max_turns, 50);
     }
 }

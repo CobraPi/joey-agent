@@ -253,9 +253,28 @@ impl Subagent {
     }
 
     /// Run the subagent's turn loop and produce a DelegationResult.
+    ///
+    /// Backward-compatible wrapper: no live tap, events forwarded raw to the
+    /// per-dispatch channel (legacy behavior for direct callers/tests).
+    #[allow(dead_code)] // legacy entry kept for direct callers/tests; manager uses run_with_tap
     pub(crate) async fn run(
-        mut self,
+        self,
         event_tx: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
+    ) -> DelegationResult {
+        self.run_with_tap(0, event_tx, None).await
+    }
+
+    /// Run the subagent's turn loop, forwarding every child event to the
+    /// tap wrapped as `AgentEvent::SubagentEvent { id, event }` (parallel-
+    /// subagent feature) while the per-dispatch channel keeps receiving the
+    /// RAW events (legacy behavior preserved).
+    ///
+    /// Id `0` + no tap is byte-identical to the pre-feature `run`.
+    pub(crate) async fn run_with_tap(
+        mut self,
+        id: u64,
+        event_tx: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
+        tap: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
     ) -> DelegationResult {
         let start = Instant::now();
         let goal = self.goal.clone();
@@ -302,8 +321,36 @@ impl Subagent {
             }
         });
 
-        let result: TurnResult = self.agent.run_turn(&initial_prompt, tx_for_run).await;
-        
+        // Parallel-subagent feature: intercept the child's event stream.
+        // When a tap is installed, every event the child emits is FIRST
+        // mirrored to the tap (wrapped with the child's stable id) and ALSO
+        // forwarded raw to the legacy per-dispatch channel so existing
+        // consumers are unaffected. Implementation: wrap the sender with a
+        // fan-out via an mpsc channel + forwarding task.
+        let result: TurnResult = if tap.is_some() {
+            let (child_tx, mut child_rx) =
+                tokio::sync::mpsc::unbounded_channel::<joey_agent_core::AgentEvent>();
+            let tap_tx = tap.cloned().unwrap();
+            let legacy_tx = tx_for_run.clone();
+            let fanout = tokio::spawn(async move {
+                while let Some(ev) = child_rx.recv().await {
+                    if id != 0 {
+                        let _ = tap_tx.send(joey_agent_core::AgentEvent::SubagentEvent {
+                            id,
+                            event: Box::new(ev.clone()),
+                        });
+                    }
+                    let _ = legacy_tx.send(ev);
+                }
+            });
+            let r = self.agent.run_turn(&initial_prompt, child_tx).await;
+            // child_tx drops here → fanout drains → task ends.
+            let _ = fanout.await;
+            r
+        } else {
+            self.agent.run_turn(&initial_prompt, tx_for_run).await
+        };
+
         // Stop the forwarder.
         forwarder_handle.abort();
         let elapsed = start.elapsed();

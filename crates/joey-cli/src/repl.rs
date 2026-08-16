@@ -786,6 +786,15 @@ async fn process_input(raw: &str, st: &mut ReplState) -> LoopOutcome {
 async fn run_turn_interactive(st: &mut ReplState, input: &str) -> String {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let render_handle = tokio::spawn(render::render_turn(rx, st.ropts.clone()));
+    // Parallel-subagent feature: route delegation events (spawn/complete/
+    // failed — the tool registers with event_tx: None) into this turn's
+    // render stream via the process-global tap, so the line REPL shows
+    // subagent lifecycle lines just like the TUI does. Wrapped child
+    // streams are ignored by the renderer (render.rs handles the variant).
+    {
+        let tx_for_tap = tx.clone();
+        joey_orchestration::tap::set_global_tap(Some(tx_for_tap));
+    }
     let interrupt = st.agent.interrupt_handle();
 
     let mut last_ctrlc: Option<Instant> = None;
@@ -810,6 +819,9 @@ async fn run_turn_interactive(st: &mut ReplState, input: &str) -> String {
         }
     }
     let final_text = render_handle.await.unwrap_or_default();
+    // Turn over: drop the line REPL's tap (a background delegation outliving
+    // the turn would send into a dead render task otherwise).
+    joey_orchestration::tap::set_global_tap(None);
     st.last_response = final_text.clone();
 
     // Auto-checkpoint: take a filesystem snapshot after each agent turn if

@@ -1028,6 +1028,69 @@ pub fn transcript_hit_test(app: &App, theme: Theme, row: u16, col: u16) -> Optio
     None
 }
 
+/// Generic transcript hit-test core (expandable-stats / pane parity):
+/// resolves a screen row to an item index in ANY bottom-anchored transcript
+/// render (main or pane), given the raw render inputs. The accounting
+/// mirrors [`draw_transcript`]: items newest-last with the streaming tail
+/// (if any) bottommost, scroll anchored to the bottom.
+pub fn transcript_hit_test_core(
+    transcript: &std::collections::VecDeque<TranscriptItem>,
+    streaming: &str,
+    scroll: Option<usize>,
+    last_max_scroll: usize,
+    (_tx, ty, tw, th): (u16, u16, u16, u16),
+    theme: Theme,
+    row: u16,
+) -> Option<usize> {
+    if th == 0 || tw == 0 {
+        return None;
+    }
+    if row < ty || row >= ty + th {
+        return None;
+    }
+    let content_w = tw as usize;
+    let visible = th as usize;
+    let offset = scroll.unwrap_or(0);
+    let click_row_from_top = (row - ty) as usize;
+
+    let mut blocks_rev: Vec<(usize, usize)> = Vec::new();
+    let mut built = 0usize;
+    let has_streaming = !streaming.is_empty();
+    if has_streaming {
+        built += 1 + wrap(streaming, content_w.saturating_sub(2)).len();
+    }
+    let needed = visible + offset + 1;
+    for (i, item) in transcript.iter().enumerate().rev() {
+        if built >= needed {
+            break;
+        }
+        let ls = item_lines(item, content_w, theme).len();
+        built += ls;
+        blocks_rev.push((i, ls));
+    }
+    let items_fwd: Vec<(usize, usize)> = blocks_rev.into_iter().rev().collect();
+    let streaming_line_count = if has_streaming {
+        1 + wrap(streaming, content_w.saturating_sub(2)).len()
+    } else {
+        0
+    };
+    let total = items_fwd.iter().map(|(_, c)| *c).sum::<usize>() + streaming_line_count;
+    let clamped = offset.min(last_max_scroll.max(total.saturating_sub(visible)));
+    let scroll_rows = total.saturating_sub(visible + clamped);
+    let content_line = scroll_rows + click_row_from_top;
+    if content_line >= total {
+        return None;
+    }
+    let mut acc = 0usize;
+    for &(item_idx, count) in &items_fwd {
+        if content_line < acc + count {
+            return Some(item_idx);
+        }
+        acc += count;
+    }
+    None
+}
+
 /// Resolve the transcript item that owns the FIRST fully-visible content
 /// line of the viewport (the item at the top of the screen). Used by the
 /// keyboard expand toggle (Space/Enter/x in transcript focus) so expansion
@@ -1524,6 +1587,180 @@ pub fn draw_output_viewer(f: &mut Frame, area: Rect, app: &App, theme: Theme, sp
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
+// ── Expandable context stream (expandable-stats feature) ──────────────────
+//
+// Shared builder for the stats pages' context stream: one header row per
+// entry (index/role/tokens/preview + expand affordance), and — when the
+// entry is in the expansion set — the FULL content rendered inline with a
+// line-number gutter, the same visual language as the maximized output
+// viewer. Returns the built lines plus a per-entry (first_row, row_count)
+// map used for click hit-testing against the pane's content grid.
+
+/// Cap on the number of wrapped lines an expanded entry may occupy in the
+/// stream. Entries larger than this get a "… N more lines (open output
+/// viewer)" affordance instead of an unbounded inline dump; a giant tool
+/// result would otherwise swallow the whole stream.
+const MAX_EXPANDED_ENTRY_LINES: usize = 40;
+
+/// The built context-stream pieces: display lines + the entry geometry.
+pub(crate) struct ContextStream {
+    pub lines: Vec<Line<'static>>,
+    /// (entry_index, first_row, row_count) — rows are indices into `lines`.
+    pub entry_rows: Vec<(usize, usize, usize)>,
+    /// Total line count (== lines.len()).
+    pub total: usize,
+}
+
+/// Build the context stream for a stats page.
+///
+/// * `entries` — the snapshot's entries (oldest first).
+/// * `expanded` — which entry indices are expanded.
+/// * `content_w` — usable width for previews/content.
+/// * `empty_note` — placeholder line when there are no entries.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_context_stream(
+    entries: &[joey_agent_core::events::ContextEntry],
+    expanded: &std::collections::HashSet<usize>,
+    content_w: usize,
+    theme: Theme,
+    empty_note: &str,
+) -> ContextStream {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut entry_rows: Vec<(usize, usize, usize)> = Vec::new();
+    let idx_w = entries.len().max(1).to_string().len();
+
+    for (i, e) in entries.iter().enumerate() {
+        let first_row = lines.len();
+        let (role_label, role_col) = match e.role.as_str() {
+            "user" => ("user", theme.accent),
+            "assistant" => ("asst", theme.info),
+            "tool" => ("tool", theme.warning),
+            _ => (e.role.as_str(), theme.fg_more_subtle),
+        };
+        let flag = if e.is_compressed_summary {
+            " ⤳compressed"
+        } else if e.has_tool_calls {
+            " ⚒calls"
+        } else {
+            ""
+        };
+        let is_expanded = expanded.contains(&i);
+        // Expand affordance: ▸ collapsed / ▾ expanded (always shown — every
+        // entry is expandable, matching the main transcript's click-any-item).
+        let arrow = if is_expanded { "▾" } else { "▸" };
+        let header_preview_w = content_w.saturating_sub(24);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:>idx_w$} ", i + 1, idx_w = idx_w),
+                Style::default().fg(theme.fg_most_subtle.to_color()),
+            ),
+            Span::styled(
+                arrow.to_string(),
+                Style::default()
+                    .fg(theme.primary.to_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {:<5}", role_label),
+                Style::default().fg(role_col.to_color()),
+            ),
+            Span::styled(
+                format!("{:>7}t ", fmt_tokens(e.tokens)),
+                Style::default().fg(theme.fg_more_subtle.to_color()),
+            ),
+            Span::styled(
+                format!(
+                    "{}{}",
+                    if is_expanded {
+                        String::new()
+                    } else {
+                        one_line(&e.preview, header_preview_w)
+                    },
+                    if is_expanded { "" } else { flag }
+                ),
+                Style::default().fg(theme.fg_subtle.to_color()),
+            ),
+        ]));
+
+        if is_expanded {
+            // Inline full content with a gutter (output-viewer style).
+            let text = &e.full_content;
+            let gutter_w = digits(text.lines().count().max(1));
+            let body_w = content_w.saturating_sub(gutter_w + 5).max(4);
+            let wrapped: Vec<(usize, String)> = text
+                .lines()
+                .enumerate()
+                .flat_map(|(ln, l)| {
+                    wrap(l, body_w)
+                        .into_iter()
+                        .map(move |w| (ln + 1, w))
+                })
+                .collect();
+            let truncated = wrapped.len() > MAX_EXPANDED_ENTRY_LINES;
+            let shown = if truncated {
+                &wrapped[..MAX_EXPANDED_ENTRY_LINES]
+            } else {
+                &wrapped[..]
+            };
+            for (ln, wl) in shown {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:>w$} │ ", ln, w = gutter_w),
+                        Style::default().fg(theme.fg_most_subtle.to_color()),
+                    ),
+                    Span::styled(
+                        wl.clone(),
+                        Style::default().fg(theme.fg_more_subtle.to_color()),
+                    ),
+                ]));
+            }
+            if truncated {
+                lines.push(Line::from(vec![Span::styled(
+                    format!(
+                        "   … {} more lines — too large to expand inline",
+                        wrapped.len() - MAX_EXPANDED_ENTRY_LINES
+                    ),
+                    Style::default().fg(theme.fg_most_subtle.to_color()),
+                )]));
+            }
+            lines.push(Line::from(vec![Span::raw("")]));
+        }
+        entry_rows.push((i, first_row, lines.len() - first_row));
+    }
+
+    if entries.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {}", empty_note),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        )]));
+    }
+
+    ContextStream {
+        entry_rows,
+        total: lines.len(),
+        lines,
+    }
+}
+
+/// Resolve a click (row within the stream's visible window) to the context
+/// entry it belongs to. `start` is the window's first visible row index.
+#[allow(dead_code)] // superseded by App-level geometry hit-testing; kept for
+                    // direct callers building their own ContextStream.
+pub(crate) fn context_entry_hit(
+    stream: &ContextStream,
+    start: usize,
+    row: u16,
+    area_y: u16,
+) -> Option<usize> {
+    let content_row = row.saturating_sub(area_y) as usize + start;
+    for &(entry, first_row, count) in &stream.entry_rows {
+        if content_row >= first_row && content_row < first_row + count {
+            return Some(entry);
+        }
+    }
+    None
+}
+
 // ── Agent stats page (maximized context window) ────────────────────────────
 
 /// Render a bounded horizontal bar (`filled/total`), e.g. context usage.
@@ -1674,52 +1911,21 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
 
     lines.push(Line::from(vec![Span::raw("")]));
 
-    // ── Context stream (windowed, auto-follow/freeze) ──────────────────
-    // One display line per entry: "#idx role tokens preview".
-    let mut stream: Vec<Line> = Vec::with_capacity(app.context_entries.len());
-    for (i, e) in app.context_entries.iter().enumerate() {
-        let (role_label, role_col) = match e.role.as_str() {
-            "user" => ("user", theme.accent),
-            "assistant" => ("asst", theme.info),
-            "tool" => ("tool", theme.warning),
-            _ => (e.role.as_str(), theme.fg_more_subtle),
-        };
-        let flag = if e.is_compressed_summary {
-            " ⤳compressed"
-        } else if e.has_tool_calls {
-            " ⚒calls"
-        } else {
-            ""
-        };
-        let idx_w = app.context_entries.len().max(1).to_string().len();
-        stream.push(Line::from(vec![
-            Span::styled(
-                format!(" {:>idx_w$} ", i + 1, idx_w = idx_w),
-                Style::default().fg(theme.fg_most_subtle.to_color()),
-            ),
-            Span::styled(
-                format!("{:<5}", role_label),
-                Style::default().fg(role_col.to_color()),
-            ),
-            Span::styled(
-                format!("{:>7}t ", fmt_tokens(e.tokens)),
-                Style::default().fg(theme.fg_more_subtle.to_color()),
-            ),
-            Span::styled(
-                format!("{}{}", one_line(&e.preview, content_w.saturating_sub(20)), flag),
-                Style::default().fg(theme.fg_subtle.to_color()),
-            ),
-        ]));
-    }
-    if stream.is_empty() {
-        stream.push(Line::from(vec![Span::styled(
-            " (no context yet — send a prompt)".to_string(),
-            Style::default().fg(theme.fg_most_subtle.to_color()),
-        )]));
-    }
+    // ── Context stream (windowed, auto-follow/freeze, EXPANDABLE) ─────
+    // Expandable-stats feature: one header row per entry
+    // ("#idx ▸ role tokens preview") plus the full content inline when the
+    // entry is expanded — same affordance as the main transcript (click a
+    // row or press Space on the selected row to toggle).
+    let stream = build_context_stream(
+        &app.context_entries,
+        &app.expanded_context,
+        content_w,
+        theme,
+        "(no context yet — send a prompt)",
+    );
 
     let body_rows = inner.height.saturating_sub(lines.len() as u16 + 1).max(1) as usize; // +1 footer
-    let total = stream.len();
+    let total = stream.total;
     let visible = body_rows.min(total);
     let max_anchor = total.saturating_sub(visible);
     app.last_stats_max_anchor.set(max_anchor);
@@ -1728,7 +1934,13 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
         Some(anchor) => anchor.min(max_anchor),
     };
     let end = (start + visible).min(total);
-    lines.extend(stream.into_iter().skip(start).take(visible));
+    // Record the visible window + entry geometry for click hit-testing.
+    app.last_stats_window.set((inner.y, start));
+    app.last_stats_stream_rows.borrow_mut().clear();
+    app.last_stats_stream_rows
+        .borrow_mut()
+        .extend(stream.entry_rows.iter().copied());
+    lines.extend(stream.lines.into_iter().skip(start).take(visible));
 
     // Footer: live indicator + overflow counters + follow state.
     let mut footer = vec![Span::raw(" ")];
@@ -1757,6 +1969,10 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
             Style::default().fg(theme.fg_more_subtle.to_color()),
         ));
     }
+    footer.push(Span::styled(
+        "  · click a row (or Space) to expand".to_string(),
+        Style::default().fg(theme.fg_most_subtle.to_color()),
+    ));
     lines.push(Line::from(footer));
 
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -3046,6 +3262,7 @@ mod tests {
                 preview: "please fix the login bug".into(),
                 has_tool_calls: false,
                 is_compressed_summary: false,
+                full_content: String::new(),
             },
             ContextEntry {
                 role: "assistant".into(),
@@ -3053,6 +3270,7 @@ mod tests {
                 preview: "I'll search the codebase".into(),
                 has_tool_calls: true,
                 is_compressed_summary: false,
+                full_content: String::new(),
             },
             ContextEntry {
                 role: "tool".into(),
@@ -3060,6 +3278,7 @@ mod tests {
                 preview: "crates/auth/src/lib.rs:42".into(),
                 has_tool_calls: false,
                 is_compressed_summary: false,
+                full_content: String::new(),
             },
         ];
         app.apply(AgentEvent::ContextSnapshot {
@@ -3147,6 +3366,7 @@ mod tests {
                 preview: format!("message number {i}"),
                 has_tool_calls: false,
                 is_compressed_summary: false,
+                full_content: String::new(),
             })
             .collect();
         app.apply(AgentEvent::ContextSnapshot {
@@ -4480,4 +4700,339 @@ mod visual_check_tests {
         assert!(joined.contains("   43 + pub mod extra;"), "second insertion numbered");
         assert!(joined.contains("43 44"), "context after edits renumbers new side");
     }
+}
+
+// ── Per-subagent panes (parallel-subagent feature) ─────────────────────────
+//
+// The right-side vertical tab rail stacks one tab per spawned subagent.
+// Clicking a tab focuses that child: the main transcript area + the
+// maximized stats/context window retarget to the child's live stream. The
+// orchestrator's own view is always the leftmost implicit tab (focus None).
+
+use crate::state::SubagentPane;
+
+/// Draw the vertical subagent tab rail on the RIGHT edge of the body area.
+/// Each pane gets one stacked tab (goal preview + status glyph). Records
+/// per-tab hit rects on the App for click routing.
+pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    // Reset hit rects for this frame; re-recorded per drawn tab below.
+    app.last_subagent_tab_rects.borrow_mut().clear();
+
+    if app.subagent_panes.is_empty() || area.width < 3 || area.height < 3 {
+        return;
+    }
+
+    let rail_w = 18u16.min(area.width);
+    let rail = Rect::new(area.x + area.width - rail_w, area.y, rail_w, area.height);
+    // Panel background.
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.separator.to_color()))
+        .style(Style::default().bg(theme.bg_panel.to_color()));
+    let inner = block.inner(rail);
+    f.render_widget(block, rail);
+
+    // Title row.
+    let title = Line::from(vec![
+        Span::styled(
+            " subagents ".to_string(),
+            Style::default()
+                .fg(theme.primary.to_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("({})", app.subagent_panes.len()),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ),
+    ]);
+    if inner.width > 0 {
+        f.render_widget(
+            Paragraph::new(title).style(Style::default().bg(theme.bg_panel.to_color())),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+    }
+
+    // Tabs: 2 rows each, stacked vertically below the title.
+    let label_w = inner.width.saturating_sub(2) as usize;
+    for (i, pane) in app.subagent_panes.iter().enumerate() {
+        let tab_y = inner.y + 1 + (i as u16) * 2;
+        if tab_y + 1 >= inner.y + inner.height {
+            break; // rail full
+        }
+        let focused = app.focused_subagent == Some(i);
+        let (glyph, color) = match pane.status {
+            SubagentStatus::Running => ("◐", theme.busy),
+            SubagentStatus::Done => ("✓", theme.success),
+            SubagentStatus::Failed => ("✗", theme.error),
+            SubagentStatus::Pending => ("·", theme.fg_more_subtle),
+        };
+        let goal_line: String = pane.goal.chars().take(label_w.max(4)).collect();
+        let tab_area = Rect::new(inner.x, tab_y, inner.width, 2);
+        let style = if focused {
+            Style::default()
+                .bg(theme.primary.to_color())
+                .fg(theme.bg_void.to_color())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(theme.bg_panel.to_color())
+                .fg(theme.fg_base.to_color())
+        };
+        let mut spans = vec![
+            Span::styled(format!("{} ", glyph), Style::default().fg(color.to_color())),
+            Span::styled(goal_line, style),
+        ];
+        if focused {
+            spans.insert(0, Span::styled("▸".to_string(), Style::default().fg(theme.primary.to_color())));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(if focused {
+                theme.primary.to_color()
+            } else {
+                theme.bg_panel.to_color()
+            })),
+            tab_area,
+        );
+        // Record the clickable row (first line of the tab).
+        app.last_subagent_tab_rects
+            .borrow_mut()
+            .push((tab_area.x, tab_y, tab_area.width, 1));
+    }
+}
+
+/// Draw the focused subagent's transcript in the main area (parallel-
+/// subagent feature). Mirrors `draw_transcript` but reads from the pane and
+/// records geometry into the App-level pane cells.
+pub fn draw_pane_transcript(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    pane: &SubagentPane,
+    theme: Theme,
+    focused: bool,
+    glow: f32,
+) {
+    let title = format!(
+        " ◆ subagent: {} [{}] {} ",
+        pane.goal,
+        pane.model,
+        match pane.status {
+            SubagentStatus::Running => "· live",
+            SubagentStatus::Done => "· done",
+            SubagentStatus::Failed => "· failed",
+            SubagentStatus::Pending => "· queued",
+        }
+    );
+    let block = panel_block(&title, theme, focused, glow);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        app.last_pane_text_area.set((0, 0, 0, 0));
+        return;
+    }
+
+    let content_width = inner.width.saturating_sub(1) as usize;
+    let text_area = Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height);
+    app.last_pane_text_area.set((
+        text_area.x,
+        text_area.y,
+        text_area.width,
+        text_area.height,
+    ));
+
+    let content_w = content_width;
+    let visible = text_area.height as usize;
+    let offset = pane.scroll.unwrap_or(0);
+    let needed = visible + offset + 1;
+
+    let mut blocks_rev: Vec<Vec<Line>> = Vec::new();
+    let mut built = 0usize;
+
+    if !pane.streaming_assistant.is_empty() {
+        let mut tail = vec![Line::from(vec![Span::styled(
+            "◆ agent ",
+            Style::default().fg(theme.info.to_color()).add_modifier(Modifier::BOLD),
+        )])];
+        for wl in wrap(&pane.streaming_assistant, content_w.saturating_sub(2)) {
+            tail.push(Line::from(vec![Span::styled(
+                format!("  {}", wl),
+                Style::default().fg(theme.fg_base.to_color()),
+            )]));
+        }
+        built += tail.len();
+        blocks_rev.push(tail);
+    }
+
+    let mut exhausted = true;
+    for item in pane.transcript.iter().rev() {
+        if built >= needed {
+            exhausted = false;
+            break;
+        }
+        let ls = item_lines(item, content_w, theme);
+        built += ls.len();
+        blocks_rev.push(ls);
+    }
+
+    let lines: Vec<Line> = blocks_rev.into_iter().rev().flatten().collect();
+    let total = lines.len();
+    let max_scroll = if exhausted {
+        total.saturating_sub(visible)
+    } else {
+        offset + visible
+    };
+    app.last_pane_max_scroll.set(max_scroll);
+
+    let clamped = offset.min(max_scroll);
+    let scroll_rows = total.saturating_sub(visible + clamped).min(u16::MAX as usize);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((scroll_rows as u16, 0)),
+        text_area,
+    );
+}
+
+/// Draw the focused subagent's maximized stats/context page (parallel-
+/// subagent feature). Mirrors `draw_stats_page` but reads the pane's
+/// context-window snapshot + usage; driven when the user opens the stats
+/// view while a pane is focused.
+pub fn draw_pane_stats_page(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    pane: &SubagentPane,
+    theme: Theme,
+    spinner: &Spinner,
+) {
+    app.last_pane_stats_rect.set((area.x, area.y, area.width, area.height));
+    let live = pane.status == SubagentStatus::Running;
+    let title = format!(
+        " ◆ subagent stats · {} · {} ",
+        pane.model,
+        if live { "LIVE · Esc to restore" } else { "Esc to restore" }
+    );
+    let block = gradient_block_focused(&title, theme, 0.6);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let content_w = inner.width.max(1) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let used = pane.context_system_tokens + pane.context_history_tokens;
+    let pct = pane.context_usage_pct();
+    let bar_w = (content_w.saturating_sub(34)).clamp(10, 40);
+    let (pct_col, warn) = if pct >= 85.0 {
+        (theme.error, " ⚠ near limit")
+    } else if pct >= 65.0 {
+        (theme.warning, "")
+    } else {
+        (theme.success, "")
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            " context ".to_string(),
+            Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "{} / {} ({:.1}%){}  ",
+                fmt_tokens(used),
+                if pane.context_window > 0 { fmt_tokens(pane.context_window) } else { "?".into() },
+                pct,
+                warn,
+            ),
+            Style::default().fg(pct_col.to_color()),
+        ),
+        Span::styled(
+            usage_bar(bar_w, pct as f32 / 100.0, &theme),
+            Style::default().fg(pct_col.to_color()),
+        ),
+    ]));
+    // Breakdown.
+    lines.push(Line::from(vec![
+        Span::styled("         ".to_string(), Style::default()),
+        Span::styled(
+            format!(
+                "goal: {} · system {} · history {} · msgs {}",
+                pane.goal,
+                fmt_tokens(pane.context_system_tokens),
+                fmt_tokens(pane.context_history_tokens),
+                pane.context_entries.len(),
+            ),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ),
+    ]));
+    // Session usage.
+    lines.push(Line::from(vec![
+        Span::styled(" child   ".to_string(), Style::default().fg(theme.accent.to_color())),
+        Span::styled(
+            format!(
+                "prompt {} · completion {} · total {} · iters {} · {:.0}s elapsed",
+                fmt_tokens(pane.tokens.prompt),
+                fmt_tokens(pane.tokens.completion),
+                fmt_tokens(pane.tokens.total()),
+                pane.tokens.iterations,
+                pane.started.elapsed().as_secs_f32(),
+            ),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ),
+    ]));
+    lines.push(Line::from(vec![Span::raw("")]));
+
+    // Context stream (windowed like the main stats page, EXPANDABLE).
+    let stream = build_context_stream(
+        &pane.context_entries,
+        &pane.expanded_context,
+        content_w,
+        theme,
+        "(no context yet — the child is waiting for its first response)",
+    );
+
+    let body_rows = inner.height.saturating_sub(lines.len() as u16 + 1).max(1) as usize;
+    let total = stream.total;
+    let visible = body_rows.min(total);
+    let max_anchor = total.saturating_sub(visible);
+    app.last_pane_stats_max_anchor.set(max_anchor);
+    let start = match app.pane_stats_view {
+        None => max_anchor,
+        Some(anchor) => anchor.min(max_anchor),
+    };
+    let end = (start + visible).min(total);
+    // Record the visible window + entry geometry for click hit-testing.
+    app.last_pane_stats_window.set((inner.y, start));
+    app.last_pane_stats_stream_rows.borrow_mut().clear();
+    app.last_pane_stats_stream_rows
+        .borrow_mut()
+        .extend(stream.entry_rows.iter().copied());
+    lines.extend(stream.lines.into_iter().skip(start).take(visible));
+
+    // Footer.
+    let mut footer = vec![Span::raw(" ")];
+    if live {
+        footer.push(spinner.styled_glyph(theme));
+        footer.push(Span::styled(
+            " live".to_string(),
+            Style::default().fg(theme.busy.to_color()),
+        ));
+    }
+    if start > 0 {
+        footer.push(Span::styled(
+            format!("  ↑{} above", start),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        ));
+    }
+    if total > visible && app.pane_stats_view.is_some() {
+        footer.push(Span::styled(
+            format!("  ↓{} below · scroll to bottom to resume", total - end),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ));
+    }
+    footer.push(Span::styled(
+        "  · click a row (or Space) to expand".to_string(),
+        Style::default().fg(theme.fg_most_subtle.to_color()),
+    ));
+    lines.push(Line::from(footer));
+
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }

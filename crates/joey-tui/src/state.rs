@@ -183,18 +183,19 @@ pub fn display_result_content(content: &str) -> Option<String> {
     }
 }
 
-/// Pretty-print a string as JSON when it parses (2-space indent). Any string
-/// embedded in the JSON keeps its REAL escapes for valid JSON; on parse
-/// failure the original is returned unchanged. This is what makes raw tool
-/// output readable in a text-editor-like view (no literal `\n` runs).
+/// Pretty-print a string as JSON when it parses (2-space indent), for
+/// DISPLAY in text-editor-like views: string values keep their REAL
+/// newlines/tabs (via [`joey_core::utils::pretty_json_for_display`]) so
+/// the view shows actual line breaks instead of literal `\n` escape runs.
+/// On parse failure the original is returned unchanged.
 pub fn pretty_json_if_parses(s: &str) -> String {
     let trimmed = s.trim();
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
         return s.to_string();
     }
-    match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| s.to_string()),
-        Err(_) => s.to_string(),
+    match joey_core::utils::pretty_json_for_display(trimmed) {
+        Some(out) => out,
+        None => s.to_string(),
     }
 }
 
@@ -261,6 +262,9 @@ pub struct DisplayAgent {
 pub struct ActiveSubagentEntry {
     /// Unique entry ID.
     pub id: usize,
+    /// Stable child id from the orchestration layer (parallel-subagent
+    /// feature). Correlates SubagentSpawn/SubagentEvent/SubagentComplete.
+    pub child_id: u64,
     /// "explore", "librarian", "oracle", "sisyphus-junior", etc.
     pub agent_type: String,
     /// If category-spawned (e.g. "quick").
@@ -284,6 +288,291 @@ pub struct ActiveSubagentEntry {
     pub tool_call_count: usize,
     /// T155: Name of the most recent tool invoked by this entry.
     pub last_tool: Option<String>,
+}
+
+// ── Per-subagent panes (parallel-subagent feature) ─────────────────────
+
+/// A dedicated live view for one subagent. The TUI keeps one pane per
+/// spawned child; the right-side vertical tab rail lists them and clicking
+/// a tab focuses that pane, retargeting the main transcript + the
+/// maximized stats/context window to the child's stream.
+#[derive(Clone, Debug)]
+pub struct SubagentPane {
+    /// Stable child id (correlates SubagentSpawn.id).
+    pub child_id: u64,
+    /// Goal line (tab label source).
+    pub goal: String,
+    /// Resolved model.
+    pub model: String,
+    /// Toolset summary at spawn.
+    pub toolset_summary: String,
+    /// Delegation depth.
+    pub depth: usize,
+    /// Lifecycle status.
+    pub status: SubagentStatus,
+    /// The child's transcript (items pushed from wrapped SubagentEvents).
+    pub transcript: VecDeque<TranscriptItem>,
+    /// Bounded capacity for the child transcript (ring).
+    pub transcript_capacity: usize,
+    /// Live streaming assistant text from the child.
+    pub streaming_assistant: String,
+    /// Live streaming reasoning text from the child.
+    pub streaming_reasoning: String,
+    /// Scroll offset in the child transcript (None = auto-follow).
+    pub scroll: Option<usize>,
+    /// Latest context-window snapshot fields (for the per-child stats view).
+    pub context_entries: Vec<ContextEntry>,
+    pub context_system_tokens: u64,
+    pub context_history_tokens: u64,
+    pub context_window: u64,
+    pub compression_threshold: u64,
+    pub compactions: u32,
+    /// Expandable-stats feature: which context-stream entries are expanded
+    /// (indices into `context_entries`). Entries whose index isn't in the
+    /// set render collapsed (one-line preview); expanded entries render the
+    /// full content inline with a gutter.
+    pub expanded_context: std::collections::HashSet<usize>,
+    /// Cumulative usage for the child.
+    pub tokens: TokenStats,
+    /// When the child started.
+    pub started: Instant,
+    /// Summary preview once complete.
+    pub summary_preview: Option<String>,
+}
+
+impl SubagentPane {
+    fn new(spawn_goal: &str, model: String, toolset_summary: String, depth: usize) -> Self {
+        Self {
+            child_id: 0,
+            goal: spawn_goal.to_string(),
+            model,
+            toolset_summary,
+            depth,
+            status: SubagentStatus::Running,
+            transcript: VecDeque::with_capacity(64),
+            transcript_capacity: 256,
+            streaming_assistant: String::new(),
+            streaming_reasoning: String::new(),
+            scroll: None,
+            context_entries: Vec::new(),
+            context_system_tokens: 0,
+            context_history_tokens: 0,
+            context_window: 0,
+            compression_threshold: 0,
+            compactions: 0,
+            expanded_context: std::collections::HashSet::new(),
+            tokens: TokenStats::default(),
+            started: Instant::now(),
+            summary_preview: None,
+        }
+    }
+
+    /// Percentage of the child's context window in use (0.0 when unknown).
+    pub fn context_usage_pct(&self) -> f64 {
+        if self.context_window == 0 {
+            return 0.0;
+        }
+        let used = self.context_system_tokens + self.context_history_tokens;
+        (used as f64 / self.context_window as f64) * 100.0
+    }
+
+    /// Push an item into the pane transcript, enforcing the ring capacity.
+    pub fn push_item(&mut self, item: TranscriptItem) {
+        if self.transcript.len() >= self.transcript_capacity {
+            self.transcript.pop_front();
+        }
+        self.transcript.push_back(item);
+    }
+
+    /// Expandable-stats/pane parity: toggle the pane transcript item at
+    /// `index` (tool/file-diff boolean toggle; reasoning three-state cycle).
+    pub fn toggle_item_expand(&mut self, index: usize) {
+        if index >= self.transcript.len() {
+            return;
+        }
+        match &mut self.transcript[index] {
+            TranscriptItem::Reasoning { text, expand_state, .. } => {
+                let total_lines = text.lines().count();
+                *expand_state = expand_state.cycle(total_lines);
+            }
+            TranscriptItem::Tool { expanded, .. }
+            | TranscriptItem::FileDiff { expanded, .. } => {
+                *expanded = !*expanded;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Expandable-stats feature: identity of a context entry for expansion
+/// remapping across snapshots. (role, tokens, preview) is stable for an
+/// unchanged message; pure renumbering (append/compaction) maps cleanly.
+/// When multiple entries share an identity the FIRST match wins and is
+/// consumed, avoiding duplicate expansion after repeated identical turns.
+fn entry_identity(e: &ContextEntry) -> (String, u64, String) {
+    (e.role.clone(), e.tokens, e.preview.clone())
+}
+
+/// Remap an old expansion set onto a new snapshot's indices. Old expanded
+/// entries keep their expansion when a same-identity entry exists in the
+/// new list; dropped messages (compacted away) lose their expansion.
+fn remap_expansions(
+    old_entries: &[ContextEntry],
+    old_expanded: &std::collections::HashSet<usize>,
+    new_entries: &[ContextEntry],
+) -> std::collections::HashSet<usize> {
+    if old_expanded.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let mut new_set = std::collections::HashSet::new();
+    let mut wanted: Vec<(String, u64, String)> = old_entries
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| old_expanded.contains(i))
+        .map(|(_, e)| entry_identity(e))
+        .collect();
+    for (j, e) in new_entries.iter().enumerate() {
+        let id = entry_identity(e);
+        if let Some(pos) = wanted.iter().position(|w| *w == id) {
+            wanted.remove(pos);
+            new_set.insert(j);
+        }
+    }
+    new_set
+}
+
+/// Apply a child event to a pane — a reduced version of the main
+/// `App::apply` logic covering the display-relevant subset. Lifecycle
+/// events (`TurnStart`/`Done`/`Failed` from the CHILD) intentionally do
+/// NOT touch pane status: pane status is owned by the parent-side
+/// `SubagentComplete`/`SubagentFailed` lifecycle events.
+fn pane_apply(pane: &mut SubagentPane, ev: &AgentEvent) {
+    use AgentEvent::*;
+    match ev {
+        ContentDelta(d) => pane.streaming_assistant.push_str(d),
+        ReasoningDelta(d) => pane.streaming_reasoning.push_str(d),
+        AssistantMessage(text) => {
+            let final_text = if text.is_empty() {
+                std::mem::take(&mut pane.streaming_assistant)
+            } else {
+                pane.streaming_assistant.clear();
+                text.clone()
+            };
+            if !final_text.is_empty() {
+                pane.push_item(TranscriptItem::Assistant { text: final_text });
+            }
+        }
+        ToolStart { name, emoji, summary } => pane.push_item(TranscriptItem::Tool {
+            name: name.clone(),
+            emoji: emoji.clone(),
+            summary: summary.clone(),
+            status: ToolStatus::Running,
+            duration_secs: None,
+            result_preview: String::new(),
+            expanded: false,
+            full_args: None,
+            full_result: None,
+            is_terminal: is_terminal_block(name),
+            exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: LIVE_OUTPUT_CAPACITY,
+        }),
+        ToolProgress { name, progress } => {
+            if !progress.is_empty() {
+                for it in pane.transcript.iter_mut().rev() {
+                    if let TranscriptItem::Tool { name: n, status, summary, is_terminal, .. } = it {
+                        if *status == ToolStatus::Running && *n == *name && !*is_terminal {
+                            *summary = progress.clone();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        ToolOutput { name, chunk } => {
+            if !chunk.is_empty() {
+                for it in pane.transcript.iter_mut().rev() {
+                    if let TranscriptItem::Tool {
+                        name: n,
+                        status,
+                        live_output,
+                        live_output_capacity,
+                        ..
+                    } = it
+                    {
+                        if *status == ToolStatus::Running && *n == *name {
+                            App::push_bounded_item(live_output, chunk, *live_output_capacity);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        ToolEnd { name, is_error, result_preview, duration_secs, exit_code, full_result } => {
+            for it in pane.transcript.iter_mut().rev() {
+                if let TranscriptItem::Tool {
+                    name: n,
+                    status,
+                    duration_secs: dur,
+                    result_preview: rp,
+                    exit_code: ec,
+                    full_result: fr,
+                    ..
+                } = it
+                {
+                    if *status == ToolStatus::Running && *n == *name {
+                        *status = if *is_error { ToolStatus::Failed } else { ToolStatus::Done };
+                        *dur = Some(*duration_secs);
+                        *rp = result_preview.clone();
+                        *ec = *exit_code;
+                        *fr = Some(full_result.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        Notice(msg) => pane.push_item(TranscriptItem::Notice {
+            text: msg.clone(),
+            kind: NoticeKind::Info,
+        }),
+        RetryAttempt { attempt, max_retries, error, .. } => pane.push_item(TranscriptItem::Notice {
+            text: format!("Retry {}/{}: {}", attempt, max_retries, error),
+            kind: NoticeKind::Warning,
+        }),
+        CompressionStart { reason, approx_tokens } => pane.push_item(TranscriptItem::Notice {
+            text: format!("Compressing ~{} tokens: {}", approx_tokens, reason),
+            kind: NoticeKind::Busy,
+        }),
+        CompressionEnd { original_msgs, new_msgs } => pane.push_item(TranscriptItem::Notice {
+            text: format!("Compressed {} → {} messages", original_msgs, new_msgs),
+            kind: NoticeKind::Success,
+        }),
+        ContextSnapshot {
+            entries,
+            system_tokens,
+            history_tokens,
+            context_window,
+            compression_threshold,
+            compactions,
+            model: _,
+        } => {
+            pane.expanded_context =
+                remap_expansions(&pane.context_entries, &pane.expanded_context, entries);
+            pane.context_entries = entries.clone();
+            pane.context_system_tokens = *system_tokens;
+            pane.context_history_tokens = *history_tokens;
+            pane.context_window = *context_window;
+            pane.compression_threshold = *compression_threshold;
+            pane.compactions = *compactions;
+        }
+        ApiCallEnd { usage } => {
+            pane.tokens.prompt += usage.prompt_tokens;
+            pane.tokens.completion += usage.completion_tokens;
+            pane.tokens.iterations += 1;
+        }
+        // Child lifecycle / orchestration / OMO events: not pane-relevant.
+        _ => {}
+    }
 }
 
 /// Status of a subagent entry in the activity panel.
@@ -421,6 +710,19 @@ pub struct App {
     /// Screen rect of the stats page as drawn by the LAST frame; zeroed on
     /// frames where it isn't drawn (stale-rect guard).
     pub last_stats_rect: Cell<(u16, u16, u16, u16)>,
+    /// Expandable-stats feature: the stats page's visible stream window,
+    /// recorded at render time — (inner_y, first_visible_row). Click
+    /// hit-testing maps screen rows to entry rows through this.
+    pub last_stats_window: Cell<(u16, usize)>,
+    /// Expandable-stats feature: per-entry row geometry of the stats page's
+    /// context stream as drawn by the LAST frame — (entry_index,
+    /// first_row, row_count), rows relative to the stream's top. Matches
+    /// `last_stats_window.1` to resolve absolute rows.
+    pub last_stats_stream_rows: std::cell::RefCell<Vec<(usize, usize, usize)>>,
+    /// Same geometry pair for the FOCUSED pane's stats page (the retargeted
+    /// view when a subagent is focused).
+    pub last_pane_stats_window: Cell<(u16, usize)>,
+    pub last_pane_stats_stream_rows: std::cell::RefCell<Vec<(usize, usize, usize)>>,
     /// Screen rect of the header's RIGHT section (model/session/status) as
     /// drawn by the last frame — the click target that opens the stats page.
     pub last_header_right_rect: Cell<(u16, u16, u16, u16)>,
@@ -432,6 +734,11 @@ pub struct App {
     pub context_window: u64,
     pub compression_threshold: u64,
     pub compactions: u32,
+    /// Expandable-stats feature: which context-stream entries are expanded
+    /// (indices into `context_entries`). Collapsed entries show the
+    /// one-line preview; expanded entries render the full content inline
+    /// with a gutter — the same affordance as transcript item expansion.
+    pub expanded_context: std::collections::HashSet<usize>,
     /// Monotonic count of snapshots received (drives the "live" pulse).
     pub context_snapshots: u64,
     /// Timestamp of the most recent snapshot.
@@ -460,6 +767,30 @@ pub struct App {
     pub subagent_entries: Vec<ActiveSubagentEntry>,
     /// Monotonic ID generator for subagent entries.
     pub next_subagent_id: usize,
+    /// Per-subagent live panes (parallel-subagent feature): one per spawned
+    /// child, stacked as vertical tabs on the right rail. Pane order matches
+    /// spawn order (orchestrator implicit tab 0; children appended right).
+    pub subagent_panes: Vec<SubagentPane>,
+    /// Which view the main transcript + maximized stats/context window are
+    /// showing: `None` = the main orchestrator; `Some(i)` = panes[i].
+    pub focused_subagent: Option<usize>,
+    /// Rects of each tab in the right rail as drawn by the LAST frame
+    /// (click hit-testing), one per pane in order. RefCell: recorded by the
+    /// rail widget during `&App` renders (mirrors the `Cell` geometry).
+    pub last_subagent_tab_rects: std::cell::RefCell<Vec<(u16, u16, u16, u16)>>,
+    /// Render-time geometry for the FOCUSED pane (parallel-subagent
+    /// feature): scroll upper bound + text-area rect, recorded by the pane
+    /// transcript widget each frame. App-level because widgets render
+    /// through `&App` (interior mutability, mirroring `last_text_area`).
+    pub last_pane_max_scroll: Cell<usize>,
+    pub last_pane_text_area: Cell<(u16, u16, u16, u16)>,
+    /// View anchor for the focused pane's maximized stats/context stream
+    /// (None = auto-follow the live tail). Mirrors `stats_view`.
+    pub pane_stats_view: Option<usize>,
+    /// Upper bound for a valid `pane_stats_view` anchor, recorded at render.
+    pub last_pane_stats_max_anchor: Cell<usize>,
+    /// Screen rect of the pane stats page as drawn by the LAST frame.
+    pub last_pane_stats_rect: Cell<(u16, u16, u16, u16)>,
     /// Learnings counter for wisdom accumulation display.
     pub learnings_count: usize,
     // ── NeuroCode (feature 015) ──
@@ -849,6 +1180,10 @@ impl App {
             stats_view: None,
             last_stats_max_anchor: Cell::new(0),
             last_stats_rect: Cell::new((0, 0, 0, 0)),
+            last_stats_window: Cell::new((0, 0)),
+            last_stats_stream_rows: std::cell::RefCell::new(Vec::new()),
+            last_pane_stats_window: Cell::new((0, 0)),
+            last_pane_stats_stream_rows: std::cell::RefCell::new(Vec::new()),
             last_header_right_rect: Cell::new((0, 0, 0, 0)),
             context_entries: Vec::new(),
             context_system_tokens: 0,
@@ -856,6 +1191,7 @@ impl App {
             context_window: 0,
             compression_threshold: 0,
             compactions: 0,
+            expanded_context: std::collections::HashSet::new(),
             context_snapshots: 0,
             context_updated_at: None,
             usage_series: Vec::new(),
@@ -868,6 +1204,14 @@ impl App {
             pending_agent_switch: None,
             subagent_entries: Vec::new(),
             next_subagent_id: 1,
+            subagent_panes: Vec::new(),
+            focused_subagent: None,
+            last_subagent_tab_rects: std::cell::RefCell::new(Vec::new()),
+            last_pane_max_scroll: Cell::new(0),
+            last_pane_text_area: Cell::new((0, 0, 0, 0)),
+            pane_stats_view: None,
+            last_pane_stats_max_anchor: Cell::new(0),
+            last_pane_stats_rect: Cell::new((0, 0, 0, 0)),
             learnings_count: 0,
             neurocode_active: false,
             neurocode_context: String::new(),
@@ -1089,6 +1433,10 @@ impl App {
                 // Live context-window view (agent stats page). The snapshot
                 // replaces the previous one wholesale — it is a complete
                 // projection of the history at emit time.
+                // Expandable-stats: remap expansions by entry identity
+                // (role/tokens/preview) so expanded rows survive appends
+                // and renumbering (compaction).
+                self.expanded_context = remap_expansions(&self.context_entries, &self.expanded_context, &entries);
                 self.context_entries = entries;
                 self.context_system_tokens = system_tokens;
                 self.context_history_tokens = history_tokens;
@@ -1212,7 +1560,7 @@ impl App {
                 for it in self.transcript.iter_mut().rev() {
                     if let TranscriptItem::Tool { name: n, status, live_output, live_output_capacity, .. } = it {
                         if *status == ToolStatus::Running && *n == name {
-                            Self::push_bounded(live_output, &chunk, *live_output_capacity);
+                            Self::push_bounded_item(live_output, &chunk, *live_output_capacity);
                             break;
                         }
                     }
@@ -1277,9 +1625,9 @@ impl App {
                     kind: NoticeKind::Warning,
                 });
             }
-            AgentEvent::SubagentSpawn { goal, model, toolset_summary, depth: _ } => {
+            AgentEvent::SubagentSpawn { id, goal, model, toolset_summary, depth: _ } => {
                 // Populate the activity panel's subagent roster (T064).
-                let id = self.next_subagent_id;
+                let entry_id = self.next_subagent_id;
                 self.next_subagent_id += 1;
                 // The goal text is the closest thing to an agent_type label we
                 // have at spawn time; the summary_preview on completion is too
@@ -1288,30 +1636,73 @@ impl App {
                 // T155: use the full goal as the job-board task title.
                 let task_title = if goal.is_empty() { None } else { Some(goal.clone()) };
                 self.subagent_entries.push(ActiveSubagentEntry {
-                    id,
+                    id: entry_id,
+                    child_id: id,
                     agent_type: label,
                     category: None,
                     status: SubagentStatus::Running,
                     phase: "querying model".to_string(),
-                    model,
+                    model: model.clone(),
                     iterations: 0,
                     started: Instant::now(),
                     task_title,
                     tool_call_count: 0,
                     last_tool: None,
                 });
+                // Parallel-subagent feature: open a dedicated live pane and
+                // stack it as a new tab on the right rail.
+                let mut pane = SubagentPane::new(&goal, model.clone(), toolset_summary.clone(), 0);
+                pane.child_id = id;
+                self.subagent_panes.push(pane);
                 self.push_item(TranscriptItem::Notice {
-                    text: format!("🤖 Subagent: {} [{}]", goal, toolset_summary),
+                    text: format!("🤖 Subagent: {} [{}] (click its tab on the right rail to watch live)", goal, toolset_summary),
                     kind: NoticeKind::Busy,
                 });
             }
-            AgentEvent::SubagentComplete { goal, success, summary_preview, token_usage: _, duration_secs: _ } => {
+            AgentEvent::SubagentEvent { id, event } => {
+                // Route the child's live event to its pane (matched by the
+                // stable child id). Unknown ids (e.g. an id spawned before a
+                // pane-capable UI attached) are dropped.
+                if let Some(pane) = self
+                    .subagent_panes
+                    .iter_mut()
+                    .find(|p| p.child_id == id)
+                {
+                    pane_apply(pane, event.as_ref());
+                    // Mirror phase/activity into the job-board entry.
+                    if let Some(entry) = self
+                        .subagent_entries
+                        .iter_mut()
+                        .rev()
+                        .find(|e| e.child_id == id && e.status == SubagentStatus::Running)
+                    {
+                        match event.as_ref() {
+                            AgentEvent::ToolStart { name, .. } => {
+                                entry.tool_call_count += 1;
+                                entry.last_tool = Some(name.clone());
+                                entry.phase = format!("running tool: {}", name);
+                            }
+                            AgentEvent::ApiCallStart => {
+                                entry.phase = "querying model".to_string();
+                            }
+                            AgentEvent::ApiCallEnd { .. } => {
+                                entry.iterations += 1;
+                            }
+                            AgentEvent::IterationStart { iteration, .. } => {
+                                entry.iterations = *iteration;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            AgentEvent::SubagentComplete { id, goal, success, summary_preview, token_usage: _, duration_secs: _ } => {
                 // Mark the matching subagent entry as done/failed (T064).
-                // Entries are matched by goal prefix (the label we stored at
-                // spawn time). Stale entries are cleaned up on turn Done.
                 let label: String = goal.chars().take(28).collect();
                 for entry in self.subagent_entries.iter_mut().rev() {
-                    if entry.status == SubagentStatus::Running && entry.agent_type == label {
+                    if entry.status == SubagentStatus::Running
+                        && (entry.child_id == id || entry.agent_type == label)
+                    {
                         entry.status = if success {
                             SubagentStatus::Done
                         } else {
@@ -1320,18 +1711,40 @@ impl App {
                         break;
                     }
                 }
+                // Close out the pane's live state.
+                if let Some(pane) = self.subagent_panes.iter_mut().find(|p| p.child_id == id) {
+                    pane.status = if success {
+                        SubagentStatus::Done
+                    } else {
+                        SubagentStatus::Failed
+                    };
+                    pane.summary_preview = Some(summary_preview.clone());
+                    // Flush any pending streamed text so the pane's final
+                    // answer is visible even if the child skipped the
+                    // AssistantMessage event.
+                    if !pane.streaming_assistant.is_empty() {
+                        let text = std::mem::take(&mut pane.streaming_assistant);
+                        pane.push_item(TranscriptItem::Assistant { text });
+                    }
+                }
                 self.push_item(TranscriptItem::Notice {
                     text: format!("{} {}: {}", if success { "✓" } else { "✗" }, goal, summary_preview),
                     kind: if success { NoticeKind::Success } else { NoticeKind::Warning },
                 });
             }
-            AgentEvent::SubagentFailed { goal, error, duration_secs: _ } => {
+            AgentEvent::SubagentFailed { id, goal, error, duration_secs: _ } => {
                 let label: String = goal.chars().take(28).collect();
                 for entry in self.subagent_entries.iter_mut().rev() {
-                    if entry.status == SubagentStatus::Running && entry.agent_type == label {
+                    if entry.status == SubagentStatus::Running
+                        && (entry.child_id == id || entry.agent_type == label)
+                    {
                         entry.status = SubagentStatus::Failed;
                         break;
                     }
+                }
+                if let Some(pane) = self.subagent_panes.iter_mut().find(|p| p.child_id == id) {
+                    pane.status = SubagentStatus::Failed;
+                    pane.push_item(TranscriptItem::Error { text: error.clone() });
                 }
                 self.push_item(TranscriptItem::Notice {
                     text: format!("✗ {}: {}", goal, error),
@@ -1428,6 +1841,7 @@ impl App {
                 let title = format!("[{}] delegation", category);
                 self.subagent_entries.push(ActiveSubagentEntry {
                     id,
+                    child_id: 0, // category delegations carry no stable child id
                     agent_type: format!("junior:{}", category),
                     category: Some(category.clone()),
                     status: SubagentStatus::Running,
@@ -1523,6 +1937,17 @@ impl App {
                     self.last_final_text = text;
                 }
                 self.active_agents.clear();
+                // T064: stale activity-panel entries are cleaned up, but the
+                // per-subagent PANES deliberately survive the turn — the
+                // user can still click a completed child's tab and read its
+                // full transcript. Panes accumulate until cleared (Ctrl+L or
+                // a new batch replaces the view); bounded by pane count.
+                let _keep_panes = &self.subagent_panes;
+                if let Some(focus) = self.focused_subagent {
+                    if focus >= self.subagent_panes.len() {
+                        self.focused_subagent = None;
+                    }
+                }
                 self.subagent_entries.clear();
                 self.mode = RunMode::Input;
                 self.turn_started = None;
@@ -1573,7 +1998,7 @@ impl App {
     /// head (keep the tail) when the capacity is hit. Tries to cut at a line
     /// boundary near the eviction point so the live view doesn't start
     /// mid-word more than necessary.
-    fn push_bounded(buf: &mut String, chunk: &str, cap: usize) {
+    pub(crate) fn push_bounded_item(buf: &mut String, chunk: &str, cap: usize) {
         buf.push_str(chunk);
         if buf.len() > cap {
             let mut cut = buf.len() - cap;
@@ -1838,6 +2263,170 @@ impl App {
         let used = self.context_system_tokens + self.context_history_tokens;
         (used as f64 / self.context_window as f64) * 100.0
     }
+
+    // ── Expandable context stream (expandable-stats feature) ─────────
+
+    /// Toggle expansion of the context-stream entry at `index` (main
+    /// orchestrator's stats page). No-op for out-of-range indices.
+    pub fn toggle_context_entry(&mut self, index: usize) {
+        if index >= self.context_entries.len() {
+            return;
+        }
+        if !self.expanded_context.insert(index) {
+            self.expanded_context.remove(&index);
+        }
+    }
+
+    /// Toggle expansion of the context-stream entry at `index` in the
+    /// FOCUSED subagent pane's stats page.
+    pub fn toggle_pane_context_entry(&mut self, index: usize) {
+        if let Some(pane) = self.focused_pane_mut() {
+            if index >= pane.context_entries.len() {
+                return;
+            }
+            if !pane.expanded_context.insert(index) {
+                pane.expanded_context.remove(&index);
+            }
+        }
+    }
+
+    /// Clear all context-entry expansions (main stats page).
+    pub fn clear_context_expansions(&mut self) {
+        self.expanded_context.clear();
+    }
+
+    /// Clear all context-entry expansions in the focused pane.
+    pub fn clear_pane_context_expansions(&mut self) {
+        if let Some(pane) = self.focused_pane_mut() {
+            pane.expanded_context.clear();
+        }
+    }
+
+    // ── Per-subagent panes (parallel-subagent feature) ────────────────
+    /// Focus a subagent pane by index. `None` returns to the orchestrator
+    /// (main) view. Retargets the main transcript + the maximized stats /
+    /// context window to the selected child.
+    pub fn focus_subagent(&mut self, index: Option<usize>) {
+        self.focused_subagent = match index {
+            None => None,
+            Some(i) if i < self.subagent_panes.len() => Some(i),
+            Some(_) => None,
+        };
+    }
+
+    /// Click hit-test against the right rail's tab rects. Returns the pane
+    /// index whose tab was clicked, or None.
+    pub fn subagent_tab_hit(&self, row: u16, col: u16) -> Option<usize> {
+        for (i, (x, y, w, h)) in self.last_subagent_tab_rects.borrow().iter().enumerate() {
+            if w > &0 && h > &0 && row >= *y && row < *y + *h && col >= *x && col < *x + *w {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    // ── Expandable context stream hit-testing (expandable-stats) ───────
+
+    /// Resolve a screen row to a context-stream entry index on the MAIN
+    /// stats page, using the geometry recorded by the last render. Column
+    /// must be inside the stats page (checked by the caller). Returns None
+    /// when the click isn't on an entry row (dashboard header, footer, or
+    /// the page wasn't drawn).
+    pub fn stats_context_entry_hit(&self, row: u16) -> Option<usize> {
+        let (inner_y, start) = self.last_stats_window.get();
+        if inner_y == 0 && start == 0 && self.last_stats_stream_rows.borrow().is_empty() {
+            return None;
+        }
+        let content_row = (row as usize).saturating_sub(inner_y as usize) + start;
+        for &(entry, first_row, count) in self.last_stats_stream_rows.borrow().iter() {
+            if content_row >= first_row && content_row < first_row + count {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    /// Resolve a screen row to a context-stream entry index on the FOCUSED
+    /// pane's stats page. Mirrors [`Self::stats_context_entry_hit`].
+    pub fn pane_stats_context_entry_hit(&self, row: u16) -> Option<usize> {
+        let (inner_y, start) = self.last_pane_stats_window.get();
+        if self.last_pane_stats_stream_rows.borrow().is_empty() {
+            return None;
+        }
+        let content_row = (row as usize).saturating_sub(inner_y as usize) + start;
+        for &(entry, first_row, count) in self.last_pane_stats_stream_rows.borrow().iter() {
+            if content_row >= first_row && content_row < first_row + count {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    /// Scroll the focused pane's transcript up by `by` lines.
+    pub fn pane_scroll_up(&mut self, by: usize) {
+        if self.focused_subagent.is_some() {
+            let cur = self
+                .focused_pane()
+                .and_then(|p| p.scroll)
+                .unwrap_or(0);
+            let max = self.last_pane_max_scroll.get();
+            let next = (cur + by).min(max);
+            if let Some(pane) = self.focused_pane_mut() {
+                pane.scroll = Some(next);
+            }
+        }
+    }
+
+    /// Scroll the focused pane's transcript down by `by` lines (None at the
+    /// bottom resumes auto-follow).
+    pub fn pane_scroll_down(&mut self, by: usize) {
+        let max = self.last_pane_max_scroll.get();
+        if let Some(pane) = self.focused_pane_mut() {
+            if let Some(s) = pane.scroll {
+                let s = s.min(max);
+                pane.scroll = if s > by { Some(s - by) } else { None };
+            }
+        }
+    }
+
+    /// Clear all panes and return to the orchestrator view (Ctrl+L parity).
+    pub fn clear_subagent_panes(&mut self) {
+        self.subagent_panes.clear();
+        self.focused_subagent = None;
+        self.last_subagent_tab_rects.borrow_mut().clear();
+    }
+
+    /// The pane currently focused, if any.
+    pub fn focused_pane(&self) -> Option<&SubagentPane> {
+        self.focused_subagent.and_then(|i| self.subagent_panes.get(i))
+    }
+
+    /// The pane currently focused, mutably, if any.
+    pub fn focused_pane_mut(&mut self) -> Option<&mut SubagentPane> {
+        self.focused_subagent.and_then(|i| self.subagent_panes.get_mut(i))
+    }
+
+    /// Scroll the focused pane's maximized stats stream up (freezes the
+    /// anchor). Mirrors `stats_scroll_up`.
+    pub fn pane_stats_scroll_up(&mut self, by: usize) {
+        let cur = self
+            .pane_stats_view
+            .unwrap_or_else(|| self.last_pane_stats_max_anchor.get());
+        self.pane_stats_view = Some(cur.saturating_sub(by));
+    }
+
+    /// Scroll the focused pane's maximized stats stream down; re-pins at the
+    /// bottom. Mirrors `stats_scroll_down`.
+    pub fn pane_stats_scroll_down(&mut self, by: usize) {
+        if let Some(a) = self.pane_stats_view {
+            let target = a.saturating_add(by);
+            if target >= self.last_pane_stats_max_anchor.get() {
+                self.pane_stats_view = None;
+            } else {
+                self.pane_stats_view = Some(target);
+            }
+        }
+    }
 }
 
 // ── Live reasoning panel ───────────────────────────────────────────
@@ -2053,6 +2642,7 @@ mod tests {
         // Three parallel explore spawns.
         for i in 1..=3 {
             app.apply(AgentEvent::SubagentSpawn {
+                id: i as u64,
                 goal: format!("explore task {i}"),
                 model: "glm-5".into(),
                 toolset_summary: "read".into(),
@@ -2069,6 +2659,7 @@ mod tests {
 
         // First completes successfully → Done.
         app.apply(AgentEvent::SubagentComplete {
+            id: 1,
             goal: "explore task 1".into(),
             success: true,
             summary_preview: "ok".into(),
@@ -2080,6 +2671,7 @@ mod tests {
 
         // Third fails → Failed.
         app.apply(AgentEvent::SubagentFailed {
+            id: 3,
             goal: "explore task 3".into(),
             error: "boom".into(),
             duration_secs: 1.0,
@@ -2119,6 +2711,7 @@ mod tests {
     fn done_clears_subagent_entries() {
         let mut app = App::new("s", "m");
         app.apply(AgentEvent::SubagentSpawn {
+            id: 1,
             goal: "explore x".into(),
             model: "m".into(),
             toolset_summary: "read".into(),
@@ -2155,6 +2748,7 @@ mod tests {
 
         // A delegated task spawns an entry carrying the task title.
         app.apply(AgentEvent::SubagentSpawn {
+            id: 2,
             goal: "Task 1: Implement auth".into(),
             model: "glm-5".into(),
             toolset_summary: "file".into(),
@@ -3003,7 +3597,7 @@ mod live_output_tests {
             buf.push_str(&format!("row-{i:02}\n"));
         }
         let cap = 50;
-        App::push_bounded(&mut buf, "row-60\n", cap);
+        App::push_bounded_item(&mut buf, "row-60\n", cap);
         // The retained tail starts at a row boundary (starts with "row-").
         assert!(buf.starts_with("row-"), "cut at line boundary: {:?}", &buf[..12]);
         assert!(buf.ends_with("row-60\n"));
@@ -3116,6 +3710,7 @@ mod stats_page_tests {
             preview: preview.into(),
             has_tool_calls: false,
             is_compressed_summary: false,
+            full_content: String::new(),
         }
     }
 

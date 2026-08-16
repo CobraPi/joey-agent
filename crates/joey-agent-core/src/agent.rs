@@ -26,6 +26,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use rayon::prelude::*;
 
 use crate::compression::{self, ContextCompressor};
 use crate::events::AgentEvent;
@@ -840,12 +841,40 @@ impl Agent {
         // Collapse runs of whitespace in the preview and bound it.
         let collapsed: String = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
         let preview: String = collapsed.chars().take(80).collect();
+        // Expandable-stats feature: carry the full content. Assistant
+        // tool-request messages carry their calls rendered as indented JSON
+        // (their text content is empty, so there'd be nothing to expand
+        // otherwise).
+        let full_content = if !text.is_empty() {
+            text.clone()
+        } else if !msg.tool_calls.is_empty() {
+            msg.tool_calls
+                .iter()
+                .map(|tc| {
+                    format!(
+                        "{}({}):\n{}",
+                        tc.function.name,
+                        tc.id,
+                        serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                            .ok()
+                            .and_then(|v| joey_core::utils::pretty_json_for_display(
+                                &v.to_string()
+                            ))
+                            .unwrap_or_else(|| tc.function.arguments.clone())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        } else {
+            String::new()
+        };
         crate::events::ContextEntry {
             role: msg.role.clone(),
             tokens: joey_core::utils::estimate_tokens(&text) as u64,
             preview,
             has_tool_calls: !msg.tool_calls.is_empty(),
             is_compressed_summary: msg.compressed_summary,
+            full_content,
         }
     }
 
@@ -2558,6 +2587,13 @@ impl Agent {
                         registry.dispatch_call(&name, args, &ctx, &id).await
                     }));
                 }
+                // Collect all results first (join in call order), then run
+                // the CPU-bound post-processing for the WHOLE batch through
+                // rayon in one fan-out: untrusted wrapping, previews, and
+                // exit-code extraction are independent per result. Event
+                // emission + history pushes stay sequential after, so the
+                // stream ordering is byte-identical to the sequential path.
+                let mut results = Vec::with_capacity(calls.len());
                 for (idx, (tc, handle)) in calls.iter().zip(handles).enumerate() {
                     let (content, is_error) = match handle.await {
                         Ok(result) => (result.to_content_string(), result.is_error()),
@@ -2566,17 +2602,29 @@ impl Agent {
                             true,
                         ),
                     };
-                    let duration = start_times[idx].elapsed().as_secs_f64();
-                    let wrapped = maybe_wrap_untrusted(&tc.function.name, &content);
-                    let preview = preview_result(&content);
+                    results.push((content, is_error, start_times[idx].elapsed().as_secs_f64()));
+                }
+                let processed: Vec<(String, String, Option<i64>)> = results
+                    .par_iter()
+                    .zip(&calls)
+                    .map(|((content, _, _), tc)| {
+                        let wrapped = maybe_wrap_untrusted(&tc.function.name, content);
+                        let preview = preview_result(content);
+                        let exit = extract_exit_code(&tc.function.name, content);
+                        (wrapped, preview, exit)
+                    })
+                    .collect();
+                for (((content, is_error, duration), tc), (wrapped, preview, exit)) in
+                    results.iter().zip(&calls).zip(processed)
+                {
                     // Feature 005 (T011): emit FileChange events before ToolEnd.
-                    emit_pending_file_changes(tx, &tc.function.name, &content, self.neurocode_engine.as_ref());
+                    emit_pending_file_changes(tx, &tc.function.name, content, self.neurocode_engine.as_ref());
                     let _ = tx.send(AgentEvent::ToolEnd {
                         name: tc.function.name.clone(),
-                        is_error,
+                        is_error: *is_error,
                         result_preview: preview,
-                        duration_secs: duration,
-                        exit_code: extract_exit_code(&tc.function.name, &content),
+                        duration_secs: *duration,
+                        exit_code: exit,
                         full_result: content.clone(),
                     });
                     self.push_message(
