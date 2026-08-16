@@ -12,6 +12,8 @@
 use std::os::unix::io::AsRawFd as _;
 use std::time::Duration;
 
+use rayon::prelude::*;
+
 use crate::file_tracker::FileTracker;
 
 use async_trait::async_trait;
@@ -19,7 +21,7 @@ use once_cell::sync::Lazy;
 use serde_json::{json, Map, Value};
 
 use crate::context::ToolContext;
-use crate::guards::strip_ansi;
+use crate::guards::strip_ansi_par as strip_ansi;
 use crate::pyjson::dumps;
 use crate::registry::{Tool, ToolResult};
 use crate::truncate;
@@ -453,7 +455,10 @@ impl Tool for Terminal {
 
         // Feature 005 (T012): snapshot known-read files before running the
         // command so we can detect terminal-caused mutations afterward.
-        let pre_snapshot = snapshot_tracked_files();
+        // Blocking + parallel (rayon) — off the async workers.
+        let pre_snapshot = tokio::task::spawn_blocking(snapshot_tracked_files)
+            .await
+            .unwrap_or_default();
 
         let (raw_output, returncode, timed_out, interrupted) =
             run_command(&command, &cwd, effective_timeout, ctx).await;
@@ -484,24 +489,35 @@ impl Tool for Terminal {
             output.push_str("\n[Command interrupted by user]");
         }
 
-        // Truncate output if too long, keeping both head and tail.
+        // CPU-bound post-processing pipeline (truncate → ANSI strip →
+        // redaction, ~30 regex passes on big outputs). Runs on the blocking
+        // pool; the strip/redact internals parallelize across rayon for
+        // large payloads. Mutation detection (stat+hash fan-out) is also
+        // rayon-parallel.
         let limits = truncate::get_tool_output_limits(ctx.config());
-        output = truncate::truncate_terminal_output(&output, limits.max_bytes);
-        // Strip ANSI escape sequences.
-        output = strip_ansi(&output);
-        // Redact secrets from command output.
-        output = if output.is_empty() {
-            output
-        } else {
-            redact_terminal_output(output.trim(), &command)
+        let max_bytes = limits.max_bytes;
+        let cmd_for_redact = command.clone();
+        let fallback_output = output.clone();
+        let output = {
+            let pre_for_mutations = pre_snapshot;
+            tokio::task::spawn_blocking(move || {
+                let mut out = truncate::truncate_terminal_output(&output, max_bytes);
+                out = strip_ansi(&out);
+                if !out.is_empty() {
+                    out = redact_terminal_output(out.trim(), &cmd_for_redact);
+                }
+                // Feature 005 (T012): detect files mutated by this terminal
+                // command and record them so the agent turn loop's drain
+                // emits FileChange events with source: Terminal
+                // (mtime+hash compare, rayon fan-out).
+                detect_terminal_mutations(&pre_for_mutations);
+                out
+            })
+            .await
+            .unwrap_or_else(|_| fallback_output)
         };
 
         let exit_note = interpret_exit_code(&command, returncode);
-
-        // Feature 005 (T012): detect files mutated by this terminal command
-        // and record them so the agent turn loop's drain emits FileChange
-        // events with source: Terminal. We compare mtime+hash before/after.
-        detect_terminal_mutations(&pre_snapshot);
 
         let mut result = Map::new();
         result.insert("output".into(), json!(output));
@@ -1266,10 +1282,15 @@ struct FileSnapshot {
 /// Snapshot all files the agent has read this session (per
 /// `FileTracker::read_files()`). Used as the "before" baseline for
 /// detecting terminal-caused mutations.
+///
+/// Rayon: each file's metadata + content hash is independent, so the
+/// per-file work fans out across cores (`par_iter`). Runs inside
+/// `spawn_blocking` at the call site, so neither the rayon pool nor the
+/// disk I/O touches tokio's async workers.
 fn snapshot_tracked_files() -> Vec<FileSnapshot> {
     use std::hash::{Hash, Hasher};
     FileTracker::read_files()
-        .into_iter()
+        .into_par_iter()
         .map(|path| {
             let meta = std::fs::metadata(&path).ok();
             let mtime = meta.as_ref().and_then(|m| m.modified().ok());
@@ -1287,34 +1308,40 @@ fn snapshot_tracked_files() -> Vec<FileSnapshot> {
 
 /// Compare the post-command state of each snapshotted file to its pre-command
 /// snapshot. For any file whose mtime or content hash changed, record it via
-/// `FileTracker::record_external_mutation` so the turn loop's drain emits a
-/// `FileChange { source: Terminal }`.
+/// `FileTracker::record_external_mutation`.
+///
+/// Rayon: the stat + read + hash pass fans out per file; only the (Mutex-
+/// guarded, cheap) tracker recording stays sequential.
 fn detect_terminal_mutations(pre: &[FileSnapshot]) {
     use std::hash::{Hash, Hasher};
-    for snap in pre {
-        let now_meta = std::fs::metadata(&snap.path).ok();
-        let now_mtime = now_meta.as_ref().and_then(|m| m.modified().ok());
-        let now_hash = std::fs::read(&snap.path)
-            .ok()
-            .map(|bytes| {
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                bytes.hash(&mut h);
-                h.finish()
-            });
-        // Changed if mtime differs OR hash differs (hash is authoritative;
-        // mtime is a fast-path skip when unchanged).
-        let mtime_changed = match (snap.mtime, now_mtime) {
-            (Some(a), Some(b)) => a != b,
-            _ => true, // treat missing metadata as "potentially changed"
-        };
-        let hash_changed = match (snap.hash, now_hash) {
-            (Some(a), Some(b)) => a != b,
-            (None, Some(_)) => true, // file gained content
-            _ => false,
-        };
-        if mtime_changed || hash_changed {
-            FileTracker::record_external_mutation(&snap.path);
-        }
+    let mutated: Vec<&FileSnapshot> = pre
+        .par_iter()
+        .filter(|snap| {
+            let now_meta = std::fs::metadata(&snap.path).ok();
+            let now_mtime = now_meta.as_ref().and_then(|m| m.modified().ok());
+            let now_hash = std::fs::read(&snap.path)
+                .ok()
+                .map(|bytes| {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    bytes.hash(&mut h);
+                    h.finish()
+                });
+            // Changed if mtime differs OR hash differs (hash is authoritative;
+            // mtime is a fast-path skip when unchanged).
+            let mtime_changed = match (snap.mtime, now_mtime) {
+                (Some(a), Some(b)) => a != b,
+                _ => true, // treat missing metadata as "potentially changed"
+            };
+            let hash_changed = match (snap.hash, now_hash) {
+                (Some(a), Some(b)) => a != b,
+                (None, Some(_)) => true, // file gained content
+                _ => false,
+            };
+            mtime_changed || hash_changed
+        })
+        .collect();
+    for snap in mutated {
+        FileTracker::record_external_mutation(&snap.path);
     }
 }
 

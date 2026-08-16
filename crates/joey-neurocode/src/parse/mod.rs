@@ -25,6 +25,8 @@ pub mod rustlang;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::graph::edge::EdgeKind;
 use crate::graph::node::{ArtifactKind, CodeArtifactNode};
 use crate::graph::{DependencyGraph, NodeId};
@@ -59,45 +61,67 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
 
     let scan_root = primary_source_root(project_root);
 
-    for entry in walkdir::WalkDir::new(&scan_root)
+    // ── Phase 1: collect + read + parse in parallel (rayon) ────────────
+    // Tree-sitter parsing is pure CPU and per-file independent; the walk
+    // itself stays sequential (directory order), then the read+parse work
+    // fans out across cores. `collect` preserves input order, so phase 2
+    // sees files in exactly the order the sequential version did.
+    let candidate_paths: Vec<std::path::PathBuf> = walkdir::WalkDir::new(&scan_root)
         .max_depth(10)
         .into_iter()
         .filter_map(Result::ok)
-    {
-        let path = entry.path();
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        let ext = ext.to_lowercase();
-        if !registry::is_supported_extension(&ext) {
-            continue;
-        }
-        // Skip vendored/generated trees — noise in the structural graph.
-        if is_vendor_path(path) {
-            continue;
-        }
-        result.files_scanned += 1;
-        let rel_path = path
-            .strip_prefix(project_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
+        .filter_map(|entry| {
+            let path = entry.path();
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                return None;
+            };
+            if !registry::is_supported_extension(&ext.to_lowercase()) {
+                return None;
+            }
+            // Skip vendored/generated trees — noise in the structural graph.
+            if is_vendor_path(path) {
+                return None;
+            }
+            Some(path.to_path_buf())
+        })
+        .collect();
+    result.files_scanned = candidate_paths.len();
 
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                result.errors.push(format!("{}: {}", rel_path, e));
+    enum ParsedFile {
+        Ok { rel_path: String, extraction: crate::parse::extract::SourceExtraction },
+        Err { rel_path: String, error: String },
+    }
+
+    let parsed: Vec<ParsedFile> = candidate_paths
+        .into_par_iter()
+        .map(|path| {
+            let rel_path = path
+                .strip_prefix(project_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    return ParsedFile::Err { rel_path, error: e.to_string() };
+                }
+            };
+            match registry::parse_any(&path, &content) {
+                Some(Ok(extraction)) => ParsedFile::Ok { rel_path, extraction },
+                Some(Err(e)) => ParsedFile::Err { rel_path, error: e },
+                None => unreachable!("supported extensions always parse"),
+            }
+        })
+        .collect();
+
+    // ── Phase 2: graph upserts (sequential — SQLite store) ─────────────
+    for file in parsed {
+        let (rel_path, extraction) = match file {
+            ParsedFile::Ok { rel_path, extraction } => (rel_path, extraction),
+            ParsedFile::Err { rel_path, error } => {
+                result.errors.push(format!("{}: {}", rel_path, error));
                 continue;
             }
-        };
-
-        let extraction = match registry::parse_any(path, &content) {
-            Some(Ok(ext)) => ext,
-            Some(Err(e)) => {
-                result.errors.push(format!("{}: {}", rel_path, e));
-                continue;
-            }
-            None => continue, // unreachable for supported extensions
         };
 
         // Package: explicit (Java, Go) or derived from the file's directory

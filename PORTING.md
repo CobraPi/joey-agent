@@ -455,6 +455,48 @@ Tests: formatting helpers (4), gutter/envelope render contracts (8),
 visual end-to-end rows (2); two legacy indent tests updated to the gutter
 contract. No event/schema/config changes — display-layer only.
 
+
+## Rayon parallelization of CPU-bound hot paths (2026-08-16)
+
+Added `rayon 1.12` as a workspace dependency (already in the lockfile
+transitively via sysinfo — zero binary-size cost) and moved the
+CPU-intensive, non-async-appropriate work onto the rayon pool:
+
+- **Terminal tool** (`joey-tools`): the post-command pipeline (head/tail
+  truncation → ANSI strip → secret redaction → file-mutation detection)
+  now runs inside `spawn_blocking`, with the internals parallelized —
+  `strip_ansi_par` (line-boundary chunking, 256 KB threshold) and
+  per-file stat+hash fan-out for mutation snapshots/detection.
+- **Redaction** (`joey-core`): `redact_secrets_par` — line-boundary
+  chunked rayon map over the ~30-pattern regex cascade (512 KB
+  threshold); every pattern class is line-local so chunking is safe.
+- **Diff engine** (`joey-tools::file_tracker`): `generate_diff` rebuilt
+  with parallel line hashing (rayon::join), common prefix/suffix
+  trimming (a one-line edit in a 50 K-line file collapses the quadratic
+  LCS core to a tiny region instead of a 2.5×10⁹-cell table), hash-based
+  equality in the LCS hot loop, and a wholesale-rewrite guard that caps
+  memory on pathological inputs. `drain_pending_diffs` fans the per-file
+  read+decode+diff work across cores (order-preserving collect).
+  Byte-identical to the original algorithm — pinned by a reference-oracle
+  test across 8 edit shapes plus fast/bounded tests for 50 K-line edits
+  and 20 K-line rewrites.
+- **NeuroCode ingestion** (`joey-neurocode`): `ingest_project` split into
+  a parallel phase-1 (per-file read + tree-sitter parse via par_iter,
+  order-preserving) and the unchanged sequential phase-2 graph upserts.
+  Measured on a frozen copy of this repo's tree: identical output
+  (2744 artifacts / 3842 edges), 2.64 s → 1.69 s (~1.56× faster).
+- **Agent turn loop** (`joey-agent-core`): parallel tool-batch
+  post-processing (untrusted-content wrapping + preview extraction +
+  exit-code parsing fan out per result on the rayon pool; event emission
+  and history pushes stay sequential for byte-identical ordering), and
+  `estimate_messages_tokens_rough` parallelizes per-message shadow-JSON
+  serialization above a 24-message threshold.
+
+All parallel/sequential equivalence points are contract-tested
+(strip_ansi, redaction, generate_diff vs a reference oracle). Rayon work
+never runs on tokio's async workers: call sites wrap the pool in
+`spawn_blocking` where they're on the async runtime.
+
 ## Deliberate deviations (not oversights)
 
 - **Anthropic OAuth "Claude Code" impersonation is NOT ported.** Upstream,

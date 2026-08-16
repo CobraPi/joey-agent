@@ -9,6 +9,7 @@
 
 use fancy_regex::{Captures, Regex};
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
 
 /// Sensitive query-string parameter names (case-insensitive exact match).
 pub const SENSITIVE_QUERY_PARAMS: &[&str] = &[
@@ -684,6 +685,50 @@ pub fn redact_secrets(text: &str) -> String {
     redact_sensitive_text(text)
 }
 
+/// Parallel redaction for large tool outputs (terminal dumps, big file
+/// reads): splits the text on line boundaries into ≥ [`REDACT_PAR_CHUNK`]
+/// chunks, redacts each chunk on the rayon pool, and joins. Byte-identical
+/// to [`redact_sensitive_text_opts`] for any text whose patterns don't
+/// straddle the chunk cut — and none do: every pattern class is line-local
+/// (ENV/JSON/YAML assignments, headers, tokens, keys, URLs — none of the
+/// regexes match across `\n`).
+///
+/// Below the threshold the sequential path runs (scheduling overhead would
+/// dominate). Falls back to the same options semantics as
+/// `redact_terminal_output`.
+pub fn redact_secrets_par(text: &str) -> String {
+    /// Minimum size before the rayon fan-out pays for itself.
+    const REDACT_PAR_CHUNK: usize = 512 * 1024;
+    if text.len() < REDACT_PAR_CHUNK {
+        return redact_sensitive_text(text);
+    }
+    let mut chunks: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.len() <= REDACT_PAR_CHUNK {
+            chunks.push(rest);
+            break;
+        }
+        let target = &rest[..REDACT_PAR_CHUNK];
+        match target.rfind('\n') {
+            Some(nl) => {
+                let (head, tail) = rest.split_at(nl + 1);
+                chunks.push(head);
+                rest = tail;
+            }
+            None => {
+                chunks.push(rest);
+                break;
+            }
+        }
+    }
+    let redacted: Vec<String> = chunks
+        .into_par_iter()
+        .map(redact_sensitive_text)
+        .collect();
+    redacted.join("")
+}
+
 // Commands whose stdout is an environment-variable dump (KEY=value lines).
 const ENV_DUMP_COMMANDS: &[&str] = &["env", "printenv", "set", "export", "declare"];
 
@@ -979,5 +1024,35 @@ mod tests {
         // No crash. We don't assert exact contents (engine-dependent), only
         // that we got a non-panicking `String` containing the prefix bytes.
         assert!(out.starts_with(&"a".repeat(40)) || out.contains('a'));
+    }
+}
+
+#[cfg(test)]
+mod redact_par_tests {
+    use super::*;
+
+    #[test]
+    fn redact_secrets_par_identical_to_sequential() {
+        // Build a >512 KB text dense with redactable secrets.
+        let mut text = String::new();
+        for i in 0..4000 {
+            text.push_str(&format!(
+                "line {}: OPENAI_API_KEY=sk-proj-{} auth: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.{}.sig\n",
+                i,
+                "abcdef0123456789".repeat(3),
+                "payload".repeat(8)
+            ));
+        }
+        assert!(text.len() > 512 * 1024, "fixture large enough: {} bytes", text.len());
+        let seq = redact_secrets(&text);
+        let par = redact_secrets_par(&text);
+        assert_eq!(seq, par, "parallel redaction must be byte-identical");
+        assert!(!par.contains("sk-proj-abcdef"), "keys masked");
+    }
+
+    #[test]
+    fn redact_par_small_passthrough_matches() {
+        let small = "OPENAI_API_KEY=sk-abc123xyz hello";
+        assert_eq!(redact_secrets_par(small), redact_secrets(small));
     }
 }

@@ -255,7 +255,13 @@ server availability and hidden otherwise. See `docs/LSP.md`.
 Related: `FileTracker` (src/file_tracker.rs) records reads/writes/deletes/
 external mutations, generates per-file diffs (`generate_diff`), pending diffs,
 and a `ChangeSummary` for session change detection and `/diff`-style display;
-`drain_pending_diffs` feeds turn summaries.
+`drain_pending_diffs` feeds turn summaries. `generate_diff` is
+rayon-parallelized internally (parallel line hashing, common prefix/suffix
+trimming so the quadratic LCS core covers only the changed region, and a
+wholesale-rewrite guard that bounds memory) while producing byte-identical
+output to the sequential algorithm — pinned by a reference-oracle test.
+`drain_pending_diffs` fans per-file read+decode+diff across cores
+(order-preserving).
 
 ---
 

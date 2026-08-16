@@ -8,6 +8,7 @@
 
 use once_cell::sync::Lazy;
 use regex::Regex;
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -394,6 +395,46 @@ pub fn strip_ansi(text: &str) -> String {
     ANSI_ESCAPE_RE.replace_all(text, "").into_owned()
 }
 
+/// Parallel `strip_ansi` for potentially large tool outputs: splits on
+/// line boundaries into ~256 KB chunks, strips each on the rayon pool,
+/// and re-joins. Byte-identical to [`strip_ansi`] — the ANSI escape
+/// grammar never spans a `\n` (the OSC/DCS variants terminate at BEL/ST,
+/// and the char-class variants are single chars), so cutting at newline
+/// boundaries cannot split a match. Small inputs take the direct path.
+pub fn strip_ansi_par(text: &str) -> String {
+    /// Below this, parallel scheduling overhead dominates.
+    const PAR_THRESHOLD: usize = 256 * 1024;
+    if text.len() < PAR_THRESHOLD {
+        return strip_ansi(text);
+    }
+    let mut chunks: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.len() <= PAR_THRESHOLD {
+            chunks.push(rest);
+            break;
+        }
+        // Find a newline boundary at-or-after the target size; UTF-8 safe
+        // because we slice at a `\n` byte.
+        let target = &rest[..PAR_THRESHOLD];
+        match target.rfind('\n') {
+            Some(nl) => {
+                let (head, tail) = rest.split_at(nl + 1);
+                chunks.push(head);
+                rest = tail;
+            }
+            None => {
+                // No newline in the window — fall back to the single-line
+                // path for the remainder (a >256 KB line is pathological).
+                chunks.push(rest);
+                break;
+            }
+        }
+    }
+    let stripped: Vec<String> = chunks.into_par_iter().map(strip_ansi).collect();
+    stripped.join("")
+}
+
 /// Port of `has_traversal_component` (tools/path_security.py).
 pub fn has_traversal_component(path_str: &str) -> bool {
     Path::new(path_str).components().any(|c| matches!(c, std::path::Component::ParentDir))
@@ -459,5 +500,47 @@ mod tests {
         assert!(has_traversal_component("../etc/passwd"));
         assert!(has_traversal_component("a/../b"));
         assert!(!has_traversal_component("a/b/c"));
+    }
+}
+
+#[cfg(test)]
+mod ansi_par_tests {
+    use super::*;
+
+    #[test]
+    fn strip_ansi_par_identical_to_sequential() {
+        // A realistic mix of escape sequences across many lines, large
+        // enough to engage the parallel path (>256 KB).
+        let mut text = String::new();
+        for i in 0..6000 {
+            text.push_str(&format!(
+                "\x1b[32mOK\x1b[0m line {} \x1b[1;34m┌─┐\x1b[0m plain tail\n",
+                i
+            ));
+        }
+        assert!(text.len() > 256 * 1024, "fixture large enough: {} bytes", text.len());
+        let seq = strip_ansi(&text);
+        let par = strip_ansi_par(&text);
+        assert_eq!(seq, par, "parallel strip must be byte-identical");
+        assert!(!par.contains("\x1b"), "escapes removed");
+        assert!(par.contains("line 5999"));
+    }
+
+    #[test]
+    fn strip_ansi_par_chunk_boundaries_never_split_escapes() {
+        // Chunks cut only at newlines; verify content at the seam region.
+        let mut text = String::new();
+        for i in 0..5000 {
+            text.push_str(&format!("\x1b[38;5;{}mcolor {}\x1b[0m\n", i % 256, i));
+        }
+        let par = strip_ansi_par(&text);
+        let seq = strip_ansi(&text);
+        assert_eq!(par, seq);
+    }
+
+    #[test]
+    fn strip_ansi_par_small_passthrough() {
+        assert_eq!(strip_ansi_par("plain"), "plain");
+        assert_eq!(strip_ansi_par("\x1b[31mred\x1b[0m"), "red");
     }
 }
