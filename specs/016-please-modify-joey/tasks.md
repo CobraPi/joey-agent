@@ -314,3 +314,11 @@ Each increment builds and tests green alone (constitution V); every story checkp
 - T025's perf assertion is #[ignore]-by-default so CI stays deterministic; run explicitly when benchmarking.
 - Integration tests auto-skip without Chromium — `cargo test --workspace` green on browserless machines.
 - When running local integration tests, remember the external SIGKILL killer quirk: copy test binaries to /tmp/neutral_harness/ per repo memory.
+
+
+## Phase 12: Convergence
+
+- [ ] T066 Wire `/browser connect|disconnect|status` into the TUI slash-dispatch path so browser session control works identically in the TUI and the line REPL — dispatch in crates/joey-tui (or the joey-cli engine layer it drives) alongside the existing repl.rs handler; shared_browser_handle makes state common to both surfaces (Constitution II) (contradicts)
+- [ ] T067 Implement first-use auto-connect: when any browser_* tool executes while disconnected, connect lazily via BrowserConfig::from_config (resolve in joey-tools browser_tools.rs run() path or a wrapper), per T014's stated wiring (FR-017) (partial)
+- [ ] T068 Surface image-model routing: pass the joey-llm-selector catalog multimodal default into the resolve_image_model call site (replacing the hardcoded None) and report `served_by { model, source }` in vision-capable tool results (browser_vision, vision_analyze) and a debug log line (FR-016, contracts/image-model-routing.md) (partial)
+- [ ] T069 Correct stale docs: docs/tools.md inventory (browser_*/vision_analyze now implemented; 36-tool coding toolset), docs/providers.md (image-model keys + resolution order), docs/cli.md (/browser subcommands), docs/architecture.md + docs/README.md crate tables (include joey-browser) (T061 remainder) (partial)
