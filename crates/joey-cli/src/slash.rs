@@ -67,7 +67,7 @@ pub static REGISTRY: &[CommandDef] = &[
     cmd!("sessions", &[], "Browse and resume previous sessions", "Session", "", true),
     // Configuration
     cmd!("config", &[], "Show current configuration", "Configuration", "", true),
-    cmd!("model", &[], "Switch model (session-scoped; --global to persist)", "Configuration", "[model] [--global]", true),
+    cmd!("model", &[], "Switch model or configure /neurocode tiers (neurocode frontier|economical <name>)", "Configuration", "[model|neurocode <sub>] [--global]", true),
     cmd!("llm-selector", &[], "Dynamic LLM model selector: status, pool, enable, disable", "Configuration", "[status|pool|enable|disable|help]", true),
     cmd!("neurocode", &[], "NeuroCode engine: status, tier, index, query, patterns, domain", "Configuration", "[status|tier|index|query|patterns|domain] [...]", true),
     cmd!("codex-runtime", &["codex_runtime"], "Toggle codex app-server runtime for OpenAI/Codex models", "Configuration", "[auto|codex_app_server]", false),

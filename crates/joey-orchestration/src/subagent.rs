@@ -150,6 +150,7 @@ impl Subagent {
         max_spawn_depth: usize,
         workdir: Option<&std::path::Path>,
         interrupt: Arc<AtomicBool>,
+        semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Result<Self, ProviderError> {
         let model = resolve_model(
             None,
@@ -189,6 +190,12 @@ impl Subagent {
         let ts_sum = toolset_summary(&req.toolsets);
         let mut agent = Agent::new(child_agent_cfg, child_registry, child_ctx)?;
 
+        // Share the PARENT's provider-request semaphore (FR-018). Without
+        // this, a batch of N children fires unbounded concurrent provider
+        // requests — the manager's semaphore exists but was never wired
+        // into child agents, so capacity_requests() never throttled.
+        agent.set_provider_semaphore(semaphore);
+
         // T060/T149: Inject category prompt_append as extra instructions.
         // This is prepended to the system prompt alongside any loaded skills.
         if let Some(ref append) = req.prompt_append {
@@ -219,16 +226,26 @@ impl Subagent {
 
         // Persist: attach a SessionDb to the child agent when persist=true (FR-017).
         let session_id = if req.persist {
-            let child_sid = format!("subagent-{}", uuid::Uuid::new_v4().simple());
             match joey_core::state::SessionDb::open_default() {
                 Ok(db) => {
-                    let _ = db.create_session(
-                        "subagent",
-                        Some(&model),
-                        None,
-                    );
-                    agent.set_session_store(db, child_sid.clone());
-                    Some(child_sid)
+                    // Use the id create_session RETURNS (it has a real
+                    // sessions row). The old code discarded it and used an
+                    // unregistered "subagent-<uuid>" string — persisted
+                    // messages then referenced a session that no query
+                    // (session search, resume) could resolve.
+                    match db.create_session("subagent", Some(&model), None) {
+                        Ok(real_sid) => {
+                            agent.set_session_store(db, real_sid.clone());
+                            Some(real_sid)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to create session row for subagent persist: {}",
+                                e
+                            );
+                            None
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to open session DB for subagent persist: {}", e);
@@ -371,15 +388,18 @@ impl Subagent {
             );
         }
 
-        // Determine if interrupted by the batch-level flag.
+        // Determine outcome: interrupted beats fatal beats clean.
         let was_interrupted = result.interrupted || batch_interrupt.load(Ordering::SeqCst);
+        let fatal = result.fatal && !was_interrupted;
 
         DelegationResult {
             goal,
             summary,
-            success: !was_interrupted,
+            success: !was_interrupted && !fatal,
             error: if was_interrupted {
                 Some("subagent was interrupted".to_string())
+            } else if fatal {
+                Some("subagent turn failed (fatal provider error)".to_string())
             } else {
                 None
             },

@@ -171,10 +171,12 @@ impl StagingArea for GitStagingArea {
     async fn apply(
         &self,
         root: &StagingRoot,
-        _selection: &crate::staging::Selection,
+        selection: &crate::staging::Selection,
     ) -> Result<ApplyOutcome, StagingError> {
-        // For staged mode: compute diff and apply to primary worktree.
-        // git diff > patch && git apply --reject <patch>
+        // For staged mode: compute diff and apply to the PRIMARY worktree
+        // (cwd = the worktree itself — the old code used
+        // worktree.parent(), i.e. the temp dir, so `git apply` ran in the
+        // wrong repository and reviewed hunks never landed).
         if root.mode == ChangeMode::Staged {
             let diff_output = Command::new("git")
                 .arg("diff")
@@ -183,24 +185,70 @@ impl StagingArea for GitStagingArea {
                 .await
                 .map_err(|e| StagingError::Git(format!("git diff failed: {e}")))?;
 
+            // Honor the selection: apply only the chosen files' hunks when
+            // entries are listed; empty selection = everything (reviewer
+            // pressed "apply all").
+            let patch_text = String::from_utf8_lossy(&diff_output.stdout).to_string();
+            let selected_patch = if selection.entries.is_empty() || selection.apply_all_accepted {
+                patch_text.clone()
+            } else {
+                // Keep per-file diff sections for selected paths.
+                let wanted: std::collections::HashSet<&str> = selection
+                    .entries
+                    .iter()
+                    .map(|e| e.path.as_str())
+                    .collect();
+                let mut out = String::new();
+                let mut current: Option<String> = None;
+                for line in patch_text.lines() {
+                    if let Some(p) = line.strip_prefix("+++ b/") {
+                        current = Some(p.to_string());
+                    }
+                    if current
+                        .as_deref()
+                        .map(|p| wanted.contains(p))
+                        .unwrap_or(false)
+                    {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+                out
+            };
+            if selected_patch.trim().is_empty() {
+                return Ok(ApplyOutcome::default());
+            }
+
             let patch_file = std::env::temp_dir().join(format!("joey-apply-{}.patch", root.attempt_id));
-            std::fs::write(&patch_file, &diff_output.stdout)?;
+            std::fs::write(&patch_file, selected_patch)?;
 
             let apply_output = Command::new("git")
                 .arg("apply")
                 .arg("--reject")
                 .arg(&patch_file)
-                .current_dir(&root.worktree.parent().unwrap_or(&root.worktree))
+                .current_dir(&root.worktree)
                 .output()
                 .await
                 .map_err(|e| StagingError::Git(format!("git apply failed: {e}")))?;
 
             let _ = std::fs::remove_file(&patch_file);
 
-            if !apply_output.status.success() {
-                // --reject leaves unappliable hunks in .rej files; this is expected
-                // for partial application. We report success with warnings.
-            }
+            // Report the actually-applied paths (selection-relative).
+            let applied: Vec<String> = if !apply_output.status.success() {
+                // --reject leaves unappliable hunks in .rej files; report
+                // what was requested with a warning rather than nothing.
+                Vec::new()
+            } else {
+                selection
+                    .entries
+                    .iter()
+                    .map(|e| e.path.clone())
+                    .collect()
+            };
+            return Ok(ApplyOutcome {
+                applied,
+                warnings: Vec::new(),
+            });
         }
 
         Ok(ApplyOutcome {

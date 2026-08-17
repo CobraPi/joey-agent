@@ -388,6 +388,12 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
     let mut final_text = String::new();
     let mut streamed_any = false;
     let mut streamed_line_count: u32 = 0;
+    // True when something other than streamed content deltas printed since
+    // the first delta (a tool block, notice, error…). The Done reflow clears
+    // N lines above the cursor — with interleaved output those lines contain
+    // tool results, and the reflow would ERASE them. Reflow only when the
+    // streamed region is contiguous.
+    let mut interleaved_output = false;
     let mut reasoning_open = false;
     let mut reasoning_buf = String::new();
     let mut reasoning_line_count: usize = 0; // Feature 005 (T025): reasoning size tracking
@@ -713,6 +719,11 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 // Spec 008: stash emoji+summary for the ToolEnd crush header.
                 pending_tool_emoji = emoji.clone();
                 pending_tool_summary = summary.clone();
+                // A tool block between streamed deltas makes the streamed
+                // region non-contiguous — reflow at Done would erase it.
+                if streamed_any {
+                    interleaved_output = true;
+                }
                 // Feature 013 (T031): the old `if streamed_any { println!() }`
                 // ad-hoc blank is subsumed by the pending_separator flag.
                 // (Relied on INV-1 dedup — draining resets the flag.)
@@ -750,8 +761,21 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                         // line in place when the tool resolves.
                         use crossterm::{cursor, queue};
                         let mut stdout = std::io::stdout();
-                        // Get the cursor position.
-                        if let Ok(pos) = cursor::position() {
+                        // Get the cursor position. BLOCKING QUERY GUARD:
+                        // cursor::position() writes ESC[6n and blocks reading
+                        // the terminal's reply — on a pipe/non-TTY (tests,
+                        // cargo capture, `joey ... | tee`) NO reply ever
+                        // arrives and the whole turn hangs forever. Only
+                        // query when a real raw-mode-capable TTY is attached;
+                        // otherwise take the plain-line fallback below.
+                        let pos = if crossterm::terminal::is_raw_mode_enabled()
+                            .unwrap_or(false)
+                        {
+                            cursor::position().ok()
+                        } else {
+                            None
+                        };
+                        if let Some(pos) = pos {
                             // Print the entry line: spinner frame + name + summary.
                             let frame = tool_profile.frames[0];
                             let color = (tool_profile.color)(t);
@@ -828,6 +852,10 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     continue;
                 }
                 if opts.tool_progress == "new" && last_tool_line.as_deref() == Some(name.as_str()) && !is_error {
+                    // De-duplicated repeat of an already-rendered tool line.
+                    // Still retire the active spinner: leaving it pending
+                    // repaints a phantom tool row forever.
+                    active_tool.take();
                     continue;
                 }
                 last_tool_line = Some(name.clone());
@@ -855,7 +883,9 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                                 terminal::Clear(terminal::ClearType::CurrentLine),
                             );
                             let _ = stdout.flush();
-                            print!("{}", line);
+                            // Trailing newline: without it the first body
+                            // line concatenates onto this header row.
+                            print!("{}\n", line);
                             let _ = stdout.flush();
                             let _ = state;
                         } else {
@@ -886,7 +916,9 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                                 terminal::Clear(terminal::ClearType::CurrentLine),
                             );
                             let _ = stdout.flush();
-                            print!("{}", line);
+                            // Trailing newline: without it the first body
+                            // line concatenates onto this header row.
+                            print!("{}\n", line);
                             let _ = stdout.flush();
                             let _ = state;
                         } else {
@@ -1074,7 +1106,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 // text contains markdown, clear the streamed region and re-print
                 // it once as formatted markdown. Only when interactive (cursor
                 // control is required). NonInteractive keeps the raw stream.
-                if streamed_any && animations_on && !text.is_empty() {
+                if streamed_any && animations_on && !text.is_empty() && !interleaved_output {
                     use crossterm::{cursor, queue, terminal};
                     let mut stdout = std::io::stdout();
                     // Move up and clear each streamed line (+1 for the current line).
@@ -1744,7 +1776,7 @@ pub fn checkpoint_reverted(number: usize) {
 mod tests {
     use super::*;
     use crate::capability::{Capability, RenderCapability};
-    use joey_agent_core::events::{FileChangeKind, AgentEvent};
+    use joey_agent_core::events::AgentEvent;
     use joey_providers::Usage;
     use tokio::sync::mpsc;
 

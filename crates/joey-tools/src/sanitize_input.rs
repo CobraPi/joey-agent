@@ -33,8 +33,14 @@ pub fn sanitize_tool_input(_tool_name: &str, _tool_call_id: &str, input: &str) -
 /// This matches crush's error message format.
 pub fn sanitized_error_result(tool_name: &str, _tool_call_id: &str, raw_input: &str) -> String {
     // Show a preview of the invalid input for debugging.
+    // Snap the cut to a UTF-8 char boundary: a multibyte char straddling
+    // byte 200 would panic on a raw byte slice.
     let preview = if raw_input.len() > 200 {
-        format!("{}...", &raw_input[..200])
+        let mut end = 200;
+        while end < raw_input.len() && !raw_input.is_char_boundary(end) {
+            end += 1;
+        }
+        format!("{}...", &raw_input[..end])
     } else {
         raw_input.to_string()
     };

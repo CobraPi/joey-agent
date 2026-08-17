@@ -355,10 +355,20 @@ fn apply_replacements(
     new_string: &str,
     old_string: Option<&str>,
 ) -> String {
+    // Sort ascending and drop overlapping spans (keep the leftmost), matching
+    // str::replace() non-overlapping semantics. Fuzzy strategies can produce
+    // overlapping spans; splicing those at stale offsets corrupts the file
+    // (e.g. "ENDND" output). A single forward pass avoids offset drift by
+    // construction.
     let mut sorted_matches = matches.clone();
-    sorted_matches.sort_by_key(|m| std::cmp::Reverse(m.0));
-    let mut result = content.to_string();
-    for (start, end) in sorted_matches {
+    sorted_matches.sort();
+    let mut result = String::with_capacity(content.len());
+    let mut last_end = 0usize;
+    for &(start, end) in &sorted_matches {
+        if start < last_end {
+            // Overlaps the previous (kept) replacement — skip.
+            continue;
+        }
         let adjusted = match old_string {
             Some(old) => {
                 let file_region = &content[start..end];
@@ -366,8 +376,11 @@ fn apply_replacements(
             }
             None => new_string.to_string(),
         };
-        result = format!("{}{}{}", &result[..start], adjusted, &result[end..]);
+        result.push_str(&content[last_end..start]);
+        result.push_str(&adjusted);
+        last_end = end;
     }
+    result.push_str(&content[last_end..]);
     result
 }
 

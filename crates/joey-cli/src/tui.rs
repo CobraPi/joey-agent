@@ -225,12 +225,22 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
             last_ctrlc: None,
             queued: Vec::new(),
             engine_queued: Vec::new(),
+            engine_generation: 0,
         };
         session.submit(query.clone());
         loop {
+            let gen_at_start = session.engine_generation;
             match pump_one(&mut session).await {
                 Some(PumpOutcome::TurnDone) | Some(PumpOutcome::EngineGone) => break,
-                _ => {}
+                Some(PumpOutcome::Action(TuiAction::Quit)) => break,
+                // The waiting turn died with a force-killed engine — its
+                // TurnFinished will never arrive from the fresh engine.
+                // Escape instead of waiting forever.
+                _ => {
+                    if session.engine_generation != gen_at_start {
+                        break;
+                    }
+                }
             }
         }
         let final_text = session.tui.app().last_final_text.clone();
@@ -259,6 +269,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         last_ctrlc: None,
         queued: Vec::new(),
         engine_queued: Vec::new(),
+        engine_generation: 0,
     };
     let (result, outro) = interactive_loop(session).await;
 
@@ -346,6 +357,12 @@ pub struct TuiSession {
     /// announces the submit started (QueuedSubmitStarted); on force-kill
     /// the remainder is what gets discarded.
     pub engine_queued: Vec<String>,
+    /// Increments each time the engine is force-killed and restarted.
+    /// Interactive-mode pump loops compare against the generation they
+    /// started with; the single-query loop uses it to detect that the
+    /// turn it was waiting on died with the killed engine (no
+    /// TurnFinished will ever arrive from the fresh one).
+    pub engine_generation: u64,
 }
 
 impl TuiSession {
@@ -474,6 +491,185 @@ impl TuiSession {
         }
     }
 
+    /// /model: main-model switch + NeuroCode per-provider tier config.
+    ///
+    /// Grammar:
+    ///   /model                                — show current model/provider
+    ///                                          + tier config for the provider
+    ///   /model <name> [--global]              — switch the main model (the
+    ///                                          engine swaps the live agent;
+    ///                                          --global persists model.default)
+    ///   /model neurocode                      — show tier models for the
+    ///                                          active provider
+    ///   /model neurocode frontier <name>      — set the frontier tier model
+    ///                                          (persisted per provider)
+    ///   /model neurocode economical <name>    — set the economical tier model
+    ///   /model neurocode reset                — clear this provider's tier
+    ///                                          overrides (fall back to flat)
+    fn handle_model_slash(&mut self, args: &str) {
+        match ModelSlash::parse(args) {
+            ModelSlash::Show => {
+                // Show: current model + provider + neurocode tiers.
+                let model = self.tui.app().model.clone();
+                let provider = self.tui.app().provider.clone();
+                let mut text = format!("Current model: {model} (provider: {provider})");
+                if let Ok(cfg) = joey_core::Config::load() {
+                    let nc = joey_neurocode::NeuroCodeConfig::from_config(&cfg);
+                    if nc.enabled {
+                        let tiers = nc.tier.tiers_for_provider(&provider);
+                        let f = if tiers.frontier.is_empty() { "(unset)".into() } else { tiers.frontier };
+                        let e = if tiers.economical.is_empty() { "(unset)".into() } else { tiers.economical };
+                        text.push_str(&format!(
+                            "\nneurocode tiers [{provider}]: frontier={f} · economical={e} \
+                             (ambiguous→{})",
+                            nc.tier.ambiguous_default,
+                        ));
+                    } else {
+                        text.push_str("\nneurocode: disabled");
+                    }
+                }
+                text.push_str("\nUsage: /model <name> [--global] · /model neurocode <frontier|economical> <name> · /model neurocode reset");
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text,
+                    kind: NoticeKind::Info,
+                });
+            }
+            ModelSlash::Neurocode { sub } => {
+                self.handle_model_neurocode(sub);
+            }
+            ModelSlash::Switch { model, global } => {
+                if self.busy {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "⧗ model switch queued — applies when the running turn finishes.".into(),
+                        kind: NoticeKind::Busy,
+                    });
+                }
+                if let Some(engine) = &self.engine {
+                    engine.send(crate::engine::EngineCommand::SwitchModel { model, global });
+                } else {
+                    self.tui.app_mut().push_item(TranscriptItem::Error {
+                        text: "engine unavailable — cannot switch model".into(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// `/model neurocode …` sub-handler: per-provider tier model config.
+    fn handle_model_neurocode(&mut self, sub: ModelNcSub) {
+        let provider = self.tui.app().provider.clone();
+        match sub {
+            ModelNcSub::Show => {
+                let mut text = match joey_core::Config::load() {
+                    Ok(cfg) => {
+                        let nc = joey_neurocode::NeuroCodeConfig::from_config(&cfg);
+                        if nc.enabled {
+                            let tiers = nc.tier.tiers_for_provider(&provider);
+                            format!(
+                                "neurocode tiers [{provider}]:\n  frontier: {}\n  economical: {}\n  ambiguous_default: {}",
+                                if tiers.frontier.is_empty() { "(unset)".into() } else { tiers.frontier },
+                                if tiers.economical.is_empty() { "(unset)".into() } else { tiers.economical },
+                                nc.tier.ambiguous_default,
+                            )
+                        } else {
+                            "neurocode is disabled (neurocode.enabled=false) — tier models \
+                             are stored but not used."
+                                .to_string()
+                        }
+                    }
+                    Err(e) => format!("config unavailable: {e}"),
+                };
+                text.push_str("\nUsage: /model neurocode <frontier|economical> <name> · /model neurocode reset");
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text,
+                    kind: NoticeKind::Info,
+                });
+            }
+            ModelNcSub::Frontier(model) => {
+                self.set_neurocode_tier(&provider, "frontier", &model);
+            }
+            ModelNcSub::Economical(model) => {
+                self.set_neurocode_tier(&provider, "economical", &model);
+            }
+            ModelNcSub::Reset => {
+                let mut cleared = Vec::new();
+                match joey_core::Config::load() {
+                    Ok(mut cfg) => {
+                        for tier in ["frontier", "economical"] {
+                            let key = format!("neurocode.tier.providers.{provider}.{tier}");
+                            match cfg.unset(&key) {
+                                Ok(true) => cleared.push(tier),
+                                Ok(false) => {}
+                                Err(e) => {
+                                    self.tui.app_mut().push_item(TranscriptItem::Error {
+                                        text: format!("failed to unset {key}: {e}"),
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.tui.app_mut().push_item(TranscriptItem::Error {
+                            text: format!("config unavailable: {e}"),
+                        });
+                        return;
+                    }
+                }
+                let what = if cleared.is_empty() {
+                    "no per-provider overrides were set".to_string()
+                } else {
+                    format!("cleared: {}", cleared.join(", "))
+                };
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!("neurocode tier overrides for {provider} — {what} (flat keys now apply)"),
+                    kind: NoticeKind::Success,
+                });
+            }
+            ModelNcSub::Unknown(other) => {
+                self.tui.app_mut().push_item(TranscriptItem::Error {
+                    text: format!(
+                        "unknown neurocode subcommand '{other}'. Use: show | frontier <name> | economical <name> | reset"
+                    ),
+                });
+            }
+        }
+    }
+
+    /// Persist a neurocode tier model for `provider` (`frontier`/`economical`).
+    fn set_neurocode_tier(&mut self, provider: &str, tier: &str, model: &str) {
+        if model.is_empty() {
+            self.tui.app_mut().push_item(TranscriptItem::Error {
+                text: format!("Usage: /model neurocode {tier} <model-name>"),
+            });
+            return;
+        }
+        let key = format!("neurocode.tier.providers.{provider}.{tier}");
+        match joey_core::Config::load() {
+            Ok(mut cfg) => match cfg.set_and_save(&key, model) {
+                Ok(()) => {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: format!(
+                            "✓ neurocode {tier} model for {provider} → {model} \
+                             (saved; applies from the next turn)",
+                        ),
+                        kind: NoticeKind::Success,
+                    });
+                }
+                Err(e) => {
+                    self.tui.app_mut().push_item(TranscriptItem::Error {
+                        text: format!("failed to save {key}: {e}"),
+                    });
+                }
+            },
+            Err(e) => {
+                self.tui.app_mut().push_item(TranscriptItem::Error {
+                    text: format!("config unavailable: {e}"),
+                });
+            }
+        }
+    }
+
     /// /start-work: activate Atlas on a plan. The OMO bookkeeping +
     /// context injection stay UI-side; the Atlas identity switch goes to
     /// the engine (it mutates the agent).
@@ -556,6 +752,7 @@ impl TuiSession {
             });
         }
         // Fresh engine, fresh agent.
+        self.engine_generation += 1;
         let agent = match self.engine_spec.build_agent() {
             Ok(a) => a,
             Err(e) => {
@@ -731,6 +928,20 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
             Some(PumpOutcome::HeavyDone)
         }
         Some(crate::engine::EngineEvent::AgentSwitched { model, provider, notice, .. }) => {
+            session.tui.app_mut().model = model;
+            session.tui.app_mut().provider = provider;
+            session.tui.app_mut().push_item(TranscriptItem::Notice {
+                text: notice,
+                kind: NoticeKind::Success,
+            });
+            // Refresh the Default roster entry's model stamp.
+            let model_now = session.tui.app().model.clone();
+            if let Some(default) = session.tui.app_mut().agent_roster.first_mut() {
+                default.resolved_model = Some(model_now);
+            }
+            None
+        }
+        Some(crate::engine::EngineEvent::ModelSwitched { model, provider, notice }) => {
             session.tui.app_mut().model = model;
             session.tui.app_mut().provider = provider;
             session.tui.app_mut().push_item(TranscriptItem::Notice {
@@ -982,11 +1193,8 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                 }
             }
             "model" => {
-                let model_now = self.tui.app().model.clone();
-                self.tui.app_mut().push_item(TranscriptItem::Notice {
-                    text: format!("Current model: {model_now} — use `joey model` outside the TUI to change"),
-                    kind: NoticeKind::Info,
-                });
+                let args = slash_args_after(input, "model");
+                self.handle_model_slash(args);
             }
             "status" => {
                 let (sid, mdl, tok_prompt, tok_comp, tok_iter, msg_count) = {
@@ -1254,6 +1462,62 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
 /// slash::resolve so aliases (/q), and case variants classify the same as
 /// the full name. Anything else submitted while busy is queued (or, for
 /// unknown commands, answered by handle_slash as usual when idle).
+/// Parsed `/model` arguments (pure parser — unit-testable without a session).
+#[derive(Debug, PartialEq)]
+enum ModelSlash {
+    /// `/model` — show current model + tiers.
+    Show,
+    /// `/model <name> [--global]`.
+    Switch { model: String, global: bool },
+    /// `/model neurocode …` (alias: `nc`).
+    Neurocode { sub: ModelNcSub },
+}
+
+/// `/model neurocode` subcommand.
+#[derive(Debug, PartialEq)]
+enum ModelNcSub {
+    Show,
+    Frontier(String),
+    Economical(String),
+    Reset,
+    Unknown(String),
+}
+
+impl ModelSlash {
+    fn parse(args: &str) -> Self {
+        let mut parts: Vec<String> = args
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+        let global = parts.iter().any(|p| p == "--global" || p == "-g");
+        parts.retain(|p| p != "--global" && p != "-g");
+
+        let Some(first) = parts.first().cloned() else {
+            return Self::Show;
+        };
+        match first.as_str() {
+            "neurocode" | "nc" => {
+                let sub = match parts.get(1).map(|s| s.as_str()) {
+                    None | Some("show") => ModelNcSub::Show,
+                    Some("frontier") => ModelNcSub::Frontier(
+                        parts[2..].join(" "),
+                    ),
+                    Some("economical") | Some("eco") => ModelNcSub::Economical(
+                        parts[2..].join(" "),
+                    ),
+                    Some("reset") => ModelNcSub::Reset,
+                    Some(other) => ModelNcSub::Unknown(other.to_string()),
+                };
+                Self::Neurocode { sub }
+            }
+            _ => Self::Switch {
+                model: parts.join(" "),
+                global,
+            },
+        }
+    }
+}
+
 fn slash_is_light(input: &str) -> bool {
     if !input.trim_start().starts_with('/') {
         return false;
@@ -1320,6 +1584,71 @@ mod tui_tests {
         // light); /steer is a mid-turn engine command (not light).
         for heavy in ["/neurocode index", "/start-work", "/quit", "/clear", "hello", "", "/steer x", "/qu x"] {
             assert!(!super::slash_is_light(heavy), "expected not light: {heavy}");
+        }
+    }
+
+    /// /model grammar parsing: the four forms the TUI handler routes on.
+    #[test]
+    fn model_slash_parses_all_forms() {
+        use super::ModelSlash;
+        // Bare show.
+        assert!(matches!(ModelSlash::parse(""), ModelSlash::Show));
+        assert!(matches!(ModelSlash::parse("   "), ModelSlash::Show));
+        // Plain model switch (session + global; --global stripped from name).
+        match ModelSlash::parse("gpt-5.4") {
+            ModelSlash::Switch { model, global } => {
+                assert_eq!(model, "gpt-5.4");
+                assert!(!global);
+            }
+            other => panic!("expected Switch, got {other:?}"),
+        }
+        match ModelSlash::parse("claude-opus-4.6 --global") {
+            ModelSlash::Switch { model, global } => {
+                assert_eq!(model, "claude-opus-4.6");
+                assert!(global);
+            }
+            other => panic!("expected Switch, got {other:?}"),
+        }
+        // Multi-word model names stay joined.
+        match ModelSlash::parse("openai gpt-5.4") {
+            ModelSlash::Switch { model, .. } => assert_eq!(model, "openai gpt-5.4"),
+            other => panic!("expected Switch, got {other:?}"),
+        }
+        // Neurocode forms.
+        assert!(matches!(ModelSlash::parse("neurocode"), ModelSlash::Neurocode { .. }));
+        match ModelSlash::parse("neurocode frontier glm-4.6") {
+            ModelSlash::Neurocode { sub } => {
+                assert_eq!(sub, super::ModelNcSub::Frontier("glm-4.6".into()));
+            }
+            other => panic!("expected Neurocode, got {other:?}"),
+        }
+        match ModelSlash::parse("nc economical glm-4.5-air") {
+            ModelSlash::Neurocode { sub } => {
+                assert_eq!(sub, super::ModelNcSub::Economical("glm-4.5-air".into()));
+            }
+            other => panic!("expected Neurocode, got {other:?}"),
+        }
+        assert!(matches!(
+            ModelSlash::parse("neurocode reset"),
+            ModelSlash::Neurocode { sub: super::ModelNcSub::Reset }
+        ));
+        assert!(matches!(
+            ModelSlash::parse("neurocode show"),
+            ModelSlash::Neurocode { sub: super::ModelNcSub::Show }
+        ));
+        match ModelSlash::parse("neurocode bogus x") {
+            ModelSlash::Neurocode { sub: super::ModelNcSub::Unknown(w) } => {
+                assert_eq!(w, "bogus");
+            }
+            other => panic!("expected Neurocode Unknown, got {other:?}"),
+        }
+        // Tier with no model name is Unknown-shaped usage error (frontier
+        // with empty model → handled at render; parser keeps the variant).
+        match ModelSlash::parse("neurocode frontier") {
+            ModelSlash::Neurocode { sub } => {
+                assert_eq!(sub, super::ModelNcSub::Frontier(String::new()));
+            }
+            other => panic!("expected Neurocode, got {other:?}"),
         }
     }
 

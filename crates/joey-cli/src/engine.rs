@@ -63,6 +63,11 @@ pub enum EngineCommand {
     ForceKill,
     /// Switch the active OMO agent (applied between turns; queued mid-turn).
     SwitchAgent(String),
+    /// Switch the main LLM model (`/model <name>`). The engine owns the
+    /// agent, so the swap (and any NeuroCode engine refresh needed for
+    /// per-provider tier scope) happens here. `global` also persists the
+    /// choice to `model.default`.
+    SwitchModel { model: String, global: bool },
     /// Run a heavy blocking job on the engine's blocking pool (currently
     /// `/neurocode …` — tree walks + SQLite bulk upserts). Light slash
     /// commands never come here; the UI answers those inline.
@@ -95,6 +100,9 @@ pub enum EngineEvent {
     /// The engine applied an agent switch; the UI should refresh its model
     /// labels. `notice` is display text for the transcript.
     AgentSwitched { display_name: String, model: String, provider: String, notice: String },
+    /// The engine applied a `/model` switch (`SwitchModel`). The UI refreshes
+    /// its model/provider labels; `notice` is display text for the transcript.
+    ModelSwitched { model: String, provider: String, notice: String },
     /// Pre-turn notice (intent gate announcements etc.) for the transcript.
     Notice(String),
     /// The engine finished all work (turn + heavy-job queues empty) and is
@@ -321,13 +329,52 @@ async fn engine_task(
                     notice,
                 });
             }
+            EngineCommand::SwitchModel { model, global } => {
+                let notice = engine_switch_model(&mut agent, &model, global);
+                let _ = event_tx.send(EngineEvent::ModelSwitched {
+                    model: agent.model().to_string(),
+                    provider: agent.provider_name().to_string(),
+                    notice,
+                });
+            }
             EngineCommand::HeavyJob { label, args } => {
                 // Heavy jobs run on the blocking pool so even a multi-minute
                 // tree walk doesn't pin the engine's async worker.
                 let out_label = label.clone();
-                let res = tokio::task::spawn_blocking(move || run_heavy_job(&label, &args))
-                    .await
-                    .unwrap_or_else(|e| format!("job failed: {e}"));
+                let job = tokio::task::spawn_blocking(move || run_heavy_job(&label, &args));
+                tokio::pin!(job);
+                let res = loop {
+                    tokio::select! {
+                        res = &mut job => {
+                            break res.unwrap_or_else(|e| format!("job failed: {e}"));
+                        }
+                        cmd = cmd_rx.recv() => {
+                            match cmd {
+                                // A blocking job can't be cooperatively
+                                // interrupted — acknowledge instead of going
+                                // deaf (2nd Ctrl-C still force-kills via the
+                                // UI abandon path).
+                                Some(EngineCommand::Interrupt) => {
+                                    let _ = event_tx.send(EngineEvent::Notice(
+                                        "⏳ heavy job in progress — cannot interrupt; press Ctrl-C again to force-restart the engine.".into(),
+                                    ));
+                                }
+                                Some(EngineCommand::ForceKill) => {
+                                    interrupt.store(true, Ordering::SeqCst);
+                                }
+                                Some(other) => queued.push_back(other),
+                                None => {
+                                    // UI abandoned the engine — a closed
+                                    // channel resolves instantly, so stay
+                                    // here and the select would busy-spin.
+                                    // Detach the blocking job (it runs to
+                                    // completion) and exit.
+                                    break String::from("(engine abandoned during heavy job)");
+                                }
+                            }
+                        }
+                    }
+                };
                 let _ = event_tx.send(EngineEvent::HeavyJobFinished { label: out_label, text: res });
             }
             EngineCommand::Steer(text) => {
@@ -449,6 +496,53 @@ fn engine_switch_agent(agent: &mut Agent, agent_name: &str) -> String {
     }
 }
 
+/// `/model <name>` on the engine side: swap the live agent's main model,
+/// optionally persist it, and refresh the NeuroCode engine so per-provider
+/// tier scoping follows the (possibly different) provider. Returns a notice
+/// for the transcript.
+fn engine_switch_model(agent: &mut Agent, model: &str, global: bool) -> String {
+    let mut notice = match agent.switch_model("auto", "", model, None) {
+        Ok(msg) => msg,
+        Err(e) => return format!("Model switch failed: {e}"),
+    };
+    if global {
+        match joey_core::Config::load() {
+            Ok(mut cfg) => match cfg.set_and_save("model.default", model) {
+                Ok(()) => {
+                    notice.push_str(&format!(" — saved to {}", cfg.path().display()));
+                }
+                Err(e) => {
+                    notice.push_str(&format!(
+                        " (session only — failed to persist model.default: {e})"
+                    ));
+                }
+            },
+            Err(e) => {
+                notice.push_str(&format!(" (session only — config unavailable: {e})"));
+            }
+        }
+    }
+    // Refresh the NeuroCode engine: its tier resolution is scoped to the
+    // ACTIVE provider (`neurocode.tier.providers.<id>`), which may have
+    // changed with the model swap. Reads config fresh; None (neurocode
+    // disabled) clears the agent's engine override so tiers stop applying.
+    let refreshed = joey_core::Config::load().unwrap_or_else(|_| joey_core::Config::defaults());
+    let scoped: Option<Arc<dyn joey_neurocode::NeuroCodeEngine>> =
+        crate::neurocode_wiring::try_build_engine_scoped(
+            &refreshed,
+            agent.provider_name(),
+        )
+        .map(|e| e as Arc<dyn joey_neurocode::NeuroCodeEngine>);
+    let tier_note = if scoped.is_some() {
+        " · neurocode tier scope refreshed"
+    } else {
+        ""
+    };
+    agent.set_neurocode_engine_opt(scoped);
+    notice.push_str(tier_note);
+    notice
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +600,50 @@ mod actor_tests {
             }
         }
         assert_eq!(finished, 2, "both queued turns completed");
+    }
+
+    /// `/model` switch through the real engine actor: SwitchModel swaps the
+    /// agent's model (unauthenticated provider → no network) and emits
+    /// ModelSwitched carrying the new model id.
+    #[tokio::test]
+    async fn switch_model_swaps_and_emits() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "model:\n  provider: openai-api\n  default: gpt-4o-mini\n").unwrap();
+        let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let spec = EngineSpec {
+            config,
+            cwd: std::env::temp_dir(),
+            overrides: crate::repl::Overrides::default(),
+            session_id: "engmodel_00000000_0000_abc123".into(),
+        };
+        let agent = spec.build_agent().expect("agent builds");
+        assert_eq!(agent.model(), "gpt-4o-mini");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, _interrupt) = spawn_engine(agent, ev_tx);
+
+        handle.send(EngineCommand::SwitchModel {
+            model: "gpt-4.1".into(),
+            global: false,
+        });
+
+        let mut switched = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while switched.is_none() && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::ModelSwitched { model, provider, notice }) => {
+                    switched = Some((model, provider, notice));
+                }
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+        let (model, _provider, notice) =
+            switched.expect("engine emitted ModelSwitched");
+        assert_eq!(model, "gpt-4.1");
+        assert!(notice.contains("gpt-4.1"), "notice mentions the model: {notice}");
+        // `global: false` must NOT touch model.default in the config file.
+        let cfg_after = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(cfg_after.get_str("model.default", ""), "gpt-4o-mini");
     }
 
     /// ForceKill: the channel closes and the engine task exits (join

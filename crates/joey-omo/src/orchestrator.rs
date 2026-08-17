@@ -864,7 +864,7 @@ mod tests {
         assert_eq!(impl_tasks.len(), 3);
         assert_eq!(verify_tasks.len(), 1);
         assert_eq!(impl_tasks[0].number, 1);
-        assert_eq!(verify_tasks[0].number, 1);
+        assert_eq!(verify_tasks[0].number, crate::plan_parser::F_TASK_NUMBER_OFFSET + 1);
         assert!(verify_tasks[0].is_final_verification);
     }
 

@@ -46,6 +46,11 @@ pub fn format_steer_marker(steer_text: &str) -> String {
 /// Retry-After cap: 600s (conversation_loop.py:4309-4317, #26293).
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(600);
 
+/// Per-tool timeout for parallel (read-only) tool dispatch. A hung
+/// read-only tool (e.g. web_extract against a black-holed host) must not
+/// block the turn indefinitely.
+const PARALLEL_TOOL_TIMEOUT_SECS: u64 = 300;
+
 /// Read-only tools with no shared mutable session state — safe to run
 /// concurrently within a batch (tool_dispatch_helpers.py `_PARALLEL_SAFE_TOOLS`,
 /// restricted to tools the port ships).
@@ -220,6 +225,11 @@ pub struct TurnResult {
     pub usage: Usage,
     pub iterations: usize,
     pub interrupted: bool,
+    /// True when the turn ended in a FATAL provider error (auth exhausted,
+    /// unrecoverable overflow, etc.) as opposed to a clean finish or a user
+    /// interrupt. Delegation consumers use this to report child failure
+    /// instead of mistaking an empty fatal turn for success.
+    pub fatal: bool,
 }
 
 /// How a provider call block ended without a response.
@@ -443,6 +453,16 @@ impl Agent {
     /// pre-feature-015 (Constitution VII, FR-020).
     pub fn set_neurocode_engine(&mut self, engine: Arc<dyn joey_neurocode::NeuroCodeEngine>) {
         self.neurocode_engine = Some(engine);
+    }
+
+    /// Set OR CLEAR the NeuroCode engine (`/model` switch path): a None
+    /// clears the override so tier routing stops applying when NeuroCode
+    /// is disabled in config at switch time.
+    pub fn set_neurocode_engine_opt(
+        &mut self,
+        engine: Option<Arc<dyn joey_neurocode::NeuroCodeEngine>>,
+    ) {
+        self.neurocode_engine = engine;
     }
 
     /// Set the dynamic LLM model allocator (feature 011). When set, the main
@@ -902,6 +922,15 @@ impl Agent {
     fn push_synthetic(&mut self, msg: Message) {
         self.synthetic_indices.insert(self.history.len());
         self.history.push(msg);
+    }
+
+    /// Adopt a compacted transcript as the live history, invalidating the
+    /// synthetic-index map. After compaction the old indices alias arbitrary
+    /// positions in the shorter history, so `drop_trailing_synthetic_scaffolding`
+    /// could otherwise pop REAL messages it mistakes for synthetic scaffolding.
+    pub(crate) fn adopt_compressed_history(&mut self, compressed: Vec<Message>) {
+        self.synthetic_indices.clear();
+        self.history = compressed;
     }
 
     /// Drop trailing scaffolding (and the tool/assistant pair it orphaned)
@@ -1807,6 +1836,12 @@ impl Agent {
         }
         // Per-turn resets.
         self.interrupt.store(false, Ordering::SeqCst);
+        // A one-shot output-cap override from a PREVIOUS turn (set while
+        // parsing an overflow error, only cleared on success) must not leak
+        // into this turn: an aborted turn (Fatal/Interrupted) would otherwise
+        // pin every later request to max_tokens=1-style caps. Clear it here;
+        // the overflow handler re-arms it within THIS turn when needed.
+        self.ephemeral_max_output_tokens = None;
         // New user turn → the NeuroCode intercept's dedupe key is stale;
         // clear it so THIS turn's request assembles fresh context (even if
         // the user repeats the same text verbatim).
@@ -1917,7 +1952,7 @@ impl Agent {
                     usage: total_usage.clone(),
                     iterations: api_calls,
                 });
-                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true };
+                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false };
             }
 
             // ── Pre-API /steer drain (conversation_loop.py:933-975) ────────
@@ -2009,7 +2044,7 @@ impl Agent {
                         usage: total_usage.clone(),
                     iterations: api_calls,
                     });
-                    return TurnResult { final_text: text, usage: total_usage, iterations: api_calls, interrupted: true };
+                    return TurnResult { final_text: text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false };
                 }
                 Err(TurnAbort::Fatal(err)) => {
                     self.drop_trailing_synthetic_scaffolding();
@@ -2018,7 +2053,7 @@ impl Agent {
                     self.push_message(Message::assistant(err.clone()), None);
                     self.neurocode_auto_reindex(&tx).await;
                     let _ = tx.send(AgentEvent::Failed(err));
-                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false };
+                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: true };
                 }
             };
             accumulate_usage(&mut total_usage, &self.usage_or_estimate(&resp));
@@ -2115,6 +2150,7 @@ impl Agent {
                             usage: total_usage,
                             iterations: api_calls,
                             interrupted: false,
+                            fatal: true,
                         };
                     }
                     // Error-result every call so the model can self-correct
@@ -2190,7 +2226,7 @@ impl Agent {
                         usage: total_usage.clone(),
                     iterations: api_calls,
                     });
-                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true };
+                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false };
                 }
 
                 // ── Post-tool-round compression check (conversation_loop.py:
@@ -2251,7 +2287,7 @@ impl Agent {
                     usage: total_usage.clone(),
                     iterations: api_calls,
                 });
-                return TurnResult { final_text: partial, usage: total_usage, iterations: api_calls, interrupted: false };
+                return TurnResult { final_text: partial, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false };
             }
 
             let content = resp.content.clone();
@@ -2316,7 +2352,7 @@ impl Agent {
                     usage: total_usage.clone(),
                     iterations: api_calls,
                 });
-                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false };
+                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false };
             }
 
             // Final response.
@@ -2332,7 +2368,7 @@ impl Agent {
                 usage: total_usage.clone(),
                     iterations: api_calls,
             });
-            return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false };
+            return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false };
         }
 
         // ── Iteration budget exhausted: one summary call with tools
@@ -2377,6 +2413,7 @@ impl Agent {
             usage: total_usage,
             iterations: api_calls,
             interrupted: false,
+            fatal: false,
         }
     }
 
@@ -2445,11 +2482,13 @@ impl Agent {
         // ── PreToolUse hooks (crush-style) ───────────────────────────────
         // Run hooks for each tool call before execution. Halt stops the turn;
         // Deny returns an error result to the model for that call.
-        // Last hook aggregate's input rewrite for this batch (applied to the
-        // executed calls below). Shared via a Mutex so the hooks loop can
-        // record it while borrowing `self.hooks`.
-        let hooks_last_updated_input: std::sync::Mutex<Option<Value>> =
-            std::sync::Mutex::new(None);
+        // Input rewrites are keyed BY CALL ID: storing only the last hook's
+        // patch and shallow-merging it into every non-denied call
+        // cross-contaminated arguments (a `path` rewrite meant for
+        // write_file landed on a terminal call in the same batch).
+        let hooks_updated_inputs: std::sync::Mutex<
+            std::collections::HashMap<String, Value>,
+        > = std::sync::Mutex::new(std::collections::HashMap::new());
         let mut denied_calls: Vec<(usize, String)> = Vec::new();
         if let Some(ref hooks) = self.hooks {
             if !hooks.is_empty() {
@@ -2493,9 +2532,10 @@ impl Agent {
                         };
                         denied_calls.push((idx, reason));
                     } else if agg.updated_input.is_some() {
-                        *hooks_last_updated_input
+                        hooks_updated_inputs
                             .lock()
-                            .unwrap_or_else(|p| p.into_inner()) = agg.updated_input.clone();
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(tc.id.clone(), agg.updated_input.clone().unwrap_or(Value::Null));
                     }
                 }
                 // Emit error results for denied calls.
@@ -2524,16 +2564,15 @@ impl Agent {
             .collect();
         let rewritten: Vec<ToolCall> = if let Some(ref hooks) = self.hooks {
             if !hooks.is_empty() {
-                let patch = hooks_last_updated_input
+                let patches = hooks_updated_inputs
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .take();
+                    .unwrap_or_else(|p| p.into_inner());
                 tool_calls
                     .iter()
                     .filter(|tc| !denied_ids.contains(tc.id.as_str()))
                     .map(|tc| {
                         let mut tc = tc.clone();
-                        if let Some(patch) = &patch {
+                        if let Some(patch) = patches.get(&tc.id) {
                             if let Some(obj) = patch.as_object() {
                                 let mut args: Value =
                                     serde_json::from_str(&tc.function.arguments)
@@ -2595,10 +2634,26 @@ impl Agent {
                 // stream ordering is byte-identical to the sequential path.
                 let mut results = Vec::with_capacity(calls.len());
                 for (idx, (tc, handle)) in calls.iter().zip(handles).enumerate() {
-                    let (content, is_error) = match handle.await {
-                        Ok(result) => (result.to_content_string(), result.is_error()),
-                        Err(e) => (
+                    // Per-tool timeout (F6): a hung read-only tool must not
+                    // block the turn indefinitely. The detached task is
+                    // abandoned on timeout — read-only tools hold no
+                    // exclusive resources beyond their ctx clone.
+                    let bounded = tokio::time::timeout(
+                        std::time::Duration::from_secs(PARALLEL_TOOL_TIMEOUT_SECS),
+                        handle,
+                    )
+                    .await;
+                    let (content, is_error) = match bounded {
+                        Ok(Ok(result)) => (result.to_content_string(), result.is_error()),
+                        Ok(Err(e)) => (
                             format!("Error executing tool '{}': {}", tc.function.name, e),
+                            true,
+                        ),
+                        Err(_) => (
+                            format!(
+                                "Tool '{}' timed out after {}s (parallel read-only dispatch)",
+                                tc.function.name, PARALLEL_TOOL_TIMEOUT_SECS
+                            ),
                             true,
                         ),
                     };

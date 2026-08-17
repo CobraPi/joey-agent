@@ -144,6 +144,16 @@ impl WirePrefixRegistry {
         warn!("{}", warning);
         (disambiguated, Some(warning))
     }
+
+    /// Release a previously claimed prefix.
+    ///
+    /// A failed connection (handshake error/timeout) must give its claim
+    /// back: otherwise every connect retry re-registers the same name and
+    /// the prefix drifts (`my_server` → `my_server_2` → ...) permanently for
+    /// the process, leaving the real server unreachable at its plain prefix.
+    pub fn unregister(&mut self, prefix: &str) {
+        self.prefixes.remove(prefix);
+    }
 }
 
 /// Process-global wire-prefix registry: `McpClient::connect` claims prefixes
@@ -403,6 +413,9 @@ impl McpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
+            // Backstop: if the client is dropped without shutdown() (panic,
+            // cancellation), the server process must not outlive us as a zombie.
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning MCP server '{}'", command))?;
 
@@ -446,11 +459,21 @@ impl McpClient {
         {
             Ok(Ok(())) => Ok(client),
             Ok(Err(exc)) => {
+                let claimed_prefix = client.wire_prefix.clone();
                 client.shutdown().await;
+                global_wire_prefix_registry()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .unregister(&claimed_prefix);
                 Err(exc)
             }
             Err(_) => {
+                let claimed_prefix = client.wire_prefix.clone();
                 client.shutdown().await;
+                global_wire_prefix_registry()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .unregister(&claimed_prefix);
                 Err(anyhow::anyhow!(
                     "MCP server '{}': initialize handshake timed out after {:.0}s",
                     server_name,

@@ -238,10 +238,10 @@ pub fn sweep_expired(joey_home: &Path, now: chrono::DateTime<chrono::Utc>) -> Re
         if kept.is_empty() {
             let _ = std::fs::remove_file(&path);
         } else {
-            // Reverse back to oldest-first for append-order on disk.
-            let mut oldest_first: Vec<HistoryRecord> = kept.into_iter().rev().collect();
-            oldest_first.reverse(); // already reversed from read_all; un-reverse
-            write_all(&path, &oldest_first)?;
+            // read_all preserves file order (oldest-first); keep it that way
+            // for append-order on disk. (The old double-reverse was an
+            // identity — confusing but correct.)
+            write_all(&path, &kept)?;
         }
     }
 

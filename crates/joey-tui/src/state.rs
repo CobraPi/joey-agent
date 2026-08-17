@@ -87,7 +87,10 @@ pub enum TranscriptItem {
         thought_duration: Option<Duration>,
     },
     /// A tool call rendered inline with its result.
-    /// Feature 005 (T026): carries `expanded` toggle + full args/result.
+    /// Feature 005 (T026): carries the three-state expand cycle + full
+    /// args/result. Unified with the reasoning-history format: click/space
+    /// expands INLINE (collapsed → tail window → full), never a separate
+    /// viewer window.
     Tool {
         name: String,
         emoji: String,
@@ -95,8 +98,9 @@ pub enum TranscriptItem {
         status: ToolStatus,
         duration_secs: Option<f64>,
         result_preview: String,
-        /// Feature 005 (T026): per-item expand toggle for the full view.
-        expanded: bool,
+        /// Feature 005 (T026): per-item expand state (three-state cycle,
+        /// same semantics as reasoning blocks).
+        expand_state: ReasoningExpandState,
         /// Feature 005 (T026): full arguments JSON for the expanded view.
         full_args: Option<String>,
         /// Feature 005 (T026): full result text for the expanded view.
@@ -123,9 +127,10 @@ pub enum TranscriptItem {
         /// Pre-split diff lines (including `+`/`-`/` ` markers).
         lines: Vec<String>,
         is_binary: bool,
-        /// Expand toggle: collapsed shows the last MAX_DIFF_LINES lines;
-        /// expanded shows the whole diff.
-        expanded: bool,
+        /// Expand state (three-state cycle, same semantics as reasoning
+        /// blocks): collapsed shows the last MAX_DIFF_LINES lines; the tail
+        /// window shows the last 200; full shows the whole diff.
+        expand_state: ReasoningExpandState,
     },
     /// A system notice / status line.
     Notice { text: String, kind: NoticeKind },
@@ -338,6 +343,10 @@ pub struct SubagentPane {
     pub started: Instant,
     /// Summary preview once complete.
     pub summary_preview: Option<String>,
+    /// True once a wrapped SubagentEvent arrived for this pane — the
+    /// id-matched attribution path is live, and the raw-channel duplicate
+    /// must not double-count tool calls.
+    pub tap_attached: bool,
 }
 
 impl SubagentPane {
@@ -364,6 +373,7 @@ impl SubagentPane {
             tokens: TokenStats::default(),
             started: Instant::now(),
             summary_preview: None,
+            tap_attached: false,
         }
     }
 
@@ -385,22 +395,60 @@ impl SubagentPane {
     }
 
     /// Expandable-stats/pane parity: toggle the pane transcript item at
-    /// `index` (tool/file-diff boolean toggle; reasoning three-state cycle).
+    /// `index`. All expandable kinds (reasoning, tool, file-diff) use the
+    /// same three-state inline cycle.
     pub fn toggle_item_expand(&mut self, index: usize) {
         if index >= self.transcript.len() {
             return;
         }
-        match &mut self.transcript[index] {
-            TranscriptItem::Reasoning { text, expand_state, .. } => {
-                let total_lines = text.lines().count();
-                *expand_state = expand_state.cycle(total_lines);
-            }
-            TranscriptItem::Tool { expanded, .. }
-            | TranscriptItem::FileDiff { expanded, .. } => {
-                *expanded = !*expanded;
-            }
-            _ => {}
+        toggle_expand_item(&mut self.transcript[index]);
+    }
+}
+
+/// Shared three-state inline expand cycle for a single item (the
+/// reasoning-history semantics, unified across all expandable kinds).
+pub(crate) fn toggle_expand_item(item: &mut TranscriptItem) {
+    // Compute the line count BEFORE mutably borrowing the expand state.
+    let total_lines = expandable_line_count(item);
+    let expand_state = match item {
+        TranscriptItem::Reasoning { expand_state, .. }
+        | TranscriptItem::Tool { expand_state, .. }
+        | TranscriptItem::FileDiff { expand_state, .. } => expand_state,
+        _ => return,
+    };
+    *expand_state = expand_state.cycle(total_lines);
+}
+
+/// Test-only exposure of the unified inline expand cycle (integration
+/// tests link this crate as an external crate, so plain `pub`).
+pub fn toggle_expand_for_test(item: &mut TranscriptItem) {
+    toggle_expand_item(item);
+}
+
+/// Test-only read of an item's expand state (any expandable kind).
+pub fn expand_state_for_test(item: &TranscriptItem) -> ReasoningExpandState {
+    match item {
+        TranscriptItem::Reasoning { expand_state, .. }
+        | TranscriptItem::Tool { expand_state, .. }
+        | TranscriptItem::FileDiff { expand_state, .. } => *expand_state,
+        _ => ReasoningExpandState::Collapsed,
+    }
+}
+
+/// Total logical lines an item's expanded view can show (drives the cycle's
+/// redundancy skip rules).
+fn expandable_line_count(item: &TranscriptItem) -> usize {
+    match item {
+        TranscriptItem::Reasoning { text, .. } => text.lines().count(),
+        TranscriptItem::Tool { full_result, result_preview, .. } => {
+            let payload = full_result
+                .as_deref()
+                .filter(|f| !f.is_empty())
+                .unwrap_or(result_preview);
+            format_tool_result_for_display(payload).lines().count()
         }
+        TranscriptItem::FileDiff { lines, .. } => lines.len(),
+        _ => 0,
     }
 }
 
@@ -469,7 +517,7 @@ fn pane_apply(pane: &mut SubagentPane, ev: &AgentEvent) {
             status: ToolStatus::Running,
             duration_secs: None,
             result_preview: String::new(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: is_terminal_block(name),
@@ -778,6 +826,9 @@ pub struct App {
     /// (click hit-testing), one per pane in order. RefCell: recorded by the
     /// rail widget during `&App` renders (mirrors the `Cell` geometry).
     pub last_subagent_tab_rects: std::cell::RefCell<Vec<(u16, u16, u16, u16)>>,
+    /// Rect of the pinned orchestrator tab at the rail's bottom (click
+    /// hit-testing; zeroed on frames that don't draw the rail).
+    pub last_orchestrator_tab_rect: Cell<(u16, u16, u16, u16)>,
     /// Render-time geometry for the FOCUSED pane (parallel-subagent
     /// feature): scroll upper bound + text-area rect, recorded by the pane
     /// transcript widget each frame. App-level because widgets render
@@ -1207,6 +1258,7 @@ impl App {
             subagent_panes: Vec::new(),
             focused_subagent: None,
             last_subagent_tab_rects: std::cell::RefCell::new(Vec::new()),
+            last_orchestrator_tab_rect: Cell::new((0, 0, 0, 0)),
             last_pane_max_scroll: Cell::new(0),
             last_pane_text_area: Cell::new((0, 0, 0, 0)),
             pane_stats_view: None,
@@ -1298,13 +1350,13 @@ impl App {
         }
     }
 
-    /// Feature 005 (T026/T028): toggle the most-recent tool call's `expanded`
-    /// field. Targets the last completed `Tool` item (FR-018: per-item
-    /// isolation — only one item is affected).
+    /// Feature 005 (T026/T028): cycle the most-recent tool call through the
+    /// three-state inline expand. Targets the last `Tool` item (FR-018:
+    /// per-item isolation — only one item is affected).
     pub fn toggle_focused_tool_expand(&mut self) {
-        for i in (0..self.transcript.len()).rev() {
-            if let TranscriptItem::Tool { expanded, .. } = &mut self.transcript[i] {
-                *expanded = !*expanded;
+        for item in self.transcript.iter_mut().rev() {
+            if matches!(item, TranscriptItem::Tool { .. }) {
+                toggle_expand_item(item);
                 return;
             }
         }
@@ -1329,20 +1381,7 @@ impl App {
         if index >= self.transcript.len() {
             return;
         }
-        match &mut self.transcript[index] {
-            TranscriptItem::Reasoning { text, expand_state, .. } => {
-                let total_lines = text.lines().count();
-                *expand_state = expand_state.cycle(total_lines);
-            }
-            TranscriptItem::Tool { expanded, .. } => {
-                *expanded = !*expanded;
-            }
-            TranscriptItem::FileDiff { expanded, .. } => {
-                *expanded = !*expanded;
-            }
-            // Other item types are not expandable; click is a no-op for them.
-            _ => {}
-        }
+        toggle_expand_item(&mut self.transcript[index]);
     }
 
     /// Commit any pending streamed assistant text as a transcript item.
@@ -1488,17 +1527,24 @@ impl App {
                 if let Some(a) = self.active_agents.last_mut() {
                     a.phase = AgentPhase::RunningTool(name.clone());
                 }
-                // T155: attribute this tool call to the most recent running
-                // subagent entry for the Atlas job board. Tool events from a
-                // running subagent are forwarded to the parent's channel
-                // (subagent.rs), so the latest Running entry is the best
-                // attribution we have on the wire.
-                for entry in self.subagent_entries.iter_mut().rev() {
-                    if entry.status == SubagentStatus::Running {
-                        entry.tool_call_count += 1;
-                        entry.last_tool = Some(name.clone());
-                        entry.phase = format!("running tool: {}", name);
-                        break;
+                // T155: tool-call attribution to subagent entries. When the
+                // child's wrapped SubagentEvent stream is attached to a
+                // pane, that id-matched path counts precisely AND the raw
+                // duplicate arrives here too — counting both double-counted
+                // every child call. Fall back to latest-Running attribution
+                // only when no pane has an attached tap.
+                if !self
+                    .subagent_panes
+                    .iter()
+                    .any(|p| p.tap_attached)
+                {
+                    for entry in self.subagent_entries.iter_mut().rev() {
+                        if entry.status == SubagentStatus::Running {
+                            entry.tool_call_count += 1;
+                            entry.last_tool = Some(name.clone());
+                            entry.phase = format!("running tool: {}", name);
+                            break;
+                        }
                     }
                 }
                 self.push_item(TranscriptItem::Tool {
@@ -1508,7 +1554,7 @@ impl App {
                     status: ToolStatus::Running,
                     duration_secs: None,
                     result_preview: String::new(),
-                    expanded: false,
+                    expand_state: ReasoningExpandState::Collapsed,
                     full_args: None,
                     full_result: None,
                     is_terminal: is_terminal_block(&name),
@@ -1668,6 +1714,7 @@ impl App {
                     .iter_mut()
                     .find(|p| p.child_id == id)
                 {
+                    pane.tap_attached = true;
                     pane_apply(pane, event.as_ref());
                     // Mirror phase/activity into the job-board entry.
                     if let Some(entry) = self
@@ -1698,10 +1745,11 @@ impl App {
             }
             AgentEvent::SubagentComplete { id, goal, success, summary_preview, token_usage: _, duration_secs: _ } => {
                 // Mark the matching subagent entry as done/failed (T064).
-                let label: String = goal.chars().take(28).collect();
+                // Match by child_id ONLY: the old fallback compared a
+                // 28-char goal prefix, so parallel goals sharing a prefix
+                // closed the wrong entry.
                 for entry in self.subagent_entries.iter_mut().rev() {
-                    if entry.status == SubagentStatus::Running
-                        && (entry.child_id == id || entry.agent_type == label)
+                    if entry.status == SubagentStatus::Running && entry.child_id == id
                     {
                         entry.status = if success {
                             SubagentStatus::Done
@@ -1733,10 +1781,9 @@ impl App {
                 });
             }
             AgentEvent::SubagentFailed { id, goal, error, duration_secs: _ } => {
-                let label: String = goal.chars().take(28).collect();
+                // Match by child_id ONLY (see SubagentComplete).
                 for entry in self.subagent_entries.iter_mut().rev() {
-                    if entry.status == SubagentStatus::Running
-                        && (entry.child_id == id || entry.agent_type == label)
+                    if entry.status == SubagentStatus::Running && entry.child_id == id
                     {
                         entry.status = SubagentStatus::Failed;
                         break;
@@ -1918,7 +1965,7 @@ impl App {
                     stat,
                     lines,
                     is_binary,
-                    expanded: false,
+                    expand_state: ReasoningExpandState::Collapsed,
                 });
             }
             AgentEvent::Done { final_text, usage: _, iterations } => {
@@ -2325,6 +2372,14 @@ impl App {
         None
     }
 
+    /// Click hit-test against the pinned orchestrator tab (rail bottom).
+    /// True when the click lands on it. Checked BEFORE `subagent_tab_hit`
+    /// so the orchestrator rect wins over any overlapping pane rect.
+    pub fn orchestrator_tab_hit(&self, row: u16, col: u16) -> bool {
+        let (x, y, w, h) = self.last_orchestrator_tab_rect.get();
+        w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w
+    }
+
     // ── Expandable context stream hit-testing (expandable-stats) ───────
 
     /// Resolve a screen row to a context-stream entry index on the MAIN
@@ -2394,6 +2449,7 @@ impl App {
         self.subagent_panes.clear();
         self.focused_subagent = None;
         self.last_subagent_tab_rects.borrow_mut().clear();
+        self.last_orchestrator_tab_rect.set((0, 0, 0, 0));
     }
 
     /// The pane currently focused, if any.
@@ -2899,7 +2955,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.1),
             result_preview: "ok".to_string(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: false,
@@ -2914,7 +2970,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.2),
             result_preview: "ok".to_string(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: false,
@@ -2926,23 +2982,29 @@ mod tests {
         app.toggle_focused_tool_expand();
         // The most recent tool should be expanded.
         let last = app.transcript.back().unwrap();
-        if let TranscriptItem::Tool { expanded, .. } = last {
-            assert!(*expanded, "most-recent tool should be expanded after toggle");
+        if let TranscriptItem::Tool { expand_state, .. } = last {
+            assert!(matches!(expand_state, ReasoningExpandState::TailWindow | ReasoningExpandState::Full),
+                "most-recent tool should be expanded after toggle");
         } else {
             panic!("expected Tool item");
         }
         // The first tool should still be collapsed (per-item isolation).
         let first = &app.transcript[0];
-        if let TranscriptItem::Tool { expanded, .. } = first {
-            assert!(!*expanded, "first tool should still be collapsed (FR-018 isolation)");
+        if let TranscriptItem::Tool { expand_state, .. } = first {
+            assert!(matches!(expand_state, ReasoningExpandState::Collapsed),
+                "first tool should still be collapsed (FR-018 isolation)");
         } else {
             panic!("expected Tool item");
         }
         // Toggle again — should collapse.
         app.toggle_focused_tool_expand();
         let last = app.transcript.back().unwrap();
-        if let TranscriptItem::Tool { expanded, .. } = last {
-            assert!(!*expanded, "most-recent tool should collapse on second toggle");
+        if let TranscriptItem::Tool { expand_state, .. } = last {
+            // Second press advances TailWindow -> Full for short results
+            // (the cycle skips redundant states), so assert "not collapsed"
+            // is wrong; assert it moved past the first expansion instead.
+            assert!(matches!(expand_state, ReasoningExpandState::Full | ReasoningExpandState::Collapsed),
+                "most-recent tool advances on second toggle (got {:?})", expand_state);
         }
     }
 

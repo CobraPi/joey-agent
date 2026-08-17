@@ -395,6 +395,68 @@ impl ProviderClient {
             }
         }
 
+        // Final-line flush: a stream whose last event lacks a trailing
+        // newline leaves it in `buf` — usage/[DONE]/finish_reason would be
+        // silently dropped. Re-run the line parser over the remainder once.
+        if !buf.trim().is_empty() {
+            let line = buf.trim().to_string();
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim();
+                if data != "[DONE]" {
+                    if let Ok(v) = serde_json::from_str::<Value>(data) {
+                        saw_event = true;
+                        if model.is_none() {
+                            model = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
+                        }
+                        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+                            usage = parse_usage(u);
+                        }
+                        if let Some(choice) = v.get("choices").and_then(|c| c.get(0)) {
+                            if let Some(fr) = choice.get("finish_reason") {
+                                if let Some(s) = fr.as_str() {
+                                    finish = Some(FinishReason::from_wire(s));
+                                    saw_finish_string = true;
+                                } else if let Some(n) = fr.as_i64() {
+                                    finish = Some(FinishReason::from_wire(&n.to_string()));
+                                    saw_finish_string = true;
+                                }
+                            }
+                            if let Some(delta) = choice.get("delta") {
+                                if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
+                                    if !c.is_empty() {
+                                        content.push_str(c);
+                                    }
+                                }
+                                let r = delta
+                                    .get("reasoning_content")
+                                    .and_then(|r| r.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .or_else(|| {
+                                        delta
+                                            .get("reasoning")
+                                            .and_then(|r| r.as_str())
+                                            .filter(|s| !s.is_empty())
+                                    });
+                                if let Some(r) = r {
+                                    reasoning.push_str(r);
+                                }
+                                if let Some(tcs) =
+                                    delta.get("tool_calls").and_then(|t| t.as_array())
+                                {
+                                    accumulate_tool_calls(
+                                        &mut tool_accum,
+                                        tcs,
+                                        &mut last_id_at_idx,
+                                        &mut active_slot_by_idx,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let tool_calls = finalize_tool_calls(tool_accum);
 
         // Zero-event guard: a stream that yielded nothing usable is an error,
@@ -798,19 +860,34 @@ impl ProviderClient {
         let mut buf = String::new();
         let mut stream = resp.bytes_stream();
         let read_timeout = Duration::from_secs(stream_read_timeout_secs());
+        let mut stream_done = false;
         loop {
-            let next = tokio::time::timeout(read_timeout, stream.next()).await;
-            let chunk = match next {
-                Err(_) => {
-                    return Err(ProviderError::Timeout(format!(
-                        "stream stalled: no chunk within {}s",
-                        read_timeout.as_secs()
-                    )))
+            if stream_done {
+                // Flush any final line that lacked a trailing newline
+                // (message_delta/usage) through the normal parser, then exit.
+                if !buf.trim().is_empty() && !buf.ends_with('\n') {
+                    buf.push('\n');
                 }
-                Ok(None) => break,
-                Ok(Some(c)) => c.map_err(|e| ProviderError::Connection(e.to_string()))?,
-            };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            } else {
+                let next = tokio::time::timeout(read_timeout, stream.next()).await;
+                match next {
+                    Err(_) => {
+                        return Err(ProviderError::Timeout(format!(
+                            "stream stalled: no chunk within {}s",
+                            read_timeout.as_secs()
+                        )))
+                    }
+                    Ok(None) => {
+                        stream_done = true;
+                        continue;
+                    }
+                    Ok(Some(c)) => {
+                        let chunk =
+                            c.map_err(|e| ProviderError::Connection(e.to_string()))?;
+                        buf.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                }
+            }
             while let Some(nl) = buf.find('\n') {
                 let line = buf[..nl].trim().to_string();
                 buf.drain(..=nl);
@@ -842,7 +919,12 @@ impl ProviderClient {
                             .and_then(|b| b.get("type"))
                             .and_then(|t| t.as_str())
                             .unwrap_or("text");
-                        ensure_block(&mut blocks, idx);
+                        if !ensure_block(&mut blocks, idx) {
+                            return Err(ProviderError::Parse(format!(
+                                "anthropic stream index {} exceeds cap; dropping stream",
+                                idx
+                            )));
+                        }
                         blocks[idx].block_type = btype.to_string();
                         if btype == "tool_use" {
                             blocks[idx].tool_id = block
@@ -866,7 +948,9 @@ impl ProviderClient {
                     }
                     Some("content_block_delta") => {
                         let idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                        ensure_block(&mut blocks, idx);
+                        if !ensure_block(&mut blocks, idx) {
+                            continue;
+                        }
                         let delta = v.get("delta");
                         if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str())
                         {
@@ -926,6 +1010,11 @@ impl ProviderClient {
                     _ => {}
                 }
             }
+            // Stream exhausted and buffer drained — done (the flush above
+            // already ran the final unterminated line through the parser).
+            if stream_done && buf.trim().is_empty() {
+                break;
+            }
         }
 
         // Zero-event guard, parity with the chat path (M7).
@@ -934,7 +1023,6 @@ impl ProviderClient {
                 "anthropic stream delivered no events".into(),
             ));
         }
-
         // Rebuild the ordered block list + parallel channels from accumulators.
         let mut text_parts: Vec<String> = Vec::new();
         let mut reasoning_parts: Vec<String> = Vec::new();
@@ -1320,6 +1408,11 @@ fn accumulate_tool_calls(
 ) {
     for tc in tcs {
         let raw_idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+        if raw_idx > MAX_STREAM_INDEX {
+            // Hostile/buggy provider — a huge index would otherwise allocate
+            // ~10^18 accumulator slots. Drop the delta defensively.
+            continue;
+        }
         let delta_id = tc
             .get("id")
             .and_then(|i| i.as_str())
@@ -1421,10 +1514,22 @@ impl AnthropicBlockAccum {
     }
 }
 
-fn ensure_block(blocks: &mut Vec<AnthropicBlockAccum>, idx: usize) {
+/// Cap on block/tool-call slot indices accepted from SSE deltas.
+///
+/// Legitimate streams carry at most a handful of blocks per response; a
+/// hostile or buggy provider (or MITM proxy) sending `{"index": 1e18}`
+/// would otherwise allocate ~10^18 accumulator slots and OOM the process.
+/// Events referencing a slot beyond this cap are dropped defensively.
+const MAX_STREAM_INDEX: u64 = 1024;
+
+fn ensure_block(blocks: &mut Vec<AnthropicBlockAccum>, idx: usize) -> bool {
+    if idx > MAX_STREAM_INDEX as usize {
+        return false;
+    }
     while blocks.len() <= idx {
         blocks.push(AnthropicBlockAccum::default());
     }
+    true
 }
 
 #[cfg(test)]

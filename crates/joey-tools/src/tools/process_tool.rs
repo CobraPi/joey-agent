@@ -706,11 +706,17 @@ fn action_write(session_id: Option<&str>, data: Option<&Value>, add_newline: boo
         return ToolResult::Error(format!("Process session {} not found", sid));
     };
 
-    // Writing to stdin is not supported via the simple process model.
-    // The process must have been spawned with stdin piped.
-    // For now, this is a stub that acknowledges the write.
+    // Background processes are spawned with stdin=null (no interactive input
+    // in this execution model). Report honestly instead of acknowledging a
+    // write that never happened — the model would otherwise believe its
+    // input was delivered and wait forever for output.
     let _ = (data_str, add_newline);
-    ToolResult::Text(format!("[{}] Data written to stdin.", sid))
+    ToolResult::Error(format!(
+        "[{}] stdin is not connected for background processes (spawned with stdin=null); \
+         interactive input is not supported. Use `pty: true` via the terminal tool for \
+         interactive processes.",
+        sid
+    ))
 }
 
 fn action_close(session_id: Option<&str>) -> ToolResult {
@@ -725,7 +731,8 @@ fn action_close(session_id: Option<&str>) -> ToolResult {
         return ToolResult::Error(format!("Process session {} not found", sid));
     };
 
-    // Closing stdin — for the simple model this is acknowledged.
+    // stdin is null — nothing to close. Acknowledge (idempotent no-op is
+    // safe here: closing an already-null stdin is a no-op semantically).
     ToolResult::Text(format!("[{}] stdin closed (EOF).", sid))
 }
 

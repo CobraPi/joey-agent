@@ -30,6 +30,10 @@ impl GraphStore {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        // A second process touching the same graph.db (CLI index while an
+        // agent session is open) must wait briefly instead of failing the
+        // whole ingest with SQLITE_BUSY on the first lock contention.
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         Self::apply_schema(&conn)?;
         Ok(Self { conn })
     }
@@ -263,7 +267,17 @@ impl GraphStore {
                 node.signature.as_deref(),
             ],
         )?;
-        Ok(self.conn.last_insert_rowid() as NodeId)
+        // NEVER trust last_insert_rowid() here: on the ON CONFLICT DO UPDATE
+        // path SQLite does NOT refresh it, so a re-index over existing nodes
+        // returns the id of the last FRESH insert — silently wiring edges and
+        // memberships onto the wrong node (graph corruption). The unique key
+        // (fqcn, kind, source_path) pins the actual row.
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM code_artifacts WHERE fqcn=?1 AND kind=?2 AND source_path=?3",
+            params![&node.fqcn, node.kind.as_str(), &node.source_path],
+            |row| row.get(0),
+        )?;
+        Ok(id as NodeId)
     }
 
     /// Upsert a typed edge (idempotent).
@@ -274,6 +288,23 @@ impl GraphStore {
             params![from as i64, to as i64, kind.as_str()],
         )?;
         Ok(())
+    }
+
+    /// All DISTINCT source_path values currently marked Active (tombstone pass).
+    pub fn active_source_paths(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT source_path FROM code_artifacts WHERE status='Active'")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// Set status for every node with the given source_path. Returns rows changed.
+    pub fn set_status_for_path(&self, source_path: &str, status: &str) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE code_artifacts SET status=?1 WHERE source_path=?2 AND status != ?1",
+            params![status, source_path],
+        )
     }
 
     /// Look up a node by FQCN + kind + source_path (the unique key).
@@ -453,9 +484,12 @@ impl GraphStore {
     /// The number of distinct incoming edges (fan-in) for a node — how many
     /// other artifacts depend on it. Hubs have high fan-in; expansion and
     /// formatting use this to rank and to warn before wide edits.
+    /// MemberOf edges are structural (type → member), NOT dependencies —
+    /// counting them made every class with ≥5 members carry a false
+    /// "wide blast radius" warning.
     pub fn dependents_count(&self, id: NodeId) -> rusqlite::Result<usize> {
         self.conn.query_row(
-            "SELECT COUNT(DISTINCT from_id) FROM graph_edges WHERE to_id=?1",
+            "SELECT COUNT(DISTINCT from_id) FROM graph_edges WHERE to_id=?1 AND edge_kind != 'MemberOf'",
             params![id as i64],
             |row| row.get::<_, i64>(0).map(|n| n as usize),
         )

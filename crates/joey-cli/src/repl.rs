@@ -258,8 +258,38 @@ pub(crate) fn restore_history(db: &SessionDb, session_id: &str) -> Vec<Message> 
         .into_iter()
         .filter_map(|m| match m.role {
             Role::User => Some(Message::user(m.content)),
-            Role::Assistant => Some(Message::assistant(m.content)),
-            _ => None,
+            Role::Assistant => {
+                // Rebuild tool_calls so provider replay stays protocol-valid:
+                // restoring an assistant tool-call turn as empty-content
+                // degrades context and risks Anthropic 400s (non-empty
+                // content / orphaned pairs).
+                let tool_calls: Vec<joey_providers::ToolCall> = m
+                    .tool_calls
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                if tool_calls.is_empty() {
+                    Some(Message::assistant(m.content))
+                } else {
+                    let text = if m.content.is_empty() {
+                        None
+                    } else {
+                        Some(m.content)
+                    };
+                    Some(Message::assistant_with_tools(text, tool_calls))
+                }
+            }
+            Role::Tool => {
+                // Preserve tool results (and their owning ids) instead of
+                // dropping them — an assistant-with-tools turn without its
+                // results is an invalid replay sequence.
+                let id = m.tool_call_id?;
+                let name = m.tool_name.unwrap_or_default();
+                Some(Message::tool_result(id, name, m.content))
+            }
+            // System messages are re-derived from the system prompt on
+            // rebuild; stored copies are not replayed.
+            Role::System => None,
         })
         .collect()
 }
@@ -1359,26 +1389,31 @@ fn new_session(st: &mut ReplState, name: &str, quiet: bool) {
         .as_ref()
         .and_then(|d| d.create_session("cli", Some(&model_hint), st.cwd.to_str()).ok())
         .unwrap_or_else(SessionDb::new_session_id);
-    if !name.is_empty() {
-        if let Some(d) = &st.db {
-            let _ = d.set_title(&new_id, name);
-        }
-    }
-    end_session(st, "new_session");
 
-    // Re-initialize checkpoint manager for the new session.
-    st.session_id = new_id.clone();
-    st.checkpoints = None;
-    {
-        let cp = joey_tools::vcs::CheckpointManager::new(&new_id, &st.cwd);
-        if cp.is_enabled() {
-            st.checkpoints = Some(cp);
-        }
-    }
-    st.last_auto_checkpoint = Instant::now();
-
+    // Build the new agent FIRST: on failure the old session stays fully
+    // alive (the old code ended the old session + swapped the id before
+    // building, so a build failure left the old agent writing to an
+    // already-ended session while the UI showed the new id).
     match build_agent(&st.config, &st.cwd, &st.overrides, &new_id, Vec::new()) {
         Ok(agent) => {
+            if !name.is_empty() {
+                if let Some(d) = &st.db {
+                    let _ = d.set_title(&new_id, name);
+                }
+            }
+            end_session(st, "new_session");
+
+            // Re-initialize checkpoint manager for the new session.
+            st.session_id = new_id.clone();
+            st.checkpoints = None;
+            {
+                let cp = joey_tools::vcs::CheckpointManager::new(&new_id, &st.cwd);
+                if cp.is_enabled() {
+                    st.checkpoints = Some(cp);
+                }
+            }
+            st.last_auto_checkpoint = Instant::now();
+
             st.agent = agent;
             st.session_start = Instant::now();
             st.last_response.clear();
@@ -1391,7 +1426,7 @@ fn new_session(st: &mut ReplState, name: &str, quiet: bool) {
                 }
             }
         }
-        Err(e) => render::error(&format!("failed to start a new session: {}", e)),
+        Err(e) => render::error(&format!("failed to start a new session: {} (previous session kept)", e)),
     }
 }
 
@@ -1406,20 +1441,48 @@ fn model_slash(st: &mut ReplState, args: &str) {
     let mut parts: Vec<&str> = args.split_whitespace().collect();
     let global = parts.contains(&"--global");
     parts.retain(|p| *p != "--global" && *p != "--session");
+
+    // `/model neurocode …` — per-provider NeuroCode tier configuration
+    // (CLI/TUI parity with the TUI's handle_model_neurocode).
+    if parts.first().copied() == Some("neurocode") || parts.first().copied() == Some("nc") {
+        model_slash_neurocode(st, &parts[1..]);
+        return;
+    }
+
     if parts.is_empty() {
         let cfg = build_agent_config(&st.config, &st.overrides);
-        render::info(&format!(
+        let mut text = format!(
             "Current model: {} (provider: {})",
             if cfg.model.is_empty() { "(not set)" } else { &cfg.model },
             st.agent.client().profile().name
-        ));
-        render::info("Set one with /model <name> [--global], or run `joey model`.");
+        );
+        // NeuroCode tier summary for the active provider.
+        let nc = joey_neurocode::NeuroCodeConfig::from_config(&st.config);
+        if nc.enabled {
+            let provider = st.agent.client().profile().name;
+            let tiers = nc.tier.tiers_for_provider(provider);
+            let f = if tiers.frontier.is_empty() { "(unset)".to_string() } else { tiers.frontier };
+            let e = if tiers.economical.is_empty() { "(unset)".to_string() } else { tiers.economical };
+            text.push_str(&format!(
+                "\nneurocode tiers [{provider}]: frontier={f} · economical={e} (ambiguous→{})",
+                nc.tier.ambiguous_default,
+            ));
+        } else {
+            text.push_str("\nneurocode: disabled");
+        }
+        render::info(&text);
+        render::info(
+            "Usage: /model <name> [--global] · /model neurocode <frontier|economical> <name> · /model neurocode reset",
+        );
         return;
     }
     let model = parts.join(" ");
     st.overrides.model = Some(model.clone());
     match rebuild_agent_preserving_history(st) {
         Ok(()) => {
+            // The rebuild re-reads config; keep the NeuroCode engine scoped
+            // to the (possibly changed) live provider (TUI parity).
+            refresh_neurocode_engine(st);
             if global {
                 if let Err(e) = st.config.set_and_save("model.default", &model) {
                     render::error(&format!("failed to persist model.default: {}", e));
@@ -1436,6 +1499,91 @@ fn model_slash(st: &mut ReplState, args: &str) {
         }
         Err(e) => render::error(&format!("failed to switch model: {}", e)),
     }
+}
+
+/// `/model neurocode …` for the line REPL: set/show/reset the per-provider
+/// NeuroCode tier models, then rebuild the live engine so the change
+/// applies immediately (try_build_engine reads config fresh).
+fn model_slash_neurocode(st: &mut ReplState, rest: &[&str]) {
+    let provider = st.agent.client().profile().name.to_string();
+    match rest.first().copied() {
+        None | Some("show") => {
+            let nc = joey_neurocode::NeuroCodeConfig::from_config(&st.config);
+            if nc.enabled {
+                let tiers = nc.tier.tiers_for_provider(&provider);
+                render::info(&format!(
+                    "neurocode tiers [{}]:\n  frontier: {}\n  economical: {}\n  ambiguous_default: {}",
+                    provider,
+                    if tiers.frontier.is_empty() { "(unset)" } else { &tiers.frontier },
+                    if tiers.economical.is_empty() { "(unset)" } else { &tiers.economical },
+                    nc.tier.ambiguous_default,
+                ));
+            } else {
+                render::info("neurocode is disabled (neurocode.enabled=false) — tier models are stored but not used.");
+            }
+            render::info("Usage: /model neurocode <frontier|economical> <name> · /model neurocode reset");
+        }
+        Some("frontier") | Some("economical") => {
+            let tier = rest[0];
+            let Some(model) = rest.get(1) else {
+                render::error(&format!("Usage: /model neurocode {tier} <model-name>"));
+                return;
+            };
+            let key = format!("neurocode.tier.providers.{provider}.{tier}");
+            match st.config.set_and_save(&key, model) {
+                Ok(()) => {
+                    refresh_neurocode_engine(st);
+                    render::success(&format!(
+                        "✓ neurocode {tier} model for {provider} → {model} (saved; active this session)"
+                    ));
+                }
+                Err(e) => render::error(&format!("failed to save {key}: {e}")),
+            }
+        }
+        Some("reset") => {
+            let mut cleared = Vec::new();
+            for tier in ["frontier", "economical"] {
+                let key = format!("neurocode.tier.providers.{provider}.{tier}");
+                match st.config.unset(&key) {
+                    Ok(true) => cleared.push(tier),
+                    Ok(false) => {}
+                    Err(e) => {
+                        render::error(&format!("failed to unset {key}: {e}"));
+                        return;
+                    }
+                }
+            }
+            refresh_neurocode_engine(st);
+            let what = if cleared.is_empty() {
+                "no per-provider overrides were set".to_string()
+            } else {
+                format!("cleared: {}", cleared.join(", "))
+            };
+            render::success(&format!(
+                "neurocode tier overrides for {provider} — {what} (flat keys now apply)"
+            ));
+        }
+        Some(other) => {
+            render::error(&format!(
+                "unknown neurocode subcommand '{other}'. Use: show | frontier <name> | economical <name> | reset"
+            ));
+        }
+    }
+}
+
+/// Reload config + rebuild the agent's NeuroCode engine so tier changes
+/// take effect immediately (mirrors the startup wiring path).
+fn refresh_neurocode_engine(st: &mut ReplState) {
+    let refreshed = joey_core::Config::load().unwrap_or_else(|_| st.config.clone());
+    let scoped = crate::neurocode_wiring::try_build_engine_scoped(
+        &refreshed,
+        st.agent.provider_name(),
+    );
+    let engine: Option<std::sync::Arc<dyn joey_neurocode::NeuroCodeEngine>> = scoped
+        .map(|e| e as std::sync::Arc<dyn joey_neurocode::NeuroCodeEngine>);
+    st.agent.set_neurocode_engine_opt(engine);
+    // Keep the REPL's config snapshot in sync with what was just written.
+    st.config = refreshed;
 }
 
 const REASONING_LEVELS: &[&str] =

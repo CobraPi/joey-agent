@@ -1013,10 +1013,17 @@ fn load_dotenv_file(path: &Path, override_existing: bool) {
 /// Strip non-ASCII characters from credential env vars in the process env
 /// (env_loader.py:118-159). Warns once per key on stderr.
 fn sanitize_loaded_credentials() {
-    for (key, value) in std::env::vars() {
+    // Use vars_os(): vars() panics if any environment variable holds
+    // non-UTF-8 data, and this runs on every CLI startup.
+    for (key_os, value_os) in std::env::vars_os() {
+        let key = match key_os.to_str() {
+            Some(k) => k.to_string(),
+            None => continue, // non-UTF-8 key can't match a credential suffix
+        };
         if !CREDENTIAL_SUFFIXES.iter().any(|s| key.ends_with(s)) {
             continue;
         }
+        let value = value_os.to_string_lossy();
         if value.is_ascii() {
             continue;
         }

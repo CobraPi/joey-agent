@@ -399,11 +399,13 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             }
             lines.push(Line::from(vec![Span::raw("")]));
         }
-        TranscriptItem::Tool { name, emoji, summary, status, duration_secs, result_preview, expanded, full_args, full_result, is_terminal, exit_code, live_output, .. } => {
+        TranscriptItem::Tool { name, emoji, summary, status, duration_secs, result_preview, expand_state, full_args, full_result, is_terminal, exit_code, live_output, .. } => {
+            use crate::state::ReasoningExpandState;
+            let expanded = matches!(expand_state, ReasoningExpandState::TailWindow | ReasoningExpandState::Full);
             if *is_terminal {
                 // Feature 007 (T019): terminal-command block layout.
                 // Header: $ command  (exit N)  ⟳/✓/✗  ▸/▾
-                let expand_hint = if *expanded { "▾" } else { "▸" };
+                let expand_hint = if expanded { "▾" } else { "▸" };
                 let mut spans = vec![
                     Span::styled(
                         "  $ ".to_string(),
@@ -450,16 +452,30 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                 // it arrives (AgentEvent::ToolOutput accumulation) — the
                 // "watch the CLI output in realtime" inline view. Collapsed
                 // to the last MAX_TOOL_OUTPUT_LINES lines with a streaming
-                // affordance; Ctrl+O or clicking the block maximizes it.
+                // affordance; clicking the block or Space expands it inline
+                // (Ctrl+O still maximizes for live-follow).
                 if matches!(status, ToolStatus::Running) {
                     if !live_output.is_empty() {
+                        // While expanded inline, show the tail window of the
+                        // live stream instead of the tight collapsed cap.
+                        let cap = if expanded {
+                            MAX_TAIL_WINDOW_LINES_TUI
+                        } else {
+                            MAX_TOOL_OUTPUT_LINES
+                        };
                         let (shown, affordance) =
-                            bounded_tail_lines_with_affordance(live_output, MAX_TOOL_OUTPUT_LINES);
+                            bounded_tail_lines_with_affordance(live_output, cap);
                         let total = live_output.lines().count();
                         // Absolute numbering of the tail window: the first
                         // shown line is (total - shown.len() + 1).
                         let first = total.saturating_sub(shown.len()) + 1;
                         let gutter_w = digits(total.max(1));
+                        if let Some(msg) = affordance {
+                            lines.push(Line::from(vec![Span::styled(
+                                format!("    {} [click or space to expand]", msg),
+                                Style::default().fg(theme.fg_most_subtle.to_color()),
+                            )]));
+                        }
                         for (gi, ol) in shown.iter().enumerate() {
                             let num = format!("{:>w$} │ ", first + gi, w = gutter_w);
                             for w in wrap(ol, content_w.saturating_sub(8 + gutter_w)) {
@@ -472,12 +488,11 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                         let n_lines = total.max(shown.len());
                         lines.push(Line::from(vec![Span::styled(
                             format!(
-                                "    ⣿ streaming · {} lines · Ctrl+O or click to maximize",
+                                "    ⣿ streaming · {} lines · click to expand · Ctrl+O to maximize",
                                 n_lines
                             ),
                             Style::default().fg(theme.busy.to_color()),
                         )]));
-                        let _ = affordance;
                     } else {
                         // Silent so far — show the heartbeat-style hint.
                         lines.push(Line::from(vec![Span::styled(
@@ -486,15 +501,34 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                         )]));
                     }
                 } else if !result_preview.is_empty() {
-                    // Finished: collapsed (last MAX_TOOL_OUTPUT_LINES) or
-                    // expanded (the FULL result, tail-bounded). The payload
-                    // is envelope-unwrapped from the JSON envelope and shown
-                    // in a line-numbered code view (crush-style gutter).
+                    // Finished: collapsed (last MAX_TOOL_OUTPUT_LINES), tail
+                    // window (last 200), or full — the three-state cycle.
+                    // The payload is envelope-unwrapped from the JSON
+                    // envelope and shown in a line-numbered code view
+                    // (crush-style gutter).
                     let preview_payload = crate::state::display_result_content(result_preview)
                         .unwrap_or_else(|| result_preview.clone());
-                    if *expanded {
-                        // Full result when available (formatted for display);
-                        // the unwrapped preview otherwise.
+                    if matches!(expand_state, ReasoningExpandState::Full) {
+                        // FULL: the entire formatted result, no truncation.
+                        let full = full_result
+                            .as_deref()
+                            .filter(|f| !f.is_empty())
+                            .map(crate::state::format_tool_result_for_display)
+                            .unwrap_or(preview_payload.clone());
+                        let all: Vec<&str> = full.lines().collect();
+                        let gutter_w = digits(all.len().max(1));
+                        for (gi, ol) in all.iter().enumerate() {
+                            let num = format!("{:>w$} │ ", gi + 1, w = gutter_w);
+                            for w in wrap(ol, content_w.saturating_sub(8 + gutter_w)) {
+                                lines.push(Line::from(vec![
+                                    Span::styled(num.clone(), Style::default().fg(theme.fg_most_subtle.to_color())),
+                                    Span::styled(w, Style::default().fg(theme.fg_more_subtle.to_color())),
+                                ]));
+                            }
+                        }
+                    } else if expanded {
+                        // TAIL WINDOW: the last MAX_TAIL_WINDOW_LINES_TUI
+                        // lines of the formatted full result.
                         let full = full_result
                             .as_deref()
                             .filter(|f| !f.is_empty())
@@ -507,7 +541,7 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                         let gutter_w = digits(total.max(first));
                         if let Some(msg) = affordance {
                             lines.push(Line::from(vec![Span::styled(
-                                format!("    {}", msg),
+                                format!("    {} [click or space for full view]", msg),
                                 Style::default().fg(theme.fg_most_subtle.to_color()),
                             )]));
                         }
@@ -555,7 +589,7 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             let dur_str = duration_secs
                 .map(|d| format!("  {:.1}s", d))
                 .unwrap_or_default();
-            let expand_hint = if *expanded { "▾" } else { "▸" };
+            let expand_hint = if expanded { "▾" } else { "▸" };
             let mut spans = vec![
                 Span::styled(
                     format!("  {} ", icon),
@@ -587,7 +621,7 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                 Style::default().fg(theme.fg_most_subtle.to_color()),
             ));
             lines.push(Line::from(spans));
-            if !result_preview.is_empty() && !matches!(status, ToolStatus::Running) && !*expanded {
+            if !result_preview.is_empty() && !matches!(status, ToolStatus::Running) && !expanded {
                 // Feature 007 (T023): bounded output + envelope unwrapping +
                 // a line-numbered gutter (crush-style code view).
                 let payload = crate::state::display_result_content(result_preview)
@@ -618,7 +652,7 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             }
             // Feature 005 (T029) + Feature 007 (T023): expanded view —
             // primary parameter + full result, bounded with affordance.
-            if *expanded {
+            if expanded {
                 // T034 (convergence): `full_args` is never populated (contracts/
                 // agent-event.md Approach A carries no args), so fall back to
                 // `summary` — the primary parameter — so the expand affordance
@@ -653,28 +687,44 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                             Style::default().fg(theme.fg_more_subtle.to_color()),
                         )]));
                         // Feature 007 (T023) + crush-style formatting:
-                        // envelope-unwrapped + JSON pretty-printed, tail-
-                        // bounded, line-numbered gutter.
+                        // envelope-unwrapped + JSON pretty-printed, gutter-
+                        // numbered. TAIL WINDOW bounds to the last 200
+                        // lines; FULL shows everything.
                         let formatted = crate::state::format_tool_result_for_display(result);
-                        let (shown, affordance) =
-                            bounded_tail_lines_with_affordance(&formatted, MAX_TAIL_WINDOW_LINES_TUI);
-                        let total = formatted.lines().count();
-                        let first = total.saturating_sub(shown.len()) + 1;
-                        let gutter_w = digits(total.max(first));
-                        if let Some(msg) = affordance {
-                            lines.push(Line::from(vec![Span::styled(
-                                format!("      {}", msg),
-                                Style::default().fg(theme.fg_most_subtle.to_color()),
-                            )]));
-                        }
-                        for (gi, rl) in shown.iter().enumerate() {
-                            let num = format!("      {:>w$} │ ", first + gi, w = gutter_w);
-                            for w in wrap(rl, content_w.saturating_sub(10 + gutter_w)) {
-                                lines.push(Line::from(vec![
-                                    Span::styled(num.clone(), Style::default().fg(theme.fg_most_subtle.to_color())),
-                                    Span::styled(w, Style::default().fg(theme.fg_more_subtle.to_color()),
-                                    ),
-                                ]));
+                        if matches!(expand_state, ReasoningExpandState::Full) {
+                            let all: Vec<&str> = formatted.lines().collect();
+                            let gutter_w = digits(all.len().max(1));
+                            for (gi, rl) in all.iter().enumerate() {
+                                let num = format!("      {:>w$} │ ", gi + 1, w = gutter_w);
+                                for w in wrap(rl, content_w.saturating_sub(10 + gutter_w)) {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(num.clone(), Style::default().fg(theme.fg_most_subtle.to_color())),
+                                        Span::styled(w, Style::default().fg(theme.fg_most_subtle.to_color()),
+                                        ),
+                                    ]));
+                                }
+                            }
+                        } else {
+                            let (shown, affordance) =
+                                bounded_tail_lines_with_affordance(&formatted, MAX_TAIL_WINDOW_LINES_TUI);
+                            let total = formatted.lines().count();
+                            let first = total.saturating_sub(shown.len()) + 1;
+                            let gutter_w = digits(total.max(first));
+                            if let Some(msg) = affordance {
+                                lines.push(Line::from(vec![Span::styled(
+                                    format!("      {} [click or space for full view]", msg),
+                                    Style::default().fg(theme.fg_most_subtle.to_color()),
+                                )]));
+                            }
+                            for (gi, rl) in shown.iter().enumerate() {
+                                let num = format!("      {:>w$} │ ", first + gi, w = gutter_w);
+                                for w in wrap(rl, content_w.saturating_sub(10 + gutter_w)) {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(num.clone(), Style::default().fg(theme.fg_most_subtle.to_color())),
+                                        Span::styled(w, Style::default().fg(theme.fg_most_subtle.to_color()),
+                                        ),
+                                    ]));
+                                }
                             }
                         }
                     }
@@ -684,7 +734,8 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
             // (The terminal-tool early-return at line ~426-427 already has one.)
             lines.push(Line::from(vec![Span::raw("")]));
         }
-        TranscriptItem::FileDiff { path, stat, lines: diff_lines, is_binary, expanded } => {
+        TranscriptItem::FileDiff { path, stat, lines: diff_lines, is_binary, expand_state } => {
+            use crate::state::ReasoningExpandState;
             // Feature 005 (T019): render the inline diff block.
             // Header: "  ◆ path  +N -M"
             lines.push(Line::from(vec![
@@ -704,9 +755,14 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                 // Crush-style diff view: dual old/new line-number gutters
                 // (insertions blank the old number, deletions blank the new
                 // — diffview.go), colored +/- markers, hunk headers as
-                // subtle dividers. E2 height-bound stays; the bound lifts
-                // when expanded (click or Space/x).
-                let max_height = if *expanded { usize::MAX } else { MAX_DIFF_LINES };
+                // subtle dividers. Three-state inline expand (reasoning
+                // parity): collapsed = last MAX_DIFF_LINES; tail window =
+                // last 200; full = the whole diff.
+                let max_height = match expand_state {
+                    ReasoningExpandState::Collapsed => MAX_DIFF_LINES,
+                    ReasoningExpandState::TailWindow => MAX_TAIL_WINDOW_LINES_TUI,
+                    ReasoningExpandState::Full => usize::MAX,
+                };
                 let parsed = parse_diff_lines(diff_lines);
                 // Gutter width: the max line number across the whole diff
                 // (stable width regardless of the window).
@@ -810,6 +866,15 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
         }
     }
     lines
+}
+
+/// Public test wrapper over [`item_lines`] for integration tests.
+pub fn item_lines_for_test(
+    item: &TranscriptItem,
+    content_w: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    item_lines(item, content_w, theme)
 }
 
 pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focused: bool, glow: f32) {
@@ -1935,7 +2000,11 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
     };
     let end = (start + visible).min(total);
     // Record the visible window + entry geometry for click hit-testing.
-    app.last_stats_window.set((inner.y, start));
+    // The stream renders AFTER `lines.len()` dashboard header rows, so the
+    // first content row on screen is inner.y + lines.len() — recording just
+    // inner.y made every click resolve ~5 rows above the intended entry.
+    let header_rows = lines.len() as u16;
+    app.last_stats_window.set((inner.y + header_rows, start));
     app.last_stats_stream_rows.borrow_mut().clear();
     app.last_stats_stream_rows
         .borrow_mut()
@@ -2548,12 +2617,14 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("Shift+Up / Ctrl+T / PgUp·PgDn", "scroll transcript (enters scroll mode)"),
         ("Ctrl+B / Ctrl+F", "half-page scroll up/down"),
         ("j / k  ↑ / ↓", "scroll one line (in transcript focus)"),
-        ("Space / x (transcript)", "expand the tool/terminal item at the top of the view"),
+        ("Space / x (transcript)", "inline-expand the item at the top of the view"),
         ("g / G", "top / bottom (transcript focus)"),
         ("y / Y", "copy last agent / user message to clipboard"),
         ("/copy [n]", "copy nth assistant message (−n counts from last)"),
         ("Ctrl+S", "search transcript · n/N cycle matches"),
         ("Ctrl+R", "toggle reasoning panel"),
+        ("Ctrl+E", "cycle the newest reasoning block (tail ↔ full)"),
+        ("Ctrl+G", "cycle the newest tool block (inline expand)"),
         ("Ctrl+O", "maximize live terminal output · Esc restores"),
         ("  viewer: ↑↓/PgUp·PgDn", "scroll output (g/G top/bottom) · auto-follows tail"),
         ("Ctrl+A / click header ▸", "agent stats page · live context window stream"),
@@ -2566,6 +2637,8 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("  explorer: Tab / ⏎", "cycle graph · nodes · feed panes"),
         ("  explorer: Esc / click title", "dock the explorer back"),
         ("Ctrl+L", "clear transcript view"),
+        ("Ctrl+P", "back to the orchestrator tab (from a subagent pane)"),
+        ("click rail tabs", "focus a subagent · bottom tab = orchestrator"),
         ("Ctrl+A/E  Ctrl+U/K/W", "line start/end · kill line/word"),
         ("? / F1", "toggle this help"),
     ];
@@ -3031,7 +3104,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.1),
             result_preview: "drwxr-xr-x".into(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: true,
@@ -3053,7 +3126,7 @@ mod tests {
             status: ToolStatus::Failed,
             duration_secs: Some(0.01),
             result_preview: String::new(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: true,
@@ -3075,7 +3148,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.01),
             result_preview: String::new(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: true,
@@ -3101,7 +3174,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.1),
             result_preview: long_output,
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: true,
@@ -3126,7 +3199,7 @@ mod tests {
             status: ToolStatus::Running,
             duration_secs: None,
             result_preview: String::new(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: true,
@@ -3156,7 +3229,7 @@ mod tests {
             status: ToolStatus::Running,
             duration_secs: None,
             result_preview: String::new(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: true,
@@ -3191,7 +3264,7 @@ mod tests {
             status: ToolStatus::Running,
             duration_secs: None,
             result_preview: String::new(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: true,
@@ -3411,7 +3484,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.05),
             result_preview: "fn main() {}".into(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: false,
@@ -3436,7 +3509,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.3),
             result_preview: long_result,
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: false,
@@ -3461,7 +3534,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.1),
             result_preview: "line1\nline2".into(),
-            expanded: true,
+            expand_state: ReasoningExpandState::TailWindow,
             full_args: Some("path: foo.rs".into()),
             full_result: Some("line1\nline2\nline3".into()),
             is_terminal: false,
@@ -3500,7 +3573,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.1),
             result_preview: "preview".into(),
-            expanded: true,
+            expand_state: ReasoningExpandState::TailWindow,
             full_args: None,
             full_result: Some("full body".into()),
             is_terminal: false,
@@ -3538,7 +3611,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.1),
             result_preview: "line1".into(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: false,
@@ -3619,20 +3692,22 @@ mod tests {
     #[test]
     fn test_toggle_item_expand_by_index_tool() {
         let mut app = app_with_two_items();
-        // Item 1 is the tool, starts unexpanded.
+        // Item 1 is the tool, starts collapsed.
         assert_eq!(
-            matches!(&app.transcript[1], TranscriptItem::Tool { expanded: false, .. }),
+            matches!(&app.transcript[1], TranscriptItem::Tool { expand_state: ReasoningExpandState::Collapsed, .. }),
             true
         );
         app.toggle_item_expand_by_index(1);
+        // Short result: the cycle skips the redundant tail window and goes
+        // straight to Full (same rule as reasoning blocks).
         assert_eq!(
-            matches!(&app.transcript[1], TranscriptItem::Tool { expanded: true, .. }),
+            matches!(&app.transcript[1], TranscriptItem::Tool { expand_state: ReasoningExpandState::Full, .. }),
             true,
-            "toggle should expand the tool"
+            "toggle should expand the tool (short result skips to Full)"
         );
         app.toggle_item_expand_by_index(1);
         assert_eq!(
-            matches!(&app.transcript[1], TranscriptItem::Tool { expanded: false, .. }),
+            matches!(&app.transcript[1], TranscriptItem::Tool { expand_state: ReasoningExpandState::Collapsed, .. }),
             true,
             "second toggle should collapse the tool"
         );
@@ -3695,7 +3770,7 @@ mod tests {
                     status: ToolStatus::Done,
                     duration_secs: Some(0.1),
                     result_preview: "hi".into(),
-                    expanded: false,
+                    expand_state: ReasoningExpandState::Collapsed,
                     full_args: None,
                     full_result: None,
                     is_terminal: true,
@@ -3713,7 +3788,7 @@ mod tests {
                     status: ToolStatus::Done,
                     duration_secs: Some(0.1),
                     result_preview: "fn main() {}".into(),
-                    expanded: false,
+                    expand_state: ReasoningExpandState::Collapsed,
                     full_args: None,
                     full_result: None,
                     is_terminal: false,
@@ -3728,7 +3803,7 @@ mod tests {
                     path: "a.txt".into(),
                     stat: "+1 -0".into(),
                     lines: vec!["+hello".into()],
-                    is_binary: false, expanded: false,
+                    is_binary: false, expand_state: ReasoningExpandState::Collapsed,
                 },
             ),
             (
@@ -3786,7 +3861,11 @@ mod tests {
                 status: ToolStatus::Done,
                 duration_secs: Some(0.1),
                 result_preview: "x".into(),
-                expanded,
+                expand_state: if expanded {
+                    ReasoningExpandState::TailWindow
+                } else {
+                    ReasoningExpandState::Collapsed
+                },
                 full_args: None,
                 full_result: None,
                 is_terminal: false,
@@ -3800,7 +3879,7 @@ mod tests {
                 path: "a".into(),
                 stat: "+1".into(),
                 lines: vec!["+x".into()],
-                is_binary: false, expanded: false,
+                is_binary: false, expand_state: ReasoningExpandState::Collapsed,
             }
         }
         fn mk_notice() -> TranscriptItem {
@@ -3972,7 +4051,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.1),
             result_preview: "body line one".into(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: false,
@@ -3999,7 +4078,7 @@ mod tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.1),
             result_preview: "hi".into(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: true,
@@ -4427,6 +4506,7 @@ pub fn draw_neurocode_panel(f: &mut Frame, area: Rect, app: &App, theme: Theme) 
 #[cfg(test)]
 mod crush_format_tests {
     use super::*;
+    use crate::state::ReasoningExpandState;
 
     fn render_item(item: &TranscriptItem, width: usize) -> Vec<String> {
         let theme = Theme::aurora();
@@ -4447,7 +4527,7 @@ mod crush_format_tests {
             status: ToolStatus::Done,
             duration_secs: Some(2.0),
             result_preview: r#"{"output":"Compiling foo v0.1.0\nFinished dev","exit_code":0,"error":null}"#.into(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: true,
@@ -4498,7 +4578,7 @@ mod crush_format_tests {
             status: ToolStatus::Running,
             duration_secs: None,
             result_preview: String::new(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: true,
@@ -4531,7 +4611,7 @@ mod crush_format_tests {
                 " }".into(),
             ],
             is_binary: false,
-            expanded: true,
+            expand_state: ReasoningExpandState::TailWindow,
         };
         let rendered = render_item(&item, 100);
         let joined = rendered.join("\n");
@@ -4634,6 +4714,7 @@ mod visual_check_tests {
     //! Print-oriented sanity checks: drive the REAL item_lines with realistic
     //! tool results and assert the exact user-visible rows.
     use super::*;
+    use crate::state::ReasoningExpandState;
 
     #[test]
     fn terminal_block_visual() {
@@ -4644,7 +4725,7 @@ mod visual_check_tests {
             status: ToolStatus::Done,
             duration_secs: Some(4.2),
             result_preview: r#"{"output":"running 184 tests\ntest a ... ok\ntest b ... ok\n\ntest result: ok. 184 passed","exit_code":0,"error":null}"#.into(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: None,
             is_terminal: true,
@@ -4682,7 +4763,7 @@ mod visual_check_tests {
                 " pub mod input;".into(),
             ],
             is_binary: false,
-            expanded: true,
+            expand_state: ReasoningExpandState::TailWindow,
         };
         let rendered: Vec<String> = item_lines(&item, 100, Theme::aurora())
             .iter()
@@ -4756,8 +4837,8 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let label_w = inner.width.saturating_sub(2) as usize;
     for (i, pane) in app.subagent_panes.iter().enumerate() {
         let tab_y = inner.y + 1 + (i as u16) * 2;
-        if tab_y + 1 >= inner.y + inner.height {
-            break; // rail full
+        if tab_y + 1 >= inner.y + inner.height.saturating_sub(2) {
+            break; // rail full (reserve 2 rows for the orchestrator tab)
         }
         let focused = app.focused_subagent == Some(i);
         let (glyph, color) = match pane.status {
@@ -4797,6 +4878,52 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         app.last_subagent_tab_rects
             .borrow_mut()
             .push((tab_area.x, tab_y, tab_area.width, 1));
+    }
+
+    // ── Orchestrator tab (pinned at the rail's bottom) ─────────────────
+    // Always present when the rail is drawn: a dedicated way back to the
+    // main view. Clicking any pane tab focuses that child; clicking THIS
+    // one (or pressing Ctrl+P) returns to the orchestrator. Highlighted
+    // exactly like a focused pane tab when the main view IS the active one
+    // (focused_subagent == None), so the current view is always visible in
+    // the rail.
+    {
+        let orch_y = inner.y + inner.height.saturating_sub(1);
+        let orch_area = Rect::new(inner.x, orch_y, inner.width, 1);
+        if orch_y > inner.y {
+            let focused = app.focused_subagent.is_none();
+            let style = if focused {
+                Style::default()
+                    .bg(theme.primary.to_color())
+                    .fg(theme.bg_void.to_color())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .bg(theme.bg_panel.to_color())
+                    .fg(theme.fg_base.to_color())
+            };
+            let glyph = if app.is_busy() { "◐" } else { "◆" };
+            let glyph_col = if app.is_busy() { theme.busy } else { theme.accent };
+            let mut spans = vec![
+                Span::styled(format!("{} ", glyph), Style::default().fg(glyph_col.to_color())),
+                Span::styled("orchestrator".to_string(), style),
+            ];
+            if focused {
+                spans.insert(0, Span::styled("▸".to_string(), Style::default().fg(theme.primary.to_color())));
+            }
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(if focused {
+                    theme.primary.to_color()
+                } else {
+                    theme.bg_panel.to_color()
+                })),
+                orch_area,
+            );
+            // Record the orchestrator tab's own click rect (checked by
+            // App::orchestrator_tab_hit BEFORE the per-pane rects).
+            app.last_orchestrator_tab_rect
+                .set((orch_area.x, orch_y, orch_area.width, 1));
+        }
     }
 }
 
@@ -5000,7 +5127,9 @@ pub fn draw_pane_stats_page(
     };
     let end = (start + visible).min(total);
     // Record the visible window + entry geometry for click hit-testing.
-    app.last_pane_stats_window.set((inner.y, start));
+    // Content starts after the pane dashboard header rows (see main stats).
+    let header_rows = lines.len() as u16;
+    app.last_pane_stats_window.set((inner.y + header_rows, start));
     app.last_pane_stats_stream_rows.borrow_mut().clear();
     app.last_pane_stats_stream_rows
         .borrow_mut()

@@ -367,7 +367,6 @@ mod ingest_routing_tests {
 
 #[cfg(test)]
 mod ingest_tool_integration_tests {
-    use super::*;
 
     /// The neurocode_ingest TOOL is registered when NeuroCode is enabled —
     /// the agent path depends on it being callable in-turn.

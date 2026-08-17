@@ -6,6 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Numeric offset placing F-tasks in a range implementation tasks can never
+/// reach, so `F1` and task `1` stay distinct in number-keyed collections
+/// (completion sets, dependency unblocking).
+pub const F_TASK_NUMBER_OFFSET: usize = 1 << 30;
+
 /// A single parsed task from a plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedTask {
@@ -100,7 +105,11 @@ pub fn parse_plan(markdown: &str) -> ParsedPlan {
             if let Some(dot_pos) = num_part.find('.') {
                 if let Ok(num) = num_part[..dot_pos].parse::<usize>() {
                     let title = num_part[dot_pos + 1..].trim().to_string();
-                    (num, title, true)
+                    // F-tasks live in a distinct numeric range: storing the
+                    // raw F-number collided with the implementation task of
+                    // the same number (F1 vs task 1) in every `number`-keyed
+                    // lookup (completion sets, dependency unblocking).
+                    (F_TASK_NUMBER_OFFSET + num, title, true)
                 } else {
                     continue;
                 }
@@ -174,9 +183,10 @@ mod tests {
         let t3 = plan.tasks.iter().find(|t| t.number == 3).unwrap();
         assert_eq!(t3.dependencies, vec![2]);
 
-        // F1 is final verification
+        // F1 is final verification — its number is offset into the F-range
+        // so it cannot collide with implementation task 1.
         let f1 = plan.tasks.iter().find(|t| t.is_final_verification).unwrap();
-        assert_eq!(f1.number, 1);
+        assert_eq!(f1.number, F_TASK_NUMBER_OFFSET + 1);
         assert!(f1.title.contains("Final verification"));
 
         // Task 0 is completed

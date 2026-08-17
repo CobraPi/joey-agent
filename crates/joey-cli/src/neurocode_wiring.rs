@@ -40,6 +40,23 @@ pub fn try_build_engine(config: &joey_core::Config) -> Option<Arc<DefaultEngine>
     Some(Arc::new(engine))
 }
 
+/// Like [`try_build_engine`], but scopes the tier resolution to an EXPLICIT
+/// provider name (the agent's live provider after a runtime `/model`
+/// switch, which may differ from config's `model.provider` for the session).
+pub fn try_build_engine_scoped(
+    config: &joey_core::Config,
+    provider: &str,
+) -> Option<Arc<DefaultEngine>> {
+    let nc_cfg = NeuroCodeConfig::from_config(config);
+    if !nc_cfg.enabled {
+        return None;
+    }
+    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut engine = DefaultEngine::new(nc_cfg, project_root);
+    engine.set_provider(provider);
+    Some(Arc::new(engine))
+}
+
 /// Whether the active provider's NeuroCode tier models are configured —
 /// either a per-provider entry (`neurocode.tier.providers.<id>`) or the flat
 /// legacy keys. When false and NeuroCode is enabled, callers should prompt

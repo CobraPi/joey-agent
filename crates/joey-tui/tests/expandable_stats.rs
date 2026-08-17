@@ -271,14 +271,20 @@ fn pane_item_expansion_toggles() {
     let pane = a.focused_pane().unwrap();
     assert!(!matches!(
         pane.transcript.back(),
-        Some(joey_tui::state::TranscriptItem::Tool { expanded: true, .. })
+        Some(joey_tui::state::TranscriptItem::Tool { expand_state: joey_tui::state::ReasoningExpandState::TailWindow, .. })
     ));
     // Pane item toggle via the SubagentPane method.
     let idx = pane.transcript.len() - 1;
     a.focused_pane_mut().unwrap().toggle_item_expand(idx);
     let pane = a.focused_pane().unwrap();
+    // Short result: the cycle skips the redundant tail window (Full is
+    // the first meaningful expansion), matching reasoning-block semantics.
     assert!(matches!(
         pane.transcript.back(),
-        Some(joey_tui::state::TranscriptItem::Tool { expanded: true, .. })
+        Some(joey_tui::state::TranscriptItem::Tool {
+            expand_state: joey_tui::state::ReasoningExpandState::TailWindow
+                | joey_tui::state::ReasoningExpandState::Full,
+            ..
+        })
     ));
 }

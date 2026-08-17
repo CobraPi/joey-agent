@@ -296,6 +296,7 @@ impl SubagentManager {
             max_spawn_depth,
             None,
             self.interrupt.clone(),
+            self.semaphore.clone(),
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -400,7 +401,8 @@ impl SubagentManager {
         let shared_semaphore = self.semaphore.clone();
         let tap = self.event_tap();
 
-        let mut all_results = Vec::with_capacity(total);
+        let mut indexed_results: Vec<(usize, DelegationResult)> = Vec::with_capacity(total);
+        let mut dispatched_count = 0usize;
 
         // Chunk only when the batch exceeds the children cap; within a
         // chunk everything runs concurrently (semaphore-gated).
@@ -412,9 +414,9 @@ impl SubagentManager {
             .collect();
 
         for chunk in chunks {
-            let mut join_set: JoinSet<DelegationResult> = JoinSet::new();
+            let mut join_set: JoinSet<(usize, DelegationResult)> = JoinSet::new();
 
-            for req in chunk {
+            for (chunk_pos, req) in chunk.into_iter().enumerate() {
                 let parent_cfg = parent_config.clone();
                 let config_tree = parent_config_tree.clone();
                 let registry = base_registry.clone();
@@ -427,6 +429,9 @@ impl SubagentManager {
                 // ids are unique + monotonic across the whole batch (the
                 // child manager below starts its counter here).
                 let child_id = self.next_id();
+                // Original request index (for stable result ordering —
+                // JoinSet yields in COMPLETION order, not dispatch order).
+                let task_index = dispatched_count + chunk_pos;
 
                 join_set.spawn(async move {
                     // Each child shares the PARENT's semaphore (FR-018).
@@ -438,36 +443,58 @@ impl SubagentManager {
                         next_child_id: std::sync::atomic::AtomicU64::new(child_id),
                         event_tap: std::sync::Mutex::new(tap),
                     };
-                    mgr.dispatch_single_with_overrides(
-                        &req,
-                        &parent_cfg,
-                        &config_tree,
-                        &registry,
-                        tx.as_ref(),
-                        dm.as_deref(),
-                        max_turns,
-                        max_spawn_depth,
-                    )
-                    .await
+                    let result = mgr
+                        .dispatch_single_with_overrides(
+                            &req,
+                            &parent_cfg,
+                            &config_tree,
+                            &registry,
+                            tx.as_ref(),
+                            dm.as_deref(),
+                            max_turns,
+                            max_spawn_depth,
+                        )
+                        .await;
+                    (task_index, result)
                 });
             }
+            dispatched_count += join_set.len();
 
             while let Some(res) = join_set.join_next().await {
-                if let Ok(r) = res {
-                    all_results.push(r);
+                match res {
+                    Ok((idx, r)) => indexed_results.push((idx, r)),
+                    Err(join_err) => {
+                        // A panicked/aborted child must surface as a failure
+                        // row, not silently vanish (the [i/total] count would
+                        // mismatch with no explanation). It consumed no
+                        // dispatch slot we can identify, so park it at an
+                        // out-of-range index; it sorts to the end.
+                        let idx = usize::MAX;
+                        indexed_results.push((
+                            idx,
+                            DelegationResult {
+                                goal: format!("(child task panicked: {})", join_err),
+                                summary: String::new(),
+                                success: false,
+                                error: Some(format!("subagent task failed: {}", join_err)),
+                                token_usage: Default::default(),
+                                wall_clock: std::time::Duration::ZERO,
+                                model: String::new(),
+                                iterations: 0,
+                                persisted_session_id: None,
+                            },
+                        ));
+                    }
                 }
             }
         }
 
-        // Sort results by original task order (goal matching).
-        let mut results = all_results;
-        let mut ordered = Vec::with_capacity(total);
-        for task in tasks {
-            if let Some(pos) = results.iter().position(|r| r.goal == task.goal) {
-                ordered.push(results.remove(pos));
-            }
-        }
-        ordered.extend(results);
+        // Stable ordering: sort by the ORIGINAL task index (JoinSet yields
+        // in completion order; goal-string matching mis-paired results when
+        // goals repeated across tasks).
+        indexed_results.sort_by_key(|(idx, _)| *idx);
+        let ordered: Vec<DelegationResult> =
+            indexed_results.into_iter().map(|(_, r)| r).collect();
 
         let elapsed = start.elapsed().as_secs_f64();
         let succeeded = ordered.iter().filter(|r| r.success).count();

@@ -1186,6 +1186,17 @@ count for multi-spot edits."
             if resolved.exists() {
                 return tool_error(format!("file already exists: {}", path));
             }
+            // Creation consumes exactly ONE edit — silently ignoring the
+            // rest would tell the model a multi-edit create succeeded when
+            // only the first edit's content landed.
+            if edits.len() > 1 {
+                return tool_error(format!(
+                    "multi_edit: file-creation call has {} edits; creation accepts exactly 1 \
+                     (subsequent edits would be silently dropped). Create the file first, then \
+                     apply the remaining edits in a second call.",
+                    edits.len()
+                ));
+            }
             let content = &edits[0].1;
             // Syntax gate.
             if let Some(err) = syntax_gate(&path, content) {

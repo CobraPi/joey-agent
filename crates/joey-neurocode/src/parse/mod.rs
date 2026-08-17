@@ -340,6 +340,13 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
         }
     }
 
+    // ── Tombstone pass ─────────────────────────────────────────────
+    // Nodes for files that no longer exist (deleted or renamed away) must
+    // not linger as Active: FTS and queries keep returning phantoms, and a
+    // renamed file creates a duplicate under the new path while the old one
+    // stays. Mark them Deleted.
+    let _ = graph.mark_absent_paths_deleted(project_root);
+
     result
 }
 

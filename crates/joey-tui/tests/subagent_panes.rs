@@ -5,7 +5,7 @@
 //! rendered rail/pane views via a ratatui TestBackend.
 
 use joey_agent_core::events::{AgentEvent, ContextEntry};
-use joey_tui::state::{NoticeKind, RunMode, SubagentStatus, TranscriptItem};
+use joey_tui::state::{RunMode, SubagentStatus, TranscriptItem};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
@@ -255,6 +255,73 @@ fn tab_click_hit_routing() {
     assert_eq!(a.subagent_tab_hit(3, 105), Some(1));
     assert_eq!(a.subagent_tab_hit(2, 105), None, "gap between tabs");
     assert_eq!(a.subagent_tab_hit(1, 50), None, "outside the rail");
+}
+
+/// The pinned orchestrator tab renders at the rail's bottom whenever the
+/// rail is drawn, and records a click rect distinct from the pane tabs.
+#[test]
+fn orchestrator_tab_renders_and_records_click_rect() {
+    let mut a = app();
+    a.apply(spawn(1, "alpha task"));
+    let text = render_frame(&a, 120, 30);
+    assert!(text.contains("orchestrator"), "orchestrator tab label: {text}");
+    // The click rect was recorded with real geometry (non-zero w/h).
+    let (x, y, w, h) = a.last_orchestrator_tab_rect.get();
+    assert!(w > 0 && h > 0, "orchestrator tab rect recorded");
+    // It sits BELOW the pane tabs (the rail stacks panes from the top).
+    let pane_rects = a.last_subagent_tab_rects.borrow().clone();
+    assert!(!pane_rects.is_empty());
+    let (_, first_pane_y, _, _) = pane_rects[0];
+    assert!(y > first_pane_y, "orchestrator tab is pinned below the pane tabs");
+    // Hit-test: inside the rect → true; outside → false.
+    assert!(a.orchestrator_tab_hit(y, x + 2));
+    assert!(!a.orchestrator_tab_hit(y + 5, x + 2), "row below the tab");
+    assert!(!a.orchestrator_tab_hit(y, x + w + 2), "column right of the rail");
+}
+
+/// Clicking the orchestrator tab returns to the main view from a focused
+/// pane (the click handler routes through focus_subagent(None)).
+#[test]
+fn clicking_orchestrator_tab_returns_to_main_view() {
+    let mut a = app();
+    a.apply(spawn(1, "watched child"));
+    a.push_item(TranscriptItem::User { text: "parent prompt".into() });
+    a.focus_subagent(Some(0));
+    // Simulate the recorded rect, then the hit-test + routing the real
+    // handler performs.
+    a.last_orchestrator_tab_rect.set((100, 28, 18, 1));
+    assert!(a.orchestrator_tab_hit(28, 105));
+    a.focus_subagent(None);
+    assert!(a.focused_subagent.is_none(), "back on the orchestrator view");
+    let text = render_frame(&a, 120, 30);
+    assert!(text.contains("parent prompt"), "parent transcript restored");
+}
+
+/// The orchestrator tab carries the focused highlight exactly when the main
+/// view is active (no pane focused) — the rail always shows the current
+/// view.
+#[test]
+fn orchestrator_tab_highlight_follows_focus() {
+    let mut a = app();
+    a.apply(spawn(1, "alpha task"));
+    // Orchestrator focused: highlight ON. The ▸ focus marker is inserted
+    // before the status glyph ("▸ ◆ orchestrator").
+    let text = render_frame(&a, 120, 30);
+    assert!(
+        text.contains("▸") && text.find("▸").zip(text.find("orchestrator"))
+            .map(|(m, l)| m < l)
+            .unwrap_or(false),
+        "focused marker before the label (got: {:?})",
+        &text[text.find("orchestrator").map(|i| i.saturating_sub(12)).unwrap_or(0)..]
+    );
+    // Pane focused: the pane tab is highlighted instead; the orchestrator
+    // tab is dimmed. (Rendered highlight of pane tabs is covered by
+    // focused_pane_replaces_main_transcript; here we assert the state
+    // transitions the renderer reads.)
+    a.focus_subagent(Some(0));
+    assert!(a.focused_subagent == Some(0));
+    a.focus_subagent(None);
+    assert!(a.focused_subagent.is_none());
 }
 
 fn first_line(s: &str, _n: usize) -> String {

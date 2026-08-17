@@ -275,7 +275,12 @@ impl<'de> Deserialize<'de> for SessionSource {
         let wire = SessionSourceWire::deserialize(deserializer)?;
         // D-Q2.5 dual-read: prefer the canonical `scope_id`, fall back to the
         // deprecated `guild_id` alias (a peer not yet migrated still sends it).
-        let scope_id = wire.scope_id.or(wire.guild_id);
+        // Python's `or` also falls through on the EMPTY string — mirror that:
+        // an empty-string scope_id must not shadow a real legacy guild_id.
+        let scope_id = wire
+            .scope_id
+            .filter(|s| !s.is_empty())
+            .or(wire.guild_id);
         let mut source = SessionSource {
             platform: wire.platform,
             chat_id: coerce_to_python_str(&wire.chat_id),

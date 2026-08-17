@@ -4,6 +4,7 @@
 //! literal `\n` escape runs.
 
 use joey_tui::state::{App, ToolStatus, TranscriptItem, LIVE_OUTPUT_CAPACITY};
+use joey_tui::state::ReasoningExpandState;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
@@ -41,7 +42,7 @@ fn tool_item(full_result: &str, expanded: bool) -> TranscriptItem {
         status: ToolStatus::Done,
         duration_secs: Some(0.4),
         result_preview: "…".into(),
-        expanded,
+        expand_state: if expanded { ReasoningExpandState::TailWindow } else { ReasoningExpandState::Collapsed },
         full_args: None,
         full_result: Some(full_result.to_string()),
         is_terminal: false,
@@ -83,7 +84,7 @@ fn expanded_terminal_tool_renders_real_newlines_not_escapes() {
         status: ToolStatus::Done,
         duration_secs: Some(1.2),
         result_preview: "…".into(),
-        expanded: true,
+        expand_state: ReasoningExpandState::TailWindow,
         full_args: None,
         full_result: Some(raw.to_string()),
         is_terminal: true,

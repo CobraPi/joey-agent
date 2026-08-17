@@ -107,20 +107,23 @@ fn register_orchestration_inner(
         parent_config_tree.clone(),
         base_registry.clone(),
         event_tx.clone(),
-        resolver,
+        resolver.clone(),
     );
     if let Some(alloc) = allocator {
         delegate.set_model_allocator(alloc);
     }
     registry.register(std::sync::Arc::new(delegate));
-    // Register call_omo_agent without resolver (T153).
+    // Register call_omo_agent WITH the resolver: it requires
+    // `subagent_type` resolution to succeed — a None resolver made the
+    // tool permanently error ("requires an OMO category resolver"),
+    // killing Junior's research path (T153) entirely.
     registry.register(std::sync::Arc::new(CallOmoAgent::new(
         manager,
         parent_config,
         parent_config_tree,
         base_registry,
         event_tx,
-        None,
+        resolver,
     )));
 }
 

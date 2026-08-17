@@ -313,17 +313,44 @@ async fn run_agent(
     });
 
     // Drain events silently; only the Failed message matters here.
+    //
+    // A bare `rx.recv()`-until-close would hang forever: background-process
+    // reapers (process_tool.rs) hold ToolContext clones whose progress_tx
+    // keeps the turn's event forwarder — and through it a tx clone — alive
+    // for the lifetime of every child process the turn spawned. So the
+    // drain task also listens for a stop signal, then flushes whatever is
+    // still queued behind it.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
     let drain = tokio::spawn(async move {
         let mut failed: Option<String> = None;
-        while let Some(ev) = rx.recv().await {
-            if let AgentEvent::Failed(msg) = ev {
-                failed = Some(msg);
+        loop {
+            tokio::select! {
+                ev = rx.recv() => {
+                    match ev {
+                        Some(ev) => {
+                            if let AgentEvent::Failed(msg) = ev {
+                                failed = Some(msg);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = stop_rx.recv() => {
+                    // Flush events still queued behind the stop signal.
+                    while let Ok(ev) = rx.try_recv() {
+                        if let AgentEvent::Failed(msg) = ev {
+                            failed = Some(msg);
+                        }
+                    }
+                    break;
+                }
             }
         }
         failed
     });
     let result = agent.run_turn(prompt, tx).await;
+    let _ = stop_tx.send(()).await;
     let failed = drain.await.ok().flatten();
 
     if let Some(db) = agent.session_db() {

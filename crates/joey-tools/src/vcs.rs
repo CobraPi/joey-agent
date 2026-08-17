@@ -301,13 +301,21 @@ impl CheckpointManager {
         self.run_git(&["add", "--all", "--", "."])?;
         self.unstage_oversized_files()?;
 
+        // Write the staged tree FIRST, then compare it with the current
+        // ref's tree — plumbing-only, no HEAD dependency (the old
+        // `diff --cached` / `status --porcelain` checks compared against
+        // HEAD, which we no longer set).
+        let tree = self
+            .run_git_capture(&["write-tree"], &[0])?
+            .trim()
+            .to_string();
+
         if !is_initial {
-            let diff = self.run_git_capture(&["diff", "--cached", "--quiet"], &[0, 1])?;
-            let _ = diff; // exit code carries the signal; output unused
-            let status_ok = self
-                .run_git_status_has_staged_changes()
-                .unwrap_or(true);
-            if !status_ok {
+            let prev_tree = self
+                .run_git_capture(&["rev-parse", &format!("{}^{{tree}}", self.ref_name())], &[0])?
+                .trim()
+                .to_string();
+            if prev_tree == tree {
                 // Nothing changed — no new checkpoint needed.
                 return Ok(self.next_checkpoint.max(1));
             }
@@ -315,25 +323,36 @@ impl CheckpointManager {
 
         let num = self.next_checkpoint + 1;
         let full_message = format!("[{}] {}", num, message);
-        let parent_args: Vec<String> = if is_initial {
-            vec![]
+
+        // Plumbing-based commit — NEVER `git commit`. `git commit` updates
+        // whatever HEAD points at, and HEAD lives in the SHARED store: two
+        // concurrent CheckpointManagers (two projects using one store) would
+        // race the `symbolic-ref HEAD <ref>` setup and commit onto each
+        // other's ref, corrupting cross-project history. write-tree /
+        // commit-tree / update-ref touch only THIS project's ref.
+        let commit_args: Vec<String> = if is_initial {
+            vec!["commit-tree".to_string(), tree.clone(), "-m".to_string(), full_message.clone()]
         } else {
-            vec!["-p".to_string(), self.ref_name()]
+            vec![
+                "commit-tree".to_string(),
+                tree.clone(),
+                "-p".to_string(),
+                self.ref_name(),
+                "-m".to_string(),
+                full_message.clone(),
+            ]
         };
-        let _ = parent_args; // commit uses ref update below, not raw commit-tree
+        let arg_refs: Vec<&str> = commit_args.iter().map(|s| s.as_str()).collect();
+        let commit_oid = self.run_git_capture(&arg_refs, &[0])?.trim().to_string();
+        if commit_oid.len() < 40 {
+            return Err(anyhow::anyhow!(
+                "commit-tree returned invalid oid: {:?}",
+                commit_oid
+            ));
+        }
+        // Atomically move this project's ref to the new commit.
+        self.run_git(&["update-ref", &self.ref_name(), &commit_oid])?;
 
-        self.run_git(&[
-            "commit",
-            "--quiet",
-            "--allow-empty",
-            "-m",
-            &full_message,
-        ])?;
-
-        // Move this project's ref to the new HEAD (commit above updates
-        // whatever ref is checked out via GIT_DIR/HEAD in our isolated
-        // env — we explicitly point HEAD at our ref before committing so
-        // `git commit` updates refs/joey/<hash16> directly).
         self.next_checkpoint = num;
         self.touch_project_meta()?;
         Ok(num)
@@ -350,9 +369,10 @@ impl CheckpointManager {
         std::fs::create_dir_all(self.store.join(INDEXES_DIRNAME)).ok();
         std::fs::create_dir_all(self.store.join(PROJECTS_DIRNAME)).ok();
 
-        // Point this invocation's HEAD at our project ref so commits land
-        // on refs/joey/<hash16> instead of a shared default branch.
-        self.run_git(&["symbolic-ref", "HEAD", &self.ref_name()])?;
+        // (No HEAD manipulation: commits are made with write-tree /
+        // commit-tree / update-ref plumbing against THIS project's ref, so
+        // the store's shared HEAD file is never touched — concurrent
+        // managers for different projects cannot race each other.)
 
         // Seed next_checkpoint from existing history, if any.
         if self.ref_exists()? {
@@ -371,11 +391,6 @@ impl CheckpointManager {
     fn ref_exists(&self) -> Result<bool> {
         let ok = self.run_git_bool(&["rev-parse", "--verify", "--quiet", &self.ref_name()]);
         Ok(ok)
-    }
-
-    fn run_git_status_has_staged_changes(&self) -> Result<bool> {
-        let out = self.run_git_capture(&["status", "--porcelain"], &[0])?;
-        Ok(!out.trim().is_empty())
     }
 
     /// Enforce FR-007's max single tracked file size cap: unstage (but

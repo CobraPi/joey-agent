@@ -513,6 +513,11 @@ mod tests {
         use tempfile::NamedTempFile;
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("COPILOT_API_BASE_URL");
+        // A prior test's Config::load() may have loaded ~/.joey/.env with
+        // OVERRIDE semantics into the process env — scrub the HUD var too,
+        // or the magnet in resolve_provider_name fires and we get
+        // "ai-usage-hud" instead of the vendor prefix.
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
@@ -532,6 +537,9 @@ mod tests {
         use tempfile::NamedTempFile;
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("COPILOT_API_BASE_URL", "http://127.0.0.1:8317");
+        // HUD takes precedence over the copilot magnet — scrub it so this
+        // test observes the copilot path even when ~/.joey/.env set it.
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),

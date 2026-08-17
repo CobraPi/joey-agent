@@ -98,6 +98,7 @@ fn render_body(
         cols[0]
     } else {
         app.last_subagent_tab_rects.borrow_mut().clear();
+        app.last_orchestrator_tab_rect.set((0, 0, 0, 0));
         area
     };
 
@@ -931,6 +932,18 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 self.app.clear_subagent_panes();
                 return None;
             }
+            // ── Subagent pane focus ────────────────────────────────────
+            // Ctrl+P returns to the orchestrator tab (the pinned rail tab
+            // at the bottom does the same by mouse). No-op when already on
+            // the main view or when no panes exist. (Ctrl+W stays bound to
+            // delete-word-back in the input editor.)
+            KeyCode::Char('p') if ctrl => {
+                if self.app.focused_subagent.is_some() {
+                    self.app.focus_subagent(None);
+                    self.app.pane_stats_view = None; // re-pin stats to the live tail
+                }
+                return None;
+            }
             // ── Maximized terminal output viewer ──────────────────────
             // Ctrl+O toggles it: targets the most recent terminal item
             // (running or finished — a finished one replays its full output).
@@ -1647,9 +1660,15 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// main view) toggles it the same way.
     pub fn handle_mouse_click(&mut self, row: u16, col: u16) {
         // Parallel-subagent feature: the right rail's tabs are the top
-        // click target. Clicking a pane's tab focuses it (retargeting the
-        // main transcript + stats window); clicking the focused tab again
-        // returns to the orchestrator view.
+        // click target. The pinned ORCHESTRATOR tab (rail bottom) returns
+        // to the main view; clicking a pane's tab focuses it (retargeting
+        // the main transcript + stats window); clicking the focused tab
+        // again returns to the orchestrator view.
+        if self.app.orchestrator_tab_hit(row, col) {
+            self.app.focus_subagent(None);
+            self.app.pane_stats_view = None; // re-pin stats to the live tail
+            return;
+        }
         if let Some(idx) = self.app.subagent_tab_hit(row, col) {
             let target = if self.app.focused_subagent == Some(idx) {
                 None
@@ -1745,20 +1764,13 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 return;
             }
         }
-        // Resolve the clicked item via per-item hit-testing. A TOOL item
-        // click (terminal or generic) maximizes its formatted output in the
-        // code viewer (running = live stream, finished = formatted replay);
-        // diffs and reasoning keep the plain expand toggle.
+        // Resolve the clicked item via per-item hit-testing. ALL expandable
+        // kinds (tool/terminal blocks, diffs, reasoning) toggle INLINE —
+        // the reasoning-history expand format unified across the transcript.
+        // The maximized output viewer remains available via Ctrl+O for
+        // live-following long-running output.
         if let Some(item_idx) = widgets::transcript_hit_test(&self.app, self.theme, row, col) {
-            let is_tool = matches!(
-                self.app.transcript.get(item_idx),
-                Some(TranscriptItem::Tool { .. })
-            );
-            if is_tool {
-                self.app.output_viewer_click(item_idx);
-            } else {
-                self.app.toggle_item_expand_by_index(item_idx);
-            }
+            self.app.toggle_item_expand_by_index(item_idx);
         }
     }
 }
@@ -2058,7 +2070,7 @@ mod completion_key_tests {
 mod expand_tests {
     //! Keyboard + render expansion of tool/terminal/diff items.
     use super::*;
-    use crate::state::{ToolStatus, TranscriptItem};
+    use crate::state::{ReasoningExpandState, ToolStatus, TranscriptItem};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use ratatui::backend::TestBackend;
 
@@ -2071,7 +2083,7 @@ mod expand_tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.5),
             result_preview: "1\n2\n3".into(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: Some(full_result.to_string()),
             is_terminal,
@@ -2103,20 +2115,20 @@ mod expand_tests {
         t.handle_key(KeyEvent { code: KeyCode::Up, modifiers: KeyModifiers::SHIFT, kind: KeyEventKind::Press, state: KeyEventState::NONE });
         let expanded_before = matches!(
             t.app.transcript.back(),
-            Some(TranscriptItem::Tool { expanded: true, .. })
+            Some(TranscriptItem::Tool { expand_state: ReasoningExpandState::TailWindow | ReasoningExpandState::Full, .. })
         );
         assert!(!expanded_before);
         t.handle_key(space());
         let expanded_after = matches!(
             t.app.transcript.back(),
-            Some(TranscriptItem::Tool { expanded: true, .. })
+            Some(TranscriptItem::Tool { expand_state: ReasoningExpandState::TailWindow | ReasoningExpandState::Full, .. })
         );
         assert!(expanded_after, "Space toggled the top tool item");
-        // Toggle back.
+        // Toggle back (short result: Full → Collapsed directly).
         t.handle_key(space());
         let collapsed = matches!(
             t.app.transcript.back(),
-            Some(TranscriptItem::Tool { expanded: false, .. })
+            Some(TranscriptItem::Tool { expand_state: ReasoningExpandState::Collapsed, .. })
         );
         assert!(collapsed);
     }
@@ -2153,7 +2165,7 @@ mod expand_tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.5),
             result_preview: "1\n2\n3".into(),
-            expanded: true,
+            expand_state: ReasoningExpandState::TailWindow,
             full_args: None,
             full_result: Some(full),
             is_terminal: true,
@@ -2179,7 +2191,7 @@ mod expand_tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.5),
             result_preview: "1\n2\n3".into(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: Some(full),
             is_terminal: true,
@@ -2209,7 +2221,7 @@ mod expand_tests {
             status: ToolStatus::Done,
             duration_secs: Some(0.5),
             result_preview: "1\n2\n3".into(),
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
             full_args: None,
             full_result: Some(full),
             is_terminal: true,
@@ -2230,12 +2242,12 @@ mod expand_tests {
             stat: "+120 -0".into(),
             lines: diff_lines,
             is_binary: false,
-            expanded: false,
+            expand_state: ReasoningExpandState::Collapsed,
         });
         // Collapsed hides early lines; expanded shows them.
         app.toggle_item_expand_by_index(0);
-        if let Some(TranscriptItem::FileDiff { expanded, .. }) = app.transcript.back() {
-            assert!(*expanded);
+        if let Some(TranscriptItem::FileDiff { expand_state, .. }) = app.transcript.back() {
+            assert!(matches!(expand_state, ReasoningExpandState::TailWindow | ReasoningExpandState::Full));
         } else {
             panic!("no diff item");
         }
@@ -2340,6 +2352,29 @@ mod stats_page_key_tests {
         let app = App::new("sess", "model");
         let terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
         Tui::new_for_test(app, Theme::aurora(), terminal)
+    }
+
+    /// Ctrl+P returns to the orchestrator view from a focused subagent
+    /// pane (mouse parity with the pinned rail tab). No-op when already
+    /// on the main view.
+    #[test]
+    fn ctrl_p_returns_to_orchestrator_from_pane() {
+        let mut t = tui();
+        // Spawn a pane and focus it.
+        t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "child work".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+        t.app.focus_subagent(Some(0));
+        assert!(t.app.focused_subagent.is_some());
+        t.handle_key(ctrl_key('p'));
+        assert!(t.app.focused_subagent.is_none(), "Ctrl+P returned to the orchestrator");
+        // No panes at all: still a safe no-op.
+        t.handle_key(ctrl_key('p'));
+        assert!(t.app.focused_subagent.is_none());
     }
 
     #[test]

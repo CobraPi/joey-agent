@@ -138,6 +138,12 @@ pub fn save_auth_store(store: &mut Value) -> Result<PathBuf> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     constants::secure_parent_dir(&path);
+    // IndexMut panics if a caller hands us a non-object (e.g. a top-level
+    // array from a corrupted auth.json that survived load normalization).
+    // Coerce to an object instead.
+    if !store.is_object() {
+        *store = json!({});
+    }
     store["version"] = json!(AUTH_STORE_VERSION);
     store["updated_at"] = json!(chrono::Utc::now().to_rfc3339());
     let payload = format!("{}\n", serde_json::to_string_pretty(store)?);

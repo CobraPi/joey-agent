@@ -67,6 +67,22 @@ impl DependencyGraph {
         self.store.upsert_edge(from, to, kind)
     }
 
+    /// Tombstone pass: mark every Active node whose `source_path` (relative
+    /// to `project_root`) no longer exists on disk as Deleted. Called at the
+    /// end of a full ingest so deleted/renamed files stop producing phantom
+    /// FTS hits and stale edges. Re-ingesting the same file reactivates it
+    /// (upsert overwrites status).
+    pub fn mark_absent_paths_deleted(&self, project_root: &Path) -> rusqlite::Result<usize> {
+        let paths: Vec<String> = self.store.active_source_paths()?;
+        let mut deleted = 0usize;
+        for rel in paths {
+            if !project_root.join(&rel).is_file() {
+                deleted += self.store.set_status_for_path(&rel, "Deleted")?;
+            }
+        }
+        Ok(deleted)
+    }
+
     /// FTS5 search over artifact symbols.
     pub fn query_fts(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<CodeArtifactNode>> {
         self.store.query_fts(query, limit)

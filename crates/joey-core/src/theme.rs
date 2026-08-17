@@ -21,7 +21,10 @@ impl Rgb {
     /// Parse a `#rrggbb` hex string.
     pub fn from_hex(hex: &str) -> Option<Self> {
         let hex = hex.strip_prefix('#').unwrap_or(hex);
-        if hex.len() != 6 {
+        let bytes = hex.as_bytes();
+        if bytes.len() != 6 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+            // Length check on BYTES plus an ASCII-hex check: a 6-byte
+            // multibyte string (e.g. "日日") would otherwise slice mid-char.
             return None;
         }
         let r = u8::from_str_radix(&hex[0..2], 16).ok()?;

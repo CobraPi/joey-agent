@@ -149,13 +149,17 @@ fn has_known_prefix_substring(text: &str) -> bool {
 const SECRET_ENV_NAMES: &str = r"(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)";
 static ENV_ASSIGN_RE: Lazy<Regex> = Lazy::new(|| {
     rx(&format!(
-        r#"([A-Z0-9_]{{0,50}}{SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['"]?)(\S+)\2"#
+        // Quoted values match up to the closing quote (spaces included);
+        // unquoted values stay non-space. Quoted alternative comes first.
+        r#"([A-Z0-9_]{{0,50}}{SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*?("[^"]*"|'[^']*'|\S+)"#
     ))
 });
 
 // Lowercase / dotted / hyphenated config keys from config files.
 const SECRET_CFG_NAMES: &str = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential|auth)";
-const CFG_VALUE: &str = r#"(['"]?)([^\s&]+?)\2(?=[\s&]|$)"#;
+// Single capture group: quoted values first (may contain spaces/&), else the
+// unquoted run. Self-delimiting, so no lazy+lookahead gymnastics needed.
+const CFG_VALUE: &str = r#"("[^"]*"|'[^']*'|[^\s&]+)"#;
 
 // Programmatic env lookups reference variable *names*, not secret values.
 static ENV_LOOKUP_VALUE_RE: Lazy<Regex> =
@@ -179,7 +183,7 @@ static CFG_ANCHORED_RE: Lazy<Regex> = Lazy::new(|| {
 const YAML_CFG_NAMES: &str = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)";
 static YAML_ASSIGN_RE: Lazy<Regex> = Lazy::new(|| {
     rx(&format!(
-        r#"(?im)(^[ \t]*[A-Za-z0-9_.\-]*{YAML_CFG_NAMES}[A-Za-z0-9_.\-]*)(:[ \t]*)(?!['"])([^\s&]+)"#
+        r#"(?im)(^[ \t]*[A-Za-z0-9_.\-]*{YAML_CFG_NAMES}[A-Za-z0-9_.\-]*)(:[ \t]*)(?:"([^"]*)"|'([^']*)'|(?!['"])([^\s&]+))"#
     ))
 });
 
@@ -545,24 +549,58 @@ pub fn redact_sensitive_text_opts(text: &str, opts: RedactOptions) -> String {
     }
 
     if !code_file {
-        // ENV assignments: OPENAI_API_KEY=***
+        // ENV assignments: OPENAI_API_KEY=***. Quoted values (the regex's
+        // first alternative) redact with their quotes intact.
         if text.contains('=') {
             let redact_env = |caps: &Captures| -> String {
-                let (name, quote, value) = (group(caps, 1), group(caps, 2), group(caps, 3));
+                let (name, value) = (group(caps, 1), group(caps, 2));
                 // Programmatic env lookups reference variable *names*, not
                 // secret values — leave code snippets intact.
                 if ENV_LOOKUP_VALUE_RE.is_match(value).unwrap_or(false) {
                     return group(caps, 0).to_string();
                 }
-                format!("{}={}{}{}", name, quote, mask_token(value), quote)
+                // Quoted value: mask the inside, keep the original quotes.
+                if value.len() >= 2
+                    && ((value.starts_with('"') && value.ends_with('"'))
+                        || (value.starts_with('\'') && value.ends_with('\'')))
+                {
+                    let inner = &value[1..value.len() - 1];
+                    format!("{}={}{}{}", name, &value[..1], mask_token(inner), &value[value.len() - 1..])
+                } else {
+                    format!("{}={}", name, mask_token(value))
+                }
             };
             text = sub_all(&ENV_ASSIGN_RE, &text, redact_env);
-            // Lowercase/dotted config keys. Skip URLs entirely — web-URL
-            // query params are intentionally passed through.
-            if !text.contains("://") {
-                text = sub_all(&CFG_DOTTED_RE, &text, redact_env);
-                text = sub_all(&CFG_ANCHORED_RE, &text, redact_env);
+            // Lowercase/dotted config keys. Skip URL LINES entirely — web-URL
+            // query params are intentionally passed through. Per-line (not
+            // per-text): a URL anywhere used to disable redaction for every
+            // other line in a large dump.
+            let redact_cfg = |caps: &Captures| -> String {
+                let (name, value) = (group(caps, 1), group(caps, 2));
+                if ENV_LOOKUP_VALUE_RE.is_match(value).unwrap_or(false) {
+                    return group(caps, 0).to_string();
+                }
+                if value.len() >= 2
+                    && ((value.starts_with('"') && value.ends_with('"'))
+                        || (value.starts_with('\'') && value.ends_with('\'')))
+                {
+                    let inner = &value[1..value.len() - 1];
+                    format!("{}={}{}{}", name, &value[..1], mask_token(inner), &value[value.len() - 1..])
+                } else {
+                    format!("{}={}", name, mask_token(value))
+                }
+            };
+            let mut out = String::with_capacity(text.len());
+            for line in text.split_inclusive('\n') {
+                if line.contains("://") {
+                    out.push_str(line);
+                } else {
+                    let mut l = sub_all(&CFG_DOTTED_RE, line, redact_cfg);
+                    l = sub_all(&CFG_ANCHORED_RE, &l, redact_cfg);
+                    out.push_str(&l);
+                }
             }
+            text = out;
         }
 
         // JSON fields: "apiKey": "***"
@@ -576,15 +614,37 @@ pub fn redact_sensitive_text_opts(text: &str, opts: RedactOptions) -> String {
             });
         }
 
-        // Unquoted YAML / colon config: password: ***
-        if text.contains(':') && !text.contains("://") {
-            text = sub_all(&YAML_ASSIGN_RE, &text, |caps| {
-                let (key, sep, value) = (group(caps, 1), group(caps, 2), group(caps, 3));
-                if ENV_LOOKUP_VALUE_RE.is_match(value).unwrap_or(false) {
-                    return group(caps, 0).to_string();
+        // YAML / colon config: password: ***. Per-line URL gate (a URL
+        // anywhere in the text used to disable YAML redaction everywhere).
+        if text.contains(':') {
+            let mut out = String::with_capacity(text.len());
+            for line in text.split_inclusive('\n') {
+                if line.contains("://") {
+                    out.push_str(line);
+                } else {
+                    let l = sub_all(&YAML_ASSIGN_RE, line, |caps| {
+                        let (key, sep) = (group(caps, 1), group(caps, 2));
+                        // Whichever value alternative matched (dq/sq/unquoted).
+                        let (value, quoted) = if !group(caps, 3).is_empty() {
+                            (group(caps, 3), '"')
+                        } else if !group(caps, 4).is_empty() {
+                            (group(caps, 4), '\'')
+                        } else {
+                            (group(caps, 5), '\0')
+                        };
+                        if ENV_LOOKUP_VALUE_RE.is_match(value).unwrap_or(false) {
+                            return group(caps, 0).to_string();
+                        }
+                        if quoted != '\0' {
+                            format!("{}{}{}{}", sep, quoted, mask_token(value), quoted)
+                        } else {
+                            format!("{}{}{}", key, sep, mask_token(value))
+                        }
+                    });
+                    out.push_str(&l);
                 }
-                format!("{}{}{}", key, sep, mask_token(value))
-            });
+            }
+            text = out;
         }
     }
 
@@ -709,7 +769,13 @@ pub fn redact_secrets_par(text: &str) -> String {
             chunks.push(rest);
             break;
         }
-        let target = &rest[..REDACT_PAR_CHUNK];
+        // Snap the cut to a UTF-8 char boundary — a multibyte char
+        // straddling the chunk edge would panic on a raw byte slice.
+        let mut cut = REDACT_PAR_CHUNK;
+        while !rest.is_char_boundary(cut) {
+            cut += 1;
+        }
+        let target = &rest[..cut];
         match target.rfind('\n') {
             Some(nl) => {
                 let (head, tail) = rest.split_at(nl + 1);

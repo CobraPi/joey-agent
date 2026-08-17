@@ -120,6 +120,19 @@ impl CompressionLockLeaseRefresher {
     }
 }
 
+impl Drop for CompressionLockLeaseRefresher {
+    /// Cancellation safety: if the `compress_context` future is dropped
+    /// (user Ctrl-C) while the summary call is in flight, `release_lock`
+    /// never runs. Without this guard the detached refresher thread would
+    /// keep EXTENDING the compression lock forever (refreshes succeed,
+    /// so the failure-based stop never trips), blocking session compaction
+    /// for the process lifetime. On drop we stop the refresher; the lock
+    /// then expires on its own after at most one TTL.
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Build a unique holder id for the lock (`_compression_lock_holder`):
 /// pid:tid:agent-instance:uuid.
 fn compression_lock_holder(agent_addr: usize) -> String {
@@ -547,8 +560,9 @@ impl Agent {
             Self::notice(tx, cc_msg);
         }
 
-        // Adopt the compacted transcript as the live history.
-        self.history = compressed;
+        // Adopt the compacted transcript as the live history (clearing the
+        // now-aliased synthetic-index map).
+        self.adopt_compressed_history(compressed);
 
         // Post-boundary bookkeeping (conversation_compression.py:1449-1477):
         // keep the rough estimate for diagnostics, park last_prompt_tokens at

@@ -385,11 +385,13 @@ pub fn resolve_profile(provider_setting: &str, base_url: &str, model: &str) -> P
         // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("nous").unwrap();
     }
-    if host.contains("x.ai") {
+    // Exact/suffix matching for short ambiguous domains: `contains("x.ai")`
+    // misrouted e.g. max.ai/box.ai/flex.ai hosts onto the xai profile.
+    if host == "x.ai" || host.ends_with(".x.ai") || host == "api.x.ai" {
         // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("xai").unwrap();
     }
-    if host.contains("z.ai") {
+    if host == "z.ai" || host.ends_with(".z.ai") || host == "api.z.ai" {
         // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("zai").unwrap();
     }

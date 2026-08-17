@@ -453,15 +453,24 @@ fn summarize_output(output: &str) -> String {
     if output.len() <= MAX_OUTPUT_SUMMARY_CHARS {
         return output.to_string();
     }
+    // Snap both cuts to UTF-8 char boundaries: a multibyte char straddling
+    // either cut would panic on the raw byte slices below.
     let head_size = MAX_OUTPUT_SUMMARY_CHARS / 3;
     let tail_size = MAX_OUTPUT_SUMMARY_CHARS / 3;
-    let head = &output[..head_size.min(output.len())];
-    let tail_start = output.len().saturating_sub(tail_size);
+    let mut head_end = head_size.min(output.len());
+    while head_end > 0 && !output.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = output.len().saturating_sub(tail_size);
+    while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let head = &output[..head_end];
     let tail = &output[tail_start..];
     format!(
         "{}\n... [output truncated, {} chars omitted] ...\n{}",
         head,
-        output.len() - head_size - tail_size,
+        output.len().saturating_sub(head_end + (output.len() - tail_start)),
         tail
     )
 }
