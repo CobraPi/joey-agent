@@ -29,6 +29,10 @@ model:
   default: "glm-5.2"
   provider: "zai"
   base_url: ""
+  # Dedicated image-capable model for webpage/screenshot understanding
+  # (feature 016, FR-015). Unset = resolve via provider default → primary
+  # if vision-capable. Per-provider override: providers.<id>.image_model.
+  image_model: ""
 agent:
   max_turns: 90
   reasoning_overrides: {}
@@ -1413,6 +1417,32 @@ mod tests {
     }
 
     #[test]
+
+    // ── Feature 016 (FR-015/FR-016): image-model config keys ──
+
+    #[test]
+    fn image_model_keys_default_unset() {
+        let cfg = Config::defaults();
+        assert_eq!(cfg.get_str("model.image_model", ""), "");
+    }
+
+    #[test]
+    fn image_model_per_provider_wins_over_global() {
+        let cfg = cfg_from(
+            "model:\n  image_model: global-vlm\nproviders:\n  zai:\n    image_model: zai-vlm\n",
+        );
+        assert_eq!(cfg.get_str("model.image_model", ""), "global-vlm");
+        assert_eq!(cfg.get_str("providers.zai.image_model", ""), "zai-vlm");
+    }
+
+    #[test]
+    fn image_model_keys_not_env_routed() {
+        // Model names are not secrets: they must stay in config.yaml space,
+        // never auto-routed to .env.
+        assert!(!is_env_config_key("model.image_model"));
+        assert!(!is_env_config_key("providers.zai.image_model"));
+    }
+
     fn defaults_match_upstream() {
         let cfg = Config::defaults();
         // Local deviation: upstream ships model.default "" + provider "auto"

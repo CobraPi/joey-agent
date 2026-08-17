@@ -494,6 +494,58 @@ mod tests {
             .with_reasoning(reasoning)
     }
 
+    // ── Feature 016 (FR-015/FR-016): image-content wire regressions ──
+
+
+
+    /// Image parts MUST serialize on the openai-chat wire for vision models.
+    #[test]
+    fn openai_chat_image_parts_serialize_for_vision_model() {
+        let p = get_profile("openai").unwrap();
+        let mut msg = Message::user("look");
+        msg.content_parts = Some(vec![
+            crate::types::ContentPart::Text { text: "look".into() },
+            crate::types::ContentPart::ImageUrl {
+                image_url: crate::types::ImageUrl {
+                    url: "data:image/png;base64,aGk=".into(),
+                },
+            },
+        ]);
+        let r = ProviderRequest::new("gpt-4o", vec![msg]);
+        let body = build_openai_body(&p, p.base_url, &r);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,aGk=");
+    }
+
+    /// Image parts MUST be stripped (text-only) for non-vision models —
+    /// never sent as-is to a model that would reject them.
+    #[test]
+    fn openai_chat_image_parts_stripped_for_non_vision_model() {
+        let p = get_profile("openai").unwrap();
+        let mut msg = Message::user("look");
+        msg.content_parts = Some(vec![
+            crate::types::ContentPart::Text { text: "look".into() },
+            crate::types::ContentPart::ImageUrl {
+                image_url: crate::types::ImageUrl { url: "https://x/y.png".into() },
+            },
+        ]);
+        let r = ProviderRequest::new("gpt-3.5-turbo", vec![msg]);
+        let body = build_openai_body(&p, p.base_url, &r);
+        assert_eq!(body["messages"][0]["content"], json!("look"));
+    }
+
+    /// No-image request bodies MUST remain byte-identical to pre-feature
+    /// shape (Principle VII): plain string content stays a plain string.
+    #[test]
+    fn openai_chat_text_only_body_unchanged() {
+        let p = get_profile("openai").unwrap();
+        let body = build_openai_body(&p, p.base_url, &req("gpt-4o", None));
+        assert_eq!(body["messages"][1]["content"], json!("hi"));
+        assert!(body["messages"][1]["content"].is_string());
+    }
+
     #[test]
     fn openrouter_claude_uses_verbosity_no_reasoning() {
         let p = get_profile("openrouter").unwrap();

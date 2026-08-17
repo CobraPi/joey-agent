@@ -631,8 +631,18 @@ mandatory. Round-trip + partial-line-tolerance + migration-stub tests in
 - The FastAPI dashboard / web server and the Electron desktop app.
 - The TUI-gateway JSON-RPC protocol, ACP editor adapter, relay/connector.
 - Kanban multi-agent coordination, projects, blueprints, memory providers
-  (Honcho/mem0/…), computer-use, TTS/STT/voice, image/video generation,
-  browser automation.
+  (Honcho/mem0/…), computer-use, TTS/STT/voice, image/video generation.
+- ~~Browser automation~~ — **implemented (feature 016, 2026-08-17)**: the
+  declared `browser_*` tool names are now functional via the new
+  `joey-browser` crate (CDP attach/managed-launch, shadow/frame-piercing
+  snapshots, cascading-target actions, settle detection, overlay policy,
+  SoM visual fallback, feed deltas) + `vision_analyze` + per-provider
+  image-model keys (`model.image_model` / `providers.<id>.image_model`).
+  This is a native-Rust CDP implementation, not a port of upstream's
+  browser tooling — declared tool names and toolset membership are kept
+  compatible; 4 additive verbs (`browser_hover`, `browser_select_option`,
+  `browser_drag`, `browser_click_coords`) extend the declared surface.
+  See docs/browser.md and specs/016-please-modify-joey/.
 - The 6 terminal backends beyond `local` (docker/ssh/singularity/modal/daytona).
 - Research tooling: batch runner, trajectory compressor, mini-swe runner.
 
@@ -1064,3 +1074,70 @@ full agent turn: REPL via run_turn_interactive, TUI via engine Submit
 NeurocodeOutcome::{Text, AgentIngest}; the plain-text wrapper (engine
 heavy jobs, tests) degrades to usage guidance. Tests: 5 routing + 2 tool
 integration (registry registration + backend ingest roundtrip).
+
+## ai-usage-hud provider resilience fixes (2026-08-17)
+
+**Status**: Deliberate-deviation extension (proxy-side fix; joey-agent unchanged).
+
+Trigger: user could not use the `ai-usage-hud` provider at all — every request
+503'd `no_copilot_credentials`. Root-cause audit of the proxy (installed
+Electron bundle + repo) found the failures were structural, exposed by (not
+caused by) a simultaneous GitHub Copilot major outage:
+
+1. **Auth wedge**: every proxy router hard-gated on
+   `getAuthState() !== 'connected'`. One failed background token refresh
+   flipped the state permanently; every subsequent request then 503'd in ~2ms
+   without ever retrying the exchange.
+2. **Client credential ignored**: joey sends `Authorization: Bearer ghu_…`
+   (its raw GitHub OAuth token) on every request, but the proxy only used its
+   own discovered credential — which was dead (apps.json token revoked → 401).
+3. **`/models` hang**: no timeout on the live-catalog fetch; during auth
+   trouble it hung ~12s then fell back to a 12-model static alias list (no
+   gpt-5.x/gemini), degrading joey's model picker and OMO catalog.
+
+Proxy fixes (repo `~/Development/ai-usage-hud`, deployed via
+`SKIP_TESTS=1 npm run deploy`):
+
+- `copilot-auth.js`: candidate-walking `getCopilotToken(clientToken)` —
+  sticky (last-successful) credential → discovered token → client-supplied
+  credentials (Authorization header, GitHub-shaped prefixes only), deduped,
+  with per-credential cooldowns (60s hard-rejected / 10s transient);
+  single-flight exchange; 3-attempt retry with backoff for transient errors;
+  typed `ExchangeError`/`NoCopilotCredentialsError`. Refresh-timer failures no
+  longer flip the auth state; a still-valid cached token keeps serving.
+- Routers (openai/responses/anthropic/native): hard gates removed — every
+  request threads its Authorization header as an exchange candidate via
+  `githubTokenFromAuthHeader`; error mappers emit 503
+  `no_copilot_credentials`/`upstream_unavailable` with actionable messages
+  instead of opaque 500s.
+- `copilot-client.js`: `refreshModelRegistry` bounded by a 10s timeout,
+  serves the stale in-memory registry on failure, and persists the registry to
+  `data/model-registry.json` so a restart during an outage still serves the
+  last-known catalog (verified: fresh process during total mock outage served
+  the persisted catalog in 7ms). `/models` also accepts the client credential.
+- `GITHUB_TOKEN_EXCHANGE_URL` env override (tests/gateways).
+- New regression suite `test/copilot-auth-resilience.test.js` (5 tests:
+  header parsing, non-GitHub rejection, dead-credential + client-credential
+  recovery, sticky serving, transient-failure non-wedge). Full suite
+  187/188 (1 pre-existing parallel-run flake in aggregate.test.js, verified
+  failing identically before these changes).
+
+E2E verification (mocked upstream on spare ports, real joey binary, all three
+wire paths): `joey --provider ai-usage-hud --model gpt-5.4` → `/responses` →
+`E2E_RESPONSES_OK`; `--model claude-sonnet-5` → `/chat/completions` →
+`E2E_MOCK_OK`; direct native `/v1/messages` → `NATIVE_ANTHROPIC_OK`; dead
+server credential + live client credential → recovery in one request;
+`/models` bounded and persisted.
+
+Real-backend E2E was blocked by the GitHub Copilot major outage (503/502 on
+the token-exchange endpoint for ALL credentials, including `gh api` with gh's
+own token — githubstatus: `Copilot → major_outage`). The deployed bundle
+verifiably runs the new code: requests now attempt the exchange (multi-second
+retry cycle) and surface GitHub's real error instead of the 2ms wedge.
+
+joey-agent side needed no changes — provider resolution, wire routing
+(`/responses` for gpt-5.x via `model_api_mode`, `/chat/completions`
+otherwise, native `/v1/messages` when the catalog lists it exclusively), and
+the client-credential Authorization header were already correct; the fixes
+were all proxy-side. Once GitHub recovers, `joey --provider ai-usage-hud`
+works end-to-end with usage captured in the HUD dashboard.

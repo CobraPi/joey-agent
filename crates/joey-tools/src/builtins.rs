@@ -32,6 +32,16 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register(Arc::new(lsp_tools::LspSymbols));
 }
 
+/// Register the browser automation tools (feature 016). Each tool is hidden
+/// until its shared BrowserHandle is connected (check() → false), so passing
+/// `None` registers nothing visible — call this unconditionally.
+pub fn register_browser_tools(
+    registry: &mut ToolRegistry,
+    handle: Option<Arc<crate::tools::browser_tools::BrowserHandle>>,
+) {
+    crate::tools::browser_tools::register_browser_tools(registry, handle);
+}
+
 /// Register the session_search tool with an optional session DB handle.
 /// Conditionally registers (the tool's `check()` returns false when DB is None).
 pub fn register_session_tools(

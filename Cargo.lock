@@ -2556,6 +2556,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "joey-browser"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "futures-util",
+ "joey-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite 0.23.1",
+ "tracing",
+ "url",
+ "uuid",
+ "which",
+]
+
+[[package]]
 name = "joey-cli"
 version = "0.19.0"
 dependencies = [
@@ -2567,6 +2588,7 @@ dependencies = [
  "futures",
  "indexmap",
  "joey-agent-core",
+ "joey-browser",
  "joey-core",
  "joey-cron",
  "joey-llm-selector",
@@ -2863,6 +2885,7 @@ dependencies = [
  "html2text",
  "ignore",
  "indexmap",
+ "joey-browser",
  "joey-core",
  "libc",
  "once_cell",

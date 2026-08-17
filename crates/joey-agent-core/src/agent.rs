@@ -1307,6 +1307,14 @@ impl Agent {
         }
     }
 
+    /// Config access for image-model routing (feature 016). Loads the
+    /// layered config lazily; returns (provider_id, config). None when the
+    /// config subsystem is unavailable (routing degrades to primary model).
+    fn provider_config_for_image_routing(&self) -> Option<(String, joey_core::config::Config)> {
+        let cfg = joey_core::config::Config::load().ok()?;
+        Some((self.provider_name.clone(), cfg))
+    }
+
     /// Resolve the model id for the main turn. When the dynamic allocator is
     /// wired and active (feature 011), it picks the model; otherwise the
     /// configured model is used verbatim (Constitution VII non-regression).
@@ -1340,6 +1348,50 @@ impl Agent {
         // EXPLICITLY chosen model (model_pinned: --model flag, /model switch,
         // agent picker) always wins — tier routing only applies to implicit/
         // config-default models.
+        // Feature 016 (FR-016): when the turn carries image content and a
+        // dedicated image model is configured, serve the turn with it.
+        // Resolution order per contracts/image-model-routing.md; when no
+        // keys are set and the primary is vision-capable this is a no-op
+        // (primary_if_vision → same model id, byte-identical request).
+        // An explicitly pinned model (--model) always wins — image-model
+        // routing only applies to unpinned turns.
+        if !self.config.model_pinned {
+            let turn_has_images = self.history.iter().any(|m| {
+                m.content_parts
+                    .as_ref()
+                    .map(|parts| {
+                        parts.iter().any(|p| {
+                            matches!(p, joey_providers::types::ContentPart::ImageUrl { .. })
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            if turn_has_images {
+                if let Some((provider_id, cfg)) = self.provider_config_for_image_routing() {
+                    match crate::image_model::resolve_image_model(
+                        &cfg,
+                        &provider_id,
+                        &self.config.model,
+                        None,
+                        None,
+                    ) {
+                        crate::image_model::ImageModelResolution::Available(r) => {
+                            if r.model_id != self.config.model {
+                                tracing::debug!(
+                                    image_model = %r.model_id,
+                                    source = r.source.as_str(),
+                                    "routing image turn to dedicated image model"
+                                );
+                                return r.model_id;
+                            }
+                        }
+                        crate::image_model::ImageModelResolution::Unavailable(reason) => {
+                            tracing::warn!("{reason}");
+                        }
+                    }
+                }
+            }
+        }
         if !self.config.model_pinned {
             if let Some(engine) = &self.neurocode_engine {
                 if engine.is_active() {

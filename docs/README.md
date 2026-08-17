@@ -44,6 +44,10 @@ subsystem you're working on:
    retries/backoff and error classification, reasoning/thinking support
    per provider, tool-call wire formats, and the dynamic
    `joey-llm-selector` model allocator.
+7. [`browser.md`](browser.md) — browser automation (feature 016): the
+   `joey-browser` crate, CDP attach vs managed launch, the browser tool
+   family, dedicated-tab discipline, snapshot/action semantics, overlay and
+   settle policy, and the per-provider image-model keys.
 7. [`cli.md`](cli.md) — the `joey` binary's complete user-facing surface:
    every subcommand and flag, exit codes, the REPL slash-command registry,
    setup wizard, and profiles.

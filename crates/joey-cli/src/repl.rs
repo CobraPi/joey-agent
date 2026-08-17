@@ -1064,6 +1064,8 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         "compress" => manual_compress(st, args).await,
         "checkpoint" => checkpoint_slash(st, args),
         "revert" | "rollback" => revert_slash(st, args),
+        // ── Browser session (feature 016) ──
+        "browser" => browser_slash(st, args).await,
         // ── OMO slash commands ──
         "agents" | "agent" => omo_agents_slash(st, args),
         "goal" => omo_goal_slash(st, args),
@@ -2034,7 +2036,43 @@ async fn maybe_auto_checkpoint(st: &mut ReplState) {
     }
 }
 
-/// `/checkpoint [message]` — create a named filesystem checkpoint.
+/// `/browser [connect|disconnect|status]` — browser session control (feature 016).
+async fn browser_slash(_st: &mut ReplState, args: &str) {
+    use joey_tools::tools::browser_tools::shared_browser_handle;
+    let handle = shared_browser_handle();
+    match args.trim().to_lowercase().as_str() {
+        "" | "status" => {
+            if handle.is_connected() {
+                render::success("Browser: connected");
+            } else {
+                render::info("Browser: disconnected (/browser connect to attach or launch)");
+            }
+        }
+        "connect" => {
+            render::info("Connecting browser (attach, else managed launch)…");
+            let cfg = joey_browser::BrowserConfig::from_config(
+                &joey_core::config::Config::load().unwrap_or_else(|_| Config::defaults()),
+            );
+            match handle.connect(cfg).await {
+                Ok(()) => {
+                    // Wire the real URL-safety checker (FR-020) now that the
+                    // browser stack is reachable through joey-tools.
+                    joey_browser::url_safety_bridge::install_url_safety_check(|u| {
+                        browser_url_safety_shim(u)
+                    });
+                    render::success("Browser connected (agent works in its own tab; your tabs are untouched).");
+                }
+                Err(e) => render::error(&format!("Browser connect failed: {e}")),
+            }
+        }
+        "disconnect" => match handle.disconnect().await {
+            Ok(()) => render::success("Browser disconnected."),
+            Err(e) => render::error(&format!("Disconnect failed: {e}")),
+        },
+        other => render::info(&format!("Usage: /browser [connect|disconnect|status] (got '{other}')")),
+    }
+}
+
 fn checkpoint_slash(st: &mut ReplState, args: &str) {
     let Some(cp) = &mut st.checkpoints else {
         render::info("Filesystem checkpoints are not available (git not found or init failed).");
@@ -2108,3 +2146,15 @@ fn revert_slash(st: &mut ReplState, args: &str) {
     }
 }
 
+
+/// URL-safety shim: bridges joey-browser's injected checker to the REAL
+/// `url_safety::is_safe_url` used by the web tools (FR-020 — one policy,
+/// one implementation). Loads config lazily per call.
+pub(crate) fn browser_url_safety_shim(url: &str) -> Result<(), String> {
+    let cfg = joey_core::config::Config::load().unwrap_or_else(|_| Config::defaults());
+    if joey_tools::url_safety::is_safe_url(url, &cfg) {
+        Ok(())
+    } else {
+        Err(format!("local/private network target refused: {url}"))
+    }
+}

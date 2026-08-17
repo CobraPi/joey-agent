@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/joey-core",
+    "crates/joey-browser",
     "crates/joey-providers",
     "crates/joey-tools",
     "crates/joey-agent-core",
@@ -26,6 +27,7 @@ description = "joey-agent — the self-improving AI agent, in Rust. A port of He
 
 [workspace.dependencies]
 joey-core = { path = "crates/joey-core" }
+joey-browser = { path = "crates/joey-browser" }
 joey-providers = { path = "crates/joey-providers" }
 joey-tools = { path = "crates/joey-tools" }
 joey-agent-core = { path = "crates/joey-agent-core" }
@@ -119,6 +121,10 @@ which = "7"
 tempfile = "3"
 
 base64 = "0.22"
+# CDP WebSocket transport for joey-browser (feature 016). Already present in
+# the lockfile via joey-speckit-ui; promoted to a workspace dependency so
+# joey-browser can use it without a duplicate version pin (plan D1).
+tokio-tungstenite = "0.23"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"

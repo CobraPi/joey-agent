@@ -54,6 +54,12 @@ pub const CORE_TOOLS: &[&str] = &[
     "browser_console",
     "browser_cdp",
     "browser_dialog",
+    // Additive verbs (feature 016) — appended after the declared names,
+    // order-preserving; upstream parity for the first 12 preserved.
+    "browser_hover",
+    "browser_select_option",
+    "browser_drag",
+    "browser_click_coords",
     // Text-to-speech
     "text_to_speech",
     // Planning & memory
@@ -249,6 +255,10 @@ static TOOLSETS: Lazy<HashMap<&'static str, Toolset>> = Lazy::new(|| {
                 "browser_console",
                 "browser_cdp",
                 "browser_dialog",
+                "browser_hover",
+                "browser_select_option",
+                "browser_drag",
+                "browser_click_coords",
                 "todo",
                 "memory",
                 "session_search",
@@ -392,7 +402,10 @@ mod tests {
     #[test]
     fn coding_membership_verbatim() {
         let tools = resolve("coding");
-        assert_eq!(tools.len(), 32);
+        // 32 upstream-declared members + 4 additive browser verbs (feature
+        // 016: hover/select_option/drag/click_coords). Deliberate, spec'd
+        // deviation recorded in specs/016-please-modify-joey (FR-018 note).
+        assert_eq!(tools.len(), 36);
         for t in ["execute_code", "browser_cdp", "skill_manage", "clarify"] {
             assert!(tools.contains(&t.to_string()));
         }
