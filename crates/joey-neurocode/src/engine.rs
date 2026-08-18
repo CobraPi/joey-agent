@@ -324,16 +324,18 @@ impl NeuroCodeCommands for DefaultEngine {
             .collect::<Vec<_>>()
             .join(", ");
 
-        // Tier model ids.
-        let eco_model = if self.config.tier.economical_model.is_empty() {
+        // Tier model ids: resolve per-provider for the active provider, showing
+        // the scoped values when set (and the flat legacy keys otherwise).
+        let tiers = self.config.tier.tiers_for_provider(&self.provider);
+        let eco_model = if tiers.economical.is_empty() {
             "(unset)"
         } else {
-            &self.config.tier.economical_model
+            tiers.economical.as_str()
         };
-        let frontier_model = if self.config.tier.frontier_model.is_empty() {
+        let frontier_model = if tiers.frontier.is_empty() {
             "(unset)"
         } else {
-            &self.config.tier.frontier_model
+            tiers.frontier.as_str()
         };
 
         // Pattern + anti-pattern counts.
@@ -517,6 +519,19 @@ impl NeuroCodeCommands for DefaultEngine {
     }
 
     fn tier_text(&self, action: &str, tier: Option<&str>) -> String {
+        // Resolve per-provider tier models for display.
+        let tiers = self.config.tier.tiers_for_provider(&self.provider);
+        let eco_model = if tiers.economical.is_empty() {
+            "(unset)"
+        } else {
+            tiers.economical.as_str()
+        };
+        let frontier_model = if tiers.frontier.is_empty() {
+            "(unset)"
+        } else {
+            tiers.frontier.as_str()
+        };
+
         match action {
             "show" | "" => {
                 let pinned = self.classifier().pinned_tier();
@@ -527,10 +542,7 @@ impl NeuroCodeCommands for DefaultEngine {
                 format!(
                     "Tier routing: {}\n\
                      economical={}, frontier={}, ambiguous_default={}",
-                    mode,
-                    self.config().tier.economical_model,
-                    self.config().tier.frontier_model,
-                    self.config().tier.ambiguous_default,
+                    mode, eco_model, frontier_model, self.config.tier.ambiguous_default
                 )
             }
             "set" => {
@@ -1051,6 +1063,258 @@ mod tests {
         assert!(
             ctx.snapshot.is_some(),
             "assembly carries a graph snapshot after re-index"
+        );
+    }
+
+    // ── Per-provider tier model display (fix for user-reported bug) ─────────
+
+    /// `/neurocode status` displays the per-provider tier models for the
+    /// active provider, not the flat legacy keys.
+    #[test]
+    fn status_text_shows_per_provider_models() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+model:
+  provider: zai
+neurocode:
+  enabled: true
+  tier:
+    frontier:
+      model: legacy-frontier
+    economical:
+      model: legacy-economical
+    providers:
+      zai:
+        frontier: glm-5.2
+        economical: glm-4.5-flash
+"#,
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        let mut engine = DefaultEngine::new(nc, PathBuf::from("/tmp/test-project"));
+        engine.set_provider("zai");
+
+        let status = engine.status_text();
+
+        // Should show zai's per-provider models, not the legacy keys
+        assert!(
+            status.contains("economical=glm-4.5-flash"),
+            "Expected economical=glm-4.5-flash in status, got: {}",
+            status
+        );
+        assert!(
+            status.contains("frontier=glm-5.2"),
+            "Expected frontier=glm-5.2 in status, got: {}",
+            status
+        );
+        assert!(
+            !status.contains("legacy-frontier"),
+            "Should NOT contain legacy-frontier when provider-scoped models are set"
+        );
+        assert!(
+            !status.contains("legacy-economical"),
+            "Should NOT contain legacy-economical when provider-scoped models are set"
+        );
+    }
+
+    /// Unlisted providers fall back to the flat legacy keys.
+    #[test]
+    fn status_text_fallback_to_legacy_keys_for_unlisted_provider() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+model:
+  provider: deepseek
+neurocode:
+  enabled: true
+  tier:
+    frontier:
+      model: legacy-frontier
+    economical:
+      model: legacy-economical
+    providers:
+      zai:
+        frontier: glm-5.2
+        economical: glm-4.5-flash
+"#,
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        let mut engine = DefaultEngine::new(nc, PathBuf::from("/tmp/test-project"));
+        engine.set_provider("deepseek");
+
+        let status = engine.status_text();
+
+        // Should fall back to legacy keys for unlisted providers
+        assert!(
+            status.contains("economical=legacy-economical"),
+            "Expected economical=legacy-economical in status for unlisted provider"
+        );
+        assert!(
+            status.contains("frontier=legacy-frontier"),
+            "Expected frontier=legacy-frontier in status for unlisted provider"
+        );
+        assert!(
+            !status.contains("glm-5.2"),
+            "Should NOT contain zai's models when using deepseek provider"
+        );
+    }
+
+    /// `/neurocode tier show` displays per-provider tier models.
+    #[test]
+    fn tier_text_shows_per_provider_models() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+model:
+  provider: zai
+neurocode:
+  enabled: true
+  tier:
+    providers:
+      zai:
+        frontier: glm-5.2
+        economical: glm-4.5-flash
+"#,
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        let mut engine = DefaultEngine::new(nc, PathBuf::from("/tmp/test-project"));
+        engine.set_provider("zai");
+
+        let tier = engine.tier_text("show", None);
+
+        assert!(
+            tier.contains("economical=glm-4.5-flash"),
+            "Expected economical=glm-4.5-flash in tier show"
+        );
+        assert!(
+            tier.contains("frontier=glm-5.2"),
+            "Expected frontier=glm-5.2 in tier show"
+        );
+    }
+
+    /// Unconfigured tiers display as (unset).
+    #[test]
+    fn tier_text_shows_unset_when_no_config() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+model:
+  provider: zai
+neurocode:
+  enabled: true
+  tier:
+    providers: {}
+"#,
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        let mut engine = DefaultEngine::new(nc, PathBuf::from("/tmp/test-project"));
+        engine.set_provider("zai");
+
+        let tier = engine.tier_text("show", None);
+
+        assert!(
+            tier.contains("economical=(unset)"),
+            "Expected economical=(unset) when no config"
+        );
+        assert!(
+            tier.contains("frontier=(unset)"),
+            "Expected frontier=(unset) when no config"
+        );
+    }
+
+    /// Switching providers updates the displayed models.
+    #[test]
+    fn provider_switch_updates_displayed_models() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+model:
+  provider: zai
+neurocode:
+  enabled: true
+  tier:
+    providers:
+      zai:
+        frontier: glm-5.2
+        economical: glm-4.5-flash
+      copilot:
+        frontier: gpt-5.4
+        economical: gpt-4.1-turbo
+"#,
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        let mut engine = DefaultEngine::new(nc, PathBuf::from("/tmp/test-project"));
+
+        // Start with zai
+        engine.set_provider("zai");
+        let status_zai = engine.status_text();
+        assert!(status_zai.contains("glm-5.2"));
+        assert!(status_zai.contains("glm-4.5-flash"));
+
+        // Switch to copilot
+        engine.set_provider("copilot");
+        let status_copilot = engine.status_text();
+        assert!(status_copilot.contains("gpt-5.4"));
+        assert!(status_copilot.contains("gpt-4.1-turbo"));
+        assert!(
+            !status_copilot.contains("glm-5.2"),
+            "Should NOT show zai models after switching to copilot"
+        );
+    }
+
+    /// Partial provider entries inherit from flat keys.
+    #[test]
+    fn partial_provider_entry_inherits_from_flat_keys() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+model:
+  provider: zai
+neurocode:
+  enabled: true
+  tier:
+    frontier:
+      model: flat-frontier
+    economical:
+      model: flat-economical
+    providers:
+      zai:
+        frontier: glm-5.2
+        # economical intentionally left blank to test fallback
+"#,
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        let mut engine = DefaultEngine::new(nc, PathBuf::from("/tmp/test-project"));
+        engine.set_provider("zai");
+
+        let status = engine.status_text();
+
+        // frontier should be provider-scoped, economical should fall back to flat key
+        assert!(
+            status.contains("frontier=glm-5.2"),
+            "Expected provider-scoped frontier model"
+        );
+        assert!(
+            status.contains("economical=flat-economical"),
+            "Expected flat-key fallback for unconfigured economical tier"
         );
     }
 }
