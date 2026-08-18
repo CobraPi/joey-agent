@@ -51,7 +51,14 @@ pub const SCAN_JS: &str = r#"
       const v = el.getAttribute(a);
       if (v) attrs[a] = v.length > 80 ? v.slice(0, 80) : v;
     }
-    let text = norm(el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder || '');
+    let text;
+    if (el.tagName === 'SELECT') {
+      // Native selects render the selected option's label, not innerText.
+      const opt = el.options && el.options[el.selectedIndex];
+      text = norm((opt && opt.text) || el.getAttribute('aria-label') || '');
+    } else {
+      text = norm(el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder || '');
+    }
     if (text.length > 120) text = Array.from(text).slice(0, 120).join('');
     out.push({
       role, text, frame,
@@ -69,11 +76,16 @@ pub const SCAN_JS: &str = r#"
     try { nodes = root.querySelectorAll(INTERACTIVE); } catch (e) { return; }
     for (const el of nodes) {
       try { describe(el, frame, depth); } catch (e) { /* hostile element: skip */ }
-      // Piercing: same-origin iframes reachable via contentDocument.
-      if (el.tagName === 'IFRAME' && el.contentDocument) {
-        walk(el.contentDocument, 'iframe:' + (el.name || el.id || el.src.slice(-30) || 'unnamed'), depth + 1);
-      }
     }
+    // Piercing: same-origin iframes reachable via contentDocument (iframes
+    // are not in the INTERACTIVE selector — traverse them explicitly).
+    try {
+      for (const f of root.querySelectorAll('iframe')) {
+        if (f.contentDocument) {
+          walk(f.contentDocument, 'iframe:' + (f.name || f.id || f.src.slice(-30) || 'unnamed'), depth + 1);
+        }
+      }
+    } catch (e) { /* skip */ }
     // Shadow hosts that are not themselves interactive.
     try {
       for (const host of root.querySelectorAll('*')) {

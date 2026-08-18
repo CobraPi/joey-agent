@@ -28,6 +28,10 @@ impl Rect {
 /// A discovered interactive element (snapshot-format.md ElementRef).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElementRef {
+    /// Assigned by `ElementRefRegistry::push` on insert (`e1`, `e2`, …).
+    /// SCAN_JS rows arrive WITHOUT a refid (registry-local, reset per scan),
+    /// so deserialization defaults it to empty and `push` overwrites.
+    #[serde(default)]
     pub refid: String,
     pub role: String,
     /// Visible label, whitespace-normalized, ≤120 chars (char-boundary cut).

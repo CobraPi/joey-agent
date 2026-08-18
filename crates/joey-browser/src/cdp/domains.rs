@@ -116,12 +116,56 @@ pub fn key_event(kind: &str, key: &str, code: Option<&str>, modifiers: i64, text
     if let Some(t) = text {
         v["text"] = Value::String(t.to_string());
     }
+    // Chrome ignores key events without a virtual key code for most
+    // listeners (the DOM KeyboardEvent still fires, but synthetic text
+    // input and some handlers need it).
+    v["windowsVirtualKeyCode"] = Value::from(virtual_key_code(key));
+    v["nativeVirtualKeyCode"] = Value::from(virtual_key_code(key));
     v
 }
 
-/// Modifier bitmask encoding (CDP convention).
+/// Best-effort US-layout virtual key codes (DOM `KeyboardEvent.keyCode`).
+fn virtual_key_code(key: &str) -> u32 {
+    match key {
+        "Enter" => 13,
+        "Tab" => 9,
+        "Escape" => 27,
+        "Backspace" => 8,
+        "Delete" => 46,
+        "Insert" => 45,
+        "Home" => 36,
+        "End" => 35,
+        "PageUp" => 33,
+        "PageDown" => 34,
+        "ArrowUp" => 38,
+        "ArrowDown" => 40,
+        "ArrowLeft" => 37,
+        "ArrowRight" => 39,
+        " " => 32,
+        "Shift" | "ShiftLeft" => 16,
+        "Control" | "ControlLeft" => 17,
+        "Alt" | "AltLeft" => 18,
+        "Meta" | "MetaLeft" => 91,
+        "F1" => 112, "F2" => 113, "F3" => 114, "F4" => 115, "F5" => 116,
+        "F6" => 117, "F7" => 118, "F8" => 119, "F9" => 120, "F10" => 121,
+        "F11" => 122, "F12" => 123,
+        // Single printable ASCII: keyCode == char code (letters upper).
+        k if k.len() == 1 => {
+            let c = k.chars().next().unwrap_or(' ');
+            if c.is_ascii_alphabetic() {
+                c.to_ascii_uppercase() as u32
+            } else {
+                c as u32
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Modifier bitmask encoding — CDP `Input.dispatchKeyEvent` convention
+/// (Puppeteer-verified): Alt=1, Ctrl=2, Meta=4, Shift=8.
 pub fn modifier_bitmask(ctrl: bool, alt: bool, shift: bool, meta: bool) -> i64 {
-    (ctrl as i64) | ((alt as i64) << 1) | ((shift as i64) << 8) | ((meta as i64) << 4)
+    ((alt as i64) << 0) | ((ctrl as i64) << 1) | ((meta as i64) << 2) | ((shift as i64) << 3)
 }
 
 /// `Target.setAutoAttach` params with flatten.
@@ -193,10 +237,10 @@ mod tests {
     #[test]
     fn modifier_bitmask_convention() {
         assert_eq!(modifier_bitmask(false, false, false, false), 0);
-        assert_eq!(modifier_bitmask(true, false, false, false), 1);
-        assert_eq!(modifier_bitmask(false, true, false, false), 2);
-        assert_eq!(modifier_bitmask(false, false, true, false), 256);
-        assert_eq!(modifier_bitmask(false, false, false, true), 16);
+        assert_eq!(modifier_bitmask(true, false, false, false), 2); // Ctrl=2
+        assert_eq!(modifier_bitmask(false, true, false, false), 1); // Alt=1
+        assert_eq!(modifier_bitmask(false, false, true, false), 8); // Shift=8
+        assert_eq!(modifier_bitmask(false, false, false, true), 4); // Meta=4
     }
 
     #[test]

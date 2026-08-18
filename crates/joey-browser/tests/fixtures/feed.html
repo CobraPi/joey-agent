@@ -8,12 +8,13 @@
   <div id="feed"></div>
   <div id="loaded" data-marker="20">20</div>
   <script>
-    // Appends 10 items per scroll burst, up to 200 — scroll-appending feed
-    // for the delta/budget fixture.
+    // Appends 20 items per scroll burst, up to 400 — scroll-appending feed
+    // for the delta/budget fixture. Bursts of 20 exceed the 2-viewport
+    // listing window so out-of-view summarization actually engages.
     let n = 0;
     function add(k) {
       const feed = document.getElementById('feed');
-      for (let i = 0; i < k && n < 200; i++, n++) {
+      for (let i = 0; i < k && n < 400; i++, n++) {
         const b = document.createElement('button');
         b.dataset.groundTruth = 'item-' + n;
         b.textContent = 'Feed Item ' + n;
@@ -21,10 +22,10 @@
       }
       document.getElementById('loaded').dataset.marker = String(n);
     }
-    add(20);
+    add(40);
     window.addEventListener('scroll', () => {
       if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 100) {
-        add(10);
+        add(20);
       }
     });
   </script>

@@ -58,7 +58,11 @@ impl BrowserError {
 
     /// Ambiguous-match refusal carrying candidates (FR-007).
     pub fn ambiguous(candidates: &[String]) -> Self {
-        BrowserError::AmbiguousRaw(candidates.len().to_string())
+        BrowserError::AmbiguousRaw(format!(
+            "{} [{}]",
+            candidates.len(),
+            candidates.join("; ")
+        ))
     }
 }
 
@@ -231,7 +235,8 @@ mod tests {
         let e = BrowserError::target_not_found(&["e1 Save".into(), "e2 Save".into()]);
         assert!(e.to_string().contains("e1 Save"));
         let a = BrowserError::ambiguous(&["a".into(), "b".into(), "c".into()]);
-        assert_eq!(a.to_string(), "ambiguous match: 3 candidates refused");
+        // FR-007: candidates must be LISTED in the refusal, not just counted.
+        assert_eq!(a.to_string(), "ambiguous match: 3 [a; b; c] candidates refused");
     }
 
     #[tokio::test]

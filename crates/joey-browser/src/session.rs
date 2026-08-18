@@ -92,6 +92,33 @@ impl BrowserManager {
             config: cfg,
             managed_child: Mutex::new(Some(managed.child)),
         };
+        // Managed hygiene: the freshly-launched browser opens an initial tab
+        // of its own. Create OUR agent tab first (the browser must never
+        // drop to zero page targets — headless Chrome exits), then close
+        // every OTHER page target so only the agent tab remains.
+        // ("Never touch user tabs" applies to attached mode; in managed
+        // mode we own the throwaway profile.)
+        {
+            let agent = mgr.ensure_page().await?;
+            let targets = mgr
+                .conn()?
+                .send("Target.getTargets", json!({}), None)
+                .await?;
+            if let Some(infos) = targets["targetInfos"].as_array() {
+                for t in infos {
+                    if t["type"] == "page" && t["targetId"].as_str() != Some(agent.target_id.as_str()) {
+                        let _ = mgr
+                            .conn()?
+                            .send(
+                                "Target.closeTarget",
+                                json!({ "targetId": t["targetId"] }),
+                                None,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
         Ok(Arc::new(mgr))
     }
 
@@ -214,7 +241,10 @@ impl BrowserManager {
                 return Err(BrowserError::Protocol(format!("eval exception: {exc}")));
             }
         }
-        Ok(r.get("result").cloned().unwrap_or(Value::Null))
+        // CDP shape: {"result": {"type": "...", "value": <json>}} — unwrap
+        // the RemoteObject's value (undefined → Null).
+        let remote = r.get("result").cloned().unwrap_or(Value::Null);
+        Ok(remote.get("value").cloned().unwrap_or(Value::Null))
     }
 
     /// Evaluate a JS expression that returns a string (convenience).

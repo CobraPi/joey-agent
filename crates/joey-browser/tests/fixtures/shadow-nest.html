@@ -1,11 +1,12 @@
 <!doctype html>
 <html>
-<head><meta charset="utf-8"><title>Shadow Nest Fixture</title></head>
+<head><meta charset="utf-8"><title>Shadow Nest</title></head>
 <body>
   <h1>Shadow Nest</h1>
   <!-- Level 1 host -->
   <div id="host1"></div>
   <button data-ground-truth="top-btn" id="plain">Plain Button</button>
+  <a data-ground-truth="top-link" href="#top">Top Link</a>
   <script>
     // Level 1
     const s1 = host1.attachShadow({mode:'open'});

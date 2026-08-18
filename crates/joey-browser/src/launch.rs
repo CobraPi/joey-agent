@@ -127,6 +127,9 @@ pub async fn launch_managed(
         format!("--user-data-dir={}", user_data.display()).as_str(),
         "--no-first-run",
         "--no-default-browser-check",
+        // Deterministic viewport: the coarse-grid marker strategy and fixture
+        // geometry assume 1280x800 (vision.rs GRID_*).
+        "--window-size=1280,800",
     ]);
     if headless {
         cmd.arg("--headless=new");
