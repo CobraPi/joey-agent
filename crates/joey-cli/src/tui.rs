@@ -1423,6 +1423,26 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                     kind: NoticeKind::Info,
                 });
             }
+            // /browser (feature 016, T066): session control with CLI parity.
+            // connect can launch a browser + open a websocket (slow), so it
+            // runs as an engine heavy job; the result lands in the transcript
+            // via HeavyJobFinished. The global BrowserHandle is shared with
+            // the line REPL and the browser_* tools (one session everywhere).
+            "browser" => {
+                let args = slash_args_after(input, "browser").to_string();
+                self.busy = true;
+                self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "⧗ /browser running on the engine…".into(),
+                    kind: NoticeKind::Busy,
+                });
+                if let Some(engine) = &self.engine {
+                    engine.send(crate::engine::EngineCommand::HeavyJob {
+                        label: "browser".into(),
+                        args,
+                    });
+                }
+            }
             "skills" => {
                 let skills = joey_tools::tools::skills_tool::discover();
                 if skills.is_empty() {

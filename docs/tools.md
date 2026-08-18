@@ -101,10 +101,15 @@ configured servers existing (`lsp.rs` `LspManager::from_joey_config`; see
 
 Registered by higher crates (not in joey-tools): `delegate_task`
 (delegation), `cronjob` (joey-cron), plus platform tools upstream ships that
-this port names in toolsets but does not implement (`browser_*`, `vision_analyze`,
-`image_generate`, `execute_code`, `computer_use`, `ha_*`, `kanban_*`,
-`read_terminal`, `close_terminal`, `text_to_speech`, `skill_manage` — the
-resolver filters unregistered names at definition time, matching upstream).
+this port names in toolsets but does not implement (`image_generate`,
+`execute_code`, `computer_use`, `ha_*`, `kanban_*`, `read_terminal`,
+`close_terminal`, `text_to_speech` — the resolver filters unregistered names
+at definition time, matching upstream).
+
+Browser automation is implemented (feature 016, joey-browser crate): the
+16 `browser_*` tools (12 declared + hover/select_option/drag/click_coords)
+plus `vision_analyze` — hidden until a browser session connects (`/browser
+connect` or first browser-tool use). See [browser.md](browser.md).
 
 \* = required parameter.
 
@@ -132,13 +137,13 @@ including names of unimplemented tools.
 | `safe` | — (include-only) | web, vision, image_gen |
 | `vision` | vision_analyze | — |
 | `image_gen` | image_generate | — |
-| `coding` | 32 tools: web_search, web_extract, terminal, process, read_terminal, close_terminal, read_file, write_file, patch, search_files, vision_analyze, skills_list, skill_view, skill_manage, browser_navigate/snapshot/click/type/scroll/back/press/get_images/vision/console/cdp/dialog, todo, memory, session_search, clarify, execute_code, delegate_task | — |
+| `coding` | 36 tools (32 declared + 4 additive browser verbs): web_search, web_extract, terminal, process, read_terminal, close_terminal, read_file, write_file, patch, search_files, vision_analyze, skills_list, skill_view, skill_manage, browser_navigate/snapshot/click/type/scroll/back/press/get_images/vision/console/cdp/dialog, todo, memory, session_search, clarify, execute_code, delegate_task | — |
 | `joey-cli` | CORE_TOOLS (full default set + cronjob) | — |
 | `joey-cron` | CORE_TOOLS | — |
 
 - **CORE_TOOLS** is the shared upstream `_HERMES_CORE_TOOLS` membership list
   (verbatim): web, terminal+process+GUI-terminal readers, file tools,
-  vision/image-gen, skills, browser automation (12 tools), TTS, todo, memory,
+  vision/image-gen, skills, browser automation (16 tools, feature 016), TTS, todo, memory,
   session_search, clarify, LSP tools, execute_code, delegate_task, cronjob,
   Home Assistant (4), kanban (12), computer_use.
 - **Platform toolsets**: `register_platform("telegram")` makes

@@ -2058,7 +2058,7 @@ async fn browser_slash(_st: &mut ReplState, args: &str) {
                     // Wire the real URL-safety checker (FR-020) now that the
                     // browser stack is reachable through joey-tools.
                     joey_browser::url_safety_bridge::install_url_safety_check(|u| {
-                        browser_url_safety_shim(u)
+                        crate::engine::browser_url_safety_shim(u)
                     });
                     render::success("Browser connected (agent works in its own tab; your tabs are untouched).");
                 }
@@ -2143,18 +2143,5 @@ fn revert_slash(st: &mut ReplState, args: &str) {
         Err(e) => {
             render::error(&format!("revert failed: {}", e));
         }
-    }
-}
-
-
-/// URL-safety shim: bridges joey-browser's injected checker to the REAL
-/// `url_safety::is_safe_url` used by the web tools (FR-020 — one policy,
-/// one implementation). Loads config lazily per call.
-pub(crate) fn browser_url_safety_shim(url: &str) -> Result<(), String> {
-    let cfg = joey_core::config::Config::load().unwrap_or_else(|_| Config::defaults());
-    if joey_tools::url_safety::is_safe_url(url, &cfg) {
-        Ok(())
-    } else {
-        Err(format!("local/private network target refused: {url}"))
     }
 }

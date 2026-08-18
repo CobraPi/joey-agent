@@ -254,3 +254,17 @@ NeuroCode (`joey-neurocode`, wired via `joey-cli`): separate subsystem, off
 by default (`neurocode.enabled`); has its own frontier/economical tier
 models (`neurocode.tier.providers.<id>`), resolved through the same
 provider profile machinery — not part of llm-selector's allocation map.
+
+## Image-model routing (feature 016)
+
+Every provider supports an optional dedicated image-capable model for
+webpage/screenshot understanding, independent of the primary text model:
+
+- `model.image_model` — global default
+- `providers.<id>.image_model` — per-provider override (wins)
+
+Resolution order: per-provider → global → provider multimodal default →
+primary model if vision-capable (else an actionable error). Image-bearing
+turns route to the resolved model (`--model`-pinned turns are never
+rerouted); text-only turns are unaffected. Vision-capable tool results
+report `served_by { model, source }`.

@@ -22,7 +22,7 @@ subsystem you're working on:
 1. [`features.md`](features.md) — up-to-date feature-first overview of the
    whole project: every capability with links into the per-subsystem
    reference pages, plus an honest "not yet implemented" list.
-2. [`architecture.md`](architecture.md) — the Cargo workspace (13 crates),
+2. [`architecture.md`](architecture.md) — the Cargo workspace (14 crates),
    crate dependency graph, high-level data flow from user input to final
    answer.
 3. [`agent-turn-loop.md`](agent-turn-loop.md) — the heart of the project:

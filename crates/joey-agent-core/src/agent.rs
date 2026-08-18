@@ -1368,19 +1368,25 @@ impl Agent {
             });
             if turn_has_images {
                 if let Some((provider_id, cfg)) = self.provider_config_for_image_routing() {
+                    // Catalog default (step 3): joey-llm-selector's vision
+                    // capability data for the active provider, when a default
+                    // multimodal model is configured in the catalog module.
+                    let catalog_default = None::<&str>; // catalog exposes capability, not a default pick; selection via keys (T068)
                     match crate::image_model::resolve_image_model(
                         &cfg,
                         &provider_id,
                         &self.config.model,
-                        None,
-                        None,
+                        catalog_default,
+                        Some(joey_llm_selector::candidate::supports_vision_by_id(
+                            &self.config.model,
+                        )),
                     ) {
                         crate::image_model::ImageModelResolution::Available(r) => {
                             if r.model_id != self.config.model {
                                 tracing::debug!(
                                     image_model = %r.model_id,
                                     source = r.source.as_str(),
-                                    "routing image turn to dedicated image model"
+                                    "routing image turn to dedicated image model (served_by)"
                                 );
                                 return r.model_id;
                             }

@@ -107,3 +107,12 @@ Prefix resolution: exact match → unique prefix → unique-shortest (so `/qui`�
 ## 6. README verification
 
 Root README.md command table matches the code, with two caveats: (a) README line "joey skills # Search, install, inspect, and manage skills" overstates — only `skills list` is implemented (code prints "(only 'list' is available in joey-agent so far)"); (b) README says "joey auth <provider>" — code only supports `auth copilot`. Everything else (flags, cron, mcp, speckit, discover, llm-selector, doctor, home, version) verified accurate.
+
+### `/browser [connect|disconnect|status]`
+
+Browser session control (feature 016; TUI and line REPL both): connect
+attaches to your running Chromium-family browser at `browser.cdp_url`
+(logins preserved; the agent works in its own dedicated tab) or launches a
+managed instance headless when none is attachable. `status` reports the
+session; `disconnect` releases it (managed instances are terminated, no
+orphans). Browser tools also auto-connect on first use.

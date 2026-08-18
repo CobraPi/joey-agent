@@ -42,6 +42,29 @@ fn image_part(path: &str) -> Result<Value, String> {
     }))
 }
 
+/// Display-side mirror of agent-core's image-model routing (FR-016
+/// reporting): resolve which model served/serves visual content using the
+/// same config-key order (per-provider → global → primary-if-vision) and
+/// return the `served_by` object for tool results. The authoritative
+/// routing decision happens in joey-agent-core::image_model; this mirror
+/// exists because joey-tools cannot depend on that crate (DAG).
+pub fn served_by_report() -> Value {
+    let cfg = joey_core::config::Config::load()
+        .unwrap_or_else(|_| joey_core::config::Config::defaults());
+    let provider = cfg.get_str("model.provider", "");
+    let primary = cfg.get_str("model.default", "");
+    let per_provider = cfg.get_str(&format!("providers.{provider}.image_model"), "");
+    let global = cfg.get_str("model.image_model", "");
+    let (model, source) = if !per_provider.is_empty() {
+        (per_provider, "explicit_per_provider")
+    } else if !global.is_empty() {
+        (global, "explicit_global")
+    } else {
+        (primary.clone(), "primary_if_vision")
+    };
+    json!({ "model": model, "source": source })
+}
+
 /// The `vision_analyze` tool.
 pub struct VisionAnalyze;
 
@@ -105,8 +128,16 @@ impl Tool for VisionAnalyze {
                 Err(e) => return ToolResult::Error(e),
             }
         };
+        let served = served_by_report();
         ToolResult::Multimodal(vec![
-            json!({ "type": "text", "text": format!("Analyze this image: {question}") }),
+            json!({
+                "type": "text",
+                "text": format!(
+                    "Analyze this image: {question}\n(served_by: {} via {})",
+                    served["model"].as_str().unwrap_or("?"),
+                    served["source"].as_str().unwrap_or("?")
+                )
+            }),
             part,
         ])
     }

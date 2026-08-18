@@ -66,6 +66,26 @@ impl BrowserHandle {
         F: FnOnce(Arc<BrowserManager>) -> Fut,
         Fut: std::future::Future<Output = Result<T, joey_browser::BrowserError>>,
     {
+        // First-use auto-connect (FR-017 / T067): a browser_* tool invoked
+        // while disconnected connects lazily (attach when possible, else
+        // managed launch) instead of erroring — mirrors /browser connect.
+        if !self.is_connected() {
+            let cfg = joey_browser::BrowserConfig::from_config(
+                &joey_core::config::Config::load()
+                    .unwrap_or_else(|_| joey_core::config::Config::defaults()),
+            );
+            self.connect(cfg).await?;
+            // The real URL-safety checker is injectable only from higher
+            // crates; joey-tools installs the canonical policy directly
+            // (FR-020: same url_safety the web tools use).
+            joey_browser::url_safety_bridge::install_url_safety_check(|u| {
+                if crate::url_safety::is_safe_url(u, &joey_core::config::Config::defaults()) {
+                    Ok(())
+                } else {
+                    Err(format!("local/private network target refused: {u}"))
+                }
+            });
+        }
         let guard = self.manager.lock().await;
         let m = guard.as_ref().ok_or(joey_browser::BrowserError::NotConnected)?;
         op(m.clone()).await
@@ -544,7 +564,11 @@ impl Tool for BrowserVision {
     }
     async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
         match self.handle.run(|m| async move { m.visual_observe(None).await }).await {
-            Ok(v) => ok_json(serde_json::to_value(&v).unwrap_or_default()),
+            Ok(v) => {
+                let mut out = serde_json::to_value(&v).unwrap_or_default();
+                out["served_by"] = crate::tools::vision_tools::served_by_report();
+                ok_json(out)
+            }
             Err(e) => err(e),
         }
     }

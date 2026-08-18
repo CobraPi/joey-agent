@@ -412,10 +412,60 @@ async fn engine_task(
 fn run_heavy_job(label: &str, args: &str) -> String {
     match label {
         "neurocode" => crate::commands::neurocode::neurocode_slash(args),
+        // /browser (feature 016, T066): runs on the blocking pool; the
+        // async connect is driven via a runtime handle (same semantics as
+        // the line REPL's browser_slash).
+        "browser" => run_browser_session_op(args),
         _ => format!("unknown heavy job: {label}"),
     }
 }
 
+/// Shared /browser session operation used by the TUI heavy-job path (the
+/// line REPL has its own interactive handler; both drive the same global
+/// BrowserHandle, so state is common — Constitution II parity).
+fn run_browser_session_op(args: &str) -> String {
+    use joey_tools::tools::browser_tools::shared_browser_handle;
+    let handle = shared_browser_handle();
+    let op = args.trim().to_lowercase();
+    // Blocking pool: drive the async ops on the ambient runtime handle.
+    let rt = tokio::runtime::Handle::try_current()
+        .map_err(|e| format!("no tokio runtime: {e}"));
+    let rt = match rt {
+        Ok(rt) => rt,
+        Err(e) => return e,
+    };
+    match op.as_str() {
+        "" | "status" => {
+            if handle.is_connected() {
+                "Browser: connected".to_string()
+            } else {
+                "Browser: disconnected (/browser connect to attach or launch)".to_string()
+            }
+        }
+        "connect" => rt.block_on(async {
+            let cfg = joey_browser::BrowserConfig::from_config(
+                &joey_core::config::Config::load()
+                    .unwrap_or_else(|_| joey_core::config::Config::defaults()),
+           );
+            match handle.connect(cfg).await {
+                Ok(()) => {
+                    joey_browser::url_safety_bridge::install_url_safety_check(|u| {
+                        browser_url_safety_shim(u)
+                    });
+                    "Browser connected (agent works in its own tab; your tabs are untouched).".to_string()
+                }
+                Err(e) => format!("Browser connect failed: {e}"),
+            }
+        }),
+        "disconnect" => rt.block_on(async {
+            match handle.disconnect().await {
+                Ok(()) => "Browser disconnected.".to_string(),
+                Err(e) => format!("Disconnect failed: {e}"),
+            }
+        }),
+        other => format!("Usage: /browser [connect|disconnect|status] (got '{other}')"),
+    }
+}
 /// Pre-turn preprocessing on the engine side: @plan prefix + intent gate.
 /// Returns the text to send (empty = skip the turn). Announcements go to
 /// the UI as Notice events (mirrors the old UI-side helpers).
@@ -864,5 +914,17 @@ mod steer_command_tests {
         assert!(Agent::steer_via_handle(&handle, "two"));
         assert_eq!(*handle.lock().unwrap(), "one\ntwo");
         assert!(!Agent::steer_via_handle(&handle, "  "));
+    }
+}
+
+/// URL-safety shim: bridges joey-browser's injected checker to the REAL
+/// `url_safety::is_safe_url` used by the web tools (FR-020 — one policy,
+/// one implementation). Loads config lazily per call.
+pub(crate) fn browser_url_safety_shim(url: &str) -> Result<(), String> {
+    let cfg = joey_core::config::Config::load().unwrap_or_else(|_| joey_core::config::Config::defaults());
+    if joey_tools::url_safety::is_safe_url(url, &cfg) {
+        Ok(())
+    } else {
+        Err(format!("local/private network target refused: {url}"))
     }
 }
