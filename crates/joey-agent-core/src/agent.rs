@@ -194,6 +194,36 @@ fn parse_fallback_chain(cfg: &Config) -> Vec<FallbackEntry> {
         .collect()
 }
 
+/// Family prefix of a model id — the vendor/model-family segment that must
+/// match between a requested model and the echoed one ("gpt", "claude",
+/// "gemini", "glm", …). Version digits are ignored: gpt-5.4 vs gpt-5.6 is
+/// legitimate proxy behavior (same family), but glm-5.2 answered by
+/// claude-sonnet-5 is a silent substitution.
+fn model_family(id: &str) -> &str {
+    let bare = id.trim().split_once('/').map_or(id.trim(), |(_, tail)| tail);
+    bare.split(['-', '.'])
+        .next()
+        .filter(|s| !s.is_empty() && s.chars().next().is_some_and(char::is_alphabetic))
+        .unwrap_or("unknown")
+}
+
+/// True when the served model belongs to a DIFFERENT family than the one
+/// requested — the signature of a proxy silently substituting its default
+/// model. Same-family echoes (including version remaps like gpt-5.4→5.6)
+/// are normal and do not trip this.
+fn model_family_mismatch(requested: &str, echoed: &str) -> bool {
+    let r = model_family(requested);
+    let s = model_family(echoed);
+    // OpenAI reasoning-series aliases (o1/o3/o4) are gpt-family answers.
+    if matches!(r, "o1" | "o3" | "o4") && s == "gpt" {
+        return false;
+    }
+    if matches!(s, "o1" | "o3" | "o4") && r == "gpt" {
+        return false;
+    }
+    r != s
+}
+
 /// Provider abstraction so the loop can be driven by a scripted mock in tests.
 #[async_trait]
 pub trait Transport: Send + Sync {
@@ -1339,7 +1369,21 @@ impl Agent {
                     needs_tools,
                     0, // token_budget_hint: 0 = no hard gate from the call site
                 );
-                return alloc.model_id;
+                // A copilot-wire client cannot serve vendor families the
+                // Copilot backend never carries (glm-, deepseek-, …): the
+                // proxy would silently substitute its default model. Fall
+                // back to the configured model instead.
+                if !alloc.model_id.is_empty()
+                    && joey_providers::profile::is_copilot_wire(&self.provider_name)
+                    && !joey_providers::profile::copilot_servable(&alloc.model_id)
+                {
+                    tracing::warn!(
+                        allocated = %alloc.model_id,
+                        "allocator model not servable by the copilot-wire provider; keeping configured model"
+                    );
+                } else {
+                    return alloc.model_id;
+                }
             }
         }
         // Feature 015 (NeuroCode Mode 2): when 011 is not active but NeuroCode
@@ -1404,7 +1448,17 @@ impl Agent {
                     // The context was already assembled by apply_neurocode_intercept.
                     // Mode 2: NeuroCode resolves the tier model from its own config.
                     if let Some(model_id) = engine.resolve_tier_model() {
-                        return model_id;
+                        // Copilot-wire servability guard (same rationale as the
+                        // allocator branch above).
+                        if !joey_providers::profile::is_copilot_wire(&self.provider_name)
+                            || joey_providers::profile::copilot_servable(&model_id)
+                        {
+                            return model_id;
+                        }
+                        tracing::warn!(
+                            tier_model = %model_id,
+                            "NeuroCode tier model not servable by the copilot-wire provider; keeping configured model"
+                        );
                     }
                 }
             }
@@ -1494,7 +1548,27 @@ impl Agent {
                 self.build_request(&[], Some(tx))
             };
             match self.transport_call(&req, tx).await {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    // Silent-substitution guard: some proxies (notably the
+                    // ai-usage-hud Copilot reverse proxy's mapModel fallback)
+                    // replace an unservable requested model with their default
+                    // and still return 200. Surface that loudly instead of
+                    // letting a different model answer unnoticed.
+                    if let Some(echoed) = resp.model.as_deref() {
+                        if model_family_mismatch(&req.model, echoed) {
+                            tracing::warn!(
+                                requested = %req.model,
+                                served = %echoed,
+                                "provider served a different model family than requested"
+                            );
+                            let _ = tx.send(AgentEvent::Notice(format!(
+                                "⚠️ Provider served {} when {} was requested — the configured endpoint may not carry that model.",
+                                echoed, req.model
+                            )));
+                        }
+                    }
+                    return Ok(resp);
+                }
                 Err(e) => {
                     retry_count += 1;
                     // Interrupt beats any retry decision
@@ -3436,6 +3510,16 @@ mod tests {
         }
     }
 
+    /// A response that ECHOES a model id — as real providers do on the wire.
+    fn text_resp_model(text: &str, model: &str) -> NormalizedResponse {
+        NormalizedResponse {
+            content: text.to_string(),
+            finish_reason: FinishReason::Stop,
+            model: Some(model.to_string()),
+            ..NormalizedResponse::empty()
+        }
+    }
+
     fn tool_resp(calls: Vec<ToolCall>, finish: FinishReason) -> NormalizedResponse {
         NormalizedResponse {
             tool_calls: calls,
@@ -3603,6 +3687,58 @@ mod tests {
     }
 
     // ── Loop tests ────────────────────────────────────────────────────
+
+    /// Silent model substitution (ai-usage-hud mapModel fallback): when the
+    /// provider answers with a model from a DIFFERENT family than requested,
+    /// the loop must surface a Notice instead of letting the swap pass
+    /// silently (observed live 2026-08-18: requested glm-5.2, served
+    /// claude-sonnet-5, HTTP 200).
+    #[tokio::test]
+    async fn model_family_substitution_surfaces_notice() {
+        let _l = lock();
+        let mut fx = fixture(
+            vec![Ok(text_resp_model("done", "claude-sonnet-5"))],
+            10,
+            3,
+            None,
+        );
+        fx.agent.config.model = "glm-5.2".to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        let events = drain(&mut rx);
+        let noticed = events.iter().any(|e| match e {
+            AgentEvent::Notice(msg) => {
+                msg.contains("served claude-sonnet-5") && msg.contains("glm-5.2 was requested")
+            }
+            _ => false,
+        });
+        assert!(noticed, "expected a substitution Notice, got: {events:?}");
+    }
+
+    /// Same-family echoes (version remaps like gpt-5.4 → gpt-5.6) are normal
+    /// proxy behavior and must NOT trip the notice.
+    #[tokio::test]
+    async fn same_family_echo_does_not_notice() {
+        let _l = lock();
+        let mut fx = fixture(
+            vec![Ok(text_resp_model("done", "gpt-5.6-luna"))],
+            10,
+            3,
+            None,
+        );
+        fx.agent.config.model = "gpt-5.4".to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(_) )),
+            "same-family echo must not notice: {events:?}"
+        );
+    }
 
     /// tool_calls execute REGARDLESS of finish_reason
     /// (conversation_loop.py:4707).

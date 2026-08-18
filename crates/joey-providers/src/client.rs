@@ -122,12 +122,38 @@ impl ProviderClient {
                 .unwrap_or(false)
     }
 
+    /// Derive the effective API mode for a request. Non-copilot clients pin
+    /// their wire at build time (profile.api_mode). Copilot-wire clients
+    /// (copilot + ai-usage-hud) re-derive per-request because the SAME proxy
+    /// serves models on different wires — gpt-5.x speaks /responses only,
+    /// claude/gemini speak /chat/completions or /v1/messages — and a
+    /// per-turn model substitution (fallback chain, NeuroCode tier,
+    /// llm-selector allocator, image routing) must not ride the build-time
+    /// wire of a different model (observed live 2026-08-18: chat-wire client
+    /// + gpt-5.6-luna request → HTTP 400 "not accessible via the
+    /// /chat/completions endpoint").
+    fn effective_api_mode(&self, req: &ProviderRequest) -> ApiMode {
+        if !crate::profile::is_copilot_wire(self.profile.name) {
+            return self.profile.api_mode;
+        }
+        // Cache-only peek: `fetch_model_catalog` (called at client-build time
+        // via build_client) keeps the cache warm; a cold cache degrades to
+        // the same heuristic `build_client` uses. Never block the request
+        // path on a synchronous catalog fetch.
+        let normalized = copilot::normalize_model_id(&req.model);
+        let catalog = copilot::peek_model_catalog();
+        let entry = catalog.iter().find(|item| {
+            item.get("id").and_then(Value::as_str) == Some(normalized.as_str())
+        });
+        copilot::model_api_mode(&req.model, entry)
+    }
+
     /// Non-streaming completion. Returns a fully-assembled response.
     pub async fn complete(
         &self,
         req: &ProviderRequest,
     ) -> Result<NormalizedResponse, ProviderError> {
-        match self.profile.api_mode {
+        match self.effective_api_mode(req) {
             ApiMode::ChatCompletions => self.chat_completions(req, None).await,
             ApiMode::AnthropicMessages => self.anthropic_messages(req, None).await,
             ApiMode::CodexResponses => self.responses(req, None).await,
@@ -146,7 +172,7 @@ impl ProviderClient {
             stream: true,
             ..req.clone()
         };
-        let result = match self.profile.api_mode {
+        let result = match self.effective_api_mode(&streaming_req) {
             ApiMode::ChatCompletions => self.chat_completions(&streaming_req, Some(&tx)).await,
             ApiMode::AnthropicMessages => self.anthropic_messages(&streaming_req, Some(&tx)).await,
             ApiMode::CodexResponses => self.responses(&streaming_req, Some(&tx)).await,
@@ -646,9 +672,20 @@ impl ProviderClient {
     ) -> Result<NormalizedResponse, ProviderError> {
         let mut content = String::new();
         let mut reasoning = String::new();
-        // item_id -> (wire call_id, function name, accumulated arguments)
-        let mut calls: std::collections::HashMap<String, (String, String, String)> =
-            Default::default();
+        // Output-item accumulation for tool calls. Two join strategies are
+        // maintained because real Copilot /responses streams (via the
+        // ai-usage-hud proxy, observed 2026-08-18) obfuscate `item_id` on
+        // `function_call_arguments` events — every delta carries a DIFFERENT
+        // opaque item_id that matches neither `output_item.added` nor its
+        // siblings — so keying deltas by item_id shreds the arguments into
+        // one-entry-per-fragment garbage. `output_index` IS stable across
+        // all events for one call, so it is the primary join key.
+        //
+        // `response.output_item.done` carries the COMPLETE item (clean
+        // call_id, name, full arguments) and is treated as authoritative
+        // when seen; deltas only fill in when `done` events are absent.
+        // slot = output_index -> (wire call_id, function name, accumulated args, authoritative?)
+        let mut calls: Vec<(Option<u64>, String, String, String, bool)> = Vec::new();
         let mut completed: Option<Value> = None;
         let mut buffer = String::new();
         let mut stream = response.bytes_stream();
@@ -671,6 +708,7 @@ impl ProviderClient {
                 let Ok(event) = serde_json::from_str::<Value>(raw.trim()) else {
                     continue;
                 };
+                let output_index = event.get("output_index").and_then(Value::as_u64);
                 match event.get("type").and_then(Value::as_str).unwrap_or("") {
                     "response.output_text.delta" => {
                         if let Some(delta) = event.get("delta").and_then(Value::as_str) {
@@ -707,27 +745,79 @@ impl ProviderClient {
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
                                 .to_string();
-                            if !item_id.is_empty() {
-                                calls
-                                    .entry(item_id)
-                                    .or_insert((call_id, name, String::new()));
+                            if !call_id.is_empty() || !name.is_empty() {
+                                match output_index {
+                                    Some(idx) => {
+                                        let slot = ensure_call_slot(&mut calls, idx);
+                                        if !call_id.is_empty() {
+                                            slot.1 = call_id;
+                                        }
+                                        if !name.is_empty() {
+                                            slot.2 = name;
+                                        }
+                                    }
+                                    None => {
+                                        calls.push((None, call_id, name, String::new(), false))
+                                    }
+                                }
                             }
                         }
                     }
                     "response.function_call_arguments.delta" => {
-                        let item_id = event
-                            .get("item_id")
-                            .or_else(|| event.get("call_id"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
                         let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
-                        if !item_id.is_empty() {
-                            calls
-                                .entry(item_id.clone())
-                                .or_insert_with(|| (item_id, String::new(), String::new()))
-                                .2
-                                .push_str(delta);
+                        // Join by output_index when present (the stable key on
+                        // obfuscated streams); fall back to item_id only when
+                        // the event carries no output_index at all.
+                        if let Some(idx) = output_index {
+                            if let Some(slot) = calls.iter_mut().find(|(i, ..)| *i == Some(idx)) {
+                                slot.3.push_str(delta);
+                            } else {
+                                calls.push((Some(idx), String::new(), String::new(), delta.to_string(), false));
+                            }
+                        }
+                    }
+                    "response.function_call_arguments.done" => {
+                        // Full accumulated arguments for the call — authoritative.
+                        let args = event
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if let Some(idx) = output_index {
+                            let slot = ensure_call_slot(&mut calls, idx);
+                            if slot.3.len() < args.len() {
+                                slot.3 = args.to_string();
+                            }
+                            slot.4 = true;
+                        }
+                    }
+                    "response.output_item.done" => {
+                        // Complete output item — authoritative call identity.
+                        let item = event.get("item").unwrap_or(&Value::Null);
+                        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                            let call_id = item
+                                .get("call_id")
+                                .or_else(|| item.get("id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                            let args = item
+                                .get("arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if let Some(idx) = output_index {
+                                let slot = ensure_call_slot(&mut calls, idx);
+                                if !call_id.is_empty() {
+                                    slot.1 = call_id;
+                                }
+                                if !name.is_empty() {
+                                    slot.2 = name.to_string();
+                                }
+                                if slot.3.len() < args.len() {
+                                    slot.3 = args.to_string();
+                                }
+                                slot.4 = true;
+                            }
                         }
                     }
                     "response.completed" => completed = event.get("response").cloned(),
@@ -744,10 +834,25 @@ impl ProviderClient {
                 return Ok(parsed);
             }
         }
+        // Slots: drop empty-name/empty-arg fragments (deltas that never joined
+        // a real item), order by slot index.
+        calls.sort_by_key(|(idx, ..)| idx.unwrap_or(u64::MAX));
         let tool_calls = calls
             .into_iter()
-            .map(|(_, (call_id, name, arguments))| ToolCall {
-                id: call_id,
+            .filter(|(_, call_id, name, args, authoritative)| {
+                *authoritative
+                    || (!name.is_empty() && !args.trim().is_empty())
+                    || (!call_id.is_empty() && !args.trim().is_empty())
+            })
+            .map(|(idx, call_id, name, arguments, _authoritative)| ToolCall {
+                // Obfuscated streams may never reveal a clean call_id; fall
+                // back to a deterministic synthetic id so tool results can
+                // still reference the call.
+                id: if call_id.is_empty() {
+                    format!("call_resp_{}", idx.unwrap_or(0))
+                } else {
+                    call_id
+                },
                 call_type: "function".into(),
                 function: FunctionCall { name, arguments },
             })
@@ -1152,6 +1257,23 @@ fn request_has_images(req: &ProviderRequest) -> bool {
             })
             .unwrap_or(false)
     })
+}
+
+/// Get-or-create the accumulator slot for output item index `idx` in a
+/// Responses stream. Slots are `(output_index, call_id, name, args,
+/// authoritative)` tuples; see [`ProviderClient::parse_responses_stream`]
+/// for why `output_index` (not `item_id`) is the join key.
+fn ensure_call_slot<'a>(
+    calls: &'a mut Vec<(Option<u64>, String, String, String, bool)>,
+    idx: u64,
+) -> &'a mut (Option<u64>, String, String, String, bool) {
+    // Slots are kept sorted by index in practice (events arrive in order);
+    // scan from the back for the common append case, else linear search.
+    if let Some(pos) = calls.iter().rposition(|(i, ..)| *i == Some(idx)) {
+        return &mut calls[pos];
+    }
+    calls.push((Some(idx), String::new(), String::new(), String::new(), false));
+    calls.last_mut().expect("just pushed")
 }
 
 fn parse_responses_response(v: &Value) -> Result<NormalizedResponse, ProviderError> {
@@ -1634,6 +1756,139 @@ mod tests {
         assert_eq!(response.tool_calls[0].function.name, "read_file");
         assert_eq!(response.usage.prompt_tokens, 10);
         assert_eq!(response.usage.reasoning_tokens, 2);
+    }
+
+    /// Regression (2026-08-18): the live ai-usage-hud proxy obfuscates
+    /// `item_id` on function_call_arguments events — every delta carries a
+    /// DIFFERENT opaque id matching neither output_item.added nor its
+    /// siblings. Keying by item_id shredded tool args into one garbage entry
+    /// per fragment. The stream must accumulate by `output_index` and prefer
+    /// the authoritative `output_item.done` / `function_call_arguments.done`
+    /// / `response.completed` payloads.
+    #[test]
+    fn copilot_responses_stream_survives_obfuscated_item_ids() {
+        let sse = [
+            r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
+            r#"{"type":"response.in_progress"}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"OBFC_ADD_111","call_id":"call_REAL_1","name":"calculate","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"OBFC_A","obfuscation":1,"delta":"{\"e""#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"OBFC_B","obfuscation":1,"delta":"xpr\":"}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"OBFC_C","obfuscation":1,"delta":"\"6*7\"}"}"#,
+            r#"{"type":"response.function_call_arguments.done","output_index":0,"item_id":"OBFC_DONE","arguments":"{\"expr\":\"6*7\"}"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"OBFC_ITEM_DONE","call_id":"call_REAL_1","name":"calculate","arguments":"{\"expr\":\"6*7\"}","status":"completed"}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","content":[]},{"type":"function_call","call_id":"call_REAL_1","name":"calculate","arguments":"{\"expr\":\"6*7\"}"}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            "[DONE]",
+        ];
+        let body = {
+            let mut b = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            for line in &sse {
+                b.push_str("data: ");
+                b.push_str(line);
+                b.push_str("\n\n");
+            }
+            b
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf); // drain the request
+            sock.write_all(body.as_bytes()).unwrap();
+            sock.flush().unwrap();
+        });
+        let profile = crate::profile::get_profile("copilot").unwrap();
+        let base = format!("http://{}", addr);
+        let client = ProviderClient::new(profile, Some(base), Some("ghu_test".into())).unwrap();
+        let req = ProviderRequest::new(
+            "gpt-5.4",
+            vec![crate::types::Message::user("compute 6*7")],
+        )
+        .streaming(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let resp = rt.block_on(client.stream(&req, tx)).expect("stream ok");
+        // Exactly ONE tool call, cleanly assembled.
+        assert_eq!(resp.tool_calls.len(), 1, "deltas must not shred into fragments");
+        assert_eq!(resp.tool_calls[0].id, "call_REAL_1");
+        assert_eq!(resp.tool_calls[0].function.name, "calculate");
+        assert_eq!(resp.tool_calls[0].function.arguments, "{\"expr\":\"6*7\"}");
+        assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
+        while let Ok(_) = rx.try_recv() {}
+    }
+
+    /// Same obfuscated stream but WITHOUT `response.completed` — the delta
+    /// accumulator alone must still produce one clean call.
+    #[test]
+    fn copilot_responses_stream_obfuscated_without_completed() {
+        let sse = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"OBFC_ADD","call_id":"call_X","name":"calculate","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"OBFC_1","delta":"{\"expr"}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"OBFC_2","delta":"\":\"9+1\"}"}"#,
+            r#"{"type":"response.function_call_arguments.done","output_index":0,"item_id":"OBFC_D","arguments":"{\"expr\":\"9+1\"}"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_X","name":"calculate","arguments":"{\"expr\":\"9+1\"}","status":"completed"}}"#,
+            "data: [DONE]",
+        ];
+        let body = {
+            let mut b = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            for line in &sse {
+                b.push_str("data: ");
+                b.push_str(line);
+                b.push_str("\n\n");
+            }
+            b
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            sock.write_all(body.as_bytes()).unwrap();
+            sock.flush().unwrap();
+        });
+        let profile = crate::profile::get_profile("copilot").unwrap();
+        let base = format!("http://{}", addr);
+        let client = ProviderClient::new(profile, Some(base), Some("ghu_test".into())).unwrap();
+        let req = ProviderRequest::new(
+            "gpt-5.4",
+            vec![crate::types::Message::user("compute 9+1")],
+        )
+        .streaming(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let resp = rt.block_on(client.stream(&req, tx)).expect("stream ok");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "call_X");
+        assert_eq!(resp.tool_calls[0].function.arguments, "{\"expr\":\"9+1\"}");
+    }
+
+    /// Regression (2026-08-18): a copilot-wire client built for a chat-wire
+    /// model must re-derive the wire per request — gpt-5.x rides /responses
+    /// even when profile.api_mode was pinned to chat at build time.
+    #[test]
+    fn copilot_client_reroutes_wire_per_request_model() {
+        let profile = crate::profile::get_profile("copilot").unwrap();
+        // Chat wire at build time (gpt-4.1 → ChatCompletions heuristically).
+        let client = ProviderClient::new(profile, None, Some("ghu_test".into())).unwrap();
+        let gpt5_req = ProviderRequest::new("gpt-5.4", vec![crate::types::Message::user("hi")]);
+        assert_eq!(client.effective_api_mode(&gpt5_req), ApiMode::CodexResponses);
+        let claude_req = ProviderRequest::new(
+            "claude-sonnet-5",
+            vec![crate::types::Message::user("hi")],
+        );
+        assert_eq!(
+            client.effective_api_mode(&claude_req),
+            ApiMode::ChatCompletions
+        );
     }
 
     #[test]

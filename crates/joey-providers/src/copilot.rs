@@ -331,14 +331,22 @@ fn exchange_base_url(data: &Value, token: &str) -> Option<String> {
 /// is served by the proxy through a copilot-wire profile, so the agent can
 /// see and freely switch between every model the proxy exposes.
 pub fn custom_endpoint() -> Option<String> {
-    if let Some(value) = std::env::var("COPILOT_API_BASE_URL")
-        .ok()
-        .as_deref()
-        .and_then(off_githubcopilot_host)
-    {
+    if let Some(value) = explicit_custom_endpoint() {
         return Some(value);
     }
     hud_endpoint()
+}
+
+/// `COPILOT_API_BASE_URL` explicitly set to an off-githubcopilot host —
+/// WITHOUT the HUD fallback that [`custom_endpoint`] applies. Callers that
+/// must distinguish "the user pinned a proxy" (a routing contract: magnetize
+/// EVERYTHING) from "the HUD is configured" (observability: magnetize only
+/// models Copilot can actually serve) use this.
+pub fn explicit_custom_endpoint() -> Option<String> {
+    std::env::var("COPILOT_API_BASE_URL")
+        .ok()
+        .as_deref()
+        .and_then(off_githubcopilot_host)
 }
 
 /// The AI Usage HUD reverse-proxy endpoint (`AI_USAGE_HUD_BASE_URL`), when it
@@ -650,6 +658,22 @@ pub fn fetch_model_catalog(timeout: Duration) -> Result<Vec<Value>, ProviderErro
 static CATALOG_CACHE: Mutex<Option<(Vec<Value>, std::time::Instant)>> =
     Mutex::new(None);
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Peek at the cached catalog WITHOUT fetching. Returns the cached entries
+/// regardless of TTL (a slightly-stale endpoint list is still a better
+/// routing signal than none) or an empty vec when never fetched.
+///
+/// Use this from per-request routing paths (`effective_api_mode`) where a
+/// blocking HTTP fetch would stall the async runtime; `fetch_model_catalog`
+/// (called at client-build time) keeps the cache warm.
+pub fn peek_model_catalog() -> Vec<Value> {
+    CATALOG_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(items, _)| items.clone())
+        .unwrap_or_default()
+}
 
 fn fetch_model_catalog_uncached(timeout: Duration) -> Result<Vec<Value>, ProviderError> {
     let (raw_token, _) = resolve_copilot_token()?;

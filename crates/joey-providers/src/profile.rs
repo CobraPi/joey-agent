@@ -336,6 +336,30 @@ const KNOWN_PREFIXES: &[&str] = &[
     "copilot", "github-copilot", "github-models", "github-model", "github",
 ];
 
+/// Whether the Copilot backend (or a copilot-wire proxy) can plausibly serve
+/// `model`. Consults the cached live catalog when available (a model id
+/// present in the catalog is definitively servable, including exotic ids a
+/// prefix list would miss); otherwise falls back to known Copilot model
+/// families. Vendor families Copilot never carries (glm-, deepseek-, grok-,
+/// mistral-…) return false so the HUD magnet does not hijack them onto a
+/// proxy that would silently substitute the default model.
+pub fn copilot_servable(model: &str) -> bool {
+    let normalized = crate::copilot::normalize_model_id(model);
+    // Live-catalog truth when we have it.
+    let catalog = crate::copilot::peek_model_catalog();
+    if !catalog.is_empty() {
+        return catalog.iter().any(|item| {
+            item.get("id").and_then(serde_json::Value::as_str) == Some(normalized.as_str())
+        });
+    }
+    // Cold cache: known Copilot-servable families.
+    let lower = normalized.to_ascii_lowercase();
+    const SERVABLE_PREFIXES: &[&str] = &[
+        "gpt-", "claude-", "gemini-", "o1", "o3", "o4", "mai-code-",
+    ];
+    SERVABLE_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
 /// Resolve which provider profile to use, given an explicit provider setting
 /// (may be "auto"), the base_url, and the model string. Mirrors upstream's
 /// base-url-hostname + model-prefix detection.
@@ -354,11 +378,24 @@ pub fn resolve_profile(provider_setting: &str, base_url: &str, model: &str) -> P
     // EVERYTHING through the matching copilot-wire profile: `build_client`
     // pins its base URL to the custom endpoint, and the proxy serves every
     // model family.
-    if crate::copilot::hud_endpoint().is_some() {
+    //
+    // EXCEPT models the Copilot backend can never serve (glm-, deepseek-,
+    // grok-… vendor families). The proxy silently substitutes those to its
+    // default model (mapModel → DEFAULT_COPILOT_MODEL) with a 200, so the
+    // user asks for glm-5.2 and gets claude-sonnet-5 without any error —
+    // worse than a clean miss. Let those fall through to their native
+    // vendor profiles below (observed live 2026-08-18).
+    if crate::copilot::hud_endpoint().is_some() && copilot_servable(model) {
         // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("ai-usage-hud").unwrap();
     }
-    if crate::copilot::custom_endpoint().is_some() {
+    // NOTE: the COPILOT_API_BASE_URL magnet intentionally magnetizes EVERY
+    // model (including non-Copilot families) — its documented contract is
+    // "no request escapes the proxy", a routing guarantee. The HUD fallback
+    // is deliberately EXCLUDED here (explicit_custom_endpoint) and gated
+    // separately below on servability — the HUD proxy would silently
+    // substitute non-Copilot models with its default.
+    if crate::copilot::explicit_custom_endpoint().is_some() {
         // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("copilot").unwrap();
     }
@@ -649,17 +686,30 @@ mod tests {
     }
 
     /// AI_USAGE_HUD_BASE_URL magnetizes auto-resolution to the ai-usage-hud
-    /// profile (same semantics as COPILOT_API_BASE_URL → copilot).
+    /// profile (same semantics as COPILOT_API_BASE_URL → copilot) — but ONLY
+    /// for models the Copilot backend can serve. Vendor families Copilot
+    /// never carries (glm-, deepseek-, grok-) fall through to their native
+    /// providers: magnetizing them made the proxy silently substitute its
+    /// default model (requested glm-5.2 → served claude-sonnet-5, HTTP 200)
+    /// — observed live 2026-08-18.
     #[test]
     fn hud_env_var_magnetizes_auto_resolution() {
         let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
         std::env::remove_var("COPILOT_API_BASE_URL");
         std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317");
-        assert_eq!(resolve_profile("auto", "", "glm-5.2").name, "ai-usage-hud");
+        // Copilot-servable families → magnetized onto the HUD.
         assert_eq!(resolve_profile("auto", "", "claude-opus-4.8").name, "ai-usage-hud");
+        assert_eq!(resolve_profile("auto", "", "gpt-5.4").name, "ai-usage-hud");
+        assert_eq!(
+            resolve_profile("auto", "https://api.z.ai/api/paas/v4", "gpt-5.4").name,
+            "ai-usage-hud"
+        );
+        // Copilot can NEVER serve GLM — must fall through to zai, not ride
+        // the proxy that would silently swap in its default model.
+        assert_eq!(resolve_profile("auto", "", "glm-5.2").name, "zai");
         assert_eq!(
             resolve_profile("auto", "https://api.z.ai/api/paas/v4", "glm-5.2").name,
-            "ai-usage-hud"
+            "zai"
         );
         // An explicit different provider still wins.
         assert_eq!(resolve_profile("zai", "", "glm-5.2").name, "zai");
