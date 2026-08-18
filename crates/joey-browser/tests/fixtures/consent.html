@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Consent Banner</title><style>
+#consent{position:fixed;inset:auto 0 0 0;z-index:9999;background:#223;color:#fff;padding:16px;display:flex;gap:8px;align-items:center;justify-content:center}
+</style></head>
+<body>
+  <h1>Page With Consent</h1>
+  <button data-ground-truth="page-btn" onclick="document.body.dataset.page='clicked'">Page Button</button>
+  <div id="consent">
+    <span>We use cookies to improve your experience. Accept cookies?</span>
+    <button id="accept" onclick="document.getElementById('consent').remove()">Accept all cookies</button>
+    <button id="reject" onclick="document.getElementById('consent').remove()">Reject all</button>
+  </div>
+</body>
+</html>

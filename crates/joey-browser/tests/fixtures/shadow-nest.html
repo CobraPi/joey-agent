@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Shadow Nest Fixture</title></head>
+<body>
+  <h1>Shadow Nest</h1>
+  <!-- Level 1 host -->
+  <div id="host1"></div>
+  <button data-ground-truth="top-btn" id="plain">Plain Button</button>
+  <script>
+    // Level 1
+    const s1 = host1.attachShadow({mode:'open'});
+    s1.innerHTML = `<button data-ground-truth="l1-btn">L1 Button</button><div id="host2"></div>`;
+    // Level 2
+    const s2 = s1.getElementById('host2').attachShadow({mode:'open'});
+    s2.innerHTML = `<button data-ground-truth="l2-btn">L2 Button</button><a data-ground-truth="l2-link" href="#x">L2 Link</a><div id="host3"></div>`;
+    // Level 3
+    const s3 = s2.getElementById('host3').attachShadow({mode:'open'});
+    s3.innerHTML = `<button data-ground-truth="l3-btn">L3 Deep Button</button><input data-ground-truth="l3-input" placeholder="deep input">`;
+  </script>
+</body>
+</html>

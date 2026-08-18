@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Never Settle</title></head>
+<body>
+  <h1>Continuously Mutating</h1>
+  <div id="ticker">0</div>
+  <button data-ground-truth="stable-btn" onclick="document.body.dataset.clicked='yes'">Stable</button>
+  <script>
+    // Mutates forever — network-idle would hang; settle must hit the hard
+    // timeout path or the quiet-window on a brief lull.
+    let n = 0;
+    setInterval(() => { document.getElementById('ticker').textContent = ++n; }, 100);
+  </script>
+</body>
+</html>

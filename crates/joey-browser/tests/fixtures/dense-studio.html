@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Dense Studio</title></head>
+<body>
+  <h1>Dense Enterprise Studio (fixtures)</h1>
+  <nav>
+    <script>document.currentScript.replaceWith(Object.assign(document.createElement('div'),{textContent:''}))</script>
+  </nav>
+  <script>
+    // Hundreds of controls; most far below the fold — viewport-priority
+    // presentation + out-of-view summaries (FR-004a) + perf budget (T025).
+    const sections = ['Explorer','Canvas','Properties','Debugger','Tracer','Data','Case','Settings'];
+    let id = 0;
+    for (const s of sections) {
+      const h = document.createElement('h2'); h.textContent = s; document.body.appendChild(h);
+      for (let i = 0; i < 60; i++) {
+        const b = document.createElement('button');
+        b.dataset.groundTruth = `dense-${s}-${i}`;
+        b.textContent = `${s} action ${i}`;
+        b.style.display = 'block';
+        document.body.appendChild(b);
+        id++;
+      }
+      const sel = document.createElement('select');
+      sel.dataset.groundTruth = `dense-sel-${s}`;
+      for (const o of ['option-a','option-b','option-c']) {
+        const oe = document.createElement('option'); oe.value = o; oe.textContent = o; sel.appendChild(oe);
+      }
+      document.body.appendChild(sel);
+    }
+    window.__denseCount = id;
+  </script>
+</body>
+</html>

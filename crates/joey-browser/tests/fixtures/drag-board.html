@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Drag Board</title><style>
+.col{display:inline-block;width:120px;min-height:160px;border:1px solid #999;margin:8px;vertical-align:top;padding:4px}
+.card{background:#def;border:1px solid #369;margin:4px;padding:8px;cursor:grab}
+.card.dragging{opacity:.5}
+</style></head>
+<body>
+  <h1>Drag Board</h1>
+  <div class="col" id="col1" data-ground-truth="col1">
+    <div class="card" id="card1" draggable="true" data-ground-truth="card1">Card 1</div>
+  </div>
+  <div class="col" id="col2" data-ground-truth="col2"></div>
+  <div id="report">none</div>
+  <script>
+    let dragged = null;
+    document.addEventListener('dragstart', e => {
+      const c = e.target.closest('.card');
+      if (c) { dragged = c; c.classList.add('dragging'); }
+    });
+    document.addEventListener('dragend', () => { if (dragged) dragged.classList.remove('dragging'); });
+    for (const col of document.querySelectorAll('.col')) {
+      col.addEventListener('dragover', e => e.preventDefault());
+      col.addEventListener('drop', e => {
+        e.preventDefault();
+        if (dragged) {
+          col.appendChild(dragged);
+          document.getElementById('report').textContent = 'dropped:' + dragged.id + ':' + col.id;
+        }
+      });
+    }
+  </script>
+</body>
+</html>

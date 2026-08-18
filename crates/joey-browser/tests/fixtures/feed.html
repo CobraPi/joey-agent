@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Feed</title><style>
+#feed button{display:block;margin:6px 0}
+</style></head>
+<body>
+  <h1>Infinite-ish Feed</h1>
+  <div id="feed"></div>
+  <div id="loaded" data-marker="20">20</div>
+  <script>
+    // Appends 10 items per scroll burst, up to 200 — scroll-appending feed
+    // for the delta/budget fixture.
+    let n = 0;
+    function add(k) {
+      const feed = document.getElementById('feed');
+      for (let i = 0; i < k && n < 200; i++, n++) {
+        const b = document.createElement('button');
+        b.dataset.groundTruth = 'item-' + n;
+        b.textContent = 'Feed Item ' + n;
+        feed.appendChild(b);
+      }
+      document.getElementById('loaded').dataset.marker = String(n);
+    }
+    add(20);
+    window.addEventListener('scroll', () => {
+      if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 100) {
+        add(10);
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Hover Menu Fixture</title><style>
+.menu{position:relative;display:inline-block}
+.menu-items{display:none;position:absolute;background:#fff;border:1px solid #ccc;padding:4px}
+.menu:hover .menu-items{display:block}
+</style></head>
+<body>
+  <h1>Hover Menu</h1>
+  <div class="menu" data-ground-truth="hover-trigger">
+    <button data-ground-truth="hover-btn">Open Menu</button>
+    <div class="menu-items">
+      <button data-ground-truth="menu-item-1" onclick="document.body.dataset.menu='item1'">Item 1</button>
+      <button data-ground-truth="menu-item-2" onclick="document.body.dataset.menu='item2'">Item 2</button>
+    </div>
+  </div>
+</body>
+</html>

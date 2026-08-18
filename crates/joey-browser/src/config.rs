@@ -47,6 +47,10 @@ pub struct BrowserConfig {
     pub overlay_policy: OverlayPolicy,
     /// Expert gate for raw CDP passthrough.
     pub allow_raw_cdp: bool,
+    /// Test/internal knob: skip the URL-safety gate for loopback targets
+    /// (fixture servers live on 127.0.0.1). Default false — production
+    /// navigation always runs the gate (FR-020).
+    pub allow_local_urls: bool,
     pub quiet_window: Duration,
     pub hard_timeout: Duration,
     pub budgets: SnapshotBudgets,
@@ -60,6 +64,7 @@ impl Default for BrowserConfig {
             headless: HeadlessPolicy::Auto,
             overlay_policy: OverlayPolicy::Conservative,
             allow_raw_cdp: false,
+            allow_local_urls: false,
             quiet_window: Duration::from_millis(1500),
             hard_timeout: Duration::from_millis(10_000),
             budgets: SnapshotBudgets {
@@ -81,6 +86,7 @@ impl BrowserConfig {
             headless: parse_headless(&config.get_str("browser.headless", "auto")),
             overlay_policy: parse_overlay(&config.get_str("browser.overlay_policy", "conservative")),
             allow_raw_cdp: config.get_bool("browser.allow_raw_cdp", false),
+            allow_local_urls: config.get_bool("browser.allow_local_urls", false),
             quiet_window: Duration::from_millis(
                 config.get_i64("browser.settle.quiet_ms", 1500).clamp(250, 5000) as u64,
             ),

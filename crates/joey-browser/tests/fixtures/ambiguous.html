@@ -1,0 +1,10 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Ambiguous Submit</title></head>
+<body>
+  <h1>Three Submits</h1>
+  <form id="checkout"><button data-ground-truth="s1" onclick="document.body.dataset.which='1'">Submit</button></form>
+  <div><button data-ground-truth="s2" onclick="document.body.dataset.which='2'">Submit</button></div>
+  <div><button data-ground-truth="s3" onclick="document.body.dataset.which='3'">Submit</button></div>
+</body>
+</html>

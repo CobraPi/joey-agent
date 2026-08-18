@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Churn Fixture</title><style>
+body{font-family:sans-serif}
+</style></head>
+<body>
+  <h1>DOM Churn</h1>
+  <div id="zone"></div>
+  <div id="status" data-marker="initial">initial</div>
+  <script>
+    // Destroy + rebuild the controls every 500ms (US2 churn fixture).
+    let n = 0;
+    function rebuild() {
+      n++;
+      const zone = document.getElementById('zone');
+      zone.innerHTML = '';
+      const b = document.createElement('button');
+      b.dataset.groundTruth = 'churn-btn';
+      b.id = 'churn-btn-' + n;
+      b.textContent = 'Churn Button ' + n;
+      b.onclick = () => { document.getElementById('status').dataset.marker = 'clicked-' + n; };
+      const i = document.createElement('input');
+      i.dataset.groundTruth = 'churn-input';
+      i.placeholder = 'churn input';
+      zone.appendChild(b);
+      zone.appendChild(i);
+    }
+    rebuild();
+    setInterval(rebuild, 500);
+  </script>
+</body>
+</html>

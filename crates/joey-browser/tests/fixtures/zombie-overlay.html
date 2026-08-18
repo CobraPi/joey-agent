@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Zombie Overlay</title><style>
+#banner{position:fixed;top:0;left:0;right:0;z-index:8000;background:#322;color:#fff;padding:12px}
+</style></head>
+<body>
+  <h1>Zombie Banner</h1>
+  <div id="count" data-marker="0">0</div>
+  <script>
+    // Reappears 300ms after every dismissal — rate-limit fixture: after 3
+    // dismissals the system must flag, not keep fighting.
+    let n = 0;
+    function show() {
+      const b = document.createElement('div');
+      b.id = 'banner';
+      b.innerHTML = '<span>We use cookies.</span> <button id="bx">Reject all</button>';
+      b.querySelector('#bx').onclick = () => {
+        b.remove();
+        n++;
+        document.getElementById('count').dataset.marker = String(n);
+        setTimeout(show, 300);
+      };
+      document.body.appendChild(b);
+    }
+    show();
+  </script>
+</body>
+</html>

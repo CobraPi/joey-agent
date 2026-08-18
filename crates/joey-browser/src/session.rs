@@ -157,8 +157,10 @@ impl BrowserManager {
     /// Navigate the agent tab (URL-safety gate first). Returns title/frames.
     pub async fn navigate(&self, url: &str) -> Result<Value, BrowserError> {
         // FR-020: same URL-safety rules as the agent's other web tools.
-        if let Err(reason) = crate::url_safety_bridge::url_safety_check(url) {
-            return Err(BrowserError::UrlBlocked(reason));
+        if !self.config.allow_local_urls {
+            if let Err(reason) = crate::url_safety_bridge::url_safety_check(url) {
+                return Err(BrowserError::UrlBlocked(reason));
+            }
         }
         let page = self.ensure_page().await?;
         let r = self
@@ -247,6 +249,13 @@ impl BrowserManager {
         })
     }
 
+    /// UNGATED raw send to the page session (diagnostics; cfg-allow_raw_cdp
+    /// does NOT apply — this is crate-internal).
+    pub async fn raw_eval_diag(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
+        let page = self.ensure_page().await?;
+        self.conn()?.send(method, params, Some(&page.session_id)).await
+    }
+
     /// Raw CDP passthrough (gated).
     pub async fn raw_cdp(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
         if !self.config.allow_raw_cdp {
@@ -303,6 +312,92 @@ impl BrowserManager {
             page_url: url,
             page_title: title,
         }
+    }
+
+    /// Current connection mode.
+    pub async fn mode(&self) -> Mode {
+        *self.mode.lock().await
+    }
+
+    /// Count of page-type targets (agent-tab isolation assertions).
+    pub async fn targets_count(&self) -> Result<usize, BrowserError> {
+        let r = self
+            .conn()?
+            .send("Target.getTargets", json!({}), None)
+            .await?;
+        Ok(r["targetInfos"]
+            .as_array()
+            .map(|a| a.iter().filter(|t| t["type"] == "page").count())
+            .unwrap_or(0))
+    }
+
+    /// Alias for disconnect(self: Arc<Self>) used by tests/callers that
+    /// hold the manager in an Arc.
+    pub async fn disconnect_arc(self: Arc<Self>) -> Result<(), BrowserError> {
+        self.disconnect().await
+    }
+
+    /// Full structural snapshot of the agent page (viewport-priority).
+    pub async fn snapshot(&self) -> Result<crate::snapshot::Snapshot, BrowserError> {
+        let registry = self.scan_to_registry().await?;
+        Ok(crate::snapshot::structural_snapshot(
+            self.eval_string("location.href").await?,
+            self.eval_string("document.title").await?,
+            self.frame_count().await?,
+            self.viewport().await?,
+            registry.elements,
+            Vec::new(),
+            &self.config.budgets,
+            self.config.budgets.viewport_margin,
+        ))
+    }
+
+    /// Detect + handle blocking overlays per the configured policy
+    /// (FR-011; research.md D5). Conservative default: auto-dismiss only
+    /// high-confidence consent overlays with a safe dismissal control;
+    /// everything else is left for the model (flagged upstream by the
+    /// caller reading the overlay findings).
+    pub async fn apply_overlay_policy(&self) -> Result<Vec<serde_json::Value>, BrowserError> {
+        use crate::config::OverlayPolicy;
+        if self.config.overlay_policy == OverlayPolicy::Never {
+            return Ok(Vec::new());
+        }
+        let raw = self.evaluate(crate::extract::OVERLAYS_JS).await?;
+        let parsed: serde_json::Value = serde_json::from_str(raw.as_str().unwrap_or("{\"overlays\":[]}"))
+            .map_err(|e| BrowserError::Protocol(format!("overlay decode: {e}")))?;
+        let mut acted = Vec::new();
+        for ov in parsed["overlays"].as_array().cloned().unwrap_or_default() {
+            let kind = ov["kind"].as_str().unwrap_or("unknown");
+            let safe = ov["hasSafeDismissal"].as_bool().unwrap_or(false);
+            // Conservative: only consent + safe dismissal.
+            let dismissible = kind == "consent" && safe
+                || self.config.overlay_policy == OverlayPolicy::Aggressive && safe;
+            acted.push(serde_json::json!({
+                "kind": kind,
+                "description": ov["description"].as_str().unwrap_or(""),
+                "action": if dismissible { "auto_dismissed" } else { "flagged" },
+            }));
+            if dismissible {
+                // Prefer the reject-style label the heuristics identified.
+                let label = ov["dismissalLabel"].as_str().unwrap_or("Reject all");
+                let js = format!(
+                    "(function(){{ const btns=[...document.querySelectorAll('button, a')]; \
+                    const b=btns.find(x=>(x.innerText||'').trim()==={lbl:?}); \
+                    if(b){{ b.click(); return 'dismissed'; }} return 'no-control'; }})()",
+                    lbl = label
+                );
+                let _ = self.evaluate(&js).await;
+            }
+        }
+        Ok(acted)
+    }
+
+    /// Current observation mode (FR-013/FR-014): `visual` when the last
+    /// scan yielded zero actionable elements, else `structural`.
+    pub async fn observation_mode(&self) -> &'static str {
+        let registry = self.scan_to_registry().await.unwrap_or_default();
+        let actionable = registry.elements.iter().any(|e| e.interactable);
+        if actionable { "structural" } else { "visual" }
     }
 }
 

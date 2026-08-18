@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Native Select</title></head>
+<body>
+  <h1>Native Select</h1>
+  <select id="sel" data-ground-truth="select">
+    <option value="a">Alpha</option>
+    <option value="b">Beta</option>
+    <option value="c">Gamma</option>
+  </select>
+  <div id="report">none</div>
+  <script>
+    document.getElementById('sel').addEventListener('change', e => {
+      document.getElementById('report').textContent = 'selected:' + e.target.value;
+    });
+  </script>
+</body>
+</html>

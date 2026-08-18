@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Nested Scroll</title><style>
+#outer{height:300px;overflow-y:scroll;border:1px solid #999}
+#inner{height:150px;overflow-y:scroll;border:1px solid #666;margin:10px}
+.spacer{height:1200px;background:linear-gradient(#eee,#fff)}
+</style></head>
+<body>
+  <h1>Nested Scroll</h1>
+  <div id="outer" data-ground-truth="outer-scroll">
+    <p>outer top</p>
+    <div id="inner" data-ground-truth="inner-scroll">
+      <p>inner top</p><div class="spacer"></div>
+      <button data-ground-truth="inner-deep-btn" onclick="document.body.dataset.inner='reached'">Deep Inner Button</button>
+    </div>
+    <div class="spacer"></div>
+    <button data-ground-truth="outer-deep-btn" onclick="document.body.dataset.outer='reached'">Deep Outer Button</button>
+  </div>
+</body>
+</html>
