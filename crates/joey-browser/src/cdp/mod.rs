@@ -71,7 +71,8 @@ type Pending = oneshot::Sender<Result<Value, BrowserError>>;
 
 /// Internal command after correlation.
 enum ToWs {
-    Send { id: u64, text: String },
+    Send { _id: u64, text: String },
+    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -144,7 +145,7 @@ impl CdpConnection {
         tokio::spawn(async move {
             while let Some(cmd) = writer_rx.recv().await {
                 match cmd {
-                    ToWs::Send { id: _, text } => {
+                    ToWs::Send { _id: _, text } => {
                         let mut s = sink.lock().await;
                         if s.send(Message::Text(text)).await.is_err() {
                             break;
@@ -180,7 +181,7 @@ impl CdpConnection {
 
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        if self.writer.send(ToWs::Send { id, text }).is_err() {
+        if self.writer.send(ToWs::Send { _id: id, text }).is_err() {
             self.pending.lock().await.remove(&id);
             return Err(BrowserError::NotConnected);
         }

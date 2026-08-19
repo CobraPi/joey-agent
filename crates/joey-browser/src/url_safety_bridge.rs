@@ -3,7 +3,6 @@
 //! function pointer set at wiring time by the higher crate (FR-020 —
 //! reuses the SAME url_safety::is_safe_url the web tools use).
 
-use std::sync::atomic::Ordering;
 use std::sync::RwLock;
 
 type CheckFn = fn(&str) -> Result<(), String>;
@@ -85,6 +84,8 @@ mod tests {
 
     #[test]
     fn injected_check_is_used_then_restored() {
+        use std::sync::atomic::Ordering;
+
         static CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         fn mark_called(_u: &str) -> Result<(), String> {
             CALLED.store(true, Ordering::SeqCst);

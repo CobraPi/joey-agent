@@ -30,7 +30,7 @@ use ratatui::Terminal;
 
 use crate::anim::{Activity, Clock, Equalizer, ParticleField, Pulse, Spinner};
 use crate::input::Input;
-use crate::state::{App, RunMode, TranscriptItem};
+use crate::state::{App, RunMode, TranscriptItem, NoticeKind};
 use crate::theme::Theme;
 use crate::widgets;
 
@@ -1686,6 +1686,21 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             let (x, y, w, h) = self.app.last_header_right_rect.get();
             if w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w {
                 self.app.toggle_stats();
+                return;
+            }
+        }
+        // HyperCode badge in header: toggles the feature.
+        {
+            let (x, y, w, h) = self.app.last_hypercode_rect.get();
+            if w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w {
+                self.app.hypercode_enabled = !self.app.hypercode_enabled;
+                self.app.push_item(crate::TranscriptItem::Notice {
+                    text: format!(
+                        "⚡ HyperCode mode: {}",
+                        if self.app.hypercode_enabled { "ON" } else { "OFF" }
+                    ),
+                    kind: NoticeKind::Success,
+                });
                 return;
             }
         }

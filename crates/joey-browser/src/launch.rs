@@ -37,6 +37,7 @@ const UNIX_NAMES: &[&str] = &[
     "brave-browser",
 ];
 
+#[allow(dead_code)]
 const WINDOWS_CANDIDATES: &[&str] = &[
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",

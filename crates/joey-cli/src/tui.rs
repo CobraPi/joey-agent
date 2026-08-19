@@ -114,6 +114,8 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     app_state.provider = provider_name.to_string();
     app_state.cwd = cwd.to_string_lossy().into_owned();
     app_state.show_reasoning = config.get_bool("display.show_reasoning", true);
+    // Load HyperCode enabled state from config
+    app_state.hypercode_enabled = config.get_bool("hypercode.enabled", false);
     // Slash-command popup catalog: inject the shared registry (single source
     // of truth in crate::slash — the TUI crate cannot depend on joey-cli).
     app_state.slash_commands = crate::slash::REGISTRY
@@ -133,10 +135,23 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     // Feature 015 (NeuroCode): when the engine is enabled in config,
     // build_agent wires it into the agent's turn loop. Surface the state in
     // the TUI immediately (status badge + bottom-right live context panel).
-    if crate::neurocode_wiring::try_build_engine(&config).is_some() {
+    let neurocode_active = crate::neurocode_wiring::try_build_engine(&config).is_some();
+    if neurocode_active {
         app_state.apply(joey_agent_core::AgentEvent::NeuroCodeActive { active: true });
         app_state.push_item(TranscriptItem::Notice {
             text: "⚡ NeuroCode active — dependency-aware context injection is ON (live feed: bottom-right panel)".into(),
+            kind: NoticeKind::Success,
+        });
+    }
+    // HyperCode additive: show if it's enabled alongside NeuroCode
+    if app_state.hypercode_enabled && neurocode_active {
+        app_state.push_item(TranscriptItem::Notice {
+            text: "⚡ HyperCode also active — parallel task optimization is ON (works with NeuroCode context)".into(),
+            kind: NoticeKind::Success,
+        });
+    } else if app_state.hypercode_enabled {
+        app_state.push_item(TranscriptItem::Notice {
+            text: "⚡ HyperCode active — parallel task optimization is ON".into(),
             kind: NoticeKind::Success,
         });
     }
@@ -692,6 +707,39 @@ impl TuiSession {
             Err(e) => {
                 self.tui.app_mut().push_item(TranscriptItem::Error {
                     text: format!("start-work failed: {e}"),
+                });
+            }
+        }
+    }
+
+    /// /hypercode: parallel task optimization status and configuration.
+    fn handle_hypercode_slash(&mut self, args: &str) {
+        let provider = self.tui.app().provider.clone();
+        match crate::repl::hypercode_slash_with_provider(&provider, args) {
+            Ok(crate::hypercode::HyperCodeOutput::Text(lines)) => {
+                for line in lines {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: line,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            Ok(crate::hypercode::HyperCodeOutput::Toggle(new_state)) => {
+                self.tui.app_mut().hypercode_enabled = new_state;
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: format!("⚡ HyperCode mode toggled: {} (saved to config.yaml)", if new_state { "ON" } else { "OFF" }),
+                    kind: NoticeKind::Success,
+                });
+            }
+            Ok(crate::hypercode::HyperCodeOutput::Configured(msg)) => {
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: msg,
+                    kind: NoticeKind::Success,
+                });
+            }
+            Err(e) => {
+                self.tui.app_mut().push_item(TranscriptItem::Error {
+                    text: e,
                 });
             }
         }
@@ -1461,6 +1509,11 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                         kind: NoticeKind::Info,
                     });
                 }
+            }
+            "hypercode" => {
+                // HyperCode parallel optimization — TUI version.
+                let args = slash_args_after(input, "hypercode");
+                self.handle_hypercode_slash(args);
             }
             name => {
                 self.tui.app_mut().push_item(TranscriptItem::Notice {

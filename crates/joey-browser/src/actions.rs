@@ -169,7 +169,7 @@ impl BrowserManager {
         direction: &str,
         amount_px: f64,
     ) -> Result<ActionResult, BrowserError> {
-        let s = &self.ensure_page().await?.session_id;
+        let _s = &self.ensure_page().await?.session_id;
         let sign = if direction.eq_ignore_ascii_case("up") { -1.0 } else { 1.0 };
         match target {
             None => {

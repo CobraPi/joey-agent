@@ -3,7 +3,6 @@
 //! FR-004a, FR-012).
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::config::SnapshotBudgets;
 use crate::refs::{ElementRef, Rect};

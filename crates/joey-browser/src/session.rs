@@ -327,7 +327,7 @@ impl BrowserManager {
         let mode = *self.mode.lock().await;
         let page = self.page.lock().await.clone();
         let (url, title) = match page {
-            Some(p) => match self.evaluate("({ url: location.href, title: document.title })").await {
+            Some(_p) => match self.evaluate("({ url: location.href, title: document.title })").await {
                 Ok(v) => (
                     v["url"].as_str().map(str::to_string),
                     v["title"].as_str().map(str::to_string),

@@ -24,6 +24,7 @@ use reedline::{
 
 use crate::render::{self, RenderOptions};
 use crate::slash::{self, Resolution};
+use crate::hypercode::HyperCodeOutput;
 
 /// Interval for automatic checkpoints (in seconds).
 const AUTO_CHECKPOINT_INTERVAL_SECS: u64 = 120;
@@ -1090,7 +1091,27 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         "speckit-status" => speckit_status_slash(),
         "speckit-help" => println!("{}", crate::speckit_slash::render_help()),
         // ── HyperCode parallel optimization ──
-        "hypercode" => hypercode_slash(st, args).await,
+        "hypercode" => {
+            match hypercode_slash(st, args) {
+                Ok(crate::hypercode::HyperCodeOutput::Text(lines)) => {
+                    for line in lines {
+                        println!("  {}", line);
+                    }
+                }
+                Ok(crate::hypercode::HyperCodeOutput::Toggle(new_state)) => {
+                    render::success(&format!(
+                        "⚡ HyperCode mode toggled: {} (saved to config.yaml)",
+                        if new_state { "ON" } else { "OFF" }
+                    ));
+                }
+                Ok(crate::hypercode::HyperCodeOutput::Configured(msg)) => {
+                    render::success(&msg);
+                }
+                Err(e) => {
+                    render::error(&e);
+                }
+            }
+        }
         other => {
             // Registry says implemented but no handler — treat as unported.
             println!("Command '/{}' is not available in joey-agent yet.", other);
@@ -2150,49 +2171,114 @@ fn revert_slash(st: &mut ReplState, args: &str) {
 
 /// `/hypercode` — HyperCode parallel optimization slash command.
 ///
+/// CLI version: prints to stdout.
+/// TUI version: returns HyperCodeOutput for display in transcript.
+///
+/// NOTE: HyperCode is currently a **visual indicator** in the TUI that signals
+/// the model to use parallel subagent delegation. The actual parallelization
+/// happens through the existing `delegate_task` tool with batch mode:
+/// - All subagents get full TUI visibility (per-subagent panes, live streaming)
+/// - Events: SubagentSpawn, SubagentEvent, SubagentComplete
+/// - Fully interactive: you can click tabs to see each subagent's transcript
+///
+/// ADDITIVE WITH NEUROCODE: HyperCode and NeuroCode are independent features
+/// that work together:
+/// - NeuroCode: Dependency-aware context injection (what code to include)
+/// - HyperCode: Parallel task decomposition (how to execute in parallel)
+/// - When both are enabled, NeuroCode provides rich context to each parallel
+///   HyperCode subagent, maximizing both context quality and execution speed.
+/// - Each HyperCode subagent receives NeuroCode's dependency-aware context
+///   based on its specific task focus, ensuring parallel agents work with
+///   the right subset of code.
+///
 /// Usage:
 /// - `/hypercode status` — Show current HyperCode configuration
+/// - `/hypercode toggle` — Toggle HyperCode mode ON/OFF (visual indicator in TUI)
 /// - `/hypercode configure <explorer|implementor> <provider> <model>` — Set model for a role
 /// - `/hypercode configure <explorer|implementor> <provider> --reasoning <none|low|medium|high>` — Set reasoning level
 /// - `/hypercode configure <explorer|implementor> <provider> --tokens <N>` — Set context window size
 /// - `/hypercode configure <explorer|implementor> <provider> --turns <N>` — Set max turns
-/// - `/hypercode toggle` — Toggle HyperCode mode on/off
-async fn hypercode_slash(st: &mut ReplState, args: &str) {
-    use crate::hypercode::{HyperCodeConfig, ExplorerConfig, ImplementorConfig};
-    
+pub fn hypercode_slash(st: &mut ReplState, args: &str) -> Result<HyperCodeOutput, String> {
+    hypercode_slash_with_provider(st.agent.provider_name(), args)
+}
+
+/// HyperCode slash command with explicit provider (usable from TUI).
+pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<HyperCodeOutput, String> {
+    use crate::hypercode::HyperCodeConfig;
+    use joey_core::Config;
+
     let args = args.trim();
-    
+
     if args.is_empty() || args == "status" {
-        // Show current HyperCode configuration
-        let config = HyperCodeConfig::default();
-        let provider = &st.agent.provider();
+        // Show current HyperCode configuration from config
+        let cfg = Config::load()
+            .map_err(|e| format!("Failed to load config: {}", e))?;
+        let hc_config = HyperCodeConfig::from_config(&cfg);
+        let neurocode_cfg = joey_neurocode::NeuroCodeConfig::from_config(&cfg);
+        let neurocode_active = neurocode_cfg.enabled;
+
+        let explorer_cfg = hc_config.get_explorer_config(provider);
+        let impl_cfg = hc_config.get_implementor_config(provider);
         
-        let explorer_cfg = config.get_explorer_config(provider);
-        let impl_cfg = config.get_implementor_config(provider);
+        let explorer_tokens = if explorer_cfg.max_tokens == 0 { "default".to_string() } else { explorer_cfg.max_tokens.to_string() };
+        let impl_tokens = if impl_cfg.max_tokens == 0 { "default".to_string() } else { impl_cfg.max_tokens.to_string() };
         
-        println!();
-        println!("{} HyperCode Status:", nu_ansi_term::Color::Cyan.bold().paint("●"));
-        println!("  Provider: {}", provider);
-        println!();
-        println!("  Explorer Agent:");
-        println!("    Model: {}", explorer_cfg.model);
-        println!("    Max turns: {}", explorer_cfg.max_turns);
-        println!("    Max tokens: {}", if explorer_cfg.max_tokens == 0 { "default" } else { &explorer_cfg.max_tokens.to_string() });
-        println!("    Reasoning: {}", explorer_cfg.reasoning_level);
-        println!();
-        println!("  Implementor Agent:");
-        println!("    Model: {}", impl_cfg.model);
-        println!("    Max turns: {}", impl_cfg.max_turns);
-        println!("    Max tokens: {}", if impl_cfg.max_tokens == 0 { "default" } else { &impl_cfg.max_tokens.to_string() });
-        println!("    Reasoning: {}", impl_cfg.reasoning_level);
-        println!();
-        println!("Configuration examples:");
-        println!("  /hypercode configure explorer anthropic claude-sonnet-4-20250514");
-        println!("  /hypercode configure explorer anthropic --reasoning high");
-        println!("  /hypercode configure implementor anthropic --tokens 128000");
-        println!("  /hypercode configure explorer anthropic --turns 10");
-        println!();
-        return;
+        let mut lines = vec![
+            "HyperCode Status:".to_string(),
+            format!("  Mode: {} (visual indicator in TUI)", if hc_config.enabled { "ON ⚡" } else { "OFF" }),
+            format!("  Provider: {}", provider),
+        ];
+        
+        // Add NeuroCode integration status
+        if neurocode_active {
+            lines.push("".to_string());
+            lines.push("  + NeuroCode is active:".to_string());
+            lines.push("    HyperCode works ADDITIVELY with NeuroCode:".to_string());
+            lines.push("    • NeuroCode provides dependency-aware context".to_string());
+            lines.push("    • HyperCode adds parallel task decomposition".to_string());
+            lines.push("    • Together: rich context + parallel execution".to_string());
+        }
+        
+        lines.extend(vec![
+            "".to_string(),
+            "Explorer Agent:".to_string(),
+            format!("    Model: {}", explorer_cfg.model),
+            format!("    Max turns: {}", explorer_cfg.max_turns),
+            format!("    Max tokens: {}", explorer_tokens),
+            format!("    Reasoning: {}", explorer_cfg.reasoning_level),
+            "".to_string(),
+            "Implementor Agent:".to_string(),
+            format!("    Model: {}", impl_cfg.model),
+            format!("    Max turns: {}", impl_cfg.max_turns),
+            format!("    Max tokens: {}", impl_tokens),
+            format!("    Reasoning: {}", impl_cfg.reasoning_level),
+            "".to_string(),
+            "How it works:".to_string(),
+            "  HyperCode adds a '⚡' badge to the TUI header when enabled.".to_string(),
+            "  The model receives a hint to use delegate_task in batch mode.".to_string(),
+            "  All subagents get full TUI visibility (per-subagent panes).".to_string(),
+            "  Click the ⚡ badge in the TUI to toggle HyperCode mode.".to_string(),
+        ]);
+        
+        if neurocode_active {
+            lines.push("".to_string());
+            lines.push("NeuroCode + HyperCode synergy:".to_string());
+            lines.push("  Use /neurocode to manage the context engine.".to_string());
+            lines.push("  Use /hypercode to manage parallel execution.".to_string());
+        }
+        
+        lines.extend(vec![
+            "".to_string(),
+            "Configuration examples:".to_string(),
+            "  /hypercode toggle                    # Toggle HyperCode mode".to_string(),
+            "  /hypercode configure explorer anthropic claude-sonnet-4-20250514".to_string(),
+            "  /hypercode configure explorer anthropic --reasoning high".to_string(),
+            "  /hypercode configure implementor anthropic --tokens 128000".to_string(),
+            "  /hypercode configure explorer anthropic --turns 10".to_string(),
+            "".to_string(),
+        ]);
+        
+        return Ok(HyperCodeOutput::Text(lines));
     }
     
     let parts: Vec<&str> = args.split_whitespace().collect();
@@ -2204,18 +2290,33 @@ async fn hypercode_slash(st: &mut ReplState, args: &str) {
             let is_implementor = *role_str == "implementor";
             
             if !is_explorer && !is_implementor {
-                render::error("Invalid role. Use 'explorer' or 'implementor'.");
-                return;
+                return Err("Invalid role. Use 'explorer' or 'implementor'.".to_string());
             }
             
             let provider_name = provider.to_string();
             let model_name = model.to_string();
             
-            render::success(&format!(
-                "HyperCode {} model for provider '{}': {}",
+            // Load current config, update, and save
+            let cfg = Config::load()
+                .map_err(|e| format!("Failed to load config: {}", e))?;
+            let mut hc_config = HyperCodeConfig::from_config(&cfg);
+            
+            if is_explorer {
+                let mut ec = hc_config.get_explorer_config(&provider_name);
+                ec.model = model_name.clone();
+                HyperCodeConfig::save_explorer_config(&provider_name, &ec)
+                    .map_err(|e| format!("Failed to save config: {}", e))?;
+            } else {
+                let mut ic = hc_config.get_implementor_config(&provider_name);
+                ic.model = model_name.clone();
+                HyperCodeConfig::save_implementor_config(&provider_name, &ic)
+                    .map_err(|e| format!("Failed to save config: {}", e))?;
+            }
+            
+            Ok(HyperCodeOutput::Configured(format!(
+                "✓ HyperCode {} model for provider '{}': {} (saved to config.yaml)",
                 role_str, provider_name, model_name
-            ));
-            render::info("(Configuration would persist to config.yaml in a full implementation)");
+            )))
         }
         ["configure", role_str, provider, "--reasoning", level] => {
             // Configure reasoning level
@@ -2223,22 +2324,38 @@ async fn hypercode_slash(st: &mut ReplState, args: &str) {
             let is_implementor = *role_str == "implementor";
             
             if !is_explorer && !is_implementor {
-                render::error("Invalid role. Use 'explorer' or 'implementor'.");
-                return;
+                return Err("Invalid role. Use 'explorer' or 'implementor'.".to_string());
             }
             
             let valid_levels = ["none", "low", "medium", "high"];
             if !valid_levels.contains(level) {
-                render::error(&format!("Invalid reasoning level '{}'. Use: none, low, medium, high", level));
-                return;
+                return Err(format!("Invalid reasoning level '{}'. Use: none, low, medium, high", level));
             }
             
             let provider_name = provider.to_string();
+            let level_str = level.to_string();
             
-            render::success(&format!(
-                "HyperCode {} reasoning level for provider '{}': {}",
-                role_str, provider_name, level
-            ));
+            // Load current config, update, and save
+            let cfg = Config::load()
+                .map_err(|e| format!("Failed to load config: {}", e))?;
+            let mut hc_config = HyperCodeConfig::from_config(&cfg);
+            
+            if is_explorer {
+                let mut ec = hc_config.get_explorer_config(&provider_name);
+                ec.reasoning_level = level_str.clone();
+                HyperCodeConfig::save_explorer_config(&provider_name, &ec)
+                    .map_err(|e| format!("Failed to save config: {}", e))?;
+            } else {
+                let mut ic = hc_config.get_implementor_config(&provider_name);
+                ic.reasoning_level = level_str.clone();
+                HyperCodeConfig::save_implementor_config(&provider_name, &ic)
+                    .map_err(|e| format!("Failed to save config: {}", e))?;
+            }
+            
+            Ok(HyperCodeOutput::Configured(format!(
+                "✓ HyperCode {} reasoning level for provider '{}': {} (saved to config.yaml)",
+                role_str, provider_name, level_str
+            )))
         }
         ["configure", role_str, provider, "--tokens", tokens_str] => {
             // Configure max tokens
@@ -2246,24 +2363,40 @@ async fn hypercode_slash(st: &mut ReplState, args: &str) {
             let is_implementor = *role_str == "implementor";
             
             if !is_explorer && !is_implementor {
-                render::error("Invalid role. Use 'explorer' or 'implementor'.");
-                return;
+                return Err("Invalid role. Use 'explorer' or 'implementor'.".to_string());
             }
             
             let tokens: usize = match tokens_str.parse() {
                 Ok(n) => n,
                 Err(_) => {
-                    render::error(&format!("Invalid token count '{}'", tokens_str));
-                    return;
+                    return Err(format!("Invalid token count '{}'", tokens_str));
                 }
             };
-            
+
             let provider_name = provider.to_string();
+            let tokens_display = if tokens == 0 { "default".to_string() } else { tokens.to_string() };
+
+            // Load current config, update, and save
+            let cfg = Config::load()
+                .map_err(|e| format!("Failed to load config: {}", e))?;
+            let mut hc_config = HyperCodeConfig::from_config(&cfg);
             
-            render::success(&format!(
-                "HyperCode {} context window for provider '{}': {} tokens",
-                role_str, provider_name, if tokens == 0 { "default" } else { &tokens.to_string() }
-            ));
+            if is_explorer {
+                let mut ec = hc_config.get_explorer_config(&provider_name);
+                ec.max_tokens = tokens;
+                HyperCodeConfig::save_explorer_config(&provider_name, &ec)
+                    .map_err(|e| format!("Failed to save config: {}", e))?;
+            } else {
+                let mut ic = hc_config.get_implementor_config(&provider_name);
+                ic.max_tokens = tokens;
+                HyperCodeConfig::save_implementor_config(&provider_name, &ic)
+                    .map_err(|e| format!("Failed to save config: {}", e))?;
+            }
+
+            Ok(HyperCodeOutput::Configured(format!(
+                "✓ HyperCode {} context window for provider '{}': {} tokens (saved to config.yaml)",
+                role_str, provider_name, tokens_display
+            )))
         }
         ["configure", role_str, provider, "--turns", turns_str] => {
             // Configure max turns
@@ -2271,36 +2404,63 @@ async fn hypercode_slash(st: &mut ReplState, args: &str) {
             let is_implementor = *role_str == "implementor";
             
             if !is_explorer && !is_implementor {
-                render::error("Invalid role. Use 'explorer' or 'implementor'.");
-                return;
+                return Err("Invalid role. Use 'explorer' or 'implementor'.".to_string());
             }
             
             let turns: usize = match turns_str.parse() {
                 Ok(n) if n > 0 => n,
                 _ => {
-                    render::error(&format!("Invalid turn count '{}'", turns_str));
-                    return;
+                    return Err(format!("Invalid turn count '{}'", turns_str));
                 }
             };
             
             let provider_name = provider.to_string();
             
-            render::success(&format!(
-                "HyperCode {} max turns for provider '{}': {}",
+            // Load current config, update, and save
+            let cfg = Config::load()
+                .map_err(|e| format!("Failed to load config: {}", e))?;
+            let mut hc_config = HyperCodeConfig::from_config(&cfg);
+            
+            if is_explorer {
+                let mut ec = hc_config.get_explorer_config(&provider_name);
+                ec.max_turns = turns;
+                HyperCodeConfig::save_explorer_config(&provider_name, &ec)
+                    .map_err(|e| format!("Failed to save config: {}", e))?;
+            } else {
+                let mut ic = hc_config.get_implementor_config(&provider_name);
+                ic.max_turns = turns;
+                HyperCodeConfig::save_implementor_config(&provider_name, &ic)
+                    .map_err(|e| format!("Failed to save config: {}", e))?;
+            }
+            
+            Ok(HyperCodeOutput::Configured(format!(
+                "✓ HyperCode {} max turns for provider '{}': {} (saved to config.yaml)",
                 role_str, provider_name, turns
-            ));
+            )))
         }
         ["toggle"] => {
-            render::info("HyperCode mode toggled. (In a full implementation, this would enable/disable parallel optimization)");
+            // Toggle HyperCode enabled state and persist to config
+            let cfg = Config::load()
+                .map_err(|e| format!("Failed to load config: {}", e))?;
+            let hc_config = HyperCodeConfig::from_config(&cfg);
+            let new_state = !hc_config.enabled;
+            
+            HyperCodeConfig::save_enabled(new_state)
+                .map_err(|e| format!("Failed to save config: {}", e))?;
+            
+            Ok(HyperCodeOutput::Toggle(new_state))
         }
         _ => {
-            render::error("Invalid usage. Options:");
-            render::info("  /hypercode status");
-            render::info("  /hypercode configure <explorer|implementor> <provider> <model>");
-            render::info("  /hypercode configure <explorer|implementor> <provider> --reasoning <none|low|medium|high>");
-            render::info("  /hypercode configure <explorer|implementor> <provider> --tokens <N>");
-            render::info("  /hypercode configure <explorer|implementor> <provider> --turns <N>");
-            render::info("  /hypercode toggle");
+            let help_lines = vec![
+                "Invalid usage. Options:".to_string(),
+                "  /hypercode status".to_string(),
+                "  /hypercode configure <explorer|implementor> <provider> <model>".to_string(),
+                "  /hypercode configure <explorer|implementor> <provider> --reasoning <none|low|medium|high>".to_string(),
+                "  /hypercode configure <explorer|implementor> <provider> --tokens <N>".to_string(),
+                "  /hypercode configure <explorer|implementor> <provider> --turns <N>".to_string(),
+                "  /hypercode toggle".to_string(),
+            ];
+            Ok(HyperCodeOutput::Text(help_lines))
         }
     }
 }

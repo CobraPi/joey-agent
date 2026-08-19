@@ -8,9 +8,8 @@
 //! refid → locator → text → geometry → refuse-with-candidates.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-/// Viewport-coordinate rectangle.
+/// References to page elements for stable interaction across navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: f64,

@@ -104,11 +104,15 @@ logging:
 timezone: ""
 cron:
   provider: ""
+hypercode:
+  enabled: false
+  explorer: {}
+  implementor: {}
 _config_version: 33
 "#;
 
 /// Config schema version written on save (upstream `_config_version`).
-pub const CONFIG_VERSION: i64 = 33;
+pub const CONFIG_VERSION: i64 = 34;
 
 static DEFAULTS: Lazy<Value> = Lazy::new(|| {
     // SAFETY: DEFAULT_CONFIG_YAML is a compile-time constant; if it were

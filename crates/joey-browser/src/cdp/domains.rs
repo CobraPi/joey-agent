@@ -6,12 +6,14 @@ use serde_json::{json, Value};
 
 /// `Target.createTarget` → returns targetId.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[allow(non_snake_case)]
 pub struct CreateTargetResult {
     pub targetId: String,
 }
 
 /// `Target.attachToTarget` → sessionId.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[allow(non_snake_case)]
 pub struct AttachToTargetResult {
     pub sessionId: String,
 }
@@ -45,6 +47,7 @@ pub struct FrameTreeNode {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[allow(non_snake_case)]
 pub struct GetFrameTreeResult {
     pub frameTree: FrameTreeNode,
 }
