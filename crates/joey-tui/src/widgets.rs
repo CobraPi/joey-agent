@@ -213,6 +213,30 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
             x += 1;
         }
     }
+    
+    // HyperCode indicator (enabled/disabled badge).
+    if app.hypercode_enabled {
+        let badge = if app.is_busy() { "⚡ HYPER" } else { "⚡" };
+        let badge_style = Style::default()
+            .fg(theme.accent.to_color())
+            .add_modifier(Modifier::BOLD);
+        let badge_start_x = x + 2;
+        for ch in badge.chars() {
+            if badge_start_x + (badge.chars().count() as u16) > inner.x + inner.width {
+                break;
+            }
+            let cell = &mut buf[(badge_start_x, inner.y)];
+            cell.set_char(ch).set_style(badge_style);
+        }
+        // Record the badge rect for click hit-testing.
+        app.last_hypercode_rect.set((
+            badge_start_x,
+            inner.y,
+            badge.chars().count() as u16,
+            1,
+        ));
+    }
+    
     // Render right portion, right-aligned.
     let right_len: usize = right_spans
         .iter()

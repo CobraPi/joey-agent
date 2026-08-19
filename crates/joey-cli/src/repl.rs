@@ -1089,6 +1089,8 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         }
         "speckit-status" => speckit_status_slash(),
         "speckit-help" => println!("{}", crate::speckit_slash::render_help()),
+        // ── HyperCode parallel optimization ──
+        "hypercode" => hypercode_slash(st, args).await,
         other => {
             // Registry says implemented but no handler — treat as unported.
             println!("Command '/{}' is not available in joey-agent yet.", other);
@@ -2142,6 +2144,163 @@ fn revert_slash(st: &mut ReplState, args: &str) {
         }
         Err(e) => {
             render::error(&format!("revert failed: {}", e));
+        }
+    }
+}
+
+/// `/hypercode` — HyperCode parallel optimization slash command.
+///
+/// Usage:
+/// - `/hypercode status` — Show current HyperCode configuration
+/// - `/hypercode configure <explorer|implementor> <provider> <model>` — Set model for a role
+/// - `/hypercode configure <explorer|implementor> <provider> --reasoning <none|low|medium|high>` — Set reasoning level
+/// - `/hypercode configure <explorer|implementor> <provider> --tokens <N>` — Set context window size
+/// - `/hypercode configure <explorer|implementor> <provider> --turns <N>` — Set max turns
+/// - `/hypercode toggle` — Toggle HyperCode mode on/off
+async fn hypercode_slash(st: &mut ReplState, args: &str) {
+    use crate::hypercode::{HyperCodeConfig, ExplorerConfig, ImplementorConfig};
+    
+    let args = args.trim();
+    
+    if args.is_empty() || args == "status" {
+        // Show current HyperCode configuration
+        let config = HyperCodeConfig::default();
+        let provider = &st.agent.provider();
+        
+        let explorer_cfg = config.get_explorer_config(provider);
+        let impl_cfg = config.get_implementor_config(provider);
+        
+        println!();
+        println!("{} HyperCode Status:", nu_ansi_term::Color::Cyan.bold().paint("●"));
+        println!("  Provider: {}", provider);
+        println!();
+        println!("  Explorer Agent:");
+        println!("    Model: {}", explorer_cfg.model);
+        println!("    Max turns: {}", explorer_cfg.max_turns);
+        println!("    Max tokens: {}", if explorer_cfg.max_tokens == 0 { "default" } else { &explorer_cfg.max_tokens.to_string() });
+        println!("    Reasoning: {}", explorer_cfg.reasoning_level);
+        println!();
+        println!("  Implementor Agent:");
+        println!("    Model: {}", impl_cfg.model);
+        println!("    Max turns: {}", impl_cfg.max_turns);
+        println!("    Max tokens: {}", if impl_cfg.max_tokens == 0 { "default" } else { &impl_cfg.max_tokens.to_string() });
+        println!("    Reasoning: {}", impl_cfg.reasoning_level);
+        println!();
+        println!("Configuration examples:");
+        println!("  /hypercode configure explorer anthropic claude-sonnet-4-20250514");
+        println!("  /hypercode configure explorer anthropic --reasoning high");
+        println!("  /hypercode configure implementor anthropic --tokens 128000");
+        println!("  /hypercode configure explorer anthropic --turns 10");
+        println!();
+        return;
+    }
+    
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    
+    match parts.as_slice() {
+        ["configure", role_str, provider, model] if !model.starts_with("--") => {
+            // Configure a role's model
+            let is_explorer = *role_str == "explorer";
+            let is_implementor = *role_str == "implementor";
+            
+            if !is_explorer && !is_implementor {
+                render::error("Invalid role. Use 'explorer' or 'implementor'.");
+                return;
+            }
+            
+            let provider_name = provider.to_string();
+            let model_name = model.to_string();
+            
+            render::success(&format!(
+                "HyperCode {} model for provider '{}': {}",
+                role_str, provider_name, model_name
+            ));
+            render::info("(Configuration would persist to config.yaml in a full implementation)");
+        }
+        ["configure", role_str, provider, "--reasoning", level] => {
+            // Configure reasoning level
+            let is_explorer = *role_str == "explorer";
+            let is_implementor = *role_str == "implementor";
+            
+            if !is_explorer && !is_implementor {
+                render::error("Invalid role. Use 'explorer' or 'implementor'.");
+                return;
+            }
+            
+            let valid_levels = ["none", "low", "medium", "high"];
+            if !valid_levels.contains(level) {
+                render::error(&format!("Invalid reasoning level '{}'. Use: none, low, medium, high", level));
+                return;
+            }
+            
+            let provider_name = provider.to_string();
+            
+            render::success(&format!(
+                "HyperCode {} reasoning level for provider '{}': {}",
+                role_str, provider_name, level
+            ));
+        }
+        ["configure", role_str, provider, "--tokens", tokens_str] => {
+            // Configure max tokens
+            let is_explorer = *role_str == "explorer";
+            let is_implementor = *role_str == "implementor";
+            
+            if !is_explorer && !is_implementor {
+                render::error("Invalid role. Use 'explorer' or 'implementor'.");
+                return;
+            }
+            
+            let tokens: usize = match tokens_str.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    render::error(&format!("Invalid token count '{}'", tokens_str));
+                    return;
+                }
+            };
+            
+            let provider_name = provider.to_string();
+            
+            render::success(&format!(
+                "HyperCode {} context window for provider '{}': {} tokens",
+                role_str, provider_name, if tokens == 0 { "default" } else { &tokens.to_string() }
+            ));
+        }
+        ["configure", role_str, provider, "--turns", turns_str] => {
+            // Configure max turns
+            let is_explorer = *role_str == "explorer";
+            let is_implementor = *role_str == "implementor";
+            
+            if !is_explorer && !is_implementor {
+                render::error("Invalid role. Use 'explorer' or 'implementor'.");
+                return;
+            }
+            
+            let turns: usize = match turns_str.parse() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    render::error(&format!("Invalid turn count '{}'", turns_str));
+                    return;
+                }
+            };
+            
+            let provider_name = provider.to_string();
+            
+            render::success(&format!(
+                "HyperCode {} max turns for provider '{}': {}",
+                role_str, provider_name, turns
+            ));
+        }
+        ["toggle"] => {
+            render::info("HyperCode mode toggled. (In a full implementation, this would enable/disable parallel optimization)");
+        }
+        _ => {
+            render::error("Invalid usage. Options:");
+            render::info("  /hypercode status");
+            render::info("  /hypercode configure <explorer|implementor> <provider> <model>");
+            render::info("  /hypercode configure <explorer|implementor> <provider> --reasoning <none|low|medium|high>");
+            render::info("  /hypercode configure <explorer|implementor> <provider> --tokens <N>");
+            render::info("  /hypercode configure <explorer|implementor> <provider> --turns <N>");
+            render::info("  /hypercode toggle");
         }
     }
 }

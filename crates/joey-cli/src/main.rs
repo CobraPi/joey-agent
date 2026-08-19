@@ -11,6 +11,7 @@ mod commands;
 mod clipboard;
 mod engine;
 mod history;
+mod hypercode;
 mod llm_selector;
 mod neurocode_wiring;
 mod slash_menu;
