@@ -217,7 +217,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         session_id: session_id.clone(),
     };
     let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<crate::engine::EngineEvent>();
-    let (engine, interrupt) = crate::engine::spawn_engine(agent, ev_tx);
+    let (engine, interrupt) = crate::engine::spawn_engine(agent, engine_spec.clone(), ev_tx);
 
     // Parallel-subagent feature: install the process-global delegation
     // event tap. Every SubagentManager in this process (including engines
@@ -737,6 +737,28 @@ impl TuiSession {
                     kind: NoticeKind::Success,
                 });
             }
+            Ok(crate::hypercode::HyperCodeOutput::Run { goal }) => {
+                // Execute on the engine: children stream live through the
+                // global orchestration tap into native TUI panes + rail +
+                // job board; phase progress arrives as HypercodeProgress.
+                if self.engine.is_none() {
+                    self.tui.app_mut().push_item(TranscriptItem::Error {
+                        text: "engine unavailable — cannot start hypercode run".into(),
+                    });
+                    return;
+                }
+                self.busy = true;
+                self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
+                self.tui.app_mut().hypercode_phase = None;
+                self.tui.app_mut().job_board_visible = true;
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "⚡ HyperCode run starting on the engine — subagents appear on the right rail; Ctrl-C interrupts".into(),
+                    kind: NoticeKind::Busy,
+                });
+                if let Some(engine) = &self.engine {
+                    engine.send(crate::engine::EngineCommand::Hypercode { goal });
+                }
+            }
             Err(e) => {
                 self.tui.app_mut().push_item(TranscriptItem::Error {
                     text: e,
@@ -814,13 +836,20 @@ impl TuiSession {
             }
         };
         let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<crate::engine::EngineEvent>();
-        let (engine, interrupt) = crate::engine::spawn_engine(agent, ev_tx);
+        let (engine, interrupt) = crate::engine::spawn_engine(
+            agent,
+            self.engine_spec.clone(),
+            ev_tx,
+        );
         self.ev_rx = ev_rx;
         self.engine = Some(engine);
         self.interrupt = interrupt;
         self.busy = false;
         // The killed turn never sends Done — reset the RunMode ourselves.
         self.tui.app_mut().mode = joey_tui::state::RunMode::Input;
+        // A hypercode run dying with the engine never emits its final
+        // HeavyJobFinished — clear the live phase badge.
+        self.tui.app_mut().hypercode_phase = None;
         self.tui.app_mut().push_item(TranscriptItem::Notice {
             text: format!("☠ engine killed & restarted ({reason}) — GUI stayed live"),
             kind: NoticeKind::Warning,
@@ -961,12 +990,24 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
             }
             None
         }
+        Some(crate::engine::EngineEvent::HypercodeProgress { phase, detail }) => {
+            // Live phase banner for the running hypercode pipeline. The
+            // badge picks this up (⚡ PLAN/EXPL/BUILD/SYNTH) and the
+            // transcript records the transition.
+            session.tui.app_mut().hypercode_phase = Some(phase.clone());
+            session.tui.app_mut().push_item(TranscriptItem::Notice {
+                text: format!("⚡ hypercode: {phase} — {detail}"),
+                kind: NoticeKind::Busy,
+            });
+            None
+        }
         Some(crate::engine::EngineEvent::HeavyJobFinished { label: _, text }) => {
             session.busy = false;
             // A heavy job never sends AgentEvent::Done, so reset the
             // RunMode ourselves — without this the status bar stays BUSY
             // forever after /neurocode completes.
             session.tui.app_mut().mode = joey_tui::state::RunMode::Input;
+            session.tui.app_mut().hypercode_phase = None;
             for line in text.lines() {
                 session.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: line.to_string(),
@@ -1010,6 +1051,7 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
             // Engine death never sends Done — reset the RunMode ourselves
             // or the status bar stays BUSY forever.
             session.tui.app_mut().mode = joey_tui::state::RunMode::Input;
+            session.tui.app_mut().hypercode_phase = None;
             session.tui.app_mut().push_item(TranscriptItem::Error { text: msg });
             Some(PumpOutcome::EngineGone)
         }
@@ -1017,6 +1059,7 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
             session.busy = false;
             session.engine_queued.clear();
             session.tui.app_mut().mode = joey_tui::state::RunMode::Input;
+            session.tui.app_mut().hypercode_phase = None;
             Some(PumpOutcome::EngineGone)
         }
     }

@@ -60,6 +60,15 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
 - `delegate_task`: single or parallel-batch subagents with isolated
   contexts, per-task model/toolset/budget, concurrency limits.
   → [orchestration.md](orchestration.md)
+- **HyperCode** (`/hypercode run <goal>`): a plan → explore → build
+  pipeline of parallel subagents (Planner decomposes into disjoint
+  workstreams; read-only Explorers brief each stream; Implementors build
+  them in parallel) executed on the SAME `SubagentManager` as
+  `delegate_task` — every child gets a live TUI pane, rail tab, and
+  job-board row via the orchestration event tap. Runs on the engine
+  actor (Ctrl-C interrupts children cooperatively; phase shown live on
+  the ⚡ badge). Per-role model/reasoning/token/turn budgets via
+  `/hypercode configure`. Works additively with NeuroCode.
 - OMO (oh-my-openagent): 11 agent personas, 11 delegation categories,
   intent gating (ultrawork/hyperplan/team), goals, boulder plan execution,
   wisdom notepads, optional team mode. → [orchestration.md](orchestration.md)

@@ -72,6 +72,14 @@ pub enum EngineCommand {
     /// `/neurocode …` — tree walks + SQLite bulk upserts). Light slash
     /// commands never come here; the UI answers those inline.
     HeavyJob { label: String, args: String },
+    /// Run a `/hypercode run …` pipeline on the engine task. The pipeline
+    /// is async (parallel subagent children), NOT blocking-pool — it runs
+    /// directly on the engine with the agent's SubagentManager, so all
+    /// children share the provider semaphore + interrupt handle and every
+    /// child event streams to the UI through the global orchestration tap
+    /// (native TUI panes). `goal` may embed `--stream a;b;c` workstreams
+    /// and `--max N`.
+    Hypercode { goal: String },
     /// /steer mid-turn: stash text into the agent's steer slot (no
     /// interrupt; injected after the current tool batch). Outside a turn
     /// it's a no-op (the UI queues it as a normal prompt instead).
@@ -91,6 +99,11 @@ pub enum EngineEvent {
     },
     /// A heavy job finished with its display text.
     HeavyJobFinished { label: String, text: String },
+    /// Live progress from a running `/hypercode` pipeline: phase
+    /// transitions (planning → exploring → building → synthesizing).
+    /// Follows the HeavyJobFinished lifecycle: progress events, then one
+    /// final HeavyJobFinished { label: "hypercode", text: report }.
+    HypercodeProgress { phase: String, detail: String },
     /// The engine is starting a Submit that arrived while a previous turn
     /// was still running (interrupt-with-message, or a steer that lost the
     /// turn-end race). Carries the RAW prompt so the UI can render the user
@@ -138,6 +151,7 @@ impl EngineHandle {
 
 /// Everything needed to construct a FRESH agent — the UI holds this so a
 /// killed engine can be replaced without user-visible state loss.
+#[derive(Clone)]
 pub struct EngineSpec {
     pub config: joey_core::Config,
     pub cwd: std::path::PathBuf,
@@ -158,23 +172,74 @@ impl EngineSpec {
 /// UI-side info — e.g. the OMO roster — before handing it over). Returns
 /// the handle plus the agent's interrupt flag (the UI can request an
 /// interrupt even while the engine is mid-turn and not polling commands).
+///
+/// `spec` is retained by the engine for features that need build-time
+/// context (the HyperCode pipeline rebuilds a delegation context from it).
 pub fn spawn_engine(
     agent: Agent,
+    spec: EngineSpec,
     event_tx: mpsc::UnboundedSender<EngineEvent>,
 ) -> (EngineHandle, Arc<AtomicBool>) {
     let interrupt = agent.interrupt_handle();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<EngineCommand>();
-    let join = tokio::spawn(engine_task(agent, cmd_rx, event_tx));
+    let join = tokio::spawn(engine_task(agent, spec, cmd_rx, event_tx));
     (EngineHandle { cmd_tx, join: Some(join) }, interrupt)
+}
+
+/// Build the HyperCode execution context for an agent: the SAME
+/// SubagentManager, AgentConfig snapshot, and base registry that the
+/// agent's `delegate_task` tool uses (rebuilt here because Agent keeps
+/// them private). Sharing the manager means hypercode children and
+/// delegate_task children compete for one provider semaphore and obey one
+/// interrupt — no double-billing the provider.
+pub(crate) fn hypercode_context_for_agent(
+    config: &joey_core::Config,
+    cwd: &std::path::Path,
+    overrides: &Overrides,
+    _agent: &Agent,
+) -> crate::hypercode::HypercodeContext {
+    let agent_config = crate::repl::build_agent_config(config, overrides);
+    // Base registry = the registry build_agent starts from (builtins +
+    // session/clarify/lsp), WITHOUT orchestration/neurocode additions —
+    // exactly the snapshot delegate_task's children get.
+    let mut base = joey_tools::ToolRegistry::with_builtins();
+    {
+        let session_db = joey_core::SessionDb::open_default()
+            .ok()
+            .map(|db| std::sync::Arc::new(std::sync::Mutex::new(db)));
+        joey_tools::builtins::register_session_tools(&mut base, session_db);
+        joey_tools::builtins::register_clarify_tool(&mut base, None);
+        let root = cwd.to_path_buf();
+        let lsp_mgr = joey_tools::lsp::LspManager::from_joey_config(config, root);
+        if lsp_mgr.has_servers() {
+            joey_tools::tools::lsp_tools::register_lsp_manager(lsp_mgr);
+        }
+    }
+    let manager = std::sync::Arc::new(joey_orchestration::SubagentManager::new(
+        joey_orchestration::ManagerConfig::from_config(config),
+    ));
+    crate::hypercode::HypercodeContext {
+        agent_config,
+        config: config.clone(),
+        base_registry: base,
+        manager,
+        cwd: cwd.to_path_buf(),
+    }
 }
 
 /// The engine task body. Owns the agent; processes commands sequentially;
 /// forwards agent events to the UI. NEVER touches the terminal or Tui.
 async fn engine_task(
     mut agent: Agent,
+    spec: EngineSpec,
     mut cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
     event_tx: mpsc::UnboundedSender<EngineEvent>,
 ) {
+    // Split the spec into the pieces the Hypercode arm needs (avoid holding
+    // the whole spec alive across the loop).
+    let spec_config = spec.config;
+    let spec_cwd = spec.cwd;
+    let spec_overrides = spec.overrides;
     // Queued prompts / jobs submitted while a turn runs.
     let mut queued: VecDeque<EngineCommand> = VecDeque::new();
     // True while a turn (or heavy job) is executing or commands sit in the
@@ -376,6 +441,89 @@ async fn engine_task(
                     }
                 };
                 let _ = event_tx.send(EngineEvent::HeavyJobFinished { label: out_label, text: res });
+            }
+            EngineCommand::Hypercode { goal } => {
+                // HyperCode runs the multi-phase parallel pipeline directly
+                // on the engine's async task (children are network-bound —
+                // the blocking pool would be wrong). The pipeline shares
+                // the agent's provider semaphore via its own manager, and
+                // every child event streams to the UI through the global
+                // orchestration tap (TUI panes). Commands race the pipeline:
+                // Interrupt signals the manager's cooperative interrupt.
+                let ctx = hypercode_context_for_agent(
+                    &spec_config,
+                    &spec_cwd,
+                    &spec_overrides,
+                    &agent,
+                );
+                // Decode the UI-encoded run options (--stream/--max travel
+                // in the goal string; see repl::encode_run_goal).
+                let (streams, max_ws, goal) = crate::repl::decode_run_goal(&goal);
+                let provider = agent.provider_name().to_string();
+                let opts = crate::hypercode::HypercodeOptions {
+                    workstreams: streams,
+                    max_workstreams: max_ws,
+                    provider,
+                };
+                let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<(String, String)>();
+                let progress = move |phase: crate::hypercode::Phase, detail: &str| {
+                    let _ = prog_tx.send((phase.label().to_string(), detail.to_string()));
+                };
+                let manager = ctx.manager.clone();
+                let mut abandoned = false;
+                let run = crate::hypercode::run_hypercode(
+                    &ctx,
+                    &goal,
+                    &opts,
+                    Some(&progress),
+                );
+                tokio::pin!(run);
+                let res = loop {
+                    tokio::select! {
+                        rep = &mut run => break rep,
+                        prog = prog_rx.recv() => {
+                            if let Some((phase, detail)) = prog {
+                                let _ = event_tx.send(EngineEvent::HypercodeProgress { phase, detail });
+                            }
+                        }
+                        // Once the UI has abandoned us the channel resolves
+                        // None instantly — disable the arm (a plain loop
+                        // would busy-spin while children wind down).
+                        cmd = cmd_rx.recv(), if !abandoned => {
+                            match cmd {
+                                Some(EngineCommand::Interrupt)
+                                | Some(EngineCommand::ForceKill) => {
+                                    // Cooperative: children wind down at the
+                                    // next checkpoint and the pipeline
+                                    // returns an interrupted report.
+                                    manager.signal_interrupt();
+                                    interrupt.store(true, Ordering::SeqCst);
+                                }
+                                Some(other) => queued.push_back(other),
+                                None => {
+                                    // UI abandoned the engine: signal and
+                                    // keep awaiting the pipeline so children
+                                    // unwind cooperatively (the run future
+                                    // owns their JoinSet — dropping it would
+                                    // abort them mid-provider-call).
+                                    manager.signal_interrupt();
+                                    interrupt.store(true, Ordering::SeqCst);
+                                    abandoned = true;
+                                }
+                            }
+                        }
+                    }
+                };
+                // Flush any pending progress before the final report.
+                while let Ok((phase, detail)) = prog_rx.try_recv() {
+                    let _ = event_tx.send(EngineEvent::HypercodeProgress { phase, detail });
+                }
+                interrupt.store(false, Ordering::SeqCst);
+                let text = res.render().join("\n");
+                let _ = event_tx.send(EngineEvent::HeavyJobFinished {
+                    label: "hypercode".into(),
+                    text,
+                });
             }
             EngineCommand::Steer(text) => {
                 // Idle steer: nothing to inject into. Match the line REPL's
@@ -634,7 +782,7 @@ mod actor_tests {
         };
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_handle, _interrupt) = spawn_engine(agent, ev_tx);
+        let (_handle, _interrupt) = spawn_engine(agent, spec, ev_tx);
 
         // Send two submits; both should eventually produce TurnFinished
         // (queued sequentially), and the engine stays alive between them.
@@ -669,7 +817,7 @@ mod actor_tests {
         let agent = spec.build_agent().expect("agent builds");
         assert_eq!(agent.model(), "gpt-4o-mini");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (handle, _interrupt) = spawn_engine(agent, ev_tx);
+        let (handle, _interrupt) = spawn_engine(agent, spec, ev_tx);
 
         handle.send(EngineCommand::SwitchModel {
             model: "gpt-4.1".into(),
@@ -711,7 +859,7 @@ mod actor_tests {
         };
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (handle, _interrupt) = spawn_engine(agent, ev_tx);
+        let (handle, _interrupt) = spawn_engine(agent, spec, ev_tx);
         // Send ForceKill then drop our sender via abandon; the task should
         // return and the leaked join handle completes. We can't await the
         // join after abandon (it's detached), so instead verify via a
@@ -743,9 +891,10 @@ mod actor_tests {
     #[tokio::test]
     async fn engine_early_exit_sends_done_before_turn_finished() {
         for (tag, prompt) in [("engdone1", "@plan"), ("engdone2", "hello")] {
-            let agent = unauth_spec(tag).build_agent().expect("agent builds");
+            let eng_spec = unauth_spec(tag);
+            let agent = eng_spec.build_agent().expect("agent builds");
             let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (handle, _int) = spawn_engine(agent, ev_tx);
+            let (handle, _int) = spawn_engine(agent, eng_spec, ev_tx);
             handle.send(EngineCommand::Submit { prompt: prompt.into(), active_agent: "default".into(), announce: false });
 
             let mut saw_done_at: Option<usize> = None;
@@ -775,9 +924,10 @@ mod actor_tests {
     /// abandon check — it is re-queued and runs.
     #[tokio::test]
     async fn engine_survives_post_turn_submit() {
-        let agent = unauth_spec("engrace").build_agent().expect("agent builds");
+        let spec = unauth_spec("engrace");
+        let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (handle, _int) = spawn_engine(agent, ev_tx);
+        let (handle, _int) = spawn_engine(agent, spec, ev_tx);
         handle.send(EngineCommand::Submit { prompt: "one".into(), active_agent: "default".into(), announce: false });
         // Wait for the first turn to fully finish, THEN submit — this is
         // exactly the instant the old try_recv-based check raced with.
@@ -810,9 +960,10 @@ mod actor_tests {
     /// dropped — the engine queues it as the next turn and tells the UI.
     #[tokio::test]
     async fn idle_steer_degrades_to_queued_submit() {
-        let agent = unauth_spec("engsteer1").build_agent().expect("agent builds");
+        let spec = unauth_spec("engsteer1");
+        let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (handle, _int) = spawn_engine(agent, ev_tx);
+        let (handle, _int) = spawn_engine(agent, spec, ev_tx);
         handle.send(EngineCommand::Steer("please also check the tests".into()));
 
         let mut saw_notice = false;
@@ -834,9 +985,10 @@ mod actor_tests {
     /// and not for announce=false ones (the normal UI funnel).
     #[tokio::test]
     async fn queued_submit_started_announces_only_marked_submits() {
-        let agent = unauth_spec("engqss1").build_agent().expect("agent builds");
+        let spec = unauth_spec("engqss1");
+        let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (handle, _int) = spawn_engine(agent, ev_tx);
+        let (handle, _int) = spawn_engine(agent, spec, ev_tx);
         handle.send(EngineCommand::Submit {
             prompt: "marked".into(),
             active_agent: "default".into(),
@@ -877,9 +1029,10 @@ mod actor_tests {
     /// The engine announces Idle once its queues drain (not at startup).
     #[tokio::test]
     async fn engine_announces_idle_after_drain() {
-        let agent = unauth_spec("engidle1").build_agent().expect("agent builds");
+        let spec = unauth_spec("engidle1");
+        let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (handle, _int) = spawn_engine(agent, ev_tx);
+        let (handle, _int) = spawn_engine(agent, spec, ev_tx);
         handle.send(EngineCommand::Submit {
             prompt: "hello".into(),
             active_agent: "default".into(),
@@ -895,6 +1048,67 @@ mod actor_tests {
             }
         }
         assert!(saw_idle, "engine must announce Idle after the queue drains");
+    }
+
+    /// `/hypercode run` through the real engine actor: the pipeline runs
+    /// (unauthenticated provider → planner child fails fast), emits
+    /// HypercodeProgress for the planning phase, and terminates with
+    /// HeavyJobFinished { label: "hypercode" } carrying the rendered
+    /// report. Verifies the full command → progress → completion cycle
+    /// without touching the network.
+    #[tokio::test]
+    async fn hypercode_command_streams_progress_and_finishes() {
+        let spec = unauth_spec("enghc1");
+        let agent = spec.build_agent().expect("agent builds");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, _int) = spawn_engine(agent, spec, ev_tx);
+        handle.send(EngineCommand::Hypercode {
+            goal: "test the hypercode pipeline".into(),
+        });
+
+        let mut saw_planning_progress = false;
+        let mut finished_text: Option<String> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while finished_text.is_none() && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::HypercodeProgress { phase, .. }) => {
+                    if phase == "planning" {
+                        saw_planning_progress = true;
+                    }
+                }
+                Ok(EngineEvent::HeavyJobFinished { label, text }) => {
+                    assert_eq!(label, "hypercode");
+                    finished_text = Some(text);
+                }
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        let text = finished_text.expect("hypercode run must finish with HeavyJobFinished");
+        assert!(
+            saw_planning_progress,
+            "planning progress event must arrive: {text}"
+        );
+        assert!(
+            text.contains("HyperCode run"),
+            "final report must be the rendered HypercodeReport: {text}"
+        );
+        // The engine must stay alive afterwards (Idle still emitted).
+        handle.send(EngineCommand::Submit {
+            prompt: "ping".into(),
+            active_agent: "default".into(),
+            announce: false,
+        });
+        let mut saw_finished = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !saw_finished && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::TurnFinished { .. }) => saw_finished = true,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        assert!(saw_finished, "engine survives a hypercode run");
     }
 }
 

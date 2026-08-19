@@ -59,7 +59,7 @@ pub static REGISTRY: &[CommandDef] = &[
     cmd!("goal", &[], "Set a standing goal Joey works on across turns until achieved", "Session", "[set <text> | pause | resume | clear | show]", true),
     cmd!("moa", &[], "Run one prompt through the default Mixture of Agents preset", "Session", "<prompt>", false),
     cmd!("subgoal", &[], "Add or manage extra criteria on the active goal", "Session", "[text | remove N | clear]", false),
-    cmd!("hypercode", &[], "Parallel task optimization: decompose work into max parallel workstreams with Explorer/Implementor agents (works additively with /neurocode)", "Session", "[status|configure <explorer|implementor> <provider> <model>]", true),
+    cmd!("hypercode", &[], "Parallel task optimization: run plan→explore→build pipelines of Explorer/Implementor subagents natively in the TUI (live panes on the right rail)", "Session", "[status|run <goal>|toggle|configure <explorer|implementor> <provider> <model>]", true),
     cmd!("status", &[], "Show session, model, token, and context info", "Session", "", true),
     cmd!("changes", &[], "Show files changed in this session with diffs", "Session", "", true),
     cmd!("whoami", &[], "Show your slash command access (admin / user)", "Info", "", false),

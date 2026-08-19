@@ -285,6 +285,8 @@ impl Tool for DelegateTask {
                 })
                 .unwrap_or_default(),
             max_turns: None,
+            reasoning: None,
+            max_tokens: None,
             persist: args.get("persist").and_then(|v| v.as_bool()).unwrap_or(false),
             role: SubagentRole::Leaf,
             workdir: None,

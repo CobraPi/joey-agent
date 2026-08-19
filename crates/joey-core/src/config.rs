@@ -106,6 +106,7 @@ cron:
   provider: ""
 hypercode:
   enabled: false
+  max_workstreams: 0
   explorer: {}
   implementor: {}
 _config_version: 33
@@ -1538,7 +1539,7 @@ mod tests {
         assert!(map.contains_key(skey("agent")));
         assert!(map.contains_key(skey("_config_version")));
         assert_eq!(map.len(), 3, "no default contamination: {:?}", map);
-        assert_eq!(doc["_config_version"].as_i64(), Some(33));
+        assert_eq!(doc["_config_version"].as_i64(), Some(crate::config::CONFIG_VERSION));
         assert_eq!(doc["agent"]["max_turns"].as_i64(), Some(42));
 
         // Round-trip: reload sees merged values.

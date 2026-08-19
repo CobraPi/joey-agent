@@ -65,6 +65,8 @@ async fn context_field_is_passed_to_subagent() {
         model: None,
         toolsets: vec![],
         max_turns: None,
+        reasoning: None,
+        max_tokens: None,
         persist: false,
         role: joey_orchestration::SubagentRole::Leaf,
         workdir: None,

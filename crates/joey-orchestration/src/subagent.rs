@@ -167,9 +167,11 @@ impl Subagent {
             max_turns: req.max_turns.unwrap_or(default_max_turns),
             api_max_retries: parent_config.api_max_retries,
             tool_delay: parent_config.tool_delay,
-            reasoning: parent_config.reasoning.clone(),
+            // HyperCode per-role overrides: request-level reasoning/token
+            // limits win; otherwise inherit the parent's.
+            reasoning: req.reasoning.clone().or_else(|| parent_config.reasoning.clone()),
             enabled_tools: resolve_enabled_tools(req, base_registry, max_spawn_depth, depth),
-            max_tokens: parent_config.max_tokens,
+            max_tokens: req.max_tokens.or(parent_config.max_tokens),
             stream: parent_config.stream,
             pass_session_id: false,
             // The child model was resolved by the delegation layer (per-task
@@ -437,6 +439,8 @@ pub(crate) fn specs_to_requests(
             spec.toolsets.clone()
         },
         max_turns: batch_max_turns,
+        reasoning: None,
+        max_tokens: None,
         persist,
         role,
         workdir: None,

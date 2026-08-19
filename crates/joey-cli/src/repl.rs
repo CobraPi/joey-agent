@@ -85,6 +85,11 @@ pub(crate) struct ReplState {
     pending_context_injection: Option<String>,
     /// The current model name (for dispatch_system_prompt calls).
     model: String,
+    /// HyperCode execution context: the SAME SubagentManager, agent config
+    /// snapshot, and base registry the agent's delegate_task tool uses
+    /// (built once with the agent; None when the agent was built by a
+    /// caller that didn't keep parts).
+    hypercode: Option<crate::hypercode::HypercodeContext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,13 +138,26 @@ pub(crate) fn build_agent_config(config: &Config, ov: &Overrides) -> AgentConfig
     cfg
 }
 
-pub(crate) fn build_agent(
+/// The pieces `build_agent` assembles that a HyperCode run also needs.
+/// Returned by `build_agent_parts` so the line REPL can drive the SAME
+/// delegation machinery the agent's delegate_task tool uses.
+pub(crate) struct AgentParts {
+    pub agent: Agent,
+    /// Manager shared by the agent's delegate_task tool and hypercode runs.
+    pub subagent_manager: std::sync::Arc<joey_orchestration::SubagentManager>,
+    /// The AgentConfig snapshot used to construct the agent.
+    pub agent_config: AgentConfig,
+    /// Base (pre-orchestration) tool registry children are built from.
+    pub base_registry: ToolRegistry,
+}
+
+pub(crate) fn build_agent_parts(
     config: &Config,
     cwd: &std::path::Path,
     ov: &Overrides,
     session_id: &str,
     history: Vec<Message>,
-) -> Result<Agent> {
+) -> Result<AgentParts> {
     let agent_cfg = build_agent_config(config, ov);
     let ctx = ToolContext::new(cwd.to_path_buf(), config.clone(), session_id.to_string());
     let mut registry = ToolRegistry::with_builtins();
@@ -187,7 +205,7 @@ pub(crate) fn build_agent(
         manager.clone(),
         agent_cfg.clone(),
         config.clone(),
-        base_registry,
+        base_registry.clone(),
         None, // events are emitted via the per-turn channel at runtime
         resolver.clone(),
         allocator
@@ -196,7 +214,7 @@ pub(crate) fn build_agent(
     );
 
     let mut agent =
-        Agent::new(agent_cfg, registry, ctx).map_err(|e| anyhow::anyhow!("{}", e))?;
+        Agent::new(agent_cfg.clone(), registry, ctx).map_err(|e| anyhow::anyhow!("{}", e))?;
     // Inject the shared concurrency limiter into the agent's transport path.
     agent.set_provider_semaphore(manager.semaphore());
 
@@ -250,7 +268,22 @@ pub(crate) fn build_agent(
     if let Ok(db) = SessionDb::open_default() {
         agent.set_session_store(db, session_id.to_string());
     }
-    Ok(agent)
+    Ok(AgentParts {
+        agent,
+        subagent_manager: manager,
+        agent_config: agent_cfg,
+        base_registry,
+    })
+}
+
+pub(crate) fn build_agent(
+    config: &Config,
+    cwd: &std::path::Path,
+    ov: &Overrides,
+    session_id: &str,
+    history: Vec<Message>,
+) -> Result<Agent> {
+    Ok(build_agent_parts(config, cwd, ov, session_id, history)?.agent)
 }
 
 pub(crate) fn restore_history(db: &SessionDb, session_id: &str) -> Vec<Message> {
@@ -473,7 +506,15 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
     };
     let restored_count = history.len();
 
-    let agent = build_agent(&config, &cwd, &overrides, &session_id, history)?;
+    let parts = build_agent_parts(&config, &cwd, &overrides, &session_id, history)?;
+    let hypercode_ctx = crate::hypercode::HypercodeContext {
+        agent_config: parts.agent_config.clone(),
+        config: config.clone(),
+        base_registry: parts.base_registry.clone(),
+        manager: parts.subagent_manager.clone(),
+        cwd: cwd.clone(),
+    };
+    let agent = parts.agent;
 
     let ropts = {
         let capability = crate::capability::RenderCapability::detect();
@@ -512,6 +553,7 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         active_agent: "default".to_string(),
         pending_context_injection: None,
         model: st_config_model.clone(),
+        hypercode: Some(hypercode_ctx),
     };
 
     // Initialize session-scoped filesystem checkpoints (fresh every session).
@@ -1107,6 +1149,9 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
                 Ok(crate::hypercode::HyperCodeOutput::Configured(msg)) => {
                     render::success(&msg);
                 }
+                Ok(crate::hypercode::HyperCodeOutput::Run { goal }) => {
+                    hypercode_run_slash(st, &goal).await;
+                }
                 Err(e) => {
                     render::error(&e);
                 }
@@ -1419,8 +1464,8 @@ fn new_session(st: &mut ReplState, name: &str, quiet: bool) {
     // alive (the old code ended the old session + swapped the id before
     // building, so a build failure left the old agent writing to an
     // already-ended session while the UI showed the new id).
-    match build_agent(&st.config, &st.cwd, &st.overrides, &new_id, Vec::new()) {
-        Ok(agent) => {
+    match build_agent_parts(&st.config, &st.cwd, &st.overrides, &new_id, Vec::new()) {
+        Ok(parts) => {
             if !name.is_empty() {
                 if let Some(d) = &st.db {
                     let _ = d.set_title(&new_id, name);
@@ -1439,7 +1484,14 @@ fn new_session(st: &mut ReplState, name: &str, quiet: bool) {
             }
             st.last_auto_checkpoint = Instant::now();
 
-            st.agent = agent;
+            st.hypercode = Some(crate::hypercode::HypercodeContext {
+                agent_config: parts.agent_config.clone(),
+                config: st.config.clone(),
+                base_registry: parts.base_registry.clone(),
+                manager: parts.subagent_manager.clone(),
+                cwd: st.cwd.clone(),
+            });
+            st.agent = parts.agent;
             st.session_start = Instant::now();
             st.last_response.clear();
             joey_core::logging::set_session_context(Some(&new_id));
@@ -1457,8 +1509,17 @@ fn new_session(st: &mut ReplState, name: &str, quiet: bool) {
 
 fn rebuild_agent_preserving_history(st: &mut ReplState) -> Result<()> {
     let history = st.agent.history().to_vec();
-    let agent = build_agent(&st.config, &st.cwd, &st.overrides, &st.session_id, history)?;
-    st.agent = agent;
+    let parts = build_agent_parts(&st.config, &st.cwd, &st.overrides, &st.session_id, history)?;
+    // Keep the hypercode context in lockstep with the rebuilt agent (model
+    // switches via /model must be reflected in hypercode children).
+    st.hypercode = Some(crate::hypercode::HypercodeContext {
+        agent_config: parts.agent_config.clone(),
+        config: st.config.clone(),
+        base_registry: parts.base_registry.clone(),
+        manager: parts.subagent_manager.clone(),
+        cwd: st.cwd.clone(),
+    });
+    st.agent = parts.agent;
     Ok(())
 }
 
@@ -2242,22 +2303,23 @@ pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<Hyper
         lines.extend(vec![
             "".to_string(),
             "Explorer Agent:".to_string(),
-            format!("    Model: {}", explorer_cfg.model),
+            format!("    Model: {}", if explorer_cfg.model.is_empty() { "(inherit main model)" } else { &explorer_cfg.model }),
             format!("    Max turns: {}", explorer_cfg.max_turns),
             format!("    Max tokens: {}", explorer_tokens),
-            format!("    Reasoning: {}", explorer_cfg.reasoning_level),
+            format!("    Reasoning: {}", if explorer_cfg.reasoning_level.is_empty() { "(inherit)" } else { &explorer_cfg.reasoning_level }),
             "".to_string(),
             "Implementor Agent:".to_string(),
-            format!("    Model: {}", impl_cfg.model),
+            format!("    Model: {}", if impl_cfg.model.is_empty() { "(inherit main model)" } else { &impl_cfg.model }),
             format!("    Max turns: {}", impl_cfg.max_turns),
             format!("    Max tokens: {}", impl_tokens),
-            format!("    Reasoning: {}", impl_cfg.reasoning_level),
+            format!("    Reasoning: {}", if impl_cfg.reasoning_level.is_empty() { "(inherit)" } else { &impl_cfg.reasoning_level }),
             "".to_string(),
             "How it works:".to_string(),
-            "  HyperCode adds a '⚡' badge to the TUI header when enabled.".to_string(),
-            "  The model receives a hint to use delegate_task in batch mode.".to_string(),
-            "  All subagents get full TUI visibility (per-subagent panes).".to_string(),
-            "  Click the ⚡ badge in the TUI to toggle HyperCode mode.".to_string(),
+            "  /hypercode run <goal> executes a plan → explore → build pipeline".to_string(),
+            "  of parallel subagents (Planner/Explorer/Implementor roles).".to_string(),
+            "  Every subagent gets a live TUI pane on the right rail + job board".to_string(),
+            "  (same machinery as delegate_task batches — full streaming).".to_string(),
+            "  /hypercode toggle enables the ⚡ badge + model hint for delegate_task.".to_string(),
         ]);
         
         if neurocode_active {
@@ -2299,7 +2361,7 @@ pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<Hyper
             // Load current config, update, and save
             let cfg = Config::load()
                 .map_err(|e| format!("Failed to load config: {}", e))?;
-            let mut hc_config = HyperCodeConfig::from_config(&cfg);
+            let hc_config = HyperCodeConfig::from_config(&cfg);
             
             if is_explorer {
                 let mut ec = hc_config.get_explorer_config(&provider_name);
@@ -2338,7 +2400,7 @@ pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<Hyper
             // Load current config, update, and save
             let cfg = Config::load()
                 .map_err(|e| format!("Failed to load config: {}", e))?;
-            let mut hc_config = HyperCodeConfig::from_config(&cfg);
+            let hc_config = HyperCodeConfig::from_config(&cfg);
             
             if is_explorer {
                 let mut ec = hc_config.get_explorer_config(&provider_name);
@@ -2379,7 +2441,7 @@ pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<Hyper
             // Load current config, update, and save
             let cfg = Config::load()
                 .map_err(|e| format!("Failed to load config: {}", e))?;
-            let mut hc_config = HyperCodeConfig::from_config(&cfg);
+            let hc_config = HyperCodeConfig::from_config(&cfg);
             
             if is_explorer {
                 let mut ec = hc_config.get_explorer_config(&provider_name);
@@ -2419,7 +2481,7 @@ pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<Hyper
             // Load current config, update, and save
             let cfg = Config::load()
                 .map_err(|e| format!("Failed to load config: {}", e))?;
-            let mut hc_config = HyperCodeConfig::from_config(&cfg);
+            let hc_config = HyperCodeConfig::from_config(&cfg);
             
             if is_explorer {
                 let mut ec = hc_config.get_explorer_config(&provider_name);
@@ -2450,17 +2512,259 @@ pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<Hyper
             
             Ok(HyperCodeOutput::Toggle(new_state))
         }
+        _ if parts.first().copied() == Some("run") => {
+            // /hypercode run [--stream a;b;c] [--max N] <goal>
+            let raw = args.trim_start()
+                .strip_prefix("run")
+                .map(str::trim)
+                .unwrap_or("");
+            let (workstreams, max_ws, goal) = parse_run_args(raw);
+            if goal.trim().is_empty() && workstreams.is_empty() {
+                return Ok(HyperCodeOutput::Text(vec![
+                    "Usage: /hypercode run <goal>".to_string(),
+                    "       /hypercode run --stream \"stream A;stream B;stream C\" [goal context]".to_string(),
+                    "       /hypercode run --max 3 <goal>".to_string(),
+                ]));
+            }
+            let full_goal = if goal.trim().is_empty() {
+                format!("Implement the {} supplied workstream(s).", workstreams.len())
+            } else {
+                goal.trim().to_string()
+            };
+            // Stash the stream/max options in the goal string for the
+            // executor (encoded as a prefix the executor strips).
+            let encoded = encode_run_goal(&full_goal, &workstreams, max_ws);
+            Ok(HyperCodeOutput::Run { goal: encoded })
+        }
         _ => {
             let help_lines = vec![
                 "Invalid usage. Options:".to_string(),
+                "  /hypercode run <goal>                # execute the parallel pipeline now".to_string(),
+                "  /hypercode run --stream \"a;b;c\"      # explicit workstreams, skip the planner".to_string(),
+                "  /hypercode run --max 3 <goal>        # cap workstreams at 3".to_string(),
                 "  /hypercode status".to_string(),
+                "  /hypercode toggle".to_string(),
                 "  /hypercode configure <explorer|implementor> <provider> <model>".to_string(),
                 "  /hypercode configure <explorer|implementor> <provider> --reasoning <none|low|medium|high>".to_string(),
                 "  /hypercode configure <explorer|implementor> <provider> --tokens <N>".to_string(),
                 "  /hypercode configure <explorer|implementor> <provider> --turns <N>".to_string(),
-                "  /hypercode toggle".to_string(),
             ];
             Ok(HyperCodeOutput::Text(help_lines))
         }
+    }
+}
+
+/// Parse `/hypercode run` arguments: `--stream "a;b;c"` and `--max N`
+/// flags followed by the free-text goal. Double-quoted values keep their
+/// spaces/semicolons (a naive whitespace split would shred them).
+pub(crate) fn parse_run_args(raw: &str) -> (Vec<String>, usize, String) {
+    let mut workstreams = Vec::new();
+    let mut max_ws = 0usize;
+    let mut goal_parts: Vec<String> = Vec::new();
+    let tokens = tokenize_quoted(raw);
+    let mut tokens = tokens.into_iter().peekable();
+    while let Some(tok) = tokens.next() {
+        match tok.as_str() {
+            "--stream" | "--streams" => {
+                if let Some(spec) = tokens.next() {
+                    for s in spec.split(';') {
+                        let s = s.trim();
+                        if !s.is_empty() {
+                            workstreams.push(s.to_string());
+                        }
+                    }
+                }
+            }
+            "--max" => {
+                if let Some(n) = tokens.next() {
+                    if let Ok(v) = n.parse::<usize>() {
+                        max_ws = v;
+                    }
+                }
+            }
+            other => goal_parts.push(other.to_string()),
+        }
+    }
+    (workstreams, max_ws, goal_parts.join(" "))
+}
+
+/// Split on whitespace but keep double-quoted segments intact (strips the
+/// quotes). An unterminated quote treats the rest as one token.
+fn tokenize_quoted(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut have_token = false;
+    for ch in raw.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                have_token = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if have_token {
+                    out.push(std::mem::take(&mut cur));
+                    have_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                have_token = true;
+            }
+        }
+    }
+    if have_token {
+        out.push(cur);
+    }
+    out
+}
+
+/// Encode run options into the goal string (engine transport). Format:
+/// `[hc:max=N;streams=a|b|c]\n<goal>` — stripped by `decode_run_goal`.
+pub(crate) fn encode_run_goal(goal: &str, workstreams: &[String], max_ws: usize) -> String {
+    use std::fmt::Write as _;
+    let mut header = String::from("[hc:");
+    let mut wrote = false;
+    if max_ws > 0 {
+        let _ = write!(&mut header, "max={}", max_ws);
+        wrote = true;
+    }
+    if !workstreams.is_empty() {
+        if wrote {
+            header.push(';');
+        }
+        // '|' cannot appear in a stream split on ';' — escape defensively.
+        let joined = workstreams
+            .iter()
+            .map(|s| s.replace('|', "/"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let _ = write!(&mut header, "streams={}", joined);
+    }
+    header.push(']');
+    format!("{}\n{}", header, goal)
+}
+
+/// Decode a goal string produced by `encode_run_goal`.
+pub(crate) fn decode_run_goal(encoded: &str) -> (Vec<String>, usize, String) {
+    if let Some(rest) = encoded.strip_prefix("[hc:") {
+        if let Some(end) = rest.find(']') {
+            let header = &rest[..end];
+            let goal = rest[end + 1..].trim_start_matches('\n').to_string();
+            let mut streams = Vec::new();
+            let mut max_ws = 0usize;
+            for kv in header.split(';') {
+                if let Some(v) = kv.strip_prefix("max=") {
+                    max_ws = v.parse().unwrap_or(0);
+                } else if let Some(v) = kv.strip_prefix("streams=") {
+                    for s in v.split('|') {
+                        let s = s.trim();
+                        if !s.is_empty() {
+                            streams.push(s.to_string());
+                        }
+                    }
+                }
+            }
+            return (streams, max_ws, goal);
+        }
+    }
+    (Vec::new(), 0, encoded.to_string())
+}
+
+/// Execute a `/hypercode run` pipeline in the LINE REPL: runs the same
+/// SubagentManager-driven pipeline as the TUI, printing phase progress.
+async fn hypercode_run_slash(st: &mut ReplState, encoded_goal: &str) {
+    use crate::hypercode::{self, HypercodeOptions};
+    let Some(ctx) = st.hypercode.clone() else {
+        render::error("hypercode context unavailable (agent was rebuilt without parts)");
+        return;
+    };
+    let (streams, max_ws, goal) = decode_run_goal(encoded_goal);
+    render::info(&format!("⚡ HyperCode run: {}", goal));
+    render::info("  pipeline: plan → explore → build → synthesize (subagents stream events)");
+    let provider = st.agent.provider_name().to_string();
+    let report = hypercode::run_hypercode(
+        &ctx,
+        &goal,
+        &HypercodeOptions {
+            workstreams: streams,
+            max_workstreams: max_ws,
+            provider,
+        },
+        Some(&|phase, detail| {
+            render::info(&format!("  ⧗ [{}] {}", phase.label(), detail));
+        }),
+    )
+    .await;
+    for line in report.render() {
+        println!("  {}", line);
+    }
+}
+
+#[cfg(test)]
+mod hypercode_args_tests {
+    use super::*;
+
+    #[test]
+    fn quoted_stream_value_keeps_spaces() {
+        let (streams, _max, goal) =
+            parse_run_args("--stream \"fix A in a.rs;add B to b.rs\" clean up both modules");
+        assert_eq!(
+            streams,
+            vec!["fix A in a.rs".to_string(), "add B to b.rs".to_string()]
+        );
+        assert_eq!(goal, "clean up both modules");
+    }
+
+    #[test]
+    fn unquoted_stream_still_works() {
+        let (streams, _max, goal) = parse_run_args("--stream one;two do things");
+        assert_eq!(streams, vec!["one".to_string(), "two".to_string()]);
+        assert_eq!(goal, "do things");
+    }
+
+    #[test]
+    fn max_flag_parses() {
+        let (_streams, max, goal) = parse_run_args("--max 3 big refactor");
+        assert_eq!(max, 3);
+        assert_eq!(goal, "big refactor");
+    }
+
+    #[test]
+    fn goal_with_quotes_survives() {
+        let (_s, _m, goal) = parse_run_args("make the \"fast path\" faster");
+        assert_eq!(goal, "make the fast path faster");
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let streams = vec!["a b".to_string(), "c".to_string()];
+        let encoded = encode_run_goal("my goal", &streams, 4);
+        let (dec_streams, dec_max, dec_goal) = decode_run_goal(&encoded);
+        assert_eq!(dec_streams, streams);
+        assert_eq!(dec_max, 4);
+        assert_eq!(dec_goal, "my goal");
+    }
+
+    #[test]
+    fn decode_plain_goal_untouched() {
+        let (streams, max, goal) = decode_run_goal("just a goal");
+        assert!(streams.is_empty());
+        assert_eq!(max, 0);
+        assert_eq!(goal, "just a goal");
+    }
+
+    #[test]
+    fn tokenize_quoted_basics() {
+        assert_eq!(
+            tokenize_quoted("a \"b c\" d"),
+            vec!["a".to_string(), "b c".to_string(), "d".to_string()]
+        );
+        assert_eq!(tokenize_quoted(""), Vec::<String>::new());
+        // Unterminated quote: rest is one token.
+        assert_eq!(
+            tokenize_quoted("x \"y z"),
+            vec!["x".to_string(), "y z".to_string()]
+        );
     }
 }

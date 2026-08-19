@@ -894,6 +894,10 @@ pub struct App {
     // ── HyperCode parallel optimization ──
     /// Whether HyperCode mode is enabled (parallel task decomposition).
     pub hypercode_enabled: bool,
+    /// Live HyperCode pipeline phase (planning/exploring/building/
+    /// synthesizing) while a `/hypercode run` executes on the engine;
+    /// None when no run is active. Drives the ⚡ badge's phase label.
+    pub hypercode_phase: Option<String>,
     /// Rect of the HyperCode status indicator in the header (click target).
     pub last_hypercode_rect: Cell<(u16, u16, u16, u16)>,
     /// T155: when true, the Atlas job board section renders in draw_omo_panel.
@@ -1286,6 +1290,7 @@ impl App {
             neurocode_viz: crate::neurocode_viz::VizState::default(),
             last_viz_nodes_rect: Cell::new((0, 0, 0, 0)),
             hypercode_enabled: false,
+            hypercode_phase: None,
             last_hypercode_rect: Cell::new((0, 0, 0, 0)),
             job_board_visible: false,
             pending_context_injection: None,

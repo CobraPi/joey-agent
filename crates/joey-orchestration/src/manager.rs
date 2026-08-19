@@ -359,7 +359,6 @@ impl SubagentManager {
 
         result
     }
-
     /// Dispatch a batch of subagents in parallel (batch mode).
     ///
     /// PARALLEL-SUBAGENT FEATURE: all children in the batch are spawned as
@@ -390,7 +389,28 @@ impl SubagentManager {
             SubagentRole::Leaf,
         );
 
+        self.dispatch_requests(&requests, parent_config, parent_config_tree, base_registry, event_tx)
+            .await
+    }
+
+    /// Dispatch a wave of PRE-BUILT heterogeneous requests in parallel
+    /// (HyperCode entry point: planner/explorer/implementor children with
+    /// different models, toolsets, budgets, and prompts in one wave).
+    ///
+    /// Semantics identical to `dispatch_batch` — one concurrency wave
+    /// (chunked over `max_concurrent_children`), semaphore-gated provider
+    /// admission, stable result ordering by request index, and a closing
+    /// `DelegationBatchComplete` on the dispatch channel + tap.
+    pub async fn dispatch_requests(
+        &self,
+        requests: &[DelegationRequest],
+        parent_config: &AgentConfig,
+        parent_config_tree: &Config,
+        base_registry: &ToolRegistry,
+        event_tx: Option<&mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Vec<DelegationResult> {
         let total = requests.len();
+
         let start = Instant::now();
 
         let default_model = self.config.default_model.clone();
@@ -404,11 +424,10 @@ impl SubagentManager {
         let mut indexed_results: Vec<(usize, DelegationResult)> = Vec::with_capacity(total);
         let mut dispatched_count = 0usize;
 
-        // Chunk only when the batch exceeds the children cap; within a
+        // Chunk only when the wave exceeds the children cap; within a
         // chunk everything runs concurrently (semaphore-gated).
         let chunks: Vec<Vec<DelegationRequest>> = requests
-            .into_iter()
-            .collect::<Vec<_>>()
+            .to_vec()
             .chunks(max_children)
             .map(|c| c.to_vec())
             .collect();

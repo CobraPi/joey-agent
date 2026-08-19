@@ -216,16 +216,34 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
     
     // HyperCode indicator (enabled/disabled badge).
     if app.hypercode_enabled {
-        let badge = if app.is_busy() { "⚡ HYPER" } else { "⚡" };
+        // Live phase label during a /hypercode run; static ⚡ otherwise.
+        let badge = match app.hypercode_phase.as_deref() {
+            Some("planning") => "⚡ PLAN",
+            Some("exploring") => "⚡ EXPL",
+            Some("building") => "⚡ BUILD",
+            Some("synthesizing") => "⚡ SYNTH",
+            Some(other) if !other.is_empty() => "⚡ HYPER",
+            _ => {
+                if app.is_busy() {
+                    "⚡ HYPER"
+                } else {
+                    "⚡"
+                }
+            }
+        };
         let badge_style = Style::default()
             .fg(theme.accent.to_color())
             .add_modifier(Modifier::BOLD);
         let badge_start_x = x + 2;
-        for ch in badge.chars() {
-            if badge_start_x + (badge.chars().count() as u16) > inner.x + inner.width {
+        // FIX: advance one cell per char — the old loop wrote every char to
+        // the same cell, so multi-char badges ("⚡ HYPER") rendered as just
+        // their last character.
+        for (i, ch) in badge.chars().enumerate() {
+            let cx = badge_start_x + i as u16;
+            if cx >= inner.x + inner.width {
                 break;
             }
-            let cell = &mut buf[(badge_start_x, inner.y)];
+            let cell = &mut buf[(cx, inner.y)];
             cell.set_char(ch).set_style(badge_style);
         }
         // Record the badge rect for click hit-testing.
@@ -2938,6 +2956,55 @@ mod tests {
         assert_eq!(base, idle, "idle flow == static gradient");
         // Sanity: the static row is actually a gradient (ends differ).
         assert_ne!(base.first(), base.last());
+    }
+
+    /// HyperCode badge: draw the header through TestBackend and read the
+    /// rendered text, verifying the live-phase labels replace the static ⚡.
+    fn header_text(app: &App) -> String {
+        use ratatui::backend::TestBackend;
+        let theme = Theme::aurora();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 4)).unwrap();
+        let spinner = Spinner::dots();
+        let pulse = Pulse::new();
+        terminal
+            .draw(|f| {
+                draw_header(f, f.area(), app, theme, &spinner, &pulse, None);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .take(100) // first header row only
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn hypercode_badge_shows_live_phase() {
+        // Disabled: no badge at all.
+        let plain = header_text(&App::new("sess", "model"));
+        assert!(!plain.contains("HYPER") && !plain.contains("PLAN"), "no badge when disabled");
+
+        // Enabled, idle: plain ⚡ (no phase label).
+        let mut app = App::new("sess", "model");
+        app.hypercode_enabled = true;
+        let idle = header_text(&app);
+        assert!(idle.contains('⚡'), "badge present when enabled: {idle}");
+        assert!(!idle.contains("PLAN") && !idle.contains("EXPL"), "idle shows no phase: {idle}");
+
+        // Live phases render their labels.
+        for (phase, label) in [
+            ("planning", "PLAN"),
+            ("exploring", "EXPL"),
+            ("building", "BUILD"),
+            ("synthesizing", "SYNTH"),
+        ] {
+            app.hypercode_phase = Some(phase.to_string());
+            let text = header_text(&app);
+            assert!(text.contains(label), "{phase} shows {label}: {text}");
+        }
     }
 
     #[test]
