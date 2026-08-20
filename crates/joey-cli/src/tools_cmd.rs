@@ -65,11 +65,10 @@ pub fn tools_command(args: &ToolsArgs) -> Result<i32> {
         Some(ToolsAction::Other(rest)) => {
             let sub = rest.first().map(String::as_str).unwrap_or("");
             if sub == "post-setup" {
-                println!("'joey tools post-setup' is not available in joey-agent yet.");
-                Ok(1)
+                post_setup()
             } else {
                 eprintln!("Unknown tools command: {}", sub);
-                eprintln!("Usage: joey tools [--summary] [list|enable|disable]");
+                eprintln!("Usage: joey tools [--summary] [list|enable|disable|post-setup]");
                 Ok(2)
             }
         }
@@ -230,15 +229,18 @@ fn apply_change(names: &[String], platform: &str, enable: bool) -> Result<i32> {
     let valid = configurable_toolsets();
 
     let mut targets: Vec<String> = Vec::new();
+    let mut mcp_toggles: Vec<(String, String)> = Vec::new();
     for name in names {
-        if name.contains(':') {
-            eprintln!(
-                "{}",
-                Color::Red.paint(format!(
-                    "MCP tool toggling ('{}') is not available in joey-agent yet",
-                    name
-                ))
-            );
+        if let Some((server, tool)) = name.split_once(':') {
+            // MCP per-tool toggle: mcp_servers.<server>.tools.include/exclude.
+            if server.is_empty() || tool.is_empty() {
+                eprintln!(
+                    "{}",
+                    Color::Red.paint(format!("Invalid MCP tool reference '{}' (want '<server>:<tool>')", name))
+                );
+                continue;
+            }
+            mcp_toggles.push((server.to_string(), tool.to_string()));
             continue;
         }
         if !valid.contains(&name.as_str()) {
@@ -246,6 +248,9 @@ fn apply_change(names: &[String], platform: &str, enable: bool) -> Result<i32> {
             continue;
         }
         targets.push(name.clone());
+    }
+    if !mcp_toggles.is_empty() {
+        return mcp_tool_toggle(&mcp_toggles, enable);
     }
     if targets.is_empty() {
         return Ok(1);
@@ -306,4 +311,127 @@ fn save_platform_list(config: &mut Config, platform: &str, enabled: &[String]) -
     }
     std::fs::write(&path, serde_yaml::to_string(&serde_yaml::Value::Mapping(doc))?)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MCP per-tool toggling: `joey tools enable|disable <server>:<tool>`
+// ---------------------------------------------------------------------------
+
+/// Toggle individual MCP tools by writing `mcp_servers.<server>.tools.include`
+/// (enable) or `.exclude` (disable) in config.yaml. Toggling enable after an
+/// exclude removes it from the exclude list (and vice versa) so the two
+/// lists never fight.
+fn mcp_tool_toggle(toggles: &[(String, String)], enable: bool) -> Result<i32> {
+    let path = joey_core::constants::config_path();
+    let mut doc: serde_yaml::Mapping = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_yaml::from_str::<serde_yaml::Value>(&s).ok())
+        .and_then(|v| v.as_mapping().cloned())
+        .unwrap_or_default();
+    let servers_key = serde_yaml::Value::String("mcp_servers".to_string());
+    let mut servers = doc
+        .get(&servers_key)
+        .and_then(|v| v.as_mapping())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut applied: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (server, tool) in toggles {
+        let server_key = serde_yaml::Value::String(server.clone());
+        let Some(entry) = servers.get_mut(&server_key).and_then(|v| v.as_mapping_mut()) else {
+            failures.push(format!("{server}:{tool} (server '{server}' not configured)"));
+            continue;
+        };
+        // Ensure the tools sub-mapping exists.
+        let tools_key = serde_yaml::Value::String("tools".to_string());
+        if !entry.contains_key(&tools_key) {
+            entry.insert(tools_key.clone(), serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        }
+        let Some(tools) = entry.get_mut(&tools_key).and_then(|v| v.as_mapping_mut()) else {
+            failures.push(format!("{server}:{tool} (tools is not a mapping)"));
+            continue;
+        };
+        let (list_key, clear_key) = if enable {
+            ("include", "exclude")
+        } else {
+            ("exclude", "include")
+        };
+        // Remove from the opposite list first.
+        for key in [list_key, clear_key] {
+            let k = serde_yaml::Value::String(key.to_string());
+            if let Some(serde_yaml::Value::Sequence(seq)) = tools.get_mut(&k) {
+                seq.retain(|v| v.as_str() != Some(tool.as_str()));
+            }
+        }
+        let k = serde_yaml::Value::String(list_key.to_string());
+        if !tools.contains_key(&k) {
+            tools.insert(k.clone(), serde_yaml::Value::Sequence(Vec::new()));
+        }
+        if let Some(serde_yaml::Value::Sequence(seq)) = tools.get_mut(&k) {
+            if !seq.iter().any(|v| v.as_str() == Some(tool.as_str())) {
+                seq.push(serde_yaml::Value::String(tool.clone()));
+            }
+        }
+        applied.push(format!("{server}:{tool}"));
+    }
+
+    // Persist only when something changed.
+    if !applied.is_empty() {
+        doc.insert(servers_key, serde_yaml::Value::Mapping(servers));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, serde_yaml::to_string(&serde_yaml::Value::Mapping(doc))?)?;
+        let verb = if enable { "Enabled" } else { "Disabled" };
+        println!("{}", Color::Green.paint(format!("✓ {}: {}", verb, applied.join(", "))));
+        println!(
+            "{}",
+            Color::DarkGray.paint("  Applies to new sessions and after /reload-mcp.")
+        );
+    }
+    for f in &failures {
+        eprintln!("{}", Color::Red.paint(format!("✗ {f}")));
+    }
+    Ok(if applied.is_empty() { 1 } else { 0 })
+}
+
+// ---------------------------------------------------------------------------
+// post-setup: finish tool configuration after first-run
+// ---------------------------------------------------------------------------
+
+/// `joey tools post-setup` — the post-first-run tool configuration step:
+/// verifies the enabled toolsets resolve to real tools and offers the
+/// summary. Non-interactive variant of the upstream curses flow.
+fn post_setup() -> Result<i32> {
+    let config = Config::load()?;
+    let platform = "cli";
+    let enabled = effective_leaf_toolsets(&config, platform);
+    println!();
+    println!("{}", Color::Cyan.bold().paint("⚕ Tool Post-Setup"));
+    println!();
+    if enabled.is_empty() {
+        println!(
+            "{}",
+            Color::Yellow.paint(format!("No toolsets enabled for '{platform}' — the agent has no tools."))
+        );
+        println!("Enable the essentials:");
+        println!("  joey tools enable file,terminal,web --platform {platform}");
+    } else {
+        println!("  ✓ {} toolset(s) enabled for '{platform}':", enabled.len());
+        for ts in &enabled {
+            let count = joey_tools::toolsets::resolve(ts).len();
+            let desc = joey_tools::toolsets::description(ts).unwrap_or("");
+            println!("    {:<14} {:>3} tool(s)  {}", ts, count, desc);
+        }
+        let total = joey_tools::toolsets::resolve_multiple(&enabled).len();
+        println!();
+        println!("  Total: {total} distinct tools available to the agent.");
+        println!(
+            "{}",
+            Color::DarkGray.paint("  Adjust with: joey tools enable|disable <name> --platform cli")
+        );
+    }
+    println!();
+    Ok(0)
 }

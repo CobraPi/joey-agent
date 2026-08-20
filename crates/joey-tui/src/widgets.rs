@@ -161,19 +161,42 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
         .style(Style::default().bg(theme.bg_elevated.to_color()));
     f.render_widget(buf_area, area);
 
-    // Left: gradient wordmark "joey" with a faint breathing highlight
-    // (toned down considerably from the original glow — crush's header is
-    // static; we keep a hint of life without the "light show" feel).
-    let logo = "✦ joey";
+    // Left: the "joey" wordmark as an inverted brand chip — a solid gradient
+    // background with a near-black foreground reads with far more contrast
+    // than gradient-on-dark text. A gold "✦" spark sits outside the chip.
+    // The pulse drives a gentle breathing lift on the chip background
+    // (15% max — visible but no strobing).
+    let spark = "✦";
+    let word = "joey";
     let glow = pulse.value();
-    let bright_stops = [
-        theme.grad_0.lerp(Rgb(255, 255, 255), glow * 0.08),
-        theme.grad_1.lerp(Rgb(255, 255, 255), glow * 0.08),
-        theme.grad_2.lerp(Rgb(255, 255, 255), glow * 0.08),
-        theme.grad_3.lerp(Rgb(255, 255, 255), glow * 0.08),
+    let chip_stops = [
+        theme.grad_0.lerp(Rgb(255, 255, 255), glow * 0.15),
+        theme.grad_1.lerp(Rgb(255, 255, 255), glow * 0.15),
+        theme.grad_2.lerp(Rgb(255, 255, 255), glow * 0.15),
+        theme.grad_3.lerp(Rgb(255, 255, 255), glow * 0.15),
     ];
-    let logo_spans =
-        crate::theme::gradient_spans_stops(logo, &bright_stops);
+    let mut logo_spans: Vec<Span<'static>> = Vec::new();
+    logo_spans.push(Span::styled(
+        spark,
+        Style::default()
+            .fg(theme.gold.to_color())
+            .add_modifier(Modifier::BOLD),
+    ));
+    logo_spans.push(Span::raw(" "));
+    let chip_text = format!(" {word} ");
+    let chip_chars: Vec<char> = chip_text.chars().collect();
+    let chip_fg = theme.bg_void.to_color();
+    for (i, ch) in chip_chars.iter().enumerate() {
+        let t = i as f32 / (chip_chars.len() - 1) as f32;
+        let bg = crate::theme::sample_stops(&chip_stops, t).to_color();
+        logo_spans.push(Span::styled(
+            ch.to_string(),
+            Style::default()
+                .fg(chip_fg)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     let logo_line = Line::from(logo_spans);
 
     // Right: model + session id + spinner.
@@ -2956,6 +2979,77 @@ mod tests {
         assert_eq!(base, idle, "idle flow == static gradient");
         // Sanity: the static row is actually a gradient (ends differ).
         assert_ne!(base.first(), base.last());
+    }
+
+    /// Render the header's first row through TestBackend and return the
+    /// buffer cells (symbol + fg + bg) so style contracts can be asserted.
+    fn header_cells(app: &App) -> Vec<(char, ratatui::style::Color, ratatui::style::Color)> {
+        use ratatui::backend::TestBackend;
+        let theme = Theme::aurora();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 4)).unwrap();
+        let spinner = Spinner::dots();
+        let pulse = Pulse::new();
+        terminal
+            .draw(|f| {
+                draw_header(f, f.area(), app, theme, &spinner, &pulse, None);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .take(100) // first header row only
+            .map(|c| {
+                (
+                    c.symbol().chars().next().unwrap_or(' '),
+                    c.fg,
+                    c.bg,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn header_wordmark_renders_as_high_contrast_brand_chip() {
+        let cells = header_cells(&App::new("sess", "model"));
+        let text: String = cells.iter().map(|(s, _, _)| *s).collect();
+
+        // Layout contract (inner starts at area.x+1): pad, gold spark, gap,
+        // then the inverted "joey" chip (" joey " = 6 cells).
+        assert!(text.starts_with(" ✦  joey "), "wordmark layout: {text:?}");
+        let chip: String = text.chars().skip(3).take(6).collect();
+        assert_eq!(chip, " joey ", "chip renders the padded wordmark: {text:?}");
+
+        // Spark is gold on the header background.
+        let (_, sfg, _) = cells[1];
+        assert_eq!(sfg, ratatui::style::Color::Rgb(0xFF, 0xC9, 0x3D));
+
+        // Prominence contract: every chip cell is INVERTED — its background
+        // is a bright gradient color (not the header's elevated bg), and the
+        // foreground is the near-black void color. This is what makes the
+        // wordmark pop: contrast comes from the filled background, not just
+        // glyph color.
+        let header_bg = ratatui::style::Color::Rgb(0x1D, 0x1D, 0x31); // bg_elevated
+        let chip_cells: Vec<char> = " joey ".chars().collect();
+        for (i, (sym, fg, bg)) in cells.iter().enumerate().skip(3).take(6) {
+            assert_ne!(*bg, header_bg, "chip cell {i} must be color-filled");
+            assert_eq!(*fg, ratatui::style::Color::Rgb(0x0B, 0x0B, 0x12), "chip fg is void: cell {i}");
+            assert_eq!(*sym, chip_cells[i - 3]);
+            // Brightness: the chip background must be a high-luma gradient
+            // stop (each channel significantly above the header bg).
+            if let ratatui::style::Color::Rgb(r, g, b) = bg {
+                let luma = (*r as u32 + *g as u32 + *b as u32) / 3;
+                assert!(luma > 0x60, "chip bg is bright at cell {i}: luma {luma:#x}");
+            } else {
+                panic!("chip bg must be Rgb at cell {i}");
+            }
+        }
+
+        // The chip is a real gradient: first and last chip bg colors differ.
+        let first_bg = cells[3].2;
+        let last_bg = cells[8].2;
+        assert_ne!(first_bg, last_bg, "chip background is a gradient");
     }
 
     /// HyperCode badge: draw the header through TestBackend and read the

@@ -27,6 +27,11 @@ pub struct TaskSpec {
     pub model: Option<String>,
     #[serde(default)]
     pub toolsets: Vec<String>,
+    /// HyperCode role routing ("explorer" | "implementor"): fills toolsets/
+    /// model/turns from the role's config table (gaps only) and injects the
+    /// role directive. Optional.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// A request from the parent agent (or user) to dispatch one or more

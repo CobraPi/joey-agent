@@ -36,6 +36,7 @@ mod secret_prompt;
 mod setup_wizard;
 mod skills_cmd;
 mod slash;
+mod slash_extra;
 mod speckit_cmd;
 mod speckit_slash;
 mod tools_cmd;

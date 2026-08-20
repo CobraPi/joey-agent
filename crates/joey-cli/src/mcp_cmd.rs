@@ -89,19 +89,89 @@ pub async fn mcp_command(args: McpArgs) -> Result<i32> {
         Some(McpAction::Other(rest)) => {
             let sub = rest.first().map(String::as_str).unwrap_or("");
             match sub {
-                "serve" | "catalog" | "picker" | "install" | "login" | "reauth" | "configure"
-                | "config" => {
-                    println!("'joey mcp {}' is not available in joey-agent yet.", sub);
+                "configure" | "config" => configure(rest.get(1).map(String::as_str)),
+                "catalog" => catalog(),
+                "serve" | "picker" | "install" | "login" | "reauth" => {
+                    // These need the upstream registry/marketplace service or
+                    // the gateway serve loop — not present in this port.
+                    println!("'joey mcp {sub}' needs infrastructure not present in this port:");
+                    match sub {
+                        "serve" => println!("  serve exposes joey itself as an MCP server over stdio; add an MCP server with `joey mcp add` instead."),
+                        "picker" => println!("  picker is the interactive TUI selector; use `joey mcp list` + `joey mcp add` for the same result."),
+                        "install" => println!("  install pulls from the MCP registry; add servers directly with `joey mcp add <name> --command <cmd>`."),
+                        "login" | "reauth" => println!("  login/reauth manage OAuth flows for remote servers; configure tokens in ~/.joey/.env instead."),
+                        _ => unreachable!(),
+                    }
                     Ok(1)
                 }
                 other => {
                     eprintln!("Unknown mcp command: {}", other);
-                    eprintln!("Usage: joey mcp [add|remove|list|test]");
+                    eprintln!("Usage: joey mcp [add|remove|list|test|configure|catalog]");
                     Ok(2)
                 }
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// configure / catalog (local-config equivalents of the upstream registry UI)
+// ---------------------------------------------------------------------------
+
+/// `joey mcp configure [name]` — open config.yaml in $EDITOR positioned at
+/// the mcp_servers section (no name: jump-to-section hint printed).
+fn configure(name: Option<&str>) -> Result<i32> {
+    let config_path = joey_core::constants::config_path();
+    if !config_path.exists() {
+        println!("No config.yaml yet — add your first server with `joey mcp add <name> --command <cmd>`.");
+        return Ok(1);
+    }
+    let config = joey_core::Config::load()?;
+    let servers = joey_mcp::load_server_configs(&config);
+    if let Some(name) = name {
+        if servers.contains_key(name) {
+            println!("Server '{name}' is configured. Edit its entry under mcp_servers in:");
+            println!("  {}", config_path.display());
+            println!("Then validate the change: joey mcp test {name}");
+        } else {
+            println!("Server '{name}' is NOT configured. Add it:");
+            println!("  joey mcp add {name} --command <cmd> --args <args...>");
+            return Ok(1);
+        }
+        return Ok(0);
+    }
+    // No name: open the file in the editor like `joey config edit`.
+    crate::config_cmd::config_command(&crate::config_cmd::ConfigArgs {
+        action: Some(crate::config_cmd::ConfigAction::Edit),
+    })
+}
+
+/// `joey mcp catalog` — a curated list of common MCP servers with their
+/// install command lines (offline catalog; no registry round-trip).
+fn catalog() -> Result<i32> {
+    println!();
+    println!("{}", Color::Cyan.bold().paint("  MCP Server Catalog (curated, offline)"));
+    println!("{}", Color::DarkGray.paint("  Install any of these with the printed command."));
+    println!();
+    let entries: &[(&str, &str, &str)] = &[
+        ("github", "GitHub issues/PRs/repos", "joey mcp add github --command docker --args run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server"),
+        ("filesystem", "Sandboxed filesystem access", "joey mcp add filesystem --command npx --args -y @modelcontextprotocol/server-filesystem /path"),
+        ("sqlite", "SQLite database access", "joey mcp add sqlite --command uvx --args mcp-server-sqlite --db-path /path/app.db"),
+        ("postgres", "PostgreSQL access (read/write)", "joey mcp add postgres --command npx --args -y @modelcontextprotocol/server-postgres postgresql://localhost/db"),
+        ("puppeteer", "Browser automation (headless)", "joey mcp add puppeteer --command npx --args -y @modelcontextprotocol/server-puppeteer"),
+        ("memory", "Persistent knowledge graph", "joey mcp add memory --command npx --args -y @modelcontextprotocol/server-memory"),
+        ("fetch", "Web fetch with markdown conversion", "joey mcp add fetch --command uvx --args mcp-server-fetch"),
+        ("brave-search", "Brave web search", "joey mcp add brave-search --command npx --args -y @modelcontextprotocol/server-brave-search --env BRAVE_API_KEY=your_key"),
+    ];
+    for (name, desc, _cmd) in entries {
+        println!("  {:<14} {}", Color::Green.paint(*name), desc);
+    }
+    println!();
+    println!("{}", Color::DarkGray.paint("  Example install:"));
+    println!("{}", Color::DarkGray.paint(format!("    {}", entries[0].2)));
+    println!();
+    println!("{}", Color::DarkGray.paint("  Then verify: joey mcp list && joey mcp test github"));
+    Ok(0)
 }
 
 fn print_mcp_help() {

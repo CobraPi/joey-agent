@@ -452,6 +452,29 @@ pub(crate) fn specs_to_requests(
     .collect()
 }
 
+/// Apply per-task HyperCode role routing to a batch's requests (in place).
+/// Tasks without a `role` are untouched. Config-based role settings only
+/// fill gaps the task spec didn't set explicitly.
+pub(crate) fn apply_batch_hyper_roles(
+    requests: &mut [DelegationRequest],
+    tasks: &[TaskSpec],
+    tree: &Config,
+    provider: &str,
+) -> Result<(), String> {
+    for (req, spec) in requests.iter_mut().zip(tasks.iter()) {
+        if let Some(role_str) = spec.role.as_deref() {
+            let Some(role) = crate::delegation_tool::hyper_role_parse(role_str) else {
+                return Err(format!(
+                    "Unknown role '{role_str}' on task {:?}. Use 'explorer' or 'implementor'.",
+                    spec.goal
+                ));
+            };
+            crate::delegation_tool::apply_hyper_role(req, role, tree, provider);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

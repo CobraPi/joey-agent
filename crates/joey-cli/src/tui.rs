@@ -241,6 +241,9 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
             queued: Vec::new(),
             engine_queued: Vec::new(),
             engine_generation: 0,
+            busy_enter_mode: joey_core::Config::load()
+                .map(|c| c.get_str("display.busy_enter", "interrupt"))
+                .unwrap_or_else(|_| "interrupt".to_string()),
         };
         session.submit(query.clone());
         loop {
@@ -285,6 +288,9 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         queued: Vec::new(),
         engine_queued: Vec::new(),
         engine_generation: 0,
+        busy_enter_mode: joey_core::Config::load()
+            .map(|c| c.get_str("display.busy_enter", "interrupt"))
+            .unwrap_or_else(|_| "interrupt".to_string()),
     };
     let (result, outro) = interactive_loop(session).await;
 
@@ -378,6 +384,10 @@ pub struct TuiSession {
     /// turn it was waiting on died with the killed engine (no
     /// TurnFinished will ever arrive from the fresh one).
     pub engine_generation: u64,
+    /// What Enter does while a turn runs (`/busy`): "queue", "steer", or
+    /// "interrupt" (backed by config display.busy_enter; upstream default
+    /// interrupt).
+    pub busy_enter_mode: String,
 }
 
 impl TuiSession {
@@ -726,8 +736,17 @@ impl TuiSession {
             }
             Ok(crate::hypercode::HyperCodeOutput::Toggle(new_state)) => {
                 self.tui.app_mut().hypercode_enabled = new_state;
+                // Live-apply orchestrator mode on the engine's agent (tool
+                // surface + overlay swap; no rebuild needed).
+                if let Some(engine) = &self.engine {
+                    engine.send(crate::engine::EngineCommand::SetOrchestratorMode(new_state));
+                }
                 self.tui.app_mut().push_item(TranscriptItem::Notice {
-                    text: format!("⚡ HyperCode mode toggled: {} (saved to config.yaml)", if new_state { "ON" } else { "OFF" }),
+                    text: format!(
+                        "⚡ HyperCode mode toggled: {} (saved to config.yaml){}",
+                        if new_state { "ON" } else { "OFF" },
+                        if new_state { " — orchestrator mode: file writes/builds go through subagents; main agent keeps process monitoring + read-only peeks + web" } else { "" }
+                    ),
                     kind: NoticeKind::Success,
                 });
             }
@@ -1113,17 +1132,35 @@ async fn interactive_loop(mut session: TuiSession) -> (anyhow::Result<()>, Outro
                         engine.send(crate::engine::EngineCommand::Steer(steer_text));
                     }
                 } else if session.busy {
-                    // Hermes parity (busy_input_mode: interrupt — the
-                    // upstream default): a plain message mid-turn
-                    // INTERRUPTS the running turn; the engine unwinds it
-                    // and runs the new message as the next turn.
+                    // /busy selects what Enter does mid-turn (upstream
+                    // busy_input_mode; default interrupt).
                     let preview: String = text.chars().take(48).collect();
-                    session.tui.app_mut().push_item(TranscriptItem::Notice {
-                        text: format!("⚡ interrupting — your message runs next: {preview}"),
-                        kind: NoticeKind::Warning,
-                    });
-                    session.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
-                    session.send_queued_submit(text);
+                    match session.busy_enter_mode.as_str() {
+                        "queue" => {
+                            session.stash_ui_queue(text);
+                        }
+                        "steer" => {
+                            if let Some(engine) = &session.engine {
+                                engine.send(crate::engine::EngineCommand::Steer(text.clone()));
+                            }
+                            session.tui.app_mut().push_item(TranscriptItem::Notice {
+                                text: format!("🧭 steering the running turn: {preview}"),
+                                kind: NoticeKind::Info,
+                            });
+                        }
+                        _ => {
+                            // Hermes parity (busy_input_mode: interrupt — the
+                            // upstream default): a plain message mid-turn
+                            // INTERRUPTS the running turn; the engine unwinds
+                            // it and runs the new message as the next turn.
+                            session.tui.app_mut().push_item(TranscriptItem::Notice {
+                                text: format!("⚡ interrupting — your message runs next: {preview}"),
+                                kind: NoticeKind::Warning,
+                            });
+                            session.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+                            session.send_queued_submit(text);
+                        }
+                    }
                 } else if session.submit(text) {
                     break;
                 }
@@ -1225,7 +1262,7 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
         }
         Resolution::Command { def, .. } if !def.implemented => {
             self.tui.app_mut().push_item(TranscriptItem::Notice {
-                text: format!("/{} is not available in joey-agent yet.", def.name),
+                text: format!("/{} has no handler in this build (registry inconsistency).", def.name),
                 kind: NoticeKind::Warning,
             });
         }
@@ -1557,6 +1594,598 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                 // HyperCode parallel optimization — TUI version.
                 let args = slash_args_after(input, "hypercode");
                 self.handle_hypercode_slash(args);
+            }
+            // ── Newly-wired commands (slash_extra.rs shared handlers) ──
+            "redraw" => {
+                // ratatui repaints fully every frame — clear the stale
+                // transcript scroll state and force an immediate redraw tick.
+                self.tui.app_mut().scroll = None;
+                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                    text: "screen repainted".into(),
+                    kind: NoticeKind::Info,
+                });
+            }
+            "save" => {
+                let sid = self.tui.app().session_id.clone();
+                let db = joey_core::SessionDb::open_default().ok();
+                let lines = crate::slash_extra::save_session_markdown(&sid, db.as_ref());
+                for l in lines.0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "retry" => {
+                // Re-send the last user message from the transcript as a new
+                // turn (the engine owns the agent + its history).
+                let last_user = self
+                    .tui
+                    .app()
+                    .transcript
+                    .iter()
+                    .rev()
+                    .find_map(|item| match item {
+                        TranscriptItem::User { text } if !text.trim().is_empty() => {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    });
+                match last_user {
+                    Some(text) => {
+                        self.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: format!("↻ retrying: {}", text.chars().take(60).collect::<String>()),
+                            kind: NoticeKind::Info,
+                        });
+                        self.submit(text);
+                    }
+                    None => self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "Nothing to retry yet.".into(),
+                        kind: NoticeKind::Warning,
+                    }),
+                }
+            }
+            "prompt" | "compose" => {
+                let args = slash_args_after(input, "prompt").to_string();
+                // Leave the alternate screen so $EDITOR owns the terminal.
+                let _ = self.tui.leave();
+                let composed = crate::slash_extra::compose_in_editor(&args);
+                let back = self.tui.enter_from_leave();
+                let quit = match composed {
+                    Some(text) => self.submit(text),
+                    None => {
+                        self.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: "(editor cancelled or empty — nothing sent)".into(),
+                            kind: NoticeKind::Info,
+                        });
+                        false
+                    }
+                };
+                debug_assert!(back.is_ok(), "re-entering the TUI after $EDITOR must succeed");
+                if quit {
+                    return true;
+                }
+            }
+            "undo" => {
+                let sid = self.tui.app().session_id.clone();
+                let n: usize = slash_args_after(input, "undo")
+                    .trim()
+                    .parse()
+                    .unwrap_or(1)
+                    .max(1);
+                if let Ok(db) = joey_core::SessionDb::open_default() {
+                    match db.rewind_last_user_exchanges(&sid, n) {
+                        Ok(0) => self.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: "Nothing to undo (no active user exchange left).".into(),
+                            kind: NoticeKind::Warning,
+                        }),
+                        Ok(removed) => {
+                            // Signal the engine to drop its tail too; it
+                            // rebuilds history from the DB on the next turn.
+                            if let Some(engine) = &self.engine {
+                                engine.send(crate::engine::EngineCommand::ReloadHistory);
+                            }
+                            self.tui.app_mut().push_item(TranscriptItem::Notice {
+                                text: format!("Undid {removed} message(s) ({n} exchange(s)). History reloaded."),
+                                kind: NoticeKind::Success,
+                            });
+                        }
+                        Err(e) => self.tui.app_mut().push_item(TranscriptItem::Error {
+                            text: format!("rewind failed: {e}"),
+                        }),
+                    }
+                }
+            }
+            "title" => {
+                let args = slash_args_after(input, "title").trim().to_string();
+                if args.is_empty() {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "Usage: /title <name>".into(),
+                        kind: NoticeKind::Warning,
+                    });
+                } else if let Ok(db) = joey_core::SessionDb::open_default() {
+                    let sid = self.tui.app().session_id.clone();
+                    match db.set_title(&sid, &args) {
+                        Ok(()) => self.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: format!("✓ Title set: {args}"),
+                            kind: NoticeKind::Success,
+                        }),
+                        Err(e) => self.tui.app_mut().push_item(TranscriptItem::Error {
+                            text: format!("failed to set title: {e}"),
+                        }),
+                    }
+                }
+            }
+            "handoff" => {
+                let args = slash_args_after(input, "handoff").to_string();
+                let sid = self.tui.app().session_id.clone();
+                for l in crate::slash_extra::handoff_lines(&args, &sid).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "branch" | "fork" => {
+                let args = slash_args_after(input, "branch").to_string();
+                let sid = self.tui.app().session_id.clone();
+                if let Ok(db) = joey_core::SessionDb::open_default() {
+                    let (lines, _) = crate::slash_extra::branch_session(&sid, &args, Some(&db));
+                    for l in lines.0 {
+                        self.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: l,
+                            kind: NoticeKind::Info,
+                        });
+                    }
+                }
+            }
+            "snapshot" => {
+                let args = slash_args_after(input, "snapshot").to_string();
+                let config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::snapshot::handle(&args, &config).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "stop" => {
+                for l in crate::slash_extra::stop_background_processes().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "background" | "bg" | "btw" => {
+                let args = slash_args_after(input, "background").trim().to_string();
+                if args.is_empty() {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "Usage: /background <prompt>".into(),
+                        kind: NoticeKind::Warning,
+                    });
+                } else {
+                    // Queue without interrupting — the engine drains it when
+                    // the current turn ends (same as /queue semantics).
+                    self.stash_ui_queue(args);
+                }
+            }
+            "journey" | "learning" | "memory-graph" => {
+                let args = slash_args_after(input, "journey").to_string();
+                let cwd = std::env::current_dir().unwrap_or_default();
+                for l in crate::slash_extra::journey_lines(&cwd, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "moa" => {
+                let args = slash_args_after(input, "moa").trim().to_string();
+                if args.is_empty() {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "Usage: /moa <prompt>".into(),
+                        kind: NoticeKind::Warning,
+                    });
+                } else {
+                    let (lines, composed) = crate::slash_extra::moa_prompt(&args);
+                    for l in lines.0 {
+                        self.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: l,
+                            kind: NoticeKind::Info,
+                        });
+                    }
+                    self.submit(composed);
+                }
+            }
+            "subgoal" => {
+                let args = slash_args_after(input, "subgoal").to_string();
+                let cwd = std::env::current_dir().unwrap_or_default();
+                for l in crate::slash_extra::subgoal_lines(&cwd, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "whoami" => {
+                for l in crate::slash_extra::whoami_lines().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "profile" => {
+                for l in crate::slash_extra::profile_lines().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "codex-runtime" | "codex_runtime" => {
+                let args = slash_args_after(input, "codex-runtime").to_string();
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::codex_runtime_lines(&mut config, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "personality" => {
+                let args = slash_args_after(input, "personality").to_string();
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                let (lines, _overlay) = crate::slash_extra::personality::handle(&mut config, &args);
+                for l in lines.0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+                // The overlay applies engine-side on the next agent rebuild;
+                // switching personalities mid-session re-reads config there.
+            }
+            "statusbar" | "sb" => {
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::statusbar_lines(&mut config).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+                // Apply live: the TUI reads display.statusbar at render time
+                // via App::statusbar_visible (set below).
+                let visible = config.get_bool("display.statusbar", true);
+                self.tui.app_mut().show_status_bar = visible;
+            }
+            "footer" => {
+                let args = slash_args_after(input, "footer").to_string();
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::footer_lines(&mut config, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "yolo" => {
+                for l in crate::slash_extra::yolo_lines().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Warning,
+                    });
+                }
+            }
+            "fast" => {
+                let args = slash_args_after(input, "fast").to_string();
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::fast_lines(&mut config, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "skin" => {
+                let args = slash_args_after(input, "skin").to_string();
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::skin::handle(&mut config, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "indicator" => {
+                let args = slash_args_after(input, "indicator").to_string();
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::indicator::handle(&mut config, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "voice" => {
+                let args = slash_args_after(input, "voice").to_string();
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::voice_lines(&mut config, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "busy" => {
+                let args = slash_args_after(input, "busy").to_string();
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::busy::handle(&mut config, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+                // Live-apply: the interactive loop reads this for busy-Enter.
+                self.busy_enter_mode = config.get_str("display.busy_enter", "interrupt");
+            }
+            "reload" => {
+                for l in crate::slash_extra::reload_env().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "memory" => {
+                let args = slash_args_after(input, "memory").to_string();
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::memory_lines(&mut config, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "bundles" => {
+                let config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::bundles_lines(&config).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "pet" => {
+                let args = slash_args_after(input, "pet").to_string();
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::pet::handle(&mut config, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "hatch" | "generate-pet" => {
+                let args = slash_args_after(input, "hatch").to_string();
+                for l in crate::slash_extra::pet::hatch(&args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "learn" => {
+                let args = slash_args_after(input, "learn").trim().to_string();
+                if args.is_empty() {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "Usage: /learn <what to learn from>".into(),
+                        kind: NoticeKind::Warning,
+                    });
+                } else {
+                    let (lines, prompt) = crate::slash_extra::learn_prompt(&args);
+                    for l in lines.0 {
+                        self.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: l,
+                            kind: NoticeKind::Info,
+                        });
+                    }
+                    self.submit(prompt);
+                }
+            }
+            "cron" => {
+                let args = slash_args_after(input, "cron").to_string();
+                for l in crate::slash_extra::cron::handle(&args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "suggestions" | "suggest" => {
+                let args = slash_args_after(input, "suggestions").to_string();
+                let mut config = joey_core::Config::load().unwrap_or_else(|_| Config::defaults());
+                for l in crate::slash_extra::suggestions::handle(&mut config, &args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "blueprint" | "bp" => {
+                let args = slash_args_after(input, "blueprint").to_string();
+                for l in crate::slash_extra::blueprint::handle(&args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "curator" => {
+                let args = slash_args_after(input, "curator").to_string();
+                let job = args.split_whitespace().next().unwrap_or("").to_string();
+                for l in crate::slash_extra::curator_lines(&args).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+                if job == "dedupe" || job == "refresh" {
+                    let prompt = crate::slash_extra::curator_prompt(&job);
+                    self.submit(prompt);
+                }
+            }
+            "kanban" => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                for l in crate::slash_extra::kanban_lines(&cwd).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "reload-mcp" | "reload_mcp" => {
+                for l in crate::slash_extra::reload_mcp_lines().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "reload-skills" | "reload_skills" => {
+                for l in crate::slash_extra::reload_skills_lines().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "plugins" => {
+                for l in crate::slash_extra::plugins_lines().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "subscription" | "upgrade" => {
+                for l in crate::slash_extra::subscription_lines().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "topup" => {
+                for l in crate::slash_extra::topup_lines().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "insights" => {
+                let args = slash_args_after(input, "insights").trim().to_string();
+                let days: i64 = args.parse().unwrap_or(7).max(1);
+                let db = joey_core::SessionDb::open_default().ok();
+                for l in crate::slash_extra::insights_lines(days, db.as_ref()).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "platforms" | "gateway" => {
+                for l in crate::slash_extra::platforms_lines().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "image" => {
+                let args = slash_args_after(input, "image").trim().to_string();
+                if args.is_empty() {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "Usage: /image <path> (png/jpg/gif/webp, ≤15MB)".into(),
+                        kind: NoticeKind::Warning,
+                    });
+                } else {
+                    match crate::slash_extra::image_data_url(&args) {
+                        Ok(url) => {
+                            if let Some(engine) = &self.engine {
+                                engine.send(crate::engine::EngineCommand::AttachImage(url.clone()));
+                                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                                    text: "✓ Image attached — it goes with your next message.".into(),
+                                    kind: NoticeKind::Success,
+                                });
+                            }
+                        }
+                        Err(e) => self.tui.app_mut().push_item(TranscriptItem::Error { text: e }),
+                    }
+                }
+            }
+            "paste" => {
+                #[cfg(target_os = "macos")]
+                {
+                    let dir = std::env::temp_dir();
+                    let out_path = dir.join(format!("joey-paste-{}.png", std::process::id()));
+                    let script = format!(
+                        "set theClipboard to the clipboard as «class PNGf»\nset theFile to open for access POSIX file \"{}\" with write permission\nwrite theClipboard to theFile\nclose access theFile",
+                        out_path.display()
+                    );
+                    let status = std::process::Command::new("osascript")
+                        .arg("-e")
+                        .arg(&script)
+                        .stderr(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .status();
+                    let ok = matches!(status, Ok(s) if s.success()) && out_path.exists();
+                    if ok {
+                        match crate::slash_extra::image_data_url(out_path.to_str().unwrap_or_default()) {
+                            Ok(url) => {
+                                if let Some(engine) = &self.engine {
+                                    engine.send(crate::engine::EngineCommand::AttachImage(url.clone()));
+                                }
+                                let _ = std::fs::remove_file(&out_path);
+                                self.tui.app_mut().push_item(TranscriptItem::Notice {
+                                    text: "✓ Clipboard image attached — it goes with your next message.".into(),
+                                    kind: NoticeKind::Success,
+                                });
+                            }
+                            Err(e) => self.tui.app_mut().push_item(TranscriptItem::Error { text: e }),
+                        }
+                    } else {
+                        self.tui.app_mut().push_item(TranscriptItem::Error {
+                            text: "no image on the clipboard (or clipboard access denied)".into(),
+                        });
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    self.tui.app_mut().push_item(TranscriptItem::Error {
+                        text: "clipboard image paste needs macOS (osascript) — use /image <path> instead".into(),
+                    });
+                }
+            }
+            "update" => {
+                for l in crate::slash_extra::update_lines().0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
+            }
+            "debug" => {
+                let args = slash_args_after(input, "debug").trim().to_string();
+                let mode = if args.is_empty() { "local".to_string() } else { args };
+                for l in crate::slash_extra::debug_lines(&mode).0 {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: l,
+                        kind: NoticeKind::Info,
+                    });
+                }
             }
             name => {
                 self.tui.app_mut().push_item(TranscriptItem::Notice {

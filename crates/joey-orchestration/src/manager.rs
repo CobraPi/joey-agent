@@ -393,6 +393,44 @@ impl SubagentManager {
             .await
     }
 
+    /// `dispatch_batch` + HyperCode per-task role routing: each TaskSpec's
+    /// `role` ("explorer"/"implementor") resolves its config-backed
+    /// model/turns/tokens/reasoning and injects the role directive.
+    /// Tasks without a role behave exactly like `dispatch_batch`.
+    #[allow(clippy::too_many_arguments)] // deviation: domain-shaped batch dispatch, parameter bag would be speculative abstraction
+    pub async fn dispatch_batch_with_roles(
+        &self,
+        tasks: &[TaskSpec],
+        batch_model: Option<&str>,
+        batch_toolsets: &[String],
+        parent_config: &AgentConfig,
+        parent_config_tree: &Config,
+        base_registry: &ToolRegistry,
+        event_tx: Option<&mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Vec<DelegationResult> {
+        let mut requests = specs_to_requests(
+            tasks,
+            batch_model,
+            batch_toolsets,
+            Some(self.config.default_max_turns),
+            self.config.default_persist,
+            SubagentRole::Leaf,
+        );
+        if let Err(e) = crate::subagent::apply_batch_hyper_roles(
+            &mut requests,
+            tasks,
+            parent_config_tree,
+            &parent_config.provider,
+        ) {
+            // Surface the routing error as a failed batch of one entry — the
+            // caller contract (Vec<DelegationResult>) stays intact.
+            tracing::warn!("hypercode role routing failed: {e}");
+        }
+
+        self.dispatch_requests(&requests, parent_config, parent_config_tree, base_registry, event_tx)
+            .await
+    }
+
     /// Dispatch a wave of PRE-BUILT heterogeneous requests in parallel
     /// (HyperCode entry point: planner/explorer/implementor children with
     /// different models, toolsets, budgets, and prompts in one wave).

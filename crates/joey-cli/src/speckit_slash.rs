@@ -34,6 +34,11 @@ pub struct StepDef {
     pub script: Option<&'static str>,
     /// Extra script args.
     pub script_args: &'static [&'static str],
+    /// True when the script/flags may be absent in older `.specify` scaffolds
+    /// (e.g. `resolve-template.sh` and `--template` postdate many inits).
+    /// A missing script or a rejected flag degrades gracefully (retry
+    /// without the newer args / skip the pre-flight) instead of failing.
+    pub script_optional: bool,
     /// Append the user's arguments to the script invocation as the
     /// positional feature description (only `speckit-specify` needs this).
     pub script_gets_user_args: bool,
@@ -49,8 +54,13 @@ pub const LIFECYCLE: &[StepDef] = &[
     StepDef {
         name: "speckit-constitution",
         skill: "speckit-constitution",
-        script: None,
-        script_args: &[],
+        // Upstream: resolve-template.sh constitution-template --json. The
+        // script ships only in NEWER .specify scaffolds — older inits don't
+        // have it, so this is an optional pre-flight (missing script is not
+        // an error; the skill reads the constitution template itself).
+        script: Some("resolve-template.sh"),
+        script_args: &["constitution-template", "--json"],
+        script_optional: true,
         script_gets_user_args: false,
         description: "Create or update the project constitution from interactive Q&A",
         args_hint: "[guidelines...]",
@@ -63,6 +73,7 @@ pub const LIFECYCLE: &[StepDef] = &[
         // agent updates spec.md in place (upstream "Create or update").
         script: Some("create-new-feature.sh"),
         script_args: &["--json", "--allow-existing-branch"],
+        script_optional: false,
         script_gets_user_args: true,
         description: "Create or update the feature specification from a description",
         args_hint: "<feature description>",
@@ -70,8 +81,12 @@ pub const LIFECYCLE: &[StepDef] = &[
     StepDef {
         name: "speckit-clarify",
         skill: "speckit-clarify",
+        // Upstream clarify.md: check-prerequisites.sh --json --paths-only —
+        // PURE PATH RESOLUTION, no plan.md validation. Clarify runs between
+        // specify and plan (it must NOT require plan.md to exist).
         script: Some("check-prerequisites.sh"),
-        script_args: &["--json"],
+        script_args: &["--json", "--paths-only"],
+        script_optional: false,
         script_gets_user_args: false,
         description: "Identify underspecified areas in the current feature spec",
         args_hint: "[focus areas...]",
@@ -81,6 +96,7 @@ pub const LIFECYCLE: &[StepDef] = &[
         skill: "speckit-plan",
         script: Some("setup-plan.sh"),
         script_args: &["--json"],
+        script_optional: false,
         script_gets_user_args: false,
         description: "Execute the implementation planning workflow (design artifacts)",
         args_hint: "[notes...]",
@@ -88,8 +104,12 @@ pub const LIFECYCLE: &[StepDef] = &[
     StepDef {
         name: "speckit-checklist",
         skill: "speckit-checklist",
-        script: None,
-        script_args: &[],
+        // Upstream: check-prerequisites.sh --json --template checklist-template.
+        // --template support (and the JSON TEMPLATE_CONTENT field) exists only
+        // in NEWER .specify scaffolds; degrade to plain --json when rejected.
+        script: Some("check-prerequisites.sh"),
+        script_args: &["--json", "--template", "checklist-template"],
+        script_optional: true,
         script_gets_user_args: false,
         description: "Generate a custom checklist for the current feature",
         args_hint: "",
@@ -99,6 +119,7 @@ pub const LIFECYCLE: &[StepDef] = &[
         skill: "speckit-tasks",
         script: Some("setup-tasks.sh"),
         script_args: &["--json"],
+        script_optional: false,
         script_gets_user_args: false,
         description: "Generate an actionable dependency-ordered tasks.md",
         args_hint: "",
@@ -106,8 +127,11 @@ pub const LIFECYCLE: &[StepDef] = &[
     StepDef {
         name: "speckit-analyze",
         skill: "speckit-analyze",
+        // Upstream analyze.md: --require-tasks --include-tasks (analyze runs
+        // AFTER tasks exist — it cross-checks spec/plan/tasks).
         script: Some("check-prerequisites.sh"),
-        script_args: &["--json", "--include-tasks"],
+        script_args: &["--json", "--require-tasks", "--include-tasks"],
+        script_optional: false,
         script_gets_user_args: false,
         description: "Cross-artifact consistency and coverage analysis",
         args_hint: "",
@@ -117,6 +141,7 @@ pub const LIFECYCLE: &[StepDef] = &[
         skill: "speckit-implement",
         script: Some("check-prerequisites.sh"),
         script_args: &["--json", "--require-tasks", "--include-tasks"],
+        script_optional: false,
         script_gets_user_args: false,
         description: "Execute the implementation plan task by task",
         args_hint: "[--task N | --phase N | --continue]",
@@ -124,8 +149,11 @@ pub const LIFECYCLE: &[StepDef] = &[
     StepDef {
         name: "speckit-converge",
         skill: "speckit-converge",
+        // Upstream converge.md: --require-tasks --include-tasks (converge
+        // appends unbuilt work to an existing tasks.md).
         script: Some("check-prerequisites.sh"),
-        script_args: &["--json", "--include-tasks"],
+        script_args: &["--json", "--require-tasks", "--include-tasks"],
+        script_optional: false,
         script_gets_user_args: false,
         description: "Assess implementation against the spec and list gaps",
         args_hint: "",
@@ -133,8 +161,10 @@ pub const LIFECYCLE: &[StepDef] = &[
     StepDef {
         name: "speckit-taskstoissues",
         skill: "speckit-taskstoissues",
+        // Upstream taskstoissues.md: --require-tasks --include-tasks.
         script: Some("check-prerequisites.sh"),
-        script_args: &["--json", "--include-tasks"],
+        script_args: &["--json", "--require-tasks", "--include-tasks"],
+        script_optional: false,
         script_gets_user_args: false,
         description: "Convert tasks into actionable GitHub issues",
         args_hint: "",
@@ -228,6 +258,10 @@ pub struct StepPrep {
 /// pre-flight runs the step's script (if any); a non-zero exit is FATAL
 /// for gate steps (the workflow must not proceed when prerequisites
 /// fail) and the error is surfaced to the user instead of an agent turn.
+/// For `script_optional` steps, a MISSING script or a rejected NEWER flag
+/// (older `.specify` scaffolds) degrades gracefully: retry without the
+/// newer args, then skip the pre-flight entirely — the skill workflow is
+/// self-sufficient (it reads templates/paths itself).
 pub fn prepare_step(
     step: &StepDef,
     root: &Path,
@@ -248,18 +282,65 @@ pub fn prepare_step(
             }
             argv.push(desc);
         }
-        let (stdout, stderr, code) = run_specify_script(root, script, &argv)?;
-        if code != 0 {
-            return Err(format!(
-                "spec-kit pre-flight failed ({script}, exit {code}):\n{}{}",
-                if stderr.is_empty() { String::new() } else { format!("{stderr}\n") },
-                stdout
-            ));
-        }
-        if !stdout.is_empty() {
-            preflight.push_str(&format!(
-                "## Pre-flight ({script})\n\n```json\n{stdout}\n```\n\n"
-            ));
+        let path = root.join(".specify/scripts/bash").join(script);
+        if !path.is_file() {
+            if step.script_optional {
+                // Older scaffold: script postdates this .specify init. The
+                // skill workflow is self-sufficient — proceed without it.
+                preflight.push_str(&format!(
+                    "## Pre-flight\n\n(script `{script}` not present in this .specify scaffold — skipped; the workflow below resolves paths/templates itself)\n\n"
+                ));
+            } else {
+                return Err(format!("spec-kit script not found: {}", path.display()));
+            }
+        } else {
+            let (stdout, stderr, code) = run_specify_script(root, script, &argv)?;
+            match code {
+                0 => {
+                    if !stdout.is_empty() {
+                        preflight.push_str(&format!(
+                            "## Pre-flight ({script})\n\n```json\n{stdout}\n```\n\n"
+                        ));
+                    }
+                }
+                _ if step.script_optional => {
+                    // Older scaffold rejecting a NEWER flag (e.g.
+                    // check-prerequisites.sh without --template support, or
+                    // --paths-only before it existed). Retry with the
+                    // baseline invocation (--json only); if that also fails
+                    // the step's prerequisites genuinely aren't met.
+                    let retry_argv: Vec<&str> = argv
+                        .iter()
+                        .copied()
+                        .take_while(|a| *a != "--template")
+                        .collect();
+                    let retry_argv = if retry_argv.last() == Some(&"--json") || retry_argv.is_empty() {
+                        retry_argv
+                    } else {
+                        vec!["--json"]
+                    };
+                    let (rout, rerr, rcode) = run_specify_script(root, script, &retry_argv)?;
+                    if rcode == 0 {
+                        preflight.push_str(&format!(
+                            "## Pre-flight ({script}, baseline flags)\n\n```json\n{rout}\n```\n\n"
+                        ));
+                    } else {
+                        return Err(format!(
+                            "spec-kit pre-flight failed ({script}, exit {rcode}):\n{}{}",
+                            if rerr.is_empty() { String::new() } else { format!("{rerr}\n") },
+                            rout
+                        ));
+                    }
+                    let _ = (stderr, code);
+                }
+                _ => {
+                    return Err(format!(
+                        "spec-kit pre-flight failed ({script}, exit {code}):\n{}{}",
+                        if stderr.is_empty() { String::new() } else { format!("{stderr}\n") },
+                        stdout
+                    ));
+                }
+            }
         }
     }
 
@@ -497,5 +578,147 @@ mod tests {
         assert!(text.contains("[x] spec.md"));
         assert!(text.contains("[ ] plan.md"));
         assert!(text.contains("/speckit-plan"));
+    }
+
+    // ── Upstream spec-kit parity (templates/commands/*.md) ────────────
+
+    fn step_args(name: &str) -> (&'static str, &'static [&'static str], bool) {
+        let s = step_by_name(name).unwrap();
+        (s.script.unwrap(), s.script_args, s.script_optional)
+    }
+
+    #[test]
+    fn preflight_invocations_match_upstream_spec_kit() {
+        // Mirrors templates/commands/*.md `scripts.sh` lines in
+        // ~/Development/spec-kit. Any change here must match upstream.
+        let (script, args, _) = step_args("speckit-clarify");
+        assert_eq!(script, "check-prerequisites.sh");
+        assert_eq!(args, &["--json", "--paths-only"],
+            "clarify runs BETWEEN specify and plan: paths-only, NO plan.md validation");
+
+        let (script, args, _) = step_args("speckit-plan");
+        assert_eq!((script, args), ("setup-plan.sh", &["--json"][..]));
+
+        let (script, args, _) = step_args("speckit-tasks");
+        assert_eq!((script, args), ("setup-tasks.sh", &["--json"][..]));
+
+        let (script, args, _) = step_args("speckit-specify");
+        assert_eq!(script, "create-new-feature.sh");
+        assert!(args.contains(&"--allow-existing-branch"));
+
+        for step in ["speckit-analyze", "speckit-implement", "speckit-converge", "speckit-taskstoissues"] {
+            let (script, args, _) = step_args(step);
+            assert_eq!(script, "check-prerequisites.sh", "{step}");
+            assert_eq!(args, &["--json", "--require-tasks", "--include-tasks"],
+                "{step} requires tasks.md upstream (it consumes/extends tasks)");
+        }
+
+        let (script, args, optional) = step_args("speckit-checklist");
+        assert_eq!(script, "check-prerequisites.sh");
+        assert_eq!(args, &["--json", "--template", "checklist-template"]);
+        assert!(optional, "older scaffolds lack --template; must degrade");
+
+        let (script, args, optional) = step_args("speckit-constitution");
+        assert_eq!((script, args), ("resolve-template.sh", &["constitution-template", "--json"][..]));
+        assert!(optional, "older scaffolds lack resolve-template.sh; must degrade");
+    }
+
+    #[test]
+    fn clarify_runs_without_plan_md() {
+        // THE reported bug: /speckit-clarify must work right after
+        // /speckit-specify, BEFORE /speckit-plan creates plan.md. The
+        // paths-only pre-flight does no plan validation, so preparing the
+        // step on this repo (which has an active feature) must succeed
+        // even if plan.md were deleted. Verify via the actual script.
+        let cwd = std::env::current_dir().unwrap();
+        let root = find_repo_root(&cwd).unwrap();
+        let (out, _err, code) = run_specify_script(
+            &root,
+            "check-prerequisites.sh",
+            &["--json", "--paths-only"],
+        )
+        .unwrap();
+        assert_eq!(code, 0, "paths-only never validates plan.md");
+        assert!(out.contains("\"FEATURE_DIR\""), "paths payload: {out}");
+        // And the step prepares end-to-end (skill + pre-flight compose).
+        // The skill lives in ~/.joey/skills — under the workspace test run
+        // another test may relocate JOEY_HOME, so skip the skill-dependent
+        // half when the skill isn't resolvable in THIS test's environment.
+        let step = step_by_name("speckit-clarify").unwrap();
+        match prepare_step(step, &root, "", None) {
+            Ok(_) => {}
+            Err(e) if e.contains("not installed") => {
+                // pre-flight succeeded; only the (environment-relocated)
+                // skill lookup failed. That's fine — the paths-only gate
+                // itself was verified above.
+            }
+            Err(e) => panic!("clarify must prepare without plan.md: {e}"),
+        }
+    }
+
+    #[test]
+    fn optional_script_missing_degrades_instead_of_failing() {
+        // Simulate an older scaffold: resolve-template.sh absent.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".specify/scripts/bash")).unwrap();
+        std::fs::write(root.join(".specify/scripts/bash/check-prerequisites.sh"), "#!/usr/bin/env bash\necho '{}'\n").unwrap();
+        let step = StepDef {
+            name: "speckit-constitution",
+            skill: "speckit-constitution",
+            script: Some("resolve-template.sh"),
+            script_args: &["constitution-template", "--json"],
+            script_optional: true,
+            script_gets_user_args: false,
+            description: "",
+            args_hint: "",
+        };
+        // Skills resolve GLOBALLY (~/.joey/skills); under the workspace
+        // test run another test may relocate JOEY_HOME. Assert the
+        // DEGRADATION specifically: the error (if any) must be the
+        // skill-lookup one, never "script not found".
+        match prepare_step(&step, root, "", None) {
+            Ok(prep) => {
+                assert!(prep.preflight.contains("skipped"),
+                    "preflight notes the skip: {}", prep.preflight);
+            }
+            Err(e) if e.contains("not installed") => { /* env-relocated home */ }
+            Err(e) => panic!("optional script absence must degrade, not fail: {e}"),
+        }
+    }
+
+    #[test]
+    fn optional_flag_rejection_retries_baseline() {
+        // Simulate an older check-prerequisites.sh that rejects --template.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".specify/scripts/bash")).unwrap();
+        std::fs::write(
+            root.join(".specify/scripts/bash/check-prerequisites.sh"),
+            "#!/usr/bin/env bash\nif [[ \"$*\" == *--template* ]]; then echo 'Unknown option' >&2; exit 1; fi\necho '{\"FEATURE_DIR\":\"x\"}'\n",
+        )
+        .unwrap();
+        let step = StepDef {
+            name: "speckit-checklist",
+            skill: "speckit-checklist",
+            script: Some("check-prerequisites.sh"),
+            script_args: &["--json", "--template", "checklist-template"],
+            script_optional: true,
+            script_gets_user_args: false,
+            description: "",
+            args_hint: "",
+        };
+        // The rejected --template must trigger the baseline retry, which
+        // succeeds; the composed prompt carries the baseline-flag preflight.
+        // (Skill-lookup may fail under a relocated JOEY_HOME — only the
+        // script-level behavior is being asserted here.)
+        match prepare_step(&step, root, "", None) {
+            Ok(prep) => {
+                assert!(prep.preflight.contains("baseline flags"),
+                    "preflight records the retry: {}", prep.preflight);
+            }
+            Err(e) if e.contains("not installed") => { /* env-relocated home */ }
+            Err(e) => panic!("baseline retry after flag rejection must succeed: {e}"),
+        }
     }
 }

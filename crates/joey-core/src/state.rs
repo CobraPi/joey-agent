@@ -840,6 +840,63 @@ impl SessionDb {
         })
     }
 
+    /// Soft-delete the trailing exchange(s) of a session: the last `n` user
+    /// messages and every active message after the FIRST of them (i.e. the
+    /// assistant/tool tail that answers them). Returns the number of messages
+    /// deactivated. Used by `/undo N` (upstream `rewind_session` semantics,
+    /// soft-archive variant: rows are marked `active = 0`, never destroyed).
+    pub fn rewind_last_user_exchanges(&self, session_id: &str, n: usize) -> Result<usize> {
+        if n == 0 {
+            return Ok(0);
+        }
+        let changed: usize = self.execute_write(|conn| {
+            // Row id of the Nth-from-last active user message.
+            let user_row: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM messages WHERE session_id = ?1 AND active = 1 \
+                     AND role = 'user' ORDER BY id DESC LIMIT 1 OFFSET ?2",
+                    params![session_id, (n - 1) as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(from_id) = user_row else {
+                return Ok(0);
+            };
+            let changed = conn.execute(
+                "UPDATE messages SET active = 0 WHERE session_id = ?1 AND active = 1 AND id >= ?2",
+                params![session_id, from_id],
+            )?;
+            // Refresh the session counters to the active totals.
+            conn.execute(
+                "UPDATE sessions SET message_count = \
+                    (SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND active = 1), \
+                    tool_call_count = \
+                    (SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND active = 1 AND tool_calls IS NOT NULL) \
+                 WHERE id = ?1",
+                params![session_id],
+            )?;
+            Ok(changed)
+        })?;
+        Ok(changed)
+    }
+
+    /// Token usage aggregated across ALL sessions whose messages fall in the
+    /// last `days` days (for `/insights`). Returns
+    /// `(sessions, messages_with_counts, total_tokens, assistant_tokens)`.
+    pub fn usage_over_days(&self, days: i64) -> Result<(i64, i64, i64, i64)> {
+        let cutoff = unix_now() - (days.max(1) * 86_400) as f64;
+        let (sessions, messages, total, assistant): (i64, i64, i64, i64) = self.conn.query_row(
+            "SELECT COUNT(DISTINCT m.session_id), COUNT(m.id), \
+                    COALESCE(SUM(m.token_count), 0), \
+                    COALESCE(SUM(CASE WHEN m.role = 'assistant' THEN m.token_count ELSE 0 END), 0) \
+             FROM messages m JOIN sessions s ON s.id = m.session_id \
+             WHERE m.timestamp >= ?1 AND m.token_count IS NOT NULL",
+            params![cutoff],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        Ok((sessions, messages, total, assistant))
+    }
+
     /// Fetch a session summary.
     pub fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
         let row = self
@@ -1683,6 +1740,57 @@ INSERT INTO messages (session_id, role, content, timestamp) VALUES ('old_joey_se
         assert!(db.try_acquire_compression_lock(&sid, "holder-c", 300.0), "expired row reclaimed");
         // A refresh from the crashed holder can't resurrect it.
         assert!(!db.refresh_compression_lock(&sid, "crashed", 300.0));
+    }
+
+    #[test]
+    fn rewind_deactivates_last_user_exchange_and_tail() {
+        let db = SessionDb::open_in_memory().unwrap();
+        let sid = db.create_session("cli", None, None).unwrap();
+        for i in 0..3 {
+            db.add_message(&StoredMessage::new(&sid, Role::User, format!("u{i}"))).unwrap();
+            db.add_message(&StoredMessage::new(&sid, Role::Assistant, format!("a{i}"))).unwrap();
+        }
+        assert_eq!(db.messages(&sid).unwrap().len(), 6);
+
+        // Undo 1 exchange: from the LAST user message to the end.
+        let removed = db.rewind_last_user_exchanges(&sid, 1).unwrap();
+        assert_eq!(removed, 2);
+        let live = db.messages(&sid).unwrap();
+        assert_eq!(live.len(), 4);
+        assert_eq!(live.last().unwrap().content, "a1");
+
+        // Undo 2 more exchanges: everything from user msg 0 onwards.
+        let removed = db.rewind_last_user_exchanges(&sid, 2).unwrap();
+        assert_eq!(removed, 4);
+        assert!(db.messages(&sid).unwrap().is_empty());
+
+        // Nothing left to rewind.
+        assert_eq!(db.rewind_last_user_exchanges(&sid, 1).unwrap(), 0);
+        // Counters refreshed.
+        let s = db.get_session(&sid).unwrap().unwrap();
+        assert_eq!(s.message_count, 0);
+    }
+
+    #[test]
+    fn usage_over_days_aggregates_across_sessions() {
+        let db = SessionDb::open_in_memory().unwrap();
+        let s1 = db.create_session("cli", None, None).unwrap();
+        let s2 = db.create_session("cli", None, None).unwrap();
+        let mut m = StoredMessage::new(&s1, Role::User, "hi");
+        m.token_count = Some(10);
+        db.add_message(&m).unwrap();
+        let mut m = StoredMessage::new(&s1, Role::Assistant, "yo");
+        m.token_count = Some(25);
+        db.add_message(&m).unwrap();
+        let mut m = StoredMessage::new(&s2, Role::User, "hey");
+        m.token_count = Some(5);
+        db.add_message(&m).unwrap();
+
+        let (sessions, messages, total, assistant) = db.usage_over_days(7).unwrap();
+        assert_eq!(sessions, 2);
+        assert_eq!(messages, 3);
+        assert_eq!(total, 40);
+        assert_eq!(assistant, 25);
     }
 
     #[test]

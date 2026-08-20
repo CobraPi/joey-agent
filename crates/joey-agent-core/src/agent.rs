@@ -371,6 +371,11 @@ pub struct Agent {
     /// would also re-bump anti-pattern hit counts). Cleared at run_turn
     /// start so every user turn re-assembles.
     pub(crate) neurocode_assembled_for: std::sync::Mutex<Option<String>>,
+    /// Pending image attachments for the NEXT user turn (`/image`, `/paste`).
+    /// Data-URL strings (data:image/png;base64,...) merged into the user
+    /// message's `content_parts` by `run_turn`, then cleared. Additive:
+    /// None/empty → behavior identical to before.
+    pending_images: std::sync::Mutex<Vec<String>>,
 }
 
 impl Agent {
@@ -474,7 +479,64 @@ impl Agent {
             neurocode_engine: None,
             neurocode_context: std::sync::Mutex::new(None),
             neurocode_assembled_for: std::sync::Mutex::new(None),
+            pending_images: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Queue an image attachment for the NEXT user turn (`/image <path>`,
+    /// `/paste`). Accepts a data URL (`data:image/...;base64,...`) directly,
+    /// or an https/file reference passed through verbatim. Consumed and
+    /// cleared by the next `run_turn`.
+    pub fn attach_image(&self, data_url: impl Into<String>) {
+        let url = data_url.into();
+        if url.is_empty() {
+            return;
+        }
+        self.pending_images
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(url);
+    }
+
+    /// Number of images queued for the next turn (for UI feedback).
+    pub fn pending_image_count(&self) -> usize {
+        self.pending_images
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
+    /// Drain queued images, folding them into the user message about to be
+    /// pushed (multimodal `content_parts`). Private to run_turn.
+    fn take_pending_images_into(&self, user_input: &str) -> Message {
+        let images = {
+            let mut guard = self.pending_images.lock().unwrap_or_else(|p| p.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        if images.is_empty() {
+            return Message::user(user_input);
+        }
+        let mut parts = vec![joey_providers::types::ContentPart::Text {
+            text: user_input.to_string(),
+        }];
+        for url in images {
+            parts.push(joey_providers::types::ContentPart::ImageUrl {
+                image_url: joey_providers::types::ImageUrl { url },
+            });
+        }
+        Message {
+            role: "user".to_string(),
+            content: Some(user_input.to_string()),
+            content_parts: Some(parts),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+            reasoning_details: None,
+            anthropic_content_blocks: None,
+            compressed_summary: false,
+            synthetic: false,
+        }
     }
 
     /// Set the NeuroCode engine (feature 015). When set and active, the main
@@ -1164,6 +1226,21 @@ impl Agent {
     /// The active model ID.
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    /// Replace the enabled-tool list on the LIVE agent (runtime mode
+    /// switches, e.g. HyperCode orchestrator mode toggling between
+    /// delegate_task-only and the full surface). Takes effect on the next
+    /// request — `tool_schemas()` filters through this list, and dispatch
+    /// resolves against the registry the same way. Model/provider identity,
+    /// history, and the session store are untouched.
+    pub fn set_enabled_tools(&mut self, tools: Vec<String>) {
+        self.config.enabled_tools = tools;
+    }
+
+    /// The live enabled-tool list.
+    pub fn enabled_tools(&self) -> &[String] {
+        &self.config.enabled_tools
     }
 
     /// The active provider (canonical profile name).
@@ -2056,7 +2133,7 @@ impl Agent {
             self.push_message(Message::user(notice), None);
         }
 
-        self.push_message(Message::user(user_input), None);
+        self.push_message(self.take_pending_images_into(user_input), None);
 
         // Live context view: baseline snapshot with the user turn appended.
         self.emit_context_snapshot(&tx);

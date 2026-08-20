@@ -51,7 +51,7 @@ pub use models::{
     resolve_model, AvailableModelSet, FallbackEntry, ModelFamily, ModelRequirement,
 };
 pub use boulder::{BoulderState, BoulderWork, BoulderWorkStatus};
-pub use goal::{parse_goal_command, GoalAction, GoalState, GoalStatus};
+pub use goal::{parse_goal_command, parse_subgoal_command, GoalAction, GoalState, GoalStatus, Subgoal, SubgoalAction};
 pub use team::{
     activate_team, MemberActivity, TeamActivationError, TeamMailbox, TeamMember, TeamMemberKind,
     TeamModeConfig, TeamSpec, TeamTask, TeamTaskList, TeamTaskStatus, TmuxVisualizer,

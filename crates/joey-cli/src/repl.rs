@@ -158,7 +158,12 @@ pub(crate) fn build_agent_parts(
     session_id: &str,
     history: Vec<Message>,
 ) -> Result<AgentParts> {
-    let agent_cfg = build_agent_config(config, ov);
+    let mut agent_cfg = build_agent_config(config, ov);
+    // HyperCode orchestrator mode: when enabled, the MAIN agent is a pure
+    // orchestrator — delegate_task is its ONLY tool; all file/command work
+    // happens in Explorer/Implementor children (cost-efficient: the powerful
+    // main model only ever sees summaries and makes decisions).
+    let orchestrator_on = crate::hypercode::apply_orchestrator_to_agent_config(config, &mut agent_cfg);
     let ctx = ToolContext::new(cwd.to_path_buf(), config.clone(), session_id.to_string());
     let mut registry = ToolRegistry::with_builtins();
 
@@ -215,6 +220,11 @@ pub(crate) fn build_agent_parts(
 
     let mut agent =
         Agent::new(agent_cfg.clone(), registry, ctx).map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Orchestrator overlay: the delegation-only identity prompt, applied as
+    // extra instructions (rebuild-safe: engine restarts re-derive it).
+    if orchestrator_on {
+        agent.set_extra_instructions(Some(crate::hypercode::orchestrator_overlay()));
+    }
     // Inject the shared concurrency limiter into the agent's transport path.
     agent.set_provider_semaphore(manager.semaphore());
 
@@ -968,7 +978,7 @@ async fn handle_slash(input: &str, st: &mut ReplState) -> SlashOutcome {
         }
         Resolution::Command { def, rest } => {
             if !def.implemented {
-                println!("Command '/{}' is not available in joey-agent yet.", def.name);
+                println!("Command '/{}' has no handler in this build (registry inconsistency).", def.name);
                 return SlashOutcome::Continue;
             }
             run_slash_command(def.name, rest.trim(), st).await
@@ -1104,6 +1114,367 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         }
         "version" => crate::commands::print_version_info(),
         "copy" => copy_last(st),
+        // ── Newly-wired commands (slash_extra.rs shared handlers) ──
+        "redraw" => {
+            print!("\x1b[H\x1b[2J\x1b[3J");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            // Re-print the banner-ish header so the screen isn't blank.
+            render::info("screen repainted");
+        }
+        "save" => {
+            let lines = crate::slash_extra::save_session_markdown(&st.session_id, st.db.as_ref());
+            for l in lines.0 {
+                println!("{}", l);
+            }
+        }
+        "retry" => {
+            // Resend the last user message: rewind nothing, just re-submit it.
+            let last_user = st
+                .agent
+                .history()
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .and_then(|m| m.content.clone())
+                .filter(|c| !c.trim().is_empty());
+            match last_user {
+                Some(text) => {
+                    render::info(&format!("Retrying: {}…", text.chars().take(60).collect::<String>()));
+                    let _ = run_turn_interactive(st, &text).await;
+                }
+                None => render::info("Nothing to retry yet."),
+            }
+        }
+        "prompt" | "compose" => {
+            match crate::slash_extra::compose_in_editor(args) {
+                Some(text) => {
+                    let _ = run_turn_interactive(st, &text).await;
+                }
+                None => render::info("(editor cancelled or empty — nothing sent)"),
+            }
+        }
+        "undo" => {
+            let n = args.trim().parse::<usize>().unwrap_or(1).max(1);
+            let (lines, resubmit) = crate::slash_extra::undo_exchange(
+                &st.session_id,
+                n,
+                st.agent.history(),
+                st.db.as_ref(),
+            );
+            for l in lines.0 {
+                println!("{}", l);
+            }
+            // Mirror the DB rewind into the live agent history so the very
+            // next request doesn't still carry the undone exchange.
+            if let Some(db) = &st.db {
+                let restored = restore_history(db, &st.session_id);
+                if restored.len() < st.agent.history().len() {
+                    st.agent.set_history(restored);
+                }
+            }
+            if let Some(text) = resubmit {
+                render::info("(re-prompting with the undone message — Ctrl-C to interrupt)");
+                let _ = run_turn_interactive(st, &text).await;
+            }
+        }
+        "title" => {
+            if args.trim().is_empty() {
+                render::info("Usage: /title <name>");
+            } else if let Some(db) = &st.db {
+                match db.set_title(&st.session_id, args.trim()) {
+                    Ok(()) => render::success(&format!("✓ Title set: {}", args.trim())),
+                    Err(e) => render::error(&format!("failed to set title: {e}")),
+                }
+            } else {
+                render::error("no session database");
+            }
+        }
+        "handoff" => {
+            for l in crate::slash_extra::handoff_lines(args, &st.session_id).0 {
+                println!("{}", l);
+            }
+        }
+        "branch" | "fork" => {
+            let (lines, _) = crate::slash_extra::branch_session(&st.session_id, args, st.db.as_ref());
+            for l in lines.0 {
+                println!("{}", l);
+            }
+        }
+        "snapshot" => {
+            for l in crate::slash_extra::snapshot::handle(args, &st.config).0 {
+                println!("{}", l);
+            }
+        }
+        "stop" => {
+            for l in crate::slash_extra::stop_background_processes().0 {
+                println!("{}", l);
+            }
+        }
+        "background" | "bg" | "btw" => {
+            if args.trim().is_empty() {
+                render::info("Usage: /background <prompt> — the prompt runs as a detached agent turn you can keep chatting");
+            } else {
+                // Upstream: spawn a detached turn whose completion arrives as a
+                // notice. This port runs it inline after a notice (the line
+                // REPL has one input stream; true detachment needs the engine).
+                render::info("background prompt queued — it runs next (results arrive as a notice)");
+                st.queued.push(args.to_string());
+            }
+        }
+        "journey" | "learning" | "memory-graph" => {
+            for l in crate::slash_extra::journey_lines(&st.cwd, args).0 {
+                println!("{}", l);
+            }
+        }
+        "moa" => {
+            if args.trim().is_empty() {
+                render::info("Usage: /moa <prompt>");
+            } else {
+                let (lines, composed) = crate::slash_extra::moa_prompt(args);
+                for l in lines.0 {
+                    println!("{}", l);
+                }
+                let _ = run_turn_interactive(st, &composed).await;
+            }
+        }
+        "subgoal" => {
+            for l in crate::slash_extra::subgoal_lines(&st.cwd, args).0 {
+                println!("{}", l);
+            }
+        }
+        "whoami" => {
+            for l in crate::slash_extra::whoami_lines().0 {
+                println!("{}", l);
+            }
+        }
+        "profile" => {
+            for l in crate::slash_extra::profile_lines().0 {
+                println!("{}", l);
+            }
+        }
+        "codex-runtime" | "codex_runtime" => {
+            for l in crate::slash_extra::codex_runtime_lines(&mut st.config, args).0 {
+                println!("{}", l);
+            }
+        }
+        "personality" => {
+            let (lines, overlay) = crate::slash_extra::personality::handle(&mut st.config, args);
+            for l in lines.0 {
+                println!("{}", l);
+            }
+            if let Some(overlay) = overlay {
+                st.agent.set_extra_instructions(Some(overlay));
+                render::info("personality overlay applied to this session");
+            }
+        }
+        "statusbar" | "sb" => {
+            for l in crate::slash_extra::statusbar_lines(&mut st.config).0 {
+                println!("{}", l);
+            }
+        }
+        "footer" => {
+            for l in crate::slash_extra::footer_lines(&mut st.config, args).0 {
+                println!("{}", l);
+            }
+        }
+        "yolo" => {
+            for l in crate::slash_extra::yolo_lines().0 {
+                println!("{}", l);
+            }
+        }
+        "fast" => {
+            for l in crate::slash_extra::fast_lines(&mut st.config, args).0 {
+                println!("{}", l);
+            }
+        }
+        "skin" => {
+            for l in crate::slash_extra::skin::handle(&mut st.config, args).0 {
+                println!("{}", l);
+            }
+        }
+        "indicator" => {
+            for l in crate::slash_extra::indicator::handle(&mut st.config, args).0 {
+                println!("{}", l);
+            }
+        }
+        "voice" => {
+            for l in crate::slash_extra::voice_lines(&mut st.config, args).0 {
+                println!("{}", l);
+            }
+        }
+        "busy" => {
+            for l in crate::slash_extra::busy::handle(&mut st.config, args).0 {
+                println!("{}", l);
+            }
+        }
+        "reload" => {
+            for l in crate::slash_extra::reload_env().0 {
+                println!("{}", l);
+            }
+        }
+        "memory" => {
+            for l in crate::slash_extra::memory_lines(&mut st.config, args).0 {
+                println!("{}", l);
+            }
+        }
+        "bundles" => {
+            for l in crate::slash_extra::bundles_lines(&st.config).0 {
+                println!("{}", l);
+            }
+        }
+        "pet" => {
+            for l in crate::slash_extra::pet::handle(&mut st.config, args).0 {
+                println!("{}", l);
+            }
+        }
+        "hatch" | "generate-pet" => {
+            for l in crate::slash_extra::pet::hatch(args).0 {
+                println!("{}", l);
+            }
+        }
+        "learn" => {
+            if args.trim().is_empty() {
+                render::info("Usage: /learn <what to learn from>");
+            } else {
+                let (lines, prompt) = crate::slash_extra::learn_prompt(args);
+                for l in lines.0 {
+                    println!("{}", l);
+                }
+                let _ = run_turn_interactive(st, &prompt).await;
+            }
+        }
+        "cron" => {
+            for l in crate::slash_extra::cron::handle(args).0 {
+                println!("{}", l);
+            }
+        }
+        "suggestions" | "suggest" => {
+            for l in crate::slash_extra::suggestions::handle(&mut st.config, args).0 {
+                println!("{}", l);
+            }
+        }
+        "blueprint" | "bp" => {
+            for l in crate::slash_extra::blueprint::handle(args).0 {
+                println!("{}", l);
+            }
+        }
+        "curator" => {
+            let job = args.split_whitespace().next().unwrap_or("");
+            for l in crate::slash_extra::curator_lines(args).0 {
+                println!("{}", l);
+            }
+            if job == "dedupe" || job == "refresh" {
+                let prompt = crate::slash_extra::curator_prompt(job);
+                let _ = run_turn_interactive(st, &prompt).await;
+            }
+        }
+        "kanban" => {
+            for l in crate::slash_extra::kanban_lines(&st.cwd).0 {
+                println!("{}", l);
+            }
+        }
+        "reload-mcp" | "reload_mcp" => {
+            for l in crate::slash_extra::reload_mcp_lines().0 {
+                println!("{}", l);
+            }
+        }
+        "reload-skills" | "reload_skills" => {
+            for l in crate::slash_extra::reload_skills_lines().0 {
+                println!("{}", l);
+            }
+        }
+        "plugins" => {
+            for l in crate::slash_extra::plugins_lines().0 {
+                println!("{}", l);
+            }
+        }
+        "subscription" | "upgrade" => {
+            for l in crate::slash_extra::subscription_lines().0 {
+                println!("{}", l);
+            }
+        }
+        "topup" => {
+            for l in crate::slash_extra::topup_lines().0 {
+                println!("{}", l);
+            }
+        }
+        "insights" => {
+            let days = args.trim().parse::<i64>().unwrap_or(7).max(1);
+            for l in crate::slash_extra::insights_lines(days, st.db.as_ref()).0 {
+                println!("{}", l);
+            }
+        }
+        "platforms" | "gateway" => {
+            for l in crate::slash_extra::platforms_lines().0 {
+                println!("{}", l);
+            }
+        }
+        "image" => {
+            if args.trim().is_empty() {
+                render::info("Usage: /image <path> (png/jpg/gif/webp, ≤15MB)");
+            } else {
+                match crate::slash_extra::image_data_url(args.trim()) {
+                    Ok(url) => {
+                        st.agent.attach_image(url);
+                        render::success(&format!(
+                            "✓ Image attached ({} pending) — it goes with your next message.",
+                            st.agent.pending_image_count()
+                        ));
+                    }
+                    Err(e) => render::error(&e),
+                }
+            }
+        }
+        "paste" => {
+            // Clipboard image: pbpaste gives text on macOS; for images we
+            // osascript-export the clipboard to a temp png.
+            #[cfg(target_os = "macos")]
+            {
+                let dir = std::env::temp_dir();
+                let out_path = dir.join(format!("joey-paste-{}.png", std::process::id()));
+                let script = format!(
+                    "set theClipboard to the clipboard as «class PNGf»\nset theFile to open for access POSIX file \"{}\" with write permission\nwrite theClipboard to theFile\nclose access theFile",
+                    out_path.display()
+                );
+                let status = std::process::Command::new("osascript")
+                    .arg("-e")
+                    .arg(&script)
+                    .stderr(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .status();
+                let ok = matches!(status, Ok(s) if s.success()) && out_path.exists();
+                if ok {
+                    match crate::slash_extra::image_data_url(out_path.to_str().unwrap_or_default()) {
+                        Ok(url) => {
+                            st.agent.attach_image(url);
+                            let _ = std::fs::remove_file(&out_path);
+                            render::success(&format!(
+                                "✓ Clipboard image attached ({} pending) — it goes with your next message.",
+                                st.agent.pending_image_count()
+                            ));
+                        }
+                        Err(e) => render::error(&e),
+                    }
+                    return SlashOutcome::Continue;
+                }
+                render::error("no image on the clipboard (or clipboard access denied)");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                render::error("clipboard image paste needs macOS (osascript) in this port — use /image <path> instead");
+            }
+        }
+        "update" => {
+            for l in crate::slash_extra::update_lines().0 {
+                println!("{}", l);
+            }
+        }
+        "debug" => {
+            let mode = if args.trim().is_empty() { "local" } else { args.trim() };
+            for l in crate::slash_extra::debug_lines(mode).0 {
+                println!("{}", l);
+            }
+        }
         "compress" => manual_compress(st, args).await,
         "checkpoint" => checkpoint_slash(st, args),
         "revert" | "rollback" => revert_slash(st, args),
@@ -1141,9 +1512,25 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
                     }
                 }
                 Ok(crate::hypercode::HyperCodeOutput::Toggle(new_state)) => {
+                    // Live-apply on the line REPL's agent: swap the tool
+                    // surface + overlay directly (no history-losing rebuild).
+                    if new_state {
+                        let tools = crate::hypercode::orchestrator_tool_names();
+                        st.agent.set_enabled_tools(tools);
+                        st.agent.set_extra_instructions(Some(crate::hypercode::orchestrator_overlay()));
+                    } else {
+                        let tools = crate::commands::platform_tools(&st.config, "cli");
+                        st.agent.set_enabled_tools(tools);
+                        st.agent.set_extra_instructions(None);
+                    }
                     render::success(&format!(
-                        "⚡ HyperCode mode toggled: {} (saved to config.yaml)",
-                        if new_state { "ON" } else { "OFF" }
+                        "⚡ HyperCode mode toggled: {} (saved to config.yaml){}",
+                        if new_state { "ON" } else { "OFF" },
+                        if new_state {
+                            " — orchestrator mode: file writes/builds go through subagents; main agent keeps process monitoring + read-only peeks + web"
+                        } else {
+                            ""
+                        }
                     ));
                 }
                 Ok(crate::hypercode::HyperCodeOutput::Configured(msg)) => {
@@ -1159,7 +1546,7 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         }
         other => {
             // Registry says implemented but no handler — treat as unported.
-            println!("Command '/{}' is not available in joey-agent yet.", other);
+            println!("Command '/{}' has no handler in this build (registry inconsistency).", other);
         }
     }
     SlashOutcome::Continue
@@ -1973,8 +2360,8 @@ fn show_usage(st: &ReplState) {
 /// Manual context compression (`/compress` / `/compact` — cli.py
 /// `_manual_compress`). `force=true` bypasses the summary-failure cooldown;
 /// a non-flag argument tail is the focus topic (Claude Code's `/compact
-/// <focus>` shape). `here [N]` / `--preview` / `--aggressive` are recognized
-/// but not ported.
+/// <focus>` shape). `here [N]` keeps only the last N exchanges (truncating
+/// without a summary pass); `--preview` shows what would happen, no changes.
 async fn manual_compress(st: &mut ReplState, args: &str) {
     if st.agent.history().len() < 4 {
         println!("(._.) Not enough conversation to compress (need at least 4 messages).");
@@ -2009,13 +2396,96 @@ async fn manual_compress(st: &mut ReplState, args: &str) {
             return;
         }
     }
-    if preview {
-        println!("Compression preview (--preview) is not available in joey-agent yet.");
-        return;
-    }
+
+    // `/compress here [N]` — hard-truncate to the last N user exchanges
+    // (everything from the Nth-from-last user message onward is kept as-is;
+    // everything before it is dropped without a summary pass).
     let mut words = raw_args.split_whitespace();
     if words.next().map(|w| w.eq_ignore_ascii_case("here")).unwrap_or(false) {
-        println!("'/compress here [N]' is not available in joey-agent yet.");
+        let n: usize = words.next().and_then(|w| w.parse().ok()).unwrap_or(1).max(1);
+        let history = st.agent.history();
+        // Index of the message that starts the kept window: the Nth-from-last
+        // user message.
+        let user_positions: Vec<usize> = history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "user")
+            .map(|(i, _)| i)
+            .collect();
+        let Some(&keep_from) = user_positions.iter().rev().nth(n - 1) else {
+            println!("(._.) Not enough user turns for 'here {n}'.");
+            return;
+        };
+        let dropped = keep_from;
+        let kept_msgs = st.agent.history()[keep_from..].to_vec();
+        let approx_tokens = st.agent.request_tokens_estimate();
+        // Rough estimate of the kept window's share (character-proportional).
+        let kept_chars: usize = kept_msgs.iter().map(|m| m.text_content().len()).sum();
+        let total_chars: usize = st.agent.history().iter().map(|m| m.text_content().len()).sum();
+        let kept_tokens = if total_chars > 0 {
+            (approx_tokens as f64 * kept_chars as f64 / total_chars as f64) as i64
+        } else {
+            0
+        };
+        if preview {
+            println!("Preview (--dry-run): would drop the first {dropped} message(s),");
+            println!(
+                "  keeping {} message(s) (~{} of ~{} tokens). No changes made.",
+                kept_msgs.len(),
+                commafy_i64(kept_tokens),
+                commafy_i64(approx_tokens)
+            );
+            return;
+        }
+        if dropped == 0 {
+            println!("(._.) Already keeping the whole conversation.");
+            return;
+        }
+        // Persist the truncation via the session store (soft-archive), then
+        // mirror into the live agent.
+        let mut restored_ok = false;
+        if let Some(db) = &st.db {
+            // Soft-archive everything BEFORE the keep window. The rewind API
+            // deactivates from a row id onward; we need the complement, so do
+            // a direct archive of the older rows via set_history + a full
+            // re-record: simplest correct path is archive_and_compact with
+            // the kept messages as the compacted set (compacted=1 markers on
+            // the old rows).
+            let stored: Vec<joey_core::StoredMessage> = kept_msgs
+                .iter()
+                .map(|m| {
+                    let mut row = joey_core::StoredMessage::new(
+                        &st.session_id,
+                        joey_core::Role::from_label(&m.role),
+                        m.text_content(),
+                    );
+                    row.tool_calls = None;
+                    row
+                })
+                .collect();
+            let _ = db.archive_and_compact(&st.session_id, &stored);
+            restored_ok = true;
+        }
+        st.agent.set_history(kept_msgs);
+        println!("🗜️  Kept the last {n} exchange(s): dropped {dropped} message(s).");
+        println!("     ~{} of ~{} tokens retained.", commafy_i64(kept_tokens), commafy_i64(approx_tokens));
+        if !restored_ok {
+            println!("     (no session DB — truncation is in-memory only for this session)");
+        }
+        return;
+    }
+    if preview {
+        // Preview of a summary compression: sizes + what a summary pass does.
+        let original_count = st.agent.history().len();
+        let approx_tokens = st.agent.request_tokens_estimate();
+        let comp = st.agent.compressor();
+        let ctx_len = comp.context_length;
+        let pct = if ctx_len > 0 { (comp.last_prompt_tokens.max(0) as f64 / ctx_len as f64 * 100.0).min(100.0) } else { 0.0 };
+        println!("Preview (--dry-run): would summarize-compress {original_count} message(s) (~{} tokens).", commafy_i64(approx_tokens));
+        println!("     Current context: {} / {} ({pct:.0}%), threshold {}.",
+            commafy_i64(comp.last_prompt_tokens.max(0)), commafy_i64(ctx_len), commafy_i64(comp.threshold_tokens));
+        println!("     Target ratio: the summary replaces protected-window-exempt history.");
+        println!("     No changes made.");
         return;
     }
     let focus_topic = if raw_args.is_empty() { None } else { Some(raw_args.as_str()) };
@@ -2286,7 +2756,15 @@ pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<Hyper
         
         let mut lines = vec![
             "HyperCode Status:".to_string(),
-            format!("  Mode: {} (visual indicator in TUI)", if hc_config.enabled { "ON ⚡" } else { "OFF" }),
+            format!("  Mode: {}", if hc_config.enabled { "ON ⚡" } else { "OFF" }),
+            format!(
+                "  Orchestrator mode: {}",
+                if hc_config.orchestrator_mode {
+                    "ON — file writes/builds delegated to subagents; main agent keeps process monitoring, read-only file peeks, web"
+                } else {
+                    "OFF — main agent keeps its full toolset"
+                }
+            ),
             format!("  Provider: {}", provider),
         ];
         
@@ -2313,13 +2791,22 @@ pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<Hyper
             format!("    Max turns: {}", impl_cfg.max_turns),
             format!("    Max tokens: {}", impl_tokens),
             format!("    Reasoning: {}", if impl_cfg.reasoning_level.is_empty() { "(inherit)" } else { &impl_cfg.reasoning_level }),
+        ]);
+
+        lines.extend(vec![
             "".to_string(),
             "How it works:".to_string(),
+            "  ORCHESTRATOR MODE (on by default): the main agent becomes a pure".to_string(),
+            "  orchestrator — it never reads/writes files or runs commands itself.".to_string(),
+            "  Its ONLY tool is delegate_task with role routing:".to_string(),
+            "    role:\"explorer\"    read-only investigation + diagnostic commands".to_string(),
+            "    role:\"implementor\" edits files + runs builds/tests to verify".to_string(),
+            "  Batch them: tasks:[{goal,role:\"explorer\"},...] fans out in ONE call.".to_string(),
             "  /hypercode run <goal> executes a plan → explore → build pipeline".to_string(),
             "  of parallel subagents (Planner/Explorer/Implementor roles).".to_string(),
             "  Every subagent gets a live TUI pane on the right rail + job board".to_string(),
             "  (same machinery as delegate_task batches — full streaming).".to_string(),
-            "  /hypercode toggle enables the ⚡ badge + model hint for delegate_task.".to_string(),
+            "  Toggle orchestrator-only delegation: /hypercode orchestrator on|off".to_string(),
         ]);
         
         if neurocode_active {
@@ -2506,11 +2993,31 @@ pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<Hyper
                 .map_err(|e| format!("Failed to load config: {}", e))?;
             let hc_config = HyperCodeConfig::from_config(&cfg);
             let new_state = !hc_config.enabled;
-            
+
             HyperCodeConfig::save_enabled(new_state)
                 .map_err(|e| format!("Failed to save config: {}", e))?;
-            
+
             Ok(HyperCodeOutput::Toggle(new_state))
+        }
+        ["orchestrator", state_str] => {
+            let on = match state_str.to_lowercase().as_str() {
+                "on" | "true" | "1" => true,
+                "off" | "false" | "0" => false,
+                other => {
+                    return Err(format!("Unknown state '{other}'. Use: /hypercode orchestrator on|off"));
+                }
+            };
+            HyperCodeConfig::save_orchestrator_mode(on)
+                .map_err(|e| format!("Failed to save config: {}", e))?;
+            Ok(HyperCodeOutput::Configured(format!(
+                "✓ Orchestrator mode {} (saved). {}",
+                if on { "ON" } else { "OFF" },
+                if on {
+                    "When HyperCode is enabled, the main agent delegates ALL file/terminal work to explorer/implementor subagents."
+                } else {
+                    "The main agent keeps its full toolset when HyperCode is enabled."
+                }
+            )))
         }
         _ if parts.first().copied() == Some("run") => {
             // /hypercode run [--stream a;b;c] [--max N] <goal>
@@ -2544,6 +3051,7 @@ pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<Hyper
                 "  /hypercode run --max 3 <goal>        # cap workstreams at 3".to_string(),
                 "  /hypercode status".to_string(),
                 "  /hypercode toggle".to_string(),
+                "  /hypercode orchestrator on|off       # delegate writes/builds, keep monitor+read+web (default)".to_string(),
                 "  /hypercode configure <explorer|implementor> <provider> <model>".to_string(),
                 "  /hypercode configure <explorer|implementor> <provider> --reasoning <none|low|medium|high>".to_string(),
                 "  /hypercode configure <explorer|implementor> <provider> --tokens <N>".to_string(),

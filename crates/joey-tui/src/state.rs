@@ -941,6 +941,9 @@ pub struct App {
     pub history_pos: Option<usize>,
     /// Draft saved when the user first pressed Up (restored on Down past newest).
     pub history_draft: String,
+    /// Whether the bottom status bar renders (toggled by /statusbar; backed
+    /// by config key display.statusbar, default true).
+    pub show_status_bar: bool,
 }
 
 /// One entry of the slash-command catalog shown in the TUI popup. Injected by
@@ -1308,6 +1311,7 @@ impl App {
             input_history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
+            show_status_bar: true,
         }
     }
 

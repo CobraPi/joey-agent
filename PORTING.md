@@ -220,8 +220,9 @@ it is intended to match upstream exactly.
   `JOEY_INFERENCE_MODEL` honored only here.
 - REPL: Ctrl-C interrupt (second press within 2s force-exits), the full
   upstream slash-command registry (73 names; `/q` = `/queue`, unique-prefix
-  expansion, upstream unknown/ambiguous texts; ~22 implemented, the rest
-  answer honestly that they're not available yet), persistent
+  expansion, upstream unknown/ambiguous texts; ALL commands implemented as
+  of 2026-08-19 — see the "Slash-command completion" feature entry),
+  persistent
   `~/.joey/.joey_history`, `❯` prompt, exit outro with resume hints, banner
   with model/context/cwd/session/tools/tips, dim Reasoning box + tool-progress
   modes, interactive streaming overlay.
@@ -1141,3 +1142,53 @@ otherwise, native `/v1/messages` when the catalog lists it exclusively), and
 the client-credential Authorization header were already correct; the fixes
 were all proxy-side. Once GitHub recovers, `joey --provider ai-usage-hud`
 works end-to-end with usage captured in the HUD dashboard.
+
+## Slash-command + CLI-stub completion (2026-08-19)
+
+**Status**: Complete. Every "not available in joey-agent yet" surface now has a
+functional implementation; nothing answers the old deferral string anymore.
+
+**Slash commands (48 newly implemented, REPL + TUI parity via new
+`crates/joey-cli/src/slash_extra.rs` shared handlers):**
+
+- Session/state: /redraw /save (markdown export to ~/.joey/saves/) /retry
+  /prompt ($EDITOR; TUI leaves/re-enters the alternate screen via new
+  `Tui::enter_from_leave`) /undo (new `SessionDb::rewind_last_user_exchanges`
+  soft-archive + resubmit; engine ReloadHistory mirrors it into the live
+  agent) /title /branch (session fork) /snapshot (zip create/restore/prune of
+  config+.env; new `zip` workspace dep, deflate-only) /stop (kills
+  process-tool registry sessions) /background /journey (derives from .omo/
+  goals+boulder+notepads) /moa (3-proposal + synthesizer prompt through
+  delegate_task) /subgoal (new `GoalState.subgoals` + `parse_subgoal_command`
+  in joey-omo, additive serde) /whoami /profile /handoff (honest: no adapters).
+- Config-backed: /codex-runtime /personality (persona overlays) /statusbar
+  (TUI `App::show_status_bar` gates the bottom bar live) /footer /yolo
+  (JOEY_YOLO_MODE) /fast /skin /indicator /voice (honest: STT/TTS deferred)
+  /busy (display.busy_enter — the TUI busy-Enter path now honors
+  queue/steer/interrupt, upstream busy_input_mode).
+- Tools/skills/info: /memory (file + approval-gate state) /bundles /pet /hatch
+  /learn (agent drafts SKILL.md) /cron (full CRUD against joey-cron)
+  /suggestions /blueprint /curator /kanban /reload (load_joey_dotenv re-read)
+  /reload-mcp (config re-read + listing) /reload-skills /plugins
+  /subscription /topup (BYOK honesty) /insights (new
+  `SessionDb::usage_over_days` cross-session aggregation) /platforms /paste
+  (macOS osascript clipboard-PNG export) /image (new additive
+  `Agent::attach_image`/`pending_image_count`/`take_pending_images_into` —
+  next user turn carries multimodal content_parts; TUI routes through new
+  `EngineCommand::AttachImage`) /update /debug (local report, never uploads).
+
+**CLI subcommands:** `joey config check` (parse + secret-hygiene + type-shape
++ .env perms) and `config migrate` (documented renames, idempotent);
+`joey doctor --ack <id>` (marker files under ~/.joey/doctor/acks/);
+`joey cron edit` ($EDITOR on jobs.json with envelope validation, no-save on
+invalid) and `cron runs [job]` (per-job output/ retention listing);
+`joey mcp configure [name]` + `mcp catalog` (curated offline catalog; serve/
+picker/install/login/reauth explain exactly what they need);
+`joey skills inspect|enable|disable|config` (skills.disabled list);
+`joey tools post-setup` (toolset→tool resolution summary); `joey tools
+enable|disable <server>:<tool>` writes mcp_servers.<s>.tools.include/exclude.
+
+**Deliberate honesty preserved**: commands whose upstream backends don't exist
+here (voice STT/TTS, marketplace, Nous-account billing, platform adapters,
+petdex media generation, kanban coordination) do their maximal local behavior
+and state precisely what's deferred — no fabricated success.

@@ -23,9 +23,8 @@ pub struct DoctorArgs {
 }
 
 pub fn doctor_command(args: &DoctorArgs) -> Result<i32> {
-    if args.ack.is_some() {
-        println!("'joey doctor --ack' is not available in joey-agent yet.");
-        return Ok(1);
+    if let Some(advisory_id) = &args.ack {
+        return ack_advisory(advisory_id);
     }
     let should_fix = args.fix;
     let mut issues: Vec<String> = Vec::new();
@@ -276,6 +275,57 @@ enum ProbeResult {
     Ok(u128),
     Offline,
     Failed(String),
+}
+
+// ---------------------------------------------------------------------------
+// --ack: persistently acknowledge an advisory by ID
+// ---------------------------------------------------------------------------
+
+/// The advisory-acknowledgement directory (~/.joey/doctor/acks/). One marker
+/// file per acknowledged advisory ID; doctor suppresses matching advisories.
+fn acks_dir() -> std::path::PathBuf {
+    joey_core::joey_home().join("doctor").join("acks")
+}
+
+/// Read the set of acknowledged advisory IDs.
+#[allow(dead_code)] // consumed by future advisory suppression in doctor checks
+pub fn acknowledged_advisories() -> std::collections::HashSet<String> {
+    std::fs::read_dir(acks_dir())
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_file())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `joey doctor --ack <id>`: record the acknowledgement so future runs
+/// suppress that advisory. IDs are sanitized to path-safe characters.
+fn ack_advisory(advisory_id: &str) -> Result<i32> {
+    let id = advisory_id.trim();
+    if id.is_empty() {
+        eprintln!("Usage: joey doctor --ack <ADVISORY_ID>");
+        return Ok(2);
+    }
+    let safe: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if safe != id {
+        eprintln!("Advisory ID contains unsafe characters.");
+        return Ok(2);
+    }
+    let dir = acks_dir();
+    std::fs::create_dir_all(&dir)?;
+    let marker = dir.join(&safe);
+    if marker.exists() {
+        println!("Advisory {safe} is already acknowledged.");
+        return Ok(0);
+    }
+    std::fs::write(&marker, chrono::Local::now().to_rfc3339())?;
+    println!("✓ Acknowledged advisory {safe} — future `joey doctor` runs will suppress it.");
+    Ok(0)
 }
 
 fn host_of(url: &str) -> String {

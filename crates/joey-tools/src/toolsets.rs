@@ -152,6 +152,14 @@ static TOOLSETS: Lazy<HashMap<&'static str, Toolset>> = Lazy::new(|| {
         },
     );
     m.insert(
+        "file-read",
+        Toolset {
+            description: "Read-only file tools: read and search, no writes (exploration/review)",
+            tools: &["read_file", "search_files"],
+            includes: &[],
+        },
+    );
+    m.insert(
         "todo",
         Toolset {
             description: "Task planning and tracking for multi-step work",
@@ -375,6 +383,7 @@ mod tests {
     #[test]
     fn resolves_leaf() {
         assert_eq!(resolve("file"), vec!["patch", "read_file", "search_files", "write_file"]);
+        assert_eq!(resolve("file-read"), vec!["read_file", "search_files"]);
         assert_eq!(resolve("search"), vec!["web_search"]);
         assert_eq!(resolve("delegation"), vec!["delegate_task"]);
         assert_eq!(resolve("session_search"), vec!["session_search"]);

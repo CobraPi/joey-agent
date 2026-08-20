@@ -91,7 +91,15 @@ ghost-text hints (slash-name/subcommand remainder, history fallback).
   (artifact readiness, no turn) · `/speckit-help`. Requires a `.specify/`
   directory in the repo (error explains how to init otherwise).
 
-**Registered but "not available in joey-agent yet":** /redraw /save /retry /prompt /undo /title /handoff /branch /snapshot /stop /background /journey /moa /subgoal /whoami /profile /codex-runtime /personality /statusbar /footer /yolo /fast /skin /indicator /voice /busy /memory /bundles /pet /hatch /learn /cron /suggestions /blueprint /curator /kanban /reload /reload-mcp /reload-skills /browser /plugins /subscription /topup /insights /platforms /paste /image /update /debug.
+**Fully implemented (previously "not available in joey-agent yet", wired 2026-08-19 via `slash_extra.rs`, shared by the line REPL and the TUI):** /redraw /save /retry /prompt /undo /title /handoff /branch /snapshot /stop /background /journey /moa /subgoal /whoami /profile /codex-runtime /personality /statusbar /footer /yolo /fast /skin /indicator /voice /busy /memory /bundles /pet /hatch /learn /cron /suggestions /blueprint /curator /kanban /reload /reload-mcp /reload-skills /browser /plugins /subscription /topup /insights /platforms /paste /image /update /debug.
+
+Behavior notes for the newly wired set:
+- Real state changes: /save (markdown export to ~/.joey/saves/), /undo (soft-archives the last N exchanges in the session DB + resubmits), /title, /branch (forks the session), /snapshot (zip snapshots of config/.env under ~/.joey/snapshots/), /stop (kills background processes), /subgoal (GoalState subgoals), /cron (job CRUD via joey-cron), /image + /paste (data-URL attach to the next turn), /insights (cross-session token analytics), /debug (local report, never uploads), /reload (re-reads .env), /reload-skills.
+- Agent-turn composites: /retry, /moa (3-proposal + synthesize via delegate_task), /learn (drafts a SKILL.md), /curator dedupe|refresh, /prompt ($EDITOR compose).
+- Config-backed toggles (persist via config.yaml, honored live where applicable): /statusbar (display.statusbar), /footer (display.footer), /yolo (JOEY_YOLO_MODE), /fast (agent.fast_mode), /skin (display.skin), /indicator (display.indicator), /busy (display.busy_enter — TUI busy-Enter queue/steer/interrupt), /personality (agent.personality overlay), /codex-runtime (provider.codex_runtime).
+- Honest local answers (backend deferred upstream-side): /voice (no STT/TTS), /handoff + /platforms (no adapters compiled in), /subscription + /topup (BYOK), /hatch (petdex media gen), /kanban (board dir if present), /plugins (dir scan), /suggestions + /blueprint (local templates/config lists).
+
+CLI subcommands also completed: `joey config check|migrate`, `joey doctor --ack`, `joey cron edit|runs [job]`, `joey mcp configure|catalog`, `joey skills inspect|enable|disable|config`, `joey tools post-setup`, and `joey tools enable|disable <server>:<tool>` (MCP per-tool include/exclude lists).
 
 Prefix resolution: exact match → unique prefix → unique-shortest (so `/qui`→/quit, `/q`→/queue). Ambiguous → "Did you mean" list. Unknown → "Unknown command".
 
@@ -106,7 +114,7 @@ Prefix resolution: exact match → unique prefix → unique-shortest (so `/qui`�
 
 ## 6. README verification
 
-Root README.md command table matches the code, with two caveats: (a) README line "joey skills # Search, install, inspect, and manage skills" overstates — only `skills list` is implemented (code prints "(only 'list' is available in joey-agent so far)"); (b) README says "joey auth <provider>" — code only supports `auth copilot`. Everything else (flags, cron, mcp, speckit, discover, llm-selector, doctor, home, version) verified accurate.
+Root README.md command table matches the code, with one caveat: (a) README says "joey auth <provider>" — code only supports `auth copilot`. `joey skills` now implements list/inspect/enable/disable/config (marketplace subcommands deferred). Everything else (flags, cron, mcp, speckit, discover, llm-selector, doctor, home, version) verified accurate.
 
 ### `/browser [connect|disconnect|status]`
 

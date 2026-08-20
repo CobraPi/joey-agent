@@ -35,18 +35,21 @@ async fn mixed_model_batch_records_per_task_model() {
             context: None,
             model: Some("heavy-model".to_string()),
             toolsets: vec![],
+            role: None,
         },
         TaskSpec {
             goal: "Light task A".to_string(),
             context: None,
             model: Some("light-model".to_string()),
             toolsets: vec![],
+            role: None,
         },
         TaskSpec {
             goal: "Light task B".to_string(),
             context: None,
             model: Some("light-model".to_string()),
             toolsets: vec![],
+            role: None,
         },
     ];
 

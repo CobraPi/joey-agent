@@ -52,6 +52,11 @@ pub struct HyperCodeConfig {
     pub implementor_configs: HashMap<String, RoleConfig>,
     /// Max parallel workstreams per phase (0 = default).
     pub max_workstreams: usize,
+    /// When HyperCode is enabled, run the MAIN agent as an orchestrator:
+    /// file WRITES and build/test commands are delegated to children; the
+    /// main agent keeps delegate_task + process monitoring + read-only file
+    /// peeks + web (default true).
+    pub orchestrator_mode: bool,
 }
 
 /// Configuration for a HyperCode role (Explorer or Implementor).
@@ -81,6 +86,7 @@ impl Default for HyperCodeConfig {
             explorer_configs: HashMap::new(),
             implementor_configs: HashMap::new(),
             max_workstreams: 0,
+            orchestrator_mode: true,
         }
     }
 }
@@ -121,6 +127,7 @@ impl HyperCodeConfig {
         }
     }
 
+
     /// Set the explorer config for a specific provider.
     /// (Currently exercised by tests and kept for future `configure` flows —
     /// CLI persistence goes through `save_explorer_config`.)
@@ -144,6 +151,7 @@ impl HyperCodeConfig {
         // Load enabled state
         hc.enabled = config.get_bool("hypercode.enabled", false);
         hc.max_workstreams = config.get_i64("hypercode.max_workstreams", 0).max(0) as usize;
+        hc.orchestrator_mode = config.get_bool("hypercode.orchestrator_mode", true);
 
         // Load role configs per provider (explorer + implementor tables).
         for (table_key, target) in [
@@ -188,6 +196,72 @@ impl HyperCodeConfig {
     pub fn save_implementor_config(provider: &str, config: &RoleConfig) -> Result<(), String> {
         save_role_config("hypercode.implementor", provider, config)
     }
+
+    /// Persist the orchestrator-mode flag.
+    pub fn save_orchestrator_mode(on: bool) -> Result<(), String> {
+        let mut config = joey_core::Config::load()
+            .map_err(|e| format!("Failed to load config: {e}"))?;
+        config
+            .set_and_save("hypercode.orchestrator_mode", if on { "true" } else { "false" })
+            .map_err(|e| format!("Failed to save config: {e}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator mode: the main agent delegates EVERYTHING
+// ---------------------------------------------------------------------------
+
+/// The orchestrator's effective toolsets: delegation + terminal (process
+/// monitoring/management) + read-only files + web research. It still never
+/// WRITES files or runs build/edit commands itself — those belong to the
+/// Implementor children.
+pub const ORCHESTRATOR_TOOLSET: &[&str] = &["delegation", "terminal", "file-read", "web"];
+
+/// True when the main agent should run as a pure orchestrator right now:
+/// HyperCode enabled AND orchestrator_mode on.
+pub fn orchestrator_active(config: &joey_core::Config) -> bool {
+    let hc = HyperCodeConfig::from_config(config);
+    hc.enabled && hc.orchestrator_mode
+}
+
+/// Apply orchestrator mode to a freshly-built [`AgentConfig`]: restrict the
+/// enabled tools to `delegate_task` (the `delegation` toolset resolved to
+/// tool names — `enabled_tools` holds flat tool names). Call BEFORE
+/// `Agent::new` so the system prompt's tool section reflects the restricted
+/// surface.
+///
+/// Returns false (and changes nothing) when orchestrator mode is off.
+pub fn apply_orchestrator_to_agent_config(
+    config: &joey_core::Config,
+    agent_cfg: &mut AgentConfig,
+) -> bool {
+    if !orchestrator_active(config) {
+        return false;
+    }
+    agent_cfg.enabled_tools = orchestrator_tool_names();
+    true
+}
+
+/// The resolved tool-name list for orchestrator mode (delegate_task only).
+/// `enabled_tools` holds flat TOOL names, so the `delegation` toolset must be
+/// RESOLVED — returning the toolset name verbatim would leave the agent with
+/// zero valid tools (the registry gate matches tool names, not set names).
+pub fn orchestrator_tool_names() -> Vec<String> {
+    let names: Vec<String> = ORCHESTRATOR_TOOLSET.iter().map(|s| s.to_string()).collect();
+    let resolved = joey_tools::resolve_toolsets(&names);
+    if resolved.is_empty() {
+        // Defensive: never hand the agent an empty toolset (that would be a
+        // silent no-tool agent). Fall back to the canonical tool name.
+        return vec!["delegate_task".to_string()];
+    }
+    resolved
+}
+
+/// The overlay appended to the system prompt when orchestrator mode is on.
+/// Applied via `Agent::set_extra_instructions` — a runtime toggle never
+/// needs an agent rebuild.
+pub fn orchestrator_overlay() -> String {
+    ORCHESTRATOR_PROMPT.to_string()
 }
 
 /// Read one RoleConfig from a YAML mapping (provider table row).
@@ -358,20 +432,28 @@ impl HypercodeReport {
     }
 }
 
-/// Explorer system prompt (read-only context gathering).
+/// Explorer system prompt (read-only context gathering — including running
+/// read-only/diagnostic commands on the orchestrator's behalf).
 pub const EXPLORER_PROMPT: &str = "\
-You are an Explorer agent in a HyperCode parallel pipeline. Your job is to:\n\
-1. Locate the relevant code, tests, and documentation for your assigned workstream\n\
-2. Identify dependencies, relationships, and integration points\n\
-3. Surface gotchas, edge cases, and risks\n\
-4. Produce a concise, actionable brief for an Implementor agent\n\
+You are an Explorer agent in a HyperCode pipeline. Your ORCHESTRATOR has no\n\
+tools of its own — you are its eyes and hands for everything read-only.\n\
+Your job is to:\n\
+1. Locate the relevant code, tests, and documentation for the assigned question\n\
+2. Run read-only/diagnostic commands on the orchestrator's behalf (grep/rg,\n\
+   ls, git log/diff, cargo check/test --list --no-run, --help, version\n\
+   probes) and report their ACTUAL output — never invent output\n\
+3. Identify dependencies, relationships, and integration points\n\
+4. Surface gotchas, edge cases, and risks\n\
+5. Return exactly the facts the orchestrator asked for — nothing more\n\
 \n\
 Rules:\n\
-- READ-ONLY: do not modify, create, or delete any files. Exploration only.\n\
-- Your final message is handed verbatim to the Implementor agent for this\n\
-  workstream — make it a self-contained implementation brief: exact file\n\
-  paths, function/type names, relevant snippets, and a suggested approach.\n\
-- Keep the brief under 600 tokens.";
+- READ-ONLY: do not modify, create, or delete any files.\n\
+- Never run state-changing commands (no installs, no builds that write\n\
+  artifacts unless the question demands it; prefer --dry-run/--check).\n\
+- Your final message is the orchestrator's ONLY source of truth: quote real\n\
+  paths, symbols, command output, and snippets. If asked for an\n\
+  implementation brief, make it self-contained for an Implementor agent.\n\
+- Keep the report under 600 tokens; lead with the answer, then evidence.";
 
 /// Implementor system prompt (focused implementation).
 pub const IMPLEMENTOR_PROMPT: &str = "\
@@ -388,6 +470,63 @@ Rules:\n\
 - If the brief is insufficient, make the smallest reasonable decision and\n\
   note it in your report rather than expanding scope.\n\
 - Keep your final report under 500 tokens.";
+
+/// Orchestrator system prompt (delegation-first; no direct file writes or
+/// code-manipulation commands).
+///
+/// The orchestrator runs on a powerful LLM while keeping its context lean:
+/// code READING, file WRITING, and build/test execution happen in children.
+/// The orchestrator keeps narrow supervision powers: read-only file peeks,
+/// the `process` tool (list/poll/kill subagent processes), and web research.
+pub const ORCHESTRATOR_PROMPT: &str = "\
+You are the ORCHESTRATOR of a HyperCode pipeline. You coordinate the work;\n\
+your subagents do the hands-on implementation.\n\
+\n\
+HARD RULES:\n\
+- NEVER write, patch, or delete files yourself — that is the Implementors' job.\n\
+- NEVER run build/edit/test commands yourself (cargo build/test, npm, git\n\
+  commit, formatters…) — Implementors verify their own work.\n\
+- NEVER claim to have done either. If a fact about the code or a command's\n\
+  output matters, delegate for it; do not guess.\n\
+\n\
+WHAT YOU KEEP (supervision only):\n\
+- delegate_task — your primary tool (see below).\n\
+- read_file/search_files — PEEKING only: spot-check a specific file or\n\
+  confirm a subagent's claim. Bulk code comprehension belongs to Explorers;\n\
+  do not read whole files into your context.\n\
+- terminal with process actions — monitor and manage subagent processes\n\
+  (process list/poll/log/kill) and run trivial read-only probes (ls, pwd).\n\
+- web tools — research docs, APIs, and context for your decisions.\n\
+\n\
+YOUR SUBAGENTS (via delegate_task):\n\
+- role:\"explorer\" — read-only investigation. Give it focused questions; it\n\
+  returns exact file paths, symbols, snippets, risks, AND runs read-only or\n\
+  diagnostic commands (build checks, test lists, greps) for you.\n\
+- role:\"implementor\" — makes changes. Give it a self-contained brief (paths,\n\
+  approach, constraints); it edits files AND runs builds/tests/commands to\n\
+  verify its own work, then reports what changed and the verification result.\n\
+\n\
+WORK LOOP:\n\
+1. Decompose the user's goal into independent, parallelizable tasks.\n\
+2. Fan out Explorers IN ONE delegate_task batch (tasks:[...]) whenever the\n\
+   questions are independent — parallel dispatch is dramatically faster.\n\
+3. Turn explorer findings into Implementor briefs. Parallelize implementors\n\
+   the same way, but NEVER let two implementors edit the same file.\n\
+4. When an implementor reports failure or uncertainty, delegate a focused\n\
+   Explorer to diagnose, then a follow-up Implementor to fix. Iterate.\n\
+5. Delegate as MANY subagents as the work genuinely needs — there is no\n\
+   fixed cap; batch independent ones together.\n\
+6. Monitor long-running work with the process tool; kill and re-delegate\n\
+   when a subagent is stuck or off-track.\n\
+\n\
+ECONOMY (why this mode exists):\n\
+- Your context stays small: summaries in, decisions out. Ask subagents for\n\
+  exactly the facts you need to decide — never file dumps.\n\
+- Prefer one batched delegate_task call over N sequential ones.\n\
+\n\
+FINAL ANSWER: synthesize the subagent reports for the user: what was done,\n\
+files touched, verification results, and anything left open. Be honest\n\
+about failures — you personally verified nothing.";
 
 /// Planner prompt (decomposition into parallel workstreams).
 pub const PLANNER_PROMPT: &str = "\
@@ -508,7 +647,8 @@ fn planner_request(
     parent_model: &str,
 ) -> DelegationRequest {
     // The planner uses the IMPLEMENTOR config (it needs to reason about the
-    // codebase but produces a tiny output).
+    // codebase but produces a tiny output). Toolsets: read-only + terminal so
+    // it can inspect the repo (rg/cargo metadata) without write access.
     let rc = cfg.get_implementor_config(&opts.provider);
     DelegationRequest {
         goal: format!(
@@ -518,7 +658,11 @@ fn planner_request(
         context: None,
         tasks: Vec::new(),
         model: model_override(&rc, parent_model),
-        toolsets: vec!["file".to_string()],
+        toolsets: vec![
+            "file-read".to_string(),
+            "terminal".to_string(),
+            "web".to_string(),
+        ],
         max_turns: Some(rc.max_turns.max(4)),
         reasoning: parse_reasoning_level(&rc.reasoning_level),
         max_tokens: nonzero(rc.max_tokens),
@@ -533,6 +677,10 @@ fn planner_request(
 }
 
 /// Build an explorer request for one workstream.
+///
+/// Explorer is the orchestrator's read-only proxy INCLUDING terminal access
+/// (diagnostic commands: grep, ls, git log, cargo check, --help probes) —
+/// the orchestrator itself never runs commands.
 fn explorer_request(
     ws: &Workstream,
     goal: &str,
@@ -550,8 +698,12 @@ fn explorer_request(
         context: None,
         tasks: Vec::new(),
         model: model_override(&rc, parent_model),
-        toolsets: vec!["file".to_string()],
-        max_turns: Some(rc.max_turns.max(2)),
+        toolsets: vec![
+            "file-read".to_string(),
+            "terminal".to_string(),
+            "web".to_string(),
+        ],
+        max_turns: Some(rc.max_turns.max(4)),
         reasoning: parse_reasoning_level(&rc.reasoning_level),
         max_tokens: nonzero(rc.max_tokens),
         persist: false,
@@ -565,6 +717,9 @@ fn explorer_request(
 }
 
 /// Build an implementor request for one workstream.
+///
+/// Implementor owns the write path: edits AND the build/test commands that
+/// verify its own work.
 fn implementor_request(
     ws: &Workstream,
     goal: &str,
@@ -589,8 +744,9 @@ fn implementor_request(
         toolsets: vec![
             "file".to_string(),
             "terminal".to_string(),
+            "web".to_string(),
         ],
-        max_turns: Some(rc.max_turns.max(2)),
+        max_turns: Some(rc.max_turns.max(4)),
         reasoning: parse_reasoning_level(&rc.reasoning_level),
         max_tokens: nonzero(rc.max_tokens),
         persist: false,
@@ -919,7 +1075,7 @@ mod tests {
         assert_eq!(req.max_turns, Some(6));
         assert_eq!(req.max_tokens, Some(4000));
         assert_eq!(req.reasoning, Some(ReasoningEffort::Level("high".into())));
-        assert_eq!(req.toolsets, vec!["file".to_string()]);
+        assert_eq!(req.toolsets, vec!["file-read".to_string(), "terminal".to_string(), "web".to_string()]);
         assert_eq!(req.prompt_append.as_deref(), Some(EXPLORER_PROMPT));
     }
 
@@ -951,5 +1107,99 @@ mod tests {
         assert!(req.goal.starts_with("You are the Planner agent"));
         assert!(req.goal.contains("my goal"));
         assert!(req.goal.contains(&format!("Max workstreams: {}", DEFAULT_MAX_WORKSTREAMS)));
+    }
+
+    // ── Orchestrator mode ─────────────────────────────────────────────
+
+    fn config_with_yaml(yaml: &str) -> joey_core::Config {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), yaml).unwrap();
+        joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap()
+    }
+
+    #[test]
+    fn orchestrator_mode_defaults_on_and_loads_from_config() {
+        // Default: ON.
+        let cfg = HyperCodeConfig::default();
+        assert!(cfg.orchestrator_mode);
+
+        // from_config: absent key → true (default).
+        let tree = config_with_yaml("model:\n  default: m\n");
+        assert!(HyperCodeConfig::from_config(&tree).orchestrator_mode);
+
+        // Explicit off.
+        let tree = config_with_yaml("hypercode:\n  orchestrator_mode: false\n");
+        assert!(!HyperCodeConfig::from_config(&tree).orchestrator_mode);
+
+        // Explicit on.
+        let tree = config_with_yaml("hypercode:\n  enabled: true\n  orchestrator_mode: true\n");
+        assert!(HyperCodeConfig::from_config(&tree).orchestrator_mode);
+    }
+
+    #[test]
+    fn orchestrator_active_requires_both_flags() {
+        let off_off = config_with_yaml("");
+        assert!(!orchestrator_active(&off_off));
+
+        let enabled_orch = config_with_yaml("hypercode:\n  enabled: true\n");
+        assert!(orchestrator_active(&enabled_orch));
+
+        let enabled_no_orch = config_with_yaml("hypercode:\n  enabled: true\n  orchestrator_mode: false\n");
+        assert!(!orchestrator_active(&enabled_no_orch));
+    }
+
+    #[test]
+    fn apply_orchestrator_restricts_tools_to_delegate_task() {
+        // Off → untouched, returns false.
+        let tree = config_with_yaml("");
+        let mut ac = joey_agent_core::AgentConfig::from_config(&tree);
+        ac.enabled_tools = vec!["read_file".into(), "write_file".into(), "delegate_task".into()];
+        assert!(!apply_orchestrator_to_agent_config(&tree, &mut ac));
+        assert_eq!(ac.enabled_tools.len(), 3);
+
+        // On → delegation + supervision surface (terminal/process, read-only
+        // files, web) — but NO write_file/patch.
+        let tree = config_with_yaml("hypercode:\n  enabled: true\n");
+        assert!(apply_orchestrator_to_agent_config(&tree, &mut ac));
+        assert!(ac.enabled_tools.contains(&"delegate_task".to_string()));
+        assert!(ac.enabled_tools.contains(&"terminal".to_string()), "process monitoring");
+        assert!(ac.enabled_tools.contains(&"process".to_string()), "subagent process mgmt");
+        assert!(ac.enabled_tools.contains(&"read_file".to_string()), "read-only peeking");
+        assert!(ac.enabled_tools.contains(&"web_search".to_string()), "web research");
+        assert!(!ac.enabled_tools.contains(&"write_file".to_string()), "no direct writes");
+        assert!(!ac.enabled_tools.contains(&"patch".to_string()), "no direct patches");
+    }
+
+    #[test]
+    fn orchestrator_overlay_mentions_roles_and_guardrails() {
+        let o = orchestrator_overlay();
+        assert!(o.contains("role:\"explorer\""));
+        assert!(o.contains("role:\"implementor\""));
+        assert!(o.contains("NEVER write, patch, or delete files"));
+        assert!(o.contains("NEVER run build/edit/test commands"));
+        assert!(o.contains("process tool"));
+        assert!(o.contains("web tools"));
+    }
+
+    #[test]
+    fn explorer_and_implementor_requests_match_roles() {
+        let cfg = HyperCodeConfig::default();
+        let opts = HypercodeOptions { provider: "p".into(), ..Default::default() };
+        let ws = Workstream { id: 0, focus: "f".into() };
+
+        // Explorer: READ-ONLY files + terminal + web.
+        let ex = explorer_request(&ws, "g", &cfg, &opts, "m", std::path::Path::new("/tmp"));
+        assert!(ex.toolsets.contains(&"file-read".to_string()));
+        assert!(!ex.toolsets.contains(&"file".to_string()), "explorer must NOT have write access");
+        assert!(ex.toolsets.contains(&"terminal".to_string()), "explorer runs diagnostic commands");
+        assert!(ex.toolsets.contains(&"web".to_string()));
+        assert!(ex.prompt_append.as_deref().unwrap_or("").contains("Explorer agent"));
+        assert!(ex.prompt_append.as_deref().unwrap_or("").contains("READ-ONLY"));
+
+        // Implementor: write access + terminal + web.
+        let im = implementor_request(&ws, "g", "brief", &cfg, &opts, "m", std::path::Path::new("/tmp"));
+        assert!(im.toolsets.contains(&"file".to_string()), "implementor owns the write path");
+        assert!(im.toolsets.contains(&"terminal".to_string()));
+        assert!(im.prompt_append.as_deref().unwrap_or("").contains("Implementor agent"));
     }
 }

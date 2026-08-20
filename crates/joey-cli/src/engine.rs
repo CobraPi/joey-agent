@@ -84,6 +84,16 @@ pub enum EngineCommand {
     /// interrupt; injected after the current tool batch). Outside a turn
     /// it's a no-op (the UI queues it as a normal prompt instead).
     Steer(String),
+    /// Toggle HyperCode orchestrator mode on the live agent: swap the
+    /// enabled-tool surface (delegate_task-only ↔ full) and apply/clear the
+    /// orchestrator overlay. Between turns.
+    SetOrchestratorMode(bool),
+    /// Re-read the session history from the DB into the live agent
+    /// (`/undo` rewound the DB; the engine mirrors it in-memory).
+    ReloadHistory,
+    /// Queue an image data-URL onto the engine's agent for the next turn
+    /// (`/image`, `/paste`).
+    AttachImage(String),
 }
 
 /// Event from the engine task to the UI.
@@ -545,6 +555,44 @@ async fn engine_task(
             }
             EngineCommand::Interrupt => {
                 interrupt.store(true, Ordering::SeqCst);
+            }
+            EngineCommand::ReloadHistory => {
+                // /undo rewound the DB — mirror it into the live agent.
+                let history = crate::repl::restore_history_from_db(&spec.session_id);
+                agent.set_history(history);
+                let _ = event_tx.send(EngineEvent::Notice(
+                    "↺ conversation history reloaded from the session store.".into(),
+                ));
+            }
+            EngineCommand::SetOrchestratorMode(on) => {
+                // /hypercode toggle (orchestrator mode): swap the tool
+                // surface + overlay on the LIVE agent — no rebuild needed.
+                // The system prompt's tool section was baked at build time,
+                // but the registry gate (enabled_tools) is authoritative for
+                // dispatch and the overlay instructs the model, so the stale
+                // prompt list is cosmetic until the next rebuild.
+                if on {
+                    let tools = crate::hypercode::orchestrator_tool_names();
+                    agent.set_enabled_tools(tools);
+                    agent.set_extra_instructions(Some(crate::hypercode::orchestrator_overlay()));
+                    let _ = event_tx.send(EngineEvent::Notice(
+                        "⚡ orchestrator mode ON — file writes/builds now go through explorer/implementor subagents (you keep process monitoring, read-only peeks, and web)".into(),
+                    ));
+                } else {
+                    let tools = crate::commands::platform_tools(&spec_config, "cli");
+                    agent.set_enabled_tools(tools);
+                    agent.set_extra_instructions(None);
+                    let _ = event_tx.send(EngineEvent::Notice(
+                        "orchestrator mode OFF — full tool surface restored.".into(),
+                    ));
+                }
+            }
+            EngineCommand::AttachImage(url) => {
+                agent.attach_image(url);
+                let _ = event_tx.send(EngineEvent::Notice(format!(
+                    "🖼 image attached ({}) — it goes with your next message.",
+                    agent.pending_image_count()
+                )));
             }
             EngineCommand::ForceKill => {
                 interrupt.store(true, Ordering::SeqCst);

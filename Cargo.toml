@@ -79,6 +79,7 @@ bytes = "1"
 
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip", "socks"] }
 ureq = { version = "2.12", features = ["json"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 url = "2"
 percent-encoding = "2"
 

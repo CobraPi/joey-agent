@@ -355,6 +355,27 @@ impl Tui<FrameBackend> {
             completion_suppressed: false,
         })
     }
+
+    /// Re-enter the terminal after a `leave()` (e.g. returning from
+    /// `$EDITOR` via `/prompt`): re-enables raw mode + the alternate screen
+    /// and clears the `restored` latch. Complements idempotent `leave()`.
+    pub fn enter_from_leave(&mut self) -> io::Result<()> {
+        if !self.restored {
+            return Ok(()); // never left
+        }
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
+        // Force a full repaint on the next draw (the screen was destroyed).
+        self.terminal.clear()?;
+        self.restored = false;
+        Ok(())
+    }
 }
 
 impl<B: ratatui::backend::Backend> Tui<B> {
@@ -526,7 +547,9 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             }
 
             let elapsed = app.turn_started.map(|t| t.elapsed()).unwrap_or_default();
-            widgets::draw_status(f, chunks[3], app, theme, elapsed);
+            if app.show_status_bar {
+                widgets::draw_status(f, chunks[3], app, theme, elapsed);
+            }
 
             if *show_help {
                 widgets::draw_help_overlay(f, area, theme);

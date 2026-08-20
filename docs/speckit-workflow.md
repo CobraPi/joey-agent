@@ -19,18 +19,24 @@ model as running the skill by hand, minus the copy-paste.
 
 ## Lifecycle (in order)
 
-| Command | Pre-flight script | What the agent does |
+| Command | Pre-flight script (upstream spec-kit parity) | What the agent does |
 |---|---|---|
-| `/speckit-constitution` | — | Create/update `.specify/memory/constitution.md` from Q&A |
+| `/speckit-constitution` | `resolve-template.sh constitution-template --json` (optional — older scaffolds skip) | Create/update `.specify/memory/constitution.md` from Q&A |
 | `/speckit-specify <description>` | `create-new-feature.sh` (`--allow-existing-branch`) | Scaffold the feature branch (specs/NNN-slug/spec.md template) and author the spec; re-runs update in place |
-| `/speckit-clarify` | `check-prerequisites.sh` | Identify underspecified areas in spec.md |
+| `/speckit-clarify` | `check-prerequisites.sh --json --paths-only` (NO plan.md validation — clarify runs between specify and plan) | Identify underspecified areas in spec.md |
 | `/speckit-plan` | `setup-plan.sh` | Author plan.md (design artifacts) |
-| `/speckit-checklist` | — | Generate a feature checklist |
+| `/speckit-checklist` | `check-prerequisites.sh --json --template checklist-template` (optional — older scaffolds fall back to `--json`) | Generate a feature checklist |
 | `/speckit-tasks` | `setup-tasks.sh` | Author dependency-ordered tasks.md |
-| `/speckit-analyze` | `check-prerequisites.sh --include-tasks` | Cross-artifact consistency/coverage analysis |
+| `/speckit-analyze` | `check-prerequisites.sh --require-tasks --include-tasks` | Cross-artifact consistency/coverage analysis |
 | `/speckit-implement` | `check-prerequisites.sh --require-tasks --include-tasks` | Execute tasks one by one |
-| `/speckit-converge` | `check-prerequisites.sh --include-tasks` | Assess implementation vs spec, list gaps |
-| `/speckit-taskstoissues` | `check-prerequisites.sh --include-tasks` | Convert tasks to GitHub issues |
+| `/speckit-converge` | `check-prerequisites.sh --require-tasks --include-tasks` | Assess implementation vs spec, list gaps |
+| `/speckit-taskstoissues` | `check-prerequisites.sh --require-tasks --include-tasks` | Convert tasks to GitHub issues |
+
+The script flags mirror `templates/commands/*.md` in upstream spec-kit
+(`~/Development/spec-kit`) exactly. Steps marked optional degrade
+gracefully on older `.specify` scaffolds that predate the script or flag:
+the pre-flight retries with baseline flags, then skips — the skill
+workflow resolves paths/templates itself.
 
 Auxiliary: `/speckit-status` (current feature + spec/plan/tasks readiness
 checkboxes + next-step hint + existing features list; no agent turn) and

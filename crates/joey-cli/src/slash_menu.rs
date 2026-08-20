@@ -319,8 +319,10 @@ mod tests {
     #[test]
     fn subcommand_completion_implemented_only() {
         let mut c = SmartCompleter::new(PathBuf::from("."));
-        // /voice is registered but not implemented — no subcommand offers.
-        assert!(c.complete("/voice o", 8).is_empty());
+        // /voice now IS implemented — subcommand offers must appear.
+        assert!(!c.complete("/voice o", 8).is_empty());
+        // An unknown command still offers nothing.
+        assert!(c.complete("/zzzz o", 8).is_empty());
     }
 
     #[test]
