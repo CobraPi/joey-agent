@@ -199,8 +199,17 @@ pub(crate) fn build_agent_parts(
     let allocator = crate::llm_selector::try_build_allocator(config);
     // Feature 015 (NeuroCode): build the engine when enabled and register the
     // 4 NeuroCode tools on the registry (T056/T057). None when disabled —
-    // byte-identical to pre-feature-015 (FR-020).
-    let neurocode_engine = crate::neurocode_wiring::try_build_engine(config);
+    // byte-identical to pre-feature-015 (FR-020). Scoped via the AGENT's
+    // (provider, base_url, model) triple — the same inputs `Agent::new` feeds
+    // build_client — so the engine scope stays locked to the live agent
+    // provider even when CLI overrides diverge from the raw config triple
+    // (e.g. --model forces provider=auto; HUD env magnet on servable models).
+    let neurocode_engine = crate::neurocode_wiring::try_build_engine_for_agent_inputs(
+        config,
+        &agent_cfg.provider,
+        &agent_cfg.base_url,
+        &agent_cfg.model,
+    );
     if let Some(engine) = &neurocode_engine {
         let backend = crate::neurocode_wiring::backend_for_engine(engine);
         joey_tools::builtins::register_neurocode_tools(&mut registry, Some(backend));
@@ -523,6 +532,7 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         base_registry: parts.base_registry.clone(),
         manager: parts.subagent_manager.clone(),
         cwd: cwd.clone(),
+        parent_effective_model: Some(parts.agent.effective_main_turn_model()),
     };
     let agent = parts.agent;
 
@@ -612,11 +622,16 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
     // NeuroCode multi-provider: when enabled and the ACTIVE provider has no
     // tier models configured, prompt for frontier/economical picks from that
     // provider's catalog before the first turn (interactive TTY only — never
-    // in quiet/piped/batch mode).
+    // in quiet/piped/batch mode). Scoped to the LIVE agent provider: the
+    // prompt writes keys under it and the engine must read them there (the
+    // config-resolved scope can diverge, e.g. --model override + HUD magnet).
     if !opts.quiet
         && std::io::IsTerminal::is_terminal(&std::io::stdin())
         && opts.query.is_none()
-        && !crate::neurocode_wiring::tier_models_configured(&st.config)
+        && !crate::neurocode_wiring::tier_models_configured_scoped(
+            &st.config,
+            st.agent.provider_name(),
+        )
     {
         let profile = st.agent.client().profile();
         let mut model_list: Vec<String> =
@@ -630,9 +645,13 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         }
         let _ = crate::setup_wizard::prompt_neurocode_tiers_if_needed(profile.name, &model_list);
         // Rebuild the engine so the just-saved tier models take effect this
-        // session (try_build_engine reads config fresh).
+        // session, scoped to the live agent provider (the same scope the
+        // prompt above wrote the keys under).
         let refreshed = joey_core::Config::load().unwrap_or_else(|_| st.config.clone());
-        if let Some(engine) = crate::neurocode_wiring::try_build_engine(&refreshed) {
+        if let Some(engine) = crate::neurocode_wiring::try_build_engine_scoped(
+            &refreshed,
+            st.agent.provider_name(),
+        ) {
             st.agent.set_neurocode_engine(engine);
         }
     }
@@ -1027,8 +1046,12 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
             // agent resolves category/path and calls neurocode_ingest);
             // everything else is the plain blocking handler.
             let owned = args.to_string();
+            let live_provider = st.agent.provider_name().to_string();
             let outcome = tokio::task::spawn_blocking(move || {
-                crate::commands::neurocode::neurocode_slash_outcome(&owned)
+                crate::commands::neurocode::neurocode_slash_provider_scoped(
+                    &owned,
+                    &live_provider,
+                )
             })
             .await
             .unwrap_or_else(|e| {
@@ -1513,15 +1536,27 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
                 }
                 Ok(crate::hypercode::HyperCodeOutput::Toggle(new_state)) => {
                     // Live-apply on the line REPL's agent: swap the tool
-                    // surface + overlay directly (no history-losing rebuild).
+                    // surface + overlay directly (no history-losing rebuild),
+                    // then re-bake the system prompt so its tool-guidance
+                    // section matches the new surface (the stale list
+                    // contradicted the reduced schemas on some wires).
                     if new_state {
                         let tools = crate::hypercode::orchestrator_tool_names();
                         st.agent.set_enabled_tools(tools);
+                        st.agent.rebuild_system_prompt();
                         st.agent.set_extra_instructions(Some(crate::hypercode::orchestrator_overlay()));
                     } else {
                         let tools = crate::commands::platform_tools(&st.config, "cli");
                         st.agent.set_enabled_tools(tools);
+                        st.agent.rebuild_system_prompt();
                         st.agent.set_extra_instructions(None);
+                    }
+                    // The toggle persisted to disk but st.config is the
+                    // REPL's startup snapshot — refresh it so a later /model
+                    // (which rebuilds the agent from st.config) keeps the
+                    // new orchestrator state instead of silently reverting.
+                    if let Ok(refreshed) = Config::load() {
+                        st.config = refreshed;
                     }
                     render::success(&format!(
                         "⚡ HyperCode mode toggled: {} (saved to config.yaml){}",
@@ -1633,8 +1668,14 @@ fn omo_agents_slash(st: &mut ReplState, args: &str) {
             }
             let target = primary[n - 1];
             st.active_agent = target.name.clone();
-            let overlay = joey_omo::agents::prompts::dispatch_system_prompt(&target.name, st.agent.model());
-            st.agent.set_extra_instructions(Some(overlay));
+            let identity = joey_omo::agents::prompts::dispatch_system_prompt(&target.name, st.agent.model());
+            // Persona goes in the agent_identity slot (its designed home,
+            // BC-004/FR-006) so it stacks WITH the HyperCode orchestrator
+            // overlay instead of overwriting it (engine parity).
+            st.agent.set_agent_identity(Some(identity));
+            if crate::hypercode::orchestrator_active(&st.config) {
+                st.agent.set_extra_instructions(Some(crate::hypercode::orchestrator_overlay()));
+            }
             render::success(&format!("Switched to {} [{}].", target.display_name, target.name));
             return;
         }
@@ -1643,8 +1684,12 @@ fn omo_agents_slash(st: &mut ReplState, args: &str) {
         if let Some(agent) = registry.all().iter().find(|a| a.name == lower || a.display_name.to_lowercase() == lower) {
             if agent.is_available() {
                 st.active_agent = agent.name.clone();
-                let overlay = joey_omo::agents::prompts::dispatch_system_prompt(&agent.name, st.agent.model());
-                st.agent.set_extra_instructions(Some(overlay));
+                let identity = joey_omo::agents::prompts::dispatch_system_prompt(&agent.name, st.agent.model());
+                // Identity slot, not extra_instructions — see numeric branch.
+                st.agent.set_agent_identity(Some(identity));
+                if crate::hypercode::orchestrator_active(&st.config) {
+                    st.agent.set_extra_instructions(Some(crate::hypercode::orchestrator_overlay()));
+                }
                 render::success(&format!("Switched to {} [{}].", agent.display_name, agent.name));
             } else {
                 render::error(&format!("Agent '{}' is not available (no model resolved).", agent.display_name));
@@ -1877,6 +1922,7 @@ fn new_session(st: &mut ReplState, name: &str, quiet: bool) {
                 base_registry: parts.base_registry.clone(),
                 manager: parts.subagent_manager.clone(),
                 cwd: st.cwd.clone(),
+                parent_effective_model: Some(parts.agent.effective_main_turn_model()),
             });
             st.agent = parts.agent;
             st.session_start = Instant::now();
@@ -1905,6 +1951,7 @@ fn rebuild_agent_preserving_history(st: &mut ReplState) -> Result<()> {
         base_registry: parts.base_registry.clone(),
         manager: parts.subagent_manager.clone(),
         cwd: st.cwd.clone(),
+        parent_effective_model: Some(parts.agent.effective_main_turn_model()),
     });
     st.agent = parts.agent;
     Ok(())

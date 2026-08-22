@@ -393,7 +393,11 @@ impl ProviderClient {
                     }
                 }
                 // First-non-null of reasoning_content / reasoning, not both
-                // appended (chat_completion_helpers.py:2813, M8).
+                // appended (chat_completion_helpers.py:2813, M8). Joey
+                // extension: copilot-wire claude models report thinking as
+                // `reasoning_text` (verified live 2026-08-21, see the
+                // thinking-param comment in chat.rs) — third fallback beyond
+                // the upstream pair.
                 let r = delta
                     .get("reasoning_content")
                     .and_then(|r| r.as_str())
@@ -401,6 +405,12 @@ impl ProviderClient {
                     .or_else(|| {
                         delta
                             .get("reasoning")
+                            .and_then(|r| r.as_str())
+                            .filter(|s| !s.is_empty())
+                    })
+                    .or_else(|| {
+                        delta
+                            .get("reasoning_text")
                             .and_then(|r| r.as_str())
                             .filter(|s| !s.is_empty())
                     });
@@ -618,8 +628,36 @@ impl ProviderClient {
         if let Some(max_tokens) = req.max_tokens {
             obj.insert("max_output_tokens".into(), json!(max_tokens));
         }
+        // Reasoning: clamp/map the effort onto the model's valid set before
+        // serialization. `xhigh` is a valid joey effort (joey-core
+        // VALID_EFFORTS) but historically not a /responses enum member for
+        // most models — the server (or HUD proxy translator) rejects or
+        // misroutes it. Valid efforts pass through verbatim; anything above
+        // the model's max (e.g. xhigh on a max=high gpt-5.x) clamps down.
         if let Some(crate::request::ReasoningEffort::Level(effort)) = &req.reasoning {
-            obj.insert("reasoning".into(), json!({"effort": effort}));
+            let e = effort.trim().to_lowercase();
+            if !e.is_empty() && e != "none" {
+                let normalized = copilot::normalize_model_id(&req.model);
+                let catalog_entry = copilot::peek_model_catalog().into_iter().find(|item| {
+                    item.get("id").and_then(Value::as_str) == Some(normalized.as_str())
+                });
+                let valid = copilot::model_reasoning_efforts(&req.model, catalog_entry.as_ref());
+                let mapped = clamp_effort(&e, &valid);
+                obj.insert(
+                    "reasoning".into(),
+                    json!({"effort": mapped, "summary": "auto"}),
+                );
+                // Mirror what real OpenAI /responses clients send with
+                // store:false: ask for the encrypted reasoning payload so
+                // reasoning items survive the (stateless) round trip. The
+                // server returns reasoning items regardless (observed on the
+                // live copilot wire 2026-08-21); summary:"auto" is what makes
+                // it actually emit parsable summary text.
+                obj.insert(
+                    "include".into(),
+                    json!(["reasoning.encrypted_content"]),
+                );
+            }
         }
         body
     }
@@ -1402,10 +1440,15 @@ fn parse_openai_response(v: &Value) -> Result<NormalizedResponse, ProviderError>
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string();
-    // First-non-null of reasoning / reasoning_content (chat_completions.py:714).
+    // First-non-null of reasoning / reasoning_content
+    // (chat_completions.py:714). Joey extension: copilot-wire claude
+    // models report thinking as `reasoning_text` (verified live
+    // 2026-08-21, see the thinking-param comment in chat.rs) — third
+    // fallback beyond the upstream pair.
     let reasoning = msg
         .get("reasoning")
         .or_else(|| msg.get("reasoning_content"))
+        .or_else(|| msg.get("reasoning_text"))
         .and_then(|r| r.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
@@ -1654,6 +1697,50 @@ fn ensure_block(blocks: &mut Vec<AnthropicBlockAccum>, idx: usize) -> bool {
     true
 }
 
+/// Clamp/map a reasoning effort onto a model's valid effort set for the
+/// /responses wire (2026-08-21, copilot-wire reasoning fix).
+///
+/// - Effort already in `valid` → verbatim.
+/// - Effort above the model's max → the highest valid entry not exceeding it
+///   (e.g. xhigh on a `minimal..high` gpt-5.x → high).
+/// - Effort below the model's min → the model's minimum.
+/// - Empty `valid` (unknown model, cold catalog) → generic /responses clamp:
+///   minimal/low/medium/high verbatim, xhigh/max/ultra → high, unknown →
+///   medium (matching the anthropic/gemini adapters' unknown-effort fallback).
+///
+/// Ranking follows joey-core `VALID_EFFORTS` (ascending capability); valid
+/// entries outside that order (e.g. a catalog's "none") are ignored.
+fn clamp_effort(effort: &str, valid: &[String]) -> String {
+    let rank = |e: &str| joey_core::reasoning::VALID_EFFORTS.iter().position(|r| *r == e);
+    if valid.iter().any(|v| v == effort) {
+        return effort.to_string();
+    }
+    if valid.is_empty() {
+        return match effort {
+            "minimal" | "low" | "medium" | "high" => effort.to_string(),
+            "xhigh" | "max" | "ultra" => "high".to_string(),
+            _ => "medium".to_string(),
+        };
+    }
+    let Some(effort_rank) = rank(effort) else {
+        return "medium".to_string();
+    };
+    let ranked: Vec<(usize, &str)> = valid
+        .iter()
+        .filter_map(|v| rank(v).map(|r| (r, v.as_str())))
+        .collect();
+    // Highest valid entry at or below the effort.
+    if let Some((_, v)) = ranked.iter().filter(|(r, _)| *r <= effort_rank).max() {
+        return (*v).to_string();
+    }
+    // Effort below every valid entry → clamp up to the model's minimum.
+    ranked
+        .iter()
+        .min_by_key(|(r, _)| *r)
+        .map(|(_, v)| (*v).to_string())
+        .unwrap_or_else(|| "medium".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1680,6 +1767,12 @@ mod tests {
     #[test]
     fn ai_usage_hud_client_honors_env_base_override() {
         let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        // Seed the copilot catalog cache so build_client's catalog consult
+        // (copilot-wire api-mode routing) is served in-process and never
+        // reaches the network. The fixture doesn't affect what this test
+        // asserts: with a pinned custom endpoint, request_credentials returns
+        // the raw token + pinned base without consulting api_mode.
+        let _catalog = crate::copilot::CatalogCacheGuard::seed("gpt-4o");
         std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://10.0.0.5:9000/");
         let profile = crate::profile::get_profile("ai-usage-hud").unwrap();
         // build_client applies the env override through resolve_base_override.
@@ -1871,6 +1964,144 @@ mod tests {
         assert_eq!(resp.tool_calls[0].function.arguments, "{\"expr\":\"9+1\"}");
     }
 
+    /// Copilot-wire claude models ride /chat/completions and report
+    /// thinking via a `reasoning_text` delta field (Joey extension,
+    /// verified live 2026-08-21 — see the thinking-param comment in
+    /// chat.rs). The stream parser must emit ReasoningDelta for those and
+    /// stay silent for deltas without reasoning fields.
+    #[test]
+    fn copilot_chat_stream_emits_reasoning_text_deltas() {
+        let sse = [
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","reasoning_text":"Let me "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning_text":"think this through."},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"The answer "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"is 42."},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"final"},"finish_reason":null}]}"#,
+            "[DONE]",
+        ];
+        let body = {
+            let mut b = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            for line in &sse {
+                b.push_str("data: ");
+                b.push_str(line);
+                b.push_str("\n\n");
+            }
+            b
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf); // drain the request
+            sock.write_all(body.as_bytes()).unwrap();
+            sock.flush().unwrap();
+        });
+        let profile = crate::profile::get_profile("copilot").unwrap();
+        let base = format!("http://{}", addr);
+        let client = ProviderClient::new(profile, Some(base), Some("ghu_test".into())).unwrap();
+        // claude-* on the copilot wire routes to ChatCompletions.
+        let req = ProviderRequest::new(
+            "claude-opus-5",
+            vec![crate::types::Message::user("meaning of life")],
+        )
+        .streaming(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let resp = rt.block_on(client.stream(&req, tx)).expect("stream ok");
+        // Collect the streamed events.
+        let mut reasoning_deltas = Vec::new();
+        let mut content_deltas = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::ReasoningDelta(s) => reasoning_deltas.push(s),
+                StreamEvent::ContentDelta(s) => content_deltas.push(s),
+                StreamEvent::Done(_) => {}
+            }
+        }
+        assert_eq!(
+            reasoning_deltas,
+            vec!["Let me ".to_string(), "think this through.".to_string()],
+            "reasoning_text deltas must surface as ReasoningDelta"
+        );
+        assert_eq!(content_deltas, vec!["The answer ".to_string(), "is 42.".to_string(), "final".to_string()]);
+        // Assembled response carries the joined reasoning and content.
+        assert_eq!(resp.reasoning.as_deref(), Some("Let me think this through."));
+        assert_eq!(resp.content, "The answer is 42.final");
+    }
+
+    /// Same wire, precedence: reasoning_content (or reasoning) must win
+    /// over reasoning_text when both are present — first-non-null order is
+    /// preserved, never appended together.
+    #[test]
+    fn copilot_chat_stream_reasoning_first_non_null_beats_reasoning_text() {
+        let sse = [
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"upstream ","reasoning_text":"copilot "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning":"pair ","reasoning_text":"again "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning_text":"only "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ];
+        let body = {
+            let mut b = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            for line in &sse {
+                b.push_str("data: ");
+                b.push_str(line);
+                b.push_str("\n\n");
+            }
+            b
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            sock.write_all(body.as_bytes()).unwrap();
+            sock.flush().unwrap();
+        });
+        let profile = crate::profile::get_profile("copilot").unwrap();
+        let base = format!("http://{}", addr);
+        let client = ProviderClient::new(profile, Some(base), Some("ghu_test".into())).unwrap();
+        let req = ProviderRequest::new(
+            "claude-opus-5",
+            vec![crate::types::Message::user("hi")],
+        )
+        .streaming(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let resp = rt.block_on(client.stream(&req, tx)).expect("stream ok");
+        let mut reasoning_deltas = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::ReasoningDelta(s) = ev {
+                reasoning_deltas.push(s);
+            }
+        }
+        // Higher-priority fields win per delta; reasoning_text is used only
+        // when neither sibling is present.
+        assert_eq!(
+            reasoning_deltas,
+            vec![
+                "upstream ".to_string(),
+                "pair ".to_string(),
+                "only ".to_string()
+            ]
+        );
+        assert_eq!(
+            resp.reasoning.as_deref(),
+            Some("upstream pair only ")
+        );
+    }
+
     /// Regression (2026-08-18): a copilot-wire client built for a chat-wire
     /// model must re-derive the wire per request — gpt-5.x rides /responses
     /// even when profile.api_mode was pinned to chat at build time.
@@ -1971,6 +2202,23 @@ mod tests {
         let n = parse_openai_response(&v).unwrap();
         assert_eq!(n.finish_reason, FinishReason::Stop);
         // reasoning_content wins as first-non-null over absent reasoning.
+        assert_eq!(n.reasoning.as_deref(), Some("rc"));
+    }
+
+    #[test]
+    fn openai_response_reasoning_text_copilot_extension() {
+        // Copilot-wire claude thinking: `reasoning_text` alone is captured
+        // (Joey extension, verified live 2026-08-21 — see chat.rs).
+        let v = json!({"choices": [{"message": {"content": "x", "reasoning_text": "rt"}, "finish_reason": "stop"}]});
+        let n = parse_openai_response(&v).unwrap();
+        assert_eq!(n.reasoning.as_deref(), Some("rt"));
+        // Precedence preserved: reasoning beats reasoning_text...
+        let v = json!({"choices": [{"message": {"content": "x", "reasoning": "r", "reasoning_text": "rt"}, "finish_reason": "stop"}]});
+        let n = parse_openai_response(&v).unwrap();
+        assert_eq!(n.reasoning.as_deref(), Some("r"));
+        // ...and reasoning_content beats reasoning_text.
+        let v = json!({"choices": [{"message": {"content": "x", "reasoning_content": "rc", "reasoning_text": "rt"}, "finish_reason": "stop"}]});
+        let n = parse_openai_response(&v).unwrap();
         assert_eq!(n.reasoning.as_deref(), Some("rc"));
     }
 
@@ -2197,5 +2445,117 @@ mod responses_body_tests {
         let content = item["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "input_text");
         assert_eq!(content[1]["type"], "input_image");
+    }
+
+    // ── Reasoning elicitation on the copilot-wire /responses body ──────────
+
+    /// xhigh on a gpt-5.x model (cold catalog → minimal/low/medium/high set)
+    /// MUST clamp to high and request reasoning summaries.
+    #[test]
+    fn responses_effort_xhigh_clamps_to_high_and_requests_summary() {
+        let c = client();
+        let req = ProviderRequest::new("gpt-5.4", vec![Message::user("hi")])
+            .with_reasoning(Some(crate::request::ReasoningEffort::Level("xhigh".into())));
+        let body = c.build_responses_body(&req);
+        assert_eq!(body["reasoning"]["effort"], json!("high"));
+        assert_eq!(body["reasoning"]["summary"], json!("auto"));
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        // store/stream behavior untouched.
+        assert_eq!(body["store"], json!(false));
+        assert_eq!(body["stream"], json!(false));
+    }
+
+    /// Catalog-provided valid sets win over the cold-cache heuristic: a model
+    /// whose catalog entry allows xhigh keeps xhigh verbatim; one capped at
+    /// high clamps xhigh→high.
+    #[test]
+    fn responses_effort_uses_catalog_valid_set() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        // Entry advertising xhigh — no clamp.
+        let _xhigh = crate::copilot::CatalogCacheGuard::seed_with(
+            "gpt-5.4",
+            json!({"reasoning_effort": ["none", "low", "medium", "high", "xhigh"]}),
+        );
+        let c = client();
+        let req = ProviderRequest::new("gpt-5.4", vec![Message::user("hi")])
+            .with_reasoning(Some(crate::request::ReasoningEffort::Level("xhigh".into())));
+        let body = c.build_responses_body(&req);
+        assert_eq!(body["reasoning"]["effort"], json!("xhigh"));
+
+        // Entry capped at high — xhigh clamps down.
+        let _capped = crate::copilot::CatalogCacheGuard::seed_with(
+            "gpt-5.4",
+            json!({"reasoning_effort": ["low", "medium", "high"]}),
+        );
+        let body = c.build_responses_body(&req);
+        assert_eq!(body["reasoning"]["effort"], json!("high"));
+
+        // Effort below the model minimum clamps up (low on a min=high set).
+        let _minhigh = crate::copilot::CatalogCacheGuard::seed_with(
+            "gpt-5.4",
+            json!({"reasoning_effort": ["high", "max"]}),
+        );
+        let low_req = ProviderRequest::new("gpt-5.4", vec![Message::user("hi")])
+            .with_reasoning(Some(crate::request::ReasoningEffort::Level("low".into())));
+        let body = c.build_responses_body(&low_req);
+        assert_eq!(body["reasoning"]["effort"], json!("high"));
+    }
+
+    /// Valid efforts pass through unchanged; `none`/empty/Disabled omit the
+    /// reasoning object entirely (pre-fix behavior for those cases).
+    #[test]
+    fn responses_valid_efforts_pass_through_and_none_omits() {
+        let c = client();
+        for effort in ["minimal", "low", "medium", "high"] {
+            let req = ProviderRequest::new("gpt-5.4", vec![Message::user("hi")])
+                .with_reasoning(Some(crate::request::ReasoningEffort::Level(effort.into())));
+            let body = c.build_responses_body(&req);
+            assert_eq!(
+                body["reasoning"]["effort"],
+                json!(effort),
+                "{effort} must pass through verbatim"
+            );
+            assert_eq!(body["reasoning"]["summary"], json!("auto"));
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        }
+        // ReasoningEffort::Level("none") → omitted entirely.
+        let req = ProviderRequest::new("gpt-5.4", vec![Message::user("hi")])
+            .with_reasoning(Some(crate::request::ReasoningEffort::Level("none".into())));
+        let body = c.build_responses_body(&req);
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("include").is_none());
+        // Disabled → omitted entirely.
+        let req = ProviderRequest::new("gpt-5.4", vec![Message::user("hi")])
+            .with_reasoning(Some(crate::request::ReasoningEffort::Disabled));
+        let body = c.build_responses_body(&req);
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("include").is_none());
+        // No reasoning config at all → omitted entirely.
+        let req = ProviderRequest::new("gpt-5.4", vec![Message::user("hi")]);
+        let body = c.build_responses_body(&req);
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn responses_effort_clamp_table() {
+        // Cold-catalog generic clamp table.
+        let valid: Vec<String> = vec![];
+        assert_eq!(clamp_effort("low", &valid), "low");
+        assert_eq!(clamp_effort("xhigh", &valid), "high");
+        assert_eq!(clamp_effort("max", &valid), "high");
+        assert_eq!(clamp_effort("ultra", &valid), "high");
+        assert_eq!(clamp_effort("bogus", &valid), "medium");
+        // Catalog sets.
+        let gpt5: Vec<String> = ["minimal", "low", "medium", "high"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(clamp_effort("medium", &gpt5), "medium");
+        assert_eq!(clamp_effort("xhigh", &gpt5), "high");
+        let o_series: Vec<String> = ["low", "medium", "high"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(clamp_effort("minimal", &o_series), "low");
+        // Unrankable catalog entries ("none") don't break the clamp.
+        let with_none: Vec<String> = ["none", "low", "high"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(clamp_effort("xhigh", &with_none), "high");
     }
 }

@@ -176,6 +176,11 @@ spoofing layer from upstream is deliberately NOT ported.
 Copilot wire: `model_api_mode` routes GPT-5+ (except gpt-5-mini) to the
 Responses wire, which maps reasoning to `reasoning: {effort}`; catalog
 entries exposing only `/v1/messages` route to the Anthropic wire.
+Copilot-wire claude models ride /chat/completions with a top-level
+`thinking {type: enabled, budget_tokens}` request param and report
+thinking back via a `reasoning_text` field parsed as the third
+first-non-null fallback after `reasoning`/`reasoning_content` (Joey
+extension beyond upstream, verified live 2026-08-21).
 
 ## 7. Tool-call wire formats
 

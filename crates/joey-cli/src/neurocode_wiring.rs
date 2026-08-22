@@ -57,20 +57,36 @@ pub fn try_build_engine_scoped(
     Some(Arc::new(engine))
 }
 
-/// Whether the active provider's NeuroCode tier models are configured —
+/// Like [`try_build_engine`], but scopes tier resolution to the provider an
+/// agent built from the given (provider, base_url, model) triple would
+/// ACTUALLY run on — the same triple `AgentConfig` feeds `build_client` at
+/// `Agent::new`. This keeps the engine scope locked to the live agent
+/// provider even when the agent triple diverges from the raw config triple:
+/// CLI/session overrides (`--model gpt-5.4` forces `provider: auto` while
+/// config's default model stays e.g. `glm-5.2`), and the HUD env magnet
+/// (`AI_USAGE_HUD_BASE_URL` → `ai-usage-hud` only when `copilot_servable`
+/// holds for the AGENT's model). `/model neurocode …` writes its keys under
+/// the live agent provider, so the engine must read them there too.
+pub fn try_build_engine_for_agent_inputs(
+    config: &joey_core::Config,
+    provider_setting: &str,
+    base_url: &str,
+    model: &str,
+) -> Option<Arc<DefaultEngine>> {
+    let scope = joey_providers::resolve_profile(provider_setting, base_url, model).name;
+    try_build_engine_scoped(config, &scope)
+}
+
+/// Whether the given provider's NeuroCode tier models are configured —
 /// either a per-provider entry (`neurocode.tier.providers.<id>`) or the flat
-/// legacy keys. When false and NeuroCode is enabled, callers should prompt
-/// the user to pick frontier/economical models from the provider's catalog.
-pub fn tier_models_configured(config: &joey_core::Config) -> bool {
+/// legacy keys (scoped variant for callers that know the live agent provider,
+/// which may diverge from the config-resolved one).
+pub fn tier_models_configured_scoped(config: &joey_core::Config, provider: &str) -> bool {
     let nc_cfg = NeuroCodeConfig::from_config(config);
     if !nc_cfg.enabled {
         return true; // nothing to configure when disabled
     }
-    let provider = config.get_str("model.provider", "auto");
-    let base_url = config.get_str("model.base_url", "");
-    let model = config.model();
-    let profile = joey_providers::resolve_profile(&provider, &base_url, &model);
-    let tiers = nc_cfg.tier.tiers_for_provider(profile.name);
+    let tiers = nc_cfg.tier.tiers_for_provider(provider);
     !tiers.frontier.is_empty() && !tiers.economical.is_empty()
 }
 
@@ -149,6 +165,61 @@ mod tests {
         joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap()
     }
 
+    /// RAII guard for tests that set the HUD magnet env var. Serializes on
+    /// joey-core's TEST_HOME_OVERRIDE_LOCK (the same workspace-wide lock
+    /// llm_selector's TestEnvGuard takes as the second of its pair), so this
+    /// can't race those magnet tests; redirects JOEY_HOME at an empty .env so
+    /// sibling `Config::load()` calls can't resurrect the scrubbed vars;
+    /// restores everything on drop.
+    struct HudEnvGuard {
+        _override_lock: std::sync::MutexGuard<'static, ()>,
+        prev_copilot: Option<String>,
+        prev_hud: Option<String>,
+        prev_home: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl HudEnvGuard {
+        fn new() -> Self {
+            let _override_lock = joey_core::constants::TEST_HOME_OVERRIDE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev_home = std::env::var_os("JOEY_HOME");
+            let dir = tempfile::tempdir().expect("temp joey home");
+            std::fs::write(dir.path().join(".env"), "").expect("seed empty .env");
+            std::env::set_var("JOEY_HOME", dir.path());
+            let prev_copilot = std::env::var("COPILOT_API_BASE_URL").ok();
+            let prev_hud = std::env::var("AI_USAGE_HUD_BASE_URL").ok();
+            std::env::remove_var("COPILOT_API_BASE_URL");
+            std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+            Self {
+                _override_lock,
+                prev_copilot,
+                prev_hud,
+                prev_home,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for HudEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("JOEY_HOME", v),
+                None => std::env::remove_var("JOEY_HOME"),
+            }
+            for (k, v) in [
+                ("COPILOT_API_BASE_URL", &self.prev_copilot),
+                ("AI_USAGE_HUD_BASE_URL", &self.prev_hud),
+            ] {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     #[test]
     fn disabled_config_yields_none() {
         // Default config has neurocode.enabled = false.
@@ -195,37 +266,123 @@ mod tests {
         let model_yaml = "model:\n  provider: zai\n  default: glm-5.2\n";
         // NeuroCode disabled → nothing to configure.
         let config = config_with_yaml(model_yaml);
-        assert!(tier_models_configured(&config));
+        assert!(tier_models_configured_scoped(&config, "zai"));
         // Enabled, no tiers at all → needs prompting.
         let config = config_with_yaml(&format!(
             "{}neurocode:\n  enabled: true\n",
             model_yaml
         ));
-        assert!(!tier_models_configured(&config));
+        assert!(!tier_models_configured_scoped(&config, "zai"));
         // Enabled, per-provider entry complete → configured.
         let config = config_with_yaml(&format!(
             "{}neurocode:\n  enabled: true\n  tier:\n    providers:\n      zai:\n        frontier: glm-5.2\n        economical: glm-4.5-flash\n",
             model_yaml
         ));
-        assert!(tier_models_configured(&config));
+        assert!(tier_models_configured_scoped(&config, "zai"));
         // Enabled, per-provider entry partial → still needs prompting.
         let config = config_with_yaml(&format!(
             "{}neurocode:\n  enabled: true\n  tier:\n    providers:\n      zai:\n        frontier: glm-5.2\n",
             model_yaml
         ));
-        assert!(!tier_models_configured(&config));
+        assert!(!tier_models_configured_scoped(&config, "zai"));
         // Enabled, flat legacy keys complete → configured (backward compat).
         let config = config_with_yaml(&format!(
             "{}neurocode:\n  enabled: true\n  tier:\n    frontier:\n      model: f\n    economical:\n      model: e\n",
             model_yaml
         ));
-        assert!(tier_models_configured(&config));
+        assert!(tier_models_configured_scoped(&config, "zai"));
         // Tiers configured for a DIFFERENT provider only → still needs
         // prompting for the active one.
         let config = config_with_yaml(&format!(
             "{}neurocode:\n  enabled: true\n  tier:\n    providers:\n      copilot:\n        frontier: gpt-5.4\n        economical: gpt-4o-mini\n",
             model_yaml
         ));
-        assert!(!tier_models_configured(&config));
+        assert!(!tier_models_configured_scoped(&config, "zai"));
+    }
+
+    /// ai-usage-hud: per-provider tier keys under `ai-usage-hud` are what the
+    /// engine scope reads when the agent runs on the HUD proxy. The HUD env
+    /// magnet auto-resolves `auto` + a Copilot-servable model onto
+    /// `ai-usage-hud` — the scope must follow that resolution so keys written
+    /// by `/model neurocode …` (under the live agent provider) are read back.
+    #[test]
+    fn engine_scopes_tier_resolution_to_ai_usage_hud_via_magnet() {
+        let _g = HudEnvGuard::new();
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317");
+        // Agent triple: provider=auto, empty base_url, a Copilot-servable
+        // model → resolve_profile magnetizes onto ai-usage-hud.
+        let engine = try_build_engine_for_agent_inputs(
+            &config_with_yaml(
+                "neurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    frontier:\n      model: legacy-frontier\n    providers:\n      ai-usage-hud:\n        frontier: gpt-5.4\n        economical: gpt-4.1-mini\n",
+            ),
+            "auto",
+            "",
+            "gpt-5.4",
+        )
+        .unwrap();
+        assert_eq!(engine.resolve_tier_model().as_deref(), Some("gpt-5.4"));
+        // The same config scoped via the raw-config path would resolve a
+        // different provider when the config model is NOT copilot-servable
+        // (e.g. glm-5.2 → zai) — proving the agent-triple scope is what
+        // pins the engine to ai-usage-hud here.
+        let config = config_with_yaml(
+            "model:\n  provider: auto\n  default: glm-5.2\nneurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    frontier:\n      model: legacy-frontier\n    providers:\n      ai-usage-hud:\n        frontier: gpt-5.4\n        economical: gpt-4.1-mini\n",
+        );
+        let engine = try_build_engine_for_agent_inputs(&config, "auto", "", "glm-5.2").unwrap();
+        // glm is NOT copilot-servable → agent runs on zai → the HUD keys are
+        // NOT consulted; flat legacy keys apply instead.
+        assert_eq!(
+            engine.resolve_tier_model().as_deref(),
+            Some("legacy-frontier")
+        );
+    }
+
+    /// ai-usage-hud: a non-Copilot-servable agent model falls through the
+    /// magnet to its native provider — per-provider keys under that native
+    /// provider are used, not the HUD's (mirrors the magnet's servability
+    /// gate; the wiring must not second-guess it).
+    #[test]
+    fn engine_scope_follows_agent_inputs_not_raw_config_when_diverged() {
+        let _g = HudEnvGuard::new();
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317");
+        // Config says auto + gpt-5.4 (copilot-servable → HUD), but the AGENT
+        // runs with a session model override of glm-5.2 (auto-detected zai).
+        // The agent-triple scope must resolve zai and read zai's keys.
+        let config = config_with_yaml(
+            "model:\n  provider: auto\n  default: gpt-5.4\nneurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    providers:\n      ai-usage-hud:\n        frontier: gpt-5.4\n        economical: gpt-4.1-mini\n      zai:\n        frontier: glm-5.2\n        economical: glm-4.5-flash\n",
+        );
+        let engine = try_build_engine_for_agent_inputs(&config, "auto", "", "glm-5.2").unwrap();
+        assert_eq!(engine.resolve_tier_model().as_deref(), Some("glm-5.2"));
+    }
+
+    /// The `/neurocode` command engine is provider-scoped: with the live
+    /// provider passed in, status/tier text reflects the per-provider keys
+    /// (previously the command built an unscoped engine that fell back to
+    /// flat keys / the ambiguous default).
+    #[test]
+    fn neurocode_command_engine_is_provider_scoped() {
+        use joey_neurocode::NeuroCodeCommands;
+        let config = config_with_yaml(
+            "model:\n  provider: zai\n  default: glm-5.2\nneurocode:\n  enabled: true\n  tier:\n    frontier:\n      model: legacy-frontier\n    providers:\n      ai-usage-hud:\n        frontier: gpt-5.4\n        economical: gpt-4.1-mini\n",
+        );
+        // The helper the command handler uses to scope its engine.
+        assert_eq!(
+            crate::commands::neurocode::scope_for_config(&config),
+            "zai",
+            "config-resolved scope must match resolve_profile"
+        );
+        // Scoped to the LIVE agent provider (ai-usage-hud): tier show
+        // displays the HUD's per-provider models, not the flat legacy keys.
+        let engine =
+            crate::neurocode_wiring::try_build_engine_scoped(&config, "ai-usage-hud").unwrap();
+        let tier_text = engine.tier_text("show", None);
+        assert!(
+            tier_text.contains("frontier=gpt-5.4"),
+            "scoped tier text must show the ai-usage-hud frontier model, got: {tier_text}"
+        );
+        assert!(
+            !tier_text.contains("legacy-frontier"),
+            "scoped tier text must not fall back to flat legacy keys, got: {tier_text}"
+        );
     }
 }

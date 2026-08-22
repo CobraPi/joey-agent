@@ -1234,6 +1234,11 @@ impl Agent {
     /// request — `tool_schemas()` filters through this list, and dispatch
     /// resolves against the registry the same way. Model/provider identity,
     /// history, and the session store are untouched.
+    ///
+    /// NOTE: this alone does NOT refresh the baked system prompt — its
+    /// tool-guidance section still lists the pre-toggle tools. Call
+    /// [`Agent::rebuild_system_prompt`] afterwards when the mode switch
+    /// should also be reflected in the prompt (the orchestrator toggle does).
     pub fn set_enabled_tools(&mut self, tools: Vec<String>) {
         self.config.enabled_tools = tools;
     }
@@ -1243,9 +1248,49 @@ impl Agent {
         &self.config.enabled_tools
     }
 
+    /// Recompute the baked system prompt from the CURRENT
+    /// `config.enabled_tools`, using the exact construction path as
+    /// `Agent::new` (valid_tool_names → build_system_prompt). One-shot
+    /// maintenance for mid-session mode switches (e.g. the /hypercode
+    /// orchestrator toggle): after `set_enabled_tools`, the previously baked
+    /// prompt's tool-guidance section still describes the OLD tool surface,
+    /// contradicting the reduced schemas and any overlay — this makes the
+    /// prompt self-consistent again.
+    ///
+    /// This is NOT a per-turn rebuild: the prompt stays session-stable
+    /// between explicit calls, preserving provider prompt-prefix caches
+    /// except at toggle time (which already invalidates them via the
+    /// overlay/`set_extra_instructions`). The caller is expected to have
+    /// called `set_enabled_tools` first — this reads whatever is current.
+    /// Honors `pass_session_id`/`session_id` exactly like the init-time
+    /// build. History and the session store are untouched.
+    pub fn rebuild_system_prompt(&mut self) {
+        let valid_tools =
+            valid_tool_names(&self.registry, &self.config.enabled_tools, &self.ctx);
+        self.system_prompt = build_system_prompt(&PromptInputs {
+            ctx: &self.ctx,
+            model: &self.config.model,
+            provider: &self.provider_name,
+            enabled_tools: &valid_tools,
+            pass_session_id: self.config.pass_session_id,
+            session_id: self.session_id.as_deref(),
+        });
+    }
+
     /// The active provider (canonical profile name).
     pub fn provider_name(&self) -> &str {
         &self.provider_name
+    }
+
+    /// The model id the next main turn would dispatch with: NeuroCode
+    /// tier-routed, allocator-resolved (feature 011), or image-routed when
+    /// those are active and the model is not pinned; falls back to
+    /// `config.model`. Read-only exposure of `resolve_main_turn_model` for
+    /// callers outside the turn loop (e.g. HyperCode parent-model
+    /// inheritance in joey-cli). Resolution is a pure lookup — no state
+    /// mutation, no provider calls.
+    pub fn effective_main_turn_model(&self) -> String {
+        self.resolve_main_turn_model(false)
     }
 
     /// Point the cached prompt's `Model:`/`Provider:` lines at the active
@@ -1290,6 +1335,15 @@ impl Agent {
         // resolve the main-turn model per-module. When None or inactive,
         // `config.model` is used verbatim (byte-identical to pre-feature-011).
         let model = self.resolve_main_turn_model(!tools.is_empty());
+        // Request-model observability: one INFO line per provider call.
+        // Tier/allocator/image routing all funnel through here, so this is
+        // the single point where the RESOLVED model (vs config.model) is
+        // greppable. Kept cheap: two field captures, no formatting.
+        tracing::info!(
+            provider = %self.provider_name,
+            model = %model,
+            "provider request model resolved"
+        );
         ProviderRequest::new(model, self.history.clone())
             .with_system(Some(self.effective_system_prompt()))
             .with_tools(tools.to_vec())
@@ -1525,9 +1579,19 @@ impl Agent {
                     // The context was already assembled by apply_neurocode_intercept.
                     // Mode 2: NeuroCode resolves the tier model from its own config.
                     if let Some(model_id) = engine.resolve_tier_model() {
-                        // Copilot-wire servability guard (same rationale as the
-                        // allocator branch above).
-                        if !joey_providers::profile::is_copilot_wire(&self.provider_name)
+                        // Servability guard, scoped to the REAL GitHub Copilot
+                        // backend only (canonical provider id "copilot"): it
+                        // cannot serve vendor families it never carries (glm-,
+                        // deepseek-, …) and would silently substitute its
+                        // default model. The ai-usage-hud reverse proxy serves
+                        // the full model catalog behind its own routing, so it
+                        // gets parity with every non-copilot provider (z.ai,
+                        // openrouter, …): the tier-resolved model is returned
+                        // as-is. is_copilot_wire is deliberately NOT consulted
+                        // here — it sweeps the HUD proxy back into the guard,
+                        // which silently downgraded frontier tiers to
+                        // config.model (regression observed 2026-08-21).
+                        if self.provider_name != "copilot"
                             || joey_providers::profile::copilot_servable(&model_id)
                         {
                             return model_id;
@@ -3747,6 +3811,97 @@ mod tests {
         Fixture { agent, transport, _home: home, _cwd: cwd, _guard: guard }
     }
 
+    // ── set_enabled_tools + rebuild_system_prompt (orchestrator toggle) ──
+
+    /// A tool NAMED `memory` (prompt guidance gates on the name, not the
+    /// implementation) — exercises the MEMORY_GUIDANCE block.
+    struct NamedTool(&'static str);
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn toolset(&self) -> &str {
+            "test"
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::Text("ok".to_string())
+        }
+    }
+
+    fn toggle_fixture_agent(
+        enabled: Vec<&str>,
+    ) -> (Agent, tempfile::TempDir, tempfile::TempDir, joey_core::constants::HomeOverrideGuard)
+    {
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf(), Config::defaults(), "test-session");
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(NamedTool("memory")));
+        registry.register(Arc::new(NamedTool("session_search")));
+        let config = AgentConfig {
+            model: "test-model".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: None,
+            max_turns: 5,
+            api_max_retries: 1,
+            tool_delay: 0.0,
+            reasoning: None,
+            enabled_tools: enabled.into_iter().map(|s| s.to_string()).collect(),
+            max_tokens: None,
+            stream: false,
+            pass_session_id: false,
+            model_pinned: false,
+        };
+        let agent = Agent::new(config, registry, ctx).expect("agent");
+        (agent, home, cwd, guard)
+    }
+
+    /// Regression (orchestrator toggle): after `set_enabled_tools` +
+    /// `rebuild_system_prompt`, the effective system prompt's tool guidance
+    /// reflects ONLY the enabled tools — the stale baked section (e.g.
+    /// MEMORY_GUIDANCE when `memory` was dropped) must not survive the
+    /// rebuild, while guidance for still-enabled tools and generic
+    /// tool guidance remain.
+    #[test]
+    fn rebuild_system_prompt_reflects_current_enabled_tools() {
+        let (mut agent, _home, _cwd, _guard) = toggle_fixture_agent(vec!["memory", "session_search"]);
+
+        // Baked at init with the full surface: both guidance blocks present.
+        assert!(agent.system_prompt().contains("persistent memory"));
+        assert!(agent.system_prompt().contains("session_search to recall"));
+
+        // Toggle to a reduced surface WITHOUT rebuilding: the baked prompt
+        // keeps the stale guidance (the bug rebuild_system_prompt fixes).
+        agent.set_enabled_tools(vec!["session_search".to_string()]);
+        assert!(agent.system_prompt().contains("persistent memory"));
+
+        // Rebuild: tool guidance now matches the enabled set exactly.
+        agent.rebuild_system_prompt();
+        let rebuilt = agent.effective_system_prompt();
+        assert!(
+            !rebuilt.contains("persistent memory"),
+            "stale MEMORY_GUIDANCE survived the rebuild"
+        );
+        assert!(rebuilt.contains("session_search to recall"));
+        // Generic tool guidance stays (tools are still loaded).
+        assert!(rebuilt.contains("working artifact backed by real tool output"));
+
+        // Toggle OFF restores the full surface in the prompt as well.
+        agent.set_enabled_tools(vec!["memory".to_string(), "session_search".to_string()]);
+        agent.rebuild_system_prompt();
+        assert!(agent.system_prompt().contains("persistent memory"));
+        assert!(agent.system_prompt().contains("session_search to recall"));
+    }
+
     fn drain(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
@@ -5464,6 +5619,150 @@ mod tests {
             "below-threshold edits don't re-index"
         );
         assert_eq!(engine.reindex_count.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    // ── NeuroCode tier-model servability guard (regression, 2026-08-21) ──
+    //
+    // The guard that rejects non-Copilot-servable tier models applies ONLY to
+    // the real GitHub Copilot backend (canonical provider id "copilot"). The
+    // ai-usage-hud reverse proxy routes the full catalog itself, so it gets
+    // parity with every other provider (z.ai, openrouter, …): the
+    // tier-resolved model is returned as-is, never servability-rejected and
+    // never silently downgraded to config.model.
+
+    /// Engine double with a FIXED tier-model resolution, for exercising the
+    /// servability guard in resolve_main_turn_model without config files.
+    struct TierModelEngine(String);
+
+    impl joey_neurocode::NeuroCodeEngine for TierModelEngine {
+        fn classify(&self, _request: &joey_neurocode::CodingRequest) -> joey_neurocode::ComplexityRoute {
+            joey_neurocode::ComplexityRoute {
+                tier: joey_neurocode::ComplexityTier::Frontier,
+                reasoning: "tier-model guard test".to_string(),
+                overridden: false,
+                override_tier: None,
+                signals: Vec::new(),
+            }
+        }
+
+        fn assemble_context(
+            &self,
+            _request: &joey_neurocode::CodingRequest,
+            tier: joey_neurocode::ComplexityTier,
+        ) -> joey_neurocode::AssembledContext {
+            joey_neurocode::AssembledContext {
+                formatted_context: "## tier-model guard ctx".to_string(),
+                tier,
+                ..Default::default()
+            }
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+
+        fn resolve_tier_model(&self) -> Option<String> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// ai-usage-hud + a tier model that FAILS the copilot prefix list
+    /// (my-custom-frontier-… matches no gpt-/claude-/gemini-/o1/o3/o4/
+    /// mai-code- family): the tier model must be served anyway — z.ai parity.
+    /// Verified both via direct resolution and end-to-end through run_turn
+    /// (the wire request must carry the tier model, not config.model).
+    #[tokio::test]
+    async fn tier_model_ai_usage_hud_serves_non_servable_tier_model() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        fx.agent.provider_name = "ai-usage-hud".to_string();
+        fx.agent
+            .set_neurocode_engine(Arc::new(TierModelEngine("my-custom-frontier-alias".to_string())));
+
+        // Direct: no servability rejection, no silent fallback.
+        assert_eq!(
+            fx.agent.resolve_main_turn_model(false),
+            "my-custom-frontier-alias",
+            "ai-usage-hud must return the tier-resolved model as-is (z.ai parity)"
+        );
+
+        // End-to-end: the main-turn provider request carries the tier model.
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("refactor this module", tx).await;
+        assert_eq!(fx.transport.request_count(), 1);
+        assert_eq!(
+            fx.transport.request(0).model,
+            "my-custom-frontier-alias",
+            "the wire request must carry the tier model, not config.model"
+        );
+    }
+
+    /// ai-usage-hud + a SERVABLE tier model (gpt-…): still returned (sanity —
+    /// the guard skip must not somehow break the pass-through path).
+    #[test]
+    fn tier_model_ai_usage_hud_serves_servable_tier_model() {
+        let mut fx = fixture(vec![], 5, 3, None);
+        fx.agent.provider_name = "ai-usage-hud".to_string();
+        fx.agent
+            .set_neurocode_engine(Arc::new(TierModelEngine("gpt-5.4".to_string())));
+        assert_eq!(
+            fx.agent.resolve_main_turn_model(false),
+            "gpt-5.4",
+            "servable tier model passes through unchanged"
+        );
+    }
+
+    /// copilot (GitHub Copilot backend) + the SAME non-servable tier model:
+    /// the existing guard must be preserved — warn + fall back to the
+    /// configured model instead of letting Copilot silently substitute.
+    #[test]
+    fn tier_model_copilot_falls_back_when_not_servable() {
+        let mut fx = fixture(vec![], 5, 3, None);
+        fx.agent.provider_name = "copilot".to_string();
+        fx.agent
+            .set_neurocode_engine(Arc::new(TierModelEngine("my-custom-frontier-alias".to_string())));
+        assert_eq!(
+            fx.agent.resolve_main_turn_model(false),
+            "test-model",
+            "copilot must keep the warn-and-fallback guard for non-servable tier models"
+        );
+    }
+
+    /// z.ai (never copilot-wire) + a non-servable tier model: returned as-is —
+    /// the parity anchor the ai-usage-hud fix aligns with.
+    #[test]
+    fn tier_model_zai_serves_non_servable_tier_model() {
+        let mut fx = fixture(vec![], 5, 3, None);
+        fx.agent.provider_name = "zai".to_string();
+        fx.agent
+            .set_neurocode_engine(Arc::new(TierModelEngine("my-custom-frontier-alias".to_string())));
+        assert_eq!(
+            fx.agent.resolve_main_turn_model(false),
+            "my-custom-frontier-alias",
+            "non-copilot providers were never guarded — must stay that way"
+        );
+    }
+
+    /// effective_main_turn_model (public accessor for HyperCode
+    /// parent-model inheritance): tier-routed when the engine is active and
+    /// the model is UNPINNED; config.model once the user pins an explicit
+    /// choice (--model, /model switch).
+    #[test]
+    fn effective_main_turn_model_tier_routed_unpinned_config_when_pinned() {
+        let mut fx = fixture(vec![], 5, 3, None);
+        fx.agent.provider_name = "zai".to_string();
+        fx.agent
+            .set_neurocode_engine(Arc::new(TierModelEngine("gpt-5.6-sol".to_string())));
+        assert_eq!(
+            fx.agent.effective_main_turn_model(),
+            "gpt-5.6-sol",
+            "active engine + unpinned → the tier-routed model is exposed to callers"
+        );
+        fx.agent.config.model_pinned = true;
+        assert_eq!(
+            fx.agent.effective_main_turn_model(),
+            "test-model",
+            "pinned model wins — the accessor must not rewrite the user's choice"
+        );
     }
 
     mod steer_tests {

@@ -89,7 +89,25 @@ fn render_body(
     // there; the orchestrator is the implicit leftmost tab = focus None).
     let show_rail = !app.subagent_panes.is_empty() && area.width >= 96;
     let with_rail_area = if show_rail {
-        let rail_w = 19u16.min(area.width);
+        // Collapsed (default): the fixed 19-col tab strip — byte-for-byte
+        // parity with the original layout.
+        //
+        // Expanded (Ctrl+N / title-click): widen to a 48-col detail rail,
+        // but only while the transcript keeps a sane minimum: the rail
+        // yields (clamps back toward collapsed) whenever the remaining
+        // main area would drop below 60 cols. 48 was chosen in the middle
+        // of the 40-56 range: wide enough for model + phase + last-tool
+        // lines, narrow enough that the rail never dominates the body.
+        let rail_w = if app.subagent_rail_expanded {
+            let expanded_w = 48u16.min(area.width);
+            if area.width.saturating_sub(expanded_w) >= 60 {
+                expanded_w
+            } else {
+                19u16.min(area.width) // clamp: keep the transcript >= 60 cols
+            }
+        } else {
+            19u16.min(area.width)
+        };
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(rail_w)])
@@ -99,6 +117,7 @@ fn render_body(
     } else {
         app.last_subagent_tab_rects.borrow_mut().clear();
         app.last_orchestrator_tab_rect.set((0, 0, 0, 0));
+        app.last_subagent_rail_title_rect.set((0, 0, 0, 0));
         area
     };
 
@@ -967,6 +986,16 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 }
                 return None;
             }
+            // ── Subagent rail expansion ───────────────────────────────
+            // Ctrl+N toggles the right rail between the collapsed 19-col
+            // tab strip and the expanded detail view (same as clicking the
+            // rail's title row). Ctrl+B was the natural mnemonic but is
+            // already bound (half-page scroll up + input cursor-left), so
+            // Ctrl+N ("narrow/widen") is used instead.
+            KeyCode::Char('n') if ctrl => {
+                self.app.toggle_subagent_rail();
+                return None;
+            }
             // ── Maximized terminal output viewer ──────────────────────
             // Ctrl+O toggles it: targets the most recent terminal item
             // (running or finished — a finished one replays its full output).
@@ -1682,6 +1711,13 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// Clicking the live reasoning panel (docked bottom strip or expanded
     /// main view) toggles it the same way.
     pub fn handle_mouse_click(&mut self, row: u16, col: u16) {
+        // Expandable-rail feature: clicking the rail's TITLE row toggles
+        // expansion (checked with the other rail targets; the title sits
+        // above every tab so rects never overlap).
+        if self.app.subagent_rail_title_hit(row, col) {
+            self.app.toggle_subagent_rail();
+            return;
+        }
         // Parallel-subagent feature: the right rail's tabs are the top
         // click target. The pinned ORCHESTRATOR tab (rail bottom) returns
         // to the main view; clicking a pane's tab focuses it (retargeting
@@ -2390,6 +2426,77 @@ mod stats_page_key_tests {
         let app = App::new("sess", "model");
         let terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
         Tui::new_for_test(app, Theme::aurora(), terminal)
+    }
+
+    /// Expandable-rail feature: Ctrl+N toggles the rail expansion flag.
+    #[test]
+    fn ctrl_n_toggles_subagent_rail_expansion() {
+        let mut t = tui();
+        t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "child work".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+        assert!(!t.app.subagent_rail_expanded, "collapsed by default");
+        t.handle_key(ctrl_key('n'));
+        assert!(t.app.subagent_rail_expanded, "Ctrl+N expanded the rail");
+        t.handle_key(ctrl_key('n'));
+        assert!(!t.app.subagent_rail_expanded, "Ctrl+N collapsed it again");
+        // Works without panes too (the rail is hidden but the flag still
+        // toggles — it only affects rendering when panes exist).
+        t.app.clear_subagent_panes();
+        t.handle_key(ctrl_key('n'));
+        assert!(t.app.subagent_rail_expanded);
+    }
+
+    /// Ctrl+N must not leak into the input editor (plain 'n' still types).
+    #[test]
+    fn plain_n_still_types_into_input() {
+        let mut t = tui();
+        t.handle_key(plain(KeyCode::Char('n')));
+        assert_eq!(t.input.text(), "n", "plain n reaches the input box");
+    }
+
+    /// Ctrl+P behavior is unchanged by the new binding: returns to the
+    /// orchestrator from a focused pane, no-op otherwise.
+    #[test]
+    fn ctrl_p_behavior_unchanged() {
+        let mut t = tui();
+        t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "child work".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+        t.app.focus_subagent(Some(0));
+        t.app.toggle_subagent_rail();
+        t.handle_key(ctrl_key('p'));
+        assert!(t.app.focused_subagent.is_none(), "Ctrl+P returns to orchestrator even while expanded");
+        // Ctrl+P doesn't touch the expansion flag.
+        assert!(t.app.subagent_rail_expanded, "Ctrl+P leaves expansion alone");
+    }
+
+    /// Clicking the rail's title row toggles expansion through the mouse
+    /// handler (mouse parity with Ctrl+N).
+    #[test]
+    fn clicking_rail_title_toggles_expansion() {
+        let mut t = tui();
+        t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "child work".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+        // Simulate the rect the widget recorded on the last frame.
+        t.app.last_subagent_rail_title_rect.set((80, 1, 18, 1));
+        t.handle_mouse_click(1, 85);
+        assert!(t.app.subagent_rail_expanded, "title click expanded the rail");
+        t.handle_mouse_click(1, 85);
+        assert!(!t.app.subagent_rail_expanded, "second title click collapsed it");
     }
 
     /// Ctrl+P returns to the orchestrator view from a focused subagent

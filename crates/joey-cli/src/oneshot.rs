@@ -263,8 +263,15 @@ async fn run_agent(
 
     // Feature 015 (NeuroCode): build the engine when enabled and register the
     // 4 NeuroCode tools (T056/T057). None when disabled — byte-identical
-    // to pre-feature-015 (FR-020).
-    let neurocode_engine = crate::neurocode_wiring::try_build_engine(config);
+    // to pre-feature-015 (FR-020). Scoped via the AGENT's (provider,
+    // base_url, model) triple — the same inputs `Agent::new` feeds
+    // build_client — so the engine scope matches the live agent provider.
+    let neurocode_engine = crate::neurocode_wiring::try_build_engine_for_agent_inputs(
+        config,
+        &agent_cfg.provider,
+        &agent_cfg.base_url,
+        &agent_cfg.model,
+    );
     if let Some(engine) = &neurocode_engine {
         let backend = crate::neurocode_wiring::backend_for_engine(engine);
         joey_tools::builtins::register_neurocode_tools(&mut registry, Some(backend));

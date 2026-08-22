@@ -473,6 +473,35 @@ fn apply_reasoning_shape(
                 extra_body.insert("extra_body".into(), json!({"google": {"thinking_config": tc}}));
             }
         }
+        // Copilot-wire claude served via /chat/completions: the wire ACCEPTS
+        // the Anthropic-style top-level `thinking` object (verified against
+        // the live copilot chat endpoint + HUD proxy 2026-08-21:
+        // {"type":"enabled","budget_tokens":N} → 200, response carries
+        // reasoning_text). Mirror the anthropic.rs build_anthropic_body
+        // effort→budget mapping (anthropic_adapter.py:58): xhigh 32000 /
+        // high 16000 / medium 8000 / low 4000, with xhigh+ clamped to the
+        // 32000 top budget as the max-equivalent (the 4.6 adaptive path
+        // downgrades xhigh→max there). Haiku gets nothing, as on the
+        // anthropic wire. Gemini and unknown families stay as-is — the
+        // copilot chat wire has no documented thinking shape for them.
+        // Disabled omits the parameter entirely (same as the anthropic wire,
+        // which only acts on an explicit effort level).
+        other if crate::profile::is_copilot_wire(other) => {
+            let m = crate::copilot::normalize_model_id(&req.model).to_lowercase();
+            if m.starts_with("claude") && !m.contains("haiku") {
+                if let Some(ReasoningEffort::Level(level)) = reasoning {
+                    let effort = level.trim().to_lowercase();
+                    let budget = match effort.as_str() {
+                        "xhigh" | "max" | "ultra" => 32_000, // max-equivalent
+                        other => anthropic::thinking_budget(other),
+                    };
+                    obj.insert(
+                        "thinking".into(),
+                        json!({"type": "enabled", "budget_tokens": budget}),
+                    );
+                }
+            }
+        }
         // openai-api / openai-codex: send NOTHING reasoning-related.
         _ => {}
     }
@@ -711,5 +740,135 @@ mod tests {
         )];
         let body = build_openai_body(&p, p.base_url, &r);
         assert!(body["tools"].is_array());
+    }
+
+    // ── Copilot-wire claude thinking (chat/completions) ────────────────────
+
+    /// Claude models served via copilot-wire /chat/completions MUST carry an
+    /// anthropic-style top-level `thinking` object mirroring the
+    /// anthropic.rs effort→budget mapping (xhigh→32000 as max-equivalent).
+    #[test]
+    fn copilot_wire_claude_chat_carries_thinking() {
+        let p = get_profile("copilot").unwrap();
+        // xhigh → 32000 (max-equivalent; 4.6 caps xhigh on the anthropic wire).
+        let body = build_openai_body(
+            &p,
+            p.base_url,
+            &req("claude-sonnet-4.6", Some(ReasoningEffort::Level("xhigh".into()))),
+        );
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 32000})
+        );
+        // high/medium/low use the shared anthropic budget table.
+        let body = build_openai_body(
+            &p,
+            p.base_url,
+            &req("claude-sonnet-4.6", Some(ReasoningEffort::Level("high".into()))),
+        );
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 16000})
+        );
+        let body = build_openai_body(
+            &p,
+            p.base_url,
+            &req("claude-opus-4.5", Some(ReasoningEffort::Level("low".into()))),
+        );
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 4000})
+        );
+        // The HUD proxy profile behaves identically (same copilot wire).
+        let hud = get_profile("ai-usage-hud").unwrap();
+        let body = build_openai_body(
+            &hud,
+            hud.base_url,
+            &req("claude-sonnet-4.6", Some(ReasoningEffort::Level("medium".into()))),
+        );
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 8000})
+        );
+        // Disabled → parameter omitted entirely (anthropic-wire parity).
+        let body = build_openai_body(
+            &p,
+            p.base_url,
+            &req("claude-sonnet-4.6", Some(ReasoningEffort::Disabled)),
+        );
+        assert!(body.get("thinking").is_none());
+        // Haiku → no thinking, matching the anthropic wire.
+        let body = build_openai_body(
+            &p,
+            p.base_url,
+            &req("claude-haiku-4.5", Some(ReasoningEffort::Level("high".into()))),
+        );
+        assert!(body.get("thinking").is_none());
+        // Vendor-prefixed ids normalize to the claude family too.
+        let body = build_openai_body(
+            &p,
+            p.base_url,
+            &req("anthropic/claude-sonnet-4-6", Some(ReasoningEffort::Level("high".into()))),
+        );
+        assert_eq!(body["thinking"]["budget_tokens"], json!(16000));
+    }
+
+    /// Gemini (and unknown families) on copilot wire stay as-is: no thinking
+    /// parameter, no extra_body — the conservative scope of this fix.
+    #[test]
+    fn copilot_wire_gemini_and_unknown_models_unchanged() {
+        let p = get_profile("copilot").unwrap();
+        for model in ["gemini-3-pro-preview", "gpt-4.1", "some-unknown-model"] {
+            let body = build_openai_body(
+                &p,
+                p.base_url,
+                &req(model, Some(ReasoningEffort::Level("high".into()))),
+            );
+            assert!(body.get("thinking").is_none(), "{model}: no thinking");
+            assert!(body.get("extra_body").is_none(), "{model}: no extra_body");
+        }
+    }
+
+    /// REGRESSION GUARD: non-copilot-wire chat bodies are byte-identical to
+    /// the pre-copilot-thinking shape. openai-api keeps sending nothing
+    /// reasoning-related (both with and without reasoning configured).
+    #[test]
+    fn non_copilot_wire_chat_body_regression_guard() {
+        // openai-api: the canonical "send nothing" profile.
+        let p = get_profile("openai-api").unwrap();
+        let with_effort = build_openai_body(
+            &p,
+            p.base_url,
+            &req("gpt-4.1", Some(ReasoningEffort::Level("high".into()))),
+        );
+        assert!(with_effort.get("thinking").is_none());
+        assert!(with_effort.get("extra_body").is_none());
+        assert!(with_effort.get("reasoning_effort").is_none());
+        let disabled = build_openai_body(
+            &p,
+            p.base_url,
+            &req("claude-sonnet-4.6", Some(ReasoningEffort::Disabled)),
+        );
+        assert!(disabled.get("thinking").is_none());
+        assert!(disabled.get("extra_body").is_none());
+        // openrouter claude keeps its verbosity shape — untouched.
+        let orp = get_profile("openrouter").unwrap();
+        let body = build_openai_body(
+            &orp,
+            orp.base_url,
+            &req("anthropic/claude-opus-4.6", Some(ReasoningEffort::Level("high".into()))),
+        );
+        assert_eq!(body["verbosity"], json!("high"));
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("extra_body").is_none());
+        // zai/deepseek keep their extra_body shapes — untouched.
+        let zai = get_profile("zai").unwrap();
+        let body = build_openai_body(
+            &zai,
+            zai.base_url,
+            &req("glm-5.2", Some(ReasoningEffort::Level("low".into()))),
+        );
+        assert_eq!(body["extra_body"]["thinking"], json!({"type": "enabled"}));
+        assert!(body.get("thinking").is_none());
     }
 }

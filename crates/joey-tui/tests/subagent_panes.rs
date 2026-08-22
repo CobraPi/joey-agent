@@ -327,3 +327,139 @@ fn orchestrator_tab_highlight_follows_focus() {
 fn first_line(s: &str, _n: usize) -> String {
     s.lines().next().unwrap_or("").to_string()
 }
+
+// ── Expandable rail (Ctrl+N / title-click) ─────────────────────────────
+
+/// Render the rail area only (recorded geometry from a real frame), used
+/// to assert rail widths across the collapse/expand toggle.
+fn rail_width_after_render(a: &joey_tui::state::App, width: u16, height: u16) -> (u16, u16) {
+    let _ = render_frame(a, width, height);
+    // The title rect width tracks the rail's drawn width; the per-tab
+    // rects use the same inner width.
+    let (x, y, w, h) = a.last_subagent_rail_title_rect.get();
+    assert!(w > 0 && h > 0, "rail title rect recorded (rail drawn)");
+    let tab_w = a
+        .last_subagent_tab_rects
+        .borrow()
+        .first()
+        .map(|(_, _, tw, _)| *tw)
+        .unwrap_or(0);
+    let _ = (x, y);
+    (w, tab_w)
+}
+
+/// Default is collapsed: the rail renders at the original 19-col strip
+/// width (18 inner cols + 1 border), and the title carries the ▸ hint.
+#[test]
+fn rail_defaults_to_collapsed_19_cols() {
+    let mut a = app();
+    a.apply(spawn(1, "alpha task"));
+    assert!(!a.subagent_rail_expanded, "expansion flag defaults to false");
+    let text = render_frame(&a, 120, 30);
+    assert!(text.contains("subagents"), "rail title present");
+    assert!(text.contains("▸"), "collapsed title shows the ▸ hint");
+    let (title_w, tab_w) = rail_width_after_render(&a, 120, 30);
+    assert_eq!(title_w, 18, "collapsed title row spans the 18-col inner rail");
+    assert_eq!(tab_w, 18, "collapsed tab rows span the 18-col inner rail");
+}
+
+/// Toggling via the state helper renders the wider rail (48 cols on a
+/// 120-col terminal) with the richer detail lines.
+#[test]
+fn expanded_rail_renders_wider_with_detail_lines() {
+    let mut a = app();
+    a.apply(spawn(1, "alpha task"));
+    // Give the entry some richness: a tool call updates phase + last_tool.
+    a.apply(AgentEvent::SubagentEvent {
+        id: 1,
+        event: Box::new(AgentEvent::ToolStart {
+            name: "search_files".into(),
+            emoji: "🔍".into(),
+            summary: "pattern=x".into(),
+        }),
+    });
+    a.toggle_subagent_rail();
+    assert!(a.subagent_rail_expanded);
+    let text = render_frame(&a, 120, 30);
+    assert!(text.contains("test-model"), "expanded card shows the model");
+    assert!(text.contains("d0"), "expanded card shows delegation depth");
+    assert!(text.contains("search_files"), "expanded card shows last_tool");
+    assert!(text.contains("▾"), "expanded title shows the ▾ hint");
+    let (title_w, tab_w) = rail_width_after_render(&a, 120, 30);
+    // 120-col terminal: 48-col rail (47 inner + 1 border).
+    assert_eq!(title_w, 47, "expanded title row spans the wider rail");
+    assert_eq!(tab_w, 47, "expanded card rows span the wider rail");
+    // Toggling back collapses again.
+    a.toggle_subagent_rail();
+    let (title_w, _) = rail_width_after_render(&a, 120, 30);
+    assert_eq!(title_w, 18, "toggle back to collapsed restores 19-col rail");
+}
+
+/// On a terminal too narrow to honor the expanded width (transcript would
+/// drop below 60 cols), the rail clamps back to the 19-col strip.
+#[test]
+fn expanded_rail_clamps_on_narrow_terminal() {
+    let mut a = app();
+    a.apply(spawn(1, "alpha task"));
+    a.toggle_subagent_rail();
+    // 96 cols: 96 - 48 = 48 < 60 → clamp to 19.
+    let (title_w, _) = rail_width_after_render(&a, 96, 30);
+    assert_eq!(title_w, 18, "narrow terminal clamps the rail back to 18 inner cols");
+    // Wide enough (120 - 48 = 72 >= 60) it stays wide.
+    let (title_w, _) = rail_width_after_render(&a, 120, 30);
+    assert_eq!(title_w, 47, "wide terminal honors the expanded rail");
+}
+
+/// The rail title row records a click rect in BOTH modes; the hit-test
+/// matches it and the recorded width tracks the mode.
+#[test]
+fn title_rect_recorded_in_both_modes() {
+    let mut a = app();
+    a.apply(spawn(1, "alpha task"));
+    render_frame(&a, 120, 30);
+    let (x, y, w, h) = a.last_subagent_rail_title_rect.get();
+    assert!(w > 0 && h > 0, "collapsed title rect recorded");
+    assert!(a.subagent_rail_title_hit(y, x + 2), "hit inside the title rect");
+    assert!(!a.subagent_rail_title_hit(y + 2, x + 2), "row below misses");
+    a.toggle_subagent_rail();
+    render_frame(&a, 120, 30);
+    let (x2, y2, w2, h2) = a.last_subagent_rail_title_rect.get();
+    assert!(w2 > w, "expanded title rect is wider");
+    assert!(h2 > 0 && a.subagent_rail_title_hit(y2, x2 + 2), "expanded title hit");
+}
+
+/// Clicking an entry focuses that pane in EXPANDED mode too (recorded
+/// rects + the same routing the click handler performs).
+#[test]
+fn expanded_entry_clicks_still_focus_panes() {
+    let mut a = app();
+    a.apply(spawn(1, "one"));
+    a.apply(spawn(2, "two"));
+    a.toggle_subagent_rail();
+    render_frame(&a, 120, 30);
+    let rects = a.last_subagent_tab_rects.borrow().clone();
+    assert_eq!(rects.len(), 2, "both cards recorded hit rects");
+    // Cards stack 4 rows apart in expanded mode.
+    assert_eq!(rects[0].1 + 4, rects[1].1, "expanded cards are 4 rows apart");
+    assert!(a.subagent_tab_hit(rects[0].1, rects[0].0 + 2).is_some());
+    // Route like handle_mouse_click does.
+    if let Some(idx) = a.subagent_tab_hit(rects[1].1, rects[1].0 + 2) {
+        a.focus_subagent(Some(idx));
+    }
+    assert_eq!(a.focused_subagent, Some(1), "clicking card 2 focuses pane 2");
+    // Ctrl+P parity: back to the orchestrator (state-level, key handler
+    // covered by the app.rs unit tests).
+    a.focus_subagent(None);
+    assert!(a.focused_subagent.is_none());
+}
+
+/// When the rail is hidden (no panes) the title rect is zeroed — no stale
+/// geometry catching clicks.
+#[test]
+fn title_rect_zeroed_when_rail_hidden() {
+    let a = app();
+    let _ = render_frame(&a, 120, 30);
+    let (x, y, w, h) = a.last_subagent_rail_title_rect.get();
+    assert_eq!((x, y, w, h), (0, 0, 0, 0), "no panes → no title rect");
+    assert!(!a.subagent_rail_title_hit(0, 100));
+}

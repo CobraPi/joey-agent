@@ -111,18 +111,36 @@ impl Default for ComplexityClassifier {
 
 impl ComplexityClassifier {
     /// Build from NeuroCode config (contracts/neurocode-command.md).
+    ///
+    /// Keyword semantics: an absent config key (`None`) activates the
+    /// built-in default keyword lists (backward compatible for users who
+    /// never configured them); an explicitly present list (`Some`, even
+    /// empty) is used exactly as given — `Some([])` disables keyword
+    /// matching for that tier.
     pub fn from_config(config: &NeuroCodeConfig) -> Self {
-        Self {
-            economical_keywords: if config.classifier.economical_keywords.is_empty() {
+        let economical_keywords = match &config.classifier.economical_keywords {
+            None => {
+                tracing::debug!(
+                    "neurocode classifier: economical_keywords not configured — \
+                     using built-in default keyword list"
+                );
                 default_economical_keywords()
-            } else {
-                config.classifier.economical_keywords.clone()
-            },
-            frontier_keywords: if config.classifier.frontier_keywords.is_empty() {
+            }
+            Some(list) => list.clone(),
+        };
+        let frontier_keywords = match &config.classifier.frontier_keywords {
+            None => {
+                tracing::debug!(
+                    "neurocode classifier: frontier_keywords not configured — \
+                     using built-in default keyword list"
+                );
                 default_frontier_keywords()
-            } else {
-                config.classifier.frontier_keywords.clone()
-            },
+            }
+            Some(list) => list.clone(),
+        };
+        Self {
+            economical_keywords,
+            frontier_keywords,
             scope_fanout_frontier_threshold: config
                 .classifier
                 .scope_fanout_frontier_threshold,
@@ -338,9 +356,63 @@ mod tests {
     #[test]
     fn from_config_uses_config_keywords() {
         let mut cfg = NeuroCodeConfig::default();
-        cfg.classifier.frontier_keywords = vec!["supercalifragilistic".into()];
+        cfg.classifier.frontier_keywords = Some(vec!["supercalifragilistic".into()]);
         let clf = ComplexityClassifier::from_config(&cfg);
         let route = clf.classify(&make_request("supercalifragilistic change"));
         assert_eq!(route.tier, ComplexityTier::Frontier);
+    }
+
+    #[test]
+    fn absent_config_keywords_fall_back_to_built_in_defaults() {
+        // Keys never configured (None) → built-in defaults active.
+        let cfg = NeuroCodeConfig::default();
+        assert!(cfg.classifier.economical_keywords.is_none());
+        assert!(cfg.classifier.frontier_keywords.is_none());
+        let clf = ComplexityClassifier::from_config(&cfg);
+        let eco = clf.classify(&make_request("Write a JUnit test for UserServiceImpl"));
+        assert_eq!(eco.tier, ComplexityTier::Economical);
+        let frontier = clf.classify(&make_request(
+            "Refactor UserServiceImpl to use Optional and fix the race condition",
+        ));
+        assert_eq!(frontier.tier, ComplexityTier::Frontier);
+    }
+
+    #[test]
+    fn explicit_empty_keyword_lists_disable_keyword_matching() {
+        // Explicitly `[]` → no keyword signal at all: a prompt stuffed with
+        // default economical keywords must NOT flip the tier via keywords.
+        let mut cfg = NeuroCodeConfig::default();
+        cfg.classifier.economical_keywords = Some(vec![]);
+        cfg.classifier.frontier_keywords = Some(vec![]);
+        let clf = ComplexityClassifier::from_config(&cfg);
+        let route = clf.classify(&make_request(
+            "investigate and diagnose why the JUnit test and unit test for the dto fails",
+        ));
+        assert_eq!(route.tier, ComplexityTier::AmbiguousDefault);
+        assert!(
+            !route
+                .signals
+                .iter()
+                .any(|s| s.kind == SignalKind::Keyword),
+            "no keyword signals should fire when lists are explicitly empty"
+        );
+    }
+
+    #[test]
+    fn custom_keyword_list_replaces_built_ins() {
+        // Some(custom) → custom list used exactly; built-ins inactive.
+        let mut cfg = NeuroCodeConfig::default();
+        cfg.classifier.economical_keywords = Some(vec!["boondoggle".into()]);
+        cfg.classifier.frontier_keywords = Some(vec!["supercalifragilistic".into()]);
+        let clf = ComplexityClassifier::from_config(&cfg);
+        // Built-in economical keyword alone no longer routes economical.
+        let neutral = clf.classify(&make_request("Write a JUnit test for the dto"));
+        assert_eq!(neutral.tier, ComplexityTier::AmbiguousDefault);
+        // Custom economical keyword routes economical.
+        let eco = clf.classify(&make_request("fix this boondoggle"));
+        assert_eq!(eco.tier, ComplexityTier::Economical);
+        // Custom frontier keyword routes frontier.
+        let frontier = clf.classify(&make_request("supercalifragilistic change"));
+        assert_eq!(frontier.tier, ComplexityTier::Frontier);
     }
 }

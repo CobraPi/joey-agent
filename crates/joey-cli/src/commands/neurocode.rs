@@ -14,16 +14,42 @@ use std::sync::Arc;
 
 use joey_neurocode::{DefaultEngine, NeuroCodeCommands, NeuroCodeConfig};
 
-/// Build a NeuroCode engine from the current joey config, scoped to the
-/// current working directory (the project root for graph indexing).
+/// Resolve the NeuroCode provider scope from a config, exactly the way the
+/// main wiring does (`try_build_engine` in neurocode_wiring.rs): the same
+/// provider/base_url/model triple → `resolve_profile` → profile name, which
+/// keys the per-provider tier config (`neurocode.tier.providers.<id>`).
+pub(crate) fn scope_for_config(config: &joey_core::Config) -> String {
+    let provider = config.get_str("model.provider", "auto");
+    let base_url = config.get_str("model.base_url", "");
+    let model = config.model();
+    joey_providers::resolve_profile(&provider, &base_url, &model)
+        .name
+        .to_string()
+}
+
+/// Build a NeuroCode engine from the given config + provider scope, scoped to
+/// the current working directory (the project root for graph indexing).
 ///
-/// Returns `None` when NeuroCode is disabled in config, so callers can show a
-/// "NeuroCode is disabled" notice rather than constructing a dead engine.
-fn build_engine() -> Arc<DefaultEngine> {
-    let config = joey_core::Config::load().unwrap_or_else(|_| joey_core::Config::defaults());
-    let nc_cfg = NeuroCodeConfig::from_config(&config);
+/// `live_provider` is the agent's ACTUAL provider (`agent.provider_name()`) —
+/// the same scope `/model neurocode …` writes its keys under. `None`
+/// (standalone callers without an agent) falls back to the config-resolved
+/// scope, never the empty-provider engine that silently displayed the flat
+/// legacy keys / ambiguous default instead of the per-provider entries.
+fn build_engine_with(config: &joey_core::Config, live_provider: Option<&str>) -> Arc<DefaultEngine> {
+    let nc_cfg = NeuroCodeConfig::from_config(config);
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    Arc::new(DefaultEngine::new(nc_cfg, project_root))
+    let mut engine = DefaultEngine::new(nc_cfg, project_root);
+    let scope = live_provider
+        .map(str::to_string)
+        .unwrap_or_else(|| scope_for_config(config));
+    engine.set_provider(&scope);
+    Arc::new(engine)
+}
+
+/// Load the current joey config, falling back to defaults (same policy the
+/// original `build_engine` used).
+fn load_config() -> joey_core::Config {
+    joey_core::Config::load().unwrap_or_else(|_| joey_core::Config::defaults())
 }
 
 /// Outcome of dispatching `/neurocode`: either plain display text, or a
@@ -38,12 +64,13 @@ pub enum NeurocodeOutcome {
 }
 
 /// Entry point for the `/neurocode` slash command (plain-text shape for
-/// the engine heavy-job path and tests).
-pub fn neurocode_slash(args: &str) -> String {
-    match neurocode_slash_outcome(args) {
+/// the engine heavy-job path and tests). Provider-scoped: `live_provider` is
+/// the LIVE agent provider so status/tier text reflects the per-provider
+/// tier keys (`neurocode.tier.providers.<id>`) the user configured.
+pub fn neurocode_slash_provider_scoped_text(args: &str, live_provider: &str) -> String {
+    match neurocode_slash_provider_scoped(args, live_provider) {
         NeurocodeOutcome::Text(t) => t,
         NeurocodeOutcome::AgentIngest(_) => {
-            // The plain-text caller can't run a turn; give usage guidance.
             "Natural-language ingest needs an interactive surface (REPL/TUI). \
              Use the strict form: /neurocode ingest <category> <path> [--version <v>] [--provenance <p>]"
                 .to_string()
@@ -92,11 +119,27 @@ fn structured_ingest(parts: &[&str]) -> bool {
 }
 
 /// Full-dispatch entry: returns the outcome so interactive surfaces can
-/// run the agent path.
+/// run the agent path. Scopes the engine to the config-resolved provider
+/// (standalone/legacy path; interactive callers prefer the provider-scoped
+/// variant below).
 pub fn neurocode_slash_outcome(args: &str) -> NeurocodeOutcome {
+    neurocode_dispatch(args, None)
+}
+
+/// Provider-scoped dispatch: interactive surfaces (REPL/TUI) pass the LIVE
+/// agent provider (`agent.provider_name()` / `tui.app().provider`) so the
+/// engine reads the same per-provider tier keys (`neurocode.tier.providers.<id>`)
+/// that `/model neurocode …` writes under — mirroring the main wiring's
+/// `try_build_engine_scoped` behavior on `/model` switches.
+pub fn neurocode_slash_provider_scoped(args: &str, live_provider: &str) -> NeurocodeOutcome {
+    neurocode_dispatch(args, Some(live_provider))
+}
+
+/// Shared dispatch core. `live_provider = None` → config-resolved scope.
+fn neurocode_dispatch(args: &str, live_provider: Option<&str>) -> NeurocodeOutcome {
     let parts: Vec<&str> = args.split_whitespace().collect();
     let sub = parts.first().copied().unwrap_or("status");
-    let engine = build_engine();
+    let engine = build_engine_with(&load_config(), live_provider);
 
     match sub {
         "status" => NeurocodeOutcome::Text(engine.status_text()),
@@ -247,19 +290,19 @@ mod tests {
     #[test]
     fn help_succeeds() {
         // `/neurocode --help` returns help text (exit-success path).
-        let out = neurocode_slash("--help");
+        let out = neurocode_slash_provider_scoped_text("--help", "zai");
         assert!(out.contains("Usage: /neurocode"));
     }
 
     #[test]
     fn help_aliases() {
-        assert!(neurocode_slash("help").contains("Usage: /neurocode"));
-        assert!(neurocode_slash("-h").contains("Usage: /neurocode"));
+        assert!(neurocode_slash_provider_scoped_text("help", "zai").contains("Usage: /neurocode"));
+        assert!(neurocode_slash_provider_scoped_text("-h", "zai").contains("Usage: /neurocode"));
     }
 
     #[test]
     fn unknown_subcommand_reports_error() {
-        let out = neurocode_slash("nonsense");
+        let out = neurocode_slash_provider_scoped_text("nonsense", "zai");
         assert!(out.contains("Unknown subcommand"));
     }
 
@@ -267,7 +310,7 @@ mod tests {
     fn status_works_with_disabled_engine() {
         // `status` must route to the engine's status_text(), NOT fall into
         // the unknown-subcommand catch-all (regression: it used to).
-        let out = neurocode_slash("status");
+        let out = neurocode_slash_provider_scoped_text("status", "zai");
         assert!(
             !out.contains("Unknown subcommand"),
             "status must not hit the catch-all, got: {out}"
@@ -277,7 +320,7 @@ mod tests {
 
     #[test]
     fn no_args_defaults_to_status() {
-        let out = neurocode_slash("");
+        let out = neurocode_slash_provider_scoped_text("", "zai");
         assert!(
             !out.contains("Unknown subcommand"),
             "bare /neurocode defaults to status, got: {out}"

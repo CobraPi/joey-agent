@@ -361,6 +361,16 @@ pub struct HypercodeContext {
     pub manager: Arc<SubagentManager>,
     /// Working directory for child agents.
     pub cwd: std::path::PathBuf,
+    /// The LIVE main-turn model the parent agent is actually dispatching
+    /// with (tier-routed / allocator / image-routed — NOT the raw config
+    /// default), captured from `Agent::effective_main_turn_model()` when
+    /// the context is built. Children inherit this when the role table
+    /// has no model entry for the active provider, so they never silently
+    /// run on a WORSE model than the parent (e.g. raw config glm-5.2 on a
+    /// copilot-wire provider while the parent's turns are tier-routed to
+    /// a servable model). None = legacy behavior (children inherit
+    /// `agent_config.model`).
+    pub parent_effective_model: Option<String>,
 }
 
 impl std::fmt::Debug for HypercodeContext {
@@ -483,6 +493,9 @@ You are the ORCHESTRATOR of a HyperCode pipeline. You coordinate the work;\n\
 your subagents do the hands-on implementation.\n\
 \n\
 HARD RULES:\n\
+- NEVER open your response with a tool call. Your first move is ALWAYS a\n\
+  short written plan to the user — goal, task breakdown, which subagent\n\
+  roles you will dispatch and why — BEFORE your first delegate_task.\n\
 - NEVER write, patch, or delete files yourself — that is the Implementors' job.\n\
 - NEVER run build/edit/test commands yourself (cargo build/test, npm, git\n\
   commit, formatters…) — Implementors verify their own work.\n\
@@ -507,7 +520,10 @@ YOUR SUBAGENTS (via delegate_task):\n\
   verify its own work, then reports what changed and the verification result.\n\
 \n\
 WORK LOOP:\n\
-1. Decompose the user's goal into independent, parallelizable tasks.\n\
+1. Present a short written plan to the user FIRST, in a few concise bullets:\n\
+   the goal, the task breakdown, and which subagent roles you will dispatch\n\
+   and why. Then dispatch in the SAME turn — do not wait for the user to\n\
+   confirm the plan unless the request is genuinely ambiguous.\n\
 2. Fan out Explorers IN ONE delegate_task batch (tasks:[...]) whenever the\n\
    questions are independent — parallel dispatch is dramatically faster.\n\
 3. Turn explorer findings into Implementor briefs. Parallelize implementors\n\
@@ -657,7 +673,7 @@ fn planner_request(
         ),
         context: None,
         tasks: Vec::new(),
-        model: model_override(&rc, parent_model),
+        model: model_override(&rc, parent_model, &opts.provider),
         toolsets: vec![
             "file-read".to_string(),
             "terminal".to_string(),
@@ -697,7 +713,7 @@ fn explorer_request(
         ),
         context: None,
         tasks: Vec::new(),
-        model: model_override(&rc, parent_model),
+        model: model_override(&rc, parent_model, &opts.provider),
         toolsets: vec![
             "file-read".to_string(),
             "terminal".to_string(),
@@ -740,7 +756,7 @@ fn implementor_request(
             ws.id, explorer_summary
         )),
         tasks: Vec::new(),
-        model: model_override(&rc, parent_model),
+        model: model_override(&rc, parent_model, &opts.provider),
         toolsets: vec![
             "file".to_string(),
             "terminal".to_string(),
@@ -767,14 +783,49 @@ fn effective_cap(cfg: &HyperCodeConfig, opts: &HypercodeOptions) -> usize {
     }
 }
 
-fn model_override(rc: &RoleConfig, parent_model: &str) -> Option<String> {
-    if rc.model.is_empty() {
-        // Inherit the parent's model explicitly so the config
-        // `delegation.default_model` doesn't silently shadow the live agent.
-        Some(parent_model.to_string())
+/// The model hypercode children inherit when a role table has no explicit
+/// entry: the LIVE effective main-turn model when the caller captured it,
+/// else the raw config default (legacy behavior, back-compatible).
+fn parent_model_for(ctx: &HypercodeContext) -> String {
+    ctx.parent_effective_model
+        .clone()
+        .unwrap_or_else(|| ctx.agent_config.model.clone())
+}
+
+/// Resolve a child's model: the role table's explicit model wins; an empty
+/// entry inherits the parent's (effective) model explicitly so the config
+/// `delegation.default_model` doesn't silently shadow the live agent.
+///
+/// Copilot-wire visibility: when the FINAL model is one the copilot-wire
+/// provider cannot serve, the real Copilot backend 400s (ModelNotFound) and
+/// proxies like ai-usage-hud silently substitute their default via mapModel
+/// with HTTP 200. Warn so the substitution is visible in logs. Warn-only —
+/// the returned model is unchanged.
+fn model_override(rc: &RoleConfig, parent_model: &str, provider: &str) -> Option<String> {
+    let model = if rc.model.is_empty() {
+        parent_model.to_string()
     } else {
-        Some(rc.model.clone())
+        rc.model.clone()
+    };
+    if copilot_wire_unservable(&model, provider) {
+        tracing::warn!(
+            provider = %provider,
+            model = %model,
+            "hypercode child model is not servable by the copilot-wire provider; the backend/proxy may 400 or silently substitute its default model (mapModel)"
+        );
     }
+    Some(model)
+}
+
+/// True when `model` cannot be served by a copilot-wire `provider`
+/// (canonical name or alias — aliases are canonicalized via the profile
+/// registry). Pure predicate for the warn-only visibility guard above.
+fn copilot_wire_unservable(model: &str, provider: &str) -> bool {
+    let canonical = joey_providers::profile::get_profile(provider)
+        .map(|p| p.name.to_string())
+        .unwrap_or_else(|| provider.to_string());
+    joey_providers::profile::is_copilot_wire(&canonical)
+        && !joey_providers::profile::copilot_servable(model)
 }
 
 fn nonzero(n: usize) -> Option<u32> {
@@ -809,7 +860,11 @@ pub async fn run_hypercode(
         max_workstreams: opts.max_workstreams,
         provider,
     };
-    let parent_model = ctx.agent_config.model.clone();
+    // Parent-model inheritance: children inherit the LIVE effective
+    // main-turn model (tier-routed / allocator-resolved — what the parent
+    // actually dispatches with) when available, falling back to the raw
+    // config default (legacy behavior) when the caller didn't capture it.
+    let parent_model = parent_model_for(ctx);
     let cap = effective_cap(&cfg, opts);
 
     let mut report = HypercodeReport::default();
@@ -1096,6 +1151,113 @@ mod tests {
         assert_eq!(req.max_tokens, None);
     }
 
+    // ── Parent-model inheritance (parent_effective_model) ─────────────
+
+    /// Minimal context with only what parent_model_for / model_override
+    /// need (full construction is heavy — no registry/manager required).
+    fn model_ctx(provider: &str, effective: Option<&str>) -> HypercodeContext {
+        HypercodeContext {
+            agent_config: AgentConfig {
+                model: "config-raw-model".to_string(),
+                provider: provider.to_string(),
+                base_url: String::new(),
+                api_key: None,
+                max_turns: 5,
+                api_max_retries: 1,
+                tool_delay: 0.0,
+                reasoning: None,
+                enabled_tools: Vec::new(),
+                max_tokens: None,
+                stream: false,
+                pass_session_id: false,
+                model_pinned: false,
+            },
+            config: joey_core::Config::default(),
+            base_registry: ToolRegistry::new(),
+            manager: Arc::new(SubagentManager::new(
+                joey_orchestration::ManagerConfig::default(),
+            )),
+            cwd: std::path::PathBuf::from("/tmp"),
+            parent_effective_model: effective.map(|s| s.to_string()),
+        }
+    }
+
+    /// Children inherit the LIVE effective model (parent_effective_model)
+    /// when the role table is EMPTY for the provider — not the raw config
+    /// default. This is the regression the field exists for: on a
+    /// copilot-wire provider the parent's turns are tier-routed to a
+    /// servable model while agent_config.model (glm-5.2) is unservable.
+    #[test]
+    fn run_hypercode_children_use_parent_effective_model_when_role_table_empty() {
+        // Legacy context (None) keeps the raw config model — back-compat.
+        assert_eq!(
+            parent_model_for(&model_ctx("zai", None)),
+            "config-raw-model",
+            "None parent_effective_model falls back to agent_config.model (legacy)"
+        );
+
+        // Live capture: children inherit the tier-routed model the parent
+        // actually dispatches with. Verified through the same path
+        // run_hypercode uses (parent_model_for → model_override) with an
+        // EMPTY role table for the provider.
+        let ctx = model_ctx("github-copilot", Some("gpt-5.6-sol"));
+        let cfg = HyperCodeConfig::default(); // no entries for this provider
+        let opts = HypercodeOptions {
+            provider: "github-copilot".into(),
+            ..Default::default()
+        };
+        let rc = cfg.get_explorer_config(&opts.provider);
+        assert!(rc.model.is_empty(), "role table is empty for this provider");
+        let parent_model = parent_model_for(&ctx);
+        assert_eq!(parent_model, "gpt-5.6-sol");
+        assert_eq!(
+            model_override(&rc, &parent_model, &opts.provider).as_deref(),
+            Some("gpt-5.6-sol"),
+            "children must inherit the parent's EFFECTIVE model when no role entry exists"
+        );
+
+        // Explicit role-table entries still win over the parent model.
+        let mut cfg = HyperCodeConfig::default();
+        cfg.set_explorer_config(
+            "github-copilot".into(),
+            RoleConfig {
+                model: "role-table-model".into(),
+                ..Default::default()
+            },
+        );
+        let rc = cfg.get_explorer_config(&opts.provider);
+        assert_eq!(
+            model_override(&rc, &parent_model, &opts.provider).as_deref(),
+            Some("role-table-model")
+        );
+    }
+
+    /// The copilot-wire unservable-model guard: warn-only visibility, the
+    /// returned model is unchanged (glm-5.2 is not copilot-servable).
+    /// Non-copilot providers never trip the guard.
+    #[test]
+    fn model_override_flags_unservable_copilot_wire_models() {
+        let rc = RoleConfig::default(); // empty → inherit parent model
+
+        // copilot-wire + unservable inherited model: still returned as-is.
+        assert_eq!(
+            model_override(&rc, "glm-5.2", "github-copilot").as_deref(),
+            Some("glm-5.2")
+        );
+        assert!(copilot_wire_unservable("glm-5.2", "github-copilot"));
+        assert!(copilot_wire_unservable("glm-5.2", "copilot"));
+
+        // copilot-wire + servable model: no guard.
+        assert!(!copilot_wire_unservable("gpt-5.4", "github-copilot"));
+
+        // Non-copilot provider: never guarded, whatever the model.
+        assert!(!copilot_wire_unservable("glm-5.2", "zai"));
+        assert_eq!(
+            model_override(&rc, "glm-5.2", "zai").as_deref(),
+            Some("glm-5.2")
+        );
+    }
+
     #[test]
     fn test_planner_request_carries_prompt_and_cap() {
         let cfg = HyperCodeConfig::default();
@@ -1179,6 +1341,30 @@ mod tests {
         assert!(o.contains("NEVER run build/edit/test commands"));
         assert!(o.contains("process tool"));
         assert!(o.contains("web tools"));
+    }
+
+    #[test]
+    fn orchestrator_overlay_mandates_plan_first_response() {
+        let o = orchestrator_overlay();
+        // Hard rule: the orchestrator must never open with a tool call —
+        // a written plan always comes before the first delegate_task.
+        assert!(o.contains("NEVER open your response with a tool call"));
+        assert!(o.contains("BEFORE your first delegate_task"));
+        // Work loop step 1 is presenting the plan, then dispatching in the
+        // same turn (no waiting on user confirmation unless ambiguous).
+        let work_loop = o.split("WORK LOOP:").nth(1).expect("WORK LOOP section");
+        assert!(
+            work_loop.trim_start().starts_with("1. Present a short written plan"),
+            "step 1 of the work loop must be presenting the plan"
+        );
+        assert!(o.contains("the goal, the task breakdown, and which subagent roles you will dispatch"));
+        assert!(o.contains("dispatch in the SAME turn"));
+        assert!(o.contains("genuinely ambiguous"));
+        // The fan-out guidance survives as a later step.
+        assert!(o.contains("Fan out Explorers IN ONE delegate_task batch"));
+        // ECONOMY and FINAL ANSWER sections unchanged.
+        assert!(o.contains("ECONOMY (why this mode exists):"));
+        assert!(o.contains("FINAL ANSWER:"));
     }
 
     #[test]

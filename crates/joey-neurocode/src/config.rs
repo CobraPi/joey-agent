@@ -15,6 +15,8 @@
 //!     max_fix_iterations: 3
 //!   classifier:
 //!     scope_fanout_frontier_threshold: 4
+//!     # Absent keys → built-in default keyword lists are active.
+//!     # Explicitly empty lists ([]) → keyword matching disabled for that tier.
 //!     economical_keywords: []
 //!     frontier_keywords: []
 //!   pega:
@@ -281,16 +283,19 @@ fn parse_verify_steps(cfg: &joey_core::Config) -> Vec<VerifyStepConfig> {
 #[derive(Debug, Clone)]
 pub struct ClassifierConfig {
     pub scope_fanout_frontier_threshold: usize,
-    pub economical_keywords: Vec<String>,
-    pub frontier_keywords: Vec<String>,
+    /// `None` = key absent from config → built-in defaults active.
+    /// `Some(list)` = key explicitly present (even `[]`) → use exactly that
+    /// list; an explicitly empty list disables keyword matching for that tier.
+    pub economical_keywords: Option<Vec<String>>,
+    pub frontier_keywords: Option<Vec<String>>,
 }
 
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
             scope_fanout_frontier_threshold: 4,
-            economical_keywords: Vec::new(),
-            frontier_keywords: Vec::new(),
+            economical_keywords: None,
+            frontier_keywords: None,
         }
     }
 }
@@ -302,10 +307,24 @@ impl ClassifierConfig {
                 "neurocode.classifier.scope_fanout_frontier_threshold",
                 4,
             ) as usize,
-            economical_keywords: cfg.get_str_list("neurocode.classifier.economical_keywords"),
-            frontier_keywords: cfg.get_str_list("neurocode.classifier.frontier_keywords"),
+            economical_keywords: opt_str_list(cfg, "neurocode.classifier.economical_keywords"),
+            frontier_keywords: opt_str_list(cfg, "neurocode.classifier.frontier_keywords"),
         }
     }
+}
+
+/// String-list lookup that distinguishes an absent key (`None`) from an
+/// explicitly-present sequence (`Some`, including the empty list `[]`).
+/// A present-but-non-sequence value is treated as absent so malformed
+/// entries keep the built-in defaults (matches the old `get_str_list`
+/// fallback behavior).
+fn opt_str_list(cfg: &joey_core::Config, dotted: &str) -> Option<Vec<String>> {
+    let seq = cfg.get(dotted)?.as_sequence()?;
+    Some(
+        seq.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -399,5 +418,50 @@ mod tests {
         let deepseek = nc.tier.tiers_for_provider("deepseek");
         assert_eq!(deepseek.frontier, "legacy-frontier");
         assert_eq!(deepseek.economical, "legacy-economical");
+    }
+
+    /// Classifier keyword lists: absent key → None (defaults active);
+    /// explicit `[]` → Some(empty) (keyword matching disabled); explicit
+    /// custom list → Some(custom).
+    #[test]
+    fn classifier_keyword_lists_absent_vs_empty_vs_custom() {
+        // Absent → None.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "neurocode:\n  enabled: true\n  classifier:\n    scope_fanout_frontier_threshold: 4\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        assert!(nc.classifier.economical_keywords.is_none());
+        assert!(nc.classifier.frontier_keywords.is_none());
+
+        // Explicit [] → Some(empty); explicit custom → Some(custom).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "neurocode:\n  classifier:\n    economical_keywords: []\n    frontier_keywords: []\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        assert_eq!(nc.classifier.economical_keywords, Some(Vec::new()));
+        assert_eq!(nc.classifier.frontier_keywords, Some(Vec::new()));
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "neurocode:\n  classifier:\n    economical_keywords: [boondoggle]\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        assert_eq!(
+            nc.classifier.economical_keywords,
+            Some(vec!["boondoggle".to_string()])
+        );
+        // Frontier key absent → still None.
+        assert!(nc.classifier.frontier_keywords.is_none());
     }
 }

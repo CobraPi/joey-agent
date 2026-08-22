@@ -54,6 +54,7 @@ async fn tap_receives_lifecycle_and_wrapped_child_events() {
             context: None,
             model: None,
             toolsets: vec![],
+            role: None,
         })
         .collect();
 
@@ -116,6 +117,7 @@ async fn ids_are_unique_and_monotonic() {
             context: None,
             model: None,
             toolsets: vec![],
+            role: None,
         })
         .collect();
     let _ = mgr

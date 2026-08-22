@@ -966,6 +966,35 @@ billing aliases). Verified live: `joey --model gpt-5.4 -z` served
 `gpt-5.4 → gpt-5.4` via `/responses` with usage recorded in the proxy's DB
 (neurocode tier override temporarily disabled for the clean-path check).
 
+## Copilot-wire claude thinking via /chat/completions (2026-08-21)
+
+**Status**: Deliberate-deviation extension (Joey extension beyond upstream
+Hermes parity; no upstream equivalent). Completed and live-verified
+2026-08-21 against the live Copilot chat endpoint and the HUD proxy.
+
+Copilot-wire claude models (any `claude*` model except haiku — see
+`profile::is_copilot_wire` + `copilot::model_api_mode`) ride the OpenAI
+Chat Completions wire, where upstream has no thinking support at all:
+
+- **Request side** (`chat.rs`): top-level
+  `{"thinking":{"type":"enabled","budget_tokens":N}}` parameter for
+  copilot-wire claude models (budget from reasoning effort, haiku exempt).
+- **Response side** (`client.rs`): the endpoint answers with a
+  `reasoning_text` field (delta-level in streams, message-level
+  non-streaming) that upstream's first-non-null
+  `reasoning_content`/`reasoning` pair never reads. Joey appends
+  `reasoning_text` as a third first-non-null fallback in both
+  chat-completions parsers — never appended alongside a sibling, precedence
+  preserved (`reasoning` > `reasoning_content` > `reasoning_text`).
+  Existing upstream citations (`chat_completion_helpers.py:2813`,
+  `chat_completions.py:714`) kept intact in the adjacent comments.
+
+Tests: `client.rs` streaming
+(`copilot_chat_stream_emits_reasoning_text_deltas`,
+`copilot_chat_stream_reasoning_first_non_null_beats_reasoning_text`) and
+non-streaming (`openai_response_reasoning_text_copilot_extension`).
+
+
 ## UX parity & robustness passes (2026-08-15)
 
 Four user-facing features plus a workspace-wide audit, all

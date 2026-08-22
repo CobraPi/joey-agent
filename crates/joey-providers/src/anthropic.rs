@@ -22,7 +22,9 @@ use crate::types::{FinishReason, NormalizedResponse, ToolCall, ToolSchema, Usage
 
 /// Manual thinking budgets by effort (anthropic_adapter.py:58). Unknown
 /// efforts fall back to 8000 (`THINKING_BUDGET.get(effort, 8000)`).
-fn thinking_budget(effort: &str) -> u64 {
+/// pub(crate): reused by the copilot-wire claude chat thinking mapping
+/// (chat.rs `apply_reasoning_shape`) so both wires share one budget table.
+pub(crate) fn thinking_budget(effort: &str) -> u64 {
     match effort {
         "xhigh" => 32000,
         "high" => 16000,

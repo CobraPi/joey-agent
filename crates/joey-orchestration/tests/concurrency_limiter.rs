@@ -40,8 +40,8 @@ async fn semaphore_is_shared_across_batch_children() {
 
     // Dispatch a small batch — the semaphore should still be intact after.
     let tasks = vec![
-        TaskSpec { goal: "CL-A".to_string(), context: None, model: None, toolsets: vec![] },
-        TaskSpec { goal: "CL-B".to_string(), context: None, model: None, toolsets: vec![] },
+        TaskSpec { goal: "CL-A".to_string(), context: None, model: None, toolsets: vec![], role: None },
+        TaskSpec { goal: "CL-B".to_string(), context: None, model: None, toolsets: vec![], role: None },
     ];
 
     let _ = mgr
@@ -75,6 +75,7 @@ async fn max_concurrent_children_chunks_large_batches() {
             context: None,
             model: None,
             toolsets: vec![],
+            role: None,
         })
         .collect();
 

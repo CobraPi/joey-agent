@@ -822,6 +822,11 @@ pub struct App {
     /// Which view the main transcript + maximized stats/context window are
     /// showing: `None` = the main orchestrator; `Some(i)` = panes[i].
     pub focused_subagent: Option<usize>,
+    /// Expandable subagent rail: when false the rail renders as the fixed
+    /// 19-col tab strip (parity with the original layout); when true it
+    /// widens to a detail view (model/depth/iterations/last-tool per pane).
+    /// Toggled by Ctrl+N or clicking the rail's title row.
+    pub subagent_rail_expanded: bool,
     /// Rects of each tab in the right rail as drawn by the LAST frame
     /// (click hit-testing), one per pane in order. RefCell: recorded by the
     /// rail widget during `&App` renders (mirrors the `Cell` geometry).
@@ -829,6 +834,9 @@ pub struct App {
     /// Rect of the pinned orchestrator tab at the rail's bottom (click
     /// hit-testing; zeroed on frames that don't draw the rail).
     pub last_orchestrator_tab_rect: Cell<(u16, u16, u16, u16)>,
+    /// Rect of the rail's TITLE row as drawn by the LAST frame — clicking
+    /// it toggles `subagent_rail_expanded` (zeroed when the rail is hidden).
+    pub last_subagent_rail_title_rect: Cell<(u16, u16, u16, u16)>,
     /// Render-time geometry for the FOCUSED pane (parallel-subagent
     /// feature): scroll upper bound + text-area rect, recorded by the pane
     /// transcript widget each frame. App-level because widgets render
@@ -1269,8 +1277,10 @@ impl App {
             next_subagent_id: 1,
             subagent_panes: Vec::new(),
             focused_subagent: None,
+            subagent_rail_expanded: false,
             last_subagent_tab_rects: std::cell::RefCell::new(Vec::new()),
             last_orchestrator_tab_rect: Cell::new((0, 0, 0, 0)),
+            last_subagent_rail_title_rect: Cell::new((0, 0, 0, 0)),
             last_pane_max_scroll: Cell::new(0),
             last_pane_text_area: Cell::new((0, 0, 0, 0)),
             pane_stats_view: None,
@@ -2294,6 +2304,12 @@ impl App {
         }
     }
 
+    /// Toggle the subagent rail between the collapsed 19-col tab strip and
+    /// the expanded wider detail view (Ctrl+N / clicking the rail title).
+    pub fn toggle_subagent_rail(&mut self) {
+        self.subagent_rail_expanded = !self.subagent_rail_expanded;
+    }
+
     /// Scroll the stats page's context stream up by `by` lines: freezes the
     /// view at an absolute anchor (auto-follow off). Mirrors
     /// `reasoning_scroll_up`.
@@ -2393,6 +2409,13 @@ impl App {
     /// so the orchestrator rect wins over any overlapping pane rect.
     pub fn orchestrator_tab_hit(&self, row: u16, col: u16) -> bool {
         let (x, y, w, h) = self.last_orchestrator_tab_rect.get();
+        w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w
+    }
+
+    /// Click hit-test against the rail's TITLE row (both collapsed and
+    /// expanded modes) — clicking it toggles rail expansion.
+    pub fn subagent_rail_title_hit(&self, row: u16, col: u16) -> bool {
+        let (x, y, w, h) = self.last_subagent_rail_title_rect.get();
         w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w
     }
 

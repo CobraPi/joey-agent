@@ -715,6 +715,22 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                     )]));
                 }
             }
+            // delegate_task expandability from ToolStart: while the call is
+            // Running (result_preview is only populated at ToolEnd), the
+            // block still gets the expand affordance so the delegated goal
+            // is reachable immediately — the expanded view shows the args/
+            // summary. Scoped narrowly to delegate_task; generic tools keep
+            // the completion-gated affordance (pinned by existing tests).
+            if matches!(status, ToolStatus::Running)
+                && result_preview.is_empty()
+                && !expanded
+                && name == "delegate_task"
+            {
+                lines.push(Line::from(vec![Span::styled(
+                    "    ⣿ delegate running… [click or space to expand]".to_string(),
+                    Style::default().fg(theme.fg_most_subtle.to_color()),
+                )]));
+            }
             // Feature 005 (T029) + Feature 007 (T023): expanded view —
             // primary parameter + full result, bounded with affordance.
             if expanded {
@@ -744,6 +760,14 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                             ]));
                         }
                     }
+                } else if name == "delegate_task" && matches!(status, ToolStatus::Running) {
+                    // Running delegate_task with no args/summary text yet
+                    // (ToolStart's summary can be empty for delegation): keep
+                    // the expanded block honest with a live placeholder.
+                    lines.push(Line::from(vec![Span::styled(
+                        "    ⣿ running…".to_string(),
+                        Style::default().fg(theme.busy.to_color()),
+                    )]));
                 }
                 if let Some(result) = full_result {
                     if !result.is_empty() {
@@ -2703,6 +2727,7 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("  explorer: Esc / click title", "dock the explorer back"),
         ("Ctrl+L", "clear transcript view"),
         ("Ctrl+P", "back to the orchestrator tab (from a subagent pane)"),
+        ("Ctrl+N", "expand / collapse the subagent rail (or click its title)"),
         ("click rail tabs", "focus a subagent · bottom tab = orchestrator"),
         ("Ctrl+A/E  Ctrl+U/K/W", "line start/end · kill line/word"),
         ("? / F1", "toggle this help"),
@@ -4980,15 +5005,33 @@ use crate::state::SubagentPane;
 /// Draw the vertical subagent tab rail on the RIGHT edge of the body area.
 /// Each pane gets one stacked tab (goal preview + status glyph). Records
 /// per-tab hit rects on the App for click routing.
+///
+/// Two modes (expandable-rail feature):
+/// - collapsed (default): fixed 19-col tab strip, 2 rows per pane —
+///   byte-for-byte parity with the original layout.
+/// - expanded (`subagent_rail_expanded`, Ctrl+N / title-click): wider
+///   detail cards (4 rows: goal, model/depth/iterations, phase, last
+///   tool). The width itself is decided by `render_body` (which clamps
+///   back to 19 when the transcript would drop below ~60 cols); the
+///   widget detects the clamped case by its `area.width` and renders
+///   collapsed regardless of the flag.
 pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     // Reset hit rects for this frame; re-recorded per drawn tab below.
     app.last_subagent_tab_rects.borrow_mut().clear();
 
     if app.subagent_panes.is_empty() || area.width < 3 || area.height < 3 {
+        app.last_subagent_rail_title_rect.set((0, 0, 0, 0));
         return;
     }
 
-    let rail_w = 18u16.min(area.width);
+    // The rail only receives the EXPANDED width when render_body honored
+    // it; a 19-col area means the terminal was too narrow (clamped).
+    let expanded = app.subagent_rail_expanded && area.width >= 24;
+
+    // Collapsed keeps the original 18-of-19-cols geometry (19 total minus
+    // the 1-col LEFT border = 18 inner); expanded fills the wider
+    // allocation render_body granted, capped at 48.
+    let rail_w = if expanded { area.width.min(48) } else { 19u16.min(area.width) };
     let rail = Rect::new(area.x + area.width - rail_w, area.y, rail_w, area.height);
     // Panel background.
     let block = Block::default()
@@ -4998,7 +5041,10 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let inner = block.inner(rail);
     f.render_widget(block, rail);
 
-    // Title row.
+    // Title row — clickable: toggles rail expansion (Ctrl+N parity).
+    // The trailing ▸ (collapsed → can widen) / ▾ (expanded → can shrink)
+    // hints the toggle and still fits the 18-col collapsed strip.
+    let hint = if expanded { "▾" } else { "▸" };
     let title = Line::from(vec![
         Span::styled(
             " subagents ".to_string(),
@@ -5010,59 +5056,181 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
             format!("({})", app.subagent_panes.len()),
             Style::default().fg(theme.fg_more_subtle.to_color()),
         ),
+        Span::styled(
+            format!(" {}", hint),
+            Style::default().fg(theme.fg_more_subtle.to_color()),
+        ),
     ]);
     if inner.width > 0 {
         f.render_widget(
             Paragraph::new(title).style(Style::default().bg(theme.bg_panel.to_color())),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
+        app.last_subagent_rail_title_rect
+            .set((inner.x, inner.y, inner.width, 1));
+    } else {
+        app.last_subagent_rail_title_rect.set((0, 0, 0, 0));
     }
 
-    // Tabs: 2 rows each, stacked vertically below the title.
-    let label_w = inner.width.saturating_sub(2) as usize;
-    for (i, pane) in app.subagent_panes.iter().enumerate() {
-        let tab_y = inner.y + 1 + (i as u16) * 2;
-        if tab_y + 1 >= inner.y + inner.height.saturating_sub(2) {
-            break; // rail full (reserve 2 rows for the orchestrator tab)
-        }
-        let focused = app.focused_subagent == Some(i);
-        let (glyph, color) = match pane.status {
-            SubagentStatus::Running => ("◐", theme.busy),
-            SubagentStatus::Done => ("✓", theme.success),
-            SubagentStatus::Failed => ("✗", theme.error),
-            SubagentStatus::Pending => ("·", theme.fg_more_subtle),
-        };
-        let goal_line: String = pane.goal.chars().take(label_w.max(4)).collect();
-        let tab_area = Rect::new(inner.x, tab_y, inner.width, 2);
-        let style = if focused {
-            Style::default()
-                .bg(theme.primary.to_color())
-                .fg(theme.bg_void.to_color())
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .bg(theme.bg_panel.to_color())
-                .fg(theme.fg_base.to_color())
-        };
-        let mut spans = vec![
-            Span::styled(format!("{} ", glyph), Style::default().fg(color.to_color())),
-            Span::styled(goal_line, style),
-        ];
-        if focused {
-            spans.insert(0, Span::styled("▸".to_string(), Style::default().fg(theme.primary.to_color())));
-        }
-        f.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(if focused {
-                theme.primary.to_color()
+    // Truncate a string to at most `w` chars (char-boundary safe, matching
+    // the collapsed tab's `chars().take()` policy).
+    fn trunc(s: &str, w: usize) -> String {
+        s.chars().take(w.max(0)).collect()
+    }
+
+    if expanded {
+        // ── Expanded: 4-row detail cards ────────────────────────────
+        // Line 1: status glyph + task title/goal (click target).
+        // Line 2: model · depth · API iterations.
+        // Line 3: live phase (from the matched activity entry).
+        // Line 4: last invoked tool, when known.
+        let label_w = inner.width.saturating_sub(3) as usize;
+        let detail_w = inner.width.saturating_sub(3) as usize;
+        for (i, pane) in app.subagent_panes.iter().enumerate() {
+            let card_y = inner.y + 1 + (i as u16) * 4;
+            if card_y + 3 >= inner.y + inner.height.saturating_sub(2) {
+                break; // rail full (reserve 2 rows for the orchestrator tab)
+            }
+            let focused = app.focused_subagent == Some(i);
+            let (glyph, color) = match pane.status {
+                SubagentStatus::Running => ("◐", theme.busy),
+                SubagentStatus::Done => ("✓", theme.success),
+                SubagentStatus::Failed => ("✗", theme.error),
+                SubagentStatus::Pending => ("·", theme.fg_more_subtle),
+            };
+            // Task title (falls back to the goal) truncated to the card.
+            let title_src = app
+                .subagent_entries
+                .iter()
+                .rev()
+                .find(|e| e.child_id == pane.child_id)
+                .and_then(|e| e.task_title.clone())
+                .unwrap_or_else(|| pane.goal.clone());
+            let title_line = trunc(&title_src, label_w);
+            let focus_style = if focused {
+                Style::default()
+                    .bg(theme.primary.to_color())
+                    .fg(theme.bg_void.to_color())
+                    .add_modifier(Modifier::BOLD)
             } else {
-                theme.bg_panel.to_color()
-            })),
-            tab_area,
-        );
-        // Record the clickable row (first line of the tab).
-        app.last_subagent_tab_rects
-            .borrow_mut()
-            .push((tab_area.x, tab_y, tab_area.width, 1));
+                Style::default()
+                    .bg(theme.bg_panel.to_color())
+                    .fg(theme.fg_base.to_color())
+            };
+            let mut spans = vec![
+                Span::styled(format!("{} ", glyph), Style::default().fg(color.to_color())),
+                Span::styled(title_line, focus_style),
+            ];
+            if focused {
+                spans.insert(0, Span::styled("▸".to_string(), Style::default().fg(theme.primary.to_color())));
+            }
+            let card_area = Rect::new(inner.x, card_y, inner.width, 4);
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(if focused {
+                    theme.primary.to_color()
+                } else {
+                    theme.bg_panel.to_color()
+                })),
+                Rect::new(inner.x, card_y, inner.width, 1),
+            );
+            // Detail lines (dim; never the click target).
+            let entry = app
+                .subagent_entries
+                .iter()
+                .rev()
+                .find(|e| e.child_id == pane.child_id);
+            let dim = Style::default()
+                .fg(theme.fg_more_subtle.to_color())
+                .bg(theme.bg_panel.to_color());
+            let line2 = format!(
+                "{} · d{} · {} it",
+                trunc(&pane.model, detail_w.saturating_sub(12)),
+                pane.depth,
+                pane.tokens.iterations
+            );
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!("  {}", line2), dim)))
+                    .style(Style::default().bg(theme.bg_panel.to_color())),
+                Rect::new(inner.x, card_y + 1, inner.width, 1),
+            );
+            let phase = entry
+                .map(|e| e.phase.clone())
+                .unwrap_or_else(|| match pane.status {
+                    SubagentStatus::Running => "running".to_string(),
+                    SubagentStatus::Done => "done".to_string(),
+                    SubagentStatus::Failed => "failed".to_string(),
+                    SubagentStatus::Pending => "queued".to_string(),
+                });
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("  {}", trunc(&phase, detail_w)),
+                    dim,
+                )))
+                .style(Style::default().bg(theme.bg_panel.to_color())),
+                Rect::new(inner.x, card_y + 2, inner.width, 1),
+            );
+            if let Some(tool) = entry.and_then(|e| e.last_tool.clone()) {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("  ⚒ {}", trunc(&tool, detail_w)),
+                        dim,
+                    )))
+                    .style(Style::default().bg(theme.bg_panel.to_color())),
+                    Rect::new(inner.x, card_y + 3, inner.width, 1),
+                );
+            }
+            // Record the clickable row (the card's title line).
+            app.last_subagent_tab_rects
+                .borrow_mut()
+                .push((card_area.x, card_y, card_area.width, 1));
+        }
+    } else {
+        // Tabs: 2 rows each, stacked vertically below the title.
+        let label_w = inner.width.saturating_sub(2) as usize;
+        for (i, pane) in app.subagent_panes.iter().enumerate() {
+            let tab_y = inner.y + 1 + (i as u16) * 2;
+            if tab_y + 1 >= inner.y + inner.height.saturating_sub(2) {
+                break; // rail full (reserve 2 rows for the orchestrator tab)
+            }
+            let focused = app.focused_subagent == Some(i);
+            let (glyph, color) = match pane.status {
+                SubagentStatus::Running => ("◐", theme.busy),
+                SubagentStatus::Done => ("✓", theme.success),
+                SubagentStatus::Failed => ("✗", theme.error),
+                SubagentStatus::Pending => ("·", theme.fg_more_subtle),
+            };
+            let goal_line: String = pane.goal.chars().take(label_w.max(4)).collect();
+            let tab_area = Rect::new(inner.x, tab_y, inner.width, 2);
+            let style = if focused {
+                Style::default()
+                    .bg(theme.primary.to_color())
+                    .fg(theme.bg_void.to_color())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .bg(theme.bg_panel.to_color())
+                    .fg(theme.fg_base.to_color())
+            };
+            let mut spans = vec![
+                Span::styled(format!("{} ", glyph), Style::default().fg(color.to_color())),
+                Span::styled(goal_line, style),
+            ];
+            if focused {
+                spans.insert(0, Span::styled("▸".to_string(), Style::default().fg(theme.primary.to_color())));
+            }
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(if focused {
+                    theme.primary.to_color()
+                } else {
+                    theme.bg_panel.to_color()
+                })),
+                tab_area,
+            );
+            // Record the clickable row (first line of the tab).
+            app.last_subagent_tab_rects
+                .borrow_mut()
+                .push((tab_area.x, tab_y, tab_area.width, 1));
+        }
     }
 
     // ── Orchestrator tab (pinned at the rail's bottom) ─────────────────

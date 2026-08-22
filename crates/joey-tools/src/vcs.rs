@@ -44,6 +44,18 @@ use serde::{Deserialize, Serialize};
 /// Wall-clock timeout applied to every git subprocess invocation (FR-005).
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Effective per-git-call wall-clock timeout. Overridable in tests via
+/// `JOEY_TEST_GIT_TIMEOUT_MS` so the timeout-enforcement path can be
+/// exercised without waiting the full 5s default (production default
+/// unchanged).
+fn git_timeout() -> Duration {
+    std::env::var("JOEY_TEST_GIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(GIT_TIMEOUT)
+}
+
 /// Max checkpoints retained per project (FR-007 default).
 const MAX_SNAPSHOTS_PER_PROJECT: usize = 50;
 
@@ -797,7 +809,7 @@ impl CheckpointManager {
         }
         cmd.args(args);
         cmd.current_dir(&self.store);
-        run_with_timeout(cmd, GIT_TIMEOUT, &[0]).ok()
+        run_with_timeout(cmd, git_timeout(), &[0]).ok()
     }
 
     /// Make previously-unreachable objects actually leave the store:
@@ -837,7 +849,7 @@ impl CheckpointManager {
         self.git_env(&mut cmd);
         cmd.args(args);
         cmd.current_dir(&self.work_tree);
-        run_with_timeout(cmd, GIT_TIMEOUT, allowed).with_context(|| {
+        run_with_timeout(cmd, git_timeout(), allowed).with_context(|| {
             format!(
                 "git {} (store: {})",
                 args.join(" "),
@@ -853,7 +865,7 @@ impl CheckpointManager {
         self.git_env(&mut cmd);
         cmd.args(args);
         cmd.current_dir(&self.work_tree);
-        run_with_timeout(cmd, GIT_TIMEOUT, allowed.unwrap_or(&[0])).ok()
+        run_with_timeout(cmd, git_timeout(), allowed.unwrap_or(&[0])).ok()
     }
 
     fn run_git_bool(&self, args: &[&str]) -> bool {
@@ -861,7 +873,7 @@ impl CheckpointManager {
         self.git_env(&mut cmd);
         cmd.args(args);
         cmd.current_dir(&self.work_tree);
-        run_with_timeout(cmd, GIT_TIMEOUT, &[0]).is_ok()
+        run_with_timeout(cmd, git_timeout(), &[0]).is_ok()
     }
 }
 
@@ -886,22 +898,34 @@ fn ensure_store_initialized(store: &Path) -> Result<()> {
     cmd.env_remove("GIT_WORK_TREE");
     cmd.env_remove("GIT_INDEX_FILE");
     cmd.args(["init", "--bare", "--quiet", &store.to_string_lossy()]);
-    run_with_timeout(cmd, GIT_TIMEOUT, &[0]).context("git init --bare (shared store)")?;
+    run_with_timeout(cmd, git_timeout(), &[0]).context("git init --bare (shared store)")?;
 
-    // Per-store config, isolated by env vars above (belt-and-suspenders).
-    for (key, value) in [
-        ("user.email", "joey@local"),
-        ("user.name", "Joey Checkpoint"),
-        ("commit.gpgsign", "false"),
-        ("tag.gpgSign", "false"),
-        ("gc.auto", "0"),
-    ] {
-        let mut cmd = Command::new("git");
-        cmd.env("GIT_DIR", store);
-        apply_isolation_env(&mut cmd);
-        cmd.args(["config", key, value]);
-        let _ = run_with_timeout(cmd, GIT_TIMEOUT, &[0]);
-    }
+    // Per-store config. Written directly as a config block appended to the
+    // store's own `config` file — semantically identical to running
+    // `git config <k> <v>` for each pair below (Apple Git rejects
+    // multi-pair `git config k v k v` invocations with "no action
+    // specified", and five separate subprocesses add ~0.25s of spawn
+    // overhead per first checkpoint). The store is freshly created by the
+    // `git init --bare` above (this function returns early if `HEAD`
+    // already exists), so the file either does not exist or is the bare
+    // init template — appending a dedicated block mirrors the previous
+    // create/overwrite-per-key semantics exactly. Env-var isolation
+    // (above) keeps global/system config from interfering either way.
+    const STORE_CONFIG: &str = "[user]
+\temail = joey@local
+\tname = Joey Checkpoint
+[commit]
+\tgpgsign = false
+[tag]
+\tgpgSign = false
+[gc]
+\tauto = 0
+";
+    let config_path = store.join("config");
+    let mut existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    existing.push_str(STORE_CONFIG);
+    std::fs::write(&config_path, existing)
+        .context("writing shared-store git config")?;
 
     let info_dir = store.join("info");
     std::fs::create_dir_all(&info_dir)?;
@@ -1469,7 +1493,8 @@ mod tests {
         // Prepend a fake, hanging `git` script to PATH.
         let fake_bin_dir = tempfile::tempdir().unwrap();
         let fake_git = fake_bin_dir.path().join("git");
-        std::fs::write(&fake_git, "#!/bin/sh\nsleep 30\n").unwrap();
+        // Sleep long enough to trip even the shrunk test timeout (>= 2x).
+        std::fs::write(&fake_git, "#!/bin/sh\nsleep 5\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1481,6 +1506,10 @@ mod tests {
         let orig_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{}", fake_bin_dir.path().display(), orig_path);
         std::env::set_var("PATH", &new_path);
+        // Shrink the per-call timeout so the test trips it in milliseconds
+        // instead of waiting out the 5s production default. The fake git
+        // sleeps 5s — far beyond the 400ms override (kept >= 2x it).
+        std::env::set_var("JOEY_TEST_GIT_TIMEOUT_MS", "400");
 
         let (_home, dir, _guard) = test_setup();
         let work_tree = dir.path();
@@ -1492,11 +1521,12 @@ mod tests {
         let elapsed = start.elapsed();
 
         std::env::set_var("PATH", &orig_path);
+        std::env::remove_var("JOEY_TEST_GIT_TIMEOUT_MS");
 
         assert!(result.is_none(), "hung git call should fail gracefully");
         assert!(
-            elapsed < Duration::from_secs(10),
-            "should not hang beyond the 5s timeout + overhead, took {:?}",
+            elapsed < Duration::from_secs(4),
+            "should not hang beyond the 400ms test timeout + overhead, took {:?}",
             elapsed
         );
     }

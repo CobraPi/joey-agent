@@ -447,9 +447,136 @@ fn cmd_help() {
 mod tests {
     use super::*;
 
-    /// Shared lock for tests that mutate COPILOT_API_BASE_URL (process-global
-    /// env; parallel test threads would race otherwise).
+    /// Shared lock for tests that touch the process-global environment
+    /// (COPILOT_API_BASE_URL / AI_USAGE_HUD_BASE_URL / JOEY_HOME) — directly
+    /// or transitively via `Config::load()`, whose `.env` import applies user
+    /// values with OVERRIDE semantics (a concurrent env WRITE). Sibling test
+    /// modules in this binary also call `Config::load()` without knowing
+    /// about these vars, so every reader must hold this lock too: otherwise
+    /// a parallel help/nonsense test's dotenv import re-sets
+    /// AI_USAGE_HUD_BASE_URL between a magnet test's scrub and its assert.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII test-env guard. While held:
+    /// 1. ENV_LOCK is held, serializing every env-touching test in this
+    ///    module (writers AND readers — `resolve_provider_name` reads
+    ///    hud_endpoint()/custom_endpoint() from the live process env).
+    ///    joey-core's cross-crate TEST_HOME_OVERRIDE_LOCK is held for the
+    ///    guard's whole lifetime too, so the process-global home override
+    ///    can't race other test modules that install one (e.g.
+    ///    model_catalog.rs).
+    /// 2. The two endpoint env vars are scrubbed and restored on drop, so
+    ///    the developer's real shell / `~/.joey/.env` exports can't leak
+    ///    into magnetization assertions (mirrors joey-providers'
+    ///    copilot::EndpointEnvGuard, which serializes on its TEST_ENV_LOCK).
+    /// 3. A HomeOverrideGuard pins `joey_home()` to a fresh tempdir. The
+    ///    override beats both the JOEY_HOME env var and the platform
+    ///    default and is re-read on every call, so NO concurrent env
+    ///    mutation can make the models.dev disk cache resolve to the REAL
+    ///    ~/.joey (whose stale cache would trigger a live
+    ///    https://models.dev/api.json fetch). This is the race-free seam
+    ///    replacing reliance on the env var alone.
+    /// 4. JOEY_HOME is still pointed at that same temp dir (restored on
+    ///    drop): `load_joey_dotenv` (joey-core config.rs) resolves the
+    ///    `.env` to import from the env var, NOT from the home override,
+    ///    so this env redirect is what keeps any `Config::load()` under
+    ///    the guard (transitively, via build_engine /
+    ///    try_build_allocator, or in sibling engine.rs actor tests, whose
+    ///    engine_switch_model calls Config::load unconditionally)
+    ///    importing an EMPTY `.env` instead of the developer's real one —
+    ///    eliminating the dotenv OVERRIDE-write race without weakening any
+    ///    assertion. If load_joey_dotenv ever honors the override, this
+    ///    env machinery can be dropped entirely.
+    /// 5. A fresh empty models_dev_cache.json is seeded in that temp home
+    ///    so `fetch_candidate_pool`'s models.dev path is served from disk
+    ///    and never fetches https://models.dev/api.json over the network
+    ///    (the disk cache resolves through the overridden home; freshness
+    ///    < TTL short-circuits stage 3). The copilot path stays pinned to
+    ///    the instantly-refused 127.0.0.1:1 endpoints the tests set.
+    ///
+    /// Drop order: the manual Drop body restores the env vars while both
+    /// locks are still held; fields then drop in declaration order — the
+    /// home override releases BEFORE TEST_HOME_OVERRIDE_LOCK, and ENV_LOCK
+    /// (declared last) releases last.
+    struct TestEnvGuard {
+        _home: joey_core::constants::HomeOverrideGuard,
+        _override_lock: std::sync::MutexGuard<'static, ()>,
+        prev_copilot: Option<String>,
+        prev_hud: Option<String>,
+        prev_home: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestEnvGuard {
+        fn new() -> Self {
+            // ENV_LOCK is a static, so the guard's lifetime is 'static.
+            // Lock order ENV_LOCK → TEST_HOME_OVERRIDE_LOCK matches every
+            // other taker of the pair in the workspace — no inversion.
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _override_lock = joey_core::constants::TEST_HOME_OVERRIDE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev_home = std::env::var_os("JOEY_HOME");
+            let dir = tempfile::tempdir().expect("temp joey home");
+            std::fs::write(dir.path().join(".env"), "").expect("seed empty .env");
+            // Seed a fresh (mtime=now) empty models.dev disk cache: stage 2
+            // of fetch_models_dev serves it within the 1h TTL and stage 3
+            // (network fetch of https://models.dev/api.json) is unreachable.
+            std::fs::write(dir.path().join("models_dev_cache.json"), "{\"_\":{}}")
+                .expect("seed models.dev disk cache");
+            // Race-free home redirect FIRST: every `joey_home()` reader
+            // (models_dev_cache_path et al.) now sees the tempdir even if
+            // the env var below is momentarily unset or restored by a
+            // concurrent guard, so the stale-real-cache models.dev fetch
+            // can never fire.
+            let _home =
+                joey_core::constants::HomeOverrideGuard::new(dir.path().to_path_buf());
+            // The env var still matters for `load_joey_dotenv` (it resolves
+            // `.env` from the env var, not the override): redirect it to the
+            // SAME tempdir so any concurrent sibling `Config::load()`
+            // (engine.rs tests call it without knowing about this module's
+            // env vars) imports the EMPTY temp `.env` — an OVERRIDE write
+            // of nothing — instead of the developer's real one, so it can
+            // no longer resurrect AI_USAGE_HUD_BASE_URL after the scrub
+            // below.
+            std::env::set_var("JOEY_HOME", dir.path());
+            // Now scrub the endpoint vars (saved for restore-on-drop).
+            let prev_copilot = std::env::var("COPILOT_API_BASE_URL").ok();
+            let prev_hud = std::env::var("AI_USAGE_HUD_BASE_URL").ok();
+            std::env::remove_var("COPILOT_API_BASE_URL");
+            std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+            Self {
+                _home,
+                _override_lock,
+                prev_copilot,
+                prev_hud,
+                prev_home,
+                _dir: dir,
+                _lock,
+            }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            // Env restores run first, while both locks are still held; the
+            // fields below then release the override and the locks.
+            match &self.prev_home {
+                Some(v) => std::env::set_var("JOEY_HOME", v),
+                None => std::env::remove_var("JOEY_HOME"),
+            }
+            for (k, v) in [
+                ("COPILOT_API_BASE_URL", &self.prev_copilot),
+                ("AI_USAGE_HUD_BASE_URL", &self.prev_hud),
+            ] {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
 
     /// Constitution VII non-regression: `try_build_allocator` returns None when
     /// the selector is neither enabled nor engaged via the `auto` sentinel.
@@ -457,6 +584,7 @@ mod tests {
     /// the agent never wires the intercept and uses the configured model verbatim.
     #[test]
     fn try_build_allocator_none_when_disabled_and_not_auto() {
+        let _g = TestEnvGuard::new();
         let mut cfg = joey_core::Config::defaults();
         // Concretely configured model, selector not enabled.
         cfg.set_model_override("gpt-4o");
@@ -471,6 +599,7 @@ mod tests {
     /// state and the intercept is ready the moment `auto` engages.
     #[test]
     fn try_build_allocator_some_when_auto_active() {
+        let _g = TestEnvGuard::new();
         let mut cfg = joey_core::Config::defaults();
         cfg.set_model_override("auto");
         assert_eq!(cfg.model(), "auto");
@@ -481,6 +610,7 @@ mod tests {
     /// exit 0 on `help` (T024).
     #[test]
     fn llm_selector_help_succeeds() {
+        let _g = TestEnvGuard::new();
         assert!(llm_selector_slash("help").is_ok());
         // The `-h` / `--help` aliases also succeed.
         assert!(llm_selector_slash("-h").is_ok());
@@ -490,6 +620,7 @@ mod tests {
     /// Unknown subcommand returns an error (non-zero exit).
     #[test]
     fn llm_selector_unknown_subcommand_errors() {
+        let _g = TestEnvGuard::new();
         assert!(llm_selector_slash("nonsense").is_err());
     }
 
@@ -500,6 +631,7 @@ mod tests {
     #[test]
     fn resolve_provider_name_reads_model_provider_key() {
         use tempfile::NamedTempFile;
+        let _g = TestEnvGuard::new();
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "model:\n  provider: zai\n  model: glm-5.2\n").unwrap();
         let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
@@ -507,11 +639,11 @@ mod tests {
     }
 
     /// `resolve_provider_name` falls back to the model's vendor prefix when
-    /// provider is "auto" (e.g. "anthropic/claude-..." → "anthropic").
+    /// provider is "auto" (e.g. "anthropic/claude-...” → "anthropic").
     #[test]
     fn resolve_provider_name_falls_back_to_model_vendor() {
         use tempfile::NamedTempFile;
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _g = TestEnvGuard::new();
         std::env::remove_var("COPILOT_API_BASE_URL");
         // A prior test's Config::load() may have loaded ~/.joey/.env with
         // OVERRIDE semantics into the process env — scrub the HUD var too,
@@ -535,7 +667,7 @@ mod tests {
     #[test]
     fn resolve_provider_name_magnetizes_to_copilot_on_custom_endpoint() {
         use tempfile::NamedTempFile;
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _g = TestEnvGuard::new();
         std::env::set_var("COPILOT_API_BASE_URL", "http://127.0.0.1:8317");
         // HUD takes precedence over the copilot magnet — scrub it so this
         // test observes the copilot path even when ~/.joey/.env set it.
@@ -556,7 +688,7 @@ mod tests {
     #[test]
     fn resolve_provider_name_magnetizes_to_hud_on_hud_env_var() {
         use tempfile::NamedTempFile;
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _g = TestEnvGuard::new();
         std::env::remove_var("COPILOT_API_BASE_URL");
         std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317");
         let tmp = NamedTempFile::new().unwrap();
@@ -575,7 +707,7 @@ mod tests {
     /// (empty is acceptable when the proxy is down — FR-017 auto-disable).
     #[test]
     fn candidate_pool_fetch_targets_hud_via_copilot_wire() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _g = TestEnvGuard::new();
         std::env::remove_var("COPILOT_API_BASE_URL");
         std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:1");
         // is_copilot_wire dispatch — unreachable endpoint yields an empty

@@ -52,6 +52,7 @@ async fn pre_signaled_interrupt_propagates_to_batch_results() {
             context: None,
             model: None,
             toolsets: vec![],
+            role: None,
         },
     ];
 

@@ -892,6 +892,59 @@ impl Drop for EndpointEnvGuard {
     }
 }
 
+/// Test-only catalog-cache guard: pre-seed `CATALOG_CACHE` with a fixture so
+/// `build_client`'s copilot-wire catalog consult is served from cache and
+/// never touches the network (on hosts with an IPv6 blackhole the real
+/// fetch stalls the full 5s timeout per attempt). Restores the prior cache
+/// state on drop. The caller must already hold `TEST_ENV_LOCK` so tests that
+/// peek the cache (`copilot_servable`, magnetization asserts) can't observe
+/// the fixture concurrently — they serialize on the same lock.
+#[cfg(test)]
+pub(crate) struct CatalogCacheGuard {
+    saved: Option<(Vec<Value>, std::time::Instant)>,
+}
+
+#[cfg(test)]
+impl CatalogCacheGuard {
+    /// Seed the cache with a non-empty, fresh fixture containing `model`.
+    pub(crate) fn seed(model: &str) -> Self {
+        Self::seed_with(model, json!({}))
+    }
+
+    /// Seed the cache with a fixture whose capabilities are merged over the
+    /// default shape (e.g. a custom `reasoning_effort` list).
+    pub(crate) fn seed_with(model: &str, capabilities: Value) -> Self {
+        let mut entry = json!({
+            "id": model,
+            "model_picker_enabled": true,
+            "supported_endpoints": ["/chat/completions"],
+        });
+        // Splice capabilities under capabilities.supports (the documented
+        // merge target for reasoning_effort lists).
+        let caps = capabilities.as_object().cloned().unwrap_or_default();
+        let supports = if caps.contains_key("reasoning_effort") {
+            json!({"supports": caps})
+        } else {
+            json!({"supports": {}})
+        };
+        entry
+            .as_object_mut()
+            .unwrap()
+            .insert("capabilities".into(), supports);
+        let mut guard = CATALOG_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = guard.take();
+        *guard = Some((vec![entry], std::time::Instant::now()));
+        Self { saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CatalogCacheGuard {
+    fn drop(&mut self) {
+        *CATALOG_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = self.saved.take();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

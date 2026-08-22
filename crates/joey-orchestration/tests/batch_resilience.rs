@@ -41,18 +41,21 @@ async fn batch_resilience_all_results_returned() {
             context: None,
             model: None,
             toolsets: vec![],
+            role: None,
         },
         TaskSpec {
             goal: "Resilient task B".to_string(),
             context: None,
             model: None,
             toolsets: vec![],
+            role: None,
         },
         TaskSpec {
             goal: "Resilient task C".to_string(),
             context: None,
             model: None,
             toolsets: vec![],
+            role: None,
         },
     ];
 

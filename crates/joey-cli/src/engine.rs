@@ -206,9 +206,13 @@ pub(crate) fn hypercode_context_for_agent(
     config: &joey_core::Config,
     cwd: &std::path::Path,
     overrides: &Overrides,
-    _agent: &Agent,
+    agent: &Agent,
 ) -> crate::hypercode::HypercodeContext {
     let agent_config = crate::repl::build_agent_config(config, overrides);
+    // Capture the LIVE effective main-turn model (tier-routed / allocator
+    // / image-routed — NOT the raw config default) so hypercode children
+    // inherit what the parent actually dispatches with.
+    let parent_effective_model = Some(agent.effective_main_turn_model());
     // Base registry = the registry build_agent starts from (builtins +
     // session/clarify/lsp), WITHOUT orchestration/neurocode additions —
     // exactly the snapshot delegate_task's children get.
@@ -234,6 +238,7 @@ pub(crate) fn hypercode_context_for_agent(
         base_registry: base,
         manager,
         cwd: cwd.to_path_buf(),
+        parent_effective_model,
     }
 }
 
@@ -248,6 +253,11 @@ async fn engine_task(
     // Split the spec into the pieces the Hypercode arm needs (avoid holding
     // the whole spec alive across the loop).
     let spec_config = spec.config;
+    // Live view of HyperCode orchestrator mode. The spec's config snapshot
+    // goes stale the moment /hypercode toggles (it persists to disk and
+    // sends SetOrchestratorMode; the spec is not rebuilt), so switch_model
+    // re-application below must consult THIS flag, not re-read the snapshot.
+    let mut orchestrator_on = crate::hypercode::orchestrator_active(&spec_config);
     let spec_cwd = spec.cwd;
     let spec_overrides = spec.overrides;
     // Queued prompts / jobs submitted while a turn runs.
@@ -396,7 +406,7 @@ async fn engine_task(
                 }
             }
             EngineCommand::SwitchAgent(agent_name) => {
-                let notice = engine_switch_agent(&mut agent, &agent_name);
+                let notice = engine_switch_agent(&mut agent, &agent_name, orchestrator_on);
                 let _ = event_tx.send(EngineEvent::AgentSwitched {
                     display_name: agent_name,
                     model: agent.model().to_string(),
@@ -405,7 +415,7 @@ async fn engine_task(
                 });
             }
             EngineCommand::SwitchModel { model, global } => {
-                let notice = engine_switch_model(&mut agent, &model, global);
+                let notice = engine_switch_model(&mut agent, &model, global, orchestrator_on);
                 let _ = event_tx.send(EngineEvent::ModelSwitched {
                     model: agent.model().to_string(),
                     provider: agent.provider_name().to_string(),
@@ -416,7 +426,12 @@ async fn engine_task(
                 // Heavy jobs run on the blocking pool so even a multi-minute
                 // tree walk doesn't pin the engine's async worker.
                 let out_label = label.clone();
-                let job = tokio::task::spawn_blocking(move || run_heavy_job(&label, &args));
+                // Scope NeuroCode tier resolution to the LIVE agent provider
+                // (the engine actor owns the agent, so this survives /model
+                // switches — same scope /model neurocode writes its keys under).
+                let live_provider = agent.provider_name().to_string();
+                let job =
+                    tokio::task::spawn_blocking(move || run_heavy_job(&label, &args, &live_provider));
                 tokio::pin!(job);
                 let res = loop {
                     tokio::select! {
@@ -565,15 +580,20 @@ async fn engine_task(
                 ));
             }
             EngineCommand::SetOrchestratorMode(on) => {
+                // Keep the live flag authoritative for later
+                // switch_model/switch_agent overlay re-application.
+                orchestrator_on = on;
                 // /hypercode toggle (orchestrator mode): swap the tool
-                // surface + overlay on the LIVE agent — no rebuild needed.
-                // The system prompt's tool section was baked at build time,
-                // but the registry gate (enabled_tools) is authoritative for
-                // dispatch and the overlay instructs the model, so the stale
-                // prompt list is cosmetic until the next rebuild.
+                // surface + overlay on the LIVE agent — no agent rebuild
+                // needed. The system prompt's tool section was baked at
+                // build time, so re-bake it from the new enabled list:
+                // otherwise the stale tool guidance contradicts the
+                // reduced schemas + overlay on provider wires that weigh
+                // the baked prompt heavily.
                 if on {
                     let tools = crate::hypercode::orchestrator_tool_names();
                     agent.set_enabled_tools(tools);
+                    agent.rebuild_system_prompt();
                     agent.set_extra_instructions(Some(crate::hypercode::orchestrator_overlay()));
                     let _ = event_tx.send(EngineEvent::Notice(
                         "⚡ orchestrator mode ON — file writes/builds now go through explorer/implementor subagents (you keep process monitoring, read-only peeks, and web)".into(),
@@ -581,6 +601,7 @@ async fn engine_task(
                 } else {
                     let tools = crate::commands::platform_tools(&spec_config, "cli");
                     agent.set_enabled_tools(tools);
+                    agent.rebuild_system_prompt();
                     agent.set_extra_instructions(None);
                     let _ = event_tx.send(EngineEvent::Notice(
                         "orchestrator mode OFF — full tool surface restored.".into(),
@@ -604,10 +625,14 @@ async fn engine_task(
 
 /// The heavy-job dispatch table. ONLY blocking, CPU-bound handlers live
 /// here; anything that mutates TUI state is a light command handled by the
-/// UI directly.
-fn run_heavy_job(label: &str, args: &str) -> String {
+/// UI directly. `live_provider` scopes NeuroCode tier resolution to the
+/// agent's actual provider.
+fn run_heavy_job(label: &str, args: &str, live_provider: &str) -> String {
     match label {
-        "neurocode" => crate::commands::neurocode::neurocode_slash(args),
+        "neurocode" => crate::commands::neurocode::neurocode_slash_provider_scoped_text(
+            args,
+            live_provider,
+        ),
         // /browser (feature 016, T066): runs on the blocking pool; the
         // async connect is driven via a runtime handle (same semantics as
         // the line REPL's browser_slash).
@@ -711,8 +736,16 @@ fn engine_pre_turn(
 
 /// Agent switching on the engine side (T033/BC-015). Returns a notice for
 /// the transcript. "default" reverts to the base joey prompt.
-fn engine_switch_agent(agent: &mut Agent, agent_name: &str) -> String {
+///
+/// `orchestrator_on` is the engine's LIVE view of whether the HyperCode
+/// orchestrator overlay should be present: `Agent::switch_model` clears
+/// `extra_instructions` (intentional — identity overlays must not leak
+/// across a model swap), so the orchestrator overlay must be re-applied
+/// here when orchestrator mode is active.
+fn engine_switch_agent(agent: &mut Agent, agent_name: &str, orchestrator_on: bool) -> String {
     if agent_name == "default" {
+        // No switch_model here, so extra_instructions survives — nothing to
+        // re-apply (the orchestrator overlay, if active, is still in place).
         agent.set_agent_identity(None);
         return "Reverted to the default agent".into();
     }
@@ -736,9 +769,20 @@ fn engine_switch_agent(agent: &mut Agent, agent_name: &str) -> String {
     match agent.switch_model("auto", "", &model, None) {
         Ok(msg) => {
             agent.set_agent_identity(Some(identity));
+            reapply_orchestrator_overlay(agent, orchestrator_on);
             format!("{msg} — agent mode: {}", omo_agent.display_name)
         }
         Err(e) => format!("Switch failed: {e}"),
+    }
+}
+
+/// Re-apply the HyperCode orchestrator overlay after a switch that cleared
+/// it (`Agent::switch_model` resets `extra_instructions` by design). No-op
+/// when the orchestrator is not active — the same overlay the
+/// `SetOrchestratorMode` arm applies via `hypercode::orchestrator_overlay`.
+fn reapply_orchestrator_overlay(agent: &mut Agent, orchestrator_on: bool) {
+    if orchestrator_on {
+        agent.set_extra_instructions(Some(crate::hypercode::orchestrator_overlay()));
     }
 }
 
@@ -746,11 +790,19 @@ fn engine_switch_agent(agent: &mut Agent, agent_name: &str) -> String {
 /// optionally persist it, and refresh the NeuroCode engine so per-provider
 /// tier scoping follows the (possibly different) provider. Returns a notice
 /// for the transcript.
-fn engine_switch_model(agent: &mut Agent, model: &str, global: bool) -> String {
+fn engine_switch_model(
+    agent: &mut Agent,
+    model: &str,
+    global: bool,
+    orchestrator_on: bool,
+) -> String {
     let mut notice = match agent.switch_model("auto", "", model, None) {
         Ok(msg) => msg,
         Err(e) => return format!("Model switch failed: {e}"),
     };
+    // switch_model cleared extra_instructions (by design) — restore the
+    // orchestrator overlay when HyperCode orchestrator mode is active.
+    reapply_orchestrator_overlay(agent, orchestrator_on);
     if global {
         match joey_core::Config::load() {
             Ok(mut cfg) => match cfg.set_and_save("model.default", model) {
@@ -797,13 +849,13 @@ mod tests {
     fn heavy_job_dispatch_known_label() {
         // The neurocode label routes to the real handler (output shape
         // varies; just prove dispatch doesn't fall through to unknown).
-        let out = run_heavy_job("neurocode", "status");
+        let out = run_heavy_job("neurocode", "status", "zai");
         assert!(!out.contains("unknown heavy job"));
     }
 
     #[test]
     fn heavy_job_unknown_label_answers_honestly() {
-        assert!(run_heavy_job("nope", "").contains("unknown heavy job"));
+        assert!(run_heavy_job("nope", "", "zai").contains("unknown heavy job"));
     }
 }
 
@@ -811,12 +863,141 @@ mod tests {
 mod actor_tests {
     use super::*;
 
+    /// Shared lock for actor tests that (transitively) touch the
+    /// process-global environment. `spec.build_agent()` ->
+    /// `repl::build_agent_parts` -> `joey_omo::AvailableModelSet::
+    /// from_connected_with_catalog` performs a REAL network catalog fetch
+    /// (models.dev via model_catalog.rs) whenever `copilot::custom_endpoint()`
+    /// is Some — which it is in a developer shell exporting
+    /// AI_USAGE_HUD_BASE_URL / COPILOT_API_BASE_URL. Sibling test modules in
+    /// this binary also call `Config::load()` whose `.env` import applies
+    /// user values with OVERRIDE semantics, so every actor test must hold
+    /// this lock for its whole body to keep the scrubbed env stable.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII test-env guard (self-contained port of llm_selector.rs's
+    /// TestEnvGuard). While held:
+    /// 1. ENV_LOCK is held, serializing env-touching tests in this module
+    ///    against each other and against this module's Config::load_from
+    ///    readers under the same lock. joey-core's cross-crate
+    ///    TEST_HOME_OVERRIDE_LOCK is held for the guard's whole lifetime
+    ///    too, so the process-global home override can't race other test
+    ///    modules that install one (e.g. model_catalog.rs).
+    /// 2. A HomeOverrideGuard pins `joey_home()` to a fresh tempdir. The
+    ///    override beats both the JOEY_HOME env var and the platform
+    ///    default and is re-read on every call, so NO concurrent env
+    ///    mutation can make `models_dev_cache_path()` resolve to the REAL
+    ///    ~/.joey — whose stale models_dev_cache.json would make stage 3
+    ///    fetch https://models.dev/api.json over the network. This is the
+    ///    race-free seam replacing reliance on the env var alone.
+    /// 3. COPILOT_API_BASE_URL and AI_USAGE_HUD_BASE_URL are scrubbed (and
+    ///    restored on drop), so a developer shell's exports can't leak into
+    ///    agent construction and trigger the copilot/models.dev catalog
+    ///    fetch path.
+    /// 4. JOEY_HOME is still pointed at the SAME tempdir (restored on
+    ///    drop): `load_joey_dotenv` (joey-core config.rs) resolves the
+    ///    `.env` to import from the env var, NOT from the home override,
+    ///    so this env redirect is what keeps any transitive
+    ///    `Config::load()` — ours or a sibling module's — importing the
+    ///    EMPTY temp `.env` instead of the developer's real one (which
+    ///    sets AI_USAGE_HUD_BASE_URL and would re-magnetize provider
+    ///    resolution mid-test). If load_joey_dotenv ever honors the
+    ///    override, this env machinery can be dropped entirely.
+    /// 5. The tempdir is seeded with an EMPTY `.env` and a fresh
+    ///    (mtime=now) `models_dev_cache.json` containing `{"_":{}}`: the
+    ///    cache makes the 1h-TTL stage-2 disk-cache check hit under the
+    ///    overridden home, so models.dev is never fetched over the network.
+    ///
+    /// Drop order: the manual Drop body restores the env vars while both
+    /// locks are still held; fields then drop in declaration order — the
+    /// home override releases BEFORE TEST_HOME_OVERRIDE_LOCK, and ENV_LOCK
+    /// (declared last) releases last.
+    struct TestEnvGuard {
+        _home: joey_core::constants::HomeOverrideGuard,
+        _override_lock: std::sync::MutexGuard<'static, ()>,
+        prev_copilot: Option<String>,
+        prev_hud: Option<String>,
+        prev_home: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestEnvGuard {
+        fn new() -> Self {
+            // ENV_LOCK is a static, so the guard's lifetime is 'static.
+            // Lock order ENV_LOCK → TEST_HOME_OVERRIDE_LOCK matches every
+            // other taker of the pair in the workspace — no inversion.
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _override_lock = joey_core::constants::TEST_HOME_OVERRIDE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev_home = std::env::var_os("JOEY_HOME");
+            let dir = tempfile::tempdir().expect("temp joey home");
+            std::fs::write(dir.path().join(".env"), "").expect("seed empty .env");
+            // Seed a fresh (mtime=now) empty models.dev disk cache: stage 2
+            // serves it within the 1h TTL and stage 3 (network fetch of
+            // https://models.dev/api.json) is unreachable.
+            std::fs::write(dir.path().join("models_dev_cache.json"), "{\"_\":{}}")
+                .expect("seed models.dev disk cache");
+            // Race-free home redirect FIRST: every `joey_home()` reader
+            // (models_dev_cache_path, session/auth stores) now sees the
+            // tempdir even if the env var below is momentarily unset or
+            // restored by a concurrent guard, so the stale-real-cache
+            // models.dev fetch can never fire.
+            let _home =
+                joey_core::constants::HomeOverrideGuard::new(dir.path().to_path_buf());
+            // The env var still matters for `load_joey_dotenv` (it resolves
+            // `.env` from the env var, not the override): redirect it to the
+            // SAME tempdir so any concurrent sibling `Config::load()`
+            // imports the EMPTY temp `.env` — an OVERRIDE write of nothing —
+            // instead of the developer's real one, so it can no longer
+            // resurrect AI_USAGE_HUD_BASE_URL after the scrub below.
+            std::env::set_var("JOEY_HOME", dir.path());
+            // Now scrub the endpoint vars (saved for restore-on-drop). A
+            // test that legitimately needs them can set its own afterwards.
+            let prev_copilot = std::env::var("COPILOT_API_BASE_URL").ok();
+            let prev_hud = std::env::var("AI_USAGE_HUD_BASE_URL").ok();
+            std::env::remove_var("COPILOT_API_BASE_URL");
+            std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+            Self {
+                _home,
+                _override_lock,
+                prev_copilot,
+                prev_hud,
+                prev_home,
+                _dir: dir,
+                _lock,
+            }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            // Env restores run first, while both locks are still held; the
+            // fields below then release the override and the locks.
+            match &self.prev_home {
+                Some(v) => std::env::set_var("JOEY_HOME", v),
+                None => std::env::remove_var("JOEY_HOME"),
+            }
+            for (k, v) in [
+                ("COPILOT_API_BASE_URL", &self.prev_copilot),
+                ("AI_USAGE_HUD_BASE_URL", &self.prev_hud),
+            ] {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     /// The engine task processes commands sequentially and queues Submits
     /// that arrive mid-turn. Uses the real engine with a stub prompt that
     /// produces no provider call (no credentials path → immediate
     /// TurnFinished), verifying the actor plumbing end-to-end.
     #[tokio::test]
     async fn engine_queues_and_completes_turns() {
+        let _env_guard = TestEnvGuard::new();
         // Build a spec with an unauthenticated provider so run_turn returns
         // fast (the engine sends the no-credentials notice + TurnFinished).
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -848,11 +1029,109 @@ mod actor_tests {
         assert_eq!(finished, 2, "both queued turns completed");
     }
 
+    /// Regression (orchestrator overlay loss): `/model` must not drop the
+    /// HyperCode orchestrator overlay. `Agent::switch_model` clears
+    /// `extra_instructions` BY DESIGN (identity/personality overlays must
+    /// not leak across a model swap) — the engine's switch handler has to
+    /// re-apply the orchestrator overlay while orchestrator mode is active.
+    /// Pre-fix this silently reverted the main agent to full-tool mode,
+    /// so it opened turns with delegate_task(explorer) instead of a plan.
+    #[test]
+    fn switch_model_preserves_orchestrator_overlay_when_active() {
+        let _env_guard = TestEnvGuard::new();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "model:\n  provider: openai-api\n  default: gpt-4o-mini\nhypercode:\n  enabled: true\n  orchestrator_mode: true\n",
+        )
+        .unwrap();
+        let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let spec = EngineSpec {
+            config,
+            cwd: std::env::temp_dir(),
+            overrides: crate::repl::Overrides::default(),
+            session_id: "engorch1_00000000_0000_abc123".into(),
+        };
+        let mut agent = spec.build_agent().expect("agent builds");
+        // Sanity: build_agent_parts applied the overlay at construction.
+        assert!(
+            agent
+                .effective_system_prompt()
+                .contains(crate::hypercode::ORCHESTRATOR_PROMPT),
+            "overlay present after build"
+        );
+        // Real model swap (different id -> the switch_model path that
+        // clears extra_instructions actually runs).
+        let notice = engine_switch_model(&mut agent, "gpt-4.1", false, true);
+        assert_eq!(agent.model(), "gpt-4.1", "model actually swapped: {notice}");
+        assert!(
+            agent
+                .effective_system_prompt()
+                .contains(crate::hypercode::ORCHESTRATOR_PROMPT),
+            "orchestrator overlay survives /model while orchestrator mode is active"
+        );
+        // Control: with the orchestrator off, a switch must NOT inject it.
+        let _ = engine_switch_model(&mut agent, "gpt-4o-mini", false, false);
+        assert!(
+            !agent
+                .effective_system_prompt()
+                .contains(crate::hypercode::ORCHESTRATOR_PROMPT),
+            "overlay must not be re-applied when orchestrator mode is off"
+        );
+    }
+
+    /// Regression (orchestrator overlay loss): `/agents <name>` must not
+    /// drop the HyperCode orchestrator overlay either. The OMO identity
+    /// goes into the agent_identity slot and the overlay is re-applied on
+    /// top after switch_model cleared it. Uses zai so Sisyphus resolves to
+    /// glm-5.2 (exact fallback-chain hit ≠ active glm-4.5-flash), proving
+    /// the real clearing path runs (an identical model would no-op).
+    #[test]
+    fn switch_agent_preserves_orchestrator_overlay_when_active() {
+        let _env_guard = TestEnvGuard::new();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "model:\n  provider: zai\n  default: glm-4.5-flash\nhypercode:\n  enabled: true\n  orchestrator_mode: true\n",
+        )
+        .unwrap();
+        let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let spec = EngineSpec {
+            config,
+            cwd: std::env::temp_dir(),
+            overrides: crate::repl::Overrides::default(),
+            session_id: "engorch2_00000000_0000_abc123".into(),
+        };
+        let mut agent = spec.build_agent().expect("agent builds");
+        assert!(
+            agent
+                .effective_system_prompt()
+                .contains(crate::hypercode::ORCHESTRATOR_PROMPT),
+            "overlay present after build"
+        );
+        let notice = engine_switch_agent(&mut agent, "sisyphus", true);
+        assert!(notice.contains("agent mode: Sisyphus"), "switch ok: {notice}");
+        assert_eq!(
+            agent.model(),
+            "glm-5.2",
+            "model actually swapped (the extra_instructions-clearing path ran)"
+        );
+        assert!(
+            agent
+                .effective_system_prompt()
+                .contains(crate::hypercode::ORCHESTRATOR_PROMPT),
+            "orchestrator overlay survives /agents while orchestrator mode is active"
+        );
+        // The OMO persona landed in its own slot (stacks with the overlay).
+        assert!(agent.agent_identity().is_some(), "identity slot populated");
+    }
+
     /// `/model` switch through the real engine actor: SwitchModel swaps the
     /// agent's model (unauthenticated provider → no network) and emits
     /// ModelSwitched carrying the new model id.
     #[tokio::test]
     async fn switch_model_swaps_and_emits() {
+        let _env_guard = TestEnvGuard::new();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "model:\n  provider: openai-api\n  default: gpt-4o-mini\n").unwrap();
         let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
@@ -896,6 +1175,7 @@ mod actor_tests {
     /// resolves) even from idle.
     #[tokio::test]
     async fn force_kill_exits_engine() {
+        let _env_guard = TestEnvGuard::new();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "model:\n  provider: openai-api\n  default: gpt-4o-mini\n").unwrap();
         let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
@@ -938,6 +1218,7 @@ mod actor_tests {
     /// host busy flag.
     #[tokio::test]
     async fn engine_early_exit_sends_done_before_turn_finished() {
+        let _env_guard = TestEnvGuard::new();
         for (tag, prompt) in [("engdone1", "@plan"), ("engdone2", "hello")] {
             let eng_spec = unauth_spec(tag);
             let agent = eng_spec.build_agent().expect("agent builds");
@@ -972,6 +1253,7 @@ mod actor_tests {
     /// abandon check — it is re-queued and runs.
     #[tokio::test]
     async fn engine_survives_post_turn_submit() {
+        let _env_guard = TestEnvGuard::new();
         let spec = unauth_spec("engrace");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1008,6 +1290,7 @@ mod actor_tests {
     /// dropped — the engine queues it as the next turn and tells the UI.
     #[tokio::test]
     async fn idle_steer_degrades_to_queued_submit() {
+        let _env_guard = TestEnvGuard::new();
         let spec = unauth_spec("engsteer1");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1033,6 +1316,7 @@ mod actor_tests {
     /// and not for announce=false ones (the normal UI funnel).
     #[tokio::test]
     async fn queued_submit_started_announces_only_marked_submits() {
+        let _env_guard = TestEnvGuard::new();
         let spec = unauth_spec("engqss1");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1077,6 +1361,7 @@ mod actor_tests {
     /// The engine announces Idle once its queues drain (not at startup).
     #[tokio::test]
     async fn engine_announces_idle_after_drain() {
+        let _env_guard = TestEnvGuard::new();
         let spec = unauth_spec("engidle1");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1106,6 +1391,7 @@ mod actor_tests {
     /// without touching the network.
     #[tokio::test]
     async fn hypercode_command_streams_progress_and_finishes() {
+        let _env_guard = TestEnvGuard::new();
         let spec = unauth_spec("enghc1");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
