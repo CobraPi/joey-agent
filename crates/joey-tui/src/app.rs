@@ -47,7 +47,14 @@ pub enum TuiAction {
     SwitchAgent(String),
     /// Copy the text of transcript item `usize` to the clipboard (the `y`
     /// key in transcript mode). Host owns the clipboard access.
+    /// Main-transcript-only: the index addresses `App::transcript`.
     CopyItem(usize),
+    /// Copy the text of pane `pane`'s transcript item `idx` (pane-relative)
+    /// to the clipboard. T017 (D4): the `y`/`Y` keys with a subagent pane
+    /// focused must resolve against the PANE transcript, never the main
+    /// one — a bare `CopyItem` would copy the wrong text. Host owns the
+    /// clipboard access.
+    CopyPaneItem { pane: usize, idx: usize },
 }
 
 pub type FrameBackend = CrosstermBackend<Stdout>;
@@ -123,7 +130,14 @@ fn render_body(
 
     // Body: transcript (left, large) + sidebar (right). The sidebar
     // yields entirely on narrow terminals.
-    let show_sidebar = with_rail_area.width >= 72;
+    // T020 (US4, FR-006): it also yields while the focused pane's output
+    // viewer is maximized — the shared viewer chrome ("… Ctrl+O or Esc to
+    // restore") needs the full main-column width; the takeover is
+    // transient (Ctrl+O/Esc restores the full pane view with sidebar).
+    let pane_viewer_takeover = app.focused_pane().is_some()
+        && app.output_viewer_open
+        && with_rail_area.height >= 12;
+    let show_sidebar = with_rail_area.width >= 72 && !pane_viewer_takeover;
     let body = if show_sidebar {
         Layout::default()
             .direction(Direction::Horizontal)
@@ -151,6 +165,14 @@ fn render_body(
     // A focused subagent takes over the main transcript area; the
     // maximized panels (stats/output viewer) retarget to the child too.
     if let Some(pane) = app.focused_pane() {
+        // T021 (US4, FR-008, D6): the pane's live reasoning panel mirrors
+        // the main screen's docked strip — same `draw_reasoning` widget,
+        // retargeted to the pane's `streaming_reasoning` (a non-empty
+        // accumulator IS the live condition; the pane has no
+        // `reasoning_open` flag). Hidden while reasoning is toggled off or
+        // the area is too short — same guards as `show_reasoning_panel`.
+        let show_pane_reasoning_panel =
+            app.show_reasoning && !pane.streaming_reasoning.is_empty() && body[0].height >= 14;
         if app.stats_open && body[0].height >= 12 {
             let (transcript_h, stats_h) = split_expanded_feed(body[0].height);
             let main = Layout::default()
@@ -162,6 +184,56 @@ fn render_body(
                 .split(body[0]);
             widgets::draw_pane_transcript(f, main[0], app, pane, theme, focused, glow);
             widgets::draw_pane_stats_page(f, main[1], app, pane, theme, spinner);
+        } else if pane_viewer_takeover {
+            // T020 (US4, FR-006/FR-008, D6): the maximized output viewer
+            // retargets to the focused pane — the SAME `draw_output_viewer`
+            // chrome over the pane's tool output, with a transcript strip
+            // kept on top (main-view layout parity), spanning the FULL main
+            // column (`with_rail_area` — the sidebar yielded above).
+            // Precedence mirrors the main branch: stats > viewer >
+            // reasoning > explorer (T022 added the mode-attributed
+            // explorer arm below — reachable only when the spawning
+            // mode matches, FR-008).
+            let (transcript_h, viewer_h) = split_expanded_feed(with_rail_area.height);
+            let main = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(transcript_h),
+                    Constraint::Min(viewer_h),
+                ])
+                .split(with_rail_area);
+            widgets::draw_pane_transcript(f, main[0], app, pane, theme, focused, glow);
+            widgets::draw_output_viewer(f, main[1], app, theme, spinner);
+        } else if show_pane_reasoning_panel {
+            let convo_split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(4), Constraint::Length(8)])
+                .split(body[0]);
+            widgets::draw_pane_transcript(f, convo_split[0], app, pane, theme, focused, glow);
+            widgets::draw_reasoning(f, convo_split[1], app, theme, spinner);
+        } else if app.neurocode_expanded
+            && app.neurocode_active
+            && pane.spawned_by_neurocode
+            && body[0].height >= 12
+        {
+            // T022 (US4, FR-008, D2): mode-attributed explorer arm. The
+            // pane reuses the orchestrator's `draw_explorer` (same widget
+            // function, no pane-local reimplementation) but is reachable
+            // ONLY when the spawning mode matches — `spawned_by_neurocode`
+            // is snapshotted at SubagentSpawn, so a plain delegation pane
+            // never shows the mode explorer even with both App flags set
+            // (FR-008). Precedence per the pane branch: stats > viewer >
+            // reasoning > explorer.
+            let (transcript_h, feed_h) = split_expanded_feed(body[0].height);
+            let main = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(transcript_h),
+                    Constraint::Min(feed_h),
+                ])
+                .split(body[0]);
+            widgets::draw_pane_transcript(f, main[0], app, pane, theme, focused, glow);
+            crate::neurocode_viz::draw_explorer(f, main[1], app, theme);
         } else {
             widgets::draw_pane_transcript(f, body[0], app, pane, theme, focused, glow);
         }
@@ -326,10 +398,37 @@ pub struct Tui<B: ratatui::backend::Backend = FrameBackend> {
     completion_suppressed: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
     Input,
     Transcript,
+}
+
+/// T003 (research.md D1/D3): the view a transcript-targeted key acts on.
+///
+/// Resolved from `App.focused_subagent` in exactly ONE place
+/// (`Tui::resolve_transcript_target`) so every transcript-targeted key
+/// handler routes through a single point — no scattered
+/// `focused_subagent.is_some()` checks. Deliberately a lightweight enum +
+/// match (D1: no `TranscriptView` trait / view-object refactor).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TranscriptTarget {
+    /// The orchestrator's main transcript (`App::transcript` / `App::scroll`).
+    Main,
+    /// The focused subagent pane's transcript (`SubagentPane`, by index).
+    Pane(usize),
+}
+
+/// T011 (US2, FR-003): pane-side counterpart of `App::item_is_expandable`
+/// (same kinds: tool calls, file diffs, reasoning blocks). The pane
+/// transcript lives on `SubagentPane`, which has no such helper, so the
+/// Space/x Pane arm in `handle_key` uses this — keeping the kind list in
+/// app.rs next to the routing instead of reaching into state.rs.
+fn pane_item_is_expandable(item: &TranscriptItem) -> bool {
+    matches!(
+        item,
+        TranscriptItem::Tool { .. } | TranscriptItem::FileDiff { .. } | TranscriptItem::Reasoning { .. }
+    )
 }
 
 /// Raw-mode enter path: only meaningful for the real crossterm/stdout
@@ -615,6 +714,19 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         }
     }
 
+    /// T003 (D3): THE single routing point for transcript-targeted keys.
+    /// `focused_subagent == None` → [`TranscriptTarget::Main`] (orchestrator
+    /// view, byte-identical to the pre-indirection behavior); a focused pane
+    /// → [`TranscriptTarget::Pane`] with its index. Key handlers match on
+    /// this instead of reading `focused_subagent` themselves, so target
+    /// resolution has exactly one definition.
+    fn resolve_transcript_target(&self) -> TranscriptTarget {
+        match self.app.focused_subagent {
+            Some(idx) => TranscriptTarget::Pane(idx),
+            None => TranscriptTarget::Main,
+        }
+    }
+
     /// Handle a single crossterm key event. Returns an action for the host.
     ///
     /// Design: printable characters ALWAYS reach the input box when it has
@@ -658,7 +770,10 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // same keys drive the PANE's stats stream (retargeted view).
         if self.app.stats_open {
             let vim = self.focus == Focus::Transcript;
-            let pane_focused = self.app.focused_subagent.is_some();
+            // T003 (D3): route through the single resolver instead of a raw
+            // `focused_subagent` check.
+            let pane_focused =
+                matches!(self.resolve_transcript_target(), TranscriptTarget::Pane(_));
             match key.code {
                 KeyCode::Up => {
                     if pane_focused {
@@ -694,7 +809,7 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 }
                 KeyCode::Home => {
                     if pane_focused {
-                        self.app.pane_stats_view = Some(0);
+                        self.app.set_focused_pane_stats_view(Some(0));
                     } else {
                         self.app.stats_view = Some(0);
                     }
@@ -702,7 +817,7 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 }
                 KeyCode::End => {
                     if pane_focused {
-                        self.app.pane_stats_view = None;
+                        self.app.set_focused_pane_stats_view(None);
                     } else {
                         self.app.stats_view = None;
                     }
@@ -726,7 +841,7 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 }
                 KeyCode::Char('g') if vim => {
                     if pane_focused {
-                        self.app.pane_stats_view = Some(0);
+                        self.app.set_focused_pane_stats_view(Some(0));
                     } else {
                         self.app.stats_view = Some(0);
                     }
@@ -734,7 +849,7 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 }
                 KeyCode::Char('G') if vim => {
                     if pane_focused {
-                        self.app.pane_stats_view = None;
+                        self.app.set_focused_pane_stats_view(None);
                     } else {
                         self.app.stats_view = None;
                     }
@@ -891,8 +1006,7 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             // overlays / returns focus / quits.
             KeyCode::Esc => {
                 if self.app.search_open {
-                    self.app.search_open = false;
-                    self.app.search_query.clear();
+                    self.close_search();
                     return None;
                 }
                 if self.app.agent_picker_open {
@@ -956,12 +1070,18 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             }
             // Feature 005 (T023): Ctrl+E cycles the most-recent reasoning
             // block through the three-state expand cycle.
+            // T012 (US2, FR-004): retargets to the FOCUSED pane. Like Ctrl+A
+            // (T004), the App mutator reads `focused_subagent` itself, so the
+            // arm stays target-agnostic — no scattered is_some() checks (the
+            // resolver defines target resolution; the mutator owns the walk).
             KeyCode::Char('e') if ctrl => {
                 self.app.cycle_focused_reasoning_expand();
                 return None;
             }
             // Feature 005 (T028): Ctrl+G toggles the most-recent tool call's
             // expanded state (full args/result view).
+            // T012 (US2, FR-004): retargets to the FOCUSED pane (same
+            // self-retargeting mutator pattern as Ctrl+E above).
             KeyCode::Char('g') if ctrl => {
                 self.app.toggle_focused_tool_expand();
                 return None;
@@ -982,7 +1102,11 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             KeyCode::Char('p') if ctrl => {
                 if self.app.focused_subagent.is_some() {
                     self.app.focus_subagent(None);
-                    self.app.pane_stats_view = None; // re-pin stats to the live tail
+                    // T004: stats anchors are per-pane — with no pane
+                    // focused this is a no-op, so the departed pane KEEPS
+                    // its own scroll across focus switches (FR-010); there
+                    // is no shared anchor left to reset.
+                    self.app.set_focused_pane_stats_view(None);
                 }
                 return None;
             }
@@ -999,13 +1123,45 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             // ── Maximized terminal output viewer ──────────────────────
             // Ctrl+O toggles it: targets the most recent terminal item
             // (running or finished — a finished one replays its full output).
+            // T020 (US4, FR-006/FR-008, D6): target-agnostic — the shared
+            // viewer widget resolves its SOURCE from the transcript target
+            // (the focused pane's transcript when one is focused, the main
+            // transcript otherwise), so the same key serves both views.
+            // The App mutator resolves the OPEN against the main
+            // transcript; when main holds no tool at all but the focused
+            // pane does, open directly so Ctrl+O never silently no-ops on
+            // a pane view.
             KeyCode::Char('o') if ctrl => {
+                let was_open = self.app.output_viewer_open;
                 self.app.toggle_output_viewer(None);
+                if !was_open && !self.app.output_viewer_open {
+                    // The mutator found no MAIN tool to open on. When a pane
+                    // is focused and ITS transcript holds a tool, open the
+                    // viewer anyway — the widget resolves the pane source at
+                    // render time (`output_viewer_index` stays None; it is
+                    // main-transcript-indexed and meaningless for a pane).
+                    let pane_has_tool = self
+                        .app
+                        .focused_pane()
+                        .map(|p| {
+                            p.transcript.iter().any(|it| matches!(it, TranscriptItem::Tool { .. }))
+                        })
+                        .unwrap_or(false);
+                    if pane_has_tool {
+                        self.app.output_viewer_open = true;
+                        self.app.output_viewer_index = None;
+                        self.app.output_viewer_view = None;
+                    }
+                }
                 return None;
             }
             // ── Agent stats page ───────────────────────────────────────
             // Ctrl+A toggles the maximized stats/context page (same view
-            // as clicking the header's right section).
+            // as clicking the header's right section). NOT gated on the
+            // T003 resolver: the stats page retargets ITSELF to the focused
+            // pane (T004 per-pane state; the stats key-branch above routes
+            // through the same resolver), so Ctrl+A stays target-agnostic —
+            // gating it here would regress the existing pane-stats parity.
             KeyCode::Char('a') if ctrl => {
                 self.app.toggle_stats();
                 return None;
@@ -1024,10 +1180,36 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 };
                 return None;
             }
+            // Subagent rail scrolling (Alt+Up / Alt+Down) — scrolls the
+            // right rail's tab window by one pane, making overflow tabs
+            // reachable regardless of focus mode. Bound ABOVE the Up-key
+            // history-recall arm (which would otherwise swallow Alt+Up on
+            // a single-line input). When NeuroCode is also active, panes
+            // take priority (the rail keeps its wheel route regardless).
+            KeyCode::Up
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    && !self.app.subagent_panes.is_empty() =>
+            {
+                self.app.subagent_rail_scroll_up(1);
+                return None;
+            }
+            KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    && !self.app.subagent_panes.is_empty() =>
+            {
+                self.app.subagent_rail_scroll_down(1);
+                return None;
+            }
             // When in Input focus, Shift+Up switches to Transcript scroll mode.
+            // T007 (US1): the 1-line scroll routes through the single
+            // resolver so a focused pane's transcript moves, not the main
+            // one; the focus switch itself is target-agnostic.
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.focus = Focus::Transcript;
-                self.app.scroll_up(1);
+                match self.resolve_transcript_target() {
+                    TranscriptTarget::Pane(_) => self.app.pane_scroll_up(1),
+                    TranscriptTarget::Main => self.app.scroll_up(1),
+                }
                 return None;
             }
             // T031/T146: Plain Up (no modifier) on single-line input switches
@@ -1072,7 +1254,11 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 return None;
             }
             KeyCode::PageUp => {
-                self.app.scroll_up(10);
+                // T003 (D3): route through the single resolver.
+                match self.resolve_transcript_target() {
+                    TranscriptTarget::Pane(_) => self.app.pane_scroll_up(10),
+                    TranscriptTarget::Main => self.app.scroll_up(10),
+                }
                 // Switch to transcript focus so the user sees j/k are available.
                 if self.focus == Focus::Input {
                     self.focus = Focus::Transcript;
@@ -1090,9 +1276,23 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 return None;
             }
             KeyCode::PageDown => {
-                self.app.scroll_down(10);
+                // T003 (D3): route through the single resolver. T007 (US1):
+                // the at-bottom focus return reads the TARGET's anchor —
+                // the focused pane's scroll when a pane is targeted, the
+                // main anchor otherwise (Main arm keeps the exact
+                // pre-indirection behavior).
+                let at_bottom = match self.resolve_transcript_target() {
+                    TranscriptTarget::Pane(_) => {
+                        self.app.pane_scroll_down(10);
+                        self.app.focused_pane().map_or(true, |p| p.scroll.is_none())
+                    }
+                    TranscriptTarget::Main => {
+                        self.app.scroll_down(10);
+                        self.app.scroll.is_none()
+                    }
+                };
                 // If we've reached the bottom, return focus to input.
-                if self.app.scroll.is_none() {
+                if at_bottom {
                     self.focus = Focus::Input;
                 }
                 return None;
@@ -1101,7 +1301,11 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             // to avoid clobbering the input editor's kill commands).
             KeyCode::Char('b') if ctrl => {
                 let half = 15usize;
-                self.app.scroll_up(half);
+                // T003 (D3): route through the single resolver.
+                match self.resolve_transcript_target() {
+                    TranscriptTarget::Pane(_) => self.app.pane_scroll_up(half),
+                    TranscriptTarget::Main => self.app.scroll_up(half),
+                }
                 if self.focus == Focus::Input {
                     self.focus = Focus::Transcript;
                 }
@@ -1109,8 +1313,20 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             }
             KeyCode::Char('f') if ctrl => {
                 let half = 15usize;
-                self.app.scroll_down(half);
-                if self.app.scroll.is_none() {
+                // T003 (D3): route through the single resolver. T007 (US1):
+                // the at-bottom focus return reads the TARGET's anchor (the
+                // pane's scroll when one is focused), matching PageDown.
+                let at_bottom = match self.resolve_transcript_target() {
+                    TranscriptTarget::Pane(_) => {
+                        self.app.pane_scroll_down(half);
+                        self.app.focused_pane().map_or(true, |p| p.scroll.is_none())
+                    }
+                    TranscriptTarget::Main => {
+                        self.app.scroll_down(half);
+                        self.app.scroll.is_none()
+                    }
+                };
+                if at_bottom {
                     self.focus = Focus::Input;
                 }
                 return None;
@@ -1121,58 +1337,140 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // Focus-dependent keys.
         match self.focus {
             Focus::Transcript => {
-                // Parallel-subagent feature: when a pane is focused, j/k and
-                // PgUp/PgDn scroll the pane's transcript instead.
-                let pane_focused = self.app.focused_subagent.is_some();
+                // T003 (D1/D3): single routing point for transcript-targeted
+                // keys. `Main` keeps the exact pre-indirection behavior
+                // (byte-identical when no pane is focused); `Pane` arms route
+                // to the focused pane's transcript. Search keys ('/'/n/N,
+                // T016) and copy (y/Y, T017) are wired through the same
+                // target resolution — search via the T015 focus-follow
+                // mutators.
+                let target = self.resolve_transcript_target();
                 match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if pane_focused {
-                            self.app.pane_scroll_up(1);
-                        } else {
-                            self.app.scroll_up(1);
+                    KeyCode::Up | KeyCode::Char('k') => match target {
+                        TranscriptTarget::Pane(_) => self.app.pane_scroll_up(1),
+                        TranscriptTarget::Main => self.app.scroll_up(1),
+                    },
+                    KeyCode::Down | KeyCode::Char('j') => match target {
+                        TranscriptTarget::Pane(_) => self.app.pane_scroll_down(1),
+                        TranscriptTarget::Main => self.app.scroll_down(1),
+                    },
+                    // T003 routes g/G/Home/End through the resolver too — this
+                    // naturally fixes the FR-002 misroute where they hit the
+                    // MAIN transcript even with a pane focused (full
+                    // affordance parity is T007; pane scroll_to_top needs a
+                    // max bound, so top pins to the render-time bound).
+                    KeyCode::Char('g') | KeyCode::Home => match target {
+                        TranscriptTarget::Pane(_) => {
+                            // Top = max scroll offset (render-recorded bound).
+                            let max = self.app.last_pane_max_scroll.get();
+                            if let Some(pane) = self.app.focused_pane_mut() {
+                                pane.scroll = Some(max);
+                            }
                         }
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if pane_focused {
-                            self.app.pane_scroll_down(1);
-                        } else {
-                            self.app.scroll_down(1);
+                        TranscriptTarget::Main => self.app.scroll_to_top(),
+                    },
+                    KeyCode::Char('G') | KeyCode::End => match target {
+                        TranscriptTarget::Pane(_) => {
+                            // Bottom = auto-follow.
+                            if let Some(pane) = self.app.focused_pane_mut() {
+                                pane.scroll = None;
+                            }
                         }
-                    }
-                    KeyCode::Char('g') | KeyCode::Home => self.app.scroll_to_top(),
-                    KeyCode::Char('G') | KeyCode::End => self.app.scroll_to_bottom(),
+                        TranscriptTarget::Main => self.app.scroll_to_bottom(),
+                    },
                     // Space / x: expand-toggle the item at the TOP of the
                     // viewport (mouse clicks also toggle, via hit-testing).
                     // Scroll so the tool/terminal block you want is the top
                     // visible item, then press Space/x.
                     KeyCode::Char(' ') | KeyCode::Char('x') => {
-                        // Expand the item under the viewport — reuse the
-                        // mouse hit-test resolution at the CENTER row of
-                        // the transcript (same machinery clicks use, so
-                        // keyboard and mouse always agree). When the center
-                        // lands on a non-expandable item, fall back to the
-                        // first expandable item at or below the top of the
-                        // view (the common "whole transcript fits" case:
-                        // Space expands the tool output you can see).
-                        let (_tx, ty, _tw, th) = self.app.last_text_area.get();
-                        let center_row = ty + th / 2;
-                        let center_col = 4; // inside the text area
-                        let idx = widgets::transcript_hit_test(
-                            &self.app, self.theme, center_row, center_col,
-                        );
-                        let resolved = match idx {
-                            Some(i) if self.app.item_is_expandable(i) => Some(i),
-                            _ => {
-                                let top = widgets::transcript_item_at_top(&self.app, self.theme);
-                                match top {
-                                    Some(t0) => (t0..self.app.transcript.len())
-                                        .find(|&i| self.app.item_is_expandable(i)),
-                                    None => None,
+                        // T011 (US2, FR-003): routed via `target` — the Pane
+                        // arm mirrors the Main arm's resolution strategy
+                        // (viewport-center hit-test via the shared
+                        // `transcript_hit_test_core`, then the first-expandable-
+                        // at/below-top fallback), just reading the focused
+                        // pane's transcript and geometry.
+                        match target {
+                            TranscriptTarget::Pane(_) => {
+                                let (tx, ty, tw, th) = self.app.last_pane_text_area.get();
+                                let center_row = ty + th / 2;
+                                let max = self.app.last_pane_max_scroll.get();
+                                let area = (tx, ty, tw, th);
+                                let resolved = self
+                                    .app
+                                    .focused_pane()
+                                    .and_then(|pane| {
+                                        // Center row first (same machinery
+                                        // pane clicks use, so keyboard and
+                                        // mouse always agree).
+                                        widgets::transcript_hit_test_core(
+                                            &pane.transcript,
+                                            &pane.streaming_assistant,
+                                            pane.scroll,
+                                            max,
+                                            area,
+                                            self.theme,
+                                            center_row,
+                                        )
+                                        .filter(|&i| pane_item_is_expandable(&pane.transcript[i]))
+                                    })
+                                    .or_else(|| {
+                                        // Fall back to the first expandable
+                                        // item at or below the top of the
+                                        // view (the "whole transcript fits"
+                                        // case), mirroring the Main arm.
+                                        self.app.focused_pane().and_then(|pane| {
+                                            let top = widgets::transcript_hit_test_core(
+                                                &pane.transcript,
+                                                &pane.streaming_assistant,
+                                                pane.scroll,
+                                                max,
+                                                area,
+                                                self.theme,
+                                                ty,
+                                            );
+                                            top.and_then(|t0| {
+                                                (t0..pane.transcript.len()).find(|&i| {
+                                                    pane_item_is_expandable(&pane.transcript[i])
+                                                })
+                                            })
+                                        })
+                                    });
+                                if let Some(i) = resolved {
+                                    if let Some(p) = self.app.focused_pane_mut() {
+                                        p.toggle_item_expand(i);
+                                    }
                                 }
                             }
-                        };
-                        if let Some(i) = resolved {
-                            self.app.toggle_item_expand_by_index(i);
+                            TranscriptTarget::Main => {
+                                // Expand the item under the viewport — reuse the
+                                // mouse hit-test resolution at the CENTER row of
+                                // the transcript (same machinery clicks use, so
+                                // keyboard and mouse always agree). When the center
+                                // lands on a non-expandable item, fall back to the
+                                // first expandable item at or below the top of the
+                                // view (the common "whole transcript fits" case:
+                                // Space expands the tool output you can see).
+                                let (_tx, ty, _tw, th) = self.app.last_text_area.get();
+                                let center_row = ty + th / 2;
+                                let center_col = 4; // inside the text area
+                                let idx = widgets::transcript_hit_test(
+                                    &self.app, self.theme, center_row, center_col,
+                                );
+                                let resolved = match idx {
+                                    Some(i) if self.app.item_is_expandable(i) => Some(i),
+                                    _ => {
+                                        let top = widgets::transcript_item_at_top(&self.app, self.theme);
+                                        match top {
+                                            Some(t0) => (t0..self.app.transcript.len())
+                                                .find(|&i| self.app.item_is_expandable(i)),
+                                            None => None,
+                                        }
+                                    }
+                                };
+                                if let Some(i) = resolved {
+                                    self.app.toggle_item_expand_by_index(i);
+                                }
+                            }
                         }
                     }
                     KeyCode::Enter => {
@@ -1182,41 +1480,88 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                     KeyCode::Char('?') => self.show_help = true,
                     KeyCode::Char('r') => self.toggle_reasoning(),
                     KeyCode::Char('/') => {
-                        // Enter search mode.
-                        self.app.search_open = true;
-                        self.app.search_query.clear();
+                        // Enter search mode. T016 (US3, FR-007, D5):
+                        // focus-follow — `open_search` routes the live bar
+                        // to the FOCUSED pane's per-view SearchState when
+                        // one is focused (fresh query, the orchestrator's
+                        // exact open semantics); no pane focused → Main,
+                        // byte-identical to before.
+                        self.open_search();
                     }
                     KeyCode::Char('n') => {
-                        // Find next match.
+                        // Find next match. T016: `search_next` focus-follows
+                        // (T015) — with a pane focused it walks THAT pane's
+                        // matches; the Main walk is byte-identical to before
+                        // (self-retargeting mutator, the T012 Ctrl+E/Ctrl+G
+                        // pattern — the arm stays target-agnostic).
                         self.app.search_next(true);
                     }
                     KeyCode::Char('N') => {
-                        // Find previous match.
+                        // Find previous match. T016: focus-follow
+                        // `search_next` (see 'n' above).
                         self.app.search_next(false);
                     }
                     // `y` copies the last assistant message to the clipboard
                     // (host handles the clipboard); `Y` copies the last user
                     // message. Works regardless of scroll position.
-                    KeyCode::Char('y') => {
-                        let idx = self
-                            .app
-                            .transcript
-                            .iter()
-                            .rposition(|i| matches!(i, TranscriptItem::Assistant { .. }));
-                        if let Some(idx) = idx {
-                            return Some(TuiAction::CopyItem(idx));
+                    // T003 routed these via `target`; T017 (D4) completes the
+                    // Pane arms: the same last-assistant/user resolution the
+                    // Main arm uses, but against the focused pane's
+                    // transcript, emitting `CopyPaneItem` (pane id +
+                    // pane-relative idx). The selection model is verbatim
+                    // from the orchestrator (no persistent cursor).
+                    KeyCode::Char('y') => match target {
+                        TranscriptTarget::Main => {
+                            let idx = self
+                                .app
+                                .transcript
+                                .iter()
+                                .rposition(|i| matches!(i, TranscriptItem::Assistant { .. }));
+                            if let Some(idx) = idx {
+                                return Some(TuiAction::CopyItem(idx));
+                            }
                         }
-                    }
-                    KeyCode::Char('Y') => {
-                        let idx = self
-                            .app
-                            .transcript
-                            .iter()
-                            .rposition(|i| matches!(i, TranscriptItem::User { .. }));
-                        if let Some(idx) = idx {
-                            return Some(TuiAction::CopyItem(idx));
+                        TranscriptTarget::Pane(pane_idx) => {
+                            if let Some(pane) = self.app.subagent_panes.get(pane_idx) {
+                                let idx = pane
+                                    .transcript
+                                    .iter()
+                                    .rposition(|i| matches!(i, TranscriptItem::Assistant { .. }));
+                                if let Some(idx) = idx {
+                                    return Some(TuiAction::CopyPaneItem {
+                                        pane: pane_idx,
+                                        idx,
+                                    });
+                                }
+                            }
                         }
-                    }
+                    },
+                    KeyCode::Char('Y') => match target {
+                        TranscriptTarget::Main => {
+                            let idx = self
+                                .app
+                                .transcript
+                                .iter()
+                                .rposition(|i| matches!(i, TranscriptItem::User { .. }));
+                            if let Some(idx) = idx {
+                                return Some(TuiAction::CopyItem(idx));
+                            }
+                        }
+                        TranscriptTarget::Pane(pane_idx) => {
+                            if let Some(pane) = self.app.subagent_panes.get(pane_idx) {
+                                let idx = pane
+                                    .transcript
+                                    .iter()
+                                    .rposition(|i| matches!(i, TranscriptItem::User { .. }));
+                                if let Some(idx) = idx {
+                                    return Some(TuiAction::CopyPaneItem {
+                                        pane: pane_idx,
+                                        idx,
+                                    });
+                                }
+                            }
+                        }
+                    },
                     // Any other printable character returns focus to input
                     // and is injected there, so the user doesn't have to
                     // press Ctrl+T before typing.
@@ -1508,8 +1853,10 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             KeyCode::Char('s') if ctrl => {
                 // Ctrl+S opens transcript search (the `/` key in input mode
                 // now opens the slash-command popup instead).
-                self.app.search_open = true;
-                self.app.search_query.clear();
+                // T016 (D3): routed via the single resolver — focus-follow
+                // `open_search` targets the FOCUSED pane's SearchState when
+                // one is focused; otherwise Main, byte-identical to before.
+                self.open_search();
                 None
             }
             KeyCode::Char('?') if self.input.is_empty() && !ctrl => {
@@ -1533,11 +1880,19 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     }
 
     /// Handle keys in the search bar.
+    ///
+    /// T016 (US3, FR-007, design D5): the live bar edits
+    /// `App::search_query`; the T015 focus-follow `run_search`/
+    /// `search_next` carry it into the FOCUSED pane's per-view SearchState
+    /// (query preserved, match indicator + pin set on the pane; the
+    /// orchestrator's own search state untouched) or run the
+    /// orchestrator's walk when no pane is focused (byte-identical to the
+    /// pre-pane behavior, constitution VII). The rendered indicator
+    /// mirrors the TARGET view (`draw_search_bar` routes it).
     fn handle_search_key(&mut self, key: KeyEvent) -> Option<TuiAction> {
         match key.code {
             KeyCode::Esc => {
-                self.app.search_open = false;
-                self.app.search_query.clear();
+                self.close_search();
                 None
             }
             KeyCode::Enter => {
@@ -1568,6 +1923,36 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         }
     }
 
+    /// T016 (D5): open the search bar. The live latch + query live at App
+    /// level (the orchestrator's exact open semantics — fresh query); when
+    /// a pane is focused, the latch mirrors onto that pane's per-view
+    /// SearchState (FR-010: the pane remembers its bar across focus
+    /// switches) and every subsequent `run_search`/n/N targets the pane's
+    /// transcript via the T015 focus-follow mutators.
+    fn open_search(&mut self) {
+        self.app.search_open = true;
+        self.app.search_query.clear();
+        if let Some(pane) = self.app.focused_pane_mut() {
+            pane.search_open = true;
+            pane.search_query.clear();
+        }
+    }
+
+    /// T016 (D5): close the search bar — the orchestrator's close
+    /// semantics (latch off, live query cleared) applied to the App latch
+    /// AND every pane's mirror (the live bar is a singleton overlay, so at
+    /// most the focused pane's mirror is on). The panes' preserved
+    /// query/indicator/pin from the last run stay where the user navigated
+    /// (same as the orchestrator keeping its scroll after close).
+    fn close_search(&mut self) {
+        self.app.search_open = false;
+        self.app.search_query.clear();
+        for pane in &mut self.app.subagent_panes {
+            pane.search_open = false;
+            pane.search_query.clear();
+        }
+    }
+
     /// Handle a mouse event for scroll wheel support.
     ///
     /// Call this from the host when a MouseEvent is received. Enables mouse
@@ -1575,10 +1960,37 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// NeuroCode context panel or the live reasoning panel (docked or
     /// expanded), the wheel scrolls that panel instead of the transcript.
     pub fn handle_mouse_scroll(&mut self, row: u16, col: u16, delta_up: bool) {
+        // Subagent rail window scrolling: the wheel over the rail strip
+        // (right edge) scrolls its tab list — even while a pane is focused
+        // (the rail has priority over the pane transcript for pointer
+        // events within its own columns). Checked first so it never leaks
+        // into the pane/main scroll paths below.
+        {
+            let (x, y, w, h) = self.app.last_subagent_rail_rect.get();
+            if w > 0
+                && h > 0
+                && row >= y
+                && row < y + h
+                && col >= x
+                && col < x + w
+                && !self.app.subagent_panes.is_empty()
+            {
+                if delta_up {
+                    self.app.subagent_rail_scroll_up(3);
+                } else {
+                    self.app.subagent_rail_scroll_down(3);
+                }
+                return;
+            }
+        }
         // Parallel-subagent feature: the pane stats page + pane transcript
         // are the retargeted views when a pane is focused — check their
-        // rects before the main-screen equivalents.
-        if self.app.focused_subagent.is_some() {
+        // rects before the main-screen equivalents. T007 (US1): gated on
+        // the single routing point (D3 — no scattered focused_subagent
+        // checks), and the pane-transcript arm mirrors the orchestrator's
+        // wheel semantics: up from Input switches to Transcript scroll
+        // focus, reaching the bottom (follow-tail) returns focus to Input.
+        if matches!(self.resolve_transcript_target(), TranscriptTarget::Pane(_)) {
             {
                 let (x, y, w, h) = self.app.last_pane_stats_rect.get();
                 if w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w {
@@ -1595,8 +2007,14 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 if w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w {
                     if delta_up {
                         self.app.pane_scroll_up(3);
+                        if self.focus == Focus::Input {
+                            self.focus = Focus::Transcript;
+                        }
                     } else {
                         self.app.pane_scroll_down(3);
+                        if self.app.focused_pane().map_or(true, |p| p.scroll.is_none()) {
+                            self.focus = Focus::Input;
+                        }
                     }
                     return;
                 }
@@ -1725,7 +2143,9 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // again returns to the orchestrator view.
         if self.app.orchestrator_tab_hit(row, col) {
             self.app.focus_subagent(None);
-            self.app.pane_stats_view = None; // re-pin stats to the live tail
+            // T004: per-pane stats anchors — no shared anchor to reset; the
+            // departed pane keeps its scroll (FR-010).
+            self.app.set_focused_pane_stats_view(None);
             return;
         }
         if let Some(idx) = self.app.subagent_tab_hit(row, col) {
@@ -1735,7 +2155,9 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 Some(idx)
             };
             self.app.focus_subagent(target);
-            self.app.pane_stats_view = None; // re-pin stats to the live tail
+            // T004: per-pane stats anchors — the newly focused pane keeps its
+            // own scroll; no shared reset (FR-010).
+            self.app.set_focused_pane_stats_view(None);
             return;
         }
         // Header right section (model/session/status): opens the maximized
@@ -2613,6 +3035,105 @@ mod stats_page_key_tests {
         });
         assert!(t.app.stats_open, "still open after a snapshot");
         assert_eq!(t.app.context_entries.len(), 1);
+    }
+
+    /// Alt+Down / Alt+Up scroll the subagent rail window (scrollable-rail
+    /// feature); plain j/k pane-scroll behavior is unchanged.
+    #[test]
+    fn alt_arrows_scroll_subagent_rail() {
+        let mut t = tui();
+        for i in 0..12 {
+            t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+                id: 1 + i,
+                goal: format!("goal-{i}"),
+                model: "m".into(),
+                toolset_summary: "file".into(),
+                depth: 0,
+            });
+        }
+        // Simulate the geometry a rendered frame records (clamped max).
+        t.app.last_subagent_rail_max_scroll.set(7);
+        let alt_down = KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::ALT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        let alt_up = KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::ALT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert_eq!(t.app.subagent_rail_scroll, 0);
+        t.handle_key(alt_down);
+        assert_eq!(t.app.subagent_rail_scroll, 1, "Alt+Down scrolled down 1 pane");
+        t.handle_key(alt_down);
+        assert_eq!(t.app.subagent_rail_scroll, 2);
+        t.handle_key(alt_up);
+        assert_eq!(t.app.subagent_rail_scroll, 1, "Alt+Up scrolled back up");
+        // Clamps at 0 and max.
+        t.handle_key(alt_up);
+        t.handle_key(alt_up);
+        t.handle_key(alt_up);
+        assert_eq!(t.app.subagent_rail_scroll, 0, "clamped at 0");
+        for _ in 0..20 {
+            t.handle_key(alt_down);
+        }
+        assert_eq!(t.app.subagent_rail_scroll, 7, "clamped at recorded max");
+        // Existing j/k pane-scroll behavior unchanged: with no pane focused
+        // (input focus), Alt+arrows never leaked 'j'/'k' into the input.
+        assert_eq!(t.input.text(), "", "no chars leaked into the input");
+    }
+
+    /// Alt+arrows must NOT claim the keys when no subagent panes exist —
+    /// NeuroCode's Alt-scroll (and plain typing) keeps working.
+    #[test]
+    fn alt_arrows_idle_without_panes() {
+        let mut t = tui();
+        t.app.last_subagent_rail_max_scroll.set(0);
+        t.handle_key(KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::ALT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(t.app.subagent_rail_scroll, 0, "no panes → no rail scroll");
+    }
+
+    /// Mouse wheel over the rail rect scrolls the rail — both with and
+    /// without a focused pane; elsewhere the transcript keeps the wheel.
+    #[test]
+    fn wheel_over_rail_rect_scrolls_rail() {
+        let mut t = tui();
+        for i in 0..12 {
+            t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+                id: 1 + i,
+                goal: format!("goal-{i}"),
+                model: "m".into(),
+                toolset_summary: "file".into(),
+                depth: 0,
+            });
+        }
+        t.app.last_subagent_rail_max_scroll.set(7);
+        // Simulate the rail drawn on the right edge (101..120 cols).
+        t.app.last_subagent_rail_rect.set((101, 1, 19, 28));
+        t.handle_mouse_scroll(10, 110, false);
+        assert_eq!(t.app.subagent_rail_scroll, 3, "wheel down over rail +3 panes");
+        t.handle_mouse_scroll(10, 110, true);
+        assert_eq!(t.app.subagent_rail_scroll, 0, "wheel up clamped back to 0");
+        // Rail priority holds even while a pane is focused.
+        t.app.focus_subagent(Some(0));
+        t.app.last_pane_text_area.set((0, 1, 100, 28));
+        t.handle_mouse_scroll(10, 110, false);
+        assert_eq!(
+            t.app.subagent_rail_scroll, 3,
+            "wheel over rail wins over the pane transcript"
+        );
+        // Wheel outside the rail still drives the pane transcript.
+        t.app.subagent_rail_scroll = 0;
+        t.handle_mouse_scroll(10, 50, false);
+        assert_eq!(t.app.subagent_rail_scroll, 0, "outside wheel untouched the rail");
     }
 }
 
@@ -3575,6 +4096,1412 @@ mod reasoning_expand_tests {
             }
             // Always assert the invariant: reasoning text present.
             assert!(buffer_text(&tui).contains("reasoning line"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod transcript_routing_tests {
+    //! T003 (D1/D3, constitution VII): the focused-pane action-routing
+    //! indirection. One resolver (`Tui::resolve_transcript_target` reading
+    //! `App.focused_subagent`) feeds every transcript-targeted key handler.
+    //! These pin the MECHANISM only: Main resolution when unfocused (even
+    //! with panes present), Pane resolution when focused, and one
+    //! representative key per family dispatching through it. Full per-story
+    //! behavior belongs to the T006+ suites.
+    use super::*;
+    use crate::state::{ReasoningExpandState, ToolStatus};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::backend::TestBackend;
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn tui() -> Tui<TestBackend> {
+        let app = App::new("sess", "model");
+        let terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        Tui::new_for_test(app, Theme::aurora(), terminal)
+    }
+
+    fn spawn_pane(t: &mut Tui<TestBackend>, id: u64, goal: &str) {
+        t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id,
+            goal: goal.into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+    }
+
+    /// (a) The single routing point resolves Main whenever
+    /// `focused_subagent == None` — panes existing is irrelevant — and the
+    /// focused pane's index otherwise.
+    #[test]
+    fn resolver_main_when_unfocused_even_with_panes() {
+        let mut t = tui();
+        spawn_pane(&mut t, 1, "child one");
+        spawn_pane(&mut t, 2, "child two");
+        assert_eq!(
+            t.resolve_transcript_target(),
+            TranscriptTarget::Main,
+            "panes exist but none focused → Main"
+        );
+        t.app.focus_subagent(Some(1));
+        assert_eq!(t.resolve_transcript_target(), TranscriptTarget::Pane(1));
+        t.app.focus_subagent(Some(0));
+        assert_eq!(t.resolve_transcript_target(), TranscriptTarget::Pane(0));
+        t.app.focus_subagent(None);
+        assert_eq!(
+            t.resolve_transcript_target(),
+            TranscriptTarget::Main,
+            "back to orchestrator → Main"
+        );
+    }
+
+    /// (c-scroll) `g`/`G` dispatch through the indirection: Main arm is
+    /// byte-identical (scroll_to_top/scroll_to_bottom on the main anchor);
+    /// Pane arm retargets (the FR-002 misroute fix falls out of routing
+    /// through the resolver).
+    #[test]
+    fn scroll_g_dispatches_through_indirection() {
+        let mut t = tui();
+        spawn_pane(&mut t, 1, "child");
+        t.app.last_max_scroll.set(40);
+        t.focus = Focus::Transcript;
+        // None case: main transcript to top, pane untouched.
+        t.handle_key(plain(KeyCode::Char('g')));
+        assert_eq!(t.app.scroll, Some(40), "g scrolled MAIN to top (Main arm)");
+        assert_eq!(t.app.subagent_panes[0].scroll, None, "pane scroll untouched");
+        // Pane case: g/G route to the focused pane's transcript.
+        t.app.last_pane_max_scroll.set(12);
+        t.app.focus_subagent(Some(0));
+        t.handle_key(plain(KeyCode::Char('g')));
+        assert_eq!(t.app.subagent_panes[0].scroll, Some(12), "g scrolled the PANE to top");
+        assert_eq!(t.app.scroll, Some(40), "main anchor untouched by pane-targeted g");
+        t.handle_key(plain(KeyCode::Char('G')));
+        assert_eq!(t.app.subagent_panes[0].scroll, None, "G re-pinned the PANE to auto-follow");
+    }
+
+    /// (c-expand) Space dispatches through the indirection: Main arm keeps
+    /// the exact pre-indirection expand behavior; the Pane arm (T011) now
+    /// retargets to the focused pane — with an empty pane/geometry here it
+    /// naturally no-ops and leaves main state untouched (the pane cycle
+    /// itself is pinned in `pane_expand_key_routing_tests`).
+    #[test]
+    fn expand_space_dispatches_through_indirection() {
+        let mut t = tui();
+        // Spawn the pane FIRST: apply(SubagentSpawn) appends a Notice item
+        // to the main transcript, which would otherwise sit at back().
+        spawn_pane(&mut t, 1, "child");
+        t.app.push_item(TranscriptItem::Tool {
+            name: "read_file".into(),
+            emoji: "📄".into(),
+            summary: "path=/tmp/x".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: "1\n2\n3".into(),
+            expand_state: ReasoningExpandState::Collapsed,
+            full_args: None,
+            full_result: Some("full output".into()),
+            is_terminal: false,
+            exit_code: None,
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
+        });
+        t.app.last_text_area.set((0, 0, 98, 28));
+        t.focus = Focus::Transcript;
+        // None case (pane present, unfocused): MAIN item expands as before.
+        t.handle_key(plain(KeyCode::Char(' ')));
+        let expanded = matches!(
+            t.app.transcript.back(),
+            Some(TranscriptItem::Tool { expand_state: ReasoningExpandState::TailWindow | ReasoningExpandState::Full, .. })
+        );
+        assert!(expanded, "Space expanded the MAIN item (Main arm)");
+        // Pane case: routed to the Pane arm → no-op, main state untouched.
+        t.app.focus_subagent(Some(0));
+        t.handle_key(plain(KeyCode::Char(' ')));
+        let still_expanded = matches!(
+            t.app.transcript.back(),
+            Some(TranscriptItem::Tool { expand_state: ReasoningExpandState::TailWindow | ReasoningExpandState::Full, .. })
+        );
+        assert!(still_expanded, "pane-focused Space no-ops (expand story pending)");
+    }
+
+    /// (c-copy) `y` dispatches through the indirection: Main arm still
+    /// emits `CopyItem(last assistant)`; the Pane arm resolves against
+    /// the pane transcript (T017) — this pane's transcript is EMPTY, so
+    /// there is no assistant item and no action fires.
+    #[test]
+    fn copy_y_dispatches_through_indirection() {
+        let mut t = tui();
+        t.app.push_item(TranscriptItem::User { text: "u".into() });
+        t.app.push_item(TranscriptItem::Assistant { text: "a".into() });
+        spawn_pane(&mut t, 1, "child");
+        t.focus = Focus::Transcript;
+        let idx = t
+            .app
+            .transcript
+            .iter()
+            .rposition(|i| matches!(i, TranscriptItem::Assistant { .. }))
+            .expect("assistant item present");
+        // None case: y emits CopyItem(last assistant) exactly as before.
+        assert!(matches!(t.handle_key(plain(KeyCode::Char('y'))), Some(TuiAction::CopyItem(i)) if i == idx));
+        // Pane case with an EMPTY pane transcript: no pane assistant item
+        // → no clipboard action (CopyPaneItem needs something to resolve).
+        t.app.focus_subagent(Some(0));
+        assert!(
+            t.handle_key(plain(KeyCode::Char('y'))).is_none(),
+            "pane-focused y with empty pane transcript emits nothing"
+        );
+    }
+
+    /// T017 (D4): with a pane focused, `y`/`Y` resolve against the PANE
+    /// transcript and emit `CopyPaneItem { pane, idx }` with a
+    /// pane-relative idx pointing at the pane's last assistant/user item —
+    /// never a main-transcript `CopyItem` (which would copy the wrong
+    /// text). With `focused_subagent == None` the main `CopyItem` path is
+    /// unchanged (non-regression pin, constitution VII).
+    #[test]
+    fn copy_y_pane_emits_copy_pane_item_and_main_path_unchanged() {
+        let mut t = tui();
+        // Main: last assistant is "main secret" at idx 1.
+        t.app.push_item(TranscriptItem::User { text: "main q".into() });
+        t.app.push_item(TranscriptItem::Assistant { text: "main secret".into() });
+        // Pane 0: distinct texts; last assistant is idx 1, last user idx 2.
+        spawn_pane(&mut t, 1, "child");
+        let pane = &mut t.app.subagent_panes[0];
+        pane.push_item(TranscriptItem::User { text: "pane q".into() });
+        pane.push_item(TranscriptItem::Assistant { text: "pane secret".into() });
+        pane.push_item(TranscriptItem::User { text: "pane tail".into() });
+        t.focus = Focus::Transcript;
+
+        // Focused pane: y → CopyPaneItem { pane: 0, idx: 1 } (pane-relative).
+        t.app.focus_subagent(Some(0));
+        assert!(
+            matches!(
+                t.handle_key(plain(KeyCode::Char('y'))),
+                Some(TuiAction::CopyPaneItem { pane: 0, idx: 1 })
+            ),
+            "pane-focused y resolves the PANE's last assistant (idx 1), \
+             not the main one"
+        );
+        // Focused pane: Y → CopyPaneItem { pane: 0, idx: 2 } (last pane user).
+        assert!(
+            matches!(
+                t.handle_key(plain(KeyCode::Char('Y'))),
+                Some(TuiAction::CopyPaneItem { pane: 0, idx: 2 })
+            ),
+            "pane-focused Y resolves the PANE's last user (idx 2)"
+        );
+
+        // Non-regression: unfocused → CopyItem(main last assistant), the
+        // pre-T017 behavior byte-for-byte.
+        t.app.focus_subagent(None);
+        let main_idx = t
+            .app
+            .transcript
+            .iter()
+            .rposition(|i| matches!(i, TranscriptItem::Assistant { .. }))
+            .expect("main assistant present");
+        assert_eq!(main_idx, 1);
+        assert!(
+            matches!(
+                t.handle_key(plain(KeyCode::Char('y'))),
+                Some(TuiAction::CopyItem(i)) if i == main_idx
+            ),
+            "unfocused y still emits CopyItem(main last assistant)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pane_scroll_key_routing_tests {
+    //! T007 (US1, FR-002): every scroll-key family routes to the FOCUSED
+    //! pane through the single resolver — half/page scrolls with the
+    //! at-bottom focus return reading the TARGET's anchor, and the mouse
+    //! wheel over the pane transcript area with the orchestrator's wheel
+    //! focus semantics. Negative pins: unfocused (focused_subagent == None)
+    //! leaves pane scroll untouched (the T005 subagent_panes suite pins the
+    //! main-arm direction; these pin the pane side).
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::backend::TestBackend;
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn ctrl_key(c: char) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn shift_up() -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn tui() -> Tui<TestBackend> {
+        let app = App::new("sess", "model");
+        let terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        Tui::new_for_test(app, Theme::aurora(), terminal)
+    }
+
+    fn spawn_and_focus(t: &mut Tui<TestBackend>) {
+        t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "child".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+        t.app.focus_subagent(Some(0));
+        // Render-time pane bound, as the pane widget would record.
+        t.app.last_pane_max_scroll.set(40);
+    }
+
+    /// Ctrl+B / Ctrl+F move the focused pane 15 lines (clamped at the
+    /// render-time bound / follow-tail at the bottom), and Ctrl+F's
+    /// at-bottom focus return fires on the PANE anchor, not the main one.
+    #[test]
+    fn ctrl_b_ctrl_f_scroll_focused_pane_and_clamp() {
+        let mut t = tui();
+        spawn_and_focus(&mut t);
+        t.handle_key(ctrl_key('b'));
+        assert_eq!(
+            t.app.subagent_panes[0].scroll,
+            Some(15),
+            "Ctrl+B moved the pane up a half page"
+        );
+        assert_eq!(t.app.scroll, None, "main anchor untouched");
+        // Clamped at the render-time bound.
+        t.app.last_pane_max_scroll.set(20);
+        t.handle_key(ctrl_key('b'));
+        assert_eq!(t.app.subagent_panes[0].scroll, Some(20), "Ctrl+B clamps at max");
+        // Ctrl+F walks back down; reaching follow-tail returns focus to Input.
+        t.handle_key(ctrl_key('f'));
+        assert_eq!(t.app.subagent_panes[0].scroll, Some(5));
+        t.focus = Focus::Transcript;
+        t.handle_key(ctrl_key('f'));
+        assert_eq!(t.app.subagent_panes[0].scroll, None, "Ctrl+F clamps at follow-tail");
+        assert_eq!(t.focus, Focus::Input, "pane reached bottom → focus returns to Input");
+    }
+
+    /// PgUp / PgDn move the focused pane 10 lines; PgDn's at-bottom focus
+    /// return reads the PANE anchor (T007 fix — previously the main one).
+    #[test]
+    fn page_keys_scroll_focused_pane_with_target_anchored_focus_return() {
+        let mut t = tui();
+        spawn_and_focus(&mut t);
+        t.handle_key(plain(KeyCode::PageUp));
+        assert_eq!(t.app.subagent_panes[0].scroll, Some(10), "PgUp moved the pane 10 lines");
+        assert_eq!(t.app.scroll, None, "main anchor untouched");
+        t.handle_key(plain(KeyCode::PageDown));
+        assert_eq!(
+            t.app.subagent_panes[0].scroll,
+            None,
+            "PgDn by exactly the offset lands at follow-tail (scroll_down parity)"
+        );
+        // Main anchor is None the whole time, so the pre-T007 code would
+        // ALSO have flipped focus here — pin the pane side anyway: a
+        // second PgDn from scroll 0 clamps to follow-tail.
+        t.focus = Focus::Transcript;
+        t.handle_key(plain(KeyCode::PageDown));
+        assert_eq!(t.app.subagent_panes[0].scroll, None, "PgDn clamps at follow-tail");
+        assert_eq!(t.focus, Focus::Input, "pane at bottom → focus returns to Input");
+        // Contrast: pane still scrolled (Some) → focus must NOT return even
+        // though the MAIN anchor is None (the pre-T007 code read the main
+        // anchor here and would have wrongly flipped focus to Input).
+        t.app.last_pane_max_scroll.set(40);
+        t.handle_key(plain(KeyCode::PageUp));
+        t.handle_key(plain(KeyCode::PageUp));
+        assert_eq!(t.app.subagent_panes[0].scroll, Some(20));
+        t.handle_key(plain(KeyCode::PageDown)); // 20 → 10, still pinned
+        assert_eq!(t.app.subagent_panes[0].scroll, Some(10));
+        assert_eq!(
+            t.focus,
+            Focus::Transcript,
+            "pane still scrolled → focus stays (main anchor is None but irrelevant)"
+        );
+    }
+
+    /// Shift+Up scrolls the FOCUSED PANE 1 line (T007 fix — previously
+    /// always the main transcript) while switching to Transcript focus.
+    #[test]
+    fn shift_up_scrolls_focused_pane_one_line() {
+        let mut t = tui();
+        spawn_and_focus(&mut t);
+        t.handle_key(shift_up());
+        assert_eq!(t.focus, Focus::Transcript, "Shift+Up switches to transcript focus");
+        assert_eq!(t.app.subagent_panes[0].scroll, Some(1), "the PANE scrolled 1 line");
+        assert_eq!(t.app.scroll, None, "main anchor untouched");
+    }
+
+    /// Mouse wheel over the pane transcript area (focused pane) scrolls it
+    /// 3 lines per notch; up switches Input→Transcript focus, reaching the
+    /// bottom (follow-tail) returns focus to Input — the orchestrator's
+    /// wheel semantics, on the pane.
+    #[test]
+    fn wheel_over_pane_area_scrolls_focused_pane() {
+        let mut t = tui();
+        spawn_and_focus(&mut t);
+        t.app.last_pane_text_area.set((0, 2, 60, 20));
+        let (row, col) = (10u16, 30u16);
+        t.handle_mouse_scroll(row, col, true);
+        assert_eq!(t.app.subagent_panes[0].scroll, Some(3), "wheel-up scrolled the pane 3 lines");
+        assert_eq!(t.focus, Focus::Transcript, "wheel-up from Input switches to Transcript");
+        assert_eq!(t.app.scroll, None, "main anchor untouched");
+        t.handle_mouse_scroll(row, col, true);
+        assert_eq!(t.app.subagent_panes[0].scroll, Some(6));
+        // Wheel-down toward the bottom: 6-3=3, still pinned → focus kept.
+        t.handle_mouse_scroll(row, col, false);
+        assert_eq!(t.app.subagent_panes[0].scroll, Some(3));
+        assert_eq!(t.focus, Focus::Transcript, "still scrolled → focus stays on Transcript");
+        // Down past the bottom clamps to follow-tail and returns focus.
+        t.handle_mouse_scroll(row, col, false);
+        t.handle_mouse_scroll(row, col, false);
+        assert_eq!(t.app.subagent_panes[0].scroll, None, "wheel-down clamps at follow-tail");
+        assert_eq!(t.focus, Focus::Input, "pane at bottom → focus returns to Input");
+        // Clamped up: a huge bound keeps clamping to last_pane_max_scroll.
+        t.app.last_pane_max_scroll.set(4);
+        t.handle_mouse_scroll(row, col, true);
+        t.handle_mouse_scroll(row, col, true);
+        assert_eq!(
+            t.app.subagent_panes[0].scroll,
+            Some(4),
+            "wheel-up clamps at the render-time bound"
+        );
+    }
+
+    /// Negative: with focused_subagent == None the same keys leave the pane
+    /// scroll untouched — panes may exist, but the orchestrator view is
+    /// targeted (T005's subagent_panes suite pins the main-arm direction).
+    #[test]
+    fn unfocused_keys_leave_pane_scroll_untouched() {
+        let mut t = tui();
+        // Pane exists but is NOT focused.
+        t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "child".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+        t.app.last_pane_max_scroll.set(40);
+        t.app.last_max_scroll.set(40);
+        t.handle_key(ctrl_key('b'));
+        t.handle_key(plain(KeyCode::PageUp));
+        t.handle_key(shift_up());
+        assert_eq!(
+            t.app.subagent_panes[0].scroll,
+            None,
+            "pane scroll untouched while unfocused"
+        );
+        assert_eq!(t.app.scroll, Some(1 + 15 + 10), "main transcript scrolled (Main arms)");
+    }
+}
+
+#[cfg(test)]
+mod pane_expand_key_routing_tests {
+    //! T011 (US2, FR-003): the Space/x expand arm in `Tui::handle_key`
+    //! retargets to the FOCUSED pane. The Pane arm mirrors the Main arm's
+    //! resolution strategy — viewport-CENTER row hit-tested through the
+    //! shared `widgets::transcript_hit_test_core` (the same machinery pane
+    //! clicks use), falling back to the first expandable item at/below the
+    //! top-visible row — then toggles via `SubagentPane::toggle_item_expand`.
+    //! Integration tests can't construct `Tui` (`new_for_test` is
+    //! `#[cfg(test)]`-gated), so the ROUTING is pinned here; the underlying
+    //! three-state cycle + click hit-test parity is pinned by T010's
+    //! tests/pane_expand_parity.rs, and the unfocused Main-arm direction by
+    //! transcript_routing_tests::expand_space_dispatches_through_indirection.
+    use super::*;
+    use crate::state::{ReasoningExpandState, ToolStatus, LIVE_OUTPUT_CAPACITY};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::backend::TestBackend;
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn tui() -> Tui<TestBackend> {
+        let app = App::new("sess", "model");
+        let terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        Tui::new_for_test(app, Theme::aurora(), terminal)
+    }
+
+    fn spawn_pane(t: &mut Tui<TestBackend>) {
+        t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "child".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+    }
+
+    /// A completed Tool item with an `n`-line result (>200 exercises the
+    /// full Collapsed → TailWindow → Full → Collapsed cycle).
+    fn long_tool(n: usize) -> TranscriptItem {
+        let result =
+            (0..n).map(|j| format!("tool out line {j:03}")).collect::<Vec<_>>().join("\n");
+        TranscriptItem::Tool {
+            name: "longtool".into(),
+            emoji: "🔧".into(),
+            summary: "long tool summary".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: result.clone(),
+            expand_state: ReasoningExpandState::Collapsed,
+            full_args: Some("{}".into()),
+            full_result: Some(result),
+            is_terminal: false,
+            exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: LIVE_OUTPUT_CAPACITY,
+        }
+    }
+
+    /// A NON-expandable User item `n` lines tall (center-row decoy).
+    fn tall_user(n: usize) -> TranscriptItem {
+        TranscriptItem::User {
+            text: (0..n).map(|j| format!("user line {j:03}")).collect::<Vec<_>>().join("\n"),
+        }
+    }
+
+    fn expand_state_of(item: &TranscriptItem) -> ReasoningExpandState {
+        match item {
+            TranscriptItem::Tool { expand_state, .. }
+            | TranscriptItem::Reasoning { expand_state, .. }
+            | TranscriptItem::FileDiff { expand_state, .. } => *expand_state,
+            _ => ReasoningExpandState::Collapsed,
+        }
+    }
+
+    fn main_all_collapsed(t: &Tui<TestBackend>, ctx: &str) {
+        for (i, it) in t.app.transcript.iter().enumerate() {
+            assert_eq!(
+                expand_state_of(it),
+                ReasoningExpandState::Collapsed,
+                "{ctx}: main item {i} untouched while a pane is focused"
+            );
+        }
+    }
+
+    /// Focused pane + Space/x: the viewport-center resolution lands on the
+    /// pane's tall Tool item and cycles it Collapsed → TailWindow → Full →
+    /// Collapsed (third press via `x` — same arm); the MAIN transcript's
+    /// expandables never move (focused-view isolation).
+    #[test]
+    fn space_x_routes_to_focused_pane_tool_cycle() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        t.app.focus_subagent(Some(0));
+        t.app.push_item(long_tool(6)); // MAIN marker — must stay Collapsed
+        t.app.subagent_panes[0].push_item(long_tool(220));
+        t.app.last_pane_text_area.set((0, 0, 100, 28));
+        t.app.last_pane_max_scroll.set(0);
+        t.focus = Focus::Transcript;
+        assert_eq!(
+            expand_state_of(&t.app.subagent_panes[0].transcript[0]),
+            ReasoningExpandState::Collapsed,
+            "starts Collapsed"
+        );
+
+        t.handle_key(plain(KeyCode::Char(' ')));
+        assert_eq!(
+            expand_state_of(&t.app.subagent_panes[0].transcript[0]),
+            ReasoningExpandState::TailWindow,
+            "press 1 (Space): Collapsed → TailWindow"
+        );
+        t.handle_key(plain(KeyCode::Char(' ')));
+        assert_eq!(
+            expand_state_of(&t.app.subagent_panes[0].transcript[0]),
+            ReasoningExpandState::Full,
+            "press 2 (Space): TailWindow → Full (220 > 200)"
+        );
+        t.handle_key(plain(KeyCode::Char('x')));
+        assert_eq!(
+            expand_state_of(&t.app.subagent_panes[0].transcript[0]),
+            ReasoningExpandState::Collapsed,
+            "press 3 (x, same arm): Full → Collapsed"
+        );
+
+        main_all_collapsed(&t, "space/x on focused pane tool");
+    }
+
+    /// Focused pane whose CENTER row lands on a non-expandable User block:
+    /// the arm falls back (mirroring the Main arm) to the first expandable
+    /// item at/below the top-visible row — the Tool at the bottom — and
+    /// toggles it. Keyboard Space and pane clicks therefore agree.
+    #[test]
+    fn space_x_pane_fallback_picks_first_expandable_below_top() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        t.app.focus_subagent(Some(0));
+        // Tall non-expandable decoy on top, expandable tool at the bottom:
+        // bottom-anchored viewport keeps the center row inside the decoy.
+        t.app.subagent_panes[0].push_item(tall_user(60));
+        t.app.subagent_panes[0].push_item(long_tool(4));
+        t.app.last_pane_text_area.set((0, 0, 100, 28));
+        t.app.last_pane_max_scroll.set(0);
+        t.focus = Focus::Transcript;
+
+        t.handle_key(plain(KeyCode::Char(' ')));
+        assert_ne!(
+            expand_state_of(&t.app.subagent_panes[0].transcript[1]),
+            ReasoningExpandState::Collapsed,
+            "fallback resolved and toggled the pane's Tool item"
+        );
+        assert_eq!(
+            expand_state_of(&t.app.subagent_panes[0].transcript[0]),
+            ReasoningExpandState::Collapsed,
+            "non-expandable decoy is not a toggle target (no panic, no change)"
+        );
+        main_all_collapsed(&t, "space/x fallback on focused pane");
+    }
+
+    /// Negative pin: panes exist and carry expandables, but with
+    /// `focused_subagent == None` Space targets the MAIN transcript only —
+    /// the pane's items stay Collapsed (constitution VII: unfocused
+    /// behavior byte-identical to the pre-pane routing).
+    #[test]
+    fn unfocused_space_targets_main_only() {
+        let mut t = tui();
+        spawn_pane(&mut t); // pane exists, NOT focused
+        t.app.subagent_panes[0].push_item(long_tool(220));
+        t.app.push_item(long_tool(6)); // MAIN target
+        t.app.last_text_area.set((0, 0, 98, 28));
+        // Pane geometry would resolve if misrouted — pin that it doesn't.
+        t.app.last_pane_text_area.set((0, 0, 100, 28));
+        t.app.last_pane_max_scroll.set(0);
+        t.focus = Focus::Transcript;
+
+        t.handle_key(plain(KeyCode::Char(' ')));
+        let main_expanded = matches!(
+            t.app.transcript.back(),
+            Some(TranscriptItem::Tool {
+                expand_state: ReasoningExpandState::TailWindow
+                    | ReasoningExpandState::Full,
+                ..
+            })
+        );
+        assert!(main_expanded, "Space expanded the MAIN item (Main arm)");
+        assert_eq!(
+            expand_state_of(&t.app.subagent_panes[0].transcript[0]),
+            ReasoningExpandState::Collapsed,
+            "pane item untouched while unfocused"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pane_ctrl_expand_key_routing_tests {
+    //! T012 (US2, FR-004): the dedicated expand keys retarget to the FOCUSED
+    //! pane. Ctrl+E (`cycle_focused_reasoning_expand`) and Ctrl+G
+    //! (`toggle_focused_tool_expand`) are App mutators that read
+    //! `focused_subagent` themselves (the Ctrl+A/T004 self-retargeting
+    //! pattern — the arm stays target-agnostic, no scattered is_some()
+    //! checks), so these key-level tests press the real keys through
+    //! `Tui::handle_key` and pin: focused → the PANE's most-recent entry
+    //! cycles through ALL THREE states while the main transcript stays
+    //! Collapsed; unfocused → the main transcript's entry moves and the
+    //! pane's stays Collapsed (byte-identical Main behavior, constitution
+    //! VII). The App-method retarget itself is also pinned in state.rs's
+    //! `pane_ctrl_expand_mutator_tests`.
+    use super::*;
+    use crate::state::{ReasoningExpandState, ToolStatus, LIVE_OUTPUT_CAPACITY};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use std::time::Duration;
+
+    fn ctrl_key(c: char) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn tui() -> Tui<TestBackend> {
+        let app = App::new("sess", "model");
+        let terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        Tui::new_for_test(app, Theme::aurora(), terminal)
+    }
+
+    fn spawn_pane(t: &mut Tui<TestBackend>) {
+        t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "child".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+    }
+
+    /// A `Reasoning` item with `n` lines (>200 exercises all three cycle
+    /// states distinctly: Collapsed → TailWindow → Full → Collapsed).
+    fn long_reasoning(n: usize) -> TranscriptItem {
+        TranscriptItem::Reasoning {
+            text: (0..n).map(|j| format!("think line {j:03}")).collect::<Vec<_>>().join("\n"),
+            expand_state: ReasoningExpandState::Collapsed,
+            thought_duration: Some(Duration::from_secs(2)),
+        }
+    }
+
+    /// A completed Tool item with an `n`-line result (>200 for the full
+    /// three-state cycle).
+    fn long_tool(n: usize) -> TranscriptItem {
+        let result =
+            (0..n).map(|j| format!("tool out line {j:03}")).collect::<Vec<_>>().join("\n");
+        TranscriptItem::Tool {
+            name: "longtool".into(),
+            emoji: "🔧".into(),
+            summary: "long tool summary".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: result.clone(),
+            expand_state: ReasoningExpandState::Collapsed,
+            full_args: Some("{}".into()),
+            full_result: Some(result),
+            is_terminal: false,
+            exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: LIVE_OUTPUT_CAPACITY,
+        }
+    }
+
+    fn expand_state_of(item: &TranscriptItem) -> ReasoningExpandState {
+        match item {
+            TranscriptItem::Tool { expand_state, .. }
+            | TranscriptItem::Reasoning { expand_state, .. }
+            | TranscriptItem::FileDiff { expand_state, .. } => *expand_state,
+            _ => ReasoningExpandState::Collapsed,
+        }
+    }
+
+    fn main_all_collapsed(t: &Tui<TestBackend>, ctx: &str) {
+        for (i, it) in t.app.transcript.iter().enumerate() {
+            assert_eq!(
+                expand_state_of(it),
+                ReasoningExpandState::Collapsed,
+                "{ctx}: main item {i} untouched while a pane is focused"
+            );
+        }
+    }
+
+    /// Focused pane + Ctrl+E: the PANE's most-recent reasoning entry cycles
+    /// Collapsed → TailWindow → Full → Collapsed (three real presses); the
+    /// pane's tool and every MAIN expandable stay Collapsed.
+    #[test]
+    fn ctrl_e_cycles_focused_pane_reasoning_three_states() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        t.app.focus_subagent(Some(0));
+        // Pane: tool first, reasoning LAST (the most-recent target).
+        t.app.subagent_panes[0].push_item(long_tool(6));
+        t.app.subagent_panes[0].push_item(long_reasoning(220));
+        // MAIN markers — must stay Collapsed.
+        t.app.push_item(long_reasoning(90));
+        t.app.push_item(long_tool(91));
+        t.focus = Focus::Transcript;
+        let pane_reasoning = |t: &Tui<TestBackend>| expand_state_of(&t.app.subagent_panes[0].transcript[1]);
+
+        assert_eq!(pane_reasoning(&t), ReasoningExpandState::Collapsed, "starts Collapsed");
+        t.handle_key(ctrl_key('e'));
+        assert_eq!(
+            pane_reasoning(&t),
+            ReasoningExpandState::TailWindow,
+            "press 1: Collapsed → TailWindow"
+        );
+        t.handle_key(ctrl_key('e'));
+        assert_eq!(
+            pane_reasoning(&t),
+            ReasoningExpandState::Full,
+            "press 2: TailWindow → Full (220 > 200)"
+        );
+        t.handle_key(ctrl_key('e'));
+        assert_eq!(
+            pane_reasoning(&t),
+            ReasoningExpandState::Collapsed,
+            "press 3: Full → Collapsed"
+        );
+
+        assert_eq!(
+            expand_state_of(&t.app.subagent_panes[0].transcript[0]),
+            ReasoningExpandState::Collapsed,
+            "pane tool untouched by Ctrl+E"
+        );
+        main_all_collapsed(&t, "ctrl+e while pane focused");
+    }
+
+    /// Focused pane + Ctrl+G: the PANE's most-recent tool entry cycles
+    /// Collapsed → TailWindow → Full → Collapsed; the pane's reasoning and
+    /// every MAIN expandable stay Collapsed.
+    #[test]
+    fn ctrl_g_toggles_focused_pane_tool_three_states() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        t.app.focus_subagent(Some(0));
+        // Pane: reasoning first, tool LAST (the most-recent target).
+        t.app.subagent_panes[0].push_item(long_reasoning(90));
+        t.app.subagent_panes[0].push_item(long_tool(220));
+        t.app.push_item(long_reasoning(90)); // MAIN markers
+        t.app.push_item(long_tool(91));
+        t.focus = Focus::Transcript;
+        let pane_tool = |t: &Tui<TestBackend>| expand_state_of(&t.app.subagent_panes[0].transcript[1]);
+
+        assert_eq!(pane_tool(&t), ReasoningExpandState::Collapsed, "starts Collapsed");
+        t.handle_key(ctrl_key('g'));
+        assert_eq!(pane_tool(&t), ReasoningExpandState::TailWindow, "press 1: → TailWindow");
+        t.handle_key(ctrl_key('g'));
+        assert_eq!(pane_tool(&t), ReasoningExpandState::Full, "press 2: → Full (220 > 200)");
+        t.handle_key(ctrl_key('g'));
+        assert_eq!(pane_tool(&t), ReasoningExpandState::Collapsed, "press 3: → Collapsed");
+
+        assert_eq!(
+            expand_state_of(&t.app.subagent_panes[0].transcript[0]),
+            ReasoningExpandState::Collapsed,
+            "pane reasoning untouched by Ctrl+G"
+        );
+        main_all_collapsed(&t, "ctrl+g while pane focused");
+    }
+
+    /// Negative pin (constitution VII): panes exist and carry long
+    /// expandables, but with `focused_subagent == None` the same keys act on
+    /// the MAIN transcript — the pane's entries stay Collapsed.
+    #[test]
+    fn unfocused_ctrl_e_ctrl_g_act_on_main_only() {
+        let mut t = tui();
+        spawn_pane(&mut t); // pane exists, NOT focused
+        t.app.subagent_panes[0].push_item(long_reasoning(220));
+        t.app.subagent_panes[0].push_item(long_tool(220));
+        t.app.push_item(long_reasoning(220)); // MAIN targets
+        t.app.push_item(long_tool(220));
+        t.focus = Focus::Transcript;
+        assert!(t.app.focused_subagent.is_none());
+
+        t.handle_key(ctrl_key('e'));
+        let main_reasoning = t
+            .app
+            .transcript
+            .iter()
+            .rposition(|i| matches!(i, TranscriptItem::Reasoning { .. }))
+            .expect("main reasoning present");
+        assert_eq!(
+            expand_state_of(&t.app.transcript[main_reasoning]),
+            ReasoningExpandState::TailWindow,
+            "Ctrl+E cycled the MAIN reasoning (Main behavior)"
+        );
+        t.handle_key(ctrl_key('g'));
+        let main_tool = t
+            .app
+            .transcript
+            .iter()
+            .rposition(|i| matches!(i, TranscriptItem::Tool { .. }))
+            .expect("main tool present");
+        assert_eq!(
+            expand_state_of(&t.app.transcript[main_tool]),
+            ReasoningExpandState::TailWindow,
+            "Ctrl+G toggled the MAIN tool (Main behavior)"
+        );
+        for (i, it) in t.app.subagent_panes[0].transcript.iter().enumerate() {
+            assert_eq!(
+                expand_state_of(it),
+                ReasoningExpandState::Collapsed,
+                "pane item {i} untouched while unfocused"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pane_search_key_routing_tests {
+    //! T016 (US3, FR-007, research.md D5): search keys route to the FOCUSED
+    //! pane. Real `Tui::handle_key` presses pin the routing contract:
+    //!   - '/' (Transcript focus) and Ctrl+S (Input focus) open the live bar
+    //!     AND mirror it onto the focused pane's per-view SearchState; no
+    //!     pane focused → App-level only (byte-identical Main behavior,
+    //!     constitution VII).
+    //!   - Typing drives the T015 focus-follow `run_search`: a pane-focused
+    //!     search pins the PANE, never the main view; a main-only needle is
+    //!     a no-match.
+    //!   - n/N walk the TARGET view's matches only.
+    //!   - Esc closes the bar and clears every mirror.
+    //! The rendered indicator routing (pane mirror vs App) is pinned in
+    //! tests/pane_search_copy.rs (buffer assertions over draw_search_bar).
+    use super::*;
+    use crate::state::TranscriptItem;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::backend::TestBackend;
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn ctrl_key(c: char) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn char_key(c: char) -> KeyEvent {
+        plain(KeyCode::Char(c))
+    }
+
+    fn tui() -> Tui<TestBackend> {
+        let app = App::new("sess", "model");
+        let terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        Tui::new_for_test(app, Theme::aurora(), terminal)
+    }
+
+    fn spawn_pane(t: &mut Tui<TestBackend>) {
+        t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "child".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+    }
+
+    fn user(s: &str) -> TranscriptItem {
+        TranscriptItem::User { text: s.to_string() }
+    }
+
+    /// NOTE: in the OPEN bar, n/N are next/prev keys, not typed characters
+    /// (pre-existing orchestrator semantics), so test queries avoid those
+    /// letters.
+    fn type_in_bar(t: &mut Tui<TestBackend>, query: &str) {
+        assert!(
+            !query.contains('n') && !query.contains('N'),
+            "test queries must avoid the n/N navigation keys"
+        );
+        for c in query.chars() {
+            t.handle_key(char_key(c));
+        }
+    }
+
+    /// '/' in Transcript focus with a pane focused: the live bar opens AND
+    /// the pane's mirror opens (fresh query); typing runs the T015
+    /// focus-follow search — the PANE pins to its own match, the main view
+    /// and the App indicator never move.
+    #[test]
+    fn slash_opens_pane_scoped_search_and_typing_pins_pane_only() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        t.app.focus_subagent(Some(0));
+        // Pane needle (newest), filler, main-only needle.
+        t.app.subagent_panes[0].push_item(user("filler 0"));
+        t.app.subagent_panes[0].push_item(user("pane gold here"));
+        t.app.push_item(user("main gold beta"));
+        t.app.last_pane_max_scroll.set(100);
+        t.focus = Focus::Transcript;
+
+        assert!(!t.app.subagent_panes[0].search_open, "bar closed initially");
+        t.handle_key(char_key('/'));
+        assert!(t.app.search_open, "live bar opened");
+        assert!(t.app.subagent_panes[0].search_open, "pane mirror opened");
+
+        type_in_bar(&mut t, "gold");
+        let pane = &t.app.subagent_panes[0];
+        assert!(pane.search_has_match, "pane occurrence found");
+        assert_eq!(pane.search_query, "gold", "query preserved on the pane");
+        assert!(pane.scroll.is_some(), "pane pinned to its match");
+        assert_eq!(t.app.scroll, None, "main view untouched");
+        assert!(!t.app.search_has_match, "App indicator mirrors MAIN only");
+    }
+
+    /// A needle that exists ONLY on main is a no-match from the focused
+    /// pane: nothing pins, the indicator stays false.
+    #[test]
+    fn pane_search_main_only_needle_is_no_match_via_keys() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        t.app.focus_subagent(Some(0));
+        t.app.subagent_panes[0].push_item(user("no such marker"));
+        t.app.push_item(user("main gold beta"));
+        t.app.last_pane_max_scroll.set(100);
+        t.focus = Focus::Transcript;
+
+        t.handle_key(char_key('/'));
+        type_in_bar(&mut t, "gold");
+        let pane = &t.app.subagent_panes[0];
+        assert!(!pane.search_has_match, "main-only needle → no pane match");
+        assert_eq!(pane.scroll, None, "pane view never yanked");
+        assert_eq!(t.app.scroll, None, "main view untouched");
+    }
+
+    /// n/N in the open bar walk the TARGET view only: with two pane
+    /// occurrences, N steps to the older one and n returns, while the main
+    /// scroll never leaves None.
+    #[test]
+    fn n_n_in_bar_walk_pane_matches_only() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        t.app.focus_subagent(Some(0));
+        let mut items: Vec<_> = (0..30).map(|i| user(&format!("filler {i}"))).collect();
+        items[3] = user("pane gold old");
+        items[27] = user("pane gold fresh");
+        for it in items {
+            t.app.subagent_panes[0].push_item(it);
+        }
+        t.app.push_item(user("main gold beta"));
+        t.app.last_pane_max_scroll.set(100);
+        t.focus = Focus::Transcript;
+
+        t.handle_key(char_key('/'));
+        type_in_bar(&mut t, "gold");
+        let first = t.app.subagent_panes[0].scroll.expect("run pinned the pane");
+
+        t.handle_key(char_key('N')); // toward older
+        let second = t.app.subagent_panes[0].scroll.expect("N moved the pane");
+        assert_ne!(first, second, "N advances between pane matches");
+        assert_eq!(t.app.scroll, None, "main untouched by N");
+
+        t.handle_key(char_key('n')); // back toward newer
+        let third = t.app.subagent_panes[0].scroll.expect("n moved the pane");
+        assert_ne!(second, third, "n advances back");
+        assert_eq!(t.app.scroll, None, "main untouched by n");
+    }
+
+    /// n/N with the bar CLOSED (Transcript focus): same target routing via
+    /// the self-retargeting mutator — pane matches move, main stays put.
+    #[test]
+    fn n_n_closed_bar_still_routes_to_focused_pane() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        t.app.focus_subagent(Some(0));
+        let mut items: Vec<_> = (0..30).map(|i| user(&format!("filler {i}"))).collect();
+        items[3] = user("pane gold old");
+        items[27] = user("pane gold fresh");
+        for it in items {
+            t.app.subagent_panes[0].push_item(it);
+        }
+        t.app.last_pane_max_scroll.set(100);
+        t.focus = Focus::Transcript;
+
+        // Seed exactly as the bar path would (query typed + run).
+        t.app.search_query = "gold".into();
+        t.app.run_search();
+        assert!(t.app.subagent_panes[0].scroll.is_some(), "pane pinned");
+
+        t.handle_key(char_key('N'));
+        assert_eq!(
+            t.app.subagent_panes[0].scroll,
+            Some(24),
+            "N (closed bar) walks the pane's older match (rev-idx 26 → 24)"
+        );
+        assert_eq!(t.app.scroll, None, "main untouched");
+    }
+
+    /// Ctrl+S from Input focus with a pane focused: same open semantics as
+    /// '/' (live bar + pane mirror, fresh query).
+    #[test]
+    fn ctrl_s_opens_search_routed_to_focused_pane() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        t.app.focus_subagent(Some(0));
+        t.focus = Focus::Input;
+
+        t.handle_key(ctrl_key('s'));
+        assert!(t.app.search_open, "live bar opened via Ctrl+S");
+        assert!(t.app.subagent_panes[0].search_open, "pane mirror opened");
+        type_in_bar(&mut t, "zz");
+        assert_eq!(t.app.search_query, "zz");
+        t.handle_key(plain(KeyCode::Esc));
+        t.handle_key(ctrl_key('s'));
+        assert_eq!(t.app.search_query, "", "reopen starts a fresh query");
+        assert_eq!(t.app.subagent_panes[0].search_query, "", "pane mirror fresh too");
+    }
+
+    /// Esc closes the bar and clears the App latch + every pane mirror
+    /// (singleton overlay).
+    #[test]
+    fn esc_closes_bar_and_clears_pane_mirrors() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        t.app.focus_subagent(Some(0));
+        t.app.subagent_panes[0].push_item(user("pane gold here"));
+        t.app.last_pane_max_scroll.set(100);
+        t.focus = Focus::Transcript;
+        t.handle_key(char_key('/'));
+        type_in_bar(&mut t, "gold");
+        assert!(t.app.subagent_panes[0].search_open);
+
+        t.handle_key(plain(KeyCode::Esc));
+        assert!(!t.app.search_open, "App latch off");
+        assert!(!t.app.subagent_panes[0].search_open, "pane mirror off");
+        assert_eq!(t.app.search_query, "", "live query cleared");
+        assert_eq!(t.app.subagent_panes[0].search_query, "", "pane query cleared");
+        // The pin from the last run survives close (orchestrator parity).
+        assert!(t.app.subagent_panes[0].scroll.is_some(), "pin preserved");
+        assert!(t.app.focused_subagent.is_some(), "Esc closed the bar, not the pane");
+    }
+
+    /// Unfocused regression pin (constitution VII): with panes present but
+    /// NONE focused, '/' opens MAIN-only search — no pane mirror flips on.
+    #[test]
+    fn unfocused_slash_opens_main_search_only() {
+        let mut t = tui();
+        spawn_pane(&mut t); // pane exists, NOT focused
+        t.app.push_item(user("main gold beta"));
+        t.app.last_max_scroll.set(100);
+        t.focus = Focus::Transcript;
+
+        t.handle_key(char_key('/'));
+        assert!(t.app.search_open, "main bar opened");
+        assert!(!t.app.subagent_panes[0].search_open, "no pane mirror");
+        type_in_bar(&mut t, "gold");
+        assert!(t.app.search_has_match, "main matched");
+        assert_eq!(t.app.scroll, Some(0), "main view pinned");
+        assert_eq!(
+            t.app.subagent_panes[0].scroll, None,
+            "pane untouched by main search"
+        );
+        assert_eq!(
+            t.app.subagent_panes[0].search_query, "",
+            "pane SearchState untouched"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pane_viewer_key_tests {
+    //! T020/T021/T025 (US4/US5, spec 017): Ctrl+O retargets to the focused
+    //! pane (shared `draw_output_viewer`), the pane's live reasoning renders
+    //! through the shared `draw_reasoning` panel, and the help overlay stays
+    //! reachable from a focused pane (global handler). These pins drive the
+    //! REAL key arms + the REAL render path (`render_body` via TestBackend),
+    //! complementing the integration suites' mutator-level assertions.
+    use super::*;
+    use crate::state::{ReasoningExpandState, ToolStatus, LIVE_OUTPUT_CAPACITY};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use joey_agent_core::events::AgentEvent;
+    use ratatui::backend::TestBackend;
+
+    /// Test-only adapter so the REAL `Tui::draw` path (whose bound is
+    /// `io::Error: From<B::Error>`) can run against `TestBackend`, whose
+    /// error type is `Infallible`. Every call forwards unchanged; the
+    /// impossible error is simply eliminated.
+    struct IoTestBackend(TestBackend);
+
+    impl ratatui::backend::Backend for IoTestBackend {
+        type Error = std::io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.0.draw(content).map_err(|e| match e {})
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.0.hide_cursor().map_err(|e| match e {})
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.0.show_cursor().map_err(|e| match e {})
+        }
+
+        fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+            self.0.get_cursor_position().map_err(|e| match e {})
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.0.set_cursor_position(position).map_err(|e| match e {})
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.0.clear().map_err(|e| match e {})
+        }
+
+        fn clear_region(
+            &mut self,
+            clear_type: ratatui::backend::ClearType,
+        ) -> Result<(), Self::Error> {
+            self.0.clear_region(clear_type).map_err(|e| match e {})
+        }
+
+        fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+            self.0.size().map_err(|e| match e {})
+        }
+
+        fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+            self.0.window_size().map_err(|e| match e {})
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.0.flush().map_err(|e| match e {})
+        }
+    }
+
+    /// Same as `tui()` but over [`IoTestBackend`], so `Tui::draw` (the real
+    /// full-frame render incl. the global help-overlay call site) compiles.
+    fn tui_real_draw() -> Tui<IoTestBackend> {
+        let app = App::new("sess", "model");
+        let terminal = ratatui::Terminal::new(IoTestBackend(TestBackend::new(100, 30))).unwrap();
+        Tui::new_for_test(app, Theme::aurora(), terminal)
+    }
+
+    fn key(code: KeyCode, c: char) -> KeyEvent {
+        let _ = c;
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn tui() -> Tui<TestBackend> {
+        let app = App::new("sess", "model");
+        let terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        Tui::new_for_test(app, Theme::aurora(), terminal)
+    }
+
+    fn spawn_pane<B: ratatui::backend::Backend>(t: &mut Tui<B>) {
+        t.app.apply(AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "child".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+        t.app.focus_subagent(Some(0));
+    }
+
+    fn pane_tool(t: &mut Tui<TestBackend>, lines: usize, marker: &str) {
+        let result = (0..lines)
+            .map(|j| format!("{marker} line {j}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        t.app.subagent_panes[0].push_item(TranscriptItem::Tool {
+            name: "toolp".into(),
+            emoji: "🔧".into(),
+            summary: format!("{marker} summary").into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: result.clone(),
+            expand_state: ReasoningExpandState::Collapsed,
+            full_args: None,
+            full_result: Some(result),
+            is_terminal: false,
+            exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: LIVE_OUTPUT_CAPACITY,
+        });
+    }
+
+    /// Render the real body layout and return the whole buffer as text.
+    fn buffer_text(t: &mut Tui<TestBackend>) -> String {
+        let area = Rect::new(0, 2, 100, 24);
+        let spinner = crate::anim::Spinner::dots();
+        let equalizer = crate::anim::Equalizer::new(28);
+        t.terminal
+            .draw(|f| {
+                render_body(f, area, &t.app, t.theme, false, 0.5, &spinner, &equalizer);
+            })
+            .unwrap();
+        t.terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    /// T020: Ctrl+O with a pane focused opens the viewer on the PANE's most
+    /// recent tool — shared chrome + pane content, main tool absent — and
+    /// toggles closed. Works even when the MAIN transcript has no tool at
+    /// all (the pane-fallback open path).
+    #[test]
+    fn ctrl_o_opens_viewer_on_focused_pane_tool() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        pane_tool(&mut t, 6, "PANE_TOOL");
+        assert!(t.app.transcript.iter().all(|it| !matches!(it, TranscriptItem::Tool { .. })));
+
+        t.handle_key(key(KeyCode::Char('o'), 'o'));
+        assert!(t.app.output_viewer_open, "Ctrl+O opened the viewer (pane fallback)");
+
+        let text = buffer_text(&mut t);
+        assert!(text.contains("output · finished"), "shared viewer chrome rendered");
+        assert!(text.contains("PANE_TOOL line 5"), "pane tool tail content in the viewer");
+        assert!(text.contains("Ctrl+O or Esc to restore"), "restore affordance present");
+
+        t.handle_key(key(KeyCode::Char('o'), 'o'));
+        assert!(!t.app.output_viewer_open, "second Ctrl+O closed the viewer");
+    }
+
+    /// T020: with BOTH transcripts holding tools, the pane-focused viewer
+    /// shows the PANE's tool, never the main one (focused-view isolation).
+    #[test]
+    fn pane_viewer_shows_pane_tool_not_main() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        pane_tool(&mut t, 6, "PANE_TOOL");
+        // Main marker tool (the pre-T020 code would have shown this).
+        let main_result = (0..6).map(|j| format!("MAIN_TOOL line {j}")).collect::<Vec<_>>().join("\n");
+        t.app.push_item(TranscriptItem::Tool {
+            name: "toolm".into(),
+            emoji: "🔧".into(),
+            summary: "main summary".into(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: main_result.clone(),
+            expand_state: ReasoningExpandState::Collapsed,
+            full_args: None,
+            full_result: Some(main_result),
+            is_terminal: false,
+            exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: LIVE_OUTPUT_CAPACITY,
+        });
+
+        t.handle_key(key(KeyCode::Char('o'), 'o'));
+        assert!(t.app.output_viewer_open);
+        let text = buffer_text(&mut t);
+        assert!(text.contains("PANE_TOOL line 5"), "pane tool content in the viewer");
+        assert!(
+            !text.contains("MAIN_TOOL"),
+            "main tool never renders in the pane-focused viewer"
+        );
+    }
+
+    /// T021 (render half): the focused pane's live reasoning renders through
+    /// the shared `draw_reasoning` panel; the MAIN accumulator never leaks
+    /// into the pane view. Unfocused, the pane's stream is not rendered.
+    #[test]
+    fn pane_reasoning_panel_renders_pane_stream() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        t.app.subagent_panes[0].streaming_reasoning = "pane think line 39".into();
+        // Main live reasoning — must stay invisible while the pane is focused.
+        t.app.streaming_reasoning = "MAIN think marker".into();
+        t.app.reasoning_open = true;
+
+        let text = buffer_text(&mut t);
+        assert!(text.contains("pane think line 39"), "pane stream rendered live");
+        assert!(text.contains("thinking"), "shared draw_reasoning header present");
+        assert!(!text.contains("MAIN think marker"), "main accumulator isolated");
+
+        // Unfocused: the pane's reasoning stays in its pane.
+        t.app.focus_subagent(None);
+        let text = buffer_text(&mut t);
+        assert!(!text.contains("pane think line 39"), "unfocused pane stream not rendered");
+    }
+
+    /// T025 (US5, FR-013): F1 and '?' open the help overlay while a pane is
+    /// focused (global handler — identical content, one overlay for both
+    /// views), and any dismissal key closes it. Verified-no-change pin.
+    #[test]
+    fn help_overlay_reachable_from_focused_pane() {
+        let mut t = tui();
+        spawn_pane(&mut t);
+        assert!(!t.show_help);
+        // F1 arm.
+        t.handle_key(plain(KeyCode::F(1)));
+        assert!(t.show_help, "F1 opened the help overlay from a focused pane");
+        // Dismiss via '?' (same arm family as Esc/F1/q/Enter).
+        t.handle_key(plain(KeyCode::Char('?')));
+        assert!(!t.show_help, "'?' dismissed it");
+        // '?' arm (transcript-focus path — the other global opening arm).
+        t.focus = Focus::Transcript;
+        t.handle_key(plain(KeyCode::Char('?')));
+        assert!(t.show_help, "'?' opened the help overlay from a focused pane");
+        t.handle_key(plain(KeyCode::Esc));
+        assert!(!t.show_help, "Esc dismissed it");
+    }
+
+    /// T025 (US5, FR-013) content half: the overlay drawn while a pane is
+    /// focused is IDENTICAL to the main-view overlay — `Tui::draw` has ONE
+    /// global `draw_help_overlay` call site outside any pane/main body
+    /// branch, so there is no pane-specific fork and no content drift.
+    /// Pins the modal region cell-for-cell (symbols AND styling) across the
+    /// two views via the REAL full-frame render path (`Tui::draw`).
+    #[test]
+    fn help_overlay_content_identical_from_focused_pane() {
+        // Pane-focused render with the overlay armed via the global F1 arm.
+        let mut pane = tui_real_draw();
+        spawn_pane(&mut pane);
+        pane.handle_key(plain(KeyCode::F(1)));
+        assert!(pane.show_help);
+        pane.draw().unwrap();
+        let pane_buf = pane.terminal.backend().0.buffer().clone();
+
+        // Main-view render: same terminal geometry + theme, no pane.
+        let mut main = tui_real_draw();
+        main.handle_key(plain(KeyCode::F(1)));
+        assert!(main.show_help);
+        main.draw().unwrap();
+        let main_buf = main.terminal.backend().0.buffer().clone();
+
+        assert_eq!(pane_buf.area(), main_buf.area(), "same TestBackend geometry");
+
+        // The overlay modal rect, mirroring `draw_help_overlay`'s geometry:
+        // w = 56.min(width), h = 26.min(height), centered — (22, 2, 56, 26)
+        // on the 100×30 test terminal. Under it the two views legitimately
+        // differ (pane vs main transcript); INSIDE it they must not.
+        let rect = Rect::new(22, 2, 56, 26);
+        let pane_text: String = (rect.y..rect.bottom())
+            .flat_map(|y| (rect.x..rect.right()).map(move |x| (x, y)))
+            .map(|(x, y)| pane_buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(pane_text.contains("closes"), "overlay rendered: {pane_text:?}");
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                assert_eq!(
+                    pane_buf[(x, y)],
+                    main_buf[(x, y)],
+                    "help overlay cell ({x},{y}) differs between pane and main views"
+                );
+            }
         }
     }
 }

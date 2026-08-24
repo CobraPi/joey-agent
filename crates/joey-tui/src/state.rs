@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use joey_agent_core::events::{AgentEvent, ContextEntry, FileChangeKind};
+use joey_tools::file_tracker::DiffResult;
 
 /// Feature 005 (T021): the three-state expand cycle for reasoning blocks.
 ///
@@ -332,11 +333,32 @@ pub struct SubagentPane {
     pub context_window: u64,
     pub compression_threshold: u64,
     pub compactions: u32,
+    /// T004 (FR-010): view anchor for THIS pane's maximized stats/context
+    /// stream. `None` = auto-follow (pinned to the live tail); `Some(anchor)`
+    /// = frozen at that absolute line. Per-pane so switching focus never
+    /// resets a sibling pane's scroll — mirrors `App::stats_view` (main
+    /// transcript stats page).
+    pub stats_view: Option<usize>,
+    /// T004: upper bound for a valid `stats_view` anchor, recorded by the
+    /// pane stats widget at render time (wrap widths are render-only
+    /// knowledge). Mirrors `App::last_stats_max_anchor`.
+    pub last_stats_max_anchor: Cell<usize>,
     /// Expandable-stats feature: which context-stream entries are expanded
     /// (indices into `context_entries`). Entries whose index isn't in the
     /// set render collapsed (one-line preview); expanded entries render the
     /// full content inline with a gutter.
     pub expanded_context: std::collections::HashSet<usize>,
+    /// T015 (US3, FR-006/FR-007, design D5): per-pane search state — a
+    /// mirror of `App`'s search-bar fields so each pane owns its query and
+    /// match indicator against ITS transcript (FR-010: survives focus
+    /// switches; the orchestrator's `App::search_*` is a separate view's
+    /// state and is never consulted for a pane search). Match-indicator
+    /// only — search never highlights text in-place (D5 parity).
+    pub search_open: bool,
+    /// Current search query for THIS pane's transcript.
+    pub search_query: String,
+    /// Whether the last pane search found any matches.
+    pub search_has_match: bool,
     /// Cumulative usage for the child.
     pub tokens: TokenStats,
     /// When the child started.
@@ -347,6 +369,14 @@ pub struct SubagentPane {
     /// id-matched attribution path is live, and the raw-channel duplicate
     /// must not double-count tool calls.
     pub tap_attached: bool,
+    /// T022 (US4, FR-008): mode attribution — true when the NeuroCode mode
+    /// spawned this pane (snapshot of `App::neurocode_active` at
+    /// SubagentSpawn time). Gates the mode-specific explorer render arm:
+    /// mode explorers are reachable only from surfaces that mode spawned
+    /// (the orchestrator view + the panes it spawned), never from a plain
+    /// delegation pane. Bool mirrors how App represents the mode
+    /// (`neurocode_active: bool`) — the minimal additive shape.
+    pub spawned_by_neurocode: bool,
 }
 
 impl SubagentPane {
@@ -369,11 +399,17 @@ impl SubagentPane {
             context_window: 0,
             compression_threshold: 0,
             compactions: 0,
+            stats_view: None,
+            last_stats_max_anchor: Cell::new(0),
             expanded_context: std::collections::HashSet::new(),
+            search_open: false,
+            search_query: String::new(),
+            search_has_match: false,
             tokens: TokenStats::default(),
             started: Instant::now(),
             summary_preview: None,
             tap_attached: false,
+            spawned_by_neurocode: false,
         }
     }
 
@@ -489,6 +525,32 @@ fn remap_expansions(
     new_set
 }
 
+/// Build a `TranscriptItem::FileDiff` from a `FileChange` event — the single
+/// construction shared by the main transcript (`App::apply`, feature 005
+/// T018) and the per-pane path (`pane_apply`, spec 017 T013 / D7, FR-005):
+/// panes must render file diffs exactly like the main transcript, so both
+/// paths map the event through this one fn (parity by construction).
+fn file_diff_item(path: &str, kind: FileChangeKind, diff: &DiffResult, is_binary: bool) -> TranscriptItem {
+    let label = match kind {
+        FileChangeKind::Create => " (new file)",
+        FileChangeKind::Delete => " (deleted)",
+        FileChangeKind::Edit => "",
+    };
+    let stat = format!("{}{}", diff.stat_line(), label);
+    let lines: Vec<String> = if is_binary {
+        Vec::new()
+    } else {
+        diff.diff.lines().map(|l| l.to_string()).collect()
+    };
+    TranscriptItem::FileDiff {
+        path: path.to_string(),
+        stat,
+        lines,
+        is_binary,
+        expand_state: ReasoningExpandState::Collapsed,
+    }
+}
+
 /// Apply a child event to a pane — a reduced version of the main
 /// `App::apply` logic covering the display-relevant subset. Lifecycle
 /// events (`TurnStart`/`Done`/`Failed` from the CHILD) intentionally do
@@ -500,6 +562,20 @@ fn pane_apply(pane: &mut SubagentPane, ev: &AgentEvent) {
         ContentDelta(d) => pane.streaming_assistant.push_str(d),
         ReasoningDelta(d) => pane.streaming_reasoning.push_str(d),
         AssistantMessage(text) => {
+            // T021 (US4, D6): flush pending streamed reasoning at the
+            // message boundary — the main loop's flush-on-boundary
+            // semantics (App::apply ToolStart arm / flush_reasoning).
+            // The pane has no reasoning_started clock, so the committed
+            // item carries no thought_duration (main's flush_reasoning
+            // computes one from reasoning_started; panes never set it).
+            if !pane.streaming_reasoning.is_empty() {
+                let text = std::mem::take(&mut pane.streaming_reasoning);
+                pane.push_item(TranscriptItem::Reasoning {
+                    text,
+                    expand_state: ReasoningExpandState::Collapsed,
+                    thought_duration: None,
+                });
+            }
             let final_text = if text.is_empty() {
                 std::mem::take(&mut pane.streaming_assistant)
             } else {
@@ -510,7 +586,19 @@ fn pane_apply(pane: &mut SubagentPane, ev: &AgentEvent) {
                 pane.push_item(TranscriptItem::Assistant { text: final_text });
             }
         }
-        ToolStart { name, emoji, summary } => pane.push_item(TranscriptItem::Tool {
+        ToolStart { name, emoji, summary } => {
+            // T021 (US4, D6): same flush at the ToolStart boundary — the
+            // reasoning commits BEFORE the tool item (main loop ordering:
+            // App::apply's ToolStart arm calls flush_reasoning() first).
+            if !pane.streaming_reasoning.is_empty() {
+                let text = std::mem::take(&mut pane.streaming_reasoning);
+                pane.push_item(TranscriptItem::Reasoning {
+                    text,
+                    expand_state: ReasoningExpandState::Collapsed,
+                    thought_duration: None,
+                });
+            }
+            pane.push_item(TranscriptItem::Tool {
             name: name.clone(),
             emoji: emoji.clone(),
             summary: summary.clone(),
@@ -524,7 +612,8 @@ fn pane_apply(pane: &mut SubagentPane, ev: &AgentEvent) {
             exit_code: None,
             live_output: String::new(),
             live_output_capacity: LIVE_OUTPUT_CAPACITY,
-        }),
+            });
+        }
         ToolProgress { name, progress } => {
             if !progress.is_empty() {
                 for it in pane.transcript.iter_mut().rev() {
@@ -617,6 +706,13 @@ fn pane_apply(pane: &mut SubagentPane, ev: &AgentEvent) {
             pane.tokens.prompt += usage.prompt_tokens;
             pane.tokens.completion += usage.completion_tokens;
             pane.tokens.iterations += 1;
+        }
+        // Spec 017 (T013, FR-005, D7): map FileChange events to FileDiff
+        // transcript items in panes via the SAME construction the main
+        // transcript uses (`file_diff_item`), so the shared item_lines
+        // FileDiff arm renders diffs in panes.
+        FileChange { path, kind, diff, is_binary, .. } => {
+            pane.push_item(file_diff_item(path, *kind, diff, *is_binary));
         }
         // Child lifecycle / orchestration / OMO events: not pane-relevant.
         _ => {}
@@ -837,17 +933,30 @@ pub struct App {
     /// Rect of the rail's TITLE row as drawn by the LAST frame — clicking
     /// it toggles `subagent_rail_expanded` (zeroed when the rail is hidden).
     pub last_subagent_rail_title_rect: Cell<(u16, u16, u16, u16)>,
+    /// Scroll offset for the rail's tab window, in PANES (not rows): the
+    /// first `subagent_rail_scroll` panes are skipped when the panes
+    /// overflow the rail height, making later tabs reachable (Alt+Up /
+    /// Alt+Down / mouse wheel over the rail). An item-offset sidesteps the
+    /// collapsed-2-row vs expanded-4-row geometry; the rail widget clamps
+    /// it against the capacity it records each frame.
+    pub subagent_rail_scroll: usize,
+    /// Upper bound for `subagent_rail_scroll` (panes.len() - visible
+    /// capacity), recorded by the rail widget at render. 0 = all fit.
+    pub last_subagent_rail_max_scroll: Cell<usize>,
+    /// The clamped scroll offset the LAST rendered frame actually used.
+    /// Added to the rect vec index in `subagent_tab_hit` so hit rects map
+    /// back to TRUE pane indices after windowing.
+    pub last_subagent_rail_drawn_offset: Cell<usize>,
+    /// Rect of the whole rail strip (incl. its left border) as drawn by
+    /// the LAST frame — routes mouse-wheel events over the rail to rail
+    /// scrolling. Zeroed on frames that don't draw the rail.
+    pub last_subagent_rail_rect: Cell<(u16, u16, u16, u16)>,
     /// Render-time geometry for the FOCUSED pane (parallel-subagent
     /// feature): scroll upper bound + text-area rect, recorded by the pane
     /// transcript widget each frame. App-level because widgets render
     /// through `&App` (interior mutability, mirroring `last_text_area`).
     pub last_pane_max_scroll: Cell<usize>,
     pub last_pane_text_area: Cell<(u16, u16, u16, u16)>,
-    /// View anchor for the focused pane's maximized stats/context stream
-    /// (None = auto-follow the live tail). Mirrors `stats_view`.
-    pub pane_stats_view: Option<usize>,
-    /// Upper bound for a valid `pane_stats_view` anchor, recorded at render.
-    pub last_pane_stats_max_anchor: Cell<usize>,
     /// Screen rect of the pane stats page as drawn by the LAST frame.
     pub last_pane_stats_rect: Cell<(u16, u16, u16, u16)>,
     /// Learnings counter for wisdom accumulation display.
@@ -1281,10 +1390,12 @@ impl App {
             last_subagent_tab_rects: std::cell::RefCell::new(Vec::new()),
             last_orchestrator_tab_rect: Cell::new((0, 0, 0, 0)),
             last_subagent_rail_title_rect: Cell::new((0, 0, 0, 0)),
+            subagent_rail_scroll: 0,
+            last_subagent_rail_max_scroll: Cell::new(0),
+            last_subagent_rail_drawn_offset: Cell::new(0),
+            last_subagent_rail_rect: Cell::new((0, 0, 0, 0)),
             last_pane_max_scroll: Cell::new(0),
             last_pane_text_area: Cell::new((0, 0, 0, 0)),
-            pane_stats_view: None,
-            last_pane_stats_max_anchor: Cell::new(0),
             last_pane_stats_rect: Cell::new((0, 0, 0, 0)),
             learnings_count: 0,
             neurocode_active: false,
@@ -1365,10 +1476,43 @@ impl App {
     /// The TUI uses scroll-based navigation (no per-item cursor), so this
     /// targets the last `Reasoning` item in the transcript — matching crush's
     /// behavior of expanding the most recent thinking block first.
+    ///
+    /// T012 (US2, FR-004): the TARGET follows focus. With a subagent pane
+    /// focused, the PANE's most-recent reasoning entry cycles and the main
+    /// transcript stays untouched (focused-view isolation); unfocused, the
+    /// main transcript's entry cycles exactly as before (byte-identical).
     pub fn cycle_focused_reasoning_expand(&mut self) {
+        if let Some(pane) = self.focused_pane_mut() {
+            Self::cycle_last_reasoning_expand_in(&mut pane.transcript);
+        } else {
+            Self::cycle_last_reasoning_expand_in(&mut self.transcript);
+        }
+    }
+
+    /// Feature 005 (T026/T028): cycle the most-recent tool call through the
+    /// three-state inline expand. Targets the last `Tool` item (FR-018:
+    /// per-item isolation — only one item is affected).
+    ///
+    /// T012 (US2, FR-004): the TARGET follows focus — the focused pane's
+    /// most-recent tool entry when a pane is focused (main untouched),
+    /// the main transcript's otherwise (byte-identical to before).
+    pub fn toggle_focused_tool_expand(&mut self) {
+        if let Some(pane) = self.focused_pane_mut() {
+            Self::toggle_last_tool_expand_in(&mut pane.transcript);
+        } else {
+            Self::toggle_last_tool_expand_in(&mut self.transcript);
+        }
+    }
+
+    /// T012 (US2, FR-004): walk `transcript` newest-first and advance the
+    /// most-recent `Reasoning` item's expand state through the shared
+    /// three-state cycle (the exact walk the main transcript always used,
+    /// parameterized by the target transcript). No-op when it holds no
+    /// `Reasoning` item.
+    fn cycle_last_reasoning_expand_in(transcript: &mut VecDeque<TranscriptItem>) {
         // Find the last Reasoning item in the transcript.
-        for i in (0..self.transcript.len()).rev() {
-            if let TranscriptItem::Reasoning { text, expand_state, .. } = &mut self.transcript[i] {
+        for item in transcript.iter_mut().rev() {
+            if let TranscriptItem::Reasoning { text, expand_state, .. } = item {
                 let total_lines = text.lines().count();
                 *expand_state = expand_state.cycle(total_lines);
                 return;
@@ -1376,11 +1520,11 @@ impl App {
         }
     }
 
-    /// Feature 005 (T026/T028): cycle the most-recent tool call through the
-    /// three-state inline expand. Targets the last `Tool` item (FR-018:
-    /// per-item isolation — only one item is affected).
-    pub fn toggle_focused_tool_expand(&mut self) {
-        for item in self.transcript.iter_mut().rev() {
+    /// T012 (US2, FR-004): walk `transcript` newest-first and advance the
+    /// most-recent `Tool` item's expand state (same per-item isolation the
+    /// main transcript's toggle always had). No-op when it holds no `Tool`.
+    fn toggle_last_tool_expand_in(transcript: &mut VecDeque<TranscriptItem>) {
+        for item in transcript.iter_mut().rev() {
             if matches!(item, TranscriptItem::Tool { .. }) {
                 toggle_expand_item(item);
                 return;
@@ -1725,6 +1869,12 @@ impl App {
                 // stack it as a new tab on the right rail.
                 let mut pane = SubagentPane::new(&goal, model.clone(), toolset_summary.clone(), 0);
                 pane.child_id = id;
+                // T022 (US4, FR-008): snapshot mode attribution at spawn —
+                // the pane may show the mode-specific explorer only if the
+                // spawning mode (NeuroCode) was active when this child was
+                // delegated. Frozen at spawn so a later mode toggle never
+                // retroactively grants a plain pane mode reachability.
+                pane.spawned_by_neurocode = self.neurocode_active;
                 self.subagent_panes.push(pane);
                 self.push_item(TranscriptItem::Notice {
                     text: format!("🤖 Subagent: {} [{}] (click its tab on the right rail to watch live)", goal, toolset_summary),
@@ -1974,25 +2124,10 @@ impl App {
             }
             // Feature 005 (T018): build a FileDiff transcript item from the
             // FileChange event. Rendering happens in widgets.rs (T019).
+            // Spec 017 (T013): construction extracted to `file_diff_item`,
+            // shared verbatim with `pane_apply` (D7 parity).
             AgentEvent::FileChange { path, kind, diff, is_binary, .. } => {
-                let label = match kind {
-                    FileChangeKind::Create => " (new file)",
-                    FileChangeKind::Delete => " (deleted)",
-                    FileChangeKind::Edit => "",
-                };
-                let stat = format!("{}{}", diff.stat_line(), label);
-                let lines: Vec<String> = if is_binary {
-                    Vec::new()
-                } else {
-                    diff.diff.lines().map(|l| l.to_string()).collect()
-                };
-                self.push_item(TranscriptItem::FileDiff {
-                    path,
-                    stat,
-                    lines,
-                    is_binary,
-                    expand_state: ReasoningExpandState::Collapsed,
-                });
+                self.push_item(file_diff_item(&path, kind, &diff, is_binary));
             }
             AgentEvent::Done { final_text, usage: _, iterations } => {
                 // Tokens were already counted per ApiCallEnd; only the
@@ -2385,20 +2520,76 @@ impl App {
     /// Focus a subagent pane by index. `None` returns to the orchestrator
     /// (main) view. Retargets the main transcript + the maximized stats /
     /// context window to the selected child.
+    ///
+    /// Focus-follow: when a pane is selected, the rail window scrolls the
+    /// MINIMUM amount needed to bring its tab inside the visible range
+    /// (never jumps to the top), so Ctrl+P / tab clicks auto-reveal.
     pub fn focus_subagent(&mut self, index: Option<usize>) {
         self.focused_subagent = match index {
             None => None,
             Some(i) if i < self.subagent_panes.len() => Some(i),
             Some(_) => None,
         };
+        if let Some(i) = self.focused_subagent {
+            self.reveal_subagent_in_rail(i);
+        }
+    }
+
+    /// Scroll the rail window minimally so pane `i` is inside it. Uses the
+    /// last recorded max-scroll; when `i` is already visible this is a
+    /// no-op (visible range = [scroll, scroll + visible], visible =
+    /// panes.len() - max_scroll is exact only at scroll==0, so this checks
+    /// against the drawn offset + rect count of the last frame when
+    /// available, falling back to max-scroll bounds).
+    fn reveal_subagent_in_rail(&mut self, i: usize) {
+        // Visible pane count of the last frame: recorded rects + the offset
+        // the frame skipped. If no frame has rendered yet (or the rects
+        // were cleared), fall back to treating everything as visible.
+        let offset = self.last_subagent_rail_drawn_offset.get();
+        let visible = self.last_subagent_tab_rects.borrow().len();
+        if visible == 0 {
+            return; // rail not rendered (or empty): nothing to reveal in
+        }
+        if i < offset {
+            // Above the window: scroll up just enough — pane becomes the
+            // top visible tab.
+            self.subagent_rail_scroll = i;
+        } else if i >= offset + visible {
+            // Below the window: scroll down just enough — pane becomes the
+            // bottom visible tab.
+            let target = i + 1 - visible;
+            let max = self.last_subagent_rail_max_scroll.get();
+            self.subagent_rail_scroll = target.min(max);
+        }
+        // Clamp defensively (a resize between frames can shrink capacity).
+        self.subagent_rail_scroll = self
+            .subagent_rail_scroll
+            .min(self.last_subagent_rail_max_scroll.get());
+    }
+
+    /// Scroll the subagent rail window toward the top (earlier panes) by
+    /// `by` panes. Clamped at 0.
+    pub fn subagent_rail_scroll_up(&mut self, by: usize) {
+        self.subagent_rail_scroll = self.subagent_rail_scroll.saturating_sub(by);
+    }
+
+    /// Scroll the subagent rail window toward the bottom (later panes) by
+    /// `by` panes. Clamped at the max-scroll recorded by the last frame.
+    pub fn subagent_rail_scroll_down(&mut self, by: usize) {
+        let max = self.last_subagent_rail_max_scroll.get();
+        self.subagent_rail_scroll = (self.subagent_rail_scroll + by).min(max);
     }
 
     /// Click hit-test against the right rail's tab rects. Returns the pane
-    /// index whose tab was clicked, or None.
+    /// index whose tab was clicked, or None. The recorded rect vec indexes
+    /// the WINDOWED pane list (the first `last_subagent_rail_drawn_offset`
+    /// panes are skipped), so the frame's drawn offset is added back to
+    /// map a click to the TRUE pane index.
     pub fn subagent_tab_hit(&self, row: u16, col: u16) -> Option<usize> {
+        let offset = self.last_subagent_rail_drawn_offset.get();
         for (i, (x, y, w, h)) in self.last_subagent_tab_rects.borrow().iter().enumerate() {
             if w > &0 && h > &0 && row >= *y && row < *y + *h && col >= *x && col < *x + *w {
-                return Some(i);
+                return Some(i + offset);
             }
         }
         None
@@ -2457,22 +2648,36 @@ impl App {
     }
 
     /// Scroll the focused pane's transcript up by `by` lines.
+    ///
+    /// T009 (US1, data-model ScrollState): `None` (follow-tail) →
+    /// `Some(by)`; every step clamps into `[0, last_pane_max_scroll]`, the
+    /// bound the pane transcript widget records at render time. A pinned
+    /// offset that went stale-high (transcript shrank via ring eviction
+    /// since it was pinned) is re-clamped here, so the invariant "pinned
+    /// stays ≤ the bound" holds at every mutation — exactly the main
+    /// transcript's `scroll_up` semantics on the pane. Appends never move
+    /// the offset (see `SubagentPane::push_item`); only user scrolls do.
+    /// No-op while no pane is focused (focused-view isolation).
     pub fn pane_scroll_up(&mut self, by: usize) {
-        if self.focused_subagent.is_some() {
-            let cur = self
-                .focused_pane()
-                .and_then(|p| p.scroll)
-                .unwrap_or(0);
-            let max = self.last_pane_max_scroll.get();
-            let next = (cur + by).min(max);
-            if let Some(pane) = self.focused_pane_mut() {
-                pane.scroll = Some(next);
-            }
+        let max = self.last_pane_max_scroll.get();
+        if let Some(pane) = self.focused_pane_mut() {
+            // Clamp `cur` as well: a stale-high offset (bound shrank since
+            // the pin) must not survive an up-step. `(cur + by).min(max)`
+            // already bounds the result; the explicit clamp documents the
+            // re-clamp invariant and keeps `cur + by` from overflowing.
+            let cur = pane.scroll.unwrap_or(0).min(max);
+            pane.scroll = Some((cur + by).min(max));
         }
     }
 
     /// Scroll the focused pane's transcript down by `by` lines (None at the
     /// bottom resumes auto-follow).
+    ///
+    /// T009: mirrors the main transcript's `scroll_down` exactly — re-clamp
+    /// the current offset against the render-time bound first (content may
+    /// have shrunk), then step; reaching (or passing) the bottom flips the
+    /// pane back to follow-tail (`None`), which is the ONLY way appends
+    /// resume live-tracking after the user pinned the view.
     pub fn pane_scroll_down(&mut self, by: usize) {
         let max = self.last_pane_max_scroll.get();
         if let Some(pane) = self.focused_pane_mut() {
@@ -2484,11 +2689,30 @@ impl App {
     }
 
     /// Clear all panes and return to the orchestrator view (Ctrl+L parity).
+    ///
+    /// T009 (US1, data-model ScrollState / D9): besides the pane map and
+    /// focus, the render-time pane geometry cells go back to their pristine
+    /// values — the recorded `last_pane_max_scroll` bound described panes
+    /// that no longer exist, and leaving it stale would let a pre-render
+    /// scroll on a freshly spawned pane clamp against a ghost bound
+    /// (bound-freshness invariant: the bound is only meaningful between
+    /// the render that recorded it and the next clear). The orchestrator's
+    /// own `scroll`/`last_max_scroll` are deliberately untouched (D9).
     pub fn clear_subagent_panes(&mut self) {
         self.subagent_panes.clear();
         self.focused_subagent = None;
         self.last_subagent_tab_rects.borrow_mut().clear();
         self.last_orchestrator_tab_rect.set((0, 0, 0, 0));
+        // Reset the rail window: with no panes there is nothing scrolled.
+        self.subagent_rail_scroll = 0;
+        self.last_subagent_rail_max_scroll.set(0);
+        self.last_subagent_rail_drawn_offset.set(0);
+        self.last_subagent_rail_rect.set((0, 0, 0, 0));
+        // T009: reset the pane-view geometry cells too (see doc comment) —
+        // they describe the FOCUSED pane's transcript area, which is gone.
+        self.last_pane_max_scroll.set(0);
+        self.last_pane_text_area.set((0, 0, 0, 0));
+        self.last_pane_stats_rect.set((0, 0, 0, 0));
     }
 
     /// The pane currently focused, if any.
@@ -2502,24 +2726,46 @@ impl App {
     }
 
     /// Scroll the focused pane's maximized stats stream up (freezes the
-    /// anchor). Mirrors `stats_scroll_up`.
+    /// anchor). Mirrors `stats_scroll_up`. T004: the anchor is per-pane
+    /// (`SubagentPane::stats_view`), so sibling panes keep their own scroll.
     pub fn pane_stats_scroll_up(&mut self, by: usize) {
-        let cur = self
-            .pane_stats_view
-            .unwrap_or_else(|| self.last_pane_stats_max_anchor.get());
-        self.pane_stats_view = Some(cur.saturating_sub(by));
+        if let Some(pane) = self.focused_pane_mut() {
+            let cur = pane
+                .stats_view
+                .unwrap_or_else(|| pane.last_stats_max_anchor.get());
+            pane.stats_view = Some(cur.saturating_sub(by));
+        }
     }
 
     /// Scroll the focused pane's maximized stats stream down; re-pins at the
-    /// bottom. Mirrors `stats_scroll_down`.
+    /// bottom. Mirrors `stats_scroll_down`. T004: per-pane anchor.
     pub fn pane_stats_scroll_down(&mut self, by: usize) {
-        if let Some(a) = self.pane_stats_view {
-            let target = a.saturating_add(by);
-            if target >= self.last_pane_stats_max_anchor.get() {
-                self.pane_stats_view = None;
-            } else {
-                self.pane_stats_view = Some(target);
+        if let Some(pane) = self.focused_pane_mut() {
+            if let Some(a) = pane.stats_view {
+                let target = a.saturating_add(by);
+                if target >= pane.last_stats_max_anchor.get() {
+                    pane.stats_view = None;
+                } else {
+                    pane.stats_view = Some(target);
+                }
             }
+        }
+    }
+
+    /// T004: the FOCUSED pane's stats-view anchor, if a pane is focused.
+    /// Returns `None` both when no pane is focused and when the focused
+    /// pane is auto-following — callers that must distinguish should check
+    /// `focused_subagent` first.
+    pub fn focused_pane_stats_view(&self) -> Option<usize> {
+        self.focused_pane().and_then(|p| p.stats_view)
+    }
+
+    /// T004: set the FOCUSED pane's stats-view anchor. No-op when no pane
+    /// is focused (graceful fallback for the orchestrator view, whose stats
+    /// anchor is `App::stats_view`).
+    pub fn set_focused_pane_stats_view(&mut self, view: Option<usize>) {
+        if let Some(pane) = self.focused_pane_mut() {
+            pane.stats_view = view;
         }
     }
 }
@@ -2569,47 +2815,169 @@ impl App {
         }
     }
 
-    // ── Search ─────────────���────────────────────────────────────────────
+    // ── Search ─────────────────────────────────────────────────────────
 
-    /// Run a search query against the transcript, scrolling to the first match.
-    /// Called when the user types in the search bar.
+    /// Run a search query against the transcript, scrolling to the first
+    /// (newest) match. Called when the user types in the search bar.
+    ///
+    /// T015 (US3, FR-006/FR-007, design D5): focus-follow — with a
+    /// subagent pane focused the same search bar searches the PANE's
+    /// transcript and pins the PANE view (clamped per ScrollState,
+    /// `last_pane_max_scroll`), leaving the orchestrator's scroll and
+    /// match-indicator state untouched (per-view SearchState isolation,
+    /// data-model.md). Unfocused, the main-transcript behavior is
+    /// byte-identical to before (the walk now lives in `run_search_in`).
+    /// Match-indicator only — search never highlights text in-place (D5).
     pub fn run_search(&mut self) {
-        if self.search_query.is_empty() {
-            self.search_has_match = false;
+        if self.focused_subagent.is_some() {
+            let query = self.search_query.clone();
+            let max = self.last_pane_max_scroll.get();
+            if let Some(pane) = self.focused_pane_mut() {
+                // The live bar's query becomes the pane's preserved query
+                // (FR-010: switching focus away and back keeps it).
+                pane.search_query = query;
+                Self::run_search_on_pane(pane, max);
+            }
             return;
         }
-        let query = self.search_query.to_lowercase();
-        // Search from the newest item backward.
-        for (idx, item) in self.transcript.iter().rev().enumerate() {
-            let text = transcript_item_text(item);
-            if text.to_lowercase().contains(&query) {
+        match Self::run_search_in(&self.transcript, &self.search_query) {
+            Some(idx) => {
                 // Scroll to show this item — approximate by scrolling up
                 // proportionally to the item position.
-                let total = self.transcript.len();
-                let from_bottom = idx;
-                let target_scroll = from_bottom.saturating_sub(2).min(
-                    self.last_max_scroll.get(),
-                );
+                let target_scroll = idx
+                    .saturating_sub(2)
+                    .min(self.last_max_scroll.get());
                 self.scroll = Some(target_scroll);
                 self.search_has_match = true;
-                let _ = total;
-                return;
             }
+            None => self.search_has_match = false,
         }
-        self.search_has_match = false;
     }
 
     /// Find the next/previous search match from the current scroll position.
+    ///
+    /// T015 (US3, FR-006, D5): focus-follow — with a pane focused, n/N
+    /// walk the PANE's matches and scroll only the OWNING (pane) view;
+    /// the main path is byte-identical to before (the walk now lives in
+    /// `search_next_in`).
     pub fn search_next(&mut self, forward: bool) {
-        if self.search_query.is_empty() {
+        if self.focused_subagent.is_some() {
+            let query = self.search_query.clone();
+            let max = self.last_pane_max_scroll.get();
+            if let Some(pane) = self.focused_pane_mut() {
+                pane.search_query = query;
+                Self::search_next_on_pane(pane, forward, max);
+            }
             return;
         }
-        let query = self.search_query.to_lowercase();
         let current_scroll = self.scroll.unwrap_or(0);
+        if let Some(idx) =
+            Self::search_next_in(&self.transcript, &self.search_query, current_scroll, forward)
+        {
+            let target_scroll = idx.saturating_sub(2).min(self.last_max_scroll.get());
+            self.scroll = Some(target_scroll);
+        }
+    }
+
+    /// T015 (US3, FR-006, D5): pane-targeted `run_search` — run the FOCUSED
+    /// pane's own query (its per-view SearchState) against its transcript
+    /// and pin the pane. No-op while no pane is focused (focused-view
+    /// isolation). The key-routing wave (T016) dispatches here for '/'
+    /// opened inside a pane view.
+    pub fn pane_run_search(&mut self) {
+        let max = self.last_pane_max_scroll.get();
+        if let Some(pane) = self.focused_pane_mut() {
+            Self::run_search_on_pane(pane, max);
+        }
+    }
+
+    /// T015 (US3, FR-006, D5): pane-targeted `search_next` — walk the
+    /// FOCUSED pane's matches (its own query) and scroll only the pane.
+    /// No-op while no pane is focused.
+    pub fn pane_search_next(&mut self, forward: bool) {
+        let max = self.last_pane_max_scroll.get();
+        if let Some(pane) = self.focused_pane_mut() {
+            Self::search_next_on_pane(pane, forward, max);
+        }
+    }
+
+    /// T015 (D5): apply `run_search` semantics to one pane: newest-first
+    /// first match pins the pane's scroll (clamped to the render-time
+    /// bound — ScrollState: pinned ≤ last_pane_max_scroll) and sets the
+    /// pane's match indicator; no match (or empty query) clears it and
+    /// never moves the view (never yanks a scrolled-up pane).
+    fn run_search_on_pane(pane: &mut SubagentPane, max_scroll: usize) {
+        match Self::run_search_in(&pane.transcript, &pane.search_query) {
+            Some(idx) => {
+                pane.scroll = Some(idx.saturating_sub(2).min(max_scroll));
+                pane.search_has_match = true;
+            }
+            None => pane.search_has_match = false,
+        }
+    }
+
+    /// T015 (D5): apply `search_next` semantics to one pane: navigate to
+    /// the next/previous match from the pane's current offset (wrap-around
+    /// included) and pin the pane, clamped per ScrollState. Empty query /
+    /// no matches are a no-op (the view stays where the user put it).
+    ///
+    /// Position proxy: a pinned match sits at `scroll = idx - 2` (the
+    /// display offset `run_search_on_pane` applies), so the walk threshold
+    /// is `current_scroll + 2` — the inverse mapping — to step to the
+    /// match strictly BEYOND the one in view. (The main transcript's
+    /// `search_next` keeps its historical raw-scroll proxy byte-for-byte;
+    /// under it N re-finds the current match whenever the offset is
+    /// unclamped, which pane navigation must not inherit: n/N must
+    /// advance, data-model.md "wraps/advances matches".)
+    fn search_next_on_pane(pane: &mut SubagentPane, forward: bool, max_scroll: usize) {
+        let current_scroll = pane.scroll.unwrap_or(0);
+        if let Some(idx) = Self::search_next_in(
+            &pane.transcript,
+            &pane.search_query,
+            current_scroll + 2,
+            forward,
+        ) {
+            pane.scroll = Some(idx.saturating_sub(2).min(max_scroll));
+        }
+    }
+
+    /// T015 (D5): the newest-first match walk the main `run_search` always
+    /// used, parameterized by the target transcript (the `_in()` precedent
+    /// of `cycle_last_reasoning_expand_in`). Returns the newest matching
+    /// item's from-bottom index, or `None` (empty query / no match).
+    fn run_search_in(transcript: &VecDeque<TranscriptItem>, query: &str) -> Option<usize> {
+        if query.is_empty() {
+            return None;
+        }
+        let query = query.to_lowercase();
+        // Search from the newest item backward.
+        transcript
+            .iter()
+            .rev()
+            .enumerate()
+            .find(|(_, item)| transcript_item_text(item).to_lowercase().contains(&query))
+            .map(|(idx, _)| idx)
+    }
+
+    /// T015 (D5): the next/previous match walk of `search_next`,
+    /// parameterized by the target transcript and the position threshold
+    /// (main passes the raw scroll offset — upstream's proxy, kept
+    /// byte-identical; the pane path passes the inverted display offset,
+    /// see `search_next_on_pane`). Returns the target match's from-bottom
+    /// index (wrap-around included), or `None` (empty query / no matches).
+    fn search_next_in(
+        transcript: &VecDeque<TranscriptItem>,
+        query: &str,
+        threshold: usize,
+        forward: bool,
+    ) -> Option<usize> {
+        if query.is_empty() {
+            return None;
+        }
+        let query = query.to_lowercase();
 
         // Collect match positions (items that contain the query).
-        let matches: Vec<usize> = self
-            .transcript
+        let matches: Vec<usize> = transcript
             .iter()
             .rev()
             .enumerate()
@@ -2620,27 +2988,24 @@ impl App {
             .collect();
 
         if matches.is_empty() {
-            return;
+            return None;
         }
 
         // Find the next match beyond the current scroll position.
-        let target = if forward {
+        if forward {
             // Forward = scroll down toward newer messages (decrease scroll).
             matches
                 .iter()
-                .find(|&&idx| idx < current_scroll)
-                .or_else(|| matches.first())
+                .copied()
+                .find(|&idx| idx < threshold)
+                .or_else(|| matches.first().copied())
         } else {
             // Backward = scroll up toward older messages (increase scroll).
             matches
                 .iter()
-                .find(|&&idx| idx > current_scroll)
-                .or_else(|| matches.last())
-        };
-
-        if let Some(&idx) = target {
-            let target_scroll = idx.saturating_sub(2).min(self.last_max_scroll.get());
-            self.scroll = Some(target_scroll);
+                .copied()
+                .find(|&idx| idx > threshold)
+                .or_else(|| matches.last().copied())
         }
     }
 }
@@ -3078,6 +3443,188 @@ mod tests {
             );
         } else {
             panic!("expected Tool item");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pane_ctrl_expand_mutator_tests {
+    //! T012 (US2, FR-004): the App expand mutators retarget to the FOCUSED
+    //! pane's transcript (`cycle_focused_reasoning_expand` /
+    //! `toggle_focused_tool_expand` — the shared newest-first walk, now
+    //! parameterized by target). Integration tests can't construct `Tui`,
+    //! so these pin the App-level dispatch the key arms delegate to; the
+    //! key-level routing is pinned in app.rs's
+    //! `pane_ctrl_expand_key_routing_tests`, and unfocused Main behavior by
+    //! the Feature-005 tests above (`tool_expand_toggle_flips_and_isolates`)
+    //! plus pane_expand_parity.rs's unfocused pins.
+    use super::*;
+    use joey_agent_core::AgentEvent;
+    use std::time::Duration;
+
+    fn spawn_focused_pane(app: &mut App) {
+        app.apply(AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "expand child".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+        let idx = app
+            .subagent_panes
+            .iter()
+            .position(|p| p.child_id == 1)
+            .expect("spawn created the pane");
+        app.focus_subagent(Some(idx));
+    }
+
+    fn long_reasoning(n: usize) -> TranscriptItem {
+        TranscriptItem::Reasoning {
+            text: (0..n).map(|j| format!("think line {j:03}")).collect::<Vec<_>>().join("\n"),
+            expand_state: ReasoningExpandState::Collapsed,
+            thought_duration: Some(Duration::from_secs(2)),
+        }
+    }
+
+    fn long_tool(n: usize) -> TranscriptItem {
+        let result =
+            (0..n).map(|j| format!("tool out line {j:03}")).collect::<Vec<_>>().join("\n");
+        TranscriptItem::Tool {
+            name: "longtool".to_string(),
+            emoji: "🔧".to_string(),
+            summary: "long tool summary".to_string(),
+            status: ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: result.clone(),
+            expand_state: ReasoningExpandState::Collapsed,
+            full_args: Some("{}".to_string()),
+            full_result: Some(result),
+            is_terminal: false,
+            exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: LIVE_OUTPUT_CAPACITY,
+        }
+    }
+
+    fn state_of(item: &TranscriptItem) -> ReasoningExpandState {
+        match item {
+            TranscriptItem::Reasoning { expand_state, .. }
+            | TranscriptItem::Tool { expand_state, .. }
+            | TranscriptItem::FileDiff { expand_state, .. } => *expand_state,
+            _ => ReasoningExpandState::Collapsed,
+        }
+    }
+
+    fn main_all_collapsed(app: &App, ctx: &str) {
+        for (i, it) in app.transcript.iter().enumerate() {
+            assert_eq!(
+                state_of(it),
+                ReasoningExpandState::Collapsed,
+                "{ctx}: main item {i} untouched while a pane is focused"
+            );
+        }
+    }
+
+    /// Focused pane: Ctrl+E's mutator cycles the PANE's most-recent
+    /// reasoning entry through ALL THREE states and leaves the main
+    /// transcript Collapsed (FR-004 focused-view isolation).
+    #[test]
+    fn cycle_focused_reasoning_expand_targets_pane() {
+        let mut app = App::new("s", "m");
+        spawn_focused_pane(&mut app);
+        app.subagent_panes[0].push_item(long_tool(6)); // pane decoy (index 0)
+        app.subagent_panes[0].push_item(long_reasoning(220)); // target (index 1)
+        app.push_item(long_reasoning(90)); // main marker
+        app.push_item(long_tool(91));
+        let pane = |a: &App| state_of(&a.subagent_panes[0].transcript[1]);
+
+        assert_eq!(pane(&app), ReasoningExpandState::Collapsed);
+        app.cycle_focused_reasoning_expand();
+        assert_eq!(pane(&app), ReasoningExpandState::TailWindow, "1st: → TailWindow");
+        app.cycle_focused_reasoning_expand();
+        assert_eq!(pane(&app), ReasoningExpandState::Full, "2nd: → Full (220 > 200)");
+        app.cycle_focused_reasoning_expand();
+        assert_eq!(pane(&app), ReasoningExpandState::Collapsed, "3rd: → Collapsed");
+
+        assert_eq!(
+            state_of(&app.subagent_panes[0].transcript[0]),
+            ReasoningExpandState::Collapsed,
+            "pane tool untouched (per-item isolation)"
+        );
+        main_all_collapsed(&app, "ctrl+e mutator");
+    }
+
+    /// Focused pane: Ctrl+G's mutator toggles the PANE's most-recent tool
+    /// entry through all three states; main stays Collapsed.
+    #[test]
+    fn toggle_focused_tool_expand_targets_pane() {
+        let mut app = App::new("s", "m");
+        spawn_focused_pane(&mut app);
+        app.subagent_panes[0].push_item(long_reasoning(90)); // pane decoy
+        app.subagent_panes[0].push_item(long_tool(220)); // target
+        app.push_item(long_reasoning(90));
+        app.push_item(long_tool(91));
+        let pane = |a: &App| state_of(&a.subagent_panes[0].transcript[1]);
+
+        assert_eq!(pane(&app), ReasoningExpandState::Collapsed);
+        app.toggle_focused_tool_expand();
+        assert_eq!(pane(&app), ReasoningExpandState::TailWindow, "1st: → TailWindow");
+        app.toggle_focused_tool_expand();
+        assert_eq!(pane(&app), ReasoningExpandState::Full, "2nd: → Full (220 > 200)");
+        app.toggle_focused_tool_expand();
+        assert_eq!(pane(&app), ReasoningExpandState::Collapsed, "3rd: → Collapsed");
+
+        assert_eq!(
+            state_of(&app.subagent_panes[0].transcript[0]),
+            ReasoningExpandState::Collapsed,
+            "pane reasoning untouched (per-item isolation)"
+        );
+        main_all_collapsed(&app, "ctrl+g mutator");
+    }
+
+    /// Unfocused (focused_subagent == None) with expandable-carrying panes
+    /// present: both mutators act on the MAIN transcript; panes stay
+    /// Collapsed (byte-identical Main behavior, constitution VII).
+    #[test]
+    fn unfocused_mutators_target_main_transcript() {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "idle child".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+        app.subagent_panes[0].push_item(long_reasoning(220));
+        app.subagent_panes[0].push_item(long_tool(220));
+        app.transcript.clear(); // drop the spawn notice — exact indices below
+        app.push_item(long_reasoning(220)); // main index 0
+        app.push_item(long_tool(220)); // main index 1
+        assert!(app.focused_subagent.is_none());
+
+        app.cycle_focused_reasoning_expand();
+        assert_eq!(
+            state_of(&app.transcript[0]),
+            ReasoningExpandState::TailWindow,
+            "Ctrl+E mutator cycled MAIN reasoning"
+        );
+        assert_eq!(
+            state_of(&app.transcript[1]),
+            ReasoningExpandState::Collapsed,
+            "Ctrl+E touches only the reasoning item"
+        );
+        app.toggle_focused_tool_expand();
+        assert_eq!(
+            state_of(&app.transcript[1]),
+            ReasoningExpandState::TailWindow,
+            "Ctrl+G mutator toggled MAIN tool"
+        );
+        for (i, it) in app.subagent_panes[0].transcript.iter().enumerate() {
+            assert_eq!(
+                state_of(it),
+                ReasoningExpandState::Collapsed,
+                "pane item {i} untouched while unfocused"
+            );
         }
     }
 }
@@ -3909,5 +4456,642 @@ mod stats_page_tests {
         app.apply(AgentEvent::TurnStart { max_iterations: 10 });
         app.apply(AgentEvent::TurnStart { max_iterations: 10 });
         assert_eq!(app.turns, 2);
+    }
+
+    // ── T004: per-pane stats anchors (FR-010 state preservation) ──────
+
+    fn spawn_pane(app: &mut App, id: u64, goal: &str) {
+        app.apply(AgentEvent::SubagentSpawn {
+            id,
+            goal: goal.into(),
+            model: "m".into(),
+            toolset_summary: "all".into(),
+            depth: 0,
+        });
+    }
+
+    #[test]
+    fn pane_stats_view_survives_focus_switches() {
+        // FR-010: each pane keeps its own stats scroll anchor; switching
+        // focus must not reset a sibling pane's position (the old global
+        // App::pane_stats_view reset on every focus change).
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 1, "child one");
+        spawn_pane(&mut app, 2, "child two");
+        assert_eq!(app.subagent_panes.len(), 2);
+        // New panes start auto-following.
+        assert!(app.focused_pane().is_none());
+
+        app.focus_subagent(Some(0));
+        app.set_focused_pane_stats_view(Some(7));
+        assert_eq!(app.focused_pane_stats_view(), Some(7));
+
+        app.focus_subagent(Some(1));
+        // Pane 0's anchor is untouched by the switch...
+        assert_eq!(app.subagent_panes[0].stats_view, Some(7));
+        // ...and pane 1 gets its own independent anchor.
+        assert_eq!(app.focused_pane_stats_view(), None);
+        app.set_focused_pane_stats_view(Some(11));
+        assert_eq!(app.focused_pane_stats_view(), Some(11));
+
+        // Switch back: pane 0 still holds its anchor.
+        app.focus_subagent(Some(0));
+        assert_eq!(app.focused_pane_stats_view(), Some(7));
+        assert_eq!(app.subagent_panes[1].stats_view, Some(11));
+    }
+
+    #[test]
+    fn pane_stats_scroll_helpers_use_focused_pane_bounds() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 1, "child");
+        app.focus_subagent(Some(0));
+        // Simulate the pane stats widget's render-time anchor bound.
+        app.focused_pane_mut().unwrap().last_stats_max_anchor.set(40);
+        app.pane_stats_scroll_up(5);
+        assert_eq!(app.focused_pane_stats_view(), Some(35), "scroll up freezes");
+        app.pane_stats_scroll_down(3);
+        assert_eq!(
+            app.focused_pane_stats_view(),
+            Some(38),
+            "still frozen above the tail"
+        );
+        app.pane_stats_scroll_down(10);
+        assert!(
+            app.focused_pane_stats_view().is_none(),
+            "reaching the tail resumes follow"
+        );
+        // Anchor lives on the pane itself, not on the App.
+        assert_eq!(app.subagent_panes[0].stats_view, None);
+    }
+
+    #[test]
+    fn pane_stats_helpers_no_op_without_focused_pane() {
+        // Graceful fallback: with focus on the orchestrator view the pane
+        // helpers must not panic or touch main-transcript stats state.
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 1, "child");
+        // No pane focused (orchestrator view).
+        app.pane_stats_scroll_up(5);
+        app.pane_stats_scroll_down(5);
+        app.set_focused_pane_stats_view(Some(3));
+        assert!(app.focused_pane_stats_view().is_none());
+        assert_eq!(app.subagent_panes[0].stats_view, None);
+        assert!(app.stats_view.is_none(), "main stats anchor untouched");
+    }
+
+    // ── T009 (US1): per-pane ScrollState semantics ─────────────────────
+    //
+    // data-model.md ScrollState invariants, pinned at the state level:
+    //   1. None = follow-tail; Some(n) = pinned with n ≤ last_max_scroll.
+    //   2. Clamp on EVERY mutation (up re-clamps the current offset too —
+    //      the bound may have shrunk since the pin, e.g. ring eviction).
+    //   3. The bound is render-time knowledge: with no frame drawn yet it
+    //      is 0, so a pre-render scroll pins at 0, never at `by`.
+    //   4. Appends while pinned-at-bottom keep following (stays None);
+    //      appends while scrolled-up keep the offset stable (push_item
+    //      never touches scroll — main-transcript parity).
+    //   5. Reaching the bottom via scroll_down sets None (follow-tail
+    //      resumes) — the main transcript's scroll_down, mirrored.
+    //   6. Scroll state survives focus switches (FR-010).
+    //   7. clear_subagent_panes resets the pane geometry cells (bound
+    //      freshness) and leaves the orchestrator scroll untouched (D9).
+
+    /// Invariant 2 (clamp-on-shrink): a pinned offset that went stale-high
+    /// — the recorded bound shrank after the pin (ring eviction dropped the
+    /// oldest content) — is re-clamped by the NEXT scroll mutation in both
+    /// directions, never surviving above the bound.
+    #[test]
+    fn pane_scroll_reclamps_stale_offset_after_bound_shrink() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 1, "child");
+        app.focus_subagent(Some(0));
+        // Frame recorded a generous bound; the user pins deep.
+        app.last_pane_max_scroll.set(50);
+        app.pane_scroll_up(30);
+        assert_eq!(app.subagent_panes[0].scroll, Some(30));
+        // Content shrank (eviction): the next frame records a smaller bound.
+        app.last_pane_max_scroll.set(12);
+        app.pane_scroll_up(5);
+        assert_eq!(
+            app.subagent_panes[0].scroll,
+            Some(12),
+            "up-step re-clamps the stale-high offset to the new bound"
+        );
+        // Down-steps clamp first as well (progress even from a stale pin).
+        app.subagent_panes[0].scroll = Some(30); // simulate a stale pin
+        app.last_pane_max_scroll.set(12);
+        app.pane_scroll_down(4);
+        assert_eq!(
+            app.subagent_panes[0].scroll,
+            Some(8),
+            "down-step clamps the stale-high offset before moving (12-4)"
+        );
+    }
+
+    /// Invariant 3 (bound freshness): with no pane frame rendered yet the
+    /// recorded bound is 0, so scroll_up pins at 0 (not at `by`) — the
+    /// bound only becomes real after a render, mirroring `App::scroll_up`.
+    #[test]
+    fn pane_scroll_before_first_render_pins_at_zero_bound() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 1, "child");
+        app.focus_subagent(Some(0));
+        assert_eq!(app.last_pane_max_scroll.get(), 0, "pristine bound is 0");
+        app.pane_scroll_up(25);
+        assert_eq!(
+            app.subagent_panes[0].scroll,
+            Some(0),
+            "pre-render scroll pins at the (zero) render-time bound, not at 25"
+        );
+    }
+
+    /// Invariants 4 + 5 (follow-tail semantics): pinned-at-bottom keeps
+    /// following across appends; a scrolled-up offset is stable across
+    /// appends; and scroll_down back to the bottom flips the pane to None,
+    /// after which appends follow the tail again.
+    #[test]
+    fn pane_follow_tail_pinned_follows_scrolled_stable_resumes_at_bottom() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 1, "child");
+        app.focus_subagent(Some(0));
+        app.last_pane_max_scroll.set(40);
+
+        // Pinned at bottom (None): appends keep auto-follow.
+        assert_eq!(app.subagent_panes[0].scroll, None);
+        app.subagent_panes[0].push_item(TranscriptItem::User {
+            text: "m1".into(),
+        });
+        assert_eq!(app.subagent_panes[0].scroll, None);
+
+        // Scroll up: pinned. Appends must NOT move the offset.
+        app.pane_scroll_up(6);
+        assert_eq!(app.subagent_panes[0].scroll, Some(6));
+        for t in ["m2", "m3", "m4"] {
+            app.subagent_panes[0].push_item(TranscriptItem::User { text: t.into() });
+        }
+        assert_eq!(
+            app.subagent_panes[0].scroll,
+            Some(6),
+            "scrolled-up pane does not jump on appends"
+        );
+
+        // Walk back down to the bottom: follow-tail RESUMES (None)…
+        app.pane_scroll_down(6);
+        assert_eq!(app.subagent_panes[0].scroll, None, "bottom → follow-tail");
+        // …and one step past the bottom stays None.
+        app.pane_scroll_down(3);
+        assert_eq!(app.subagent_panes[0].scroll, None, "past-bottom clamps to follow");
+        // …so the next append follows again.
+        app.subagent_panes[0].push_item(TranscriptItem::User { text: "m5".into() });
+        assert_eq!(app.subagent_panes[0].scroll, None);
+    }
+
+    /// Invariant 6 (FR-010): a pane's scroll state survives focus switches
+    /// in both directions and is never copied onto a sibling pane.
+    #[test]
+    fn pane_scroll_survives_focus_switches_without_leaking() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 1, "one");
+        spawn_pane(&mut app, 2, "two");
+        app.focus_subagent(Some(0));
+        app.last_pane_max_scroll.set(40);
+        app.pane_scroll_up(9);
+        assert_eq!(app.subagent_panes[0].scroll, Some(9));
+
+        // Switch to the sibling: pane 0 keeps its pin, pane 1 stays fresh.
+        app.focus_subagent(Some(1));
+        assert_eq!(app.subagent_panes[0].scroll, Some(9), "pin preserved");
+        assert_eq!(app.subagent_panes[1].scroll, None, "sibling untouched");
+
+        // To the orchestrator and back: still preserved.
+        app.focus_subagent(None);
+        app.focus_subagent(Some(0));
+        assert_eq!(app.subagent_panes[0].scroll, Some(9));
+        assert_eq!(app.scroll, None, "main transcript scroll never touched");
+    }
+
+    /// Invariant 7 (D9 + bound freshness): Ctrl+L's clear resets the pane
+    /// geometry cells — a freshly spawned pane's pre-render scroll clamps
+    /// against the pristine 0 bound, not the ghost of the cleared panes —
+    /// while the orchestrator's own scroll state rides through untouched.
+    #[test]
+    fn clear_subagent_panes_resets_pane_bound_and_spares_main_scroll() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 1, "child");
+        app.focus_subagent(Some(0));
+        app.last_pane_max_scroll.set(77);
+        app.last_pane_text_area.set((1, 2, 60, 20));
+        app.last_pane_stats_rect.set((1, 2, 60, 20));
+        app.pane_scroll_up(30);
+        assert_eq!(app.subagent_panes[0].scroll, Some(30));
+
+        // The orchestrator is scrolled independently.
+        app.focus_subagent(None);
+        app.last_max_scroll.set(50);
+        app.scroll_up(4);
+        assert_eq!(app.scroll, Some(4));
+
+        app.clear_subagent_panes();
+        assert!(app.subagent_panes.is_empty());
+        assert!(app.focused_subagent.is_none());
+        assert_eq!(app.last_pane_max_scroll.get(), 0, "ghost pane bound cleared");
+        assert_eq!(app.last_pane_text_area.get(), (0, 0, 0, 0));
+        assert_eq!(app.last_pane_stats_rect.get(), (0, 0, 0, 0));
+        assert_eq!(app.subagent_rail_scroll, 0, "rail reset preserved");
+        assert_eq!(
+            app.scroll,
+            Some(4),
+            "D9: orchestrator scroll untouched by Ctrl+L"
+        );
+        assert_eq!(app.last_max_scroll.get(), 50, "main bound untouched");
+
+        // A fresh pane spawned post-clear cannot inherit the ghost bound.
+        spawn_pane(&mut app, 2, "fresh");
+        app.focus_subagent(Some(0));
+        app.pane_scroll_up(15);
+        assert_eq!(
+            app.subagent_panes[0].scroll,
+            Some(0),
+            "fresh pane clamps against the pristine bound, not the ghost 77"
+        );
+    }
+
+    // ── Spec 017 T013 (US2, FR-005, D7): FileChange → FileDiff in panes ──
+
+    fn mk_file_change(path: &str, kind: FileChangeKind) -> AgentEvent {
+        AgentEvent::FileChange {
+            path: path.to_string(),
+            kind,
+            before: "old\n".to_string(),
+            after: "new\n".to_string(),
+            diff: DiffResult {
+                path: path.to_string(),
+                diff: "--- a/x\n+++ b/x\n-old\n+new\n".to_string(),
+                added: 1,
+                removed: 1,
+            },
+            is_binary: false,
+            source: joey_agent_core::events::FileChangeSource::FileTool,
+        }
+    }
+
+    fn mk_binary_file_change(path: &str) -> AgentEvent {
+        AgentEvent::FileChange {
+            path: path.to_string(),
+            kind: FileChangeKind::Edit,
+            before: String::new(),
+            after: String::new(),
+            diff: DiffResult {
+                path: path.to_string(),
+                diff: String::new(),
+                added: 0,
+                removed: 0,
+            },
+            is_binary: true,
+            source: joey_agent_core::events::FileChangeSource::FileTool,
+        }
+    }
+
+    /// Deconstruct a FileDiff item field-for-field (TranscriptItem has no
+    /// PartialEq; tests compare the Display-relevant payload explicitly).
+    fn as_filediff(it: &TranscriptItem) -> (&str, &str, &Vec<String>, bool, ReasoningExpandState) {
+        match it {
+            TranscriptItem::FileDiff { path, stat, lines, is_binary, expand_state } => {
+                (path, stat, lines, *is_binary, *expand_state)
+            }
+            other => panic!("expected FileDiff, got {:?}", other),
+        }
+    }
+
+    fn last_filediff(transcript: &VecDeque<TranscriptItem>) -> &TranscriptItem {
+        transcript
+            .iter()
+            .rev()
+            .find(|it| matches!(it, TranscriptItem::FileDiff { .. }))
+            .expect("a FileDiff item in transcript")
+    }
+
+    /// T013 (a) + (c): a FileChange routed by child id appends a FileDiff
+    /// item to the OWNING pane only — sibling panes and unknown ids get
+    /// nothing (existing SubagentEvent routing semantics preserved).
+    #[test]
+    fn pane_file_change_appends_filediff_to_owning_pane_only() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 1, "child one");
+        spawn_pane(&mut app, 2, "child two");
+
+        app.apply(AgentEvent::SubagentEvent {
+            id: 1,
+            event: Box::new(mk_file_change("src/lib.rs", FileChangeKind::Edit)),
+        });
+
+        assert_eq!(app.subagent_panes[0].transcript.len(), 1, "owning pane got the item");
+        let (path, stat, lines, is_binary, expand_state) =
+            as_filediff(&app.subagent_panes[0].transcript[0]);
+        assert_eq!(path, "src/lib.rs");
+        assert_eq!(stat, "+1 -1");
+        assert_eq!(
+            lines,
+            &vec![
+                "--- a/x".to_string(),
+                "+++ b/x".to_string(),
+                "-old".to_string(),
+                "+new".to_string(),
+            ]
+        );
+        assert!(!is_binary);
+        assert_eq!(expand_state, ReasoningExpandState::Collapsed);
+
+        // (c) sibling pane untouched; unknown child id dropped.
+        assert!(app.subagent_panes[1].transcript.is_empty(), "sibling pane untouched");
+        app.apply(AgentEvent::SubagentEvent {
+            id: 99,
+            event: Box::new(mk_file_change("src/other.rs", FileChangeKind::Edit)),
+        });
+        assert_eq!(app.subagent_panes[0].transcript.len(), 1, "unknown id not delivered");
+        assert!(app.subagent_panes[1].transcript.is_empty(), "still untouched");
+    }
+
+    /// T013 (b): the pane-constructed FileDiff is field-identical to what
+    /// the main transcript path constructs from the same event (Edit label,
+    /// Create label, and the binary placeholder variant) — parity by the
+    /// shared `file_diff_item` construction (D7).
+    #[test]
+    fn pane_filediff_matches_main_transcript_construction() {
+        for ev in [
+            mk_file_change("src/a.rs", FileChangeKind::Edit),
+            mk_file_change("src/new.rs", FileChangeKind::Create),
+            mk_binary_file_change("assets/logo.png"),
+        ] {
+            let mut app = App::new("s", "m");
+            // Main-transcript path (unwrapped FileChange → App::apply).
+            app.apply(ev.clone());
+            // Pane path (wrapped SubagentEvent → pane_apply).
+            spawn_pane(&mut app, 7, "child");
+            app.apply(AgentEvent::SubagentEvent { id: 7, event: Box::new(ev) });
+
+            let (m_path, m_stat, m_lines, m_binary, m_expand) = as_filediff(last_filediff(&app.transcript));
+            let (p_path, p_stat, p_lines, p_binary, p_expand) =
+                as_filediff(last_filediff(&app.subagent_panes[0].transcript));
+            assert_eq!(m_path, p_path, "path parity");
+            assert_eq!(m_stat, p_stat, "stat parity (incl. kind label)");
+            assert_eq!(m_lines, p_lines, "diff-lines parity");
+            assert_eq!(m_binary, p_binary, "is_binary parity");
+            assert_eq!(m_expand, p_expand, "expand_state parity");
+        }
+
+        // Spot-check the derived payloads: Create label and binary placeholder.
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 4, "child");
+        app.apply(AgentEvent::SubagentEvent {
+            id: 4,
+            event: Box::new(mk_file_change("src/new.rs", FileChangeKind::Create)),
+        });
+        let (_, stat, _, _, _) = as_filediff(&app.subagent_panes[0].transcript[0]);
+        assert_eq!(stat, "+1 -1 (new file)");
+
+        app.apply(AgentEvent::SubagentEvent {
+            id: 4,
+            event: Box::new(mk_binary_file_change("assets/logo.png")),
+        });
+        let (_, stat, lines, is_binary, _) = as_filediff(&app.subagent_panes[0].transcript[1]);
+        assert_eq!(stat, "no changes");
+        assert!(lines.is_empty(), "binary MUST NOT carry diff lines");
+        assert!(is_binary, "binary flag drives the renderer placeholder");
+    }
+
+    /// T013 (d): a mixed sequence (tool events interleaved with file
+    /// changes) preserves stream order in the pane transcript; ToolEnd
+    /// updates its tool item in place rather than appending.
+    #[test]
+    fn pane_mixed_tool_and_file_change_preserves_order() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 3, "child");
+        let send = |app: &mut App, ev: AgentEvent| {
+            app.apply(AgentEvent::SubagentEvent { id: 3, event: Box::new(ev) });
+        };
+
+        send(
+            &mut app,
+            AgentEvent::ToolStart {
+                name: "write_file".to_string(),
+                emoji: "✏️".to_string(),
+                summary: "write src/x.rs".to_string(),
+            },
+        );
+        send(&mut app, mk_file_change("src/x.rs", FileChangeKind::Create));
+        send(
+            &mut app,
+            AgentEvent::ToolEnd {
+                name: "write_file".to_string(),
+                is_error: false,
+                result_preview: "ok".to_string(),
+                duration_secs: 0.1,
+                exit_code: None,
+                full_result: "ok".to_string(),
+            },
+        );
+
+        let t = &app.subagent_panes[0].transcript;
+        assert_eq!(t.len(), 2, "ToolStart + FileDiff; ToolEnd updates in place");
+        assert!(matches!(t[0], TranscriptItem::Tool { .. }), "tool item first");
+        assert!(
+            matches!(t[1], TranscriptItem::FileDiff { .. }),
+            "file change lands in stream order after the tool"
+        );
+        match &t[0] {
+            TranscriptItem::Tool { status, .. } => {
+                assert_eq!(*status, ToolStatus::Done, "ToolEnd resolved the running tool")
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod pane_search_state_tests {
+    //! T015 (US3, FR-006/FR-007, design D5): per-pane SearchState — pure
+    //! state-level pins for the pane-targeted search paths:
+    //!   1. A pane search matches ONLY the pane transcript (a main-only
+    //!      match is a no-match: indicator false, view never moves).
+    //!   2. `search_next` navigation scrolls the OWNING (pane) view only,
+    //!      advancing between matches (n/N never re-find the current one).
+    //!   3. Match pins clamp to the render-time bound (ScrollState:
+    //!      pinned ≤ last_pane_max_scroll).
+    //!   4. Pane search state survives focus switches (FR-010) and the
+    //!      orchestrator's scroll/search state is never consulted nor
+    //!      mutated by a pane search (per-view isolation), and vice versa.
+    //! Match-indicator only — no in-text highlighting exists at this layer.
+    use super::*;
+
+    fn spawn_pane(app: &mut App, id: u64, goal: &str) {
+        app.apply(AgentEvent::SubagentSpawn {
+            id,
+            goal: goal.into(),
+            model: "m".into(),
+            toolset_summary: "all".into(),
+            depth: 0,
+        });
+    }
+
+    fn user(text: &str) -> TranscriptItem {
+        TranscriptItem::User { text: text.into() }
+    }
+
+    /// Pane 0 focused, holding `items` (oldest-first); main holds one
+    /// marker item so main-only matches are representable.
+    fn pane_app(pane_items: Vec<TranscriptItem>) -> App {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 1, "child");
+        for it in pane_items {
+            app.subagent_panes[0].push_item(it);
+        }
+        app.push_item(user("main needle beta"));
+        app.focus_subagent(Some(0));
+        app
+    }
+
+    /// 1 + 2: a pane search finds the pane's occurrences, pins only the
+    /// pane (main scroll + App indicator untouched), and n/N ADVANCE
+    /// between the pane's matches (older, then back newer).
+    #[test]
+    fn pane_search_matches_pane_only_and_n_n_advance() {
+        let mut items: Vec<_> = (0..30).map(|i| user(&format!("filler {i}"))).collect();
+        items[3] = user("pane needle old");
+        items[27] = user("pane needle new");
+        let mut app = pane_app(items);
+        app.last_pane_max_scroll.set(100); // unclamped bound
+
+        app.search_query = "needle".into();
+        app.run_search();
+        let pane = &app.subagent_panes[0];
+        assert!(pane.search_has_match, "pane occurrence found");
+        assert_eq!(pane.scroll, Some(0), "newest pane match (rev-idx 2) pins at 0");
+        assert_eq!(app.scroll, None, "main scroll untouched by pane search");
+        assert!(!app.search_has_match, "App indicator mirrors MAIN only");
+
+        // N → older pane match (rev-idx 26 → offset 24).
+        app.search_next(false);
+        assert_eq!(
+            app.subagent_panes[0].scroll,
+            Some(24),
+            "N advances to the older pane match, not re-finding the current one"
+        );
+        assert_eq!(app.scroll, None, "N still leaves the main view alone");
+
+        // n → back to the newer pane match.
+        app.search_next(true);
+        assert_eq!(
+            app.subagent_panes[0].scroll,
+            Some(0),
+            "n advances back to the newer pane match"
+        );
+    }
+
+    /// 1 (negative): a query hitting ONLY the main transcript is a
+    /// no-match from the pane — indicator false, pane view never moves.
+    #[test]
+    fn pane_search_main_only_match_is_no_match() {
+        let mut app = pane_app((0..10).map(|i| user(&format!("filler {i}"))).collect());
+        app.last_pane_max_scroll.set(50);
+
+        app.search_query = "needle".into(); // exists only on main
+        app.run_search();
+        let pane = &app.subagent_panes[0];
+        assert!(!pane.search_has_match, "no pane occurrence → no match");
+        assert_eq!(pane.scroll, None, "follow-tail view never yanked");
+        assert_eq!(app.scroll, None, "main-only match must not move MAIN either");
+    }
+
+    /// 3 (clamp): a deep pane match pins at the render-time bound, never
+    /// beyond it (ScrollState: pinned ≤ last_pane_max_scroll) — for both
+    /// `run_search` and n/N navigation.
+    #[test]
+    fn pane_search_pins_clamp_to_pane_max_scroll() {
+        let mut items: Vec<_> = (0..40).map(|i| user(&format!("filler {i}"))).collect();
+        items[2] = user("pane needle old"); // rev-idx 37
+        items[5] = user("pane needle new"); // rev-idx 34 (newest match)
+        let mut app = pane_app(items);
+        app.last_pane_max_scroll.set(7); // bound far below the raw offsets
+
+        app.search_query = "needle".into();
+        app.run_search();
+        assert_eq!(
+            app.subagent_panes[0].scroll,
+            Some(7),
+            "run_search pin clamped to the pane bound (raw offset would be 32)"
+        );
+
+        app.subagent_panes[0].scroll = Some(7);
+        app.search_next(false); // N toward older matches (raw target 32/35)
+        assert_eq!(
+            app.subagent_panes[0].scroll,
+            Some(7),
+            "n/N pin clamped to the pane bound (raw offsets are 32/35)"
+        );
+    }
+
+    /// 4 (FR-010 + isolation): the pane keeps its query/match indicator
+    /// across focus switches, and the orchestrator's search state is a
+    /// separate view's — a later MAIN search rewrites App-level state
+    /// without consulting the pane's.
+    #[test]
+    fn pane_search_state_survives_focus_switches_and_stays_isolated() {
+        let mut app = pane_app(vec![user("pane needle alpha")]);
+        app.last_pane_max_scroll.set(10);
+
+        app.search_query = "needle".into();
+        app.run_search();
+        assert!(app.subagent_panes[0].search_has_match);
+
+        // Away and back: the pane's SearchState rides through (FR-010).
+        app.focus_subagent(None);
+        app.focus_subagent(Some(0));
+        let pane = &app.subagent_panes[0];
+        assert_eq!(pane.search_query, "needle", "query preserved");
+        assert!(pane.search_has_match, "indicator preserved");
+        assert_eq!(pane.scroll, Some(0), "pin preserved");
+
+        // From the orchestrator, the pane-targeted mutators are no-ops…
+        app.focus_subagent(None);
+        let before = app.subagent_panes[0].clone();
+        app.pane_run_search();
+        app.pane_search_next(true);
+        assert_eq!(
+            app.subagent_panes[0].search_query,
+            before.search_query,
+            "unfocused pane mutators are no-ops"
+        );
+
+        // …and a main search leaves the pane's state alone.
+        app.search_query = "beta".into();
+        app.run_search();
+        assert!(app.search_has_match, "main search matched main text");
+        assert_eq!(app.subagent_panes[0].search_query, "needle", "pane query untouched");
+    }
+
+    /// Unfocused parity: with no pane focused, `run_search`/`search_next`
+    /// behave exactly as the main-only originals (App indicator + main
+    /// scroll move; panes untouched).
+    #[test]
+    fn unfocused_search_still_main_only() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 1, "child");
+        app.subagent_panes[0].push_item(user("pane needle"));
+        app.push_item(user("main needle beta"));
+        app.last_max_scroll.set(30);
+        assert!(app.focused_subagent.is_none());
+
+        app.search_query = "needle".into();
+        app.run_search();
+        assert!(app.search_has_match, "main match found");
+        assert_eq!(app.scroll, Some(0), "main view pinned");
+        assert_eq!(app.subagent_panes[0].scroll, None, "pane untouched");
+        assert_eq!(app.subagent_panes[0].search_query, "", "pane SearchState untouched");
+
+        app.search_query = "pane needle".into();
+        app.run_search();
+        assert!(!app.search_has_match, "pane text is invisible to main search");
+        assert_eq!(app.scroll, Some(0), "a miss never moves the view");
     }
 }

@@ -161,20 +161,18 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
         .style(Style::default().bg(theme.bg_elevated.to_color()));
     f.render_widget(buf_area, area);
 
-    // Left: the "joey" wordmark as an inverted brand chip — a solid gradient
-    // background with a near-black foreground reads with far more contrast
-    // than gradient-on-dark text. A gold "✦" spark sits outside the chip.
-    // The pulse drives a gentle breathing lift on the chip background
-    // (15% max — visible but no strobing).
+    // Left: the "joey" wordmark as an inverted brand chip — a solid
+    // brand-cyan background with a near-black foreground reads with far
+    // more contrast than color-on-dark text. A gold "✦" spark sits
+    // outside the chip. The pulse drives a gentle breathing lift on the
+    // chip background (20% max — visible but no strobing).
     let spark = "✦";
     let word = "joey";
     let glow = pulse.value();
-    let chip_stops = [
-        theme.grad_0.lerp(Rgb(255, 255, 255), glow * 0.15),
-        theme.grad_1.lerp(Rgb(255, 255, 255), glow * 0.15),
-        theme.grad_2.lerp(Rgb(255, 255, 255), glow * 0.15),
-        theme.grad_3.lerp(Rgb(255, 255, 255), glow * 0.15),
-    ];
+    let chip_bg = theme
+        .grad_0
+        .lerp(Rgb(255, 255, 255), glow * 0.20)
+        .to_color();
     let mut logo_spans: Vec<Span<'static>> = Vec::new();
     logo_spans.push(Span::styled(
         spark,
@@ -183,17 +181,14 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
             .add_modifier(Modifier::BOLD),
     ));
     logo_spans.push(Span::raw(" "));
-    let chip_text = format!(" {word} ");
-    let chip_chars: Vec<char> = chip_text.chars().collect();
+    let chip_text = format!("  {word}  ");
     let chip_fg = theme.bg_void.to_color();
-    for (i, ch) in chip_chars.iter().enumerate() {
-        let t = i as f32 / (chip_chars.len() - 1) as f32;
-        let bg = crate::theme::sample_stops(&chip_stops, t).to_color();
+    for ch in chip_text.chars() {
         logo_spans.push(Span::styled(
             ch.to_string(),
             Style::default()
                 .fg(chip_fg)
-                .bg(bg)
+                .bg(chip_bg)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -969,19 +964,16 @@ pub fn item_lines_for_test(
 pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focused: bool, glow: f32) {
     // Build header showing message count and scroll position.
     let msg_count = app.transcript.len();
-    let scroll_info = if let Some(offset) = app.scroll {
-        let max = app.last_max_scroll.get();
-        if max > 0 {
-            let pct = ((1.0 - (offset as f64 / max as f64)) * 100.0).round() as usize;
-            format!(" {} messages · {}% from top ", msg_count, pct)
-        } else {
-            format!(" {} messages ", msg_count)
-        }
-    } else {
-        format!(" {} messages · live ", msg_count)
-    };
+    let scroll_info = transcript_scroll_info(msg_count, app.scroll, app.last_max_scroll.get());
+    // T023 (US5, FR-009, D2 Invariant 1): the focused-header scroll-key
+    // hint routes through the shared `transcript_scroll_hint` so the
+    // focused pane composes the IDENTICAL segment. Byte-identical title.
     let title = if focused {
-        format!(" conversation [scroll: j/k g/G PgUp/PgDn /search ] {} ", scroll_info)
+        format!(
+            " conversation {} {} ",
+            transcript_scroll_hint(),
+            scroll_info
+        )
     } else {
         format!(" conversation {} ", scroll_info)
     };
@@ -992,6 +984,48 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
         return;
     }
 
+    // T023 (US5, FR-009, D2 Invariant 1): the whole body (geometry,
+    // lazy line build, scroll accounting, scrollbar, below-badge) is the
+    // shared `render_transcript_body` — the SAME code path the focused
+    // subagent pane renders through. Byte-identical output.
+    render_transcript_body(
+        f,
+        inner,
+        &app.transcript,
+        &app.streaming_assistant,
+        app.scroll,
+        theme,
+        &app.last_text_area,
+        &app.last_max_scroll,
+    );
+}
+
+/// T023 (US5, FR-009, D2 Invariant 1 — "single rendering source"): the
+/// transcript body BOTH screens render — inner-area geometry (scrollbar
+/// column reservation), the lazy newest-first line build (`item_lines` +
+/// the shared `streaming_tail_lines` tail), bottom-anchored scroll
+/// accounting with max-scroll recording, the `draw_scrollbar` track/thumb,
+/// and the `draw_below_badge` scrolled-up indicator. Extracted verbatim
+/// from `draw_transcript` so the orchestrator screen and the focused
+/// subagent pane (`draw_pane_transcript`) share ONE implementation;
+/// only the data source (main vs pane) and the geometry/scroll-recording
+/// cells differ, passed in by the caller.
+///
+/// The caller renders the border block and passes its `inner` rect; an
+/// empty transcript simply renders nothing inside the block (identical
+/// empty-state behavior on both screens — header shows " 0 messages ·
+/// live ", no scrollbar, no badge, because all three derive from the same
+/// helpers over the same empty inputs).
+fn render_transcript_body(
+    f: &mut Frame,
+    inner: Rect,
+    transcript: &std::collections::VecDeque<TranscriptItem>,
+    streaming_assistant: &str,
+    scroll: Option<usize>,
+    theme: Theme,
+    text_area_cell: &std::cell::Cell<(u16, u16, u16, u16)>,
+    max_scroll_cell: &std::cell::Cell<usize>,
+) {
     // Reserve 1 column on the right for the scrollbar.
     let content_width = inner.width.saturating_sub(1) as usize;
     let scrollbar_area = Rect::new(
@@ -1003,7 +1037,7 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
     let text_area = Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height);
 
     // Feature 007 (T026): record text-area geometry for click hit-testing.
-    app.last_text_area.set((
+    text_area_cell.set((
         text_area.x,
         text_area.y,
         text_area.width,
@@ -1012,7 +1046,7 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
 
     let content_w = content_width;
     let visible = text_area.height as usize;
-    let offset = app.scroll.unwrap_or(0);
+    let offset = scroll.unwrap_or(0);
     // One extra line beyond the viewport tells us whether more content
     // exists above (so scroll_up may keep going).
     let needed = visible + offset + 1;
@@ -1025,23 +1059,16 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
 
     // Live streaming tail is the newest block. (Live reasoning is rendered by
     // the dedicated reasoning panel, not here.)
-    if !app.streaming_assistant.is_empty() {
-        let mut tail = vec![Line::from(vec![Span::styled(
-            "◆ agent ",
-            Style::default().fg(theme.info.to_color()).add_modifier(Modifier::BOLD),
-        )])];
-        for wl in wrap(&app.streaming_assistant, content_w.saturating_sub(2)) {
-            tail.push(Line::from(vec![Span::styled(
-                format!("  {}", wl),
-                Style::default().fg(theme.fg_base.to_color()),
-            )]));
-        }
+    // T023 (US5, FR-009, D2 Invariant 1): the tail chrome is the shared
+    // `streaming_tail_lines` — verbatim extraction, byte-identical output.
+    if !streaming_assistant.is_empty() {
+        let tail = streaming_tail_lines(streaming_assistant, content_w, theme);
         built += tail.len();
         blocks_rev.push(tail);
     }
 
     let mut exhausted = true;
-    for item in app.transcript.iter().rev() {
+    for item in transcript.iter().rev() {
         if built >= needed {
             exhausted = false;
             break;
@@ -1061,7 +1088,7 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
     } else {
         offset + visible
     };
-    app.last_max_scroll.set(max_scroll);
+    max_scroll_cell.set(max_scroll);
 
     let clamped = offset.min(max_scroll);
     let scroll_rows = total.saturating_sub(visible + clamped).min(u16::MAX as usize);
@@ -1070,27 +1097,10 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
     f.render_widget(para, text_area);
 
     // ── Scrollbar ────────────────────────────────────────────────────
-    draw_scrollbar(f, scrollbar_area, app, theme, total, visible, clamped);
+    draw_scrollbar(f, scrollbar_area, theme, total, visible, clamped, scroll.is_some());
 
     // Scrolled-up indicator: bottom-right badge showing the distance to live.
-    if app.scroll.is_some() && clamped > 0 {
-        let badge = format!(" ↓ {} line{} below ", clamped, if clamped == 1 { "" } else { "s" });
-        let bw = UnicodeWidthStr::width(badge.as_str()) as u16;
-        if bw < text_area.width {
-            let bx = text_area.x + text_area.width - bw;
-            let by = text_area.y + text_area.height - 1;
-            let buf = f.buffer_mut();
-            for (xx, ch) in (bx..).zip(badge.chars()) {
-                let cell = &mut buf[(xx, by)];
-                cell.set_char(ch).set_style(
-                    Style::default()
-                        .fg(theme.bg_void.to_color())
-                        .bg(theme.gold.to_color())
-                        .add_modifier(Modifier::BOLD),
-                );
-            }
-        }
-    }
+    draw_below_badge(f, text_area, theme, scroll, clamped);
 }
 
 /// Feature 007 (T026): resolve which transcript item (if any) is at the given
@@ -1303,15 +1313,59 @@ pub fn transcript_item_at_top(app: &App, theme: Theme) -> Option<usize> {
     items_fwd.last().map(|(idx, _)| *idx)
 }
 
+/// T023 (US5, FR-009, D2 Invariant 1): the focused-header scroll-key hint
+/// `draw_transcript` shows ("[scroll: j/k g/G PgUp/PgDn /search ]"),
+/// extracted verbatim so the focused pane composes the IDENTICAL segment
+/// from the same constant (no pane-local restatement).
+fn transcript_scroll_hint() -> &'static str {
+    "[scroll: j/k g/G PgUp/PgDn /search ]"
+}
+
+/// T023 (US5, FR-009, D2 Invariant 1): the live streaming-assistant tail
+/// block `draw_transcript` renders (bold info "◆ agent " header + indented
+/// fg_base wrapped lines), extracted verbatim so `draw_pane_transcript`
+/// composes the identical tail chrome from the same function.
+fn streaming_tail_lines(streaming: &str, content_w: usize, theme: Theme) -> Vec<Line<'static>> {
+    let mut tail = vec![Line::from(vec![Span::styled(
+        "◆ agent ",
+        Style::default().fg(theme.info.to_color()).add_modifier(Modifier::BOLD),
+    )])];
+    for wl in wrap(streaming, content_w.saturating_sub(2)) {
+        tail.push(Line::from(vec![Span::styled(
+            format!("  {}", wl),
+            Style::default().fg(theme.fg_base.to_color()),
+        )]));
+    }
+    tail
+}
+
+/// Shared scroll-info header segment (feature 017 T008 / US1, D2 "parity by
+/// construction"): the exact " N messages · … " format `draw_transcript`
+/// builds for its header. Extracted verbatim so the focused subagent pane
+/// composes the IDENTICAL segment from its own transcript.
+fn transcript_scroll_info(msg_count: usize, scroll: Option<usize>, last_max_scroll: usize) -> String {
+    if let Some(offset) = scroll {
+        let max = last_max_scroll;
+        if max > 0 {
+            let pct = ((1.0 - (offset as f64 / max as f64)) * 100.0).round() as usize;
+            format!(" {} messages · {}% from top ", msg_count, pct)
+        } else {
+            format!(" {} messages ", msg_count)
+        }
+    } else {
+        format!(" {} messages · live ", msg_count)
+    }
+}
+
 /// Draw a scrollbar on the right edge of the transcript.
 fn draw_scrollbar(
     f: &mut Frame,
     area: Rect,
-    app: &App,
     theme: Theme,
     total_lines: usize,
     visible_lines: usize,
     current_offset: usize,
+    scrolled: bool,
 ) {
     if area.width == 0 || area.height == 0 || total_lines <= visible_lines {
         // No scrollbar needed — everything fits.
@@ -1334,7 +1388,7 @@ fn draw_scrollbar(
         .saturating_mul((1.0 - scroll_progress) as usize);
 
     let track_color = theme.bg_panel.to_color();
-    let thumb_color = if app.scroll.is_some() {
+    let thumb_color = if scrolled {
         theme.gold.to_color()
     } else {
         theme.info.to_color()
@@ -1348,6 +1402,37 @@ fn draw_scrollbar(
             Style::default()
                 .fg(if in_thumb { thumb_color } else { track_color }),
         );
+    }
+}
+
+/// Shared scrolled-up indicator (feature 017 T008 / US1, D2): the exact
+/// bottom-right " ↓ N line(s) below " badge `draw_transcript` paints,
+/// extracted verbatim so the focused subagent pane composes the identical
+/// affordance for its own text area.
+fn draw_below_badge(
+    f: &mut Frame,
+    text_area: Rect,
+    theme: Theme,
+    scroll: Option<usize>,
+    clamped: usize,
+) {
+    if scroll.is_some() && clamped > 0 {
+        let badge = format!(" ↓ {} line{} below ", clamped, if clamped == 1 { "" } else { "s" });
+        let bw = UnicodeWidthStr::width(badge.as_str()) as u16;
+        if bw < text_area.width {
+            let bx = text_area.x + text_area.width - bw;
+            let by = text_area.y + text_area.height - 1;
+            let buf = f.buffer_mut();
+            for (xx, ch) in (bx..).zip(badge.chars()) {
+                let cell = &mut buf[(xx, by)];
+                cell.set_char(ch).set_style(
+                    Style::default()
+                        .fg(theme.bg_void.to_color())
+                        .bg(theme.gold.to_color())
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+        }
     }
 }
 
@@ -1462,7 +1547,29 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 /// rect into `app.last_reasoning_rect` for mouse hit-testing, and zeroes it
 /// when there is nothing live to show.
 pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: &Spinner) {
-    let live = app.reasoning_open && !app.streaming_reasoning.is_empty();
+    // T021 (US4, FR-008, D6): target-aware source. With a subagent pane
+    // focused the panel renders the PANE's live `streaming_reasoning`
+    // (content-based live condition: a non-empty accumulator IS a live
+    // block — panes carry no `reasoning_open` flag) and never leaks the
+    // main accumulators (focused-view isolation). Unfocused, every field
+    // resolves exactly as before (byte-identical main screen).
+    let (live, stream, expanded, started, view) = if let Some(pane) = app.focused_pane() {
+        (
+            !pane.streaming_reasoning.is_empty(),
+            &pane.streaming_reasoning,
+            false, // panes have no expanded-reasoning takeover mode
+            None,  // ...nor a thinking timer (flush stamps no duration)
+            None,  // tail-follow only (no frozen-anchor state on panes)
+        )
+    } else {
+        (
+            app.reasoning_open && !app.streaming_reasoning.is_empty(),
+            &app.streaming_reasoning,
+            app.reasoning_expanded,
+            app.reasoning_started,
+            app.reasoning_view,
+        )
+    };
     // Record geometry for click hit-testing; zero it when not live so
     // stale rects can't catch clicks meant for the transcript.
     app.last_reasoning_rect.set(if live {
@@ -1473,8 +1580,12 @@ pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinne
 
     let title = if !live {
         "reasoning"
-    } else if app.reasoning_expanded {
+    } else if expanded {
         " reasoning · live · click or Esc to collapse "
+    } else if app.focused_pane().is_some() {
+        // Pane live panel: click-to-expand toggles MAIN state, so the pane
+        // title carries no expand affordance (honest chrome).
+        " reasoning · live "
     } else {
         " reasoning · live · click to expand "
     };
@@ -1512,7 +1623,7 @@ pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinne
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    if let Some(started) = app.reasoning_started {
+    if let Some(started) = started {
         let secs = started.elapsed().as_secs();
         header.push(Span::styled(
             format!("  {}s", secs),
@@ -1525,13 +1636,13 @@ pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinne
     // tail-anchored while auto-following, absolute-window when the user
     // has scrolled up (frozen). The render also publishes the anchor's
     // upper bound so input handlers can detect "scrolled to the bottom".
-    let wrapped = wrap(&app.streaming_reasoning, content_w);
+    let wrapped = wrap(stream, content_w);
     let body_rows = inner.height.saturating_sub(lines.len() as u16 + 1).max(1) as usize; // +1 for the footer line
     let total = wrapped.len();
     let visible = body_rows.min(total);
     let max_anchor = total.saturating_sub(visible);
     app.last_reasoning_max_anchor.set(max_anchor);
-    let start = match app.reasoning_view {
+    let start = match view {
         None => max_anchor, // following: window pinned to the live tail
         // Frozen: absolute window top, clamped into the valid range. (If
         // the clamp lands at the tail the view displays the tail; the
@@ -1555,7 +1666,7 @@ pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinne
             Style::default().fg(theme.fg_most_subtle.to_color()),
         ));
     }
-    if total > visible && app.reasoning_view.is_some() {
+    if total > visible && view.is_some() {
         footer.push(Span::styled(
             format!(
                 "  ↓{} below · scroll to bottom to resume",
@@ -1580,13 +1691,28 @@ pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinne
 /// unless the user scrolled up (frozen anchor); scrolling back to the bottom
 /// resumes follow. Records its rect for mouse hit-testing.
 pub fn draw_output_viewer(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: &Spinner) {
-    let idx = app
-        .output_viewer_index
-        .or_else(|| app.most_recent_tool_item());
+    // T020 (US4, FR-006/FR-008, D6): target-aware source. With a subagent
+    // pane focused the viewer renders the PANE's tool output (indices and
+    // text resolve against the pane's transcript; `output_viewer_index`
+    // is main-transcript-indexed so it is IGNORED while a pane is focused
+    // and the pane's most recent tool is targeted instead). Unfocused,
+    // every field resolves exactly as before (byte-identical main view).
+    let pane = app.focused_pane();
+    let pane_transcript = pane.map(|p| &p.transcript);
+    let idx = if let Some(transcript) = pane_transcript {
+        transcript
+            .iter()
+            .rposition(|i| matches!(i, TranscriptItem::Tool { .. }))
+    } else {
+        app.output_viewer_index.or_else(|| app.most_recent_tool_item())
+    };
+    let resolve = |i: usize| -> Option<&TranscriptItem> {
+        pane_transcript.map(|t| t.get(i)).unwrap_or_else(|| app.transcript.get(i))
+    };
     let live = idx
         .map(|i| {
             matches!(
-                app.transcript.get(i),
+                resolve(i),
                 Some(TranscriptItem::Tool { status: ToolStatus::Running, .. })
             )
         })
@@ -1594,7 +1720,7 @@ pub fn draw_output_viewer(f: &mut Frame, area: Rect, app: &App, theme: Theme, sp
     let is_term = idx
         .map(|i| {
             matches!(
-                app.transcript.get(i),
+                resolve(i),
                 Some(TranscriptItem::Tool { is_terminal: true, .. })
             )
         })
@@ -1604,7 +1730,7 @@ pub fn draw_output_viewer(f: &mut Frame, area: Rect, app: &App, theme: Theme, sp
     app.last_output_viewer_rect.set((area.x, area.y, area.width, area.height));
 
     let (cmd, tool_name, status_icon, exit_code, elapsed) = idx
-        .and_then(|i| match app.transcript.get(i) {
+        .and_then(|i| match resolve(i) {
             Some(TranscriptItem::Tool { name, summary, status, exit_code, duration_secs, .. }) => {
                 Some((summary.clone(), name.clone(), *status, *exit_code, *duration_secs))
             }
@@ -1674,7 +1800,37 @@ pub fn draw_output_viewer(f: &mut Frame, area: Rect, app: &App, theme: Theme, sp
 
     // Body: windowed wrapped lines, tail-anchored while following, with a
     // line-number gutter (text-editor-like view).
-    let text = app.output_viewer_text();
+    // T020: pane-focused → the pane tool's text (same precedence rules as
+    // the main `output_viewer_text`: live accumulation while Running,
+    // formatted full result once finished).
+    let text = if let Some(transcript) = pane_transcript {
+        match idx.and_then(|i| transcript.get(i)) {
+            Some(TranscriptItem::Tool {
+                status,
+                live_output,
+                full_result,
+                result_preview,
+                ..
+            }) => {
+                let full = full_result
+                    .as_deref()
+                    .filter(|f| !f.is_empty())
+                    .map(crate::state::format_tool_result_for_display);
+                match status {
+                    ToolStatus::Running => live_output.clone(),
+                    _ => full
+                        .or_else(|| {
+                            let p = result_preview.as_str();
+                            (!p.is_empty()).then(|| p.to_string())
+                        })
+                        .unwrap_or_else(|| live_output.clone()),
+                }
+            }
+            _ => String::new(),
+        }
+    } else {
+        app.output_viewer_text()
+    };
     let gutter_w = digits(text.lines().count().max(1));
     let wrapped: Vec<(usize, String)> = text
         .lines()
@@ -2755,6 +2911,15 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
 
 /// Render the search bar as a bottom overlay. Only draws when
 /// `app.search_open` is true.
+///
+/// T016 (US3, FR-007, design D5): the bar renders over the PANE view when
+/// a subagent pane is focused, and the match indicator then mirrors the
+/// PANE's per-view SearchState (`SubagentPane::search_has_match`, set by
+/// the T015 focus-follow `run_search`/`search_next`) instead of the
+/// orchestrator's App-level indicator — the same three titles, byte-for
+/// byte (FR-009 chrome parity by construction). The prompt line always
+/// shows the live `App::search_query` (the bar being typed into; T015's
+/// run_search carries it into the pane's preserved query).
 pub fn draw_search_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if !app.search_open {
         return;
@@ -2767,9 +2932,15 @@ pub fn draw_search_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let search_area = Rect::new(area.x, y, area.width, h);
     f.render_widget(Clear, search_area);
 
+    // T016: indicator routes to the TARGET view — the focused pane's own
+    // match state when one is focused, the orchestrator's otherwise.
+    let has_match = match app.focused_pane() {
+        Some(pane) => pane.search_has_match,
+        None => app.search_has_match,
+    };
     let title = if app.search_query.is_empty() {
         " search (Esc to close) "
-    } else if app.search_has_match {
+    } else if has_match {
         " search · match found (n=next N=prev) "
     } else {
         " search · no matches "
@@ -3007,8 +3178,9 @@ mod tests {
     }
 
     /// Render the header's first row through TestBackend and return the
-    /// buffer cells (symbol + fg + bg) so style contracts can be asserted.
-    fn header_cells(app: &App) -> Vec<(char, ratatui::style::Color, ratatui::style::Color)> {
+    /// buffer cells (symbol + fg + bg + modifier) so style contracts can
+    /// be asserted.
+    fn header_cells(app: &App) -> Vec<(char, ratatui::style::Color, ratatui::style::Color, ratatui::style::Modifier)> {
         use ratatui::backend::TestBackend;
         let theme = Theme::aurora();
         let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 4)).unwrap();
@@ -3030,51 +3202,60 @@ mod tests {
                     c.symbol().chars().next().unwrap_or(' '),
                     c.fg,
                     c.bg,
+                    c.modifier,
                 )
             })
             .collect()
     }
 
     #[test]
-    fn header_wordmark_renders_as_high_contrast_brand_chip() {
+    fn header_wordmark_renders_as_bold_solid_brand_chip() {
         let cells = header_cells(&App::new("sess", "model"));
-        let text: String = cells.iter().map(|(s, _, _)| *s).collect();
+        let text: String = cells.iter().map(|(s, _, _, _)| *s).collect();
 
         // Layout contract (inner starts at area.x+1): pad, gold spark, gap,
-        // then the inverted "joey" chip (" joey " = 6 cells).
-        assert!(text.starts_with(" ✦  joey "), "wordmark layout: {text:?}");
-        let chip: String = text.chars().skip(3).take(6).collect();
-        assert_eq!(chip, " joey ", "chip renders the padded wordmark: {text:?}");
+        // then the inverted "joey" chip ("  joey  " = 8 cells).
+        assert!(text.starts_with(" ✦   joey  "), "wordmark layout: {text:?}");
+        let chip: String = text.chars().skip(3).take(8).collect();
+        assert_eq!(chip, "  joey  ", "chip renders the padded wordmark: {text:?}");
 
         // Spark is gold on the header background.
-        let (_, sfg, _) = cells[1];
+        let (_, sfg, _, _) = cells[1];
         assert_eq!(sfg, ratatui::style::Color::Rgb(0xFF, 0xC9, 0x3D));
 
         // Prominence contract: every chip cell is INVERTED — its background
-        // is a bright gradient color (not the header's elevated bg), and the
-        // foreground is the near-black void color. This is what makes the
-        // wordmark pop: contrast comes from the filled background, not just
-        // glyph color.
+        // is one solid brand-cyan fill (not the header's elevated bg), and
+        // the foreground is the near-black void color, bold. This is what
+        // makes the wordmark pop: contrast comes from the filled background,
+        // not just glyph color.
         let header_bg = ratatui::style::Color::Rgb(0x1D, 0x1D, 0x31); // bg_elevated
-        let chip_cells: Vec<char> = " joey ".chars().collect();
-        for (i, (sym, fg, bg)) in cells.iter().enumerate().skip(3).take(6) {
+        // Pulse::new() has phase 0 → value() = 0.5 → glow lift = 0.10, so
+        // the expected fill is grad_0 cyan (0x22,0xE4,0xE8) lerped 10%
+        // toward white: (0x38,0xE7,0xEA).
+        let expected_chip_bg = ratatui::style::Color::Rgb(0x38, 0xE7, 0xEA);
+        let chip_cells: Vec<char> = "  joey  ".chars().collect();
+        for (i, (sym, fg, bg, modifier)) in cells.iter().enumerate().skip(3).take(8) {
             assert_ne!(*bg, header_bg, "chip cell {i} must be color-filled");
+            assert_eq!(*bg, expected_chip_bg, "chip bg is solid brand cyan at cell {i}");
             assert_eq!(*fg, ratatui::style::Color::Rgb(0x0B, 0x0B, 0x12), "chip fg is void: cell {i}");
             assert_eq!(*sym, chip_cells[i - 3]);
-            // Brightness: the chip background must be a high-luma gradient
-            // stop (each channel significantly above the header bg).
+            assert!(modifier.contains(ratatui::style::Modifier::BOLD), "chip glyphs are bold: cell {i}");
+            // Brightness + hue: high-luma cyan — green/blue dominate red.
             if let ratatui::style::Color::Rgb(r, g, b) = bg {
                 let luma = (*r as u32 + *g as u32 + *b as u32) / 3;
                 assert!(luma > 0x60, "chip bg is bright at cell {i}: luma {luma:#x}");
+                assert!(g > r && b > r, "chip bg is cyan-family at cell {i}");
             } else {
                 panic!("chip bg must be Rgb at cell {i}");
             }
         }
 
-        // The chip is a real gradient: first and last chip bg colors differ.
+        // The chip is SOLID: every chip cell shares one identical background
+        // (the old per-cell gradient is gone).
         let first_bg = cells[3].2;
-        let last_bg = cells[8].2;
-        assert_ne!(first_bg, last_bg, "chip background is a gradient");
+        for (i, (_, _, bg, _)) in cells.iter().enumerate().skip(4).take(7) {
+            assert_eq!(*bg, first_bg, "chip background is uniform at cell {i}");
+        }
     }
 
     /// HyperCode badge: draw the header through TestBackend and read the
@@ -5021,6 +5202,9 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
 
     if app.subagent_panes.is_empty() || area.width < 3 || area.height < 3 {
         app.last_subagent_rail_title_rect.set((0, 0, 0, 0));
+        app.last_subagent_rail_rect.set((0, 0, 0, 0));
+        app.last_subagent_rail_max_scroll.set(0);
+        app.last_subagent_rail_drawn_offset.set(0);
         return;
     }
 
@@ -5033,6 +5217,9 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     // allocation render_body granted, capped at 48.
     let rail_w = if expanded { area.width.min(48) } else { 19u16.min(area.width) };
     let rail = Rect::new(area.x + area.width - rail_w, area.y, rail_w, area.height);
+    // Whole-strip rect for mouse-wheel routing (handle_mouse_scroll).
+    app.last_subagent_rail_rect
+        .set((rail.x, rail.y, rail.width, rail.height));
     // Panel background.
     let block = Block::default()
         .borders(Borders::LEFT)
@@ -5078,17 +5265,46 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         s.chars().take(w.max(0)).collect()
     }
 
+    // ── Scrollable tab window (overflow panes) ────────────────────────
+    // Compute the visible pane capacity from the actual inner area using
+    // the SAME break condition the draw loops below apply (rows per tab:
+    // 2 collapsed / 4 expanded; 2 rows reserved for the pinned
+    // orchestrator tab; 1 row for the title).
+    let row_h: u16 = if expanded { 4 } else { 2 };
+    let limit_y = inner.y + inner.height.saturating_sub(2);
+    let mut capacity = 0usize;
+    while inner.y + 1 + (capacity as u16) * row_h + row_h - 1 < limit_y {
+        capacity += 1;
+    }
+    let max_scroll = app.subagent_panes.len().saturating_sub(capacity);
+    let offset = app.subagent_rail_scroll.min(max_scroll);
+    app.last_subagent_rail_max_scroll.set(max_scroll);
+    app.last_subagent_rail_drawn_offset.set(offset);
+    // When the tabs overflow, reserve the rail's inner RIGHT column for a
+    // scroll indicator so it never overlaps tab content.
+    let content_w = if max_scroll > 0 {
+        inner.width.saturating_sub(1)
+    } else {
+        inner.width
+    };
+
     if expanded {
         // ── Expanded: 4-row detail cards ────────────────────────────
         // Line 1: status glyph + task title/goal (click target).
         // Line 2: model · depth · API iterations.
         // Line 3: live phase (from the matched activity entry).
         // Line 4: last invoked tool, when known.
-        let label_w = inner.width.saturating_sub(3) as usize;
-        let detail_w = inner.width.saturating_sub(3) as usize;
-        for (i, pane) in app.subagent_panes.iter().enumerate() {
-            let card_y = inner.y + 1 + (i as u16) * 4;
-            if card_y + 3 >= inner.y + inner.height.saturating_sub(2) {
+        let label_w = content_w.saturating_sub(3) as usize;
+        let detail_w = content_w.saturating_sub(3) as usize;
+        for (vi, (i, pane)) in app
+            .subagent_panes
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .enumerate()
+        {
+            let card_y = inner.y + 1 + (vi as u16) * 4;
+            if card_y + 3 >= limit_y {
                 break; // rail full (reserve 2 rows for the orchestrator tab)
             }
             let focused = app.focused_subagent == Some(i);
@@ -5124,14 +5340,14 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
             if focused {
                 spans.insert(0, Span::styled("▸".to_string(), Style::default().fg(theme.primary.to_color())));
             }
-            let card_area = Rect::new(inner.x, card_y, inner.width, 4);
+            let card_area = Rect::new(inner.x, card_y, content_w, 4);
             f.render_widget(
                 Paragraph::new(Line::from(spans)).style(Style::default().bg(if focused {
                     theme.primary.to_color()
                 } else {
                     theme.bg_panel.to_color()
                 })),
-                Rect::new(inner.x, card_y, inner.width, 1),
+                Rect::new(inner.x, card_y, content_w, 1),
             );
             // Detail lines (dim; never the click target).
             let entry = app
@@ -5151,7 +5367,7 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(format!("  {}", line2), dim)))
                     .style(Style::default().bg(theme.bg_panel.to_color())),
-                Rect::new(inner.x, card_y + 1, inner.width, 1),
+                Rect::new(inner.x, card_y + 1, content_w, 1),
             );
             let phase = entry
                 .map(|e| e.phase.clone())
@@ -5167,7 +5383,7 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                     dim,
                 )))
                 .style(Style::default().bg(theme.bg_panel.to_color())),
-                Rect::new(inner.x, card_y + 2, inner.width, 1),
+                Rect::new(inner.x, card_y + 2, content_w, 1),
             );
             if let Some(tool) = entry.and_then(|e| e.last_tool.clone()) {
                 f.render_widget(
@@ -5176,7 +5392,7 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                         dim,
                     )))
                     .style(Style::default().bg(theme.bg_panel.to_color())),
-                    Rect::new(inner.x, card_y + 3, inner.width, 1),
+                    Rect::new(inner.x, card_y + 3, content_w, 1),
                 );
             }
             // Record the clickable row (the card's title line).
@@ -5186,10 +5402,16 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         }
     } else {
         // Tabs: 2 rows each, stacked vertically below the title.
-        let label_w = inner.width.saturating_sub(2) as usize;
-        for (i, pane) in app.subagent_panes.iter().enumerate() {
-            let tab_y = inner.y + 1 + (i as u16) * 2;
-            if tab_y + 1 >= inner.y + inner.height.saturating_sub(2) {
+        let label_w = content_w.saturating_sub(2) as usize;
+        for (vi, (i, pane)) in app
+            .subagent_panes
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .enumerate()
+        {
+            let tab_y = inner.y + 1 + (vi as u16) * 2;
+            if tab_y + 1 >= limit_y {
                 break; // rail full (reserve 2 rows for the orchestrator tab)
             }
             let focused = app.focused_subagent == Some(i);
@@ -5200,7 +5422,7 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 SubagentStatus::Pending => ("·", theme.fg_more_subtle),
             };
             let goal_line: String = pane.goal.chars().take(label_w.max(4)).collect();
-            let tab_area = Rect::new(inner.x, tab_y, inner.width, 2);
+            let tab_area = Rect::new(inner.x, tab_y, content_w, 2);
             let style = if focused {
                 Style::default()
                     .bg(theme.primary.to_color())
@@ -5230,6 +5452,59 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
             app.last_subagent_tab_rects
                 .borrow_mut()
                 .push((tab_area.x, tab_y, tab_area.width, 1));
+        }
+    }
+
+    // ── Scroll indicator (only when tabs overflow) ────────────────────
+    // Minimal custom scrollbar on the rail's inner RIGHT column, drawn
+    // with the same direct '█'/'│' cell writes as `draw_scrollbar` (the
+    // ratatui Scrollbar widget is deliberately not used in this crate).
+    // Content width was already shrunk by 1 col so it never overlaps.
+    if max_scroll > 0 && inner.width >= 2 {
+        let track_y = inner.y + 1;
+        let track_h = (inner.height.saturating_sub(3)) as usize; // below title, above orch tab
+        if track_h > 0 {
+            let x = inner.x + inner.width - 1;
+            let track_color = theme.bg_panel.to_color();
+            let thumb_color = theme.info.to_color();
+            // Thumb sized by the visible fraction of the pane list.
+            let total = app.subagent_panes.len();
+            let visible = capacity.min(total);
+            let ratio = visible as f64 / total as f64;
+            let thumb_size = ((track_h as f64 * ratio).ceil() as usize)
+                .max(1)
+                .min(track_h);
+            // offset counts skipped panes from the top; progress toward
+            // the bottom of the list pushes the thumb DOWN (rail scrolls
+            // the opposite direction of the transcript scrollbar, whose
+            // None-scroll pins the thumb at the bottom).
+            let progress = offset as f64 / max_scroll as f64;
+            let thumb_top = ((track_h - thumb_size) as f64 * progress).round() as usize;
+            let buf = f.buffer_mut();
+            for dy in 0..track_h {
+                let cell = &mut buf[(x, track_y + dy as u16)];
+                let in_thumb = dy >= thumb_top && dy < thumb_top + thumb_size;
+                let ch = if in_thumb { '█' } else { '│' };
+                cell.set_char(ch).set_style(
+                    Style::default()
+                        .fg(if in_thumb { thumb_color } else { track_color })
+                        .bg(track_color),
+                );
+            }
+            // Above/below availability glyphs at the track's ends: '▲'
+            // when earlier panes are hidden, '▼' when later ones are.
+            if offset > 0 {
+                let cell = &mut buf[(x, track_y)];
+                cell.set_char('▲').set_style(
+                    Style::default().fg(theme.fg_more_subtle.to_color()).bg(track_color),
+                );
+            }
+            if offset < max_scroll {
+                let cell = &mut buf[(x, track_y + (track_h - 1) as u16)];
+                cell.set_char('▼').set_style(
+                    Style::default().fg(theme.fg_more_subtle.to_color()).bg(track_color),
+                );
+            }
         }
     }
 
@@ -5292,6 +5567,25 @@ pub fn draw_pane_transcript(
     focused: bool,
     glow: f32,
 ) {
+    // T023 (US5, FR-009, D2 Invariant 1): the pane header carries the same scroll-info segment
+    // the orchestrator's `draw_transcript` builds — same helper, same N
+    // (transcript item count), same bound (the pane's own recorded max).
+    let scroll_info = transcript_scroll_info(
+        pane.transcript.len(),
+        pane.scroll,
+        app.last_pane_max_scroll.get(),
+    );
+    // T023 (US5, FR-009): when the pane's transcript holds keyboard focus,
+    // the header also carries the SAME scroll-key hint segment the focused
+    // orchestrator header shows — composed from the shared
+    // `transcript_scroll_hint` (no pane-local restatement), placed before
+    // the scroll-info like `draw_transcript`'s focused title. Right-aligned
+    // keeps the scroll-info segment fully visible when the row overflows.
+    let bottom_title = if focused {
+        format!("{} {}", transcript_scroll_hint(), scroll_info)
+    } else {
+        scroll_info
+    };
     let title = format!(
         " ◆ subagent: {} [{}] {} ",
         pane.goal,
@@ -5303,7 +5597,15 @@ pub fn draw_pane_transcript(
             SubagentStatus::Pending => "· queued",
         }
     );
-    let block = panel_block(&title, theme, focused, glow);
+    let block = panel_block(&title, theme, focused, glow)
+        // T008 (US1, D2) + T023 (US5, FR-009): the shared scroll-info (+
+        // focused scroll-key hint) segment from `draw_transcript`'s header
+        // (" N messages · live "/" · P% from top "). The pane's top title
+        // (goal + model + status) already fills the header row at common
+        // widths, so the segment rides the block's bottom-right corner —
+        // same strings, same `transcript_scroll_info` /
+        // `transcript_scroll_hint`.
+        .title_bottom(Line::from(bottom_title).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -5311,63 +5613,23 @@ pub fn draw_pane_transcript(
         return;
     }
 
-    let content_width = inner.width.saturating_sub(1) as usize;
-    let text_area = Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height);
-    app.last_pane_text_area.set((
-        text_area.x,
-        text_area.y,
-        text_area.width,
-        text_area.height,
-    ));
-
-    let content_w = content_width;
-    let visible = text_area.height as usize;
-    let offset = pane.scroll.unwrap_or(0);
-    let needed = visible + offset + 1;
-
-    let mut blocks_rev: Vec<Vec<Line>> = Vec::new();
-    let mut built = 0usize;
-
-    if !pane.streaming_assistant.is_empty() {
-        let mut tail = vec![Line::from(vec![Span::styled(
-            "◆ agent ",
-            Style::default().fg(theme.info.to_color()).add_modifier(Modifier::BOLD),
-        )])];
-        for wl in wrap(&pane.streaming_assistant, content_w.saturating_sub(2)) {
-            tail.push(Line::from(vec![Span::styled(
-                format!("  {}", wl),
-                Style::default().fg(theme.fg_base.to_color()),
-            )]));
-        }
-        built += tail.len();
-        blocks_rev.push(tail);
-    }
-
-    let mut exhausted = true;
-    for item in pane.transcript.iter().rev() {
-        if built >= needed {
-            exhausted = false;
-            break;
-        }
-        let ls = item_lines(item, content_w, theme);
-        built += ls.len();
-        blocks_rev.push(ls);
-    }
-
-    let lines: Vec<Line> = blocks_rev.into_iter().rev().flatten().collect();
-    let total = lines.len();
-    let max_scroll = if exhausted {
-        total.saturating_sub(visible)
-    } else {
-        offset + visible
-    };
-    app.last_pane_max_scroll.set(max_scroll);
-
-    let clamped = offset.min(max_scroll);
-    let scroll_rows = total.saturating_sub(visible + clamped).min(u16::MAX as usize);
-    f.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((scroll_rows as u16, 0)),
-        text_area,
+    // T023 (US5, FR-009, D2 Invariant 1 — "single rendering source"): the
+    // pane's ENTIRE body (scrollbar-column geometry, lazy line build via
+    // the shared `item_lines` + `streaming_tail_lines`, bottom-anchored
+    // scroll accounting, `draw_scrollbar`, `draw_below_badge`) is the SAME
+    // `render_transcript_body` the orchestrator's `draw_transcript` calls.
+    // Only the data source (the pane's transcript/stream/scroll) and the
+    // recording cells (pane-side geometry/max-scroll) differ — borders,
+    // colors, glyphs, and empty-state behavior are shared by construction.
+    render_transcript_body(
+        f,
+        inner,
+        &pane.transcript,
+        &pane.streaming_assistant,
+        pane.scroll,
+        theme,
+        &app.last_pane_text_area,
+        &app.last_pane_max_scroll,
     );
 }
 
@@ -5473,8 +5735,11 @@ pub fn draw_pane_stats_page(
     let total = stream.total;
     let visible = body_rows.min(total);
     let max_anchor = total.saturating_sub(visible);
-    app.last_pane_stats_max_anchor.set(max_anchor);
-    let start = match app.pane_stats_view {
+    // T004: record the anchor bound + read the view anchor PER-PANE so each
+    // pane preserves its own scroll across focus switches (FR-010). `Cell`
+    // gives interior mutability through the shared `&SubagentPane`.
+    pane.last_stats_max_anchor.set(max_anchor);
+    let start = match pane.stats_view {
         None => max_anchor,
         Some(anchor) => anchor.min(max_anchor),
     };
@@ -5504,7 +5769,7 @@ pub fn draw_pane_stats_page(
             Style::default().fg(theme.fg_most_subtle.to_color()),
         ));
     }
-    if total > visible && app.pane_stats_view.is_some() {
+    if total > visible && pane.stats_view.is_some() {
         footer.push(Span::styled(
             format!("  ↓{} below · scroll to bottom to resume", total - end),
             Style::default().fg(theme.fg_more_subtle.to_color()),

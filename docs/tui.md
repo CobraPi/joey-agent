@@ -193,6 +193,108 @@ in realtime (no more waiting for the call to finish to see anything):
     still reach the input box, so you can queue a message while
     watching.
 
+## Subagent panes (parallel-subagent feature)
+
+When the agent delegates (`delegate_task`), each spawned child gets a
+**pane** (`state.rs::SubagentPane`) with its own transcript, streaming
+accumulators, and view state. A vertical **tab rail** on the right lists
+the panes; clicking a tab focuses it, retargeting the main transcript
+area (and the maximized stats/output-viewer windows) to that child's
+stream. The bottom pinned rail tab (or **Ctrl+P**) returns to the
+orchestrator view. **Ctrl+N** or a title click widens the rail from its
+collapsed 19-col tab strip to a 48-col detail view — clamped back down
+whenever the main column would drop below 60 cols. **Alt+↑ / Alt+↓**
+scroll the rail's tab window itself (pane tabs take priority over the
+NeuroCode feed when both exist), and focusing a pane auto-reveals its
+tab with the minimum rail scroll needed.
+
+A focused pane has **full orchestrator-screen parity** — same keys, same
+chrome, same state model, achieved by routing pane arms through the same
+helpers the main view uses (`parity by construction`):
+
+- **Scrolling** — ↑/k, ↓/j (transcript focus), Shift+Up (1 line, from
+  input focus), PgUp/PgDn (10 lines), Ctrl+B/Ctrl+F (half page, 15
+  lines), g/G/Home/End (top/bottom), and the mouse wheel over the pane
+  area (3 lines per notch). All of it moves the PANE's transcript; the
+  orchestrator's scroll anchor is untouched.
+- **Follow-tail semantics** (subtle): the pane is pinned to the live
+  tail only while `scroll == None`. Any scroll up freezes it at an
+  absolute offset — new items arriving do NOT move the view — and the
+  only way appends resume live-tracking is scrolling back to the very
+  bottom (G/End, or PgDn/wheel-down until it lands). Reaching the
+  bottom also returns keyboard focus to the input box, reading the
+  PANE's anchor (not the orchestrator's). Offsets are clamped against a
+  render-time bound, so a stale-high pin (ring eviction shrank the
+  transcript) re-clamps at the next scroll mutation.
+- **Chrome** — header ` ◆ subagent: <goal> [<model>] · live|done|failed|queued `,
+  plus the shared scroll-info segment ` N messages · P% from top `
+  (scrolled) / ` N messages · live ` (following) on the header's
+  bottom-right, a right-edge scrollbar (gold thumb while pinned), the
+  ` ↓ N lines below ` badge, and the identical live streaming tail
+  block (`◆ agent` header + indented wrapped text) — all the same
+  helper functions the orchestrator's transcript composes.
+- **Expand/collapse** — every reasoning block, tool/terminal block, and
+  file diff uses the same three-state cycle (Collapsed → TailWindow →
+  Full, with redundancy skips: ≤10 lines collapses to everything, so
+  the cycle jumps straight to Full; ≤200 lines makes TailWindow == Full
+  so it's skipped). Collapsed shows the first 10 lines (tools) / last
+  50 (diffs); TailWindow shows the last 200; Full shows everything
+  (diffs: the entire diff). Toggled by **Space / x** (resolves the
+  viewport-CENTER item via the same hit-test machinery clicks use,
+  falling back to the first expandable item at/below the top) or by
+  clicking the block. **Ctrl+E** cycles the most-recent reasoning block
+  and **Ctrl+G** the most-recent tool block — both retarget to the
+  focused pane.
+- **File diffs** — `FileChange` events render as inline `FileDiff`
+  items in panes through the exact builder the main transcript uses:
+  dual old/new line-number gutters (deletions blank the new column,
+  insertions the old), colored +/- markers, `… …` hunk-header dividers,
+  and a `binary file changed` placeholder for binary files.
+- **Copy** — **y / Y** in transcript focus copy the pane's most recent
+  assistant / user message (regardless of scroll position) via
+  `TuiAction::CopyPaneItem` (pane id + pane-relative index). The
+  joey-cli side resolves it through the SAME item→text mapping as the
+  main transcript's `CopyItem` and hands it to the host clipboard:
+  `pbcopy` / `xclip -selection clipboard` / `wl-copy`, falling back to
+  an OSC 52 escape sequence; a `✓ Copied N chars` transcript notice (or
+  error) confirms. Out-of-range pane/index is a safe no-op.
+- **Search** — **Ctrl+S** (input focus) or **/** (transcript focus)
+  opens the search bar over the pane; typing runs live, **Enter** jumps
+  to the first (newest) match, **n / N** walk matches with wrap-around.
+  The bar's title mirrors the PANE's match state (`search · match found
+  (n=next N=prev)` / `search · no matches`) — match-indicator ONLY:
+  search never highlights text in-place. A no-match (or empty) query
+  never moves the view. The walk pins the pane's scroll, clamped to the
+  render-time bound; the orchestrator's own search state is never
+  consulted for a pane search.
+- **Maximized panels** — **Ctrl+O** retargets the maximized output
+  viewer to the pane's tool output (spanning the full main column while
+  open; it opens even when the main transcript holds no tool but the
+  pane does, so the key never silently no-ops); **Ctrl+A** opens the
+  agent-stats page driven by the pane's own context-window snapshot and
+  per-pane stats anchor; **Ctrl+R**'s docked live-reasoning strip
+  renders under the pane transcript while the child is thinking (same
+  `draw_reasoning` widget, retargeted). Takeover precedence inside the
+  pane view: stats > output viewer > reasoning > mode explorer. The
+  **F1 / ?** help overlay is global and identical everywhere.
+- **Mode-specific explorers** (e.g. NeuroCode's fullscreen graph
+  explorer) render in a pane view ONLY when that mode spawned the pane
+  (`spawned_by_neurocode`, snapshotted at spawn time) — a plain
+  delegation pane never shows the mode explorer even when the mode is
+  active.
+- **Ctrl+L** clears the panes and rail entirely and returns focus to
+  the orchestrator view (the orchestrator's own scroll is deliberately
+  untouched).
+
+**State preservation across focus switches**: scroll offset, stats-view
+anchor, expanded context entries, search state (open latch, query,
+match indicator), and per-item expand states all live ON the pane, so
+switching focus away and back preserves each pane's view exactly; the
+orchestrator keeps its own separate scroll/search state throughout.
+Only the render-time geometry cells (the max-scroll bound and text-area
+rect) are view-global — they describe whichever pane is focused and are
+reset by Ctrl+L.
+
 ## Animations (anim.rs)
 
 Particle field, spinners, equalizer, pulse, activity signal — all paced by
