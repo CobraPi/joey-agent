@@ -969,11 +969,7 @@ pub fn draw_transcript(f: &mut Frame, area: Rect, app: &App, theme: Theme, focus
     // hint routes through the shared `transcript_scroll_hint` so the
     // focused pane composes the IDENTICAL segment. Byte-identical title.
     let title = if focused {
-        format!(
-            " conversation {} {} ",
-            transcript_scroll_hint(),
-            scroll_info
-        )
+        format!(" conversation {} ", focused_header_segments(&scroll_info))
     } else {
         format!(" conversation {} ", scroll_info)
     };
@@ -1321,6 +1317,194 @@ fn transcript_scroll_hint() -> &'static str {
     "[scroll: j/k g/G PgUp/PgDn /search ]"
 }
 
+/// T023 (US5, FR-009, D2 Invariant 1): the combined focused-header segment —
+/// scroll-key hint, single space, scroll-info — that BOTH the orchestrator's
+/// `draw_transcript` title and the focused pane's header compose. One
+/// composer so ordering/spacing can never drift between the two screens.
+fn focused_header_segments(scroll_info: &str) -> String {
+    format!("{} {}", transcript_scroll_hint(), scroll_info)
+}
+
+/// T036 (US5, FR-001/FR-009, SC-003): compose the focused subagent pane's
+/// header the SAME way `draw_transcript` composes its single top title —
+/// " ◆ subagent: {goal} [{model}] {status} {segment} " where `segment` is
+/// the shared `focused_header_segments` composition when focused, the bare
+/// `transcript_scroll_info` otherwise (exactly the orchestrator's focused/
+/// unfocused title logic, riding the same helpers).
+///
+/// Ratatui renders LEFT titles clipped on the right when they exceed the
+/// block's usable width (ratatui-widgets 0.3 `Block::render_left_titles`
+/// caps `title.width` at the titles area — the trailing scroll segment
+/// would be the part cut off). So the helper measures the composed title
+/// (`unicode_width`, the same width engine ratatui buffers use) against
+/// `pane_width - 2` (inside the block's left+right borders):
+///
+/// - FITS → returned as the top `title`, `bottom_fallback = None`.
+/// - DOESN'T FIT → the bare pane title (goal/model/status, byte-identical
+///   to the pre-T036 top title) is returned for the top row and the segment
+///   rides the block's BOTTOM-right corner (`bottom_fallback = Some`), the
+///   pre-T036 placement — keeping the scroll-info/hint fully visible at
+///   every geometry instead of truncating it into ambiguity.
+///
+/// At the quickstart.md minimum geometry (96 cols) the pane's title row
+/// holds 43 usable columns (96 − 19 rail − 34 sidebar − 2 borders) — not
+/// even the bare 47-column title fits, so the fallback preserves today's
+/// rendering there; the unified top placement engages on wider terminals
+/// where the composed title genuinely fits.
+struct PaneHeaderTitle {
+    title: String,
+    bottom_fallback: Option<String>,
+}
+
+fn pane_header_title(
+    pane: &SubagentPane,
+    scroll_info: &str,
+    focused: bool,
+    pane_width: u16,
+) -> PaneHeaderTitle {
+    let status = match pane.status {
+        SubagentStatus::Running => "· live",
+        SubagentStatus::Done => "· done",
+        SubagentStatus::Failed => "· failed",
+        SubagentStatus::Pending => "· queued",
+    };
+    let base = format!(
+        " ◆ subagent: {} [{}] {} ",
+        pane.goal, pane.model, status
+    );
+    let segment = if focused {
+        focused_header_segments(scroll_info)
+    } else {
+        scroll_info.to_string()
+    };
+    // Compose the unified top title exactly like `draw_transcript`'s
+    // " conversation {segment} " — bare pane title, then the segment
+    // (the base's trailing space provides the separator).
+    let composed = format!("{}{}", base, segment);
+    // Titles area = pane width minus the left+right border columns
+    // (ratatui `Block::titles_area`).
+    let usable = pane_width.saturating_sub(2) as usize;
+    if composed.width() <= usable {
+        PaneHeaderTitle {
+            title: composed,
+            bottom_fallback: None,
+        }
+    } else {
+        // Fit fallback (T036): top row keeps the bare pane title; the
+        // segment rides the bottom-right corner, fully visible.
+        PaneHeaderTitle {
+            title: base,
+            bottom_fallback: Some(segment),
+        }
+    }
+}
+
+#[cfg(test)]
+mod t036_pane_header_title_tests {
+    use super::*;
+    use crate::state::SubagentPane;
+
+    /// Build a pane with the parity-suite fixture shape ("parity child"
+    /// goal, "test-model" model, Running) through the real spawn path —
+    /// `pane_header_title` is otherwise a pure function over the pane +
+    /// width.
+    fn pane(goal: &str, model: &str) -> SubagentPane {
+        let mut app = App::new("s", "m");
+        app.apply(joey_agent_core::events::AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: goal.to_string(),
+            model: model.to_string(),
+            toolset_summary: "file, web".to_string(),
+            depth: 0,
+        });
+        app.subagent_panes
+            .pop()
+            .expect("spawn created the pane")
+    }
+
+    fn scroll_info_40_live() -> String {
+        transcript_scroll_info(40, None, 0) // " 40 messages · live "
+    }
+
+    /// The composed top title is exactly the orchestrator-style
+    /// composition: bare pane title + shared segment, nothing else.
+    #[test]
+    fn t036_top_title_is_orchestrator_style_composition() {
+        let p = pane("parity child", "test-model");
+        let h = pane_header_title(&p, &scroll_info_40_live(), false, 140);
+        assert!(h.bottom_fallback.is_none(), "fits at 140 cols");
+        assert_eq!(
+            h.title,
+            " ◆ subagent: parity child [test-model] · live  40 messages · live "
+        );
+    }
+
+    /// Focused: the segment is the shared `focused_header_segments`
+    /// composition (scroll-key hint + space + scroll-info), byte-identical
+    /// to what `draw_transcript`'s focused title would carry.
+    #[test]
+    fn t036_focused_top_title_carries_shared_hint_segment() {
+        let p = pane("parity child", "test-model");
+        let info = scroll_info_40_live();
+        let h = pane_header_title(&p, &info, true, 200);
+        assert!(h.bottom_fallback.is_none(), "focused title fits at 200");
+        assert!(
+            h.title.contains(&focused_header_segments(&info)),
+            "focused composition embedded verbatim: {:?}",
+            h.title
+        );
+        assert!(h.title.contains("[scroll: j/k g/G PgUp/PgDn /search ]"));
+        // ...and ends with the scroll-info (hint comes first, like the
+        // orchestrator's focused title).
+        assert!(h.title.ends_with("40 messages · live "));
+    }
+
+    /// Boundary: the fit check is against `pane_width - 2` (inside the
+    /// borders) using display width, so exactly-at-capacity fits and one
+    /// column under falls back.
+    #[test]
+    fn t036_fit_boundary_is_width_minus_borders() {
+        let p = pane("parity child", "test-model");
+        let info = scroll_info_40_live();
+        let composed_w =
+            pane_header_title(&p, &info, false, 200).title.width();
+        // Exactly fits → top placement.
+        let exact = pane_header_title(&p, &info, false, (composed_w + 2) as u16);
+        assert!(exact.bottom_fallback.is_none(), "exact fit composes top");
+        // One column short → fallback keeps the segment fully visible on
+        // the bottom row and the top title stays the bare pane title.
+        let short = pane_header_title(&p, &info, false, (composed_w + 1) as u16);
+        assert_eq!(
+            short.title, " ◆ subagent: parity child [test-model] · live ",
+            "fallback top title is the bare pane title (pre-T036 string)"
+        );
+        assert_eq!(
+            short.bottom_fallback.as_deref(),
+            Some(info.as_str()),
+            "fallback carries the bare scroll-info segment"
+        );
+    }
+
+    /// Min geometry (quickstart ≥96 cols): through the real layout the
+    /// pane's title row holds 43 usable columns (96 − 19 rail − 34
+    /// sidebar − 2 borders), and even the BARE 47-col title exceeds it —
+    /// so the pane is on the bottom-corner fallback there, preserving the
+    /// pre-T036 rendering (the documented behavior Wave 4 records in
+    /// parity.md).
+    #[test]
+    fn t036_min_geometry_96_cols_uses_bottom_fallback() {
+        let p = pane("parity child", "test-model");
+        let info = scroll_info_40_live();
+        // 96 − 19 rail − 34 sidebar = 43-col pane.
+        let h = pane_header_title(&p, &info, false, 43);
+        assert!(
+            h.bottom_fallback.is_some(),
+            "segment rides the bottom-right corner at min geometry"
+        );
+        assert!(h.title.contains("subagent: parity child"));
+    }
+}
+
 /// T023 (US5, FR-009, D2 Invariant 1): the live streaming-assistant tail
 /// block `draw_transcript` renders (bold info "◆ agent " header + indented
 /// fg_base wrapped lines), extracted verbatim so `draw_pane_transcript`
@@ -1547,19 +1731,21 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 /// rect into `app.last_reasoning_rect` for mouse hit-testing, and zeroes it
 /// when there is nothing live to show.
 pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: &Spinner) {
-    // T021 (US4, FR-008, D6): target-aware source. With a subagent pane
-    // focused the panel renders the PANE's live `streaming_reasoning`
+    // T021 (US4, FR-008, D6) + T034: target-aware source. With a subagent
+    // pane focused the panel renders the PANE's live `streaming_reasoning`
     // (content-based live condition: a non-empty accumulator IS a live
-    // block — panes carry no `reasoning_open` flag) and never leaks the
-    // main accumulators (focused-view isolation). Unfocused, every field
-    // resolves exactly as before (byte-identical main screen).
+    // block — panes carry no `reasoning_open` flag) with the pane's own
+    // expansion/view/timer state (full main-screen parity, FR-008) and
+    // never leaks the main accumulators (focused-view isolation).
+    // Unfocused, every field resolves exactly as before (byte-identical
+    // main screen).
     let (live, stream, expanded, started, view) = if let Some(pane) = app.focused_pane() {
         (
             !pane.streaming_reasoning.is_empty(),
             &pane.streaming_reasoning,
-            false, // panes have no expanded-reasoning takeover mode
-            None,  // ...nor a thinking timer (flush stamps no duration)
-            None,  // tail-follow only (no frozen-anchor state on panes)
+            pane.reasoning_expanded,
+            pane.reasoning_started,
+            pane.reasoning_view,
         )
     } else {
         (
@@ -1582,11 +1768,9 @@ pub fn draw_reasoning(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinne
         "reasoning"
     } else if expanded {
         " reasoning · live · click or Esc to collapse "
-    } else if app.focused_pane().is_some() {
-        // Pane live panel: click-to-expand toggles MAIN state, so the pane
-        // title carries no expand affordance (honest chrome).
-        " reasoning · live "
     } else {
+        // T034: the pane panel toggles the PANE's expansion, so it
+        // carries the SAME affordance as main (FR-008 parity).
         " reasoning · live · click to expand "
     };
     let block = gradient_block_focused(title, theme, 0.5);
@@ -2085,46 +2269,43 @@ fn usage_bar(width: usize, ratio: f32, theme: &Theme) -> String {
     s
 }
 
-/// The maximized agent-stats page: a live dashboard (context window usage,
-/// token accounting, model/session, compression, per-call usage sparkline)
-/// on top and the full context-window stream below — one line per history
-/// message, auto-following the tail with freeze-on-scroll (same semantics
-/// as the live reasoning panel). Opened by clicking the header's right
-/// section or Ctrl+A; Esc restores.
-pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: &Spinner) {
-    // Rect for mouse hit-testing (wheel scrolling inside the page).
-    app.last_stats_rect.set((area.x, area.y, area.width, area.height));
+// ── Shared stats-page section builders (T035 / FR-009 / SC-003, D2) ────────
+//
+// Feature 017 T035 restored the plan-D2 "same widget functions" invariant
+// for the two stats pages: `draw_stats_page` (orchestrator) and
+// `draw_pane_stats_page` (focused subagent) are thin adapters composing
+// the SAME shared builders below — dashboard context row, breakdown row,
+// session row, usage sparkline, windowed context stream, and footer.
+// Only the DATA and the pane-specific labels (" child ", "goal:") differ,
+// passed in by each adapter; the builders parameterize labels and content
+// and never homogenize them. Rendering is byte-identical to the
+// pre-refactor hand-rolled pages for BOTH screens (pure refactor).
 
-    let live = app.is_busy();
-    let title = if live {
-        " ◆ agent stats · LIVE · Esc to restore "
-    } else {
-        " ◆ agent stats · Esc to restore "
-    };
-    let block = gradient_block_focused(title, theme, 0.6);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let content_w = inner.width.max(1) as usize;
-
-    // ── Dashboard section (fixed rows at the top) ──────────────────────
-    let mut lines: Vec<Line> = Vec::new();
-    let used = app.context_system_tokens + app.context_history_tokens;
-    let pct = app.context_usage_pct();
-    let bar_w = (content_w.saturating_sub(34)).clamp(10, 40);
-
-    // Row 1: context window usage bar.
-    let (pct_col, warn) = if pct >= 85.0 {
+/// Threshold styling for the dashboard context row: ≥85% error + a
+/// near-limit note, ≥65% warning, else success. Shared by both stats
+/// pages (T035, FR-009/SC-003, D2).
+fn context_pct_style(pct: f64, theme: Theme) -> (crate::theme::Rgb, &'static str) {
+    if pct >= 85.0 {
         (theme.error, " ⚠ near limit")
     } else if pct >= 65.0 {
         (theme.warning, "")
     } else {
         (theme.success, "")
-    };
-    lines.push(Line::from(vec![
+    }
+}
+
+/// Dashboard row 1: " context " label + "used / window (P.x%)warn" + the
+/// `usage_bar` gauge, colored by usage threshold. Byte-identical to the
+/// row both pages hand-rolled before T035 (FR-009/SC-003, D2).
+fn stats_context_row(
+    used: u64,
+    window: u64,
+    pct: f64,
+    bar_w: usize,
+    theme: Theme,
+) -> Line<'static> {
+    let (pct_col, warn) = context_pct_style(pct, theme);
+    Line::from(vec![
         Span::styled(
             " context ".to_string(),
             Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
@@ -2133,7 +2314,7 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
             format!(
                 "{} / {} ({:.1}%){}  ",
                 fmt_tokens(used),
-                if app.context_window > 0 { fmt_tokens(app.context_window) } else { "?".into() },
+                if window > 0 { fmt_tokens(window) } else { "?".into() },
                 pct,
                 warn,
             ),
@@ -2143,56 +2324,45 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
             usage_bar(bar_w, pct as f32 / 100.0, &theme),
             Style::default().fg(pct_col.to_color()),
         ),
-    ]));
+    ])
+}
 
-    // Row 2: breakdown + compression info.
-    let threshold_note = if app.compression_threshold > 0 {
-        format!("compress@{}", fmt_tokens(app.compression_threshold))
-    } else {
-        "compress@?".to_string()
-    };
-    lines.push(Line::from(vec![
-        Span::styled("          ".to_string(), Style::default()),
-        Span::styled(
-            format!(
-                "system {} · history {} · msgs {} · {} · compacted {}x",
-                fmt_tokens(app.context_system_tokens),
-                fmt_tokens(app.context_history_tokens),
-                app.context_entries.len(),
-                threshold_note,
-                app.compactions
-            ),
-            Style::default().fg(theme.fg_more_subtle.to_color()),
-        ),
-    ]));
+/// A subtle-colored value span — the text style both pages use for the
+/// breakdown/session row values (T035 shared extraction).
+fn subtle_span(text: String, theme: Theme) -> Span<'static> {
+    Span::styled(
+        text,
+        Style::default().fg(theme.fg_more_subtle.to_color()),
+    )
+}
 
-    // Row 3: session token totals + turns + iterations.
-    lines.push(Line::from(vec![
-        Span::styled(" session  ".to_string(), Style::default().fg(theme.accent.to_color())),
-        Span::styled(
-            format!(
-                "prompt {} · completion {} · total {} · turns {} · iters {}",
-                fmt_tokens(app.tokens.prompt),
-                fmt_tokens(app.tokens.completion),
-                fmt_tokens(app.tokens.total()),
-                app.turns,
-                app.tokens.iterations
-            ),
-            Style::default().fg(theme.fg_more_subtle.to_color()),
-        ),
-    ]));
+/// The plain label column both breakdown rows indent with — NOTE the two
+/// screens deliberately differ (main indents 10 spaces, pane 9, keeping
+/// each row's value text column-aligned with its " context "/" child "
+/// label above); the width is therefore a per-screen parameter, not a
+/// shared constant (byte-identical to the pre-T035 inline strings).
+fn stats_breakdown_label(spaces: usize) -> Span<'static> {
+    Span::styled(" ".repeat(spaces), Style::default())
+}
 
-    // Row 4: usage sparkline (per-API-call prompt tokens, recent window).
-    let spark_w = content_w.saturating_sub(24).clamp(10, 60);
-    let spark: String = if app.usage_series.is_empty() {
+/// Usage sparkline for dashboard row 4 (orchestrator page only — the pane
+/// page has no per-call series): downsampled to `spark_w` samples, each
+/// mapped to a bar-height glyph, " · streaming" suffix while live.
+/// Byte-identical to the row `draw_stats_page` hand-rolled before T035.
+fn usage_sparkline_row(
+    series: &[(u64, u64)],
+    spark_w: usize,
+    live: bool,
+    theme: Theme,
+) -> Line<'static> {
+    let spark: String = if series.is_empty() {
         "·".repeat(spark_w)
     } else {
         // Downsample to spark_w samples; each maps to a bar height glyph.
         let samples: Vec<u64> = {
-            let s = &app.usage_series;
             // Take the LAST spark_w samples; pad-left with zeros when fewer.
-            let start = s.len().saturating_sub(spark_w);
-            let mut v: Vec<u64> = s[start..].iter().map(|x| x.0).collect();
+            let start = series.len().saturating_sub(spark_w);
+            let mut v: Vec<u64> = series[start..].iter().map(|x| x.0).collect();
             if v.len() < spark_w {
                 let pad = spark_w - v.len();
                 let mut padded = vec![0u64; pad];
@@ -2211,13 +2381,118 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
             })
             .collect()
     };
-    lines.push(Line::from(vec![
+    Line::from(vec![
         Span::styled(" calls    ".to_string(), Style::default().fg(theme.accent.to_color())),
         Span::styled(
             format!("{} {}", spark, if live { " · streaming" } else { "" }),
             Style::default().fg(theme.info.to_color()),
         ),
+    ])
+}
+
+/// The per-screen inputs `render_stats_page_composed` needs beyond the
+/// recording cells: the dashboard values and the context-stream source.
+/// T035 (FR-009/SC-003, D2): one struct so BOTH stats pages drive the
+/// SAME section builders; labels stay per-screen (" session " vs
+/// " child   ", pane "goal:" breakdown) — parameterized, not homogenized.
+struct StatsPageData<'a> {
+    /// Tokens counted against the context window (system + history).
+    used: u64,
+    /// Context-window size in tokens (0 → rendered as "?").
+    window: u64,
+    /// Context usage percentage (drives bar color + near-limit note).
+    pct: f64,
+    /// Breakdown-row value span (label indent is per-screen: 10 spaces
+    /// main / 9 pane — column-aligns with each screen's row labels).
+    breakdown_value: Span<'static>,
+    /// Breakdown-row leading indent (see `stats_breakdown_label`).
+    breakdown_indent: usize,
+    /// Session-row label (" session  " main / " child   " pane).
+    session_label: &'static str,
+    /// Session-row value span.
+    session_value: Span<'static>,
+    /// Per-API-call usage series → row 4 sparkline. `None` on the pane
+    /// page (no per-call series; the row is orchestrator-only, exactly as
+    /// before T035).
+    usage_series: Option<&'a [(u64, u64)]>,
+    /// Context-window entries for the stream (main vs pane snapshot).
+    entries: &'a [joey_agent_core::events::ContextEntry],
+    /// Which entry indices are expanded (click/Space affordance).
+    expanded: &'a std::collections::HashSet<usize>,
+    /// Placeholder line when there are no entries (per-screen wording).
+    empty_note: &'static str,
+}
+
+/// T035 (FR-009/SC-003, D2 "same widget functions"): the composed body
+/// BOTH stats pages render — gradient title bar (caller-composed title),
+/// dashboard rows (context bar + breakdown + session [+ calls sparkline]),
+/// blank separator, the `build_context_stream` stream windowed with
+/// freeze-on-scroll anchors recorded into the caller's cells, and the
+/// footer (live spinner, updated-ago note, ↑above/↓below counters,
+/// expand hint). Byte-identical to the pre-T035 pages; only the data
+/// (`StatsPageData`), the scroll-anchor state, and the recording cells
+/// differ per screen.
+#[allow(clippy::too_many_arguments)]
+fn render_stats_page_composed(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    live: bool,
+    data: StatsPageData<'_>,
+    // Scroll anchor state (`app.stats_view` / `pane.stats_view`);
+    // `None` = auto-follow the live tail.
+    stats_view: Option<usize>,
+    // Render-time anchor bound (`app.last_stats_max_anchor` /
+    // `pane.last_stats_max_anchor`).
+    max_anchor_cell: &std::cell::Cell<usize>,
+    // Visible-window recorder for click hit-testing
+    // (`app.last_stats_window` / `app.last_pane_stats_window`).
+    window_cell: &std::cell::Cell<(u16, usize)>,
+    // Entry-geometry recorder for click hit-testing
+    // (`app.last_stats_stream_rows` / `app.last_pane_stats_stream_rows`).
+    stream_rows_cell: &std::cell::RefCell<Vec<(usize, usize, usize)>>,
+    // " updated Ns ago" footer segment source (main page only).
+    context_updated_at: Option<std::time::Instant>,
+    spinner: &Spinner,
+    theme: Theme,
+) {
+    let block = gradient_block_focused(title, theme, 0.6);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let content_w = inner.width.max(1) as usize;
+
+    // ── Dashboard section (fixed rows at the top) ──────────────────────
+    let mut lines: Vec<Line> = Vec::new();
+    let bar_w = (content_w.saturating_sub(34)).clamp(10, 40);
+
+    // Row 1: context window usage bar.
+    lines.push(stats_context_row(data.used, data.window, data.pct, bar_w, theme));
+
+    // Row 2: breakdown + compression info (per-screen value span).
+    lines.push(Line::from(vec![
+        stats_breakdown_label(data.breakdown_indent),
+        data.breakdown_value,
     ]));
+
+    // Row 3: session token totals (per-screen label + value spans).
+    lines.push(Line::from(vec![
+        Span::styled(
+            data.session_label.to_string(),
+            Style::default().fg(theme.accent.to_color()),
+        ),
+        data.session_value,
+    ]));
+
+    // Row 4: usage sparkline (per-API-call prompt tokens, recent window)
+    // — orchestrator page only (pane passes no usage_series).
+    if let Some(series) = data.usage_series {
+        let spark_w = content_w.saturating_sub(24).clamp(10, 60);
+        lines.push(usage_sparkline_row(series, spark_w, live, theme));
+    }
 
     lines.push(Line::from(vec![Span::raw("")]));
 
@@ -2227,19 +2502,19 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
     // entry is expanded — same affordance as the main transcript (click a
     // row or press Space on the selected row to toggle).
     let stream = build_context_stream(
-        &app.context_entries,
-        &app.expanded_context,
+        data.entries,
+        data.expanded,
         content_w,
         theme,
-        "(no context yet — send a prompt)",
+        data.empty_note,
     );
 
     let body_rows = inner.height.saturating_sub(lines.len() as u16 + 1).max(1) as usize; // +1 footer
     let total = stream.total;
     let visible = body_rows.min(total);
     let max_anchor = total.saturating_sub(visible);
-    app.last_stats_max_anchor.set(max_anchor);
-    let start = match app.stats_view {
+    max_anchor_cell.set(max_anchor);
+    let start = match stats_view {
         None => max_anchor, // following the live tail
         Some(anchor) => anchor.min(max_anchor),
     };
@@ -2249,9 +2524,9 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
     // first content row on screen is inner.y + lines.len() — recording just
     // inner.y made every click resolve ~5 rows above the intended entry.
     let header_rows = lines.len() as u16;
-    app.last_stats_window.set((inner.y + header_rows, start));
-    app.last_stats_stream_rows.borrow_mut().clear();
-    app.last_stats_stream_rows
+    window_cell.set((inner.y + header_rows, start));
+    stream_rows_cell.borrow_mut().clear();
+    stream_rows_cell
         .borrow_mut()
         .extend(stream.entry_rows.iter().copied());
     lines.extend(stream.lines.into_iter().skip(start).take(visible));
@@ -2265,7 +2540,7 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
             Style::default().fg(theme.busy.to_color()),
         ));
     }
-    if let Some(at) = app.context_updated_at {
+    if let Some(at) = context_updated_at {
         footer.push(Span::styled(
             format!("  · updated {:.0}s ago", at.elapsed().as_secs_f32()),
             Style::default().fg(theme.fg_most_subtle.to_color()),
@@ -2277,7 +2552,7 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
             Style::default().fg(theme.fg_most_subtle.to_color()),
         ));
     }
-    if total > visible && app.stats_view.is_some() {
+    if total > visible && stats_view.is_some() {
         footer.push(Span::styled(
             format!("  ↓{} below · scroll to bottom to resume", total - end),
             Style::default().fg(theme.fg_more_subtle.to_color()),
@@ -2290,6 +2565,82 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
     lines.push(Line::from(footer));
 
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// The maximized agent-stats page: a live dashboard (context window usage,
+/// token accounting, model/session, compression, per-call usage sparkline)
+/// on top and the full context-window stream below — one line per history
+/// message, auto-following the tail with freeze-on-scroll (same semantics
+/// as the live reasoning panel). Opened by clicking the header's right
+/// section or Ctrl+A; Esc restores.
+pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: &Spinner) {
+    // Rect for mouse hit-testing (wheel scrolling inside the page).
+    app.last_stats_rect.set((area.x, area.y, area.width, area.height));
+
+    let live = app.is_busy();
+    let title = if live {
+        " ◆ agent stats · LIVE · Esc to restore "
+    } else {
+        " ◆ agent stats · Esc to restore "
+    };
+
+    // T035 (FR-009/SC-003, D2 "same widget functions"): thin adapter —
+    // the composed body is the shared `render_stats_page_composed` the
+    // pane stats page also drives; this adapter only supplies the MAIN
+    // app's data, labels (" session  ", compression/turns breakdown),
+    // per-call usage sparkline, and recording cells.
+    let used = app.context_system_tokens + app.context_history_tokens;
+    let threshold_note = if app.compression_threshold > 0 {
+        format!("compress@{}", fmt_tokens(app.compression_threshold))
+    } else {
+        "compress@?".to_string()
+    };
+    render_stats_page_composed(
+        f,
+        area,
+        title,
+        live,
+        StatsPageData {
+            used,
+            window: app.context_window,
+            pct: app.context_usage_pct(),
+            breakdown_value: subtle_span(
+                format!(
+                    "system {} · history {} · msgs {} · {} · compacted {}x",
+                    fmt_tokens(app.context_system_tokens),
+                    fmt_tokens(app.context_history_tokens),
+                    app.context_entries.len(),
+                    threshold_note,
+                    app.compactions
+                ),
+                theme,
+            ),
+            breakdown_indent: 10,
+            session_label: " session  ",
+            session_value: subtle_span(
+                format!(
+                    "prompt {} · completion {} · total {} · turns {} · iters {}",
+                    fmt_tokens(app.tokens.prompt),
+                    fmt_tokens(app.tokens.completion),
+                    fmt_tokens(app.tokens.total()),
+                    app.turns,
+                    app.tokens.iterations
+                ),
+                theme,
+            ),
+            usage_series: Some(&app.usage_series),
+            entries: &app.context_entries,
+            expanded: &app.expanded_context,
+            empty_note: "(no context yet — send a prompt)",
+        },
+        app.stats_view,
+        &app.last_stats_max_anchor,
+        &app.last_stats_window,
+        &app.last_stats_stream_rows,
+        app.context_updated_at,
+        spinner,
+        theme,
+    );
 }
 
 pub fn draw_omo_panel(
@@ -5575,37 +5926,28 @@ pub fn draw_pane_transcript(
         pane.scroll,
         app.last_pane_max_scroll.get(),
     );
-    // T023 (US5, FR-009): when the pane's transcript holds keyboard focus,
-    // the header also carries the SAME scroll-key hint segment the focused
-    // orchestrator header shows — composed from the shared
-    // `transcript_scroll_hint` (no pane-local restatement), placed before
-    // the scroll-info like `draw_transcript`'s focused title. Right-aligned
-    // keeps the scroll-info segment fully visible when the row overflows.
-    let bottom_title = if focused {
-        format!("{} {}", transcript_scroll_hint(), scroll_info)
-    } else {
-        scroll_info
-    };
-    let title = format!(
-        " ◆ subagent: {} [{}] {} ",
-        pane.goal,
-        pane.model,
-        match pane.status {
-            SubagentStatus::Running => "· live",
-            SubagentStatus::Done => "· done",
-            SubagentStatus::Failed => "· failed",
-            SubagentStatus::Pending => "· queued",
-        }
-    );
-    let block = panel_block(&title, theme, focused, glow)
-        // T008 (US1, D2) + T023 (US5, FR-009): the shared scroll-info (+
-        // focused scroll-key hint) segment from `draw_transcript`'s header
-        // (" N messages · live "/" · P% from top "). The pane's top title
-        // (goal + model + status) already fills the header row at common
-        // widths, so the segment rides the block's bottom-right corner —
-        // same strings, same `transcript_scroll_info` /
-        // `transcript_scroll_hint`.
-        .title_bottom(Line::from(bottom_title).right_aligned());
+    // T036 (US5, FR-001/FR-009, SC-003): UNIFIED PLACEMENT — the scroll
+    // segment now composes into the pane's TOP title exactly the way
+    // `draw_transcript` composes its single top title, via the shared
+    // `pane_header_title` helper below (which composes " ◆ subagent:
+    // {goal} [{model}] {status} {segment} " with the SAME
+    // `focused_header_segments` / bare-`transcript_scroll_info` segment
+    // logic the orchestrator title uses). Ratatui clips LEFT titles on
+    // the right (ratatui-widgets 0.3 `Block::render_left_titles`
+    // truncates a too-long title at the pane's usable width), so the
+    // helper first checks the composed title FITS the pane's title row
+    // (`area.width - 2` inside the borders); when it would truncate the
+    // segment, the block falls back to the pre-T036 bottom-right corner
+    // placement so the scroll-info (and the focused scroll-key hint)
+    // always stay fully visible — same strings, same
+    // `transcript_scroll_info` / `transcript_scroll_hint` either way.
+    let header = pane_header_title(pane, &scroll_info, focused, area.width);
+    let mut block = panel_block(&header.title, theme, focused, glow);
+    if let Some(bottom) = header.bottom_fallback {
+        // Fit fallback (T036): the composed top title would be clipped —
+        // ride the segment on the block's bottom-right corner instead.
+        block = block.title_bottom(Line::from(bottom).right_aligned());
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -5652,134 +5994,58 @@ pub fn draw_pane_stats_page(
         pane.model,
         if live { "LIVE · Esc to restore" } else { "Esc to restore" }
     );
-    let block = gradient_block_focused(&title, theme, 0.6);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
 
-    let content_w = inner.width.max(1) as usize;
-    let mut lines: Vec<Line> = Vec::new();
-    let used = pane.context_system_tokens + pane.context_history_tokens;
-    let pct = pane.context_usage_pct();
-    let bar_w = (content_w.saturating_sub(34)).clamp(10, 40);
-    let (pct_col, warn) = if pct >= 85.0 {
-        (theme.error, " ⚠ near limit")
-    } else if pct >= 65.0 {
-        (theme.warning, "")
-    } else {
-        (theme.success, "")
-    };
-    lines.push(Line::from(vec![
-        Span::styled(
-            " context ".to_string(),
-            Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(
-                "{} / {} ({:.1}%){}  ",
-                fmt_tokens(used),
-                if pane.context_window > 0 { fmt_tokens(pane.context_window) } else { "?".into() },
-                pct,
-                warn,
+    // T035 (FR-009/SC-003, D2 "same widget functions"): thin adapter —
+    // the SAME shared `render_stats_page_composed` the orchestrator's
+    // `draw_stats_page` drives; this adapter supplies the PANE's data,
+    // its intentionally different labels (" child   ", "goal:" breakdown,
+    // no per-call sparkline — the child has no usage series) and its own
+    // recording cells (per-pane scroll anchor + App-level hit-test cells).
+    render_stats_page_composed(
+        f,
+        area,
+        &title,
+        live,
+        StatsPageData {
+            used: pane.context_system_tokens + pane.context_history_tokens,
+            window: pane.context_window,
+            pct: pane.context_usage_pct(),
+            breakdown_value: subtle_span(
+                format!(
+                    "goal: {} · system {} · history {} · msgs {}",
+                    pane.goal,
+                    fmt_tokens(pane.context_system_tokens),
+                    fmt_tokens(pane.context_history_tokens),
+                    pane.context_entries.len(),
+                ),
+                theme,
             ),
-            Style::default().fg(pct_col.to_color()),
-        ),
-        Span::styled(
-            usage_bar(bar_w, pct as f32 / 100.0, &theme),
-            Style::default().fg(pct_col.to_color()),
-        ),
-    ]));
-    // Breakdown.
-    lines.push(Line::from(vec![
-        Span::styled("         ".to_string(), Style::default()),
-        Span::styled(
-            format!(
-                "goal: {} · system {} · history {} · msgs {}",
-                pane.goal,
-                fmt_tokens(pane.context_system_tokens),
-                fmt_tokens(pane.context_history_tokens),
-                pane.context_entries.len(),
+            breakdown_indent: 9,
+            session_label: " child   ",
+            session_value: subtle_span(
+                format!(
+                    "prompt {} · completion {} · total {} · iters {} · {:.0}s elapsed",
+                    fmt_tokens(pane.tokens.prompt),
+                    fmt_tokens(pane.tokens.completion),
+                    fmt_tokens(pane.tokens.total()),
+                    pane.tokens.iterations,
+                    pane.started.elapsed().as_secs_f32(),
+                ),
+                theme,
             ),
-            Style::default().fg(theme.fg_more_subtle.to_color()),
-        ),
-    ]));
-    // Session usage.
-    lines.push(Line::from(vec![
-        Span::styled(" child   ".to_string(), Style::default().fg(theme.accent.to_color())),
-        Span::styled(
-            format!(
-                "prompt {} · completion {} · total {} · iters {} · {:.0}s elapsed",
-                fmt_tokens(pane.tokens.prompt),
-                fmt_tokens(pane.tokens.completion),
-                fmt_tokens(pane.tokens.total()),
-                pane.tokens.iterations,
-                pane.started.elapsed().as_secs_f32(),
-            ),
-            Style::default().fg(theme.fg_more_subtle.to_color()),
-        ),
-    ]));
-    lines.push(Line::from(vec![Span::raw("")]));
-
-    // Context stream (windowed like the main stats page, EXPANDABLE).
-    let stream = build_context_stream(
-        &pane.context_entries,
-        &pane.expanded_context,
-        content_w,
+            usage_series: None,
+            entries: &pane.context_entries,
+            expanded: &pane.expanded_context,
+            empty_note: "(no context yet — the child is waiting for its first response)",
+        },
+        // T004: the anchor bound + view anchor are read PER-PANE so each
+        // pane preserves its own scroll across focus switches (FR-010).
+        pane.stats_view,
+        &pane.last_stats_max_anchor,
+        &app.last_pane_stats_window,
+        &app.last_pane_stats_stream_rows,
+        None,
+        spinner,
         theme,
-        "(no context yet — the child is waiting for its first response)",
     );
-
-    let body_rows = inner.height.saturating_sub(lines.len() as u16 + 1).max(1) as usize;
-    let total = stream.total;
-    let visible = body_rows.min(total);
-    let max_anchor = total.saturating_sub(visible);
-    // T004: record the anchor bound + read the view anchor PER-PANE so each
-    // pane preserves its own scroll across focus switches (FR-010). `Cell`
-    // gives interior mutability through the shared `&SubagentPane`.
-    pane.last_stats_max_anchor.set(max_anchor);
-    let start = match pane.stats_view {
-        None => max_anchor,
-        Some(anchor) => anchor.min(max_anchor),
-    };
-    let end = (start + visible).min(total);
-    // Record the visible window + entry geometry for click hit-testing.
-    // Content starts after the pane dashboard header rows (see main stats).
-    let header_rows = lines.len() as u16;
-    app.last_pane_stats_window.set((inner.y + header_rows, start));
-    app.last_pane_stats_stream_rows.borrow_mut().clear();
-    app.last_pane_stats_stream_rows
-        .borrow_mut()
-        .extend(stream.entry_rows.iter().copied());
-    lines.extend(stream.lines.into_iter().skip(start).take(visible));
-
-    // Footer.
-    let mut footer = vec![Span::raw(" ")];
-    if live {
-        footer.push(spinner.styled_glyph(theme));
-        footer.push(Span::styled(
-            " live".to_string(),
-            Style::default().fg(theme.busy.to_color()),
-        ));
-    }
-    if start > 0 {
-        footer.push(Span::styled(
-            format!("  ↑{} above", start),
-            Style::default().fg(theme.fg_most_subtle.to_color()),
-        ));
-    }
-    if total > visible && pane.stats_view.is_some() {
-        footer.push(Span::styled(
-            format!("  ↓{} below · scroll to bottom to resume", total - end),
-            Style::default().fg(theme.fg_more_subtle.to_color()),
-        ));
-    }
-    footer.push(Span::styled(
-        "  · click a row (or Space) to expand".to_string(),
-        Style::default().fg(theme.fg_most_subtle.to_color()),
-    ));
-    lines.push(Line::from(footer));
-
-    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }

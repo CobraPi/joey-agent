@@ -51,7 +51,9 @@
 mod common;
 
 use common::*;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use joey_agent_core::events::{AgentEvent, ContextEntry};
+use joey_tui::neurocode_viz::VizTab;
 use joey_tui::state::{App, TranscriptItem};
 
 const W: u16 = 100;
@@ -251,6 +253,50 @@ fn pane_reasoning_panel_renders_pane_streaming_reasoning() {
         !f.contains("pane think line 39"),
         "unfocused: the pane's live reasoning stays in its pane"
     );
+}
+
+/// T034 (US4, FR-008, D6): the pane reasoning panel is fully pane-aware —
+/// the docked title carries the SAME affordance as main ("click to
+/// expand"), and expanding (the `toggle_focused_pane_reasoning_expanded`
+/// mutator the click/Esc arms dispatch to) switches the title to the
+/// collapse variant and renders the pane's stream through the shared
+/// expanded-path chrome. (The click/Esc/wheel routing itself is pinned
+/// inline in app.rs `reasoning_expand_tests` — `Tui::new_for_test` is
+/// cfg(test)-gated, per this suite's header convention.)
+#[test]
+fn pane_reasoning_panel_title_and_expansion_match_main() {
+    let mut a = focused_pane_with(vec![user_item(0)]);
+    let pane_reasoning = (0..40)
+        .map(|j| format!("pane think line {j}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    child_event(&mut a, AgentEvent::ReasoningDelta(pane_reasoning));
+
+    // Docked: same affordance segments as main's docked strip.
+    let f = render_frame(&a, W, H);
+    assert!(
+        f.contains("reasoning · live · click to expand"),
+        "PARITY (T034): the docked pane panel carries the expand affordance"
+    );
+
+    // Expanded (what the click dispatches to): collapse affordance + the
+    // pane's live text still visible through the shared draw_reasoning.
+    a.toggle_focused_pane_reasoning_expanded();
+    assert!(a.focused_pane().unwrap().reasoning_expanded);
+    let f = render_frame(&a, W, H);
+    assert!(
+        f.contains("reasoning · live · click or Esc to collapse"),
+        "PARITY (T034): the expanded pane panel carries the collapse affordance"
+    );
+    assert!(
+        f.contains("pane think line 39"),
+        "the pane's stream renders through the expanded path"
+    );
+    // Docking back restores the docked title.
+    a.toggle_focused_pane_reasoning_expanded();
+    let f = render_frame(&a, W, H);
+    assert!(f.contains("reasoning · live · click to expand"));
+    assert!(!a.focused_pane().unwrap().reasoning_expanded);
 }
 
 // ── 3. pane_apply flushes streaming_reasoning on completion ───────────
@@ -615,6 +661,205 @@ fn neurocode_explorer_follows_focus_between_mode_and_plain_panes() {
         f.contains("neurocode explorer"),
         "refocus the mode pane: the explorer renders again"
     );
+}
+
+// ── 9b. T037 (FR-008): the explorer's KEY gate follows the spawner ─────
+
+/// Test-side replica of `Tui::handle_key`'s explorer arm: feed `key` to
+/// the explorer ONLY when the T037 predicate `neurocode_explorer_owns_keys`
+/// says the explorer owns routing; otherwise fall through to the pane
+/// arms the real dispatcher reaches next (scroll keys → `pane_scroll_*`,
+/// Tab → the agent-picker arm's `agent_picker_open`, Enter → the
+/// transcript arm's focus return). Integration tests cannot construct
+/// `Tui` (`new_for_test` is `#[cfg(test)]`-gated and `Tui::enter` needs a
+/// real TTY), so — the suite's standing convention — this drives the
+/// exact predicate + mutators the key arm dispatches to.
+fn explorer_key_routed(a: &mut App, key: KeyCode) {
+    if joey_tui::app::neurocode_explorer_owns_keys(a) {
+        let ev = KeyEvent {
+            code: key,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        let _ = joey_tui::neurocode_viz::explorer_key(a, &ev);
+        return;
+    }
+    // Fall-through arms (Focus::Transcript target resolution, T003).
+    match key {
+        KeyCode::Down | KeyCode::Char('j') => a.pane_scroll_down(1),
+        KeyCode::Up | KeyCode::Char('k') => a.pane_scroll_up(1),
+        KeyCode::Tab => a.agent_picker_open = true,
+        KeyCode::Enter => { /* focus → Input; no transcript-side state */ }
+        _ => {}
+    }
+}
+
+/// T037 case 3, scroll keys: with the mode active + expanded AND a plain
+/// (non-neurocode) pane focused, an explorer-claimed key (Down / j) must
+/// act on the PANE, not the explorer. Observable effects: the pane's
+/// scroll offset moves (drives `pane_scroll_*`, not
+/// `neurocode_scroll`), and the explorer state (viz tab / feed scroll)
+/// is untouched.
+#[test]
+fn explorer_scroll_keys_route_to_plain_pane_not_explorer() {
+    // Plain pane (spawned OUTSIDE the mode), mode live, explorer requested.
+    let mut a = app();
+    a.apply(spawn(1, "plain child"));
+    a.neurocode_active = true;
+    a.neurocode_expanded = true;
+    let idx = a
+        .subagent_panes
+        .iter()
+        .position(|p| p.child_id == 1)
+        .expect("spawn created the pane");
+    assert!(!a.subagent_panes[idx].spawned_by_neurocode);
+    a.focus_subagent(Some(idx));
+
+    // A long pane transcript + one render records last_pane_max_scroll.
+    for i in 0..40 {
+        a.subagent_panes[idx].push_item(user_item(i));
+    }
+    let _ = render_frame(&a, W, H);
+    let max = a.last_pane_max_scroll.get();
+    assert!(max > 0, "40 items overflow the pane viewport (max={max})");
+
+    // Down: the pane pins its scroll offset (pane_scroll_down at the
+    // follow-tail bottom is a no-op, so pin from the top first via the
+    // same fall-through the dispatcher reaches).
+    explorer_key_routed(&mut a, KeyCode::Up);
+    explorer_key_routed(&mut a, KeyCode::Up);
+    assert_eq!(
+        a.focused_pane().unwrap().scroll,
+        Some(2.min(max)),
+        "plain pane focused: Down/Up drive the PANE transcript, not the explorer"
+    );
+    // The explorer's own scroll state never moved.
+    assert_eq!(a.neurocode_scroll, 0, "neurocode_scroll untouched");
+    assert_eq!(a.neurocode_viz.tab, VizTab::Graph, "viz tab untouched");
+
+    // j/k behave identically (the same arms, vim aliases).
+    explorer_key_routed(&mut a, KeyCode::Char('j'));
+    assert_eq!(
+        a.focused_pane().unwrap().scroll,
+        Some(1.min(max)),
+        "j scrolls the pane down one"
+    );
+    explorer_key_routed(&mut a, KeyCode::Char('k'));
+    assert_eq!(a.focused_pane().unwrap().scroll, Some(2.min(max)));
+}
+
+/// T037 case 3, Tab/Enter: same state (mode active + expanded, plain pane
+/// focused) — Tab must reach the pane-handling path (the global Tab arm
+/// opens the agent picker), never the explorer's tab cycler, and Enter
+/// must fall through to the transcript arm's focus return, never the
+/// explorer's Graph↔Nodes jump.
+#[test]
+fn explorer_tab_enter_route_to_plain_pane_not_explorer() {
+    let mut a = app();
+    a.apply(spawn(1, "plain child"));
+    a.neurocode_active = true;
+    a.neurocode_expanded = true;
+    let idx = a
+        .subagent_panes
+        .iter()
+        .position(|p| p.child_id == 1)
+        .expect("spawn created the pane");
+    a.focus_subagent(Some(idx));
+
+    // Tab: pane path (agent picker opens — the KeyCode::Tab arm at the
+    // global match), NOT the explorer's cycle_tab.
+    explorer_key_routed(&mut a, KeyCode::Tab);
+    assert!(
+        a.agent_picker_open,
+        "Tab with a plain pane focused opens the agent picker (pane routing)"
+    );
+    assert_eq!(
+        a.neurocode_viz.tab,
+        VizTab::Graph,
+        "the explorer's tab cycler never ran (FR-008: not fed)"
+    );
+
+    // Enter: falls through the explorer (no Graph→Nodes jump — list
+    // cursor stays put) into the transcript arm's focus→Input return,
+    // which leaves no transcript-side state to observe beyond "the
+    // explorer did not consume it".
+    let cursor_before = a.neurocode_viz.list_cursor;
+    let sel_before = a.neurocode_viz.selected;
+    explorer_key_routed(&mut a, KeyCode::Enter);
+    assert_eq!(a.neurocode_viz.tab, VizTab::Graph, "Enter did not jump to Nodes");
+    assert_eq!(a.neurocode_viz.list_cursor, cursor_before);
+    assert_eq!(a.neurocode_viz.selected, sel_before);
+}
+
+/// T037 cases 1+2 (pins, unchanged): the explorer still owns keys when
+/// NO pane is focused (orchestrator view — byte-identical to the old
+/// two-flag gate) and when the focused pane was spawned by the mode.
+/// Drives the REAL `explorer_key` through the T037 predicate and asserts
+/// its effects land on the explorer state.
+#[test]
+fn explorer_still_owns_keys_without_pane_and_on_mode_pane() {
+    // Case 1: no pane focused → explorer gets keys (old behavior).
+    let mut m = app();
+    m.apply(AgentEvent::NeuroCodeActive { active: true });
+    m.neurocode_expanded = true;
+    assert!(m.focused_subagent.is_none());
+    assert!(joey_tui::app::neurocode_explorer_owns_keys(&m));
+    // Down on the Feed-less explorer scrolls neurocode_scroll... it has
+    // no snapshot yet, so the raw-feed fallback claims Down. Instead
+    // assert via Tab (always claimed): the viz tab cycles.
+    explorer_key_routed(&mut m, KeyCode::Tab);
+    assert_eq!(m.neurocode_viz.tab, VizTab::Nodes, "no pane: explorer ate Tab");
+    explorer_key_routed(&mut m, KeyCode::Tab);
+    assert_eq!(m.neurocode_viz.tab, VizTab::Feed, "no pane: explorer cycles again");
+    assert!(!m.agent_picker_open, "the global Tab arm never ran");
+
+    // Case 2: mode-spawned pane focused → explorer still gets keys.
+    let mut p = app();
+    p.apply(AgentEvent::NeuroCodeActive { active: true });
+    p.apply(spawn(1, "mode child"));
+    let idx = p
+        .subagent_panes
+        .iter()
+        .position(|c| c.child_id == 1)
+        .expect("spawn created the pane");
+    assert!(p.subagent_panes[idx].spawned_by_neurocode);
+    p.focus_subagent(Some(idx));
+    p.neurocode_expanded = true;
+    assert!(joey_tui::app::neurocode_explorer_owns_keys(&p));
+    explorer_key_routed(&mut p, KeyCode::Tab);
+    assert_eq!(p.neurocode_viz.tab, VizTab::Nodes, "mode pane: explorer ate Tab");
+    assert!(!p.agent_picker_open, "the global Tab arm never ran");
+}
+
+/// Consistency pin (T037): key routing and drawing agree — for a plain
+/// pane focused while the flags are set, the explorer is not drawn AND
+/// `neurocode_explorer_owns_keys` is false; for a mode pane (or no pane)
+/// it is drawn AND owns keys. Guards against the two gates drifting.
+#[test]
+fn explorer_key_gate_agrees_with_draw_gate() {
+    // Plain pane: not drawn (test 8 pins the render side), not fed.
+    let mut plain = focused_pane_with(vec![user_item(0)]);
+    plain.neurocode_active = true;
+    plain.neurocode_expanded = true;
+    assert!(!joey_tui::app::neurocode_explorer_owns_keys(&plain));
+    let f = render_frame(&plain, W, H);
+    assert!(!f.contains("neurocode explorer"), "not drawn for a plain pane");
+
+    // Mode pane: drawn AND owns keys.
+    let mode = mode_pane_app("mode child");
+    assert!(joey_tui::app::neurocode_explorer_owns_keys(&mode));
+    let f = render_frame(&mode, W, H);
+    assert!(f.contains("neurocode explorer"), "drawn for a mode pane");
+
+    // No pane (orchestrator): drawn AND owns keys.
+    let mut m = app();
+    m.neurocode_active = true;
+    m.neurocode_expanded = true;
+    assert!(m.focused_subagent.is_none());
+    assert!(joey_tui::app::neurocode_explorer_owns_keys(&m));
+    let f = render_frame(&m, W, H);
+    assert!(f.contains("neurocode explorer"), "drawn on the orchestrator view");
 }
 
 // ── 10. Non-regression: main viewers still open with panes present ────

@@ -132,6 +132,17 @@ fn parse_concurrency_map(
     map
 }
 
+/// Process-global child-id source (T033). Every `SubagentManager` in this
+/// process draws child ids from this ONE counter, so two concurrently-alive
+/// managers (the agent's delegate_task manager + the separate `/hypercode`
+/// manager built by the CLI engine) can never mint the same id. This
+/// matters because hosts route wrapped `AgentEvent::SubagentEvent`s to
+/// panes by FIRST-MATCH on child id (joey-tui state.rs) — a colliding id
+/// would cross-contaminate panes through the process-global tap. Ids remain
+/// unique + monotonic per manager (allocations happen in dispatch order)
+/// and still start at 1 in a fresh process.
+static NEXT_CHILD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// The orchestrator that owns the concurrency limiter and dispatches batches.
 pub struct SubagentManager {
     config: ManagerConfig,
@@ -140,10 +151,6 @@ pub struct SubagentManager {
     /// Cooperative interrupt signal shared with all spawned subagents (FR-015).
     /// When set to true, running subagents wind down cooperatively.
     interrupt: Arc<AtomicBool>,
-    /// Monotonic child-id generator (parallel-subagent feature). Ids are
-    /// stable for a child's whole lifetime and correlate the wrapped
-    /// `AgentEvent::SubagentEvent` stream with its lifecycle events.
-    next_child_id: std::sync::atomic::AtomicU64,
     /// Optional live event tap (parallel-subagent feature). When set, every
     /// orchestration + child event is forwarded here in addition to any
     /// per-dispatch `event_tx`. The CLI uses this to wire delegation
@@ -161,7 +168,6 @@ impl SubagentManager {
             semaphore: Arc::new(Semaphore::new(permits)),
             depth: 0,
             interrupt: Arc::new(AtomicBool::new(false)),
-            next_child_id: std::sync::atomic::AtomicU64::new(1),
             event_tap: std::sync::Mutex::new(None),
         }
     }
@@ -188,10 +194,11 @@ impl SubagentManager {
         local.or_else(crate::tap::global_tap)
     }
 
-    /// Allocate the next stable child id.
+    /// Allocate the next stable child id from the PROCESS-GLOBAL counter
+    /// (T033): unique across every SubagentManager in this process, so
+    /// pane routing by child id can never cross-contaminate surfaces.
     fn next_id(&self) -> u64 {
-        self.next_child_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        NEXT_CHILD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The concurrency limiter semaphore (shared across parent + children).
@@ -243,11 +250,15 @@ impl SubagentManager {
             self.config.default_model.as_deref(),
             self.config.default_max_turns,
             self.config.max_spawn_depth,
+            self.next_id(),
         )
         .await
     }
 
     /// Internal dispatch with explicit overrides (used by batch dispatch).
+    /// `allocated_id` MUST come from [`SubagentManager::next_id`] (the
+    /// process-global counter) — the caller mints it so batch dispatch can
+    /// allocate in deterministic dispatch order before spawning the wave.
     #[allow(clippy::too_many_arguments)] // deviation: domain-shaped dispatch, parameter bag would be speculative abstraction
     pub(crate) async fn dispatch_single_with_overrides(
         &self,
@@ -259,6 +270,7 @@ impl SubagentManager {
         default_model: Option<&str>,
         default_max_turns: usize,
         max_spawn_depth: usize,
+        allocated_id: u64,
     ) -> DelegationResult {
         let model = crate::subagent::resolve_model(
             None,
@@ -267,7 +279,7 @@ impl SubagentManager {
             &parent_config.model,
         );
         let ts_sum = crate::subagent::toolset_summary(&req.toolsets);
-        let id = self.next_id();
+        let id = allocated_id;
         let tap = self.event_tap();
 
         // Emit SubagentSpawn event (per-dispatch channel + live tap).
@@ -482,9 +494,11 @@ impl SubagentManager {
                 let sem = shared_semaphore.clone();
                 let interrupt = self.interrupt.clone();
                 let tap = tap.clone();
-                // Allocate the child's stable id from the PARENT manager so
-                // ids are unique + monotonic across the whole batch (the
-                // child manager below starts its counter here).
+                // Allocate the child's stable id from the PARENT manager's
+                // counter so ids are unique + monotonic across the whole
+                // batch (T033: same process-global counter the parent draws
+                // from, so the id the child manager starts from can never
+                // collide with any other manager's allocation).
                 let child_id = self.next_id();
                 // Original request index (for stable result ordering —
                 // JoinSet yields in COMPLETION order, not dispatch order).
@@ -497,7 +511,6 @@ impl SubagentManager {
                         semaphore: sem,
                         depth,
                         interrupt,
-                        next_child_id: std::sync::atomic::AtomicU64::new(child_id),
                         event_tap: std::sync::Mutex::new(tap),
                     };
                     let result = mgr
@@ -510,6 +523,7 @@ impl SubagentManager {
                             dm.as_deref(),
                             max_turns,
                             max_spawn_depth,
+                            child_id,
                         )
                         .await;
                     (task_index, result)

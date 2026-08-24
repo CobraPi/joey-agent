@@ -97,9 +97,9 @@
 ### Implementation for User Story 3
 
 - [X] T015 [US3] Add per-pane search state (`search_open`/`search_query`/`search_has_match`) to `SubagentPane` and generalize `run_search`/`search_next` to operate on a target transcript in crates/joey-tui/src/state.rs (D5)
-- [ ] T016 [US3] Route '/', Ctrl+S, n/N to the focused pane's search state and render `draw_search_bar` for panes in crates/joey-tui/src/app.rs and crates/joey-tui/src/widgets.rs (FR-007)
+- [X] T016 [US3] Route '/', Ctrl+S, n/N to the focused pane's search state and render `draw_search_bar` for panes in crates/joey-tui/src/app.rs and crates/joey-tui/src/widgets.rs (FR-007)
 - [X] T017 [US3] Add the additive `TuiAction::CopyPaneItem { pane, idx }` variant and route y/Y hit-test copy from the focused pane in crates/joey-tui/src/app.rs (D4; `TuiAction::CopyItem` stays main-transcript-only)
-- [ ] T018 [US3] Consume `TuiAction::CopyPaneItem` in the host loop and pipe it to the existing clipboard path (pbcopy/xclip/wl-copy + OSC52) in crates/joey-cli/src/tui.rs (D4; clipboard stays host-side)
+- [X] T018 [US3] Consume `TuiAction::CopyPaneItem` in the host loop and pipe it to the existing clipboard path (pbcopy/xclip/wl-copy + OSC52) in crates/joey-cli/src/tui.rs (D4; clipboard stays host-side)
 
 **Checkpoint**: All three P1 stories complete — full P1 parity shippable
 
@@ -117,9 +117,9 @@
 
 ### Implementation for User Story 4
 
-- [ ] T020 [US4] Retarget Ctrl+O to open `draw_output_viewer` on the focused pane's hit-test-selected/last tool output in crates/joey-tui/src/app.rs and crates/joey-tui/src/widgets.rs (D6)
-- [ ] T021 [US4] Render the pane's `streaming_reasoning` in the `draw_reasoning` panel and flush it to a `Reasoning` TranscriptItem in `pane_apply` on completion (mirroring the main loop) in crates/joey-tui/src/state.rs and crates/joey-tui/src/widgets.rs (D6)
-- [ ] T022 [US4] Wire Ctrl+A to the per-pane stats page from T004 with the expandable context stream in crates/joey-tui/src/app.rs; keep mode-specific explorers (`draw_explorer` in crates/joey-tui/src/neurocode_viz.rs) reachable only when that mode spawned the focused pane (FR-008 rule)
+- [X] T020 [US4] Retarget Ctrl+O to open `draw_output_viewer` on the focused pane's hit-test-selected/last tool output in crates/joey-tui/src/app.rs and crates/joey-tui/src/widgets.rs (D6)
+- [X] T021 [US4] Render the pane's `streaming_reasoning` in the `draw_reasoning` panel and flush it to a `Reasoning` TranscriptItem in `pane_apply` on completion (mirroring the main loop) in crates/joey-tui/src/state.rs and crates/joey-tui/src/widgets.rs (D6)
+- [X] T022 [US4] Wire Ctrl+A to the per-pane stats page from T004 with the expandable context stream in crates/joey-tui/src/app.rs; keep mode-specific explorers (`draw_explorer` in crates/joey-tui/src/neurocode_viz.rs) reachable only when that mode spawned the focused pane (FR-008 rule)
 
 **Checkpoint**: US1–US4 independently functional
 
@@ -133,9 +133,9 @@
 
 ### Implementation for User Story 5
 
-- [ ] T023 [P] [US5] Chrome parity audit pass in crates/joey-tui/src/widgets.rs: make `draw_pane_transcript` render borders/status line/colors/empty state exclusively through the shared widget functions (D2 Invariant 1) and fix any residual divergence (FR-009) (SC-003)
-- [ ] T024 [P] [US5] Add state-preservation tests (scroll + expansion + search + stats survive focus switches; Ctrl+L `clear_subagent_panes` returns focus to the orchestrator with its scroll untouched; pane disappearance graceful-return) in crates/joey-tui/tests/subagent_panes.rs (D9, FR-010, SC-004)
-- [ ] T025 [P] [US5] Confirm the shared help overlay (`draw_help_overlay`, F1/'?') is reachable from focused panes with identical content — global handler, additive check only — in crates/joey-tui/src/app.rs (FR-013)
+- [X] T023 [P] [US5] Chrome parity audit pass in crates/joey-tui/src/widgets.rs: make `draw_pane_transcript` render borders/status line/colors/empty state exclusively through the shared widget functions (D2 Invariant 1) and fix any residual divergence (FR-009) (SC-003)
+- [X] T024 [P] [US5] Add state-preservation tests (scroll + expansion + search + stats survive focus switches; Ctrl+L `clear_subagent_panes` returns focus to the orchestrator with its scroll untouched; pane disappearance graceful-return) in crates/joey-tui/tests/subagent_panes.rs (D9, FR-010, SC-004)
+- [X] T025 [P] [US5] Confirm the shared help overlay (`draw_help_overlay`, F1/'?') is reachable from focused panes with identical content — global handler, additive check only — in crates/joey-tui/src/app.rs (FR-013)
 
 **Checkpoint**: All P1+P2 stories complete — visual parity done
 
@@ -149,8 +149,8 @@
 
 ### Implementation for User Story 6
 
-- [ ] T026 [US6] Verify the single-funnel guarantee (D8): all spawn surfaces feed the one SubagentManager→tap→`pane_apply` pipeline in crates/joey-orchestration/src/manager.rs with no surface-specific pane forks, and add per-surface pane parity spot-check tests in crates/joey-tui/tests/subagent_panes.rs (FR-011)
-- [ ] T027 [P] [US6] Complete the per-capability parity checklist (SC-001: zero orchestrator capabilities missing from any subagent view) in specs/017-please-modify-joey/checklists/parity.md, mapping each FR-001..FR-013 to its verification (FR-012) and each SC-001..SC-005 to its acceptance check
+- [X] T026 [US6] Verify the single-funnel guarantee (D8): all spawn surfaces feed the one SubagentManager→tap→`pane_apply` pipeline in crates/joey-orchestration/src/manager.rs with no surface-specific pane forks, and add per-surface pane parity spot-check tests in crates/joey-tui/tests/subagent_panes.rs (FR-011)
+- [X] T027 [P] [US6] Complete the per-capability parity checklist (SC-001: zero orchestrator capabilities missing from any subagent view) in specs/017-please-modify-joey/checklists/parity.md, mapping each FR-001..FR-013 to its verification (FR-012) and each SC-001..SC-005 to its acceptance check
 
 **Checkpoint**: All user stories independently functional
 
@@ -160,10 +160,10 @@
 
 **Purpose**: Documentation, upstream-parity audit, and the workspace-wide verification gate
 
-- [ ] T028 [P] Document subagent-view parity (keymap, chrome, state preservation) in docs/tui.md to match the updated behavior
-- [ ] T029 [P] Audit PORTING.md for TUI entries: the TUI is Joey-native ("no upstream equivalent" per research.md), so no update is expected — add a dated note in PORTING.md ONLY if the audit finds a TUI section that mentions pane capabilities
-- [ ] T030 Run the full verification gate `cargo build --workspace` and `cargo test --workspace` from the repository root (Cargo.toml) and record the green result plus any fixes in specs/017-please-modify-joey/checklists/parity.md (constitution VII acceptance bar)
-- [ ] T031 Execute manual scenarios S1–S11 from specs/017-please-modify-joey/quickstart.md and record outcomes against SC-001..SC-005 in specs/017-please-modify-joey/checklists/parity.md (FR-012, SC-002, SC-005)
+- [X] T028 [P] Document subagent-view parity (keymap, chrome, state preservation) in docs/tui.md to match the updated behavior
+- [X] T029 [P] Audit PORTING.md for TUI entries: the TUI is Joey-native ("no upstream equivalent" per research.md), so no update is expected — add a dated note in PORTING.md ONLY if the audit finds a TUI section that mentions pane capabilities
+- [X] T030 Run the full verification gate `cargo build --workspace` and `cargo test --workspace` from the repository root (Cargo.toml) and record the green result plus any fixes in specs/017-please-modify-joey/checklists/parity.md (constitution VII acceptance bar)
+- [X] T031 Execute manual scenarios S1–S11 from specs/017-please-modify-joey/quickstart.md and record outcomes against SC-001..SC-005 in specs/017-please-modify-joey/checklists/parity.md (FR-012, SC-002, SC-005)
 
 ---
 
@@ -254,3 +254,17 @@ With multiple developers:
 - Additive-only everywhere (constitution VII): no public CLI/config/on-disk surface changes; `TuiAction::CopyPaneItem` is internal to the joey-tui ↔ joey-cli boundary (no MAJOR bump)
 - No new dependencies (research.md D12); perf budget = widget-reuse parity with the orchestrator screen (research.md D11)
 - Commit after each task or logical group; stop at any checkpoint to validate the story independently
+
+---
+
+## Phase 10: Convergence
+
+**Purpose**: Gap-closure tasks appended by /speckit-converge (2026-08-24) — residual partial gaps found by auditing the implemented code against spec.md/plan.md/tasks.md. Ordered CRITICAL/HIGH first (none found), then MEDIUM, then LOW.
+
+- [X] T032 Flush pending `streaming_reasoning` alongside `streaming_assistant` in the `SubagentComplete` and `SubagentFailed` arms of `App::apply` (crates/joey-tui/src/state.rs, ~L1939–L1975) so a child ending without a trailing AssistantMessage/ToolStart still commits its final Reasoning item instead of dropping it and leaving the pane reasoning panel stuck "live"; add a state-logic regression test per US4/AC2 (FR-008) (partial)
+- [X] T033 Close the /hypercode pane-identity collision risk: crates/joey-cli/src/engine.rs (~L236) constructs a separate SubagentManager whose child ids restart at 1 and can first-match-collide with surviving delegate panes — namespace or disambiguate pane identity across managers (or add a test pinning the accepted behavior and record it in checklists/parity.md) per FR-011 (partial)
+- [X] T034 Make the pane reasoning panel fully pane-aware: add the expanded-takeover control (or a sanctioned, tested equivalent), stop the click path from toggling MAIN reasoning state while a pane is focused (crates/joey-tui/src/widgets.rs ~L1553–L1599 + the reasoning-rect click handler in app.rs), and stamp `thought_duration` on pane Reasoning flushes (state.rs flush sites ~L568–L600) so committed items render identically to the orchestrator screen per US4/AC2 (FR-008) (partial)
+- [X] T035 Deduplicate `draw_pane_stats_page` (crates/joey-tui/src/widgets.rs ~L5644) against `draw_stats_page` (~L2098) through shared widget helpers to restore the plan D2 "same widget functions" invariant and eliminate visual drift risk per FR-009/SC-003 (partial)
+- [X] T036 Unify the pane header scroll-info placement with the orchestrator header (pane rides "N messages · P% from top"/"· live" on the block's bottom-right corner at widgets.rs ~L5604–L5612 while `draw_transcript` puts it in the top title at ~L964–L976) — either move it into the pane header row or record the placement as a sanctioned deviation in specs/017-please-modify-joey/checklists/parity.md after the SC-003 review per FR-001/FR-009/SC-003 (partial)
+- [X] T037 Tighten the neurocode explorer key gate (crates/joey-tui/src/app.rs ~L760–L764) so explorer keys are claimed only when the focused pane was spawned by that mode (`spawned_by_neurocode`), not merely while `neurocode_expanded && active` with an unrelated pane focused per FR-008 (partial)
+- [ ] T038 Complete the pending SC-002/SC-003 human-verification rows in specs/017-please-modify-joey/checklists/parity.md (side-by-side visual review — including the T036 placement call — and the orchestrator-knowledge tester pass), then re-run the parity gate and record outcomes per FR-012/SC-005 (partial)

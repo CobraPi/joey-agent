@@ -324,6 +324,22 @@ pub struct SubagentPane {
     pub streaming_assistant: String,
     /// Live streaming reasoning text from the child.
     pub streaming_reasoning: String,
+    /// T034 (US4, FR-008, D6): expanded mode for THIS pane's live
+    /// reasoning panel — set by clicking the pane's docked strip, the
+    /// live stream takes over the pane view below a transcript strip,
+    /// and clicking again (or Esc) docks it back. Mirrors
+    /// `App::reasoning_expanded` (auto-collapses when the block flushes).
+    pub reasoning_expanded: bool,
+    /// T034: view state for THIS pane's live reasoning panel. `None` =
+    /// auto-follow (pinned to the live tail); `Some(anchor)` = frozen at
+    /// that absolute wrapped-line index. Mirrors `App::reasoning_view`;
+    /// per-pane so sibling panes keep their own scroll (FR-010).
+    pub reasoning_view: Option<usize>,
+    /// T034: timestamp of the first `ReasoningDelta` of the pane's
+    /// current block — drives the "◆ thinking Ns" header and the
+    /// `thought_duration` stamped on flush. Mirrors
+    /// `App::reasoning_started` (Feature 007).
+    pub reasoning_started: Option<Instant>,
     /// Scroll offset in the child transcript (None = auto-follow).
     pub scroll: Option<usize>,
     /// Latest context-window snapshot fields (for the per-child stats view).
@@ -392,6 +408,9 @@ impl SubagentPane {
             transcript_capacity: 256,
             streaming_assistant: String::new(),
             streaming_reasoning: String::new(),
+            reasoning_expanded: false,
+            reasoning_view: None,
+            reasoning_started: None,
             scroll: None,
             context_entries: Vec::new(),
             context_system_tokens: 0,
@@ -551,6 +570,34 @@ fn file_diff_item(path: &str, kind: FileChangeKind, diff: &DiffResult, is_binary
     }
 }
 
+/// Flush a pane's pending streamed reasoning into its transcript as a
+/// collapsed `Reasoning` item, mirroring App's `flush_reasoning` on the
+/// pane (T034 / FR-008, D6): compute `thought_duration` from the pane's
+/// `reasoning_started` clock (set on the first delta of the block),
+/// reset the clock, and auto-dock the pane's expanded reasoning panel
+/// (an expanded view with no live block is over). Shared by
+/// `pane_apply`'s boundary flushes and the parent-side
+/// `SubagentComplete`/`SubagentFailed` close-out (T032) so all flush
+/// sites construct the item identically.
+fn pane_flush_reasoning(pane: &mut SubagentPane) {
+    if !pane.streaming_reasoning.is_empty() {
+        let text = std::mem::take(&mut pane.streaming_reasoning);
+        // Feature 007 parity: compute the thinking duration from the
+        // first delta of this block (App::flush_reasoning semantics).
+        let thought_duration = pane.reasoning_started.take().map(|s| s.elapsed());
+        pane.push_item(TranscriptItem::Reasoning {
+            text,
+            expand_state: ReasoningExpandState::Collapsed,
+            thought_duration,
+        });
+        // T034: the live block ended — auto-dock the pane's expanded
+        // panel and reset its frozen anchor (App::flush_reasoning's
+        // reasoning_expanded/reasoning_view reset, mirrored).
+        pane.reasoning_expanded = false;
+        pane.reasoning_view = None;
+    }
+}
+
 /// Apply a child event to a pane — a reduced version of the main
 /// `App::apply` logic covering the display-relevant subset. Lifecycle
 /// events (`TurnStart`/`Done`/`Failed` from the CHILD) intentionally do
@@ -560,22 +607,29 @@ fn pane_apply(pane: &mut SubagentPane, ev: &AgentEvent) {
     use AgentEvent::*;
     match ev {
         ContentDelta(d) => pane.streaming_assistant.push_str(d),
-        ReasoningDelta(d) => pane.streaming_reasoning.push_str(d),
+        ReasoningDelta(d) => {
+            // T034 (US4, FR-008, D6 / Feature 007 parity): mark the start
+            // of this reasoning block on the first delta — the main
+            // loop's semantics (App::apply's ReasoningDelta arm sets
+            // reasoning_started when the block opens from empty). Panes
+            // have no reasoning_open latch, so the content-based
+            // condition is "no text yet AND no clock yet"; a fully-empty
+            // delta stream commits no item on either path, so it never
+            // starts a clock. Drives the "◆ thinking Ns" header and the
+            // thought_duration stamped by pane_flush_reasoning.
+            if pane.streaming_reasoning.is_empty() && pane.reasoning_started.is_none() {
+                pane.reasoning_started = Some(Instant::now());
+            }
+            pane.streaming_reasoning.push_str(d);
+        }
         AssistantMessage(text) => {
             // T021 (US4, D6): flush pending streamed reasoning at the
             // message boundary — the main loop's flush-on-boundary
             // semantics (App::apply ToolStart arm / flush_reasoning).
-            // The pane has no reasoning_started clock, so the committed
-            // item carries no thought_duration (main's flush_reasoning
-            // computes one from reasoning_started; panes never set it).
-            if !pane.streaming_reasoning.is_empty() {
-                let text = std::mem::take(&mut pane.streaming_reasoning);
-                pane.push_item(TranscriptItem::Reasoning {
-                    text,
-                    expand_state: ReasoningExpandState::Collapsed,
-                    thought_duration: None,
-                });
-            }
+            // T034: the committed item carries a thought_duration
+            // computed from the pane's reasoning_started clock (the
+            // same Feature-007 stamping as main's flush_reasoning).
+            pane_flush_reasoning(pane);
             let final_text = if text.is_empty() {
                 std::mem::take(&mut pane.streaming_assistant)
             } else {
@@ -590,14 +644,7 @@ fn pane_apply(pane: &mut SubagentPane, ev: &AgentEvent) {
             // T021 (US4, D6): same flush at the ToolStart boundary — the
             // reasoning commits BEFORE the tool item (main loop ordering:
             // App::apply's ToolStart arm calls flush_reasoning() first).
-            if !pane.streaming_reasoning.is_empty() {
-                let text = std::mem::take(&mut pane.streaming_reasoning);
-                pane.push_item(TranscriptItem::Reasoning {
-                    text,
-                    expand_state: ReasoningExpandState::Collapsed,
-                    thought_duration: None,
-                });
-            }
+            pane_flush_reasoning(pane);
             pane.push_item(TranscriptItem::Tool {
             name: name.clone(),
             emoji: emoji.clone(),
@@ -1943,6 +1990,12 @@ impl App {
                         SubagentStatus::Failed
                     };
                     pane.summary_preview = Some(summary_preview.clone());
+                    // T032: flush pending streamed reasoning FIRST (pane_apply
+                    // ordering: reasoning commits before the assistant text) —
+                    // a child that ends without a trailing
+                    // AssistantMessage/ToolStart would otherwise drop it and
+                    // leave draw_reasoning's live condition stuck on.
+                    pane_flush_reasoning(pane);
                     // Flush any pending streamed text so the pane's final
                     // answer is visible even if the child skipped the
                     // AssistantMessage event.
@@ -1967,6 +2020,11 @@ impl App {
                 }
                 if let Some(pane) = self.subagent_panes.iter_mut().find(|p| p.child_id == id) {
                     pane.status = SubagentStatus::Failed;
+                    // T032: flush pending streamed reasoning before the error
+                    // item — same close-out semantics as SubagentComplete (a
+                    // failed child often ends mid-reasoning with no trailing
+                    // AssistantMessage/ToolStart boundary to flush it).
+                    pane_flush_reasoning(pane);
                     pane.push_item(TranscriptItem::Error { text: error.clone() });
                 }
                 self.push_item(TranscriptItem::Notice {
@@ -2811,6 +2869,59 @@ impl App {
                 self.reasoning_view = None;
             } else {
                 self.reasoning_view = Some(target);
+            }
+        }
+    }
+
+    /// T034 (US4, FR-008, D6): toggle the FOCUSED pane's live reasoning
+    /// panel between its docked strip and expanded takeover (and back) —
+    /// the exact semantics of `toggle_reasoning_expanded` on the pane.
+    /// Invoked by clicking the panel or pressing Esc while a pane's
+    /// expanded reasoning is open. No-op when no pane is focused or the
+    /// pane has no live reasoning block (content-based live condition:
+    /// a non-empty accumulator IS a live block — panes carry no
+    /// `reasoning_open` latch). Re-pins the pane view to the live tail
+    /// on mode change so the expanded view opens at the streaming end.
+    pub fn toggle_focused_pane_reasoning_expanded(&mut self) {
+        if let Some(pane) = self.focused_pane_mut() {
+            if pane.streaming_reasoning.is_empty() {
+                return;
+            }
+            pane.reasoning_expanded = !pane.reasoning_expanded;
+            pane.reasoning_view = None;
+        }
+    }
+
+    /// T034: scroll the FOCUSED pane's live reasoning panel view up by
+    /// `by` lines — freezes at an absolute anchor (auto-follow off).
+    /// Mirrors `reasoning_scroll_up`; the anchor bound is the shared
+    /// `last_reasoning_max_anchor` the reasoning widget records at
+    /// render time (the focused pane's panel is the one that rendered,
+    /// so the cell describes IT on that frame). No-op while no pane is
+    /// focused.
+    pub fn pane_reasoning_scroll_up(&mut self, by: usize) {
+        // Read the render-time bound BEFORE the mutable pane borrow (the
+        // cell is on App, not the pane — unlike pane_stats_scroll_*).
+        let max_anchor = self.last_reasoning_max_anchor.get();
+        if let Some(pane) = self.focused_pane_mut() {
+            let cur = pane.reasoning_view.unwrap_or(max_anchor);
+            pane.reasoning_view = Some(cur.saturating_sub(by));
+        }
+    }
+
+    /// T034: scroll the FOCUSED pane's live reasoning panel view down;
+    /// re-pins to the live tail when the bottom is reached. Mirrors
+    /// `reasoning_scroll_down`. No-op while no pane is focused.
+    pub fn pane_reasoning_scroll_down(&mut self, by: usize) {
+        let max_anchor = self.last_reasoning_max_anchor.get();
+        if let Some(pane) = self.focused_pane_mut() {
+            if let Some(a) = pane.reasoning_view {
+                let target = a.saturating_add(by);
+                if target >= max_anchor {
+                    pane.reasoning_view = None;
+                } else {
+                    pane.reasoning_view = Some(target);
+                }
             }
         }
     }
@@ -5093,5 +5204,253 @@ mod pane_search_state_tests {
         app.run_search();
         assert!(!app.search_has_match, "pane text is invisible to main search");
         assert_eq!(app.scroll, Some(0), "a miss never moves the view");
+    }
+}
+
+#[cfg(test)]
+mod pane_reasoning_closeout_tests {
+    //! T032: SubagentComplete/SubagentFailed must flush the pane's pending
+    //! `streaming_reasoning` — a child that ends WITHOUT a trailing
+    //! AssistantMessage/ToolStart (failure, max-turns, abort) would
+    //! otherwise drop that reasoning entirely and leave draw_reasoning's
+    //! live condition (`!streaming_reasoning.is_empty()`) stuck on.
+    use super::*;
+
+    fn spawn_pane(app: &mut App, id: u64, goal: &str) {
+        app.apply(AgentEvent::SubagentSpawn {
+            id,
+            goal: goal.into(),
+            model: "m".into(),
+            toolset_summary: "all".into(),
+            depth: 0,
+        });
+    }
+
+    /// Push live stream content into pane `id`'s buffers directly (no
+    /// AssistantMessage/ToolStart boundary events — the exact scenario
+    /// where the old code dropped the reasoning).
+    fn stage_pending_streams(app: &mut App) {
+        let pane = app.subagent_panes.iter_mut().find(|p| p.child_id == 7).unwrap();
+        pane.streaming_reasoning.push_str("thinking hard about the task");
+        pane.streaming_assistant.push_str("partial answer");
+    }
+
+    /// Deconstruct a Reasoning item (TranscriptItem has no PartialEq;
+    /// tests compare the payload explicitly — same style as as_filediff).
+    fn as_reasoning(it: &TranscriptItem) -> (&str, ReasoningExpandState, Option<Duration>) {
+        match it {
+            TranscriptItem::Reasoning { text, expand_state, thought_duration } => {
+                (text, *expand_state, *thought_duration)
+            }
+            other => panic!("expected Reasoning, got {:?}", other),
+        }
+    }
+
+    /// T032: SubagentComplete flushes pending pane reasoning (committed
+    /// before the streaming_assistant flush), and clears the buffer so
+    /// the pane's reasoning panel stops rendering "live".
+    #[test]
+    fn subagent_complete_flushes_pending_pane_reasoning() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 7, "child");
+        stage_pending_streams(&mut app);
+
+        app.apply(AgentEvent::SubagentComplete {
+            id: 7,
+            goal: "child".into(),
+            success: true,
+            summary_preview: "ok".into(),
+            token_usage: joey_providers::Usage::default(),
+            duration_secs: 1.0,
+        });
+
+        let pane = &app.subagent_panes[0];
+        // (2) buffer drained — the live-render condition turns off.
+        assert!(pane.streaming_reasoning.is_empty(), "reasoning buffer flushed");
+        // (1) reasoning committed with the pane-flush construction.
+        assert_eq!(pane.transcript.len(), 2, "Reasoning + Assistant committed");
+        let (text, expand, dur) = as_reasoning(&pane.transcript[0]);
+        assert_eq!(text, "thinking hard about the task");
+        assert_eq!(expand, ReasoningExpandState::Collapsed);
+        // T032 staged the buffer directly (no ReasoningDelta), so no
+        // reasoning_started clock ever ran — the flush stamps no
+        // duration (App::flush_reasoning's `.take().map(...)` on None).
+        assert_eq!(dur, None, "no clock → no duration");
+        // (3) the pre-existing streaming_assistant flush still happens,
+        // AFTER the reasoning item (pane_apply ordering).
+        match &pane.transcript[1] {
+            TranscriptItem::Assistant { text } => assert_eq!(text, "partial answer"),
+            other => panic!("expected Assistant after Reasoning, got {:?}", other),
+        }
+        assert!(pane.streaming_assistant.is_empty());
+        assert_eq!(pane.status, SubagentStatus::Done);
+    }
+
+    /// T032 mirror: SubagentFailed flushes pending pane reasoning before
+    /// pushing the error item.
+    #[test]
+    fn subagent_failed_flushes_pending_pane_reasoning() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 7, "child");
+        stage_pending_streams(&mut app);
+
+        app.apply(AgentEvent::SubagentFailed {
+            id: 7,
+            goal: "child".into(),
+            error: "boom".into(),
+            duration_secs: 1.0,
+        });
+
+        let pane = &app.subagent_panes[0];
+        assert!(pane.streaming_reasoning.is_empty(), "reasoning buffer flushed");
+        let (text, expand, dur) = as_reasoning(&pane.transcript[0]);
+        assert_eq!(text, "thinking hard about the task");
+        assert_eq!(expand, ReasoningExpandState::Collapsed);
+        // T032 staged the buffer directly (no ReasoningDelta): no clock
+        // ran, so no duration (see subagent_complete test).
+        assert_eq!(dur, None, "no clock → no duration");
+        // Reasoning commits BEFORE the error item (pane_apply ordering).
+        match &pane.transcript[1] {
+            TranscriptItem::Error { text } => assert_eq!(text, "boom"),
+            other => panic!("expected Error after Reasoning, got {:?}", other),
+        }
+        assert_eq!(pane.status, SubagentStatus::Failed);
+    }
+
+    /// T034 (US4, FR-008, D6): ReasoningDelta(s) + a flush boundary commit
+    /// a `Reasoning` item carrying `thought_duration: Some(_)` (Feature 007
+    /// parity with App::flush_reasoning), the timer RESETS (a second burst
+    /// yields a fresh, independently-measured duration), and the pane's
+    /// expanded panel auto-docks with its frozen anchor cleared.
+    #[test]
+    fn pane_flush_reasoning_stamps_duration_and_resets_timer() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 7, "child");
+        app.focus_subagent(Some(0));
+
+        // Burst 1: deltas start the clock (first delta of the block).
+        app.apply(AgentEvent::SubagentEvent {
+            id: 7,
+            event: Box::new(AgentEvent::ReasoningDelta("first ".into())),
+        });
+        assert!(
+            app.subagent_panes[0].reasoning_started.is_some(),
+            "first ReasoningDelta starts the pane's thinking clock"
+        );
+        // Simulate the user having expanded the pane's panel mid-block.
+        app.subagent_panes[0].reasoning_expanded = true;
+        app.subagent_panes[0].reasoning_view = Some(12);
+
+        // Flush boundary (AssistantMessage) commits the item.
+        app.apply(AgentEvent::SubagentEvent {
+            id: 7,
+            event: Box::new(AgentEvent::AssistantMessage("answer".into())),
+        });
+        {
+            let pane = &app.subagent_panes[0];
+            let (text, _, dur) = as_reasoning(&pane.transcript[0]);
+            assert_eq!(text, "first ");
+            assert!(dur.is_some(), "PARITY: the committed item carries a thought_duration");
+            assert!(pane.reasoning_started.is_none(), "timer reset on flush");
+            assert!(!pane.reasoning_expanded, "expanded panel auto-docked on flush");
+            assert!(pane.reasoning_view.is_none(), "frozen anchor reset on flush");
+        }
+
+        // Burst 2: a fresh clock runs and yields a fresh duration.
+        app.apply(AgentEvent::SubagentEvent {
+            id: 7,
+            event: Box::new(AgentEvent::ReasoningDelta("second ".into())),
+        });
+        assert!(
+            app.subagent_panes[0].reasoning_started.is_some(),
+            "second burst restarts the clock"
+        );
+        app.apply(AgentEvent::SubagentEvent {
+            id: 7,
+            event: Box::new(AgentEvent::ToolStart {
+                name: "terminal".into(),
+                emoji: "💻".into(),
+                summary: "cargo build".into(),
+            }),
+        });
+        let pane = &app.subagent_panes[0];
+        // [0]=Reasoning(burst 1), [1]=Assistant, [2]=Reasoning(burst 2), [3]=Tool.
+        assert_eq!(pane.transcript.len(), 4);
+        let (_, _, dur2) = as_reasoning(&pane.transcript[2]);
+        assert!(dur2.is_some(), "second burst yields a fresh duration");
+        assert!(pane.reasoning_started.is_none(), "timer reset again");
+    }
+
+    /// T034: the pane toggle mutator mirrors App::toggle_reasoning_expanded
+    /// — no-op with no live block, expand + tail re-pin when live, and
+    /// collapse on the second call. No pane focused → strict no-op (the
+    /// main panel's state is the click handler's job, byte-identical).
+    #[test]
+    fn toggle_focused_pane_reasoning_expanded_mirrors_main_semantics() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 7, "child");
+        app.focus_subagent(Some(0));
+
+        // No live block → no-op.
+        app.toggle_focused_pane_reasoning_expanded();
+        assert!(!app.subagent_panes[0].reasoning_expanded);
+
+        // Live block → expand, and the view re-pins to the live tail.
+        app.subagent_panes[0].streaming_reasoning = "thinking".into();
+        app.subagent_panes[0].reasoning_view = Some(20);
+        app.toggle_focused_pane_reasoning_expanded();
+        assert!(app.subagent_panes[0].reasoning_expanded);
+        assert!(app.subagent_panes[0].reasoning_view.is_none(), "re-pinned to tail");
+        // Second call docks back.
+        app.toggle_focused_pane_reasoning_expanded();
+        assert!(!app.subagent_panes[0].reasoning_expanded);
+
+        // No pane focused → no-op, main state untouched.
+        app.focus_subagent(None);
+        app.subagent_panes[0].streaming_reasoning = "still live".into();
+        app.toggle_focused_pane_reasoning_expanded();
+        assert!(!app.subagent_panes[0].reasoning_expanded, "unfocused: pane untouched");
+        assert!(!app.reasoning_expanded, "unfocused: main toggle is the handler's job");
+    }
+
+    /// T034: the pane reasoning scroll mutators mirror
+    /// reasoning_scroll_up/down — freeze at an anchor, re-pin at the tail
+    /// — reading the bound the reasoning widget recorded for the focused
+    /// pane's panel. No pane focused → no-op.
+    #[test]
+    fn pane_reasoning_scroll_helpers_freeze_and_repin() {
+        let mut app = App::new("s", "m");
+        spawn_pane(&mut app, 7, "child");
+        app.focus_subagent(Some(0));
+        app.subagent_panes[0].streaming_reasoning = "thinking".into();
+
+        // Simulate the render-time anchor bound for the pane's panel.
+        app.last_reasoning_max_anchor.set(40);
+        app.pane_reasoning_scroll_up(5);
+        assert_eq!(app.subagent_panes[0].reasoning_view, Some(35), "freeze at anchor");
+        app.pane_reasoning_scroll_down(3);
+        assert_eq!(
+            app.subagent_panes[0].reasoning_view,
+            Some(38),
+            "still frozen above the tail"
+        );
+        app.pane_reasoning_scroll_down(10);
+        assert!(
+            app.subagent_panes[0].reasoning_view.is_none(),
+            "reaching the tail resumes follow"
+        );
+        // Sibling pane keeps its own state (FR-010).
+        spawn_pane(&mut app, 8, "sibling");
+        assert!(app.subagent_panes[1].reasoning_view.is_none());
+
+        // No pane focused → no-op on the main anchor.
+        app.focus_subagent(None);
+        app.last_reasoning_max_anchor.set(40);
+        app.pane_reasoning_scroll_up(5);
+        assert!(app.reasoning_view.is_none(), "unfocused: main view untouched");
+        assert!(
+            app.subagent_panes[0].reasoning_view.is_none(),
+            "unfocused: panes untouched"
+        );
     }
 }

@@ -140,6 +140,80 @@ async fn ids_are_unique_and_monotonic() {
 }
 
 #[tokio::test]
+async fn child_ids_disjoint_across_concurrent_managers() {
+    // T033 regression: the /hypercode surface (engine.rs) builds a SEPARATE
+    // SubagentManager while the agent's delegate_task manager stays alive.
+    // Pre-fix, each manager minted ids from its own counter starting at 1,
+    // so a hypercode child id could equal a surviving delegate pane's id —
+    // and the TUI routes wrapped events by FIRST-MATCH on child id, so
+    // events cross-contaminated panes. Post-fix both draw from ONE
+    // process-global counter, so two concurrently-alive managers can never
+    // mint the same id. Pinned here at the orchestration layer: run two
+    // managers CONCURRENTLY (tokio::join!) and prove their spawn-id sets
+    // are disjoint through their taps.
+    let mgr_a = SubagentManager::new(ManagerConfig::default());
+    let mgr_b = SubagentManager::new(ManagerConfig::default());
+    let (tap_a, mut rx_a) = mpsc::unbounded_channel();
+    let (tap_b, mut rx_b) = mpsc::unbounded_channel();
+    mgr_a.set_event_tap(Some(tap_a));
+    mgr_b.set_event_tap(Some(tap_b));
+
+    let parent_cfg = make_agent_config();
+    let config_tree = Config::defaults();
+    let registry = ToolRegistry::new();
+    let tasks: Vec<TaskSpec> = (0..2)
+        .map(|i| TaskSpec {
+            goal: format!("T033 task {}", i),
+            context: None,
+            model: None,
+            toolsets: vec![],
+            role: None,
+        })
+        .collect();
+
+    // No API key → children fail fast, but spawn lifecycle events still flow.
+    let (a, b) = tokio::join!(
+        mgr_a.dispatch_batch(&tasks, None, &[], &parent_cfg, &config_tree, &registry, None),
+        mgr_b.dispatch_batch(&tasks, None, &[], &parent_cfg, &config_tree, &registry, None),
+    );
+    let _ = (a, b);
+
+    let spawn_ids = |rx: &mut mpsc::UnboundedReceiver<AgentEvent>| {
+        drain(rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                AgentEvent::SubagentSpawn { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<u64>>()
+    };
+    let ids_a = spawn_ids(&mut rx_a);
+    let ids_b = spawn_ids(&mut rx_b);
+    assert_eq!(ids_a.len(), 2, "manager A spawned 2, got {:?}", ids_a);
+    assert_eq!(ids_b.len(), 2, "manager B spawned 2, got {:?}", ids_b);
+
+    // Per-manager invariants preserved from the per-instance counter era.
+    for (label, ids) in [("A", &ids_a), ("B", &ids_b)] {
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "manager {label} ids unique: {:?}", ids);
+        assert_eq!(&sorted, ids, "manager {label} ids monotonic in spawn order: {:?}", ids);
+        assert!(ids.iter().all(|id| *id >= 1), "manager {label} ids start at 1: {:?}", ids);
+    }
+
+    // THE fix: no id is shared between the two concurrently-alive managers.
+    let overlap: Vec<u64> = ids_a.iter().filter(|id| ids_b.contains(id)).cloned().collect();
+    assert!(
+        overlap.is_empty(),
+        "T033: concurrent managers must mint disjoint child ids, shared: {:?} (A={:?} B={:?})",
+        overlap,
+        ids_a,
+        ids_b
+    );
+}
+
+#[tokio::test]
 async fn removing_tap_stops_events() {
     let mgr = SubagentManager::new(ManagerConfig::default());
     let (tap_tx, mut tap_rx) = mpsc::unbounded_channel();

@@ -282,9 +282,12 @@ helpers the main view uses (`parity by construction`):
   (`spawned_by_neurocode`, snapshotted at spawn time) — a plain
   delegation pane never shows the mode explorer even when the mode is
   active.
-- **Ctrl+L** clears the panes and rail entirely and returns focus to
-  the orchestrator view (the orchestrator's own scroll is deliberately
-  untouched).
+- **Ctrl+L** keeps its original meaning — clear the orchestrator
+  transcript, resetting its scroll to follow-tail — and now ALSO clears
+  the panes and rail entirely, returning focus to the orchestrator view
+  (the per-pane geometry cells — `last_pane_max_scroll`, pane text-area
+  rect, tab rects — reset to pristine values so a fresh pane never clamps
+  against a ghost bound).
 
 **State preservation across focus switches**: scroll offset, stats-view
 anchor, expanded context entries, search state (open latch, query,
@@ -294,6 +297,58 @@ orchestrator keeps its own separate scroll/search state throughout.
 Only the render-time geometry cells (the max-scroll bound and text-area
 rect) are view-global — they describe whichever pane is focused and are
 reset by Ctrl+L.
+
+### Subagent view keymap (parity table)
+
+Non-regression guarantee first: every transcript-targeted key resolves
+through ONE router (`Tui::resolve_transcript_target` →
+`TranscriptTarget::{Main, Pane}`). With **no pane focused the target is
+always Main**, so all of these keys act on the orchestrator transcript
+byte-identically to the pre-pane behavior — pane routing is a pure
+retarget, never a new binding scheme.
+
+| Key | Focus | Action with a pane focused |
+|---|---|---|
+| ↑ / k, ↓ / j | transcript | pane scroll ±1 line |
+| Shift+↑ | any | pane scroll up 1 line, switches to transcript focus |
+| PgUp / PgDn | any | pane scroll ±10 lines; PgDn reaching the tail returns focus to input |
+| Ctrl+B / Ctrl+F | any | pane scroll ±15 lines (half page) |
+| g / Home | transcript | pin to top (`Some(last_pane_max_scroll)`, the render-time bound) |
+| G / End | transcript | re-pin to the live tail (`scroll = None`) |
+| mouse wheel over pane | — | pane scroll ±3 lines; up from input flips to transcript focus, hitting the tail returns it |
+| Space / x | transcript | expand-toggle the viewport-CENTER item (shared `transcript_hit_test_core`, first-expandable-at/below-top fallback) |
+| click a block | — | same hit-test expand toggle |
+| Ctrl+E | any | cycle the pane's most-recent reasoning block |
+| Ctrl+G | any | toggle the pane's most-recent tool block's expand |
+| Ctrl+O | any | maximized output viewer over the pane's tool output (opens on the pane even when the main transcript has no tool) |
+| Ctrl+A | any | agent-stats page driven by the pane's own context snapshot + per-pane anchor |
+| Ctrl+R | any | docked live-reasoning strip under the pane transcript |
+| y / Y | transcript | copy the pane's most recent assistant / user message (`TuiAction::CopyPaneItem`) |
+| Ctrl+S | input | open the search bar over the pane (fresh per-pane query) |
+| / | transcript | same, from transcript focus |
+| n / N | transcript | walk the pane's matches (wrap-around; pins pane scroll) |
+| Esc (in search) | search | close the bar (pane latch state kept on the pane) |
+| Ctrl+P | any | release focus back to the orchestrator view |
+| Ctrl+N | any | widen/narrow the pane rail (19 ↔ 48 cols) |
+| Alt+↑ / Alt+↓ | any | scroll the rail's tab window (pane rail outranks the NeuroCode feed) |
+| Ctrl+L | any | clear orchestrator transcript AND panes/rail, focus back to orchestrator |
+| F1 / ? | any | the one global help overlay — identical content everywhere |
+
+(With the pane stats page open, ↑/↓/j/k/g/G/Home/End/PgUp/PgDn and the
+wheel over it scroll the pane's stats context stream instead — same
+retargeting rule.)
+
+### Spawn-surface universality
+
+Every surface that spawns children — `delegate_task`, OMO delegation
+(`call_omo_agent` / Atlas), `/hypercode` pipelines, `dispatch_batch` —
+runs through the single `SubagentManager` → `set_event_tap` →
+`AgentEvent::SubagentEvent { id, .. }` → `pane_apply` funnel, so all
+panes behave identically regardless of who spawned them; the only
+per-surface difference is the mode-explorer gate
+(`spawned_by_neurocode`, snapshotted at `SubagentSpawn`). The
+requirements corpus for this parity work is
+`specs/017-please-modify-joey/spec.md` (FR-001…FR-013).
 
 ## Animations (anim.rs)
 

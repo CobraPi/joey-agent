@@ -204,6 +204,24 @@ fn render_body(
                 .split(with_rail_area);
             widgets::draw_pane_transcript(f, main[0], app, pane, theme, focused, glow);
             widgets::draw_output_viewer(f, main[1], app, theme, spinner);
+        } else if pane.reasoning_expanded && show_pane_reasoning_panel && body[0].height >= 12 {
+            // T034 (US4, FR-008, D6): the pane's expanded live reasoning —
+            // clicking the pane's docked strip (or Esc while expanded)
+            // takes the pane's live stream over the pane view below a
+            // transcript strip, mirroring the main screen's expanded
+            // reasoning arm: same split_expanded_feed math, same shared
+            // draw_reasoning widget (the only difference is the panel's
+            // target-aware field source resolving the pane's state).
+            let (transcript_h, reasoning_h) = split_expanded_feed(body[0].height);
+            let main = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(transcript_h),
+                    Constraint::Min(reasoning_h),
+                ])
+                .split(body[0]);
+            widgets::draw_pane_transcript(f, main[0], app, pane, theme, focused, glow);
+            widgets::draw_reasoning(f, main[1], app, theme, spinner);
         } else if show_pane_reasoning_panel {
             let convo_split = Layout::default()
                 .direction(Direction::Vertical)
@@ -417,6 +435,31 @@ enum TranscriptTarget {
     Main,
     /// The focused subagent pane's transcript (`SubagentPane`, by index).
     Pane(usize),
+}
+
+/// T037 (Phase 10, FR-008): does the NeuroCode explorer own KEY routing
+/// right now? This is the exact predicate of the explorer arm at the top
+/// of [`Tui::handle_key`], extracted as a free function so the routing
+/// decision is assertable without a TTY. It mirrors the draw-side gate
+/// (the pane explorer arm renders only when `pane.spawned_by_neurocode`),
+/// keeping keys and pixels consistent:
+///
+/// - no pane focused (orchestrator view) → the explorer owns the keys,
+///   byte-identical to the pre-T037 two-flag gate;
+/// - a pane the NeuroCode mode spawned is focused → the explorer owns
+///   the keys (it is drawn in that pane's view);
+/// - any other (plain delegation) pane focused → the explorer owns
+///   NOTHING: it is neither drawn NOR fed — keys fall through to normal
+///   pane routing (scroll/expand/etc. via the transcript resolver).
+///
+/// A stale `focused_subagent` index (pane evicted) resolves to no pane,
+/// matching the draw branch's `if let Some(pane) = app.focused_pane()`.
+pub fn neurocode_explorer_owns_keys(app: &App) -> bool {
+    app.neurocode_expanded
+        && app.neurocode_active
+        && app
+            .focused_pane()
+            .map_or(true, |pane| pane.spawned_by_neurocode)
 }
 
 /// T011 (US2, FR-003): pane-side counterpart of `App::item_is_expandable`
@@ -757,7 +800,12 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // (arrows/hjkl/Tab/Enter/zoom) drive the explorer instead of the
         // input/transcript. Esc (global handler below) docks it. Any key
         // the explorer doesn't claim falls through to normal handling.
-        if self.app.neurocode_expanded && self.app.neurocode_active {
+        // T037 (FR-008): the explorer only owns the keys when it owns the
+        // SCREEN — no pane focused, or the focused pane was spawned by
+        // the NeuroCode mode (the draw-side gate's own condition, via
+        // `neurocode_explorer_owns_keys`). A plain pane focused while the
+        // flags are set keeps normal pane routing: not drawn, not fed.
+        if neurocode_explorer_owns_keys(&self.app) {
             if crate::neurocode_viz::explorer_key(&mut self.app, &key) {
                 return None;
             }
@@ -1011,6 +1059,20 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 }
                 if self.app.agent_picker_open {
                     self.app.agent_picker_open = false;
+                    return None;
+                }
+                // T034 (US4, FR-008, D6): a focused pane's EXPANDED
+                // reasoning docks back before the pane itself releases
+                // focus — mirroring the main view's Esc precedence where
+                // the expanded reasoning panel collapses before any
+                // lower-priority Esc behavior (one Esc = one surface
+                // closed). No pane focused → this arm is never taken.
+                if self
+                    .app
+                    .focused_pane()
+                    .is_some_and(|p| p.reasoning_expanded)
+                {
+                    self.app.toggle_focused_pane_reasoning_expanded();
                     return None;
                 }
                 // Parallel-subagent feature: a focused pane releases the main
@@ -2067,7 +2129,16 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             // Wheel over the live reasoning panel: up freezes the view at
             // an absolute anchor; down moves toward the tail and re-pins
             // (auto-follow) only when the bottom is reached.
-            if delta_up {
+            // T034: the TARGET follows focus — the FOCUSED pane's view
+            // state moves while a pane is focused; main's otherwise
+            // (byte-identical to before).
+            if self.app.focused_subagent.is_some() {
+                if delta_up {
+                    self.app.pane_reasoning_scroll_up(3);
+                } else {
+                    self.app.pane_reasoning_scroll_down(3);
+                }
+            } else if delta_up {
                 self.app.reasoning_scroll_up(3);
             } else {
                 self.app.reasoning_scroll_down(3);
@@ -2226,8 +2297,16 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             return;
         }
         // Live reasoning panel next (same docked ↔ expanded toggle).
+        // T034 (US4, FR-008, D6): the TARGET follows focus — with a pane
+        // focused the click toggles THAT pane's expansion (main state
+        // untouched, focused-view isolation); unfocused it toggles the
+        // main panel exactly as before (byte-identical).
         if self.reasoning_panel_hit(row, col) {
-            self.app.toggle_reasoning_expanded();
+            if self.app.focused_subagent.is_some() {
+                self.app.toggle_focused_pane_reasoning_expanded();
+            } else {
+                self.app.toggle_reasoning_expanded();
+            }
             return;
         }
         // Focus the transcript on any click within it.
@@ -4097,6 +4176,196 @@ mod reasoning_expand_tests {
             // Always assert the invariant: reasoning text present.
             assert!(buffer_text(&tui).contains("reasoning line"));
         }
+    }
+
+    // ── T034: pane-aware click/Esc retargeting ────────────────────────
+
+    /// Fixture: a focused pane with a live reasoning block streaming
+    /// recognizable text (80x30 — the rail is hidden below width 96, so
+    /// the pane view owns the main column).
+    fn tui_with_focused_pane_reasoning() -> Tui<TestBackend> {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::SubagentSpawn {
+            id: 1,
+            goal: "pane child".into(),
+            model: "m".into(),
+            toolset_summary: "all".into(),
+            depth: 0,
+        });
+        app.apply(AgentEvent::SubagentEvent {
+            id: 1,
+            event: Box::new(AgentEvent::ReasoningDelta(
+                "PANE_REASONING_MARKER_ the child is thinking about its task, \
+                 streaming thoughts here, long enough to wrap across several \
+                 lines in the docked strip and even in the expanded view."
+                    .into(),
+            )),
+        });
+        app.focus_subagent(Some(0));
+        let terminal = ratatui::Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut tui = Tui::new_for_test(app, Theme::aurora(), terminal);
+        draw_body(&mut tui); // records the pane's docked reasoning rect
+        tui
+    }
+
+    /// T034: clicking the pane reasoning panel toggles the PANE's
+    /// expansion — App's main reasoning_expanded stays untouched.
+    #[test]
+    fn click_on_pane_reasoning_panel_toggles_pane_expansion() {
+        let mut t = tui_with_focused_pane_reasoning();
+        assert!(!t.app.focused_pane().unwrap().reasoning_expanded);
+        assert!(!t.app.reasoning_expanded);
+
+        let (x, y, w, h) = t.app.last_reasoning_rect.get();
+        assert!(w > 0 && h > 0, "pane docked reasoning rect recorded");
+        let docked_h = h;
+        t.handle_mouse_click(y + h / 2, x + w / 2);
+        assert!(
+            t.app.focused_pane().unwrap().reasoning_expanded,
+            "PARITY (T034): click toggles the PANE's expansion"
+        );
+        assert!(
+            !t.app.reasoning_expanded,
+            "isolation: main reasoning_expanded untouched by the pane click"
+        );
+
+        // Re-draw: the pane's reasoning renders in the pane view's main
+        // area, taller than the 8-row docked strip.
+        draw_body(&mut t);
+        let text = buffer_text(&t);
+        assert!(text.contains("PANE_REASONING_MARKER_"), "reasoning visible");
+        let (_ex, _ey, _ew, eh) = t.app.last_reasoning_rect.get();
+        assert!(
+            eh > docked_h,
+            "expanded pane reasoning is taller than the docked strip ({} > {})",
+            eh,
+            docked_h
+        );
+        // The expanded title carries the collapse affordance.
+        assert!(
+            text.contains("click or Esc to collapse"),
+            "expanded pane panel title carries the collapse affordance"
+        );
+
+        // Second click docks back (same mutator).
+        let (ex, ey, ew, eh) = t.app.last_reasoning_rect.get();
+        t.handle_mouse_click(ey + eh / 2, ex + ew / 2);
+        assert!(
+            !t.app.focused_pane().unwrap().reasoning_expanded,
+            "second click docked the pane panel"
+        );
+    }
+
+    /// T034: Esc collapses the pane's expanded reasoning — the pane KEEPS
+    /// focus (one Esc = one surface closed, main-view precedence order).
+    #[test]
+    fn esc_collapses_pane_expanded_reasoning() {
+        let mut t = tui_with_focused_pane_reasoning();
+        t.app.toggle_focused_pane_reasoning_expanded();
+        assert!(t.app.focused_pane().unwrap().reasoning_expanded);
+        let _ = t.handle_key(esc());
+        assert!(
+            !t.app.focused_pane().unwrap().reasoning_expanded,
+            "Esc collapsed the pane's expanded reasoning"
+        );
+        assert!(
+            t.app.focused_subagent.is_some(),
+            "the pane itself keeps focus (one surface per Esc)"
+        );
+    }
+
+    /// T034: the pane panel title carries the SAME affordance segments as
+    /// main when live (docked: "click to expand"; expanded: the collapse
+    /// variant is pinned by the click test above).
+    #[test]
+    fn pane_panel_title_carries_main_affordance_when_live() {
+        let t = tui_with_focused_pane_reasoning();
+        let text = buffer_text(&t);
+        assert!(
+            text.contains("reasoning · live · click to expand"),
+            "PARITY (T034): docked pane panel title carries the expand affordance"
+        );
+        // The honest-chrome caveat is gone: no bare " reasoning · live "
+        // title (without the affordance) anywhere in the frame.
+        assert!(
+            !text.contains("reasoning · live ") || text.contains("reasoning · live ·"),
+            "no affordance-less pane reasoning title remains"
+        );
+    }
+
+    /// T034: expanded pane reasoning supports the frozen-anchor/scroll
+    /// semantics — wheel-up over the pane panel freezes the PANE's view
+    /// (main's reasoning_view untouched), the anchor is immune to further
+    /// streaming, and scrolling back to the bottom re-pins.
+    #[test]
+    fn pane_expanded_reasoning_freeze_and_repin_semantics() {
+        let mut t = tui_with_focused_pane_reasoning();
+        t.app.toggle_focused_pane_reasoning_expanded();
+        assert!(t.app.focused_pane().unwrap().reasoning_view.is_none());
+        draw_body(&mut t); // expanded pane frame measures the stream
+
+        // Wheel over the expanded pane panel: freezes the pane's view.
+        let (x, y, w, h) = t.app.last_reasoning_rect.get();
+        t.handle_mouse_scroll(y + h / 2, x + w / 2, true);
+        let anchor = t
+            .app
+            .focused_pane()
+            .unwrap()
+            .reasoning_view
+            .expect("pane view frozen by wheel-up");
+        assert!(
+            t.app.reasoning_view.is_none(),
+            "isolation: main reasoning_view untouched by the pane wheel"
+        );
+
+        // Further streaming must not move the frozen pane anchor.
+        t.app.apply(AgentEvent::SubagentEvent {
+            id: 1,
+            event: Box::new(AgentEvent::ReasoningDelta(
+                " and more thinking that would push the tail further down".into(),
+            )),
+        });
+        assert_eq!(
+            t.app.focused_pane().unwrap().reasoning_view,
+            Some(anchor),
+            "frozen pane anchor is immune to streaming"
+        );
+
+        // Scrolling back to the bottom re-pins (auto-follow resumes).
+        t.app.pane_reasoning_scroll_down(100);
+        assert!(
+            t.app.focused_pane().unwrap().reasoning_view.is_none(),
+            "reaching the bottom re-pins the pane view"
+        );
+    }
+
+    /// T034 (constitution VII non-regression): with NO pane focused, the
+    /// click still toggles the MAIN expansion exactly as before — the
+    /// click_on_docked_strip_expands_to_main_screen test above pins the
+    /// same path; this adds the explicit pane-present-but-unfocused pin:
+    /// panes exist, focus is on the orchestrator, the click must hit the
+    /// MAIN panel (not any pane's).
+    #[test]
+    fn unfocused_click_still_toggles_main_with_panes_present() {
+        let mut t = tui_with_focused_pane_reasoning();
+        t.app.focus_subagent(None); // orchestrator view, pane still exists
+        // Main has no live reasoning of its own → its strip doesn't
+        // render, so the pane's (now unfocused-invisible) rect is zeroed;
+        // give MAIN a live block to make its strip clickable.
+        t.app.apply(AgentEvent::ReasoningDelta("MAIN_MARKER thinking".into()));
+        draw_body(&mut t);
+        assert!(t.app.focused_subagent.is_none());
+        let (x, y, w, h) = t.app.last_reasoning_rect.get();
+        assert!(w > 0 && h > 0, "main docked reasoning rect recorded");
+        t.handle_mouse_click(y + h / 2, x + w / 2);
+        assert!(
+            t.app.reasoning_expanded,
+            "unfocused: click toggles MAIN expansion (byte-identical)"
+        );
+        assert!(
+            !t.app.subagent_panes[0].reasoning_expanded,
+            "unfocused: the pane's expansion is untouched"
+        );
     }
 }
 

@@ -2453,6 +2453,10 @@ mod responses_body_tests {
     /// MUST clamp to high and request reasoning summaries.
     #[test]
     fn responses_effort_xhigh_clamps_to_high_and_requests_summary() {
+        // Serialize against catalog-seeding tests (CatalogCacheGuard users):
+        // this test asserts the COLD-catalog clamp, so it must not observe a
+        // concurrently-seeded fixture for the same model.
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
         let c = client();
         let req = ProviderRequest::new("gpt-5.4", vec![Message::user("hi")])
             .with_reasoning(Some(crate::request::ReasoningEffort::Level("xhigh".into())));
@@ -2505,6 +2509,10 @@ mod responses_body_tests {
     /// reasoning object entirely (pre-fix behavior for those cases).
     #[test]
     fn responses_valid_efforts_pass_through_and_none_omits() {
+        // Serialize against catalog-seeding tests (CatalogCacheGuard users):
+        // this test asserts pass-through against the COLD catalog, so it must
+        // not observe a concurrently-seeded valid-set for the same model.
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
         let c = client();
         for effort in ["minimal", "low", "medium", "high"] {
             let req = ProviderRequest::new("gpt-5.4", vec![Message::user("hi")])

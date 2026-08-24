@@ -109,6 +109,47 @@ fn pane_go_bottom(a: &mut App) {
     }
 }
 
+// ── T036 helpers: header scroll-segment PLACEMENT ─────────────────────
+
+/// Render one frame and return the buffer as one String per terminal
+/// row (row-major), for row-scoped placement assertions.
+fn render_rows(a: &App, width: u16, height: u16) -> Vec<String> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            joey_tui::app::render_body_for_test(
+                f,
+                area,
+                a,
+                joey_tui::theme::Theme::aurora(),
+                false,
+                0.5,
+            );
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let mut rows = Vec::with_capacity(height as usize);
+    for row in 0..height {
+        let mut s = String::new();
+        for col in 0..width {
+            s.push_str(buf[(col, row)].symbol());
+        }
+        rows.push(s);
+    }
+    rows
+}
+
+/// (top_title_row, bottom_title_row) of the focused pane's transcript
+/// block, derived from the recorded text area: the top title is the
+/// border row above the inner area, the bottom title the border row
+/// below it. Panes are always focused when this is called.
+fn pane_title_rows(a: &App) -> (usize, usize) {
+    let (_x, y, _w, h) = a.last_pane_text_area.get();
+    (y.saturating_sub(1) as usize, (y + h) as usize)
+}
+
 // ── 1. overflow precondition ──────────────────────────────────────────
 
 /// With 40 synthetic items on an 80x24 terminal the focused pane MUST
@@ -430,4 +471,76 @@ fn pane_scroll_keys_top_bottom_move_and_clamp() {
     pane_go_bottom(&mut a);
     let tail_text = render_transcript_text(&a, W, H);
     assert!(tail_text.contains("user message 39"), "G re-pins to the tail");
+}
+
+// ── 7. T036: header scroll-info PLACEMENT parity (FR-001/FR-009/SC-003) ─
+
+/// WIDE terminal (140 cols): the composed pane top title
+/// " ◆ subagent: {goal} [{model}] {status} {scroll segment} " fits, so the
+/// scroll-info rides the TOP title row exactly like `draw_transcript`'s
+/// single top title — placement parity, not just string parity.
+#[test]
+fn pane_header_scroll_info_rides_top_title_when_it_fits() {
+    let mut a = focused_pane_app(40);
+    let _ = render_frame(&a, 140, 30); // records pane geometry
+    let rows = render_rows(&a, 140, 30);
+    let (top, _bottom) = pane_title_rows(&a);
+    assert!(
+        rows[top].contains("40 messages · live"),
+        "PARITY (T036): scroll-info composes into the pane's TOP title row"
+    );
+    assert!(rows[top].contains("subagent: parity child"), "same row carries the pane identity");
+}
+
+/// The same wide geometry SCROLLED: the " {N} messages · {P}% from top "
+/// segment rides the top title too (the composition is scroll-state
+/// aware, like the orchestrator header).
+#[test]
+fn pane_header_scrolled_segment_rides_top_title_when_it_fits() {
+    let mut a = focused_pane_app(40);
+    let _ = render_frame(&a, 140, 30); // records last_pane_max_scroll
+    pane_go_top(&mut a);
+    let rows = render_rows(&a, 140, 30);
+    let (top, _bottom) = pane_title_rows(&a);
+    assert!(
+        rows[top].contains("40 messages · 0% from top"),
+        "PARITY (T036): scrolled header segment composes into the TOP title"
+    );
+}
+
+/// NARROW terminal (the 80-col suite geometry): the composed title would
+/// be clipped, so the segment falls back to the block's BOTTOM-right
+/// corner — the pre-T036 placement — keeping it fully visible.
+#[test]
+fn pane_header_scroll_info_falls_back_to_bottom_corner_when_clipped() {
+    let a = focused_pane_app(40);
+    let rows = render_rows(&a, W, H);
+    let (top, bottom) = pane_title_rows(&a);
+    assert!(
+        !rows[top].contains("messages · live"),
+        "top row stays the bare pane title at narrow widths"
+    );
+    assert!(
+        rows[bottom].contains("40 messages · live"),
+        "T036 fit fallback: the segment rides the bottom-right corner fully visible"
+    );
+}
+
+/// MINIMUM geometry (quickstart.md ≥96 cols): through the real layout the
+/// pane is 43 cols wide (96 − 19 rail − 34 sidebar) and its title row
+/// holds only 41 usable columns — even the bare 47-col pane title clips,
+/// let alone the composed one. The bottom-corner fallback preserves the
+/// pre-T036 rendering there; the residual (segment placement differs
+/// from the orchestrator at min geometry) is the sanctioned deviation
+/// Wave 4 records in checklists/parity.md.
+#[test]
+fn pane_header_min_geometry_keeps_bottom_fallback() {
+    let a = focused_pane_app(40);
+    let rows = render_rows(&a, 96, 30);
+    let (top, bottom) = pane_title_rows(&a);
+    let _ = top;
+    assert!(
+        rows[bottom].contains("40 messages · live"),
+        "min-geometry (96col) pane keeps the bottom-corner scroll segment"
+    );
 }

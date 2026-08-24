@@ -1278,6 +1278,30 @@ fn t024_search_state_survives_focus_switches() {
         "indicator renders A's (focused) match state: {frame:?}"
     );
     assert_eq!(a.scroll, None, "main scroll still untouched");
+
+    // NAVIGATION state (T015 `pane_search_next`, the n/N pane arms) survives
+    // too. A's matches sit at from-bottom idx 4 (newest, item 35) and 34
+    // (oldest, item 5); the bar left A pinned at Some(2). 'N' (backward)
+    // walks to the older match and pins at min(34-2, bound)…
+    let max_a = a.last_pane_max_scroll.get(); // A's bound (re-recorded above)
+    a.pane_search_next(false);
+    let navigated = 32.min(max_a);
+    assert_eq!(
+        a.subagent_panes[pa].scroll,
+        Some(navigated),
+        "N pinned the older match (idx 34 → offset {navigated})"
+    );
+    // …and the NAVIGATED offset — not the original pin — is what survives a
+    // round trip through the orchestrator view.
+    a.focus_subagent(None);
+    a.focus_subagent(Some(pa));
+    assert_eq!(a.subagent_panes[pa].scroll, Some(navigated), "navigated offset survives");
+    assert_eq!(a.subagent_panes[pa].search_query, "needle", "query still preserved");
+    assert!(a.subagent_panes[pa].search_has_match, "indicator still preserved");
+    // 'n' (forward) walks back to the newest match (idx 4 → Some(2)).
+    a.pane_search_next(true);
+    assert_eq!(a.subagent_panes[pa].scroll, Some(2), "n re-pins the newest match");
+    assert_eq!(a.scroll, None, "main scroll untouched by pane navigation");
 }
 
 // ── 4. Stats preservation: the FROZEN anchor (FR-010, SC-004) ──────────
@@ -1368,6 +1392,51 @@ fn t024_ctrl_l_clear_returns_focus_and_preserves_main_scroll() {
     let frame = render_frame(&a, T024_W, T024_H);
     assert!(!frame.contains("subagent:"), "no pane title remains");
     assert!(frame.contains("t024 line"), "main transcript content visible again");
+}
+
+/// The full Ctrl+L KEY path (app.rs handle_key `Char('l') if ctrl`) is
+/// `transcript.clear(); scroll = None; clear_subagent_panes();` — the
+/// historical clear-view reset PLUS the pane/rail reset. Driven here as the
+/// exact mutator sequence the handler runs (integration tests can't build
+/// `Tui`; same convention as every T024 pin). D9 splits in two: the KEY
+/// returns focus to the orchestrator with the view at follow-tail (its own
+/// transcript is emptied, so None is the only sane scroll), while the
+/// pane-clear OPERATION alone preserves a remembered main scroll — pinned
+/// by the test above. No panic, no dangling focus, either way.
+#[test]
+fn t024_ctrl_l_key_sequence_clears_panes_and_returns_focus() {
+    let mut a = app();
+    pane_with_transcript(&mut a, 1, "ctrl-l key child", 10);
+    for i in 0..45 {
+        a.push_item(TranscriptItem::User { text: format!("t024 key line {i}") });
+    }
+    let _ = render_frame(&a, T024_W, T024_H);
+    let max = a.last_max_scroll.get();
+    assert!(max >= 9, "precondition: main transcript overflows (max={max})");
+    a.scroll_up(9);
+    a.focus_subagent(Some(0));
+    let _ = render_frame(&a, T024_W, T024_H); // pane view on screen
+    assert_eq!(a.focused_subagent, Some(0));
+
+    // The exact key-handler sequence (app.rs Ctrl+L arm).
+    a.transcript.clear();
+    a.scroll = None;
+    a.clear_subagent_panes();
+
+    assert!(a.subagent_panes.is_empty(), "panes gone");
+    assert!(a.focused_subagent.is_none(), "focus returned to the orchestrator");
+    assert!(a.transcript.is_empty(), "the key also clears the main view (by design)");
+    assert_eq!(a.scroll, None, "cleared view sits at follow-tail");
+    // Subsequent main-transcript keys act on the main view, not a ghost pane
+    // (re-render first so the recorded bound reflects the emptied view).
+    let _ = render_frame(&a, T024_W, T024_H);
+    let bound = a.last_max_scroll.get();
+    a.scroll_up(3);
+    assert_eq!(a.scroll, Some(3.min(bound)), "scroll clamps to the empty view's bound");
+    a.scroll_down(3);
+    assert_eq!(a.scroll, None);
+    let frame = render_frame(&a, T024_W, T024_H);
+    assert!(!frame.contains("subagent:"), "no pane chrome remains");
 }
 
 // ── 6. Disappearance: unreachable by design; persistence pinned (D9) ────
@@ -1461,13 +1530,18 @@ fn t024_panes_persist_after_done_failed_no_disappearance() {
 // SubagentSpawn arm is `SubagentPane::new`'s sole call site (state.rs:1870)
 // and wrapped events go through the single `pane_apply` (state.rs:559).
 //
-// AUDIT FINDING (not a pane fork; pinned below, not fixed — manager.rs is
-// read-only): the /hypercode manager is a fresh SubagentManager whose child
-// id counter starts at 1 just like the delegate manager's, and panes match
-// by child_id FIRST-MATCH — so a hypercode child can collide with a
+// AUDIT FINDING — RESOLVED AT SOURCE by T033 (orchestration layer): the
+// /hypercode manager used to be a fresh SubagentManager whose child id
+// counter started at 1 just like the delegate manager's, and panes match
+// by child_id FIRST-MATCH — so a hypercode child could collide with a
 // surviving delegate pane's id and route its events into the older pane.
-// Everything still flows through the one funnel; the ids just share a
-// namespace across manager instances.
+// T033 moved child-id allocation to a PROCESS-GLOBAL counter in
+// manager.rs, so two concurrently-alive managers can never mint the same
+// id (orchestration regression:
+// parallel_tap.rs::child_ids_disjoint_across_concurrent_managers). The
+// duplicate-id first-match pin below remains as an App-level contract:
+// routing is unchanged (joey-tui src untouched this wave) and duplicate
+// ids are simply unreachable from real managers now.
 
 use joey_agent_core::events::{FileChangeKind, FileChangeSource};
 use joey_tui::state::ToolStatus;
@@ -1557,9 +1631,28 @@ fn t026_assert_funnel_capabilities(a: &mut App, pane_idx: usize, child_id: u64) 
     assert!(max >= 4, "precondition: pane {pane_idx} overflows (max={max})");
     a.pane_scroll_up(2);
     assert_eq!(a.subagent_panes[pane_idx].scroll, Some(2), "pane scroll pins");
+    // Scroll affordance state clamps to the pane bounds on every surface:
+    // an oversized up-step saturates at the recorded max, and a full
+    // down-step returns to follow-tail (None) — same ScrollState contract
+    // the main transcript uses (state.rs pane_scroll_up/down).
+    a.pane_scroll_up(1000);
+    assert_eq!(
+        a.subagent_panes[pane_idx].scroll,
+        Some(max),
+        "scroll up past the top clamps to the pane's max bound"
+    );
+    a.pane_scroll_down(max);
+    assert_eq!(
+        a.subagent_panes[pane_idx].scroll,
+        None,
+        "scroll down to the bottom resumes follow-tail"
+    );
 
-    // (c) expand: a Reasoning item cycles out of Collapsed via the pane's
-    // own toggle (per-item expand works on this surface's items).
+    // (c) expand: a Reasoning item CYCLES through the three-state inline
+    // expansion via the pane's own toggle (per-item expand works on this
+    // surface's items). The stream's reasoning blocks are 3 lines, so the
+    // fits-collapsed skip rule lands Collapsed → Full; the second toggle
+    // completes the cycle back to Collapsed.
     let r_idx = a.subagent_panes[pane_idx]
         .transcript
         .iter()
@@ -1571,6 +1664,12 @@ fn t026_assert_funnel_capabilities(a: &mut App, pane_idx: usize, child_id: u64) 
         ReasoningExpandState::Collapsed,
         "pane item expansion works"
     );
+    a.subagent_panes[pane_idx].toggle_item_expand(r_idx);
+    assert_eq!(
+        expand_state_for_test(&a.subagent_panes[pane_idx].transcript[r_idx]),
+        ReasoningExpandState::Collapsed,
+        "second toggle completes the cycle back to Collapsed"
+    );
 
     // (d) search: the pane bar finds the surface-agnostic needle.
     t024_open_search(a);
@@ -1579,7 +1678,31 @@ fn t026_assert_funnel_capabilities(a: &mut App, pane_idx: usize, child_id: u64) 
     assert!(pane.search_has_match, "pane search works on this surface's transcript");
     assert_eq!(pane.search_query, "t026-needle");
 
-    // (e) lifecycle close: pending stream flushes + status Done through the
+    // (e) copy hit-test: `y` with this pane focused resolves the last
+    // Assistant item INSIDE the pane transcript — the exact rposition the
+    // `Tui::handle_key` Pane arm performs (app.rs:1526), emitting
+    // `TuiAction::CopyPaneItem { pane: pane_idx, idx }` (pane-owned,
+    // pane-relative idx). Surface-agnostic by construction: the resolution
+    // sees only this pane's items, and each child's stream embeds its id,
+    // so a mis-routed (main/other-pane) copy is detectable — the main
+    // transcript here carries no Assistant item at all.
+    let pane = &a.subagent_panes[pane_idx];
+    let copy_idx = pane
+        .transcript
+        .iter()
+        .rposition(|i| matches!(i, TranscriptItem::Assistant { .. }))
+        .expect("an assistant item to copy");
+    assert!(
+        matches!(&pane.transcript[copy_idx], TranscriptItem::Assistant { text, .. }
+            if text.contains(&format!("t026 child {child_id}"))),
+        "copy hit-test resolves within the pane transcript: CopyPaneItem {{ pane: {pane_idx}, idx: {copy_idx} }} carries this child's own text"
+    );
+    assert!(
+        !a.transcript.iter().any(|it| matches!(it, TranscriptItem::Assistant { .. })),
+        "a wrongly-main-routed copy would resolve nothing (main has no Assistant item)"
+    );
+
+    // (f) lifecycle close: pending stream flushes + status Done through the
     // single pane path (same SubagentComplete every surface's manager emits).
     a.apply(wrap(child_id, AgentEvent::ContentDelta(format!("t026 final stream {child_id}"))));
     a.apply(AgentEvent::SubagentComplete {
@@ -1763,11 +1886,12 @@ fn t026_two_surface_panes_coexist_independently() {
     assert_eq!(a.subagent_panes[0].status, SubagentStatus::Done);
     assert_eq!(a.subagent_panes[1].status, SubagentStatus::Running, "sibling pane unaffected");
 
-    // AUDIT NOTE — cross-manager child-id collision, pinned as CURRENT
-    // behavior (see the funnel-audit comment atop this section): the
-    // /hypercode manager's id counter also starts at 1, and panes match by
-    // child_id first-match, so a colliding spawn stacks a duplicate-id pane
-    // whose events route into the OLDER pane.
+    // AUDIT NOTE — cross-manager child-id collision, KEPT as an App-level
+    // first-match routing contract (see the funnel-audit comment atop this
+    // section): T033 fixed the collision AT SOURCE (process-global id
+    // counter in manager.rs), so real managers can no longer mint a
+    // duplicate id — this synthetic duplicate pins what App::apply would
+    // do if one ever arrived (first-match wins, older pane absorbs events).
     a.apply(surface_spawn(11, "colliding later spawn", "glm-5.2", "file"));
     assert_eq!(a.subagent_panes.len(), 3, "the duplicate-id spawn still stacks a pane");
     a.apply(wrap(11, AgentEvent::ContentDelta("collision".into())));
@@ -1778,5 +1902,76 @@ fn t026_two_surface_panes_coexist_independently() {
     assert!(
         a.subagent_panes[2].streaming_assistant.is_empty(),
         "the duplicate-id pane never sees the event (pinned divergence)"
+    );
+}
+
+/// T033 — the /hypercode pane-collision fix, viewed from the TUI: with the
+/// process-global child-id counter (manager.rs), a delegate-surface child
+/// and a LATER /hypercode-surface child can no longer share a child id, so
+/// their panes coexist with zero event cross-routing even when the
+/// delegate pane survives into the hypercode run. Models the T033
+/// scenario: delegate_task child spawns first (pane 0, id D), the
+/// /hypercode manager (a separate SubagentManager, engine.rs) then spawns
+/// its first child — which pre-T033 re-minted id 1 and hijacked pane 0.
+/// Post-T033 the hypercode child's id is provably different (global
+/// counter), pinned structurally here as "a later manager's ids never
+/// reuse a live pane's id" with the disjoint-id property itself pinned at
+/// the orchestration layer (parallel_tap.rs).
+#[test]
+fn t033_hypercode_child_never_reuses_delegate_panes_child_id() {
+    let mut a = app();
+    // Delegate-surface child — would historically take id 1.
+    let delegate_id: u64 = 1;
+    a.apply(surface_spawn(delegate_id, "delegate survivor child", "glm-5.2", "file"));
+    feed_common_stream(&mut a, delegate_id, 20);
+
+    // /hypercode surface's FIRST child, from the separate manager. With the
+    // old per-manager counter this was also id 1 — the collision. The
+    // process-global counter guarantees this id is different; we simulate
+    // the post-fix id shape (any id the global counter could hand out is
+    // > every id minted before it, so > delegate_id).
+    let hypercode_id = delegate_id + 1;
+    a.apply(surface_spawn(hypercode_id, "hypercode first child", "glm-5.2-flash", "file-read, terminal"));
+    feed_common_stream(&mut a, hypercode_id, 20);
+    assert_ne!(
+        hypercode_id, delegate_id,
+        "post-T033 ids from a later manager never reuse a live pane's id"
+    );
+
+    // No cross-routing: each pane owns exactly its own stream state.
+    a.apply(wrap(delegate_id, AgentEvent::ContentDelta("delegate only".into())));
+    assert_eq!(
+        a.subagent_panes[0].streaming_assistant, "delegate only",
+        "delegate event lands in the delegate pane"
+    );
+    assert!(
+        a.subagent_panes[1].streaming_assistant.is_empty(),
+        "hypercode pane untouched by delegate events"
+    );
+
+    a.apply(wrap(hypercode_id, AgentEvent::ContentDelta("hypercode only".into())));
+    assert_eq!(
+        a.subagent_panes[1].streaming_assistant, "hypercode only",
+        "hypercode event lands in the hypercode pane"
+    );
+    assert_eq!(
+        a.subagent_panes[0].streaming_assistant, "delegate only",
+        "delegate pane's own pending stream untouched by hypercode events"
+    );
+
+    // Wrapped lifecycle also closes only the owning pane.
+    a.apply(AgentEvent::SubagentComplete {
+        id: hypercode_id,
+        goal: "hypercode first child".into(),
+        success: true,
+        summary_preview: "ok".into(),
+        token_usage: Default::default(),
+        duration_secs: 0.2,
+    });
+    assert_eq!(a.subagent_panes[1].status, SubagentStatus::Done);
+    assert_eq!(
+        a.subagent_panes[0].status,
+        SubagentStatus::Running,
+        "delegate pane keeps running — no lifecycle cross-close"
     );
 }

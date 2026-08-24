@@ -2636,6 +2636,11 @@ mod tui_tests {
                 tap_attached: false,
                 // Added in joey-tui state.rs (T022); `new()` defaults false.
                 spawned_by_neurocode: false,
+                // Added in joey-tui state.rs (T034, pane reasoning parity);
+                // `new()` defaults false/None/None.
+                reasoning_expanded: false,
+                reasoning_view: None,
+                reasoning_started: None,
             }
         }
 
