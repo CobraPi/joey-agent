@@ -1092,6 +1092,71 @@ pub struct OutroSnapshot {
     pub tool_calls: usize,
 }
 
+/// Transcript item → clipboard text. Shared by the `CopyItem` (main
+/// transcript) and `CopyPaneItem` (pane transcript) action arms so both
+/// paths copy byte-identical text for identical items — T018 (D4,
+/// FR-006): the pane arm must reuse the SAME mapping, not a variant.
+fn transcript_item_clipboard_text(item: &TranscriptItem) -> Option<String> {
+    match item {
+        TranscriptItem::User { text }
+        | TranscriptItem::Assistant { text }
+        | TranscriptItem::Reasoning { text, .. } => Some(text.clone()),
+        TranscriptItem::Tool { full_result, result_preview, .. } => {
+            full_result.clone().or_else(|| Some(result_preview.clone()))
+        }
+        TranscriptItem::FileDiff { path, lines, .. } => {
+            Some(format!("# {}\n{}", path, lines.join("\n")))
+        }
+        TranscriptItem::Notice { text, .. }
+        | TranscriptItem::Error { text } => Some(text.clone()),
+    }
+}
+
+/// Resolve `CopyPaneItem { pane, idx }`: pane `pane`'s transcript item
+/// `idx` (pane-RELATIVE index) → clipboard text. Out-of-range pane or idx
+/// → `None` (safe no-op, mirroring `CopyItem`'s out-of-range handling).
+/// Pure so the pane-relative resolution is unit-testable without a
+/// terminal (T018, D4/FR-006).
+fn pane_item_clipboard_text(app: &AppState, pane: usize, idx: usize) -> Option<String> {
+    app.subagent_panes
+        .get(pane)?
+        .transcript
+        .get(idx)
+        .and_then(transcript_item_clipboard_text)
+}
+
+/// What Enter does while a turn is busy (`display.busy_enter`; upstream
+/// `busy_input_mode`). See [`BusyEnterAction::parse`].
+#[derive(Debug, PartialEq, Eq)]
+enum BusyEnterAction {
+    /// Queue the prompt for the next turn (`display.busy_enter=queue`).
+    Queue(String),
+    /// Steer the running turn with the prompt (`display.busy_enter=steer`).
+    Steer(String),
+    /// Interrupt the turn and run the prompt next (default; Hermes parity).
+    Interrupt(String),
+}
+
+impl BusyEnterAction {
+    /// Classify a mid-turn Enter under the configured busy-enter mode.
+    ///
+    /// `None` is a no-op: empty/whitespace input never interrupts (nor
+    /// queues/steers an empty prompt) — an accidental Enter on the empty
+    /// input line must not kill the running turn. Non-empty input keeps
+    /// the exact per-mode behavior, unknown modes falling through to the
+    /// upstream-default interrupt.
+    fn parse(mode: &str, text: &str) -> Option<BusyEnterAction> {
+        if text.trim().is_empty() {
+            return None;
+        }
+        match mode {
+            "queue" => Some(BusyEnterAction::Queue(text.to_string())),
+            "steer" => Some(BusyEnterAction::Steer(text.to_string())),
+            _ => Some(BusyEnterAction::Interrupt(text.to_string())),
+        }
+    }
+}
+
 /// The interactive loop: pure UI. Pumps events, dispatches actions; all
 /// compute is engine-side. On quit it leaves the terminal, ends the
 /// session, and gathers the outro snapshot from the session DB.
@@ -1133,32 +1198,45 @@ async fn interactive_loop(mut session: TuiSession) -> (anyhow::Result<()>, Outro
                     }
                 } else if session.busy {
                     // /busy selects what Enter does mid-turn (upstream
-                    // busy_input_mode; default interrupt).
-                    let preview: String = text.chars().take(48).collect();
-                    match session.busy_enter_mode.as_str() {
-                        "queue" => {
-                            session.stash_ui_queue(text);
-                        }
-                        "steer" => {
-                            if let Some(engine) = &session.engine {
-                                engine.send(crate::engine::EngineCommand::Steer(text.clone()));
+                    // busy_input_mode; default interrupt). Empty input is a
+                    // NO-OP in every mode — an accidental Enter on the empty
+                    // input line must not interrupt (nor queue/steer
+                    // nothing) and kill the running turn.
+                    if let Some(action) =
+                        BusyEnterAction::parse(&session.busy_enter_mode, &text)
+                    {
+                        let preview: String = text.chars().take(48).collect();
+                        match action {
+                            BusyEnterAction::Queue(prompt) => {
+                                session.stash_ui_queue(prompt);
                             }
-                            session.tui.app_mut().push_item(TranscriptItem::Notice {
-                                text: format!("🧭 steering the running turn: {preview}"),
-                                kind: NoticeKind::Info,
-                            });
-                        }
-                        _ => {
-                            // Hermes parity (busy_input_mode: interrupt — the
-                            // upstream default): a plain message mid-turn
-                            // INTERRUPTS the running turn; the engine unwinds
-                            // it and runs the new message as the next turn.
-                            session.tui.app_mut().push_item(TranscriptItem::Notice {
-                                text: format!("⚡ interrupting — your message runs next: {preview}"),
-                                kind: NoticeKind::Warning,
-                            });
-                            session.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
-                            session.send_queued_submit(text);
+                            BusyEnterAction::Steer(prompt) => {
+                                if let Some(engine) = &session.engine {
+                                    engine.send(crate::engine::EngineCommand::Steer(prompt));
+                                }
+                                session.tui.app_mut().push_item(TranscriptItem::Notice {
+                                    text: format!("🧭 steering the running turn: {preview}"),
+                                    kind: NoticeKind::Info,
+                                });
+                            }
+                            BusyEnterAction::Interrupt(prompt) => {
+                                // Hermes parity (busy_input_mode: interrupt —
+                                // the upstream default): a plain message
+                                // mid-turn INTERRUPTS the running turn; the
+                                // engine unwinds it and runs the new message
+                                // as the next turn.
+                                session.tui.app_mut().push_item(TranscriptItem::Notice {
+                                    text: format!(
+                                        "⚡ interrupting — your message runs next: {preview}"
+                                    ),
+                                    kind: NoticeKind::Warning,
+                                });
+                                session.interrupt.store(
+                                    true,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                session.send_queued_submit(prompt);
+                            }
                         }
                     }
                 } else if session.submit(text) {
@@ -1177,19 +1255,31 @@ async fn interactive_loop(mut session: TuiSession) -> (anyhow::Result<()>, Outro
                 }
             }
             Some(PumpOutcome::Action(TuiAction::CopyItem(idx))) => {
-                let text = session.tui.app().transcript.get(idx).and_then(|item| match item {
-                    TranscriptItem::User { text }
-                    | TranscriptItem::Assistant { text }
-                    | TranscriptItem::Reasoning { text, .. } => Some(text.clone()),
-                    TranscriptItem::Tool { full_result, result_preview, .. } => {
-                        full_result.clone().or_else(|| Some(result_preview.clone()))
+                let text = session
+                    .tui
+                    .app()
+                    .transcript
+                    .get(idx)
+                    .and_then(transcript_item_clipboard_text);
+                if let Some(t) = text {
+                    match crate::clipboard::copy_to_clipboard(&t) {
+                        Ok(()) => session.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: format!("✓ Copied {} chars to clipboard", t.chars().count()),
+                            kind: NoticeKind::Success,
+                        }),
+                        Err(e) => session.tui.app_mut().push_item(TranscriptItem::Error {
+                            text: format!("Copy failed: {e}"),
+                        }),
                     }
-                    TranscriptItem::FileDiff { path, lines, .. } => {
-                        Some(format!("# {}\n{}", path, lines.join("\n")))
-                    }
-                    TranscriptItem::Notice { text, .. }
-                    | TranscriptItem::Error { text } => Some(text.clone()),
-                });
+                }
+            }
+            Some(PumpOutcome::Action(TuiAction::CopyPaneItem { pane, idx })) => {
+                // T018 (D4, FR-006): `y`/`Y` with a subagent pane focused
+                // resolves against THAT pane's transcript (pane-relative
+                // idx) — never the main one. Same item→text mapping,
+                // clipboard call, and notice feedback as CopyItem;
+                // out-of-range pane/idx is the same safe no-op.
+                let text = pane_item_clipboard_text(session.tui.app(), pane, idx);
                 if let Some(t) = text {
                     match crate::clipboard::copy_to_clipboard(&t) {
                         Ok(()) => session.tui.app_mut().push_item(TranscriptItem::Notice {
@@ -1414,13 +1504,20 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                 });
             }
             "llm-selector" => {
-                // Reuse the CLI handler, funneling its terminal output into
-                // the transcript (it prints; we capture by running the same
-                // underlying call when it returns Result, else we show a
-                // pointer to the CLI).
+                // Render-only call (no stdout printing): under ratatui's
+                // raw-mode alternate screen, bare \n's staircase over the
+                // frame. Funnel the rendered text into the transcript
+                // line-by-line instead (same pattern as speckit-status).
                 let args = slash_args_after(input, "llm-selector");
-                match crate::llm_selector::llm_selector_slash(args) {
-                    Ok(()) => {}
+                match crate::llm_selector::llm_selector_slash_text(args) {
+                    Ok(out) => {
+                        for line in out.lines() {
+                            self.tui.app_mut().push_item(TranscriptItem::Notice {
+                                text: line.to_string(),
+                                kind: NoticeKind::Info,
+                            });
+                        }
+                    }
                     Err(e) => self.tui.app_mut().push_item(TranscriptItem::Error { text: e }),
                 }
             }
@@ -2359,6 +2456,48 @@ mod tui_tests {
             ModelSlash::Switch { model, .. } => assert_eq!(model, "openai gpt-5.4"),
             other => panic!("expected Switch, got {other:?}"),
         }
+        // Empty-input no-op regression (self-interrupt UX): Enter on an
+        // EMPTY input line while busy must be a no-op in EVERY mode — it
+        // must not interrupt the running turn (nor queue/steer nothing).
+        use super::BusyEnterAction;
+        for mode in ["interrupt", "queue", "steer", "unknown-mode"] {
+            assert!(
+                BusyEnterAction::parse(mode, "").is_none(),
+                "empty input must be a no-op in mode {mode}"
+            );
+            assert!(
+                BusyEnterAction::parse(mode, "   ").is_none(),
+                "whitespace-only input must be a no-op in mode {mode}"
+            );
+        }
+        // Non-empty input keeps the exact per-mode behavior (Hermes parity:
+        // interrupt is the default, including for unknown modes).
+        assert_eq!(
+            BusyEnterAction::parse("interrupt", "fix the bug"),
+            Some(BusyEnterAction::Interrupt("fix the bug".into()))
+        );
+        assert_eq!(
+            BusyEnterAction::parse("queue", "fix the bug"),
+            Some(BusyEnterAction::Queue("fix the bug".into()))
+        );
+        assert_eq!(
+            BusyEnterAction::parse("steer", "fix the bug"),
+            Some(BusyEnterAction::Steer("fix the bug".into()))
+        );
+        assert_eq!(
+            BusyEnterAction::parse("whatever", "fix the bug"),
+            Some(BusyEnterAction::Interrupt("fix the bug".into()))
+        );
+        // Leading/trailing whitespace input still counts as content.
+        assert_eq!(
+            BusyEnterAction::parse("interrupt", "  padded  "),
+            Some(BusyEnterAction::Interrupt("  padded  ".into()))
+        );
+        assert!(
+            BusyEnterAction::parse("interrupt", "\n\t").is_none(),
+            "control-char whitespace is still empty"
+        );
+
         // Neurocode forms.
         assert!(matches!(ModelSlash::parse("neurocode"), ModelSlash::Neurocode { .. }));
         match ModelSlash::parse("neurocode frontier glm-4.6") {
@@ -2452,6 +2591,85 @@ mod tui_tests {
         assert_eq!(super::slash_args_after("/steer look at this instead", "steer"), "look at this instead");
         assert_eq!(super::slash_args_after("/queue", "queue"), "");
         assert_eq!(super::slash_args_after("/q check", "queue"), "check");
+    }
+
+    /// T018 (D4, FR-006): `CopyPaneItem` must resolve against the PANE
+    /// transcript (pane-relative idx), never the main transcript — the
+    /// item→text mapping is shared with `CopyItem` so both paths copy
+    /// byte-identical text for identical items. Out-of-range pane/idx is
+    /// the same safe no-op as out-of-range `CopyItem`.
+    #[test]
+    fn copy_pane_item_resolves_pane_transcript_not_main() {
+        use joey_tui::state::{SubagentPane, SubagentStatus, TokenStats};
+        use joey_tui::{AppState, TranscriptItem};
+        use std::collections::{HashSet, VecDeque};
+        use std::time::Instant;
+
+        fn mk_pane(goal: &str) -> SubagentPane {
+            SubagentPane {
+                child_id: 0,
+                goal: goal.to_string(),
+                model: "m".into(),
+                toolset_summary: "all".into(),
+                depth: 0,
+                status: SubagentStatus::Running,
+                transcript: VecDeque::new(),
+                transcript_capacity: 256,
+                streaming_assistant: String::new(),
+                streaming_reasoning: String::new(),
+                scroll: None,
+                context_entries: Vec::new(),
+                context_system_tokens: 0,
+                context_history_tokens: 0,
+                context_window: 0,
+                compression_threshold: 0,
+                compactions: 0,
+                stats_view: None,
+                last_stats_max_anchor: std::cell::Cell::new(0),
+                expanded_context: HashSet::new(),
+                search_open: false,
+                search_query: String::new(),
+                search_has_match: false,
+                tokens: TokenStats::default(),
+                started: Instant::now(),
+                summary_preview: None,
+                tap_attached: false,
+                // Added in joey-tui state.rs (T022); `new()` defaults false.
+                spawned_by_neurocode: false,
+            }
+        }
+
+        let mut app = AppState::new("s", "m");
+        // Same idx in main vs pane holds DIFFERENT text — a main-transcript
+        // fallback would copy the wrong one.
+        app.push_item(TranscriptItem::User { text: "main item".into() });
+        let mut pane0 = mk_pane("child zero");
+        pane0.transcript.push_back(TranscriptItem::User { text: "pane0 item".into() });
+        let mut pane1 = mk_pane("child one");
+        pane1.transcript.push_back(TranscriptItem::Assistant { text: "pane1 item".into() });
+        app.subagent_panes.push(pane0);
+        app.subagent_panes.push(pane1);
+
+        // Distinct pane transcripts: pane 0 and pane 1 each resolve their
+        // own item 0, never the main transcript's item 0.
+        assert_eq!(
+            super::pane_item_clipboard_text(&app, 0, 0).as_deref(),
+            Some("pane0 item")
+        );
+        assert_eq!(
+            super::pane_item_clipboard_text(&app, 1, 0).as_deref(),
+            Some("pane1 item")
+        );
+        // Shared mapping sanity: the main path maps the same item type the
+        // same way (byte-identical text for identical items).
+        assert_eq!(
+            app.transcript.get(0).and_then(super::transcript_item_clipboard_text).as_deref(),
+            Some("main item")
+        );
+
+        // Out-of-range pane / idx: safe no-op (None), no panic.
+        assert!(super::pane_item_clipboard_text(&app, 2, 0).is_none());
+        assert!(super::pane_item_clipboard_text(&app, 0, 1).is_none());
     }
 }
 

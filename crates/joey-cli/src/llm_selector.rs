@@ -7,8 +7,23 @@ use joey_llm_selector::{
     render_status, CandidateModelPool, SelectorConfig, SelectorEngine,
 };
 
-/// Entry point for the `/llm-selector` slash command.
+/// Entry point for the `/llm-selector` slash command (printing form).
+///
+/// Renders via [`llm_selector_slash_text`] and writes the result to stdout.
+/// Used by the line REPL and the `joey llm-selector` CLI mirror, where
+/// direct printing is safe (reedline is not on screen during slash
+/// handling there, and no raw-mode alternate screen is held). The TUI
+/// calls the render-only [`llm_selector_slash_text`] instead and funnels
+/// the text into its transcript — printing under ratatui's raw-mode
+/// alternate screen staircases bare `\n`s over the frame.
 pub fn llm_selector_slash(args: &str) -> Result<(), String> {
+    llm_selector_slash_text(args).map(|out| print!("{out}"))
+}
+
+/// Render-only form of `/llm-selector`: builds and returns the exact text
+/// [`llm_selector_slash`] prints (each former `println!` line keeps its
+/// trailing `\n`; `status` keeps `render_status`'s bytes verbatim).
+pub fn llm_selector_slash_text(args: &str) -> Result<String, String> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     let sub = parts.first().copied().unwrap_or("status");
 
@@ -26,10 +41,7 @@ pub fn llm_selector_slash(args: &str) -> Result<(), String> {
         "enable" => cmd_enable(&engine),
         "disable" => cmd_disable(&engine),
         "refresh" => cmd_refresh(&engine),
-        "help" | "-h" | "--help" => {
-            cmd_help();
-            Ok(())
-        }
+        "help" | "-h" | "--help" => Ok(cmd_help()),
         _ => Err(format!(
             "unknown subcommand '{}'. Run /llm-selector help.",
             sub
@@ -206,50 +218,54 @@ fn build_engine() -> SelectorEngine {
     engine
 }
 
-fn cmd_status(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_status(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let q = SelectorQuery::new(engine);
     let report = q.status();
-    print!("{}", render_status(&report));
-    Ok(())
+    // Verbatim render_status bytes — the old printer used `print!` with no
+    // added newline, so neither do we.
+    Ok(render_status(&report))
 }
 
-fn cmd_pool(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_pool(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
+    let mut out = String::new();
     let q = SelectorQuery::new(engine);
     let pool = q.pool();
     if pool.is_empty() {
-        println!("Candidate pool is empty (no catalog-exposing provider active).");
+        out.push_str("Candidate pool is empty (no catalog-exposing provider active).\n");
     } else {
-        println!("Candidate pool ({} models):", pool.len());
+        out.push_str(&format!("Candidate pool ({} models):\n", pool.len()));
         for m in &pool {
-            println!(
-                "  {:<30} {:<12} ctx={:<6} {:<10} {}{}",
+            out.push_str(&format!(
+                "  {:<30} {:<12} ctx={:<6} {:<10} {}{}\n",
                 m.id,
                 m.tier,
                 m.context_window / 1000,
                 m.provider,
                 if m.supports_tools { "[tools]" } else { "" },
                 if m.supports_vision { "[vision]" } else { "" },
-            );
+            ));
         }
     }
-    Ok(())
+    Ok(out)
 }
 
-fn cmd_enable(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_enable(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let q = SelectorQuery::new(engine);
     q.enable();
-    println!("LLM Selector enabled. Select the 'auto' model to engage dynamic allocation.");
-    Ok(())
+    Ok(
+        "LLM Selector enabled. Select the 'auto' model to engage dynamic allocation.\n"
+            .to_string(),
+    )
 }
 
 /// `/llm-selector refresh` (T071, contracts/llm-selector-command.md row 11):
 /// force-refresh the candidate pool from the live catalog. Re-fetches using
 /// the active provider, replaces the pool, and reports the new size. Exits
 /// with an error (non-zero) when the refresh yields an empty pool (degraded).
-fn cmd_refresh(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_refresh(engine: &SelectorEngine) -> Result<String, String> {
     // Use the provider recorded at construction (handles the `auto` model case
     // where the model string has no vendor prefix).
     let provider = engine.provider();
@@ -268,16 +284,14 @@ fn cmd_refresh(engine: &SelectorEngine) -> Result<(), String> {
             provider
         ));
     }
-    println!("Candidate pool refreshed: {} models.", n);
-    Ok(())
+    Ok(format!("Candidate pool refreshed: {n} models.\n"))
 }
 
-fn cmd_disable(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_disable(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let q = SelectorQuery::new(engine);
     q.disable();
-    println!("LLM Selector disabled. Using the configured model for all modules.");
-    Ok(())
+    Ok("LLM Selector disabled. Using the configured model for all modules.\n".to_string())
 }
 
 /// Parse a module argument using ModuleId::parse (contracts/llm-selector-command.md
@@ -287,14 +301,15 @@ fn parse_module(s: Option<&str>) -> Result<joey_llm_selector::ModuleId, String> 
     joey_llm_selector::ModuleId::parse(s)
 }
 
-fn cmd_allocations(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_allocations(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
+    let mut out = String::new();
     let q = SelectorQuery::new(engine);
     let report = q.status();
     if report.entries.is_empty() {
-        println!("No allocations yet (selector has not resolved any modules).");
+        out.push_str("No allocations yet (selector has not resolved any modules).\n");
     } else {
-        println!("Allocation map:");
+        out.push_str("Allocation map:\n");
         for e in &report.entries {
             let flags = match (e.pinned, e.implicit_pin) {
                 (true, _) => " [pinned]",
@@ -306,22 +321,22 @@ fn cmd_allocations(engine: &SelectorEngine) -> Result<(), String> {
                 .map(|p| format!(" p_j={:.2}", p))
                 .unwrap_or_default();
             let updated = e.updated_at.as_deref().unwrap_or("");
-            println!(
-                "  {:<14} -> {:<24}{}{}",
+            out.push_str(&format!(
+                "  {:<14} -> {:<24}{}{}\n",
                 e.module, e.model_id, flags, perf
-            );
+            ));
             if !e.reason.is_empty() {
-                println!("                 reason: {}", e.reason);
+                out.push_str(&format!("                 reason: {}\n", e.reason));
             }
             if !updated.is_empty() {
-                println!("                 updated: {}", updated);
+                out.push_str(&format!("                 updated: {}\n", updated));
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
-fn cmd_diagnostics(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
+fn cmd_diagnostics(engine: &SelectorEngine, args: &[&str]) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     // Parse optional `-n <count>`.
     let mut limit: usize = 20;
@@ -341,24 +356,25 @@ fn cmd_diagnostics(engine: &SelectorEngine, args: &[&str]) -> Result<(), String>
     }
     let q = SelectorQuery::new(engine);
     let rows = q.diagnostics(limit);
+    let mut out = String::new();
     if rows.is_empty() {
-        println!("No diagnostics recorded.");
+        out.push_str("No diagnostics recorded.\n");
     } else {
-        println!("Diagnostics (last {}):", rows.len());
+        out.push_str(&format!("Diagnostics (last {}):\n", rows.len()));
         for d in &rows {
-            println!(
-                "  [{}] module={} signal={} model={}",
+            out.push_str(&format!(
+                "  [{}] module={} signal={} model={}\n",
                 d.at, d.module, d.signal, d.implicated_model
-            );
+            ));
             if !d.rationale.is_empty() {
-                println!("         {}", d.rationale);
+                out.push_str(&format!("         {}\n", d.rationale));
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
-fn cmd_pin(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
+fn cmd_pin(engine: &SelectorEngine, args: &[&str]) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let module = parse_module(args.first().copied())?;
     let model_id = args
@@ -367,20 +383,20 @@ fn cmd_pin(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
         .to_string();
     let q = SelectorQuery::new(engine);
     q.pin(module, model_id.clone())?;
-    println!("Pinned module to model '{}'. Exempt from reallocation.", model_id);
-    Ok(())
+    Ok(format!(
+        "Pinned module to model '{model_id}'. Exempt from reallocation.\n"
+    ))
 }
 
-fn cmd_unpin(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
+fn cmd_unpin(engine: &SelectorEngine, args: &[&str]) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let module = parse_module(args.first().copied())?;
     let q = SelectorQuery::new(engine);
     q.unpin(&module)?;
-    println!("Unpinned module {}.", module);
-    Ok(())
+    Ok(format!("Unpinned module {module}.\n"))
 }
 
-fn cmd_budget(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
+fn cmd_budget(engine: &SelectorEngine, args: &[&str]) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let n_str = args
         .first()
@@ -392,14 +408,13 @@ fn cmd_budget(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
     let q = SelectorQuery::new(engine);
     q.set_budget(n);
     if n == 0 {
-        println!("Learning budget set to 0 — learning disabled (routing from cold-start map only).");
+        Ok("Learning budget set to 0 — learning disabled (routing from cold-start map only).\n".to_string())
     } else {
-        println!("Learning budget set to {}.", n);
+        Ok(format!("Learning budget set to {n}.\n"))
     }
-    Ok(())
 }
 
-fn cmd_diagnoser(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
+fn cmd_diagnoser(engine: &SelectorEngine, args: &[&str]) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     // No args: show current diagnoser model.
     if args.is_empty() {
@@ -410,37 +425,43 @@ fn cmd_diagnoser(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
         } else {
             &report.diagnoser_model
         };
-        println!("Diagnoser model: {}", m);
-        return Ok(());
+        return Ok(format!("Diagnoser model: {m}\n"));
     }
     // Otherwise: set the diagnoser model.
     let model_id = args[0];
     let q = SelectorQuery::new(engine);
     q.set_diagnoser_model(model_id)?;
-    println!("Diagnoser model set to '{}'.", model_id);
-    Ok(())
+    Ok(format!("Diagnoser model set to '{model_id}'.\n"))
 }
 
-fn cmd_help() {
-    println!("Usage: /llm-selector <subcommand>");
-    println!();
-    println!("Subcommands:");
-    println!("  status                 Show enabled/disabled state, pool size, diagnoser model");
-    println!("  pool                   List all candidate models in the active catalog");
-    println!("  allocations            Print the full allocation map (per module -> model)");
-    println!("  diagnostics [-n <n>]   Print the last N diagnoser judgments (default 20)");
-    println!("  pin <module> <model>   Pin a module to a model; exempt from reallocation");
-    println!("  unpin <module>         Remove a user pin");
-    println!("  budget <n>             Set the learning budget (0 disables learning)");
-    println!("  diagnoser [<model>]    Show or set the diagnoser model (versatile tier only)");
-    println!("  enable                 Enable dynamic allocation (engages when model is 'auto')");
-    println!("  disable                Disable dynamic allocation (fall back to configured model)");
-    println!("  refresh                Force-refresh the candidate pool from the live catalog");
-    println!("  help                   Show this help message");
-    println!();
-    println!("Module argument: main_turn | compression | subagent | custom:<name>");
-    println!();
-    println!("Alias: /llm-s (prefix abbreviation)");
+fn cmd_help() -> String {
+    let lines = [
+        "Usage: /llm-selector <subcommand>",
+        "",
+        "Subcommands:",
+        "  status                 Show enabled/disabled state, pool size, diagnoser model",
+        "  pool                   List all candidate models in the active catalog",
+        "  allocations            Print the full allocation map (per module -> model)",
+        "  diagnostics [-n <n>]   Print the last N diagnoser judgments (default 20)",
+        "  pin <module> <model>   Pin a module to a model; exempt from reallocation",
+        "  unpin <module>         Remove a user pin",
+        "  budget <n>             Set the learning budget (0 disables learning)",
+        "  diagnoser [<model>]    Show or set the diagnoser model (versatile tier only)",
+        "  enable                 Enable dynamic allocation (engages when model is 'auto')",
+        "  disable                Disable dynamic allocation (fall back to configured model)",
+        "  refresh                Force-refresh the candidate pool from the live catalog",
+        "  help                   Show this help message",
+        "",
+        "Module argument: main_turn | compression | subagent | custom:<name>",
+        "",
+        "Alias: /llm-s (prefix abbreviation)",
+    ];
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -715,5 +736,58 @@ mod tests {
         let pool = fetch_candidate_pool("ai-usage-hud");
         assert!(pool.is_empty());
         std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+    }
+
+    /// Render-only refactor (TUI transcript routing) regression: the
+    /// render-only entry point returns the exact bytes the old printers
+    /// emitted. The printing wrapper `llm_selector_slash` delegates here,
+    /// so the line-REPL and `joey llm-selector` CLI paths stay
+    /// byte-identical to the pre-refactor output.
+    #[test]
+    fn llm_selector_slash_text_matches_printer_output() {
+        let _g = TestEnvGuard::new();
+        // help: golden-ish full-shape check (one \n per line, exact ends).
+        let out = llm_selector_slash_text("help").expect("help renders");
+        assert!(out.starts_with("Usage: /llm-selector <subcommand>\n\nSubcommands:\n"));
+        assert!(
+            out.contains(
+                "  refresh                Force-refresh the candidate pool from the live catalog\n"
+            )
+        );
+        assert!(out.ends_with("Alias: /llm-s (prefix abbreviation)\n"));
+        assert_eq!(out.matches('\n').count(), out.lines().count());
+        // status: render_status bytes verbatim, non-empty.
+        assert!(!llm_selector_slash_text("status").unwrap().is_empty());
+    }
+
+    /// The guard pins home to a tempdir (empty models.dev cache, refused
+    /// copilot endpoints), so the pool is empty (FR-017) and `pool`
+    /// renders the empty-pool line exactly as the old println! did.
+    #[test]
+    fn llm_selector_slash_text_pool_empty_golden() {
+        let _g = TestEnvGuard::new();
+        assert_eq!(
+            llm_selector_slash_text("pool").unwrap(),
+            "Candidate pool is empty (no catalog-exposing provider active).\n"
+        );
+    }
+
+    /// enable/disable/diagnoser confirmations keep their exact bytes
+    /// (trailing newline included) for the printing wrapper's byte parity.
+    #[test]
+    fn llm_selector_slash_text_confirmation_lines_golden() {
+        let _g = TestEnvGuard::new();
+        assert_eq!(
+            llm_selector_slash_text("enable").unwrap(),
+            "LLM Selector enabled. Select the 'auto' model to engage dynamic allocation.\n"
+        );
+        assert_eq!(
+            llm_selector_slash_text("disable").unwrap(),
+            "LLM Selector disabled. Using the configured model for all modules.\n"
+        );
+        assert_eq!(
+            llm_selector_slash_text("diagnoser").unwrap(),
+            "Diagnoser model: (unset)\n"
+        );
     }
 }

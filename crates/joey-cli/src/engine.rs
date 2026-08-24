@@ -58,6 +58,10 @@ pub enum EngineCommand {
         announce: bool,
     },
     /// Cooperatively interrupt the running turn (Ctrl-C semantics).
+    /// Ignored (with a Notice) when no turn is running: a stale idle
+    /// store would poison the next turn (Agent::run_turn clears the
+    /// flag at start, then checks it shortly after — a true landing in
+    /// that window aborts a brand-new turn as "interrupted").
     Interrupt,
     /// Abandon the engine (UI kills + restarts with a fresh task/agent).
     ForceKill,
@@ -292,6 +296,18 @@ async fn engine_task(
 
         match cmd {
             EngineCommand::Submit { prompt, active_agent, announce } => {
+                // Idle→running transition, at the top of the arm: the actor
+                // loop is between futures here — no turn future exists and
+                // no mid-turn select can race us — so this is the atomic
+                // point to wipe any residual interrupt flag. A queued
+                // Submit is only popped AFTER the previous turn finished
+                // (its interrupt already consumed), so this never cancels
+                // a legit in-flight interrupt; it only removes poison set
+                // while idle (defense-in-depth: Agent::run_turn clears the
+                // flag at start and checks it shortly after, so a stale
+                // true landing in that window aborts a brand-new turn at
+                // birth). Covers the early-exit paths too.
+                interrupt.store(false, Ordering::SeqCst);
                 // Steer handle captured BEFORE the turn future borrows the
                 // agent — lets mid-turn Steer commands reach the running
                 // turn without touching the borrow.
@@ -352,8 +368,17 @@ async fn engine_task(
                         }
                         cmd = cmd_rx.recv() => {
                             match cmd {
-                                Some(EngineCommand::Interrupt)
-                                | Some(EngineCommand::ForceKill) => {
+                                Some(EngineCommand::Interrupt) => {
+                                    // Always mid-turn here (the turn future
+                                    // is being polled in this select).
+                                    match interrupt_action_for(true) {
+                                        InterruptAction::Signal => {
+                                            interrupt.store(true, Ordering::SeqCst);
+                                        }
+                                        InterruptAction::Ignore => {}
+                                    }
+                                }
+                                Some(EngineCommand::ForceKill) => {
                                     // Cooperative interrupt. ForceKill is the
                                     // same for the engine; the UI additionally
                                     // abandons the handle and spawns a fresh
@@ -569,7 +594,24 @@ async fn engine_task(
                 }
             }
             EngineCommand::Interrupt => {
-                interrupt.store(true, Ordering::SeqCst);
+                // Idle path (no turn future is being polled — mid-turn
+                // Interrupts are consumed by the Submit arm's select and
+                // never reach the local queue). A turn-less Interrupt must
+                // NOT store the flag: Agent::run_turn clears it at start
+                // and checks it shortly after, so a stale true poisons the
+                // NEXT turn (born interrupted — "the agent interrupted
+                // itself"). Acknowledge instead, matching the heavy-job
+                // arm's notice style.
+                match interrupt_action_for(false) {
+                    InterruptAction::Signal => {
+                        interrupt.store(true, Ordering::SeqCst);
+                    }
+                    InterruptAction::Ignore => {
+                        let _ = event_tx.send(EngineEvent::Notice(
+                            "⚡ no turn running — interrupt ignored.".into(),
+                        ));
+                    }
+                }
             }
             EngineCommand::ReloadHistory => {
                 // /undo rewound the DB — mirror it into the live agent.
@@ -623,10 +665,46 @@ async fn engine_task(
     }
 }
 
+/// How the engine actor reacts to an Interrupt-family command, given
+/// whether a turn is currently executing. Pure decision — unit-tested;
+/// the actor loop sites (mid-turn select arm, idle top-level arm) both
+/// route through [`interrupt_action_for`].
+///
+/// Stale-interrupt poisoning (the bug this gates): the interrupt flag is
+/// Arc-shared with the Agent, and `Agent::run_turn` clears it at start
+/// then first checks it shortly after. An Interrupt stored while NO turn
+/// is running therefore sits latent and, if a Submit lands in the
+/// clear→check window (queued/delayed command, then a submit), the
+/// brand-new turn is instantly "interrupted" — the agent appears to
+/// interrupt itself. Gating idle Interrupts to `Ignore` (plus clearing
+/// the flag at the idle→running transition as defense-in-depth) removes
+/// the engine-side poison path.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum InterruptAction {
+    /// Set the shared flag: a turn is live and must cooperatively unwind.
+    Signal,
+    /// No turn is running: dropping the request (a Notice is emitted by
+    /// the caller). Storing would poison the next turn.
+    Ignore,
+}
+
+/// Decision for an Interrupt command arriving at the engine actor.
+/// `turn_running` is true only while a Submit's turn future is being
+/// polled (the idle top-level arm and the between-commands path pass
+/// false). ForceKill is NOT routed here: it must stay effective from any
+/// state (the task then exits and the UI builds a fresh engine/agent).
+pub(crate) fn interrupt_action_for(turn_running: bool) -> InterruptAction {
+    if turn_running {
+        InterruptAction::Signal
+    } else {
+        InterruptAction::Ignore
+    }
+}
+
 /// The heavy-job dispatch table. ONLY blocking, CPU-bound handlers live
-/// here; anything that mutates TUI state is a light command handled by the
-/// UI directly. `live_provider` scopes NeuroCode tier resolution to the
-/// agent's actual provider.
+/// here; anything that mutates TUI state is a light command handled by
+/// the UI directly. `live_provider` scopes NeuroCode tier resolution to
+/// the agent's actual provider.
 fn run_heavy_job(label: &str, args: &str, live_provider: &str) -> String {
     match label {
         "neurocode" => crate::commands::neurocode::neurocode_slash_provider_scoped_text(
@@ -856,6 +934,16 @@ mod tests {
     #[test]
     fn heavy_job_unknown_label_answers_honestly() {
         assert!(run_heavy_job("nope", "", "zai").contains("unknown heavy job"));
+    }
+
+    #[test]
+    fn interrupt_action_signals_only_during_a_live_turn() {
+        // Mid-turn (turn future being polled): the flag must be stored.
+        assert_eq!(interrupt_action_for(true), InterruptAction::Signal);
+        // Idle: storing would poison the next turn (run_turn clears the
+        // flag at start, then checks it shortly after — a stale true in
+        // that window aborts a brand-new turn at birth).
+        assert_eq!(interrupt_action_for(false), InterruptAction::Ignore);
     }
 }
 
@@ -1246,6 +1334,98 @@ mod actor_tests {
             }
             assert!(saw_finished_at.is_some(), "{tag}: TurnFinished never arrived");
         }
+    }
+
+    /// Regression (stale-interrupt poisoning): an Interrupt arriving while
+    /// NO turn is running must not poison the NEXT turn. Pre-fix, the idle
+    /// top-level arm did `interrupt.store(true)` unconditionally; the flag
+    /// is Arc-shared with the Agent, whose run_turn clears it at start and
+    /// first checks it shortly after — so a Submit landing in that window
+    /// was born interrupted ("the agent interrupted itself"). Post-fix the
+    /// idle arm ignores the request with a Notice, and the idle→running
+    /// transition additionally clears any residual flag (defense-in-depth
+    /// against non-engine sources like the UI's shared Arc).
+    #[tokio::test]
+    async fn idle_interrupt_does_not_poison_next_turn() {
+        let _env_guard = TestEnvGuard::new();
+        let spec = unauth_spec("engstale");
+        let agent = spec.build_agent().expect("agent builds");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, interrupt) = spawn_engine(agent, spec, ev_tx);
+
+        // 1) Idle: send Interrupt. The engine must NOT store the flag.
+        handle.send(EngineCommand::Interrupt);
+        let mut saw_ignored_notice = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !saw_ignored_notice && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::Notice(text)) => {
+                    assert!(
+                        text.contains("no turn running"),
+                        "unexpected notice while idle: {text}"
+                    );
+                    saw_ignored_notice = true;
+                }
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        assert!(saw_ignored_notice, "idle Interrupt acknowledged");
+        assert!(
+            !interrupt.load(Ordering::SeqCst),
+            "engine must not store the interrupt flag while no turn is running"
+        );
+
+        // 2) Even a flag poisoned by a NON-engine source (the UI holds the
+        // same Arc) must be wiped at the idle→running transition: poison
+        // directly, then Submit, and require a clean (not interrupted)
+        // outcome. Unauthenticated provider → the Submit arm's early-exit
+        // path fires (no run_turn call), which pre-fix would have left the
+        // poison flag set for the NEXT credentialed turn; post-fix the
+        // arm-top clear wipes it before the early exit can skip it.
+        interrupt.store(true, Ordering::SeqCst);
+        handle.send(EngineCommand::Submit {
+            prompt: "hello".into(),
+            active_agent: "default".into(),
+            announce: false,
+        });
+        let mut finished = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while finished.is_none() && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::TurnFinished { interrupted, .. }) => {
+                    finished = Some(interrupted);
+                }
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        let interrupted = finished.expect("turn finished after idle interrupt");
+        assert!(
+            !interrupted,
+            "turn born after an idle-time interrupt must NOT be interrupted"
+        );
+        assert!(
+            !interrupt.load(Ordering::SeqCst),
+            "flag is clean after the turn"
+        );
+
+        // 3) The engine stays alive and a further turn still completes.
+        handle.send(EngineCommand::Submit {
+            prompt: "again".into(),
+            active_agent: "default".into(),
+            announce: false,
+        });
+        let mut second = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !second && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::TurnFinished { .. }) => second = true,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        assert!(second, "engine survived the stale-interrupt scenario");
     }
 
     /// Regression (try_recv race fix): a command arriving right as the

@@ -1172,7 +1172,7 @@ mod tests {
                 pass_session_id: false,
                 model_pinned: false,
             },
-            config: joey_core::Config::default(),
+            config: joey_core::Config::defaults(),
             base_registry: ToolRegistry::new(),
             manager: Arc::new(SubagentManager::new(
                 joey_orchestration::ManagerConfig::default(),
