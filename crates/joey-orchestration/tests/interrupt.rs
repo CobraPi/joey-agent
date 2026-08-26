@@ -20,6 +20,7 @@ fn make_agent_config() -> AgentConfig {
         max_tokens: None,
         stream: false,
         pass_session_id: false,
+        model_pinned: false,
     }
 }
 
@@ -51,6 +52,7 @@ async fn pre_signaled_interrupt_propagates_to_batch_results() {
             context: None,
             model: None,
             toolsets: vec![],
+            role: None,
         },
     ];
 

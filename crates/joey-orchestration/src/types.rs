@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use joey_providers::Usage;
+use joey_providers::{ReasoningEffort, Usage};
 use serde::{Deserialize, Serialize};
 
 /// Whether a subagent can delegate further (Leaf) or spawn its own children
@@ -27,6 +27,11 @@ pub struct TaskSpec {
     pub model: Option<String>,
     #[serde(default)]
     pub toolsets: Vec<String>,
+    /// HyperCode role routing ("explorer" | "implementor"): fills toolsets/
+    /// model/turns from the role's config table (gaps only) and injects the
+    /// role directive. Optional.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// A request from the parent agent (or user) to dispatch one or more
@@ -45,6 +50,11 @@ pub struct DelegationRequest {
     pub toolsets: Vec<String>,
     /// Override iteration budget.
     pub max_turns: Option<usize>,
+    /// Override the child's reasoning effort (HyperCode per-role levels).
+    /// None inherits the parent's `AgentConfig.reasoning`.
+    pub reasoning: Option<ReasoningEffort>,
+    /// Override the child's max output tokens. None inherits the parent's.
+    pub max_tokens: Option<u32>,
     /// Persist subagent trace to session DB.
     pub persist: bool,
     /// Leaf (default) or Orchestrator.
@@ -76,6 +86,8 @@ impl DelegationRequest {
             model: None,
             toolsets: Vec::new(),
             max_turns: None,
+            reasoning: None,
+            max_tokens: None,
             persist: false,
             role: SubagentRole::Leaf,
             workdir: None,

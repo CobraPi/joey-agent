@@ -29,6 +29,10 @@ model:
   default: "glm-5.2"
   provider: "zai"
   base_url: ""
+  # Dedicated image-capable model for webpage/screenshot understanding
+  # (feature 016, FR-015). Unset = resolve via provider default → primary
+  # if vision-capable. Per-provider override: providers.<id>.image_model.
+  image_model: ""
 agent:
   max_turns: 90
   reasoning_overrides: {}
@@ -38,6 +42,11 @@ terminal:
   backend: "local"
   cwd: "."
   timeout: 180
+  # Max concurrently executing agent-initiated terminal commands
+  # (feature 018). "auto" = clamp(CPU cores, 4, 16); a positive
+  # integer pins the cap. Env TERMINAL_MAX_CONCURRENT overrides,
+  # mirroring TERMINAL_TIMEOUT.
+  max_concurrent: auto
 toolsets:
   - "joey-cli"
 compression:
@@ -70,7 +79,7 @@ skills:
   external_dirs: []
 delegation:
   max_iterations: 50
-  max_concurrent_children: 3
+  max_concurrent_children: auto
   max_spawn_depth: 1
 code_execution:
   mode: "project"
@@ -100,11 +109,16 @@ logging:
 timezone: ""
 cron:
   provider: ""
+hypercode:
+  enabled: false
+  max_workstreams: 0
+  explorer: {}
+  implementor: {}
 _config_version: 33
 "#;
 
 /// Config schema version written on save (upstream `_config_version`).
-pub const CONFIG_VERSION: i64 = 33;
+pub const CONFIG_VERSION: i64 = 34;
 
 static DEFAULTS: Lazy<Value> = Lazy::new(|| {
     // SAFETY: DEFAULT_CONFIG_YAML is a compile-time constant; if it were
@@ -1013,10 +1027,17 @@ fn load_dotenv_file(path: &Path, override_existing: bool) {
 /// Strip non-ASCII characters from credential env vars in the process env
 /// (env_loader.py:118-159). Warns once per key on stderr.
 fn sanitize_loaded_credentials() {
-    for (key, value) in std::env::vars() {
+    // Use vars_os(): vars() panics if any environment variable holds
+    // non-UTF-8 data, and this runs on every CLI startup.
+    for (key_os, value_os) in std::env::vars_os() {
+        let key = match key_os.to_str() {
+            Some(k) => k.to_string(),
+            None => continue, // non-UTF-8 key can't match a credential suffix
+        };
         if !CREDENTIAL_SUFFIXES.iter().any(|s| key.ends_with(s)) {
             continue;
         }
+        let value = value_os.to_string_lossy();
         if value.is_ascii() {
             continue;
         }
@@ -1341,7 +1362,11 @@ pub fn remove_env_value(key: &str) -> Result<bool> {
         return Ok(false);
     }
     let raw = std::fs::read(&env_path).unwrap_or_default();
-    let text = String::from_utf8_lossy(&raw).to_string();
+    // Strip a UTF-8 BOM so the first KEY= line is recognized (save_env_value
+    // already does this; without it a BOM-prefixed key silently survived
+    // removal and the stale credential stayed on disk).
+    let body = raw.strip_prefix(b"\xef\xbb\xbf".as_slice()).unwrap_or(&raw);
+    let text = String::from_utf8_lossy(body).to_string();
     let lines: Vec<String> = text.split_inclusive('\n').map(|s| s.to_string()).collect();
     let kept: Vec<String> = lines
         .iter()
@@ -1402,6 +1427,80 @@ mod tests {
     }
 
     #[test]
+
+    // ── Feature 016 (FR-015/FR-016): image-model config keys ──
+
+    #[test]
+    fn image_model_keys_default_unset() {
+        let cfg = Config::defaults();
+        assert_eq!(cfg.get_str("model.image_model", ""), "");
+    }
+
+    #[test]
+    fn image_model_per_provider_wins_over_global() {
+        let cfg = cfg_from(
+            "model:\n  image_model: global-vlm\nproviders:\n  zai:\n    image_model: zai-vlm\n",
+        );
+        assert_eq!(cfg.get_str("model.image_model", ""), "global-vlm");
+        assert_eq!(cfg.get_str("providers.zai.image_model", ""), "zai-vlm");
+    }
+
+    #[test]
+    fn image_model_keys_not_env_routed() {
+        // Model names are not secrets: they must stay in config.yaml space,
+        // never auto-routed to .env.
+        assert!(!is_env_config_key("model.image_model"));
+        assert!(!is_env_config_key("providers.zai.image_model"));
+    }
+
+    // ── Feature 018: terminal.max_concurrent config key ──
+
+    #[test]
+    fn terminal_max_concurrent_defaults_to_auto() {
+        // Default merge must surface the key as the string "auto"
+        // (auto-derived limit = clamp(CPU cores, 4, 16)); consumers
+        // resolve it via get_i64(..., 0) with 0 meaning auto.
+        let cfg = Config::defaults();
+        assert_eq!(cfg.get_str("terminal.max_concurrent", ""), "auto");
+        // The rest of the terminal block is untouched.
+        assert_eq!(cfg.get_str("terminal.backend", ""), "local");
+        assert_eq!(cfg.get_i64("terminal.timeout", 0), 180);
+    }
+
+    #[test]
+    fn terminal_max_concurrent_invalid_value_falls_back_to_auto() {
+        // Contract (specs/018-please-fully-implement/contracts/config.md):
+        // an invalid value resolves to auto, using ONLY existing machinery —
+        // no per-key fallback or warning code is added for this key. Two
+        // already-existing paths provide the fallback:
+        //
+        // 1. Valid YAML carrying a malformed VALUE: the raw string survives
+        //    the merge untouched (no silent load-time coercion), and the
+        //    established consumer read pattern
+        //    get_i64("terminal.max_concurrent", 0) hits
+        //    value_as_i64 → None → default 0 — the auto sentinel (see
+        //    terminal_max_concurrent_defaults_to_auto; consumers map <= 0
+        //    to auto, mirroring delegation.max_concurrent_children). A
+        //    negative number likewise resolves to <= 0 at the consumer.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "terminal:\n  max_concurrent: not-a-number\n").unwrap();
+        let cfg = Config::load_from(path).unwrap();
+        // The malformed raw value is preserved in the merged tree...
+        assert_eq!(cfg.get_str("terminal.max_concurrent", ""), "not-a-number");
+        // ...but the typed consumer read falls back to 0 (= auto).
+        assert_eq!(cfg.get_i64("terminal.max_concurrent", 0), 0);
+
+        // 2. Whole-file malformed YAML: the existing warn_config_parse_failure
+        //    / last-known-good path (config.rs load_from, port of
+        //    config.py:7345-7397) serves the defaults, whose terminal block
+        //    pins max_concurrent: auto.
+        let bad = dir.path().join("broken.yaml");
+        std::fs::write(&bad, ":\n  - [unbalanced:\n    bracket:\n").unwrap();
+        let cfg = Config::load_from(bad).unwrap();
+        assert_eq!(cfg.get_str("terminal.max_concurrent", ""), "auto");
+    }
+
     fn defaults_match_upstream() {
         let cfg = Config::defaults();
         // Local deviation: upstream ships model.default "" + provider "auto"
@@ -1493,7 +1592,7 @@ mod tests {
         assert!(map.contains_key(skey("agent")));
         assert!(map.contains_key(skey("_config_version")));
         assert_eq!(map.len(), 3, "no default contamination: {:?}", map);
-        assert_eq!(doc["_config_version"].as_i64(), Some(33));
+        assert_eq!(doc["_config_version"].as_i64(), Some(crate::config::CONFIG_VERSION));
         assert_eq!(doc["agent"]["max_turns"].as_i64(), Some(42));
 
         // Round-trip: reload sees merged values.
@@ -1695,6 +1794,30 @@ mod tests {
         let cfg = Config::load_from(path.clone()).unwrap();
         assert_eq!(cfg.get_i64("agent.max_turns", 0), 90, "exactly \"1\" ignores user config");
         std::env::remove_var("JOEY_IGNORE_USER_CONFIG");
+    }
+
+    #[test]
+    fn remove_env_value_strips_bom_and_removes_key() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home_lock = crate::constants::TEST_HOME_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _home = crate::constants::HomeOverrideGuard::new(std::env::temp_dir().join(format!(
+            "joey-core-audit-{}-{}",
+            std::process::id(),
+            line!()
+        )));
+        let envfile = crate::constants::env_path();
+        std::fs::create_dir_all(envfile.parent().unwrap()).unwrap();
+        // UTF-8 BOM before the first KEY (written by Windows editors);
+        // save_env_value strips it, remove_env_value previously did not, so
+        // the first line was never recognized and the key silently survived.
+        std::fs::write(&envfile, b"\xef\xbb\xbfJOEY_TEST_RM_TOKEN=supersecret\nOTHER=1\n").unwrap();
+        assert!(remove_env_value("JOEY_TEST_RM_TOKEN").unwrap());
+        let text = std::fs::read_to_string(&envfile).unwrap();
+        assert!(!text.contains("JOEY_TEST_RM_TOKEN"), "key removed: {}", text);
+        assert!(text.contains("OTHER=1"), "other keys survive: {}", text);
+        let _ = std::fs::remove_file(&envfile);
     }
 
     // -----------------------------------------------------------------

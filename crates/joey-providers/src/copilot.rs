@@ -50,6 +50,10 @@ impl CachedToken {
 #[derive(Debug)]
 pub struct CopilotAuth {
     raw_token: String,
+    /// Endpoint pinned at construction (a non-githubcopilot.com base-URL
+    /// override on the copilot profile). Takes precedence over the
+    /// `COPILOT_API_BASE_URL` env var and disables token exchange.
+    pinned_endpoint: Option<String>,
     cached: Mutex<CachedToken>,
 }
 
@@ -57,6 +61,16 @@ impl CopilotAuth {
     pub fn new(raw_token: String) -> Self {
         Self {
             raw_token,
+            pinned_endpoint: None,
+            cached: Mutex::new(CachedToken::default()),
+        }
+    }
+
+    /// Construct with an endpoint pinned (custom Copilot-compatible proxy).
+    pub fn with_endpoint(raw_token: String, endpoint: String) -> Self {
+        Self {
+            raw_token,
+            pinned_endpoint: Some(endpoint),
             cached: Mutex::new(CachedToken::default()),
         }
     }
@@ -68,6 +82,13 @@ impl CopilotAuth {
 
     pub fn has_raw_token(&self) -> bool {
         !self.raw_token.is_empty()
+    }
+
+    /// The raw GitHub credential this auth was constructed with (used when a
+    /// custom Copilot-compatible endpoint is pinned — the proxy accepts the
+    /// raw credential directly).
+    pub fn raw_token(&self) -> &str {
+        &self.raw_token
     }
 
     pub fn invalidate(&self) {
@@ -95,6 +116,21 @@ impl CopilotAuth {
         &self,
         http: &reqwest::Client,
     ) -> Result<CopilotCredentials, ProviderError> {
+        // Custom Copilot-compatible endpoint (local reverse proxy): skip the
+        // GitHub token exchange entirely. The proxy accepts the raw GitHub
+        // credential and owns upstream auth/refresh — exchanging here would
+        // derive api.githubcopilot.com and silently bypass the proxy.
+        if let Some(endpoint) = self
+            .pinned_endpoint
+            .clone()
+            .or_else(custom_endpoint)
+        {
+            return Ok(CopilotCredentials {
+                token: self.raw_token.clone(),
+                base_url: endpoint,
+                expires_at: now_epoch() + 1800,
+            });
+        }
         if let Ok(guard) = self.cached.lock() {
             if guard.is_valid() {
                 return Ok(CopilotCredentials {
@@ -280,6 +316,81 @@ fn exchange_base_url(data: &Value, token: &str) -> Option<String> {
         return Some(endpoint.to_string());
     }
     derive_base_url_from_proxy_ep(token)
+}
+
+/// An explicit custom Copilot-compatible endpoint (e.g. a local reverse proxy
+/// that captures token usage), set via `COPILOT_API_BASE_URL` (copilot
+/// profile) or `AI_USAGE_HUD_BASE_URL` (ai-usage-hud profile) and pointing at
+/// a host that is NOT `api.githubcopilot.com`.
+///
+/// When active, ALL Copilot traffic — the model catalog AND every
+/// chat/responses/messages request — is sent to this endpoint with the RAW
+/// GitHub credential (no token exchange): the proxy owns upstream auth,
+/// token refresh, and usage capture. It also acts as a routing magnet for
+/// `resolve_profile`: every auto-resolved model (any vendor prefix/family)
+/// is served by the proxy through a copilot-wire profile, so the agent can
+/// see and freely switch between every model the proxy exposes.
+pub fn custom_endpoint() -> Option<String> {
+    if let Some(value) = explicit_custom_endpoint() {
+        return Some(value);
+    }
+    hud_endpoint()
+}
+
+/// `COPILOT_API_BASE_URL` explicitly set to an off-githubcopilot host —
+/// WITHOUT the HUD fallback that [`custom_endpoint`] applies. Callers that
+/// must distinguish "the user pinned a proxy" (a routing contract: magnetize
+/// EVERYTHING) from "the HUD is configured" (observability: magnetize only
+/// models Copilot can actually serve) use this.
+pub fn explicit_custom_endpoint() -> Option<String> {
+    std::env::var("COPILOT_API_BASE_URL")
+        .ok()
+        .as_deref()
+        .and_then(off_githubcopilot_host)
+}
+
+/// The AI Usage HUD reverse-proxy endpoint (`AI_USAGE_HUD_BASE_URL`), when it
+/// points somewhere usable. Activates the same custom-endpoint mode as
+/// `COPILOT_API_BASE_URL` but binds the resolution to the `ai-usage-hud`
+/// profile.
+pub fn hud_endpoint() -> Option<String> {
+    std::env::var("AI_USAGE_HUD_BASE_URL")
+        .ok()
+        .as_deref()
+        .and_then(off_githubcopilot_host)
+}
+
+/// Probe the AI Usage HUD proxy's `/api/health` endpoint. Ok(()) on a healthy
+/// proxy; Err(human-readable diagnosis) otherwise. Used by the setup wizard
+/// to fail fast with a clear remediation message.
+pub fn hud_health_check(base_url: &str, timeout: Duration) -> Result<(), String> {
+    let url = format!("{}/api/health", base_url.trim_end_matches('/'));
+    let response = ureq::get(&url)
+        .timeout(timeout)
+        .call()
+        .map_err(|e| format!("cannot reach the AI Usage HUD proxy at {base_url}: {e}"))?;
+    if response.status() == 200 {
+        Ok(())
+    } else {
+        Err(format!(
+            "AI Usage HUD proxy at {base_url} returned status {}",
+            response.status()
+        ))
+    }
+}
+
+/// Normalize a base-URL override and reject the real Copilot endpoints (a
+/// plain override of the real endpoint keeps the exchange flow).
+fn off_githubcopilot_host(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let host = joey_core::utils::base_url_hostname(&trimmed).to_ascii_lowercase();
+    if host == "api.githubcopilot.com" || host.ends_with(".githubcopilot.com") {
+        return None;
+    }
+    Some(trimmed)
 }
 
 pub fn derive_base_url_from_proxy_ep(token: &str) -> Option<String> {
@@ -515,10 +626,76 @@ pub fn fallback_models() -> Vec<String> {
 /// Fetch the authenticated Copilot model catalog for setup/model selection.
 /// This is intentionally synchronous because the numbered setup wizard is a
 /// synchronous TTY flow, matching Hermes' urllib implementation.
+///
+/// Results are cached in-process for 60 seconds: `build_client` consults the
+/// catalog on every Copilot client construction (model → API-mode routing),
+/// and the OMO model set + llm-selector pool fetch it too — without the cache
+/// every model switch would re-fetch `/models`.
 pub fn fetch_model_catalog(timeout: Duration) -> Result<Vec<Value>, ProviderError> {
+    {
+        let guard = CATALOG_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((items, at)) = guard.as_ref() {
+            if at.elapsed() < CATALOG_CACHE_TTL && !items.is_empty() {
+                return Ok(items.clone());
+            }
+        }
+    }
+    match fetch_model_catalog_uncached(timeout) {
+        Ok(items) => {
+            if !items.is_empty() {
+                *CATALOG_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((items.clone(), std::time::Instant::now()));
+            }
+            Ok(items)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// In-process catalog cache: (items, fetched-at). See `fetch_model_catalog`.
+static CATALOG_CACHE: Mutex<Option<(Vec<Value>, std::time::Instant)>> =
+    Mutex::new(None);
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Peek at the cached catalog WITHOUT fetching. Returns the cached entries
+/// regardless of TTL (a slightly-stale endpoint list is still a better
+/// routing signal than none) or an empty vec when never fetched.
+///
+/// Use this from per-request routing paths (`effective_api_mode`) where a
+/// blocking HTTP fetch would stall the async runtime; `fetch_model_catalog`
+/// (called at client-build time) keeps the cache warm.
+pub fn peek_model_catalog() -> Vec<Value> {
+    CATALOG_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(items, _)| items.clone())
+        .unwrap_or_default()
+}
+
+fn fetch_model_catalog_uncached(timeout: Duration) -> Result<Vec<Value>, ProviderError> {
     let (raw_token, _) = resolve_copilot_token()?;
     if raw_token.is_empty() {
         return Ok(Vec::new());
+    }
+    // Custom Copilot-compatible endpoint: fetch the catalog from the proxy
+    // with the raw GitHub credential — no exchange, no api.githubcopilot.com.
+    if let Some(base_url) = custom_endpoint() {
+        let mut request = ureq::get(&format!("{}/models", base_url.trim_end_matches('/')))
+            .set("Authorization", &format!("Bearer {raw_token}"));
+        for (name, value) in request_headers(true, false) {
+            request = request.set(name, &value);
+        }
+        let response = request
+            .timeout(timeout)
+            .call()
+            .map_err(|e| ProviderError::Connection(format!("Copilot model catalog failed: {e}")))?;
+        let payload: Value = response
+            .into_json()
+            .map_err(|e| ProviderError::Parse(e.to_string()))?;
+        return Ok(filter_catalog_items(payload));
     }
     let token_url = std::env::var("COPILOT_TOKEN_URL")
         .ok()
@@ -560,6 +737,14 @@ pub fn fetch_model_catalog(timeout: Duration) -> Result<Vec<Value>, ProviderErro
     let payload: Value = response
         .into_json()
         .map_err(|e| ProviderError::Parse(e.to_string()))?;
+    Ok(filter_catalog_items(payload))
+}
+
+/// Filter a raw `/models` payload (array or `{data: [...]}` envelope) down to
+/// usable chat models: non-empty id, picker-enabled (when flagged), chat
+/// type, at least one usable endpoint, deduplicated. Shared by the exchange
+/// path and the custom-endpoint path of `fetch_model_catalog`.
+fn filter_catalog_items(payload: Value) -> Vec<Value> {
     let items = payload
         .as_array()
         .cloned()
@@ -596,16 +781,26 @@ pub fn fetch_model_catalog(timeout: Duration) -> Result<Vec<Value>, ProviderErro
             result.push(item);
         }
     }
-    Ok(result)
+    result
 }
 
+/// Context-window size for a catalog entry: the full window the model can
+/// address. Prefers `capabilities.limits.max_context_window_tokens` (the
+/// true context window; `max_prompt_tokens` is a smaller prompt-only budget
+/// that under-reports e.g. Claude's 264k window as 200k) and falls back to
+/// `max_prompt_tokens` when the window field is absent (older catalogs).
 pub fn catalog_context_window(entry: &Value) -> Option<u64> {
-    entry
-        .get("capabilities")?
-        .get("limits")?
-        .get("max_prompt_tokens")?
-        .as_u64()
+    let limits = entry.get("capabilities")?.get("limits")?;
+    limits
+        .get("max_context_window_tokens")
+        .and_then(Value::as_u64)
         .filter(|value| *value > 0)
+        .or_else(|| {
+            limits
+                .get("max_prompt_tokens")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+        })
 }
 
 pub fn catalog_reasoning_efforts(entry: &Value) -> Vec<String> {
@@ -652,6 +847,105 @@ pub fn model_reasoning_efforts(model: &str, catalog_entry: Option<&Value>) -> Ve
 }
 
 #[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Test-env guard: serialize via TEST_ENV_LOCK, save the two endpoint env
+/// vars, clear them, and restore on drop. Prevents the DEVELOPER'S real
+/// environment (e.g. an exported AI_USAGE_HUD_BASE_URL) from leaking into
+/// endpoint-resolution assertions — the class of failure where tests pass
+/// on CI but fail on a configured machine (or vice versa). Field order
+/// matters: env restore happens in Drop BEFORE the lock releases.
+#[cfg(test)]
+pub(crate) struct EndpointEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    copilot: Option<String>,
+    hud: Option<String>,
+}
+
+#[cfg(test)]
+impl EndpointEnvGuard {
+    pub(crate) fn new() -> Self {
+        // TEST_ENV_LOCK is a static, so the guard's lifetime is 'static —
+        // no transmute needed. Held for the guard's life = env mutations
+        // stay serialized across tests.
+        let lock = TEST_ENV_LOCK.lock().unwrap();
+        let copilot = std::env::var("COPILOT_API_BASE_URL").ok();
+        let hud = std::env::var("AI_USAGE_HUD_BASE_URL").ok();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+        Self { _lock: lock, copilot, hud }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EndpointEnvGuard {
+    fn drop(&mut self) {
+        for (k, v) in [
+            ("COPILOT_API_BASE_URL", &self.copilot),
+            ("AI_USAGE_HUD_BASE_URL", &self.hud),
+        ] {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+/// Test-only catalog-cache guard: pre-seed `CATALOG_CACHE` with a fixture so
+/// `build_client`'s copilot-wire catalog consult is served from cache and
+/// never touches the network (on hosts with an IPv6 blackhole the real
+/// fetch stalls the full 5s timeout per attempt). Restores the prior cache
+/// state on drop. The caller must already hold `TEST_ENV_LOCK` so tests that
+/// peek the cache (`copilot_servable`, magnetization asserts) can't observe
+/// the fixture concurrently — they serialize on the same lock.
+#[cfg(test)]
+pub(crate) struct CatalogCacheGuard {
+    saved: Option<(Vec<Value>, std::time::Instant)>,
+}
+
+#[cfg(test)]
+impl CatalogCacheGuard {
+    /// Seed the cache with a non-empty, fresh fixture containing `model`.
+    pub(crate) fn seed(model: &str) -> Self {
+        Self::seed_with(model, json!({}))
+    }
+
+    /// Seed the cache with a fixture whose capabilities are merged over the
+    /// default shape (e.g. a custom `reasoning_effort` list).
+    pub(crate) fn seed_with(model: &str, capabilities: Value) -> Self {
+        let mut entry = json!({
+            "id": model,
+            "model_picker_enabled": true,
+            "supported_endpoints": ["/chat/completions"],
+        });
+        // Splice capabilities under capabilities.supports (the documented
+        // merge target for reasoning_effort lists).
+        let caps = capabilities.as_object().cloned().unwrap_or_default();
+        let supports = if caps.contains_key("reasoning_effort") {
+            json!({"supports": caps})
+        } else {
+            json!({"supports": {}})
+        };
+        entry
+            .as_object_mut()
+            .unwrap()
+            .insert("capabilities".into(), supports);
+        let mut guard = CATALOG_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = guard.take();
+        *guard = Some((vec![entry], std::time::Instant::now()));
+        Self { saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CatalogCacheGuard {
+    fn drop(&mut self) {
+        *CATALOG_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = self.saved.take();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -686,6 +980,15 @@ mod tests {
     fn derives_catalog_context_and_reasoning() {
         let entry = json!({"capabilities":{"limits":{"max_prompt_tokens":128000},"supports":{"reasoning_effort":["low","high"]}}});
         assert_eq!(catalog_context_window(&entry), Some(128000));
+        // Full window preferred over the smaller prompt-only budget.
+        let full = json!({"capabilities":{"limits":{"max_context_window_tokens":264000,"max_prompt_tokens":200000}}});
+        assert_eq!(catalog_context_window(&full), Some(264000));
+        // Invalid/zero window falls back to max_prompt_tokens.
+        let zero = json!({"capabilities":{"limits":{"max_context_window_tokens":0,"max_prompt_tokens":100000}}});
+        assert_eq!(catalog_context_window(&zero), Some(100000));
+        // No limits at all.
+        let none = json!({"capabilities":{"supports":{}}});
+        assert_eq!(catalog_context_window(&none), None);
         assert_eq!(
             model_reasoning_efforts("gpt-5.4", Some(&entry)),
             vec!["low", "high"]
@@ -709,5 +1012,115 @@ mod tests {
             model_api_mode("claude-opus-4.6", Some(&entry)),
             ApiMode::AnthropicMessages
         );
+    }
+
+    // ── Custom Copilot-compatible endpoint (reverse-proxy) ────────────────
+
+    #[test]
+    fn custom_endpoint_detects_off_githubcopilot_host() {
+        let _guard = EndpointEnvGuard::new();
+        std::env::set_var("COPILOT_API_BASE_URL", "http://127.0.0.1:8317");
+        assert_eq!(
+            custom_endpoint().as_deref(),
+            Some("http://127.0.0.1:8317")
+        );
+        std::env::remove_var("COPILOT_API_BASE_URL");
+    }
+
+    #[test]
+    fn custom_endpoint_ignores_real_copilot_host() {
+        let _guard = EndpointEnvGuard::new();
+        std::env::set_var("COPILOT_API_BASE_URL", "https://api.githubcopilot.com");
+        assert_eq!(custom_endpoint(), None);
+        std::env::set_var("COPILOT_API_BASE_URL", "https://proxy.enterprise.githubcopilot.com");
+        assert_eq!(custom_endpoint(), None);
+        std::env::remove_var("COPILOT_API_BASE_URL");
+    }
+
+    #[test]
+    fn custom_endpoint_ignores_empty_and_unset() {
+        let _guard = EndpointEnvGuard::new();
+        std::env::set_var("COPILOT_API_BASE_URL", "  ");
+        assert_eq!(custom_endpoint(), None);
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        assert_eq!(custom_endpoint(), None);
+    }
+
+    // ── AI Usage HUD endpoint (AI_USAGE_HUD_BASE_URL) ─────────────────────
+
+    #[test]
+    fn hud_endpoint_resolves_off_githubcopilot_host() {
+        let _guard = EndpointEnvGuard::new();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317/");
+        // Trailing slash trimmed; custom_endpoint() falls through to the HUD
+        // endpoint when COPILOT_API_BASE_URL is unset.
+        assert_eq!(hud_endpoint().as_deref(), Some("http://127.0.0.1:8317"));
+        assert_eq!(
+            custom_endpoint().as_deref(),
+            Some("http://127.0.0.1:8317")
+        );
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+    }
+
+    #[test]
+    fn copilot_env_var_takes_precedence_over_hud() {
+        let _guard = EndpointEnvGuard::new();
+        std::env::set_var("COPILOT_API_BASE_URL", "http://127.0.0.1:9999");
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317");
+        // custom_endpoint prefers COPILOT_API_BASE_URL.
+        assert_eq!(
+            custom_endpoint().as_deref(),
+            Some("http://127.0.0.1:9999")
+        );
+        // hud_endpoint still reports its own value (profile-scoped lookup).
+        assert_eq!(
+            hud_endpoint().as_deref(),
+            Some("http://127.0.0.1:8317")
+        );
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+    }
+
+    #[test]
+    fn hud_health_check_reports_unreachable_proxy() {
+        // Nothing listens on port 1 — the health check must fail cleanly
+        // (never panic, never hang).
+        let err = hud_health_check("http://127.0.0.1:1", Duration::from_millis(500))
+            .unwrap_err();
+        assert!(err.contains("cannot reach"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn pinned_endpoint_credentials_skip_exchange() {
+        // with_endpoint pins the proxy: credentials() returns the raw token
+        // and the pinned base URL without contacting GitHub's exchange.
+        let auth = CopilotAuth::with_endpoint(
+            "ghu_testtoken".to_string(),
+            "http://127.0.0.1:8317".to_string(),
+        );
+        let http = reqwest::Client::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let creds = rt.block_on(auth.credentials(&http)).unwrap();
+        assert_eq!(creds.base_url, "http://127.0.0.1:8317");
+        assert_eq!(creds.token, "ghu_testtoken");
+    }
+
+    #[test]
+    fn filter_catalog_items_drops_unusable_entries() {
+        let payload = json!({"data": [
+            {"id": "gpt-5.4", "capabilities": {"type": "chat"}, "supported_endpoints": ["/responses"]},
+            {"id": "text-embedding-3-small", "capabilities": {"type": "embedding"}},
+            {"id": "hidden-model", "model_picker_enabled": false, "capabilities": {"type": "chat"}},
+            {"id": "", "capabilities": {"type": "chat"}},
+            {"id": "gpt-5.4", "capabilities": {"type": "chat"}, "supported_endpoints": ["/responses"]},
+            {"id": "gpt-4o", "capabilities": {"type": "chat"}, "supported_endpoints": []},
+            {"id": "ws-only", "capabilities": {"type": "chat"}, "supported_endpoints": ["ws:/responses"]}
+        ]});
+        let items = filter_catalog_items(payload);
+        let ids: Vec<&str> = items.iter().filter_map(|i| i.get("id").and_then(|v| v.as_str())).collect();
+        assert_eq!(ids, vec!["gpt-5.4", "gpt-4o"]);
     }
 }

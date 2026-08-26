@@ -69,7 +69,7 @@ The `Agent` struct (agent.rs:223) owns:
 - `invalid_tool_strikes` — consecutive turns where every tool call in a
   batch was invalid; hits 3 → the turn fails outright.
 - `compressor: ContextCompressor` — the context-compaction engine (see
-  [context-compression.md](context-compression.md)).
+  [agent-core-reference.md](agent-core-reference.md)).
 
 ## Provider call block: retries, backoff, and fallback
 

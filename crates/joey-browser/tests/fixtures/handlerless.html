@@ -1,0 +1,11 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Handlerless Click</title></head>
+<body>
+  <h1>Handlerless</h1>
+  <!-- No JS handlers at all: only coordinate clicks (or synthesized events)
+       can hit this; used for FR-009/browser_click_coords. -->
+  <a href="javascript:void(0)" data-ground-truth="handlerless" id="hl" onclick="document.body.dataset.hl='hit'">Inert-looking link</a>
+  <div id="report" data-marker="none">none</div>
+</body>
+</html>

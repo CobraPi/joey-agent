@@ -261,7 +261,10 @@ fn build_file_layer(component: &str) -> Option<JoeyFileLayer> {
     Some(JoeyFileLayer {
         agent_log: Mutex::new(RotatingFile::new(
             dir.join("agent.log"),
-            max_mb * 1024 * 1024,
+            // saturating: a hostile/garbage max_size_mb must not overflow u64
+            // (debug builds panic on overflow — reachable from any library
+            // caller that initializes logging with a user config).
+            max_mb.saturating_mul(1024 * 1024),
             backups,
         )),
         errors_log: Mutex::new(RotatingFile::new(
@@ -348,6 +351,25 @@ mod tests {
         assert!(!dir.path().join("agent.log.4").exists(), "backup_count respected");
         // Current file stays under the cap.
         assert!(std::fs::metadata(&base).unwrap().len() <= 64);
+    }
+
+    #[test]
+    fn huge_max_size_mb_does_not_overflow() {
+        // config with an absurd max_size_mb; building the file layer must
+        // not panic on u64 overflow (previously `max_mb * 1024 * 1024`).
+        let _guard = crate::constants::TEST_HOME_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::constants::HomeOverrideGuard::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "logging:\n  max_size_mb: 9223372036854775807\n",
+        )
+        .unwrap();
+        let layer = build_file_layer("test");
+        assert!(layer.is_some());
     }
 
     #[test]

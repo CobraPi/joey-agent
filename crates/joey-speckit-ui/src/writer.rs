@@ -31,7 +31,7 @@ pub fn write_if_unchanged(
 ) -> Result<String, WriteError> {
     let current_content = std::fs::read_to_string(path).unwrap_or_default();
     check_conflict(&current_content, based_on_hash)?;
-    std::fs::write(path, new_content)?;
+    crate::patch::transaction::atomic_write(path, new_content)?;
     Ok(content_hash(new_content))
 }
 
@@ -67,7 +67,7 @@ pub fn replace_line_if_unchanged(
         new_content
     };
 
-    std::fs::write(path, &new_content)?;
+    crate::patch::transaction::atomic_write(path, &new_content)?;
     Ok(content_hash(&new_content))
 }
 
@@ -127,7 +127,7 @@ pub fn mark_task_complete(
         new_content
     };
 
-    std::fs::write(&tasks_path, new_content)
+    crate::patch::transaction::atomic_write(&tasks_path, &new_content)
 }
 
 #[cfg(test)]

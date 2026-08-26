@@ -2,7 +2,7 @@
 //!
 //! Port of data-model.md `BoulderState`. File-based JSON persistence (VR-004).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +62,25 @@ fn default_version() -> u32 {
     1
 }
 
+/// Unique sibling temp path for atomic writes: same directory (same
+/// filesystem, so rename is atomic), `.boulder.json.<pid>.<thread-id>.tmp`
+/// so concurrent writers from different sessions don't clobber each other's
+/// temp files.
+fn atomic_temp_path(dest: &Path) -> PathBuf {
+    let mut name = dest.file_name().map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "boulder.json".to_string());
+    name.push_str(&format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        thread_id(),
+    ));
+    dest.parent().unwrap_or_else(|| Path::new(".")).join(name)
+}
+
+fn thread_id() -> std::string::String {
+    format!("{:?}", std::thread::current().id())
+}
+
 impl Default for BoulderState {
     fn default() -> Self {
         Self {
@@ -83,6 +102,15 @@ impl BoulderState {
     }
 
     /// Write the boulder state to a `.omo/` directory.
+    ///
+    /// Atomic (VR-004 hardening): a plain `fs::write` truncates the target
+    /// and streams bytes, so concurrent Atlas sessions can interleave and
+    /// leave a truncated/torn `boulder.json`. Instead: write to a uniquely
+    /// named temp file in the same directory, fsync it, then rename over the
+    /// target — the same atomic-write pattern joey-cron uses
+    /// (`jobs.rs::atomic_write_secure`). Rename within a directory is
+    /// atomic on POSIX (and Windows `RENAME` semantics via
+    /// `fs::rename`/remove-first), so readers never observe a partial file.
     pub fn write(&self, omo_dir: &Path) -> std::io::Result<()> {
         let path = omo_dir.join("boulder.json");
         if let Some(parent) = path.parent() {
@@ -90,7 +118,25 @@ impl BoulderState {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+
+        use std::io::Write;
+        let tmp = atomic_temp_path(&path);
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            // Write + fsync the temp file BEFORE renaming so the renamed
+            // file's contents are durable, not just its directory entry.
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+        }
+        // Rename over the destination. On Windows, rename onto an existing
+        // file fails, so remove first — the small window is fine here
+        // because the replacement is a complete, fsynced file.
+        #[cfg(windows)]
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
     }
 
     /// Create a new work entry.
@@ -196,5 +242,63 @@ mod tests {
         let id = work.id.clone();
         state.complete_work(&id);
         assert_eq!(state.works[0].status, BoulderWorkStatus::Completed);
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    /// Concurrent writers must never corrupt boulder.json: the atomic
+    /// temp+rename write means a reader always sees a complete file (old or
+    /// new), never a truncated interleave.
+    #[test]
+    fn concurrent_writes_never_corrupt_state() {
+        let dir = std::env::temp_dir().join(format!("joey_boulder_race_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mk = |n: u32| BoulderState {
+            works: vec![BoulderWork {
+                id: format!("w{n}"),
+                plan_path: format!(".omo/plans/w{n}.md"),
+                plan_name: format!("w{n}"),
+                session_id: format!("sess-{n}"),
+                agent: "atlas".into(),
+                worktree_path: None,
+                status: BoulderWorkStatus::Active,
+                started_at: "2026-01-01T00:00:00".into(),
+            }],
+            version: 1,
+        };
+        mk(0).write(&dir).expect("seed write");
+
+        let writers: Vec<_> = (0..4u32)
+            .map(|n| {
+                let d = dir.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50u32 {
+                        let mut st = mk(n);
+                        st.works[0].plan_name = format!("w{n}-iter{i}");
+                        st.write(&d).map_err(|e| e.to_string())?;
+                    }
+                    Ok::<(), String>(())
+                })
+            })
+            .collect();
+        for h in writers {
+            h.join().expect("thread panicked").expect("writes ok");
+        }
+
+        // Final file must parse as a complete BoulderState.
+        let final_state = BoulderState::read(&dir);
+        assert_eq!(final_state.works.len(), 1, "complete state survived");
+        // No temp litter.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

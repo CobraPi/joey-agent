@@ -181,8 +181,10 @@ pub async fn run_oneshot(opts: OneshotOptions) -> Result<i32> {
     let model_explicit = !arg_model.is_empty() || !env_model.is_empty();
     if !arg_model.is_empty() {
         agent_cfg.model = arg_model.clone();
+        agent_cfg.model_pinned = true;
     } else if !env_model.is_empty() {
         agent_cfg.model = env_model.clone();
+        agent_cfg.model_pinned = true;
     }
 
     // Resolve effective provider: explicit arg → auto-detect from an explicit
@@ -259,6 +261,22 @@ async fn run_agent(
     // delegate_task tool (T028 subagent intercept).
     let allocator = crate::llm_selector::try_build_allocator(config);
 
+    // Feature 015 (NeuroCode): build the engine when enabled and register the
+    // 4 NeuroCode tools (T056/T057). None when disabled — byte-identical
+    // to pre-feature-015 (FR-020). Scoped via the AGENT's (provider,
+    // base_url, model) triple — the same inputs `Agent::new` feeds
+    // build_client — so the engine scope matches the live agent provider.
+    let neurocode_engine = crate::neurocode_wiring::try_build_engine_for_agent_inputs(
+        config,
+        &agent_cfg.provider,
+        &agent_cfg.base_url,
+        &agent_cfg.model,
+    );
+    if let Some(engine) = &neurocode_engine {
+        let backend = crate::neurocode_wiring::backend_for_engine(engine);
+        joey_tools::builtins::register_neurocode_tools(&mut registry, Some(backend));
+    }
+
     joey_orchestration::register_orchestration_with_allocator(
         &mut registry,
         manager.clone(),
@@ -281,6 +299,12 @@ async fn run_agent(
         agent.install_model_allocator(allocator);
     }
 
+    // Feature 015 (NeuroCode): install the engine on the parent agent
+    // (turn-loop intercept — T056). None when disabled — no-op.
+    if let Some(engine) = neurocode_engine {
+        agent.set_neurocode_engine(engine);
+    }
+
     if !agent.client().has_credentials() {
         anyhow::bail!(
             "no API key configured for provider '{}' (set one with `joey config set` or `joey model`)",
@@ -296,17 +320,44 @@ async fn run_agent(
     });
 
     // Drain events silently; only the Failed message matters here.
+    //
+    // A bare `rx.recv()`-until-close would hang forever: background-process
+    // reapers (process_tool.rs) hold ToolContext clones whose progress_tx
+    // keeps the turn's event forwarder — and through it a tx clone — alive
+    // for the lifetime of every child process the turn spawned. So the
+    // drain task also listens for a stop signal, then flushes whatever is
+    // still queued behind it.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
     let drain = tokio::spawn(async move {
         let mut failed: Option<String> = None;
-        while let Some(ev) = rx.recv().await {
-            if let AgentEvent::Failed(msg) = ev {
-                failed = Some(msg);
+        loop {
+            tokio::select! {
+                ev = rx.recv() => {
+                    match ev {
+                        Some(ev) => {
+                            if let AgentEvent::Failed(msg) = ev {
+                                failed = Some(msg);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = stop_rx.recv() => {
+                    // Flush events still queued behind the stop signal.
+                    while let Ok(ev) = rx.try_recv() {
+                        if let AgentEvent::Failed(msg) = ev {
+                            failed = Some(msg);
+                        }
+                    }
+                    break;
+                }
             }
         }
         failed
     });
     let result = agent.run_turn(prompt, tx).await;
+    let _ = stop_tx.send(()).await;
     let failed = drain.await.ok().flatten();
 
     if let Some(db) = agent.session_db() {

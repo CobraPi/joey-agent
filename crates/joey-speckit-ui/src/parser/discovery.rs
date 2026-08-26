@@ -218,6 +218,27 @@ pub fn resolve_artifact_path(repo_root: &Path, repo_relative: &str) -> Option<Pa
     Some(path)
 }
 
+/// Validate a feature id for use in a `specs/<feature_id>/<artifact>` path.
+///
+/// Feature ids arrive from HTTP request paths/bodies and were previously
+/// interpolated unchecked — a percent-encoded `..` or an absolute path could
+/// escape the repo. A safe id is a single path component: non-empty, no `/`,
+/// no `\\`, not `.`/`..`, and no NUL.
+pub fn is_safe_feature_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains('\0')
+        && id != "."
+        && id != ".."
+}
+
+/// Validate an artifact file name (e.g. `spec.md`) for the same reason —
+/// single component, and additionally must not itself be a traversal token.
+pub fn is_safe_artifact_name(artifact: &str) -> bool {
+    is_safe_feature_id(artifact)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

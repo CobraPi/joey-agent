@@ -576,13 +576,37 @@ impl SelectorEngine {
                 };
             }
         }
+        // Configured model — but NEVER the literal "auto" sentinel: an
+        // unroutable id must not reach the provider API (FR-020). If the
+        // config still says auto (no explicit model) and the pool is
+        // non-empty, use the pool's first entry.
+        let cfg_model = cfg_model_of(&self.config);
+        if !cfg_model.is_empty() && cfg_model != "auto" {
+            return Allocation {
+                model_id: cfg_model,
+                source: AllocationSource::DegradedFallback,
+            };
+        }
+        let first_pool = pool.models.first().map(|m| m.id.clone());
         drop(pool);
-        let cfg = self.config.read().unwrap();
+        if let Some(id) = first_pool {
+            return Allocation {
+                model_id: id,
+                source: AllocationSource::DegradedFallback,
+            };
+        }
         Allocation {
-            model_id: cfg.configured_model.clone(),
+            model_id: cfg_model,
             source: AllocationSource::DegradedFallback,
         }
     }
+}
+
+/// Read the configured model under the config lock.
+fn cfg_model_of(
+    config: &std::sync::RwLock<SelectorConfig>,
+) -> String {
+    config.read().unwrap().configured_model.clone()
 }
 
 impl ModelAllocator for SelectorEngine {

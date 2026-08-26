@@ -189,6 +189,25 @@ static PROFILES: Lazy<HashMap<&'static str, ProviderProfile>> = Lazy::new(|| {
             "https://github.com/settings/copilot",
             &[]
         ),
+        // Local AI Usage HUD reverse proxy (~/Development/ai-usage-hud): a
+        // Copilot-compatible MITM proxy that owns upstream GitHub auth, token
+        // refresh, and usage capture. Same wire protocol + credential
+        // resolution as the copilot profile, but pinned to the local proxy's
+        // endpoint (env-overridable). A joey-specific provider — no upstream
+        // Hermes equivalent.
+        profile!(
+            "ai-usage-hud",
+            &["usage-hud", "ai-usage"],
+            ApiMode::ChatCompletions,
+            "http://127.0.0.1:8317",
+            &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+            Some("AI_USAGE_HUD_BASE_URL"),
+            "",
+            "AI Usage HUD",
+            "AI Usage HUD (local Copilot reverse proxy w/ usage tracking)",
+            "http://127.0.0.1:8317/",
+            &[]
+        ),
         // plugins/model-providers/nous/__init__.py:43-58. Upstream auth_type
         // is oauth_device_code; the device-code OAuth flow is not ported, so
         // auth stays ApiKey (NOUS_API_KEY) here — deliberate adaptation.
@@ -294,6 +313,16 @@ pub fn get_profile(name: &str) -> Option<ProviderProfile> {
     PROFILES.get(canonical).cloned()
 }
 
+/// Providers that speak the GitHub Copilot wire protocol (Copilot headers,
+/// credential resolution, model-id normalization, Responses routing). This is
+/// the single source of truth for "copilot-family" dispatch — every call site
+/// that used to hardcode `profile.name == "copilot"` must go through here so
+/// new Copilot-compatible providers (e.g. the AI Usage HUD reverse proxy)
+/// can't drift from the registry.
+pub fn is_copilot_wire(profile_name: &str) -> bool {
+    profile_name == "copilot" || profile_name == "ai-usage-hud"
+}
+
 /// All known provider names, sorted.
 pub fn provider_names() -> Vec<&'static str> {
     let mut names: Vec<_> = PROFILES.keys().copied().collect();
@@ -307,6 +336,30 @@ const KNOWN_PREFIXES: &[&str] = &[
     "copilot", "github-copilot", "github-models", "github-model", "github",
 ];
 
+/// Whether the Copilot backend (or a copilot-wire proxy) can plausibly serve
+/// `model`. Consults the cached live catalog when available (a model id
+/// present in the catalog is definitively servable, including exotic ids a
+/// prefix list would miss); otherwise falls back to known Copilot model
+/// families. Vendor families Copilot never carries (glm-, deepseek-, grok-,
+/// mistral-…) return false so the HUD magnet does not hijack them onto a
+/// proxy that would silently substitute the default model.
+pub fn copilot_servable(model: &str) -> bool {
+    let normalized = crate::copilot::normalize_model_id(model);
+    // Live-catalog truth when we have it.
+    let catalog = crate::copilot::peek_model_catalog();
+    if !catalog.is_empty() {
+        return catalog.iter().any(|item| {
+            item.get("id").and_then(serde_json::Value::as_str) == Some(normalized.as_str())
+        });
+    }
+    // Cold cache: known Copilot-servable families.
+    let lower = normalized.to_ascii_lowercase();
+    const SERVABLE_PREFIXES: &[&str] = &[
+        "gpt-", "claude-", "gemini-", "o1", "o3", "o4", "mai-code-",
+    ];
+    SERVABLE_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
 /// Resolve which provider profile to use, given an explicit provider setting
 /// (may be "auto"), the base_url, and the model string. Mirrors upstream's
 /// base-url-hostname + model-prefix detection.
@@ -316,6 +369,35 @@ pub fn resolve_profile(provider_setting: &str, base_url: &str, model: &str) -> P
         if let Some(p) = get_profile(setting) {
             return p;
         }
+    }
+
+    // Custom Copilot-compatible endpoint (e.g. a local reverse proxy serving
+    // the full Copilot catalog). Every auto-detection path below — hostname,
+    // vendor prefix, bare model family — would re-route models to their
+    // vendor-native endpoints and silently bypass the proxy. Instead, route
+    // EVERYTHING through the matching copilot-wire profile: `build_client`
+    // pins its base URL to the custom endpoint, and the proxy serves every
+    // model family.
+    //
+    // EXCEPT models the Copilot backend can never serve (glm-, deepseek-,
+    // grok-… vendor families). The proxy silently substitutes those to its
+    // default model (mapModel → DEFAULT_COPILOT_MODEL) with a 200, so the
+    // user asks for glm-5.2 and gets claude-sonnet-5 without any error —
+    // worse than a clean miss. Let those fall through to their native
+    // vendor profiles below (observed live 2026-08-18).
+    if crate::copilot::hud_endpoint().is_some() && copilot_servable(model) {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
+        return get_profile("ai-usage-hud").unwrap();
+    }
+    // NOTE: the COPILOT_API_BASE_URL magnet intentionally magnetizes EVERY
+    // model (including non-Copilot families) — its documented contract is
+    // "no request escapes the proxy", a routing guarantee. The HUD fallback
+    // is deliberately EXCLUDED here (explicit_custom_endpoint) and gated
+    // separately below on servability — the HUD proxy would silently
+    // substitute non-Copilot models with its default.
+    if crate::copilot::explicit_custom_endpoint().is_some() {
+        // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
+        return get_profile("copilot").unwrap();
     }
 
     // Detect from base_url hostname.
@@ -340,11 +422,13 @@ pub fn resolve_profile(provider_setting: &str, base_url: &str, model: &str) -> P
         // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("nous").unwrap();
     }
-    if host.contains("x.ai") {
+    // Exact/suffix matching for short ambiguous domains: `contains("x.ai")`
+    // misrouted e.g. max.ai/box.ai/flex.ai hosts onto the xai profile.
+    if host == "x.ai" || host.ends_with(".x.ai") || host == "api.x.ai" {
         // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("xai").unwrap();
     }
-    if host.contains("z.ai") {
+    if host == "z.ai" || host.ends_with(".z.ai") || host == "api.z.ai" {
         // SAFETY: hardcoded provider alias mapped at build time; profile is guaranteed to exist.
         return get_profile("zai").unwrap();
     }
@@ -424,7 +508,7 @@ pub fn wire_model_name(profile: &ProviderProfile, model: &str) -> String {
     if profile.name == "openrouter" {
         return model.to_string();
     }
-    if profile.name == "copilot" {
+    if is_copilot_wire(profile.name) {
         return crate::copilot::normalize_model_id(model);
     }
     if profile.api_mode == ApiMode::AnthropicMessages {
@@ -444,6 +528,8 @@ mod tests {
 
     #[test]
     fn copilot_profile_and_wire_names_resolve() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
         let p = resolve_profile("github-copilot", "", "github-copilot/gpt-5.4");
         assert_eq!(p.name, "copilot");
         for alias in ["github-models", "github-model", "github"] {
@@ -455,6 +541,8 @@ mod tests {
 
     #[test]
     fn resolves_by_base_url() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
         let p = resolve_profile("auto", "https://api.anthropic.com", "claude-opus-4.6");
         assert_eq!(p.name, "anthropic");
         assert_eq!(p.api_mode, ApiMode::AnthropicMessages);
@@ -462,6 +550,8 @@ mod tests {
 
     #[test]
     fn resolves_by_model_prefix() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
         let p = resolve_profile("auto", "https://openrouter.ai/api/v1", "anthropic/claude-opus-4.6");
         assert_eq!(p.name, "openrouter");
     }
@@ -472,6 +562,8 @@ mod tests {
     /// base_url, and the fallback chain produces bare IDs like "glm-5.2".
     #[test]
     fn bare_glm_resolves_to_zai() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
         let p = resolve_profile("auto", "", "glm-5.2");
         assert_eq!(p.name, "zai");
         assert_eq!(p.base_url, "https://api.z.ai/api/paas/v4");
@@ -484,6 +576,8 @@ mod tests {
     /// instead of falling through to the aggregator default.
     #[test]
     fn bare_family_names_resolve_to_native_providers() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
         assert_eq!(resolve_profile("auto", "", "claude-opus-4-8").name, "anthropic");
         assert_eq!(resolve_profile("auto", "", "gpt-5.6-sol").name, "openai-api");
         assert_eq!(resolve_profile("auto", "", "gemini-3.1-pro").name, "gemini");
@@ -496,12 +590,141 @@ mod tests {
     /// both paths agree — and pointing at openrouter.ai keeps it openrouter.
     #[test]
     fn host_detection_takes_priority_over_bare_name() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
         // Host match wins and is not masked by the bare-name fallback.
         let p = resolve_profile("auto", "https://api.z.ai/api/paas/v4", "glm-5.2");
         assert_eq!(p.name, "zai");
         // Explicit OpenRouter host with a glm model → openrouter (aggregator).
         let or = resolve_profile("auto", "https://openrouter.ai/api/v1", "glm-5.2");
         assert_eq!(or.name, "openrouter");
+    }
+
+    /// Custom Copilot-compatible endpoint (reverse proxy): when
+    /// COPILOT_API_BASE_URL points off githubcopilot.com, EVERY auto-detection
+    /// path resolves to the copilot profile so no request escapes the proxy —
+    /// vendor prefixes, bare family names, and foreign base_url hosts alike.
+    #[test]
+    fn custom_endpoint_magnetizes_all_auto_resolution() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("COPILOT_API_BASE_URL", "http://127.0.0.1:8317");
+        // Bare family names that would otherwise route natively.
+        assert_eq!(resolve_profile("auto", "", "claude-opus-4-8").name, "copilot");
+        assert_eq!(resolve_profile("auto", "", "glm-5.2").name, "copilot");
+        assert_eq!(resolve_profile("auto", "", "gpt-5.6-sol").name, "copilot");
+        assert_eq!(resolve_profile("auto", "", "gemini-3.1-pro").name, "copilot");
+        assert_eq!(resolve_profile("auto", "", "kimi-k3").name, "copilot");
+        // Vendor-prefixed models.
+        assert_eq!(
+            resolve_profile("auto", "", "anthropic/claude-opus-4.6").name,
+            "copilot"
+        );
+        // Foreign base_url hosts would otherwise win host detection.
+        assert_eq!(
+            resolve_profile("auto", "https://api.z.ai/api/paas/v4", "glm-5.2").name,
+            "copilot"
+        );
+        assert_eq!(
+            resolve_profile("auto", "https://api.anthropic.com", "claude-opus-4.6").name,
+            "copilot"
+        );
+        // An explicit non-auto provider setting still wins (the user forced a
+        // different backend) — only "auto" resolution is magnetized.
+        assert_eq!(resolve_profile("zai", "", "glm-5.2").name, "zai");
+        std::env::remove_var("COPILOT_API_BASE_URL");
+    }
+
+    /// Without the custom endpoint, native routing is untouched.
+    #[test]
+    fn no_custom_endpoint_keeps_native_resolution() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+        assert_eq!(resolve_profile("auto", "", "glm-5.2").name, "zai");
+        assert_eq!(resolve_profile("auto", "", "claude-opus-4.8").name, "anthropic");
+    }
+
+    /// ai-usage-hud: a first-class Copilot-wire provider that pins the local
+    /// reverse proxy. Registry rows must be distinct from copilot's.
+    #[test]
+    fn ai_usage_hud_profile_registers_with_copilot_wire_semantics() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+        let hud = get_profile("ai-usage-hud").unwrap();
+        assert_eq!(hud.name, "ai-usage-hud");
+        assert_eq!(hud.base_url, "http://127.0.0.1:8317");
+        assert_eq!(hud.base_url_env_var, Some("AI_USAGE_HUD_BASE_URL"));
+        assert_eq!(hud.env_vars, &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]);
+        assert_eq!(hud.api_mode, ApiMode::ChatCompletions);
+        // Aliases resolve to the same canonical profile.
+        assert_eq!(get_profile("usage-hud").unwrap().name, "ai-usage-hud");
+        assert_eq!(get_profile("ai-usage").unwrap().name, "ai-usage-hud");
+        // Copilot-family dispatch includes it (single source of truth).
+        assert!(is_copilot_wire("ai-usage-hud"));
+        assert!(is_copilot_wire("copilot"));
+        assert!(!is_copilot_wire("zai"));
+        // Distinct registry row from copilot (non-collision).
+        assert_ne!(get_profile("copilot").unwrap().base_url, hud.base_url);
+        // Wire model names normalize through the copilot rules.
+        assert_eq!(wire_model_name(&hud, "copilot/gpt-5.4"), "gpt-5.4");
+        assert_eq!(wire_model_name(&hud, "openai/o3"), "gpt-5.3-codex");
+    }
+
+    /// Explicit `ai-usage-hud` provider setting resolves to the profile with
+    /// the proxy base URL pinned — no env var required.
+    #[test]
+    fn ai_usage_hud_explicit_setting_pins_proxy() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+        let p = resolve_profile("ai-usage-hud", "", "claude-sonnet-4.6");
+        assert_eq!(p.name, "ai-usage-hud");
+        assert_eq!(p.base_url, "http://127.0.0.1:8317");
+        // The alias works as an explicit setting too.
+        assert_eq!(resolve_profile("usage-hud", "", "").name, "ai-usage-hud");
+    }
+
+    /// AI_USAGE_HUD_BASE_URL magnetizes auto-resolution to the ai-usage-hud
+    /// profile (same semantics as COPILOT_API_BASE_URL → copilot) — but ONLY
+    /// for models the Copilot backend can serve. Vendor families Copilot
+    /// never carries (glm-, deepseek-, grok-) fall through to their native
+    /// providers: magnetizing them made the proxy silently substitute its
+    /// default model (requested glm-5.2 → served claude-sonnet-5, HTTP 200)
+    /// — observed live 2026-08-18.
+    #[test]
+    fn hud_env_var_magnetizes_auto_resolution() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317");
+        // Copilot-servable families → magnetized onto the HUD.
+        assert_eq!(resolve_profile("auto", "", "claude-opus-4.8").name, "ai-usage-hud");
+        assert_eq!(resolve_profile("auto", "", "gpt-5.4").name, "ai-usage-hud");
+        assert_eq!(
+            resolve_profile("auto", "https://api.z.ai/api/paas/v4", "gpt-5.4").name,
+            "ai-usage-hud"
+        );
+        // Copilot can NEVER serve GLM — must fall through to zai, not ride
+        // the proxy that would silently swap in its default model.
+        assert_eq!(resolve_profile("auto", "", "glm-5.2").name, "zai");
+        assert_eq!(
+            resolve_profile("auto", "https://api.z.ai/api/paas/v4", "glm-5.2").name,
+            "zai"
+        );
+        // An explicit different provider still wins.
+        assert_eq!(resolve_profile("zai", "", "glm-5.2").name, "zai");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+    }
+
+    /// The HUD env var pointing at the real Copilot host is ignored (keeps
+    /// the exchange flow) — mirrors the COPILOT_API_BASE_URL guard.
+    #[test]
+    fn hud_env_var_ignores_real_copilot_host() {
+        let _guard = crate::copilot::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "https://api.githubcopilot.com");
+        assert!(crate::copilot::hud_endpoint().is_none());
+        assert_eq!(resolve_profile("auto", "", "glm-5.2").name, "zai");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
     }
 
     #[test]

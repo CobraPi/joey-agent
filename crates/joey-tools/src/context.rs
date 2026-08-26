@@ -18,6 +18,14 @@ const READ_HISTORY_CAP: usize = 500;
 const DEDUP_CAP: usize = 1000;
 const READ_TIMESTAMPS_CAP: usize = 1000;
 
+/// Maximum number of pending background-process completions queued for
+/// delivery at the next turn boundary. Each entry carries a bounded output
+/// tail (~1KB). The agent drains the queue every turn, so this cap is only
+/// reached when many background jobs finish simultaneously during a single
+/// very long turn. Without it, the queue grows unbounded if the reaper
+/// out-produces the turn drain rate.
+const PENDING_COMPLETIONS_MAX: usize = 64;
+
 /// Per-turn aggregate tool-output budget accumulator (layer 3 of the
 /// persistence pipeline; 200_000 chars by default, `DEFAULT_TURN_BUDGET_CHARS`).
 ///
@@ -160,12 +168,33 @@ pub struct ToolContext {
     /// The agent sets this on a per-dispatch clone via [`with_progress_sender`]
     /// before passing the context to a tool that may emit streaming output.
     progress_sender: Option<ProgressSender>,
+    /// Optional channel for streaming RAW tool output (live terminal view).
+    /// `None` by default — additive, existing callers unaffected. The agent
+    /// sets this on a per-dispatch clone via [`with_output_sender`]; streaming
+    /// tools (e.g. `terminal`) push raw output chunks via [`emit_output`],
+    /// forwarded as `AgentEvent::ToolOutput` so UIs can live-render output.
+    output_sender: Option<OutputSender>,
     /// Optional cooperative-interrupt flag shared with the agent turn loop.
     /// `None` by default — existing callers are unaffected. When set (the
     /// agent wires its Ctrl-C `AtomicBool` here via [`with_interrupt_flag`]),
     /// streaming tools (e.g. `terminal`) poll [`Self::is_interrupted`] in
     /// their read loop and stop early so long-running commands cancel promptly.
     interrupt_flag: Option<Arc<AtomicBool>>,
+    /// Optional per-agent queue key used by the terminal concurrency
+    /// governor for fair round-robin admission. `None` by default —
+    /// additive, existing callers are unaffected (the governor falls back
+    /// to a single shared default key). The agent sets this on a
+    /// per-dispatch clone via [`with_queue_key`] from the agent's stable
+    /// identity (main agent id, subagent child id, background task id).
+    queue_key: Option<Arc<str>>,
+    /// Optional channel for terminal-governor queue-state snapshots
+    /// (spec 018, T017). `None` by default — additive, existing callers
+    /// unaffected. The agent sets this on a per-dispatch clone via
+    /// [`with_queue_state_sender`]; the terminal tool pushes `(active,
+    /// queued)` pairs on governor admission/release transitions, forwarded
+    /// as `AgentEvent::TerminalQueueState` so UIs can render contention
+    /// indicators. Producer-side throttled to 50ms (SC-005).
+    queue_state_sender: Option<QueueStateSender>,
 }
 
 /// A background-process completion awaiting delivery to the agent's next
@@ -188,6 +217,22 @@ pub struct BackgroundCompletion {
 /// output (e.g. `terminal`) push `String` progress deltas through this channel;
 /// the agent loop forwards them as `AgentEvent::ToolProgress` events.
 pub type ProgressSender = tokio::sync::mpsc::UnboundedSender<String>;
+
+/// Type alias for the raw-output channel sender (live terminal streaming).
+/// Tools that stream incremental command OUTPUT (e.g. `terminal`) push raw
+/// text chunks through this channel; the agent loop forwards them as
+/// `AgentEvent::ToolOutput` events so UIs can render a live output view.
+/// Distinct from [`ProgressSender`], which carries short status/heartbeat
+/// lines (`AgentEvent::ToolProgress`).
+pub type OutputSender = tokio::sync::mpsc::UnboundedSender<String>;
+
+/// Type alias for the terminal-governor queue-state channel sender
+/// (spec 018, T017). The terminal tool pushes `(active, queued)` snapshots
+/// on governor admission/release transitions; the agent loop forwards them
+/// as `AgentEvent::TerminalQueueState`. Emissions are producer-side
+/// throttled to the 50ms coalescing budget (SC-005), so bursts of
+/// transitions cannot flood the channel.
+pub type QueueStateSender = tokio::sync::mpsc::UnboundedSender<(usize, usize)>;
 
 struct ContextInner {
     cwd: PathBuf,
@@ -225,7 +270,10 @@ impl ToolContext {
                 pending_completions: Arc::new(Mutex::new(Vec::new())),
             }),
             progress_sender: None,
+            output_sender: None,
             interrupt_flag: None,
+            queue_key: None,
+            queue_state_sender: None,
         }
     }
 
@@ -244,7 +292,34 @@ impl ToolContext {
                 pending_completions: inner.pending_completions.clone(),
             }),
             progress_sender: None,
+            output_sender: None,
             interrupt_flag: None,
+            queue_key: None,
+            queue_state_sender: None,
+        }
+    }
+
+    /// Set the raw-output channel sender (live terminal streaming). Called by
+    /// the agent turn loop on a per-dispatch clone, symmetric to
+    /// [`with_progress_sender`]. Additive: callers that never call this get
+    /// `None` and [`Self::emit_output`] is a no-op.
+    pub fn with_output_sender(mut self, sender: Option<OutputSender>) -> Self {
+        self.output_sender = sender;
+        self
+    }
+
+    /// Returns the raw-output sender, if one was set via [`with_output_sender`].
+    pub fn output_sender(&self) -> Option<&OutputSender> {
+        self.output_sender.as_ref()
+    }
+
+    /// Convenience: push a raw output chunk to the output channel, if a
+    /// sender is set. Silently does nothing otherwise (backward-compatible
+    /// no-op). Chunks are lossy-UTF-8 text; the UI is responsible for
+    /// accumulation and display.
+    pub fn emit_output(&self, chunk: impl Into<String>) {
+        if let Some(tx) = &self.output_sender {
+            let _ = tx.send(chunk.into());
         }
     }
 
@@ -299,11 +374,63 @@ impl ToolContext {
             .map_or(false, |f| f.load(Ordering::SeqCst))
     }
 
+    /// Set the per-agent queue key used by the terminal concurrency
+    /// governor for fair (round-robin) admission. The agent turn loop
+    /// shares its stable agent identity here (main agent id, subagent
+    /// child id, background task id) on a per-dispatch clone, symmetric to
+    /// [`with_interrupt_flag`]. Existing callers that never call this get
+    /// `None`, and the governor treats that as a single shared default key.
+    ///
+    /// **Backward compatibility**: additive — never calling this is a no-op.
+    pub fn with_queue_key(mut self, key: Option<Arc<str>>) -> Self {
+        self.queue_key = key;
+        self
+    }
+
+    /// Returns the per-agent queue key, if one was set via
+    /// [`with_queue_key`]. `None` means the caller should fall back to a
+    /// shared default key (the backward-compatible default).
+    pub fn queue_key(&self) -> Option<&Arc<str>> {
+        self.queue_key.as_ref()
+    }
+
+    /// Set the terminal-governor queue-state channel sender (spec 018,
+    /// T017). Called by the agent turn loop on a per-dispatch clone,
+    /// symmetric to [`with_output_sender`]. Additive: callers that never
+    /// call this get `None` and [`Self::emit_queue_state`] is a no-op.
+    pub fn with_queue_state_sender(mut self, sender: Option<QueueStateSender>) -> Self {
+        self.queue_state_sender = sender;
+        self
+    }
+
+    /// Returns the queue-state sender, if one was set via
+    /// [`with_queue_state_sender`].
+    pub fn queue_state_sender(&self) -> Option<&QueueStateSender> {
+        self.queue_state_sender.as_ref()
+    }
+
+    /// Convenience: push a `(active, queued)` governor snapshot to the
+    /// queue-state channel, if a sender is set. Silently does nothing
+    /// otherwise (backward-compatible no-op — zero cost with no sender
+    /// attached). The producer (terminal tool) is responsible for
+    /// coalescing emissions to the 50ms budget (SC-005).
+    pub fn emit_queue_state(&self, active: usize, queued: usize) {
+        if let Some(tx) = &self.queue_state_sender {
+            let _ = tx.send((active, queued));
+        }
+    }
+
     /// Push a background-process completion into the session-persistent queue.
     /// The reaper calls this when a background job finishes. The agent drains
     /// the queue at the next turn boundary, emitting a visual notice and
     /// injecting the result into the conversation (non-interrupting). This
     /// survives the launching turn's event channel, unlike `emit_progress`.
+    ///
+    /// The queue is bounded ([`PENDING_COMPLETIONS_MAX`]): if a very long
+    /// turn produces more completions than the cap (many background jobs
+    /// finishing simultaneously), the oldest are dropped to prevent
+    /// unbounded memory growth. The agent drains the queue every turn, so
+    /// the cap is only reached in pathological scenarios.
     pub fn push_background_completion(&self, completion: BackgroundCompletion) {
         let mut queue = self
             .inner
@@ -311,6 +438,10 @@ impl ToolContext {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         queue.push(completion);
+        // Bound the queue: drop the oldest entries when over the cap.
+        while queue.len() > PENDING_COMPLETIONS_MAX {
+            queue.remove(0);
+        }
     }
 
     /// Drain all pending background-process completions from the queue.
@@ -450,6 +581,59 @@ mod tests {
         assert!(ctx.progress_sender().is_none());
     }
 
+    // ── Regression: output_sender backward compatibility (live terminal) ──
+
+    #[test]
+    fn output_sender_defaults_to_none() {
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        assert!(ctx.output_sender().is_none());
+    }
+
+    #[test]
+    fn with_output_sender_attaches_and_emits() {
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ctx = ctx.with_output_sender(Some(tx));
+        assert!(ctx.output_sender().is_some());
+        ctx.emit_output("chunk-1\n");
+        ctx.emit_output("chunk-2\n");
+        assert_eq!(rx.try_recv().unwrap(), "chunk-1\n");
+        assert_eq!(rx.try_recv().unwrap(), "chunk-2\n");
+    }
+
+    #[test]
+    fn emit_output_noop_without_sender() {
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        ctx.emit_output("no-op"); // must not panic
+        assert!(ctx.output_sender().is_none());
+    }
+
+    #[test]
+    fn with_interactive_clears_output_sender() {
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ctx = ctx.with_output_sender(Some(tx));
+        assert!(ctx.output_sender().is_some());
+        let ctx = ctx.with_interactive(false);
+        assert!(ctx.output_sender().is_none());
+    }
+
+    #[test]
+    fn output_channel_is_independent_of_progress_channel() {
+        // The two channels are distinct surfaces: emitting output must not
+        // show up on the progress channel and vice versa.
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ctx = ctx.with_progress_sender(Some(ptx)).with_output_sender(Some(otx));
+        ctx.emit_output("OUT");
+        ctx.emit_progress("STATUS");
+        assert_eq!(orx.try_recv().unwrap(), "OUT");
+        assert!(orx.try_recv().is_err(), "no second output event");
+        assert_eq!(prx.try_recv().unwrap(), "STATUS");
+        assert!(prx.try_recv().is_err(), "no second progress event");
+    }
+
     #[test]
     fn context_is_clone_send_sync() {
         // ToolContext must remain Clone + Send + Sync for the agent's
@@ -557,5 +741,65 @@ mod tests {
         let drained = ctx.drain_pending_completions();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].session_id, "proc-y");
+    }
+
+    #[test]
+    fn pending_completions_queue_is_bounded() {
+        // Pushing well beyond the cap must not let the queue grow unbounded.
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        for i in 0..(PENDING_COMPLETIONS_MAX + 50) {
+            ctx.push_background_completion(BackgroundCompletion {
+                session_id: format!("proc-{}", i),
+                exit_code: 0,
+                output_tail: "x".into(),
+                elapsed_secs: 1.0,
+            });
+        }
+        let drained = ctx.drain_pending_completions();
+        assert!(
+            drained.len() <= PENDING_COMPLETIONS_MAX,
+            "queue must not exceed cap: got {} (cap {})",
+            drained.len(),
+            PENDING_COMPLETIONS_MAX
+        );
+        // The newest entries survive (oldest dropped).
+        let last = drained.last().unwrap();
+        assert_eq!(last.session_id, format!("proc-{}", PENDING_COMPLETIONS_MAX + 49));
+    }
+
+    // ── Regression: queue_key backward compatibility (T005) ────────────────
+
+    #[test]
+    fn queue_key_defaults_to_none() {
+        // ToolContext::new must not set a queue key — existing callers that
+        // never call with_queue_key must see None (governor falls back to
+        // the shared default key).
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        assert!(ctx.queue_key().is_none());
+    }
+
+    #[test]
+    fn with_queue_key_sets_key() {
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        let key: Arc<str> = Arc::from("agent-42");
+        let ctx = ctx.with_queue_key(Some(key.clone()));
+        assert_eq!(ctx.queue_key(), Some(&key));
+        assert_eq!(ctx.queue_key().map(|k| &**k), Some("agent-42"));
+    }
+
+    #[test]
+    fn queue_key_survives_clone_but_not_with_interactive() {
+        // Clone is the per-dispatch path (agent clones then attaches), so a
+        // set key must survive Clone; with_interactive rebuilds the context
+        // and must not inherit a stale key (mirrors the other Option fields).
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        let ctx = ctx.with_queue_key(Some(Arc::from("subagent-7")));
+        let clone = ctx.clone();
+        assert!(clone.queue_key().is_some(), "Clone must preserve queue_key");
+        let rebuilt = clone.with_interactive(false);
+        assert!(
+            rebuilt.queue_key().is_none(),
+            "with_interactive must not inherit a stale queue_key"
+        );
     }
 }

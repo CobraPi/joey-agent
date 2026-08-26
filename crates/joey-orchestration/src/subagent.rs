@@ -150,6 +150,7 @@ impl Subagent {
         max_spawn_depth: usize,
         workdir: Option<&std::path::Path>,
         interrupt: Arc<AtomicBool>,
+        semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Result<Self, ProviderError> {
         let model = resolve_model(
             None,
@@ -166,11 +167,17 @@ impl Subagent {
             max_turns: req.max_turns.unwrap_or(default_max_turns),
             api_max_retries: parent_config.api_max_retries,
             tool_delay: parent_config.tool_delay,
-            reasoning: parent_config.reasoning.clone(),
+            // HyperCode per-role overrides: request-level reasoning/token
+            // limits win; otherwise inherit the parent's.
+            reasoning: req.reasoning.clone().or_else(|| parent_config.reasoning.clone()),
             enabled_tools: resolve_enabled_tools(req, base_registry, max_spawn_depth, depth),
-            max_tokens: parent_config.max_tokens,
+            max_tokens: req.max_tokens.or(parent_config.max_tokens),
             stream: parent_config.stream,
             pass_session_id: false,
+            // The child model was resolved by the delegation layer (per-task
+            // override or fallback chain) — that resolution is authoritative,
+            // so pin it against NeuroCode tier rewrites.
+            model_pinned: true,
         };
 
         let child_ctx = child_context(
@@ -184,6 +191,12 @@ impl Subagent {
 
         let ts_sum = toolset_summary(&req.toolsets);
         let mut agent = Agent::new(child_agent_cfg, child_registry, child_ctx)?;
+
+        // Share the PARENT's provider-request semaphore (FR-018). Without
+        // this, a batch of N children fires unbounded concurrent provider
+        // requests — the manager's semaphore exists but was never wired
+        // into child agents, so capacity_requests() never throttled.
+        agent.set_provider_semaphore(semaphore);
 
         // T060/T149: Inject category prompt_append as extra instructions.
         // This is prepended to the system prompt alongside any loaded skills.
@@ -215,16 +228,26 @@ impl Subagent {
 
         // Persist: attach a SessionDb to the child agent when persist=true (FR-017).
         let session_id = if req.persist {
-            let child_sid = format!("subagent-{}", uuid::Uuid::new_v4().simple());
             match joey_core::state::SessionDb::open_default() {
                 Ok(db) => {
-                    let _ = db.create_session(
-                        "subagent",
-                        Some(&model),
-                        None,
-                    );
-                    agent.set_session_store(db, child_sid.clone());
-                    Some(child_sid)
+                    // Use the id create_session RETURNS (it has a real
+                    // sessions row). The old code discarded it and used an
+                    // unregistered "subagent-<uuid>" string — persisted
+                    // messages then referenced a session that no query
+                    // (session search, resume) could resolve.
+                    match db.create_session("subagent", Some(&model), None) {
+                        Ok(real_sid) => {
+                            agent.set_session_store(db, real_sid.clone());
+                            Some(real_sid)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to create session row for subagent persist: {}",
+                                e
+                            );
+                            None
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to open session DB for subagent persist: {}", e);
@@ -249,9 +272,28 @@ impl Subagent {
     }
 
     /// Run the subagent's turn loop and produce a DelegationResult.
+    ///
+    /// Backward-compatible wrapper: no live tap, events forwarded raw to the
+    /// per-dispatch channel (legacy behavior for direct callers/tests).
+    #[allow(dead_code)] // legacy entry kept for direct callers/tests; manager uses run_with_tap
     pub(crate) async fn run(
-        mut self,
+        self,
         event_tx: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
+    ) -> DelegationResult {
+        self.run_with_tap(0, event_tx, None).await
+    }
+
+    /// Run the subagent's turn loop, forwarding every child event to the
+    /// tap wrapped as `AgentEvent::SubagentEvent { id, event }` (parallel-
+    /// subagent feature) while the per-dispatch channel keeps receiving the
+    /// RAW events (legacy behavior preserved).
+    ///
+    /// Id `0` + no tap is byte-identical to the pre-feature `run`.
+    pub(crate) async fn run_with_tap(
+        mut self,
+        id: u64,
+        event_tx: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
+        tap: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
     ) -> DelegationResult {
         let start = Instant::now();
         let goal = self.goal.clone();
@@ -298,8 +340,36 @@ impl Subagent {
             }
         });
 
-        let result: TurnResult = self.agent.run_turn(&initial_prompt, tx_for_run).await;
-        
+        // Parallel-subagent feature: intercept the child's event stream.
+        // When a tap is installed, every event the child emits is FIRST
+        // mirrored to the tap (wrapped with the child's stable id) and ALSO
+        // forwarded raw to the legacy per-dispatch channel so existing
+        // consumers are unaffected. Implementation: wrap the sender with a
+        // fan-out via an mpsc channel + forwarding task.
+        let result: TurnResult = if tap.is_some() {
+            let (child_tx, mut child_rx) =
+                tokio::sync::mpsc::unbounded_channel::<joey_agent_core::AgentEvent>();
+            let tap_tx = tap.cloned().unwrap();
+            let legacy_tx = tx_for_run.clone();
+            let fanout = tokio::spawn(async move {
+                while let Some(ev) = child_rx.recv().await {
+                    if id != 0 {
+                        let _ = tap_tx.send(joey_agent_core::AgentEvent::SubagentEvent {
+                            id,
+                            event: Box::new(ev.clone()),
+                        });
+                    }
+                    let _ = legacy_tx.send(ev);
+                }
+            });
+            let r = self.agent.run_turn(&initial_prompt, child_tx).await;
+            // child_tx drops here → fanout drains → task ends.
+            let _ = fanout.await;
+            r
+        } else {
+            self.agent.run_turn(&initial_prompt, tx_for_run).await
+        };
+
         // Stop the forwarder.
         forwarder_handle.abort();
         let elapsed = start.elapsed();
@@ -320,15 +390,18 @@ impl Subagent {
             );
         }
 
-        // Determine if interrupted by the batch-level flag.
+        // Determine outcome: interrupted beats fatal beats clean.
         let was_interrupted = result.interrupted || batch_interrupt.load(Ordering::SeqCst);
+        let fatal = result.fatal && !was_interrupted;
 
         DelegationResult {
             goal,
             summary,
-            success: !was_interrupted,
+            success: !was_interrupted && !fatal,
             error: if was_interrupted {
                 Some("subagent was interrupted".to_string())
+            } else if fatal {
+                Some("subagent turn failed (fatal provider error)".to_string())
             } else {
                 None
             },
@@ -366,6 +439,8 @@ pub(crate) fn specs_to_requests(
             spec.toolsets.clone()
         },
         max_turns: batch_max_turns,
+        reasoning: None,
+        max_tokens: None,
         persist,
         role,
         workdir: None,
@@ -375,6 +450,29 @@ pub(crate) fn specs_to_requests(
         prompt_append: None,
     })
     .collect()
+}
+
+/// Apply per-task HyperCode role routing to a batch's requests (in place).
+/// Tasks without a `role` are untouched. Config-based role settings only
+/// fill gaps the task spec didn't set explicitly.
+pub(crate) fn apply_batch_hyper_roles(
+    requests: &mut [DelegationRequest],
+    tasks: &[TaskSpec],
+    tree: &Config,
+    provider: &str,
+) -> Result<(), String> {
+    for (req, spec) in requests.iter_mut().zip(tasks.iter()) {
+        if let Some(role_str) = spec.role.as_deref() {
+            let Some(role) = crate::delegation_tool::hyper_role_parse(role_str) else {
+                return Err(format!(
+                    "Unknown role '{role_str}' on task {:?}. Use 'explorer' or 'implementor'.",
+                    spec.goal
+                ));
+            };
+            crate::delegation_tool::apply_hyper_role(req, role, tree, provider);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

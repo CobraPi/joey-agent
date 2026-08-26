@@ -9,6 +9,7 @@
 
 use fancy_regex::{Captures, Regex};
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
 
 /// Sensitive query-string parameter names (case-insensitive exact match).
 pub const SENSITIVE_QUERY_PARAMS: &[&str] = &[
@@ -148,13 +149,17 @@ fn has_known_prefix_substring(text: &str) -> bool {
 const SECRET_ENV_NAMES: &str = r"(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)";
 static ENV_ASSIGN_RE: Lazy<Regex> = Lazy::new(|| {
     rx(&format!(
-        r#"([A-Z0-9_]{{0,50}}{SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['"]?)(\S+)\2"#
+        // Quoted values match up to the closing quote (spaces included);
+        // unquoted values stay non-space. Quoted alternative comes first.
+        r#"([A-Z0-9_]{{0,50}}{SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*?("[^"]*"|'[^']*'|\S+)"#
     ))
 });
 
 // Lowercase / dotted / hyphenated config keys from config files.
 const SECRET_CFG_NAMES: &str = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential|auth)";
-const CFG_VALUE: &str = r#"(['"]?)([^\s&]+?)\2(?=[\s&]|$)"#;
+// Single capture group: quoted values first (may contain spaces/&), else the
+// unquoted run. Self-delimiting, so no lazy+lookahead gymnastics needed.
+const CFG_VALUE: &str = r#"("[^"]*"|'[^']*'|[^\s&]+)"#;
 
 // Programmatic env lookups reference variable *names*, not secret values.
 static ENV_LOOKUP_VALUE_RE: Lazy<Regex> =
@@ -178,7 +183,7 @@ static CFG_ANCHORED_RE: Lazy<Regex> = Lazy::new(|| {
 const YAML_CFG_NAMES: &str = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)";
 static YAML_ASSIGN_RE: Lazy<Regex> = Lazy::new(|| {
     rx(&format!(
-        r#"(?im)(^[ \t]*[A-Za-z0-9_.\-]*{YAML_CFG_NAMES}[A-Za-z0-9_.\-]*)(:[ \t]*)(?!['"])([^\s&]+)"#
+        r#"(?im)(^[ \t]*[A-Za-z0-9_.\-]*{YAML_CFG_NAMES}[A-Za-z0-9_.\-]*)(:[ \t]*)(?:"([^"]*)"|'([^']*)'|(?!['"])([^\s&]+))"#
     ))
 });
 
@@ -440,11 +445,22 @@ fn canonical_url_param_name(name: &str) -> String {
     decoded.to_lowercase().replace('-', "_")
 }
 
+/// `SENSITIVE_QUERY_PARAMS` canonicalized exactly the way
+/// [`canonical_url_param_name`] canonicalizes live parameter names
+/// (lowercased, `-` → `_`), so dashed spellings like `x-amz-signature`
+/// match their underscored live form.
+static SENSITIVE_QUERY_PARAMS_CANON: Lazy<Vec<String>> = Lazy::new(|| {
+    SENSITIVE_QUERY_PARAMS
+        .iter()
+        .map(|p| p.to_lowercase().replace('-', "_"))
+        .collect()
+});
+
 /// Redact credentials from absolute, relative, and network URL references.
 /// Stricter than display/log redaction — used only at secret-egress boundaries.
 fn redact_strict_url_credentials(text: &str) -> String {
     let text = sub_all(&STRICT_URL_PARAM_RE, text, |caps| {
-        if !SENSITIVE_QUERY_PARAMS.contains(&canonical_url_param_name(group(caps, 2)).as_str()) {
+        if !SENSITIVE_QUERY_PARAMS_CANON.contains(&canonical_url_param_name(group(caps, 2))) {
             return group(caps, 0).to_string();
         }
         format!("{}{}=***", group(caps, 1), group(caps, 2))
@@ -533,24 +549,58 @@ pub fn redact_sensitive_text_opts(text: &str, opts: RedactOptions) -> String {
     }
 
     if !code_file {
-        // ENV assignments: OPENAI_API_KEY=***
+        // ENV assignments: OPENAI_API_KEY=***. Quoted values (the regex's
+        // first alternative) redact with their quotes intact.
         if text.contains('=') {
             let redact_env = |caps: &Captures| -> String {
-                let (name, quote, value) = (group(caps, 1), group(caps, 2), group(caps, 3));
+                let (name, value) = (group(caps, 1), group(caps, 2));
                 // Programmatic env lookups reference variable *names*, not
                 // secret values — leave code snippets intact.
                 if ENV_LOOKUP_VALUE_RE.is_match(value).unwrap_or(false) {
                     return group(caps, 0).to_string();
                 }
-                format!("{}={}{}{}", name, quote, mask_token(value), quote)
+                // Quoted value: mask the inside, keep the original quotes.
+                if value.len() >= 2
+                    && ((value.starts_with('"') && value.ends_with('"'))
+                        || (value.starts_with('\'') && value.ends_with('\'')))
+                {
+                    let inner = &value[1..value.len() - 1];
+                    format!("{}={}{}{}", name, &value[..1], mask_token(inner), &value[value.len() - 1..])
+                } else {
+                    format!("{}={}", name, mask_token(value))
+                }
             };
             text = sub_all(&ENV_ASSIGN_RE, &text, redact_env);
-            // Lowercase/dotted config keys. Skip URLs entirely — web-URL
-            // query params are intentionally passed through.
-            if !text.contains("://") {
-                text = sub_all(&CFG_DOTTED_RE, &text, redact_env);
-                text = sub_all(&CFG_ANCHORED_RE, &text, redact_env);
+            // Lowercase/dotted config keys. Skip URL LINES entirely — web-URL
+            // query params are intentionally passed through. Per-line (not
+            // per-text): a URL anywhere used to disable redaction for every
+            // other line in a large dump.
+            let redact_cfg = |caps: &Captures| -> String {
+                let (name, value) = (group(caps, 1), group(caps, 2));
+                if ENV_LOOKUP_VALUE_RE.is_match(value).unwrap_or(false) {
+                    return group(caps, 0).to_string();
+                }
+                if value.len() >= 2
+                    && ((value.starts_with('"') && value.ends_with('"'))
+                        || (value.starts_with('\'') && value.ends_with('\'')))
+                {
+                    let inner = &value[1..value.len() - 1];
+                    format!("{}={}{}{}", name, &value[..1], mask_token(inner), &value[value.len() - 1..])
+                } else {
+                    format!("{}={}", name, mask_token(value))
+                }
+            };
+            let mut out = String::with_capacity(text.len());
+            for line in text.split_inclusive('\n') {
+                if line.contains("://") {
+                    out.push_str(line);
+                } else {
+                    let mut l = sub_all(&CFG_DOTTED_RE, line, redact_cfg);
+                    l = sub_all(&CFG_ANCHORED_RE, &l, redact_cfg);
+                    out.push_str(&l);
+                }
             }
+            text = out;
         }
 
         // JSON fields: "apiKey": "***"
@@ -564,15 +614,37 @@ pub fn redact_sensitive_text_opts(text: &str, opts: RedactOptions) -> String {
             });
         }
 
-        // Unquoted YAML / colon config: password: ***
-        if text.contains(':') && !text.contains("://") {
-            text = sub_all(&YAML_ASSIGN_RE, &text, |caps| {
-                let (key, sep, value) = (group(caps, 1), group(caps, 2), group(caps, 3));
-                if ENV_LOOKUP_VALUE_RE.is_match(value).unwrap_or(false) {
-                    return group(caps, 0).to_string();
+        // YAML / colon config: password: ***. Per-line URL gate (a URL
+        // anywhere in the text used to disable YAML redaction everywhere).
+        if text.contains(':') {
+            let mut out = String::with_capacity(text.len());
+            for line in text.split_inclusive('\n') {
+                if line.contains("://") {
+                    out.push_str(line);
+                } else {
+                    let l = sub_all(&YAML_ASSIGN_RE, line, |caps| {
+                        let (key, sep) = (group(caps, 1), group(caps, 2));
+                        // Whichever value alternative matched (dq/sq/unquoted).
+                        let (value, quoted) = if !group(caps, 3).is_empty() {
+                            (group(caps, 3), '"')
+                        } else if !group(caps, 4).is_empty() {
+                            (group(caps, 4), '\'')
+                        } else {
+                            (group(caps, 5), '\0')
+                        };
+                        if ENV_LOOKUP_VALUE_RE.is_match(value).unwrap_or(false) {
+                            return group(caps, 0).to_string();
+                        }
+                        if quoted != '\0' {
+                            format!("{}{}{}{}", sep, quoted, mask_token(value), quoted)
+                        } else {
+                            format!("{}{}{}", key, sep, mask_token(value))
+                        }
+                    });
+                    out.push_str(&l);
                 }
-                format!("{}{}{}", key, sep, mask_token(value))
-            });
+            }
+            text = out;
         }
     }
 
@@ -671,6 +743,56 @@ pub fn redact_sensitive_text_opts(text: &str, opts: RedactOptions) -> String {
 /// default options (log/display context).
 pub fn redact_secrets(text: &str) -> String {
     redact_sensitive_text(text)
+}
+
+/// Parallel redaction for large tool outputs (terminal dumps, big file
+/// reads): splits the text on line boundaries into ≥ [`REDACT_PAR_CHUNK`]
+/// chunks, redacts each chunk on the rayon pool, and joins. Byte-identical
+/// to [`redact_sensitive_text_opts`] for any text whose patterns don't
+/// straddle the chunk cut — and none do: every pattern class is line-local
+/// (ENV/JSON/YAML assignments, headers, tokens, keys, URLs — none of the
+/// regexes match across `\n`).
+///
+/// Below the threshold the sequential path runs (scheduling overhead would
+/// dominate). Falls back to the same options semantics as
+/// `redact_terminal_output`.
+pub fn redact_secrets_par(text: &str) -> String {
+    /// Minimum size before the rayon fan-out pays for itself.
+    const REDACT_PAR_CHUNK: usize = 512 * 1024;
+    if text.len() < REDACT_PAR_CHUNK {
+        return redact_sensitive_text(text);
+    }
+    let mut chunks: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.len() <= REDACT_PAR_CHUNK {
+            chunks.push(rest);
+            break;
+        }
+        // Snap the cut to a UTF-8 char boundary — a multibyte char
+        // straddling the chunk edge would panic on a raw byte slice.
+        let mut cut = REDACT_PAR_CHUNK;
+        while !rest.is_char_boundary(cut) {
+            cut += 1;
+        }
+        let target = &rest[..cut];
+        match target.rfind('\n') {
+            Some(nl) => {
+                let (head, tail) = rest.split_at(nl + 1);
+                chunks.push(head);
+                rest = tail;
+            }
+            None => {
+                chunks.push(rest);
+                break;
+            }
+        }
+    }
+    let redacted: Vec<String> = chunks
+        .into_par_iter()
+        .map(redact_sensitive_text)
+        .collect();
+    redacted.join("")
 }
 
 // Commands whose stdout is an environment-variable dump (KEY=value lines).
@@ -930,6 +1052,20 @@ mod tests {
         assert_eq!(redact("hello world"), "hello world");
     }
 
+    #[test]
+    fn strict_url_redaction_handles_dashed_param_names() {
+        // `x-amz-signature` is declared sensitive, but
+        // `canonical_url_param_name` canonicalizes `-` to `_`, so the
+        // membership check compared "x_amz_signature" against a list that
+        // (before the fix) only contained the dashed spelling — the
+        // presigned-S3 signature leaked at strict-egress boundaries.
+        let opts = RedactOptions { force: true, redact_url_credentials: true, ..Default::default() };
+        let s = "https://s3.example.com/obj?X-Amz-Signature=abc123def456ghi789&X-Amz-Credential=AKIAABC";
+        let r = redact_sensitive_text_opts(s, opts);
+        assert!(!r.contains("abc123def456ghi789"), "signature must be redacted: {}", r);
+        assert!(r.contains("Signature=***") || r.contains("signature=***"), "param kept, value masked: {}", r);
+    }
+
     /// Regression: `sub_all` must never panic on a runtime regex error
     /// (e.g. `BacktrackLimitExceeded`). Previously `sub_all` used
     /// `re.replace_all`, which internally unwraps `try_replacen` and would
@@ -954,5 +1090,35 @@ mod tests {
         // No crash. We don't assert exact contents (engine-dependent), only
         // that we got a non-panicking `String` containing the prefix bytes.
         assert!(out.starts_with(&"a".repeat(40)) || out.contains('a'));
+    }
+}
+
+#[cfg(test)]
+mod redact_par_tests {
+    use super::*;
+
+    #[test]
+    fn redact_secrets_par_identical_to_sequential() {
+        // Build a >512 KB text dense with redactable secrets.
+        let mut text = String::new();
+        for i in 0..4000 {
+            text.push_str(&format!(
+                "line {}: OPENAI_API_KEY=sk-proj-{} auth: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.{}.sig\n",
+                i,
+                "abcdef0123456789".repeat(3),
+                "payload".repeat(8)
+            ));
+        }
+        assert!(text.len() > 512 * 1024, "fixture large enough: {} bytes", text.len());
+        let seq = redact_secrets(&text);
+        let par = redact_secrets_par(&text);
+        assert_eq!(seq, par, "parallel redaction must be byte-identical");
+        assert!(!par.contains("sk-proj-abcdef"), "keys masked");
+    }
+
+    #[test]
+    fn redact_par_small_passthrough_matches() {
+        let small = "OPENAI_API_KEY=sk-abc123xyz hello";
+        assert_eq!(redact_secrets_par(small), redact_secrets(small));
     }
 }

@@ -1,4 +1,4 @@
-use joey_tui::anim::{Activity, Clock, Equalizer, ParticleField, Pulse, Spinner};
+use joey_tui::anim::{Activity, Equalizer, ParticleField, Pulse, Spinner};
 use joey_tui::theme::Theme;
 use std::time::Duration;
 

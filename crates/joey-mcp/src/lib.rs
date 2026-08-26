@@ -79,7 +79,10 @@ pub fn sanitize_mcp_name_component(value: &str) -> String {
 }
 
 /// Build the registry/wire name for an MCP tool (`mcp_prefixed_tool_name`):
-/// `mcp__<sanitizedServer>__<sanitizedTool>`.
+/// `mcp__<sanitizedServer>__<sanitizedTool>`. The server component is the
+/// sanitized *wire prefix* registered via [`WirePrefixRegistry::register`],
+/// which may differ from the raw sanitized name when another server already
+/// claimed the same prefix (see that type's docs).
 pub fn mcp_prefixed_tool_name(server_name: &str, tool_name: &str) -> String {
     format!(
         "{}{}{}{}",
@@ -88,6 +91,82 @@ pub fn mcp_prefixed_tool_name(server_name: &str, tool_name: &str) -> String {
         MCP_NAME_DELIM,
         sanitize_mcp_name_component(tool_name)
     )
+}
+
+/// Registry of claimed MCP wire prefixes (`mcp__<server>_`).
+///
+/// Sanitization maps every non `[A-Za-z0-9_]` character (hyphens, dots, ...)
+/// to `_`, so distinct server names such as `my-server`, `my_server`, and
+/// `my.server` all sanitize to `my_server` and would otherwise collide on the
+/// wire prefix `mcp__my_server_` — silently rerouting tool calls to the wrong
+/// server. Registration is therefore collision-checked: the first claimant
+/// (in config order) keeps the plain prefix and later claimants are
+/// disambiguated with deterministic numeric suffixes (`my_server_2`,
+/// `my_server_3`, ...). A human-readable warning is returned so the caller
+/// (e.g. the CLI) can surface it.
+#[derive(Debug, Default)]
+pub struct WirePrefixRegistry {
+    /// `claimed prefix (without the trailing delimiter) -> raw server name`.
+    prefixes: HashMap<String, String>,
+}
+
+impl WirePrefixRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `server_name`, claiming its sanitized wire prefix.
+    ///
+    /// Returns the prefix to use for this server's tool names (without the
+    /// leading `mcp__` or trailing `__`), plus an optional warning when the
+    /// sanitized name collided with an earlier registration and a numeric
+    /// suffix was applied.
+    pub fn register(&mut self, server_name: &str) -> (String, Option<String>) {
+        let base = sanitize_mcp_name_component(server_name);
+        if !self.prefixes.contains_key(&base) {
+            self.prefixes.insert(base.clone(), server_name.to_string());
+            return (base, None);
+        }
+        // Collision: deterministic numeric suffix in config/registration
+        // order — `_2` for the second claimant, `_3` for the third, ...
+        let mut n = 2;
+        while self.prefixes.contains_key(&format!("{base}_{n}")) {
+            n += 1;
+        }
+        let disambiguated = format!("{base}_{n}");
+        self.prefixes.insert(disambiguated.clone(), server_name.to_string());
+        let warning = format!(
+            "MCP server name collision: '{}' sanitizes to wire prefix '{}', already claimed by \
+             server '{}'; using '{}' instead. Rename one of the servers in the MCP config to \
+             avoid ambiguity.",
+            server_name, base, self.prefixes[&base], disambiguated
+        );
+        warn!("{}", warning);
+        (disambiguated, Some(warning))
+    }
+
+    /// Release a previously claimed prefix.
+    ///
+    /// A failed connection (handshake error/timeout) must give its claim
+    /// back: otherwise every connect retry re-registers the same name and
+    /// the prefix drifts (`my_server` → `my_server_2` → ...) permanently for
+    /// the process, leaving the real server unreachable at its plain prefix.
+    pub fn unregister(&mut self, prefix: &str) {
+        self.prefixes.remove(prefix);
+    }
+}
+
+/// Process-global wire-prefix registry: `McpClient::connect` claims prefixes
+/// here so simultaneously-connected servers with colliding sanitized names
+/// are deterministically disambiguated (first claimant in connect order
+/// keeps the plain prefix). Poisoning is recovered (into_inner) — a panicked
+/// prior connection must not take down later ones.
+static GLOBAL_WIRE_PREFIX_REGISTRY: std::sync::OnceLock<
+    std::sync::Mutex<WirePrefixRegistry>,
+> = std::sync::OnceLock::new();
+
+fn global_wire_prefix_registry() -> &'static std::sync::Mutex<WirePrefixRegistry> {
+    GLOBAL_WIRE_PREFIX_REGISTRY.get_or_init(|| std::sync::Mutex::new(WirePrefixRegistry::new()))
 }
 
 /// A discovered MCP tool.
@@ -103,7 +182,7 @@ pub struct McpTool {
     pub input_schema: Value,
 }
 
-fn tool_from_listing(server_name: &str, tool: &Value) -> Option<McpTool> {
+fn tool_from_listing(server_name: &str, wire_prefix: &str, tool: &Value) -> Option<McpTool> {
     let name = tool.get("name")?.as_str()?.to_string();
     let raw_description = tool.get("description").and_then(Value::as_str).unwrap_or("");
     let description = if raw_description.is_empty() {
@@ -113,7 +192,13 @@ fn tool_from_listing(server_name: &str, tool: &Value) -> Option<McpTool> {
         raw_description.to_string()
     };
     Some(McpTool {
-        wire_name: mcp_prefixed_tool_name(server_name, &name),
+        wire_name: format!(
+            "{}{}{}{}",
+            MCP_TOOL_NAME_PREFIX,
+            wire_prefix,
+            MCP_NAME_DELIM,
+            sanitize_mcp_name_component(&name)
+        ),
         description,
         input_schema: normalize_mcp_input_schema(tool.get("inputSchema")),
         name,
@@ -183,6 +268,73 @@ pub struct McpClient {
     /// `wire_name -> (server, tool)`: exact provenance captured at listing
     /// time (upstream `_mcp_tool_server_names`); wire names are never parsed.
     tool_names: StdMutex<HashMap<String, (String, String)>>,
+    /// Sanitized (and possibly collision-disambiguated) wire prefix for this
+    /// server's tools, from [`WirePrefixRegistry::register`].
+    wire_prefix: String,
+    /// Collisions/warnings recorded for this server (name collisions, ...);
+    /// drained via [`McpClient::take_warnings`] so the CLI can surface them.
+    warnings: StdMutex<Vec<String>>,
+}
+
+/// Upper bound on a single server-framed stdout line (`MAX_LINE_BYTES`,
+/// 32 MiB). Legitimate MCP JSON-RPC frames are far smaller; a line longer
+/// than this indicates a hostile or broken server and the connection errors
+/// cleanly instead of buffering unbounded data.
+pub const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
+
+/// `AsyncBufReadExt::read_line`, but aborts with an error once `line` plus
+/// the incoming data would exceed `max_bytes` — leaving the excess unread is
+/// fine because the connection is torn down on error anyway.
+async fn read_line_bounded<R: std::ops::DerefMut + Unpin>(
+    reader: &mut R,
+    line: &mut String,
+    max_bytes: usize,
+) -> std::io::Result<usize>
+where
+    R::Target: tokio::io::AsyncBufRead + Unpin,
+{
+    let reader: &mut R::Target = &mut **reader;
+    // Bytes are accumulated and UTF-8-decoded once at the end: decoding per
+    // fill_buf chunk would corrupt multibyte characters that straddle a
+    // buffer boundary.
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        // Scan the internal buffer for the newline instead of read_line,
+        // which would keep growing the String unchecked.
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            line.push_str(&String::from_utf8_lossy(&bytes));
+            return Ok(bytes.len()); // EOF
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                bytes.extend_from_slice(&available[..idx]);
+                if bytes.len() > max_bytes {
+                    return Err(std::io::Error::other(line_cap_error(max_bytes)));
+                }
+                reader.consume(idx + 1);
+                line.push_str(&String::from_utf8_lossy(&bytes));
+                // +1 for the consumed newline.
+                return Ok(bytes.len() + 1);
+            }
+            None => {
+                bytes.extend_from_slice(available);
+                let len = available.len();
+                reader.consume(len);
+                if bytes.len() > max_bytes {
+                    return Err(std::io::Error::other(line_cap_error(max_bytes)));
+                }
+            }
+        }
+    }
+}
+
+fn line_cap_error(max_bytes: usize) -> String {
+    format!(
+        "frame exceeded the {}-byte line cap (possible hostile/buggy server); \
+         dropping the connection",
+        max_bytes
+    )
 }
 
 impl McpClient {
@@ -261,13 +413,16 @@ impl McpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
+            // Backstop: if the client is dropped without shutdown() (panic,
+            // cancellation), the server process must not outlive us as a zombie.
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning MCP server '{}'", command))?;
 
         let stdin = child.stdin.take().context("no stdin on MCP server")?;
         let stdout = child.stdout.take().context("no stdout on MCP server")?;
 
-        let client = Self {
+        let mut client = Self {
             server_name: server_name.to_string(),
             child,
             stdin: Mutex::new(stdin),
@@ -277,7 +432,24 @@ impl McpClient {
             initialize_result: OnceLock::new(),
             tool_timeout: config.tool_timeout(),
             tool_names: StdMutex::new(HashMap::new()),
+            wire_prefix: String::new(), // set below via the global registry
+            warnings: StdMutex::new(Vec::new()),
         };
+
+        // Claim the wire prefix through the PROCESS-GLOBAL registry so any
+        // concurrently-connected servers with colliding sanitized names
+        // (e.g. "my-server" vs "my_server") get deterministic disambiguated
+        // prefixes instead of silently rerouting each other's tool calls.
+        {
+            let mut reg = global_wire_prefix_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let (prefix, warning) = reg.register(server_name);
+            client.wire_prefix = prefix;
+            if let Some(w) = warning {
+                client.push_warning(w);
+            }
+        }
 
         // Bound the MCP handshake: a stdio server that never completes
         // `initialize` must not hang connection forever (upstream wraps
@@ -287,11 +459,21 @@ impl McpClient {
         {
             Ok(Ok(())) => Ok(client),
             Ok(Err(exc)) => {
+                let claimed_prefix = client.wire_prefix.clone();
                 client.shutdown().await;
+                global_wire_prefix_registry()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .unregister(&claimed_prefix);
                 Err(exc)
             }
             Err(_) => {
+                let claimed_prefix = client.wire_prefix.clone();
                 client.shutdown().await;
+                global_wire_prefix_registry()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .unregister(&claimed_prefix);
                 Err(anyhow::anyhow!(
                     "MCP server '{}': initialize handshake timed out after {:.0}s",
                     server_name,
@@ -308,6 +490,40 @@ impl McpClient {
     /// The raw `initialize` result (capabilities, serverInfo, ...).
     pub fn initialize_result(&self) -> Option<&Value> {
         self.initialize_result.get()
+    }
+
+    /// The sanitized (and possibly collision-disambiguated) wire prefix this
+    /// client's tools are registered under (without the `mcp__` head and the
+    /// trailing `__` delimiter).
+    pub fn wire_prefix(&self) -> &str {
+        &self.wire_prefix
+    }
+
+    /// Drain recorded warnings (e.g. wire-prefix name collisions) so the
+    /// registration API caller can surface them to the user.
+    pub fn take_warnings(&self) -> Vec<String> {
+        self.warnings.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
+    }
+
+    /// Record a warning for later retrieval via [`McpClient::take_warnings`].
+    pub fn push_warning(&self, warning: String) {
+        self.warnings.lock().unwrap_or_else(|e| e.into_inner()).push(warning);
+    }
+
+    /// Claim this server's wire prefix in `registry` (before the first
+    /// [`McpClient::list_tools`]) so that tools from sanitization-colliding
+    /// servers (`my-server` vs `my_server` vs `my.server`) get distinct,
+    /// provenance-safe wire names. On collision the client's prefix is
+    /// disambiguated deterministically (numeric suffix in registration
+    /// order) and a warning is recorded (surfaced via
+    /// [`McpClient::take_warnings`]) and returned.
+    pub fn register_wire_prefix(&mut self, registry: &mut WirePrefixRegistry) -> Option<String> {
+        let (prefix, warning) = registry.register(&self.server_name);
+        self.wire_prefix = prefix;
+        if let Some(w) = &warning {
+            self.push_warning(w.clone());
+        }
+        warning
     }
 
     async fn initialize(&self) -> Result<()> {
@@ -387,7 +603,7 @@ impl McpClient {
         let tools: Vec<McpTool> = paginator
             .items
             .iter()
-            .filter_map(|t| tool_from_listing(&self.server_name, t))
+            .filter_map(|t| tool_from_listing(&self.server_name, &self.wire_prefix, t))
             .collect();
 
         // Registration-time provenance map (upstream `_track_mcp_tool_server`).
@@ -481,10 +697,17 @@ impl McpClient {
         let mut line = String::new();
         loop {
             line.clear();
-            let n = stdout
-                .read_line(&mut line)
+            // Bounded read (SC hardening): a hostile or buggy server that
+            // streams an enormous line with no trailing newline must not be
+            // able to grow memory without bound. `read_line` keeps
+            // accumulating into `line`, so check the accumulated length
+            // after each chunk-read and error out once the cap is exceeded.
+            let n = read_line_bounded(&mut stdout, &mut line, MAX_LINE_BYTES)
                 .await
-                .map_err(|exc| RequestError::Transport(exc.to_string()))?;
+                .map_err(|exc| RequestError::Transport(format!(
+                    "MCP server '{}': {}",
+                    self.server_name, exc
+                )))?;
             if n == 0 {
                 return Err(RequestError::Transport(format!(
                     "MCP server '{}' closed the connection",
@@ -649,12 +872,13 @@ mod tests {
 
     #[test]
     fn listing_applies_description_fallback_and_schema_normalization() {
-        let tool = tool_from_listing("srv", &json!({"name": "alpha"})).unwrap();
+        let tool = tool_from_listing("srv", "srv", &json!({"name": "alpha"})).unwrap();
         assert_eq!(tool.description, "MCP tool alpha from srv");
         assert_eq!(tool.wire_name, "mcp__srv__alpha");
         assert_eq!(tool.input_schema, json!({"type": "object", "properties": {}}));
 
         let tool = tool_from_listing(
+            "srv",
             "srv",
             &json!({"name": "beta", "description": "", "inputSchema": {"type": "object"}}),
         )
@@ -663,7 +887,7 @@ mod tests {
         assert_eq!(tool.description, "MCP tool beta from srv");
         assert_eq!(tool.input_schema, json!({"type": "object", "properties": {}}));
 
-        assert!(tool_from_listing("srv", &json!({"description": "no name"})).is_none());
+        assert!(tool_from_listing("srv", "srv", &json!({"description": "no name"})).is_none());
     }
 
     #[test]
@@ -833,6 +1057,141 @@ sleep 30
     // Each test feeds input that exercises the formerly-panicking path and
     // asserts no panic occurs (typed error or graceful recovery).
     // ---------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------
+    // Name-collision disambiguation (WirePrefixRegistry)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn colliding_server_names_get_distinct_wire_prefixes() {
+        let mut reg = WirePrefixRegistry::new();
+        // 'my-server' and 'my_server' (and 'my.server') all sanitize to
+        // 'my_server' - first claimant keeps the plain prefix.
+        let (p1, w1) = reg.register("my-server");
+        let (p2, w2) = reg.register("my_server");
+        let (p3, w3) = reg.register("my.server");
+        assert_eq!(p1, "my_server");
+        assert!(w1.is_none(), "first claimant must not warn");
+        assert_eq!(p2, "my_server_2");
+        assert!(w2.is_some(), "second claimant must warn");
+        assert_eq!(p3, "my_server_3");
+        assert!(w3.is_some(), "third claimant must warn");
+        // Non-colliding names are unaffected and don't warn.
+        let (p4, w4) = reg.register("other");
+        assert_eq!(p4, "other");
+        assert!(w4.is_none());
+    }
+
+    #[test]
+    fn collision_warning_mentions_both_servers_and_disambiguated_prefix() {
+        let mut reg = WirePrefixRegistry::new();
+        let _ = reg.register("my-server");
+        let (_, warning) = reg.register("my_server");
+        let warning = warning.expect("must warn");
+        assert!(warning.contains("my-server"), "{warning}");
+        assert!(warning.contains("my_server_2"), "{warning}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn colliding_servers_produce_distinct_wire_names_and_provenance() {
+        let script = r#"
+IFS= read -r line
+printf '%s
+' '{"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "s", "version": "0"}}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s
+' '{"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}}'
+IFS= read -r line
+"#;
+        // connect() itself claims prefixes via the process-global registry,
+        // so colliding names are disambiguated at connect time.
+        let mut a = McpClient::connect("my-server", &sh_server(script)).await.expect("connect a");
+        let mut b = McpClient::connect("my_server", &sh_server(script)).await.expect("connect b");
+
+        let tools_a = a.list_tools().await.expect("list a");
+        let tools_b = b.list_tools().await.expect("list b");
+        assert_eq!(tools_a[0].wire_name, "mcp__my_server__echo");
+        assert_eq!(tools_b[0].wire_name, "mcp__my_server_2__echo");
+
+        // Provenance lookups use the FINAL disambiguated names and route to
+        // the correct server - no silent overwrite.
+        assert_eq!(
+            a.tool_provenance("mcp__my_server__echo"),
+            Some(("my-server".to_string(), "echo".to_string()))
+        );
+        assert_eq!(
+            b.tool_provenance("mcp__my_server_2__echo"),
+            Some(("my_server".to_string(), "echo".to_string()))
+        );
+        assert!(a.take_warnings().is_empty());
+        assert_eq!(b.take_warnings().len(), 1);
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Bounded line read (MAX_LINE_BYTES)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn read_line_bounded_reads_normal_lines() {
+        let data = b"{\"jsonrpc\": \"2.0\", \"id\": 0, \"result\": {}}\ntrailing";
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut line = String::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let n = rt
+            .block_on(read_line_bounded(&mut &mut reader, &mut line, MAX_LINE_BYTES))
+            .expect("read");
+        assert_eq!(line, r#"{"jsonrpc": "2.0", "id": 0, "result": {}}"#);
+        assert_eq!(n, line.len() + 1);
+    }
+
+    #[test]
+    fn read_line_bounded_errors_on_oversized_line() {
+        // 1000-byte cap, 5000-byte line with no newline.
+        let data = vec![b'A'; 5000];
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut line = String::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(read_line_bounded(&mut &mut reader, &mut line, 1000))
+            .err()
+            .expect("must error");
+        assert!(err.to_string().contains("1000-byte line cap"), "{err}");
+        assert!(line.len() <= 1000, "buffer must stay bounded");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_server_frame_fails_the_call_cleanly() {
+        // 40MB of junk without a newline (over the 32MB cap), then hang - without the cap the
+        // read would keep buffering indefinitely; with it the call errors
+        // out with the line-cap message well before the 20s timeout.
+        let script = r#"
+IFS= read -r line
+printf '%s
+' '{"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "s", "version": "0"}}}'
+IFS= read -r line
+head -c 41943040 /dev/zero | tr '\000' 'A'
+sleep 30
+"#;
+        let config = ServerConfig { timeout: Some(20.0), ..sh_server(script) };
+        let client = McpClient::connect("flood", &config).await.expect("connect");
+        let out = client.call_tool("anything", json!({})).await;
+        assert!(
+            out.contains("line cap") && out.contains("MCP call failed"),
+            "unexpected envelope: {out}"
+        );
+        client.shutdown().await;
+    }
 
     /// The mutex poison recovery at lib.rs:394,414 uses `unwrap_or_else` to
     /// recover from a poisoned lock instead of panicking. Verify the recovery

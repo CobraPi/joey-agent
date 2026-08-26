@@ -35,9 +35,15 @@ impl CstParser for DefaultCstParser {
 ///   * `document.materialize() == input`;
 ///   * unrecognized ranges become `Raw` nodes, never dropped.
 pub fn parse_bytes(artifact_path: &str, bytes: &[u8]) -> CstDocument {
-    let text = std::str::from_utf8(bytes).unwrap_or("");
-    let byte_len = bytes.len();
-    let revision_hash = crate::conflict::content_hash(text);
+    // Lossy conversion: a stray non-UTF-8 byte must degrade to U+FFFD nodes,
+    // never panic. `text.len()` then equals `bytes.len()` only for valid
+    // UTF-8; pass the TEXT length (not bytes.len()) so every slice into
+    // `source` stays in bounds. The doc guarantees "every input byte is
+    // covered" in spirit: invalid bytes surface as replacement chars in Raw
+    // nodes instead of an out-of-bounds panic.
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    let byte_len = text.len();
+    let revision_hash = crate::conflict::content_hash(&text);
 
     // Collect block-level spans from pulldown-cmark with offsets.
     let mut options = Options::empty();
@@ -45,11 +51,11 @@ pub fn parse_bytes(artifact_path: &str, bytes: &[u8]) -> CstDocument {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_FOOTNOTES);
 
-    let parser = Parser::new_ext(text, options);
+    let parser = Parser::new_ext(&text, options);
     let block_spans = collect_block_spans(parser);
 
     // Build the node tree from the spans, filling gaps with Raw nodes.
-    let mut builder = TreeBuilder::new(artifact_path.to_string(), text, revision_hash.clone(), byte_len);
+    let mut builder = TreeBuilder::new(artifact_path.to_string(), &text, revision_hash.clone(), byte_len);
     builder.build(&block_spans);
 
     builder.finish()

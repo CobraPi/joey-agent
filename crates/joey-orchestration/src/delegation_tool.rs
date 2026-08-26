@@ -19,6 +19,162 @@ use crate::manager::SubagentManager;
 use crate::types::{DelegationRequest, SubagentRole, TaskSpec};
 use crate::CategoryResolver;
 
+// ---------------------------------------------------------------------------
+// HyperCode role routing (explorer / implementor)
+// ---------------------------------------------------------------------------
+
+/// Per-role delegation settings resolved from the `hypercode.*` config
+/// tables. Self-contained mirror of joey-cli's RoleConfig so this crate
+/// stays independent (the config keys are the contract).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HyperRoleSettings {
+    pub model: String,
+    pub max_tokens: u64,
+    pub max_turns: u64,
+    pub reasoning_level: String,
+}
+
+impl HyperRoleSettings {
+    fn from_config_tree(tree: &Config, table: &str, provider: &str) -> Self {
+        let mut s = Self::default();
+        let table_key = format!("hypercode.{}.{}", table, provider);
+        if let Some(node) = tree.get(&table_key) {
+            if let Some(map) = node.as_mapping() {
+                let get = |k: &str| map.get(serde_yaml::Value::String(k.to_string()));
+                if let Some(v) = get("model").and_then(|v| v.as_str()) {
+                    s.model = v.to_string();
+                }
+                if let Some(v) = get("max_tokens").and_then(|v| v.as_u64()) {
+                    s.max_tokens = v;
+                }
+                if let Some(v) = get("max_turns").and_then(|v| v.as_u64()) {
+                    s.max_turns = v;
+                }
+                if let Some(v) = get("reasoning_level").and_then(|v| v.as_str()) {
+                    s.reasoning_level = v.to_string();
+                }
+            }
+        }
+        s
+    }
+}
+
+/// The delegation role requested via the tool's `role` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HyperRole {
+    Explorer,
+    Implementor,
+}
+
+impl HyperRole {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "explorer" | "explore" => Some(HyperRole::Explorer),
+            "implementor" | "implement" | "builder" => Some(HyperRole::Implementor),
+            _ => None,
+        }
+    }
+
+    /// Config table name (`hypercode.<table>.<provider>`).
+    fn table(self) -> &'static str {
+        match self {
+            HyperRole::Explorer => "explorer",
+            HyperRole::Implementor => "implementor",
+        }
+    }
+
+    /// Toolsets the role operates with. Explorer is READ-ONLY on files but
+    /// has terminal (diagnostic commands for the orchestrator); Implementor
+    /// owns the write path plus verification builds/tests.
+    fn toolsets(self) -> &'static [&'static str] {
+        match self {
+            HyperRole::Explorer => &["file-read", "terminal", "web"],
+            HyperRole::Implementor => &["file", "terminal", "web"],
+        }
+    }
+
+    fn prompt_append(self) -> &'static str {
+        match self {
+            HyperRole::Explorer => EXPLORER_DIRECTIVE,
+            HyperRole::Implementor => IMPLEMENTOR_DIRECTIVE,
+        }
+    }
+}
+
+/// Role directives injected as the child's extra instructions. Wording kept
+/// in joey-orchestration (not joey-cli) so the tool is self-contained.
+pub(crate) const EXPLORER_DIRECTIVE: &str = "\
+You are an EXPLORER subagent. Your parent orchestrator has NO tools — you are \
+its eyes and hands for everything read-only.\n\
+- Investigate code, docs, and the environment; run read-only/diagnostic \
+commands (rg, ls, git log/diff, cargo check, --help) and report ACTUAL output.\n\
+- NEVER modify, create, or delete files. Never run state-changing commands.\n\
+- Your final message is the orchestrator's ONLY source of truth: exact paths, \
+symbols, command output, risks. Answer precisely what was asked.\n\
+- Keep it under 600 tokens; lead with the answer, then evidence.";
+
+pub(crate) const IMPLEMENTOR_DIRECTIVE: &str = "\
+You are an IMPLEMENTOR subagent. You own the write path for your assigned task.\n\
+- Edit files AND run the builds/tests/commands that verify your own work; \
+report the real verification result.\n\
+- Follow the brief exactly; if something is missing, make the smallest \
+reasonable decision and note it.\n\
+- Touch only the files in your assignment; siblings work in parallel.\n\
+- Report exactly what changed, file by file, plus verification. Under 500 tokens.";
+
+/// Resolve a DelegationRequest patch for a HyperCode role: toolsets, role
+/// config (model/turns/tokens/reasoning) unless the caller set explicit
+/// overrides, and the role directive as prompt_append (appended after any
+/// caller-provided append so both survive).
+///
+/// `explicit_toolsets` = the tool call included its own `toolsets` array
+/// (keeps user control; role defaults only fill gaps).
+pub(crate) fn apply_hyper_role(
+    req: &mut DelegationRequest,
+    role: HyperRole,
+    tree: &Config,
+    provider: &str,
+) {
+    let settings = HyperRoleSettings::from_config_tree(tree, role.table(), provider);
+    if req.toolsets.is_empty() {
+        req.toolsets = role.toolsets().iter().map(|s| s.to_string()).collect();
+    }
+    if req.model.is_none() && !settings.model.is_empty() {
+        req.model = Some(settings.model.clone());
+    }
+    if req.max_turns.is_none() && settings.max_turns > 0 {
+        req.max_turns = Some(settings.max_turns as usize);
+    }
+    if req.max_tokens.is_none() && settings.max_tokens > 0 {
+        req.max_tokens = Some(settings.max_tokens as u32);
+    }
+    if req.reasoning.is_none() && !settings.reasoning_level.is_empty() {
+        req.reasoning = parse_role_reasoning(&settings.reasoning_level);
+    }
+    // Role directive stacks with any existing prompt_append (caller content
+    // first, role identity second).
+    let directive = role.prompt_append().to_string();
+    req.prompt_append = Some(match req.prompt_append.take() {
+        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{directive}"),
+        _ => directive,
+    });
+}
+
+/// Parse a HyperCode role name (shared by single + batch paths).
+pub(crate) fn hyper_role_parse(s: &str) -> Option<HyperRole> {
+    HyperRole::parse(s)
+}
+
+/// Parse a reasoning-level string ("none"|"low"|"medium"|"high"|"") the same
+/// way joey-cli's hypercode module does.
+pub(crate) fn parse_role_reasoning(level: &str) -> Option<joey_providers::ReasoningEffort> {
+    match level.trim().to_lowercase().as_str() {
+        "" | "inherit" => None,
+        "none" | "off" => Some(joey_providers::ReasoningEffort::Disabled),
+        other => Some(joey_providers::ReasoningEffort::Level(other.to_string())),
+    }
+}
+
 /// The delegate_task tool. Holds an Arc<SubagentManager> for dispatching.
 pub struct DelegateTask {
     manager: Arc<SubagentManager>,
@@ -84,7 +240,12 @@ impl Tool for DelegateTask {
          subagent gets its own conversation history, toolset, and execution budget. \
          The parent receives only a concise summary from each child. By default, \
          subagent traces are ephemeral (discarded after summary); set persist=true \
-         to store the child session for later session_search recall."
+         to store the child session for later session_search recall. \
+         PARALLELISM: batch `tasks` all launch simultaneously (bounded only by \
+         system capacity) — for codebase exploration or multi-part implementation, \
+         ALWAYS fan out one task per concern in a single batch call instead of \
+         sequential single-goal calls; this cuts wall-clock time dramatically \
+         by parallelizing inference."
     }
 
     fn parameters(&self) -> Value {
@@ -94,6 +255,11 @@ impl Tool for DelegateTask {
                 "goal": {
                     "type": "string",
                     "description": "The task goal for the subagent. Required for single-task mode."
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["explorer", "implementor"],
+                    "description": "HyperCode role routing. 'explorer' = read-only investigation (file-read + terminal + web; runs diagnostic commands on your behalf; NEVER writes). 'implementor' = writes files AND runs builds/tests to verify its own work. When set, the role's configured model/turns/tokens/reasoning (hypercode.explorer / hypercode.implementor in config) apply unless explicitly overridden here."
                 },
                 "context": {
                     "type": "string",
@@ -107,11 +273,12 @@ impl Tool for DelegateTask {
                             "goal": {"type": "string"},
                             "context": {"type": "string"},
                             "model": {"type": "string"},
-                            "toolsets": {"type": "array", "items": {"type": "string"}}
+                            "toolsets": {"type": "array", "items": {"type": "string"}},
+                            "role": {"type": "string", "enum": ["explorer", "implementor"], "description": "HyperCode role routing for this task: 'explorer' (read-only + diagnostic commands) or 'implementor' (writes + verifies). Applies the role's config and directive unless overridden per-task."}
                         },
                         "required": ["goal"]
                     },
-                    "description": "Batch mode: array of task specs for parallel dispatch. Each runs concurrently and independently. If provided, 'goal' is ignored."
+                    "description": "Batch mode: array of task specs for parallel dispatch. Each runs concurrently and independently. If provided, 'goal' is ignored. Set role:'explorer'/'implementor' per task to fan out mixed read/write waves in ONE call."
                 },
                 "model": {
                     "type": "string",
@@ -280,6 +447,8 @@ impl Tool for DelegateTask {
                 })
                 .unwrap_or_default(),
             max_turns: None,
+            reasoning: None,
+            max_tokens: None,
             persist: args.get("persist").and_then(|v| v.as_bool()).unwrap_or(false),
             role: SubagentRole::Leaf,
             workdir: None,
@@ -288,6 +457,23 @@ impl Tool for DelegateTask {
             load_skills,
             prompt_append,
         };
+
+        // HyperCode role routing: `role: "explorer"|"implementor"` fills
+        // toolsets/model/turns/tokens/reasoning from the role's config table
+        // (gaps only — explicit args win) and injects the role directive.
+        let mut req = req;
+        if let Some(role_str) = args.get("role").and_then(|v| v.as_str()) {
+            match HyperRole::parse(role_str) {
+                Some(role) => {
+                    apply_hyper_role(&mut req, role, &self.parent_config_tree, &self.parent_config.provider);
+                }
+                None => {
+                    return ToolResult::Error(format!(
+                        "Unknown role '{role_str}'. Use 'explorer' or 'implementor'."
+                    ));
+                }
+            }
+        }
 
         let result = self
             .manager
@@ -332,9 +518,25 @@ impl DelegateTask {
             })
             .unwrap_or_default();
 
+        // Batch-level `role` applies to tasks that didn't set their own.
+        let batch_role = args.get("role").and_then(|v| v.as_str()).map(String::from);
+        let mut task_specs = task_specs;
+        if let Some(role) = &batch_role {
+            if crate::delegation_tool::hyper_role_parse(role).is_none() {
+                return ToolResult::Error(format!(
+                    "Unknown role '{role}'. Use 'explorer' or 'implementor'."
+                ));
+            }
+            for spec in &mut task_specs {
+                if spec.role.is_none() {
+                    spec.role = Some(role.clone());
+                }
+            }
+        }
+
         let results = self
             .manager
-            .dispatch_batch(
+            .dispatch_batch_with_roles(
                 &task_specs,
                 batch_model.as_deref(),
                 &batch_toolsets,
@@ -465,5 +667,124 @@ impl Tool for CallOmoAgent {
         }
         // Delegate to the inner DelegateTask which handles resolution + dispatch.
         self.inner.execute(args, ctx).await
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+    use crate::types::SubagentRole;
+
+    fn tree_with(yaml: &str) -> Config {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), yaml).unwrap();
+        Config::load_from(tmp.path().to_path_buf()).unwrap()
+    }
+
+    fn base_req() -> DelegationRequest {
+        DelegationRequest {
+            goal: "g".into(),
+            context: None,
+            tasks: Vec::new(),
+            model: None,
+            toolsets: Vec::new(),
+            max_turns: None,
+            reasoning: None,
+            max_tokens: None,
+            persist: false,
+            role: SubagentRole::Leaf,
+            workdir: None,
+            category: None,
+            subagent_type: None,
+            load_skills: Vec::new(),
+            prompt_append: None,
+        }
+    }
+
+    #[test]
+    fn role_parse_variants() {
+        assert_eq!(HyperRole::parse("explorer"), Some(HyperRole::Explorer));
+        assert_eq!(HyperRole::parse("Explore"), Some(HyperRole::Explorer));
+        assert_eq!(HyperRole::parse("implementor"), Some(HyperRole::Implementor));
+        assert_eq!(HyperRole::parse("builder"), Some(HyperRole::Implementor));
+        assert_eq!(HyperRole::parse("other"), None);
+    }
+
+    #[test]
+    fn explorer_role_gives_readonly_files_plus_terminal() {
+        let tree = tree_with("");
+        let mut req = base_req();
+        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "prov");
+        assert!(req.toolsets.contains(&"file-read".to_string()));
+        assert!(!req.toolsets.contains(&"file".to_string()));
+        assert!(req.toolsets.contains(&"terminal".to_string()));
+        assert!(req.prompt_append.as_deref().unwrap_or("").contains("EXPLORER"));
+        assert!(req.prompt_append.as_deref().unwrap_or("").contains("NEVER modify"));
+    }
+
+    #[test]
+    fn implementor_role_gives_write_access() {
+        let tree = tree_with("");
+        let mut req = base_req();
+        apply_hyper_role(&mut req, HyperRole::Implementor, &tree, "prov");
+        assert!(req.toolsets.contains(&"file".to_string()));
+        assert!(req.toolsets.contains(&"terminal".to_string()));
+        assert!(req.prompt_append.as_deref().unwrap_or("").contains("IMPLEMENTOR"));
+    }
+
+    #[test]
+    fn role_settings_fill_gaps_but_explicit_wins() {
+        let tree = tree_with(
+            "hypercode:\n  explorer:\n    prov:\n      model: cheap-model\n      max_turns: 7\n      max_tokens: 9000\n      reasoning_level: low\n",
+        );
+        // Gaps filled from config.
+        let mut req = base_req();
+        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "prov");
+        assert_eq!(req.model.as_deref(), Some("cheap-model"));
+        assert_eq!(req.max_turns, Some(7));
+        assert_eq!(req.max_tokens, Some(9000));
+        assert!(matches!(req.reasoning, Some(joey_providers::ReasoningEffort::Level(l)) if l == "low"));
+
+        // Explicit args win over role config.
+        let mut req = base_req();
+        req.model = Some("explicit".into());
+        req.max_turns = Some(3);
+        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "prov");
+        assert_eq!(req.model.as_deref(), Some("explicit"));
+        assert_eq!(req.max_turns, Some(3));
+    }
+
+    #[test]
+    fn role_directive_stacks_with_existing_append() {
+        let tree = tree_with("");
+        let mut req = base_req();
+        req.prompt_append = Some("caller content".into());
+        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "p");
+        let append = req.prompt_append.unwrap();
+        assert!(append.starts_with("caller content"));
+        assert!(append.contains("EXPLORER"));
+    }
+
+    #[test]
+    fn batch_role_routing_applies_per_task() {
+        let tree = tree_with("");
+        let tasks = vec![
+            TaskSpec { goal: "read thing".into(), context: None, model: None, toolsets: Vec::new(), role: Some("explorer".into()) },
+            TaskSpec { goal: "build thing".into(), context: None, model: None, toolsets: Vec::new(), role: Some("implementor".into()) },
+            TaskSpec { goal: "plain".into(), context: None, model: None, toolsets: Vec::new(), role: None },
+        ];
+        let mut reqs: Vec<DelegationRequest> = tasks.iter().map(|_| base_req()).collect();
+        crate::subagent::apply_batch_hyper_roles(&mut reqs, &tasks, &tree, "p").unwrap();
+        assert!(reqs[0].toolsets.contains(&"file-read".to_string()));
+        assert!(reqs[1].toolsets.contains(&"file".to_string()));
+        assert!(reqs[2].toolsets.is_empty(), "no role → untouched");
+    }
+
+    #[test]
+    fn batch_role_routing_rejects_unknown_role() {
+        let tree = tree_with("");
+        let tasks = vec![TaskSpec { goal: "x".into(), context: None, model: None, toolsets: Vec::new(), role: Some("wat".into()) }];
+        let mut reqs: Vec<DelegationRequest> = vec![base_req()];
+        assert!(crate::subagent::apply_batch_hyper_roles(&mut reqs, &tasks, &tree, "p").is_err());
     }
 }

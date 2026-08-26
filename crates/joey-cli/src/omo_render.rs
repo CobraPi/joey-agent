@@ -48,6 +48,7 @@ pub fn render_event(event: &AgentEvent) -> Option<String> {
             ))
         }
         AgentEvent::SubagentFailed {
+            id: _,
             goal,
             error,
             duration_secs,
@@ -176,6 +177,7 @@ mod tests {
     #[test]
     fn render_subagent_spawn() {
         let event = AgentEvent::SubagentSpawn {
+            id: 1,
             goal: "search codebase".into(),
             model: "glm-5".into(),
             toolset_summary: "read,search".into(),
@@ -189,6 +191,7 @@ mod tests {
     #[test]
     fn render_subagent_complete() {
         let event = AgentEvent::SubagentComplete {
+            id: 1,
             goal: "search codebase".into(),
             success: true,
             summary_preview: "found 3 files".into(),

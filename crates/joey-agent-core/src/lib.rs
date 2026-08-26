@@ -13,6 +13,7 @@ pub mod events;
 pub mod guardrails;
 pub mod guidance;
 pub mod hooks;
+pub mod image_model;
 pub mod loop_detection;
 pub mod prompt;
 pub mod threat_scan;

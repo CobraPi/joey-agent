@@ -333,7 +333,17 @@ fn validate_operations(operations: &[PatchOperation], file_ops: &dyn V4aFileOps)
                     ));
                 }
             }
-            OperationType::Add => {}
+            OperationType::Add => {
+                // Add must CREATE — an existing target means the patch would
+                // silently overwrite user content. Check at validation time
+                // so nothing is applied.
+                if file_ops.read_file_raw(&op.file_path).is_ok() {
+                    errors.push(format!(
+                        "{}: file already exists — Add would overwrite (use Update instead)",
+                        op.file_path
+                    ));
+                }
+            }
         }
     }
 

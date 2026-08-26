@@ -307,6 +307,25 @@ fn terminal_header_line(summary: &str, is_error: bool, exit_code: Option<i64>, d
     )
 }
 
+/// Spec 018 (T018/FR-010): Build the terminal contention badge line
+/// (`⧗ terminal: A active, Q queued`). Pure function extracted so the
+/// gating rule is directly unit-testable: Some(line) only while queued > 0,
+/// None when the queue is drained — no persistent chrome (spec
+/// clarification Q2, contracts/events.md consumer obligations).
+fn terminal_queue_badge(active: usize, queued: usize) -> Option<String> {
+    if queued == 0 {
+        return None;
+    }
+    let t = theme();
+    Some(format!(
+        "  {} {}",
+        t.warning.ansi().paint("⧗"),
+        t.fg_more_subtle
+            .ansi()
+            .paint(format!("terminal: {} active, {} queued", active, queued)),
+    ))
+}
+
 /// Spec 008 (T020/FR-007): Build the generic tool-call header line (status icon
 /// + emoji + bold name + primary param + duration + optional exit badge). Pure
 /// function extracted from the `ToolEnd` arm for direct unit testing.
@@ -383,11 +402,100 @@ fn streamed_line_count_overflow(count: &u32) -> bool {
     *count > 5000
 }
 
+/// Remove ANSI escape sequences (CSI: ESC [ ... final byte) so display-width
+/// math isn't inflated by color codes. Used by the row-accounting print
+/// macro — styled payloads must be measured by their VISIBLE width only.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            // Consume the sequence up to and including the final byte
+            // (0x40..=0x7E per ECMA-48).
+            for c2 in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&c2) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Pure invalidation rule for the per-tool in-place spinner row (T041).
+///
+/// `render_turn` captures the absolute cursor row when a tool starts and
+/// repaints it in place (tick arm + ToolEnd rewrite). That absolute row is
+/// only valid while the screen has not scrolled or resized since capture:
+///
+/// - G1 non-degenerate: height > 0 at both capture and repaint time.
+/// - G4 no resize: height now == height at capture (a resize reflows rows
+///   arbitrarily, so the stored row points at unrelated content).
+/// - G2 row on screen: `tool_row < height_now`.
+/// - G3 no scroll: `tool_row + rows_emitted_since < height`. Every emitted
+///   row moves the cursor one line down; once the bottom edge is reached the
+///   terminal scrolled, and the stored row now points at different content —
+///   e.g. the reedline prompt/input line after the turn ("tool call printed
+///   into my text input").
+///
+/// Returns `true` only when in-place repainting is still safe.
+fn tool_row_repaint_safe(
+    tool_row: u16,
+    rows_emitted_since: u32,
+    height_at_capture: u16,
+    height_now: u16,
+) -> bool {
+    if height_at_capture == 0 || height_now == 0 {
+        return false; // G1: degenerate/unknown size — can't validate.
+    }
+    if height_at_capture != height_now {
+        return false; // G4: resized since capture.
+    }
+    if tool_row >= height_now {
+        return false; // G2: row no longer on screen.
+    }
+    // G3: cursor sat at `tool_row` at capture; the entry line's own newline
+    // moved it to `tool_row + 1`, and each counted row since moves it one
+    // more. A newline emitted while the cursor sits on the bottom row
+    // (height-1) scrolls the screen, shifting the stored row's content up.
+    // Scroll occurred iff tool_row + 1 + rows >= height, so repaint stays
+    // safe only while (tool_row + rows + 1) < height.
+    (tool_row as u64 + rows_emitted_since as u64 + 1) < height_now as u64
+}
+
+/// Pure decision for the `Done`-arm markdown reflow (US3). Clearing N rows
+/// above the cursor is only safe when the streamed region is contiguous
+/// (nothing else printed inside it), bounded (overflow guard), and still
+/// fits on the current screen — otherwise the clear walks past rows it did
+/// not draw and erases unrelated content (e.g. the prompt line itself).
+fn reflow_safe(streamed_rows: u32, interleaved: bool, overflowed: bool, term_height: u16) -> bool {
+    !interleaved
+        && !overflowed
+        && term_height > 0
+        && streamed_rows.saturating_add(1) <= term_height as u32
+}
+
+/// Current terminal height in rows; 0 when unavailable (non-TTY).
+/// NOTE: this is a size ioctl, NOT a DSR cursor query (`cursor::position()`)
+/// — it never blocks on pipes and is safe to call on any path.
+fn current_term_height() -> u16 {
+    crossterm::terminal::size().map(|(_, h)| h).unwrap_or(0)
+}
+
 /// Consume agent events and render them live. Returns the final text.
 pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: RenderOptions) -> String {
     let mut final_text = String::new();
     let mut streamed_any = false;
     let mut streamed_line_count: u32 = 0;
+    // True when something other than streamed content deltas printed since
+    // the first delta (a tool block, notice, error…). The Done reflow clears
+    // N lines above the cursor — with interleaved output those lines contain
+    // tool results, and the reflow would ERASE them. Reflow only when the
+    // streamed region is contiguous.
+    let mut interleaved_output = false;
     let mut reasoning_open = false;
     let mut reasoning_buf = String::new();
     let mut reasoning_line_count: usize = 0; // Feature 005 (T025): reasoning size tracking
@@ -482,6 +590,15 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
     // so the running repaint (T046) can keep the name + summary visible.
     let mut active_tool: Option<(u16, crate::animation::AnimationState, String, String)> = None;
 
+    // ── Spec 018 (T018/FR-010): terminal contention badge state ──
+    // Latest TerminalQueueState snapshot (last-value-wins; producer already
+    // throttles to the 50ms budget). The badge prints ONLY on transitions
+    // into/out of contention (queued > 0), right where the active-tool line
+    // renders — there is no persistent chrome while queued == 0.
+    let mut terminal_queued: usize = 0;
+    let mut terminal_active: usize = 0;
+    let mut badge_visible: bool = false;
+
     // ── T042/T047: Persistent in-flight usage indicator ──
     // While a turn is in progress, the accumulated token counts are surfaced
     // inline on the spinner line (see `usage_suffix`). The turn-complete
@@ -492,9 +609,40 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
     //    drives the streaming caret blink via `animation::tick_phase`. ──
     let mut tick_count: u64 = 0;
 
-    // ── T048: turn-start timestamp, captured on TurnStart, used to compute
-    //    the turn duration reported in the turn-complete summary (US5/AC2). ──
+    // T048: turn-start timestamp, captured on TurnStart, used to compute
+    // the turn duration reported in the turn-complete summary (US5/AC2). ──
     let mut turn_start: Option<Instant> = None;
+
+    // ── Row-scroll accounting (tool-spinner staleness fix) ──
+    // While a tool spinner row is live, every newline-terminated row printed
+    // through the shared render path is counted in `rows_since_capture`, and
+    // the terminal height is cached in `capture_height` at row-capture time.
+    // The tick arm and the ToolEnd rewrite feed these into
+    // `tool_row_repaint_safe` to decide whether the stored absolute row can
+    // still be repainted in place, or whether scroll/resize invalidated it
+    // (failure mode 1: repaint drawing over the reedline prompt/input line).
+    let mut rows_since_capture: u32 = 0;
+    let mut capture_height: u16 = 0;
+
+    // Counted println: byte-identical output to `println!`, plus accounting.
+    // - Adds the payload's visual rows (ANSI-stripped, wrap-aware) to
+    //   `rows_since_capture` so scrolling caused by ANY arm invalidates the
+    //   stored tool row.
+    // - Marks `interleaved_output` when printed after streamed deltas so the
+    //   Done reflow never clears rows it did not draw (failure mode 2).
+    // Arms that print without a trailing newline (spinner frames, delta
+    // text, the iteration label) scroll only via their eventual newline and
+    // are accounted where that newline is emitted.
+    macro_rules! println_counted {
+        ($($arg:tt)*) => {{
+            let payload = format!($($arg)*);
+            println!("{}", payload);
+            rows_since_capture += count_visual_lines(&strip_ansi(&payload), box_width());
+            if streamed_any {
+                interleaved_output = true;
+            }
+        }};
+    }
 
     let t = theme();
 
@@ -512,20 +660,28 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             )
         }
     };
-    // Feature 013 (T028): returns `true` when a reasoning block was actually
-    // closed (footer printed), so each call site can set `pending_separator`
-    // to insert the FR-010 blank before the next element.
-    let close_reasoning = |open: &mut bool, buf: &mut String, line_count: &mut usize, started: Option<Instant>| -> bool {
+    // Feature 013 (T028): returns `Some(rows_printed)` when a reasoning block
+    // was actually closed (footer printed), so each call site can set
+    // `pending_separator` to insert the FR-010 blank before the next element
+    // AND account the emitted rows against the tool-row scroll tracking
+    // (the closure cannot touch `rows_since_capture` directly — the print
+    // macro would double-borrow it).
+    let close_reasoning = |open: &mut bool, buf: &mut String, line_count: &mut usize, started: Option<Instant>| -> Option<u32> {
         if *open {
+            let mut rows: u32 = 0;
             if !buf.is_empty() {
                 println!("{}", t.fg_more_subtle.ansi().paint(buf.as_str()));
+                rows += count_visual_lines(&strip_ansi(buf), box_width());
                 buf.clear();
             }
             // Spec 008 (T006/FR-002): replace the "N lines of reasoning" close
             // summary with `└─ Thought for {:.1}s` footer matching the TUI
             // (widgets.rs:333-336), or a plain border close when no duration.
             match reasoning_footer_line(started) {
-                Some(line) => println!("{}", line),
+                Some(line) => {
+                    println!("{}", line);
+                    rows += count_visual_lines(&strip_ansi(&line), box_width());
+                }
                 None => {
                     let w = box_width();
                     let border = theme::gradient_diagonal_field(
@@ -534,13 +690,14 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                         t.fg_most_subtle,
                     );
                     println!("{}", border);
+                    rows += count_visual_lines(&strip_ansi(&border), box_width());
                 }
             }
             *open = false;
             *line_count = 0;
-            true
+            Some(rows)
         } else {
-            false
+            None
         }
     };
 
@@ -555,7 +712,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 if !opts.quiet {
                     let label = format!("◆ Turn started (max {} iterations)", max_iterations);
                     let gradient = theme::gradient_fg_bold(&label, t.primary, t.secondary, true);
-                    println!("{}", gradient);
+                    println_counted!("{}", gradient);
                 }
             }
             AgentEvent::IterationStart { iteration: it, max_iterations } => {
@@ -564,6 +721,12 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     let colored = theme::gradient_fg(&label, t.primary, t.secondary);
                     print!("{} ", colored);
                     let _ = std::io::stdout().flush();
+                    // Partial row (no newline yet): it occupies a row that the
+                    // NEXT newline-terminated print will terminate. Counted
+                    // immediately — conservative (may over-count by one),
+                    // which only invalidates in-place repaints slightly
+                    // early, never late.
+                    rows_since_capture += 1;
                 }
             }
             AgentEvent::ApiCallStart => {
@@ -595,7 +758,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                         let _ = std::io::stdout().flush();
                     } else {
                         let spinner_label = t.fg_more_subtle.ansi().paint("⟳ querying model...");
-                        println!("{}", spinner_label);
+                        println_counted!("{}", spinner_label);
                     }
                 }
             }
@@ -613,7 +776,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                         t.fg_more_subtle.ansi().paint(format_tokens(usage.prompt_tokens)),
                         t.fg_more_subtle.ansi().paint(format_tokens(usage.completion_tokens)),
                     );
-                    println!("{}", stats);
+                    println_counted!("{}", stats);
                     pending_separator = true;
                 }
             }
@@ -634,17 +797,18 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                         t.info_most_subtle,
                         t.fg_most_subtle,
                     );
-                    println!("\n{}{}", t.fg_more_subtle.ansi().paint("┌"), label_styled);
-                    println!("{}", fill_styled);
+                    // NOTE: the leading \n emits two rows (blank + header).
+                    println_counted!("\n{}{}", t.fg_more_subtle.ansi().paint("┌"), label_styled);
+                    println_counted!("{}", fill_styled);
                 }
                 reasoning_buf.push_str(&d);
                 while let Some(pos) = reasoning_buf.find('\n') {
                     let line: String = reasoning_buf.drain(..=pos).collect();
-                    println!("{}", t.fg_more_subtle.ansi().paint(line.trim_end_matches('\n')));
+                    println_counted!("{}", t.fg_more_subtle.ansi().paint(line.trim_end_matches('\n')));
                     reasoning_line_count += 1; // Feature 005 (T025)
                 }
                 if reasoning_buf.len() > 80 {
-                    println!("{}", t.fg_more_subtle.ansi().paint(reasoning_buf.as_str()));
+                    println_counted!("{}", t.fg_more_subtle.ansi().paint(reasoning_buf.as_str()));
                     reasoning_line_count += 1; // Feature 005 (T025)
                     reasoning_buf.clear();
                 }
@@ -679,13 +843,15 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 // Feature 013 (T028): close reasoning first; if a footer was
                 // printed, set the flag so the drain below inserts the FR-010
                 // blank between the reasoning footer and the content.
-                if close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                if let Some(rows) = close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                    rows_since_capture += rows;
+                    if streamed_any { interleaved_output = true; }
                     pending_separator = true;
                 }
                 // Feature 013 (T025): drain before the first streamed char so
                 // the content block is separated from the previous element
                 // (or from the reasoning footer per FR-010).
-                if drain_separator(&mut pending_separator) { println!(); }
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
                 print!("{}", d);
                 let _ = std::io::stdout().flush();
                 streamed_any = true;
@@ -699,12 +865,14 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 final_text = text;
                 if !opts.quiet && !streamed_any && !final_text.is_empty() {
                     // Feature 013 (T028): close reasoning; set flag if closed.
-                    if close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                    if let Some(rows) = close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                        rows_since_capture += rows;
+                        if streamed_any { interleaved_output = true; }
                         pending_separator = true;
                     }
                     // Feature 013 (T025): drain before this distinct element.
-                    if drain_separator(&mut pending_separator) { println!(); }
-                    println!("{}", final_text);
+                    if drain_separator(&mut pending_separator) { println_counted!(""); }
+                    println_counted!("{}", final_text);
                     // Feature 013 (T026): set after rendering.
                     pending_separator = true;
                 }
@@ -713,6 +881,11 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 // Spec 008: stash emoji+summary for the ToolEnd crush header.
                 pending_tool_emoji = emoji.clone();
                 pending_tool_summary = summary.clone();
+                // A tool block between streamed deltas makes the streamed
+                // region non-contiguous — reflow at Done would erase it.
+                if streamed_any {
+                    interleaved_output = true;
+                }
                 // Feature 013 (T031): the old `if streamed_any { println!() }`
                 // ad-hoc blank is subsumed by the pending_separator flag.
                 // (Relied on INV-1 dedup — draining resets the flag.)
@@ -720,7 +893,9 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 caret_active = false;
                 // Feature 013 (T028): close reasoning; set flag if closed so
                 // the drain below separates the footer from the tool header.
-                if close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                if let Some(rows) = close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                    rows_since_capture += rows;
+                    if streamed_any { interleaved_output = true; }
                     pending_separator = true;
                 }
                 // US2: finalize spinner before tool output.
@@ -740,7 +915,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     // Feature 013 (T025): drain BEFORE the tool_row capture so
                     // the blank lands ABOVE the spinner row and tool_row points
                     // at the post-blank spinner row (FR-014, contract §3).
-                    if drain_separator(&mut pending_separator) { println!(); }
+                    if drain_separator(&mut pending_separator) { println_counted!(""); }
                     let e = if emoji.is_empty() { "⚡" } else { &emoji };
                     let name_styled = theme::gradient_fg(&name, t.info, t.accent);
 
@@ -750,8 +925,29 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                         // line in place when the tool resolves.
                         use crossterm::{cursor, queue};
                         let mut stdout = std::io::stdout();
-                        // Get the cursor position.
-                        if let Ok(pos) = cursor::position() {
+                        // Get the cursor position. BLOCKING QUERY GUARD:
+                        // cursor::position() writes ESC[6n and blocks reading
+                        // the terminal's reply — on a pipe/non-TTY (tests,
+                        // cargo capture, `joey ... | tee`) NO reply ever
+                        // arrives and the whole turn hangs forever. Only
+                        // query when a real raw-mode-capable TTY is attached;
+                        // otherwise take the plain-line fallback below.
+                        let pos = if crossterm::terminal::is_raw_mode_enabled()
+                            .unwrap_or(false)
+                        {
+                            cursor::position().ok()
+                        } else {
+                            None
+                        };
+                        if let Some(pos) = pos {
+                            // Reset row-scroll accounting at capture: every
+                            // newline-terminated row printed from here on is
+                            // counted (see println_counted!) and checked
+                            // against the cached height before any in-place
+                            // repaint, so a scrolled/resized screen can never
+                            // be repainted at a stale absolute row.
+                            rows_since_capture = 0;
+                            capture_height = current_term_height();
                             // Print the entry line: spinner frame + name + summary.
                             let frame = tool_profile.frames[0];
                             let color = (tool_profile.color)(t);
@@ -806,8 +1002,21 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             }
             AgentEvent::ToolProgress { name, progress } => {
                 if !opts.quiet && opts.tool_progress == "verbose" {
-                    println!("{}", t.fg_more_subtle.ansi().paint(format!("  ┊ {} {}", name, progress)));
+                    println_counted!("{}", t.fg_more_subtle.ansi().paint(format!("  ┊ {} {}", name, progress)));
                 }
+            }
+            AgentEvent::ToolOutput { name: _, chunk } => {
+                // Live raw terminal output. The one-shot CLI renderer cannot
+                // rewrite lines it has already printed; in verbose mode the
+                // chunks are already visible via the ToolProgress arm (they
+                // fire together, throttled to the same window). Nothing else
+                // to do here — the maximized live view is a TUI feature.
+                let _ = chunk;
+            }
+            AgentEvent::ContextSnapshot { .. } => {
+                // Live context-window snapshots back the TUI agent-stats
+                // page. The one-shot CLI renderer prints linearly and has
+                // no stats page; ignore (additive event, no wire effect).
             }
             AgentEvent::ToolEnd { name, is_error, result_preview, duration_secs, exit_code, full_result } => {
                 let duration = duration_secs;
@@ -815,6 +1024,10 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     continue;
                 }
                 if opts.tool_progress == "new" && last_tool_line.as_deref() == Some(name.as_str()) && !is_error {
+                    // De-duplicated repeat of an already-rendered tool line.
+                    // Still retire the active spinner: leaving it pending
+                    // repaints a phantom tool row forever.
+                    active_tool.take();
                     continue;
                 }
                 last_tool_line = Some(name.clone());
@@ -832,8 +1045,23 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     let line = terminal_header_line(summary, is_error, exit_code, duration);
 
                     // T016: in-place rewrite when animations_on and active_tool matches.
-                    if let Some((tool_row, state, tool_name, _summary)) = active_tool.take() {
-                        if tool_name == name && animations_on {
+                    // SAFETY GATE: same scroll/resize validation as the tick
+                    // arm — only rewrite the captured row when it is provably
+                    // still the tool line; otherwise fall through to the
+                    // append-only println below.
+                    let mut can_rewrite = false;
+                    if let Some((tool_row, _state, tool_name, _summary)) = active_tool.as_ref() {
+                        can_rewrite = *tool_name == name
+                            && animations_on
+                            && tool_row_repaint_safe(
+                                *tool_row,
+                                rows_since_capture,
+                                capture_height,
+                                current_term_height(),
+                            );
+                    }
+                    if can_rewrite {
+                        if let Some((tool_row, state, _tool_name, _summary)) = active_tool.take() {
                             use crossterm::{cursor, queue, terminal};
                             let mut stdout = std::io::stdout();
                             let _ = queue!(
@@ -842,19 +1070,21 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                                 terminal::Clear(terminal::ClearType::CurrentLine),
                             );
                             let _ = stdout.flush();
-                            print!("{}", line);
+                            // Trailing newline: without it the first body
+                            // line concatenates onto this header row.
+                            print!("{}\n", line);
                             let _ = stdout.flush();
                             let _ = state;
-                        } else {
-                            println!("{}", line);
+                            rows_since_capture += 1;
                         }
                     } else {
+                        active_tool.take();
                         println!("{}", line);
                     }
 
                     // T015/FR-005: print the full command output beneath the header.
                     for l in tool_body_lines(body_text) {
-                        println!("{}", l);
+                        println_counted!("{}", l);
                     }
                 } else {
                     // ── T020/FR-007: generic tool-call header (crush composition) ──
@@ -863,8 +1093,23 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     );
 
                     // T022: in-place rewrite when animations_on and active_tool matches.
-                    if let Some((tool_row, state, tool_name, _summary)) = active_tool.take() {
-                        if tool_name == name && animations_on {
+                    // SAFETY GATE: same scroll/resize validation as the tick
+                    // arm — only rewrite the captured row when it is provably
+                    // still the tool line; otherwise fall through to the
+                    // append-only println below.
+                    let mut can_rewrite = false;
+                    if let Some((tool_row, _state, tool_name, _summary)) = active_tool.as_ref() {
+                        can_rewrite = *tool_name == name
+                            && animations_on
+                            && tool_row_repaint_safe(
+                                *tool_row,
+                                rows_since_capture,
+                                capture_height,
+                                current_term_height(),
+                            );
+                    }
+                    if can_rewrite {
+                        if let Some((tool_row, state, _tool_name, _summary)) = active_tool.take() {
                             use crossterm::{cursor, queue, terminal};
                             let mut stdout = std::io::stdout();
                             let _ = queue!(
@@ -873,19 +1118,21 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                                 terminal::Clear(terminal::ClearType::CurrentLine),
                             );
                             let _ = stdout.flush();
-                            print!("{}", line);
+                            // Trailing newline: without it the first body
+                            // line concatenates onto this header row.
+                            print!("{}\n", line);
                             let _ = stdout.flush();
                             let _ = state;
-                        } else {
-                            println!("{}", line);
+                            rows_since_capture += 1;
                         }
                     } else {
+                        active_tool.take();
                         println!("{}", line);
                     }
 
                     // T021/FR-008: print the full result body indented beneath.
                     for l in tool_body_lines(body_text) {
-                        println!("{}", l);
+                        println_counted!("{}", l);
                     }
                 }
                 // Feature 013 (T026): set after the tool block finishes
@@ -898,80 +1145,86 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
             AgentEvent::Notice(msg) => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
-                    if drain_separator(&mut pending_separator) { println!(); }
-                    println!("{}", t.warning.ansi().paint(format!("  · {}", msg)));
+                    if drain_separator(&mut pending_separator) { println_counted!(""); }
+                    println_counted!("{}", t.warning.ansi().paint(format!("  · {}", msg)));
                     pending_separator = true;
                 }
             }
             AgentEvent::RetryAttempt { attempt, max_retries, error, wait_secs } => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
-                    if drain_separator(&mut pending_separator) { println!(); }
+                    if drain_separator(&mut pending_separator) { println_counted!(""); }
                     let label = format!("  ↻ Retry {}/{} in {:.1}s — {}", attempt, max_retries, wait_secs, error);
-                    println!("{}", t.warning.ansi().paint(label));
+                    println_counted!("{}", t.warning.ansi().paint(label));
                     pending_separator = true;
                 }
             }
             AgentEvent::CompressionStart { reason, approx_tokens } => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
-                    if drain_separator(&mut pending_separator) { println!(); }
+                    if drain_separator(&mut pending_separator) { println_counted!(""); }
                     let label = format!("  🗜️ Compressing (~{} tokens): {}", format_tokens(approx_tokens as u64), reason);
-                    println!("{}", t.info.ansi().paint(label));
+                    println_counted!("{}", t.info.ansi().paint(label));
                     pending_separator = true;
                 }
             }
             AgentEvent::CompressionEnd { original_msgs, new_msgs } => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
-                    if drain_separator(&mut pending_separator) { println!(); }
+                    if drain_separator(&mut pending_separator) { println_counted!(""); }
                     let label = format!("  ✅ Compressed {} → {} messages", original_msgs, new_msgs);
-                    println!("{}", t.success_more_subtle.ansi().paint(label));
+                    println_counted!("{}", t.success_more_subtle.ansi().paint(label));
                     pending_separator = true;
                 }
             }
             AgentEvent::FallbackActivated { from_model, to_model } => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
-                    if drain_separator(&mut pending_separator) { println!(); }
+                    if drain_separator(&mut pending_separator) { println_counted!(""); }
                     let label = format!("  🔄 Fallback: {} → {}", from_model, to_model);
-                    println!("{}", t.warning.ansi().paint(label));
+                    println_counted!("{}", t.warning.ansi().paint(label));
                     pending_separator = true;
                 }
             }
-            AgentEvent::SubagentSpawn { goal, model, toolset_summary, depth } => {
+            AgentEvent::SubagentSpawn { id: _, goal, model, toolset_summary, depth } => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
-                    if drain_separator(&mut pending_separator) { println!(); }
+                    if drain_separator(&mut pending_separator) { println_counted!(""); }
                     let indent = "  ".repeat(depth);
                     let label = format!("{}🤖 Subagent: {} ({}) [{}]", indent, goal, model, toolset_summary);
-                    println!("{}", t.info.ansi().paint(label));
+                    println_counted!("{}", t.info.ansi().paint(label));
                     pending_separator = true;
                 }
             }
-            AgentEvent::SubagentComplete { goal, success, summary_preview, token_usage, duration_secs } => {
+            AgentEvent::SubagentComplete { id: _, goal, success, summary_preview, token_usage, duration_secs } => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
-                    if drain_separator(&mut pending_separator) { println!(); }
+                    if drain_separator(&mut pending_separator) { println_counted!(""); }
                     let status = if success { "✓" } else { "✗" };
                     let label = format!("  {} {} ({} tok, {:.1}s): {}", status, goal, token_usage.total_tokens, duration_secs, summary_preview);
-                    println!("{}", t.success_more_subtle.ansi().paint(label));
+                    println_counted!("{}", t.success_more_subtle.ansi().paint(label));
                     pending_separator = true;
                 }
             }
-            AgentEvent::SubagentFailed { goal, error, duration_secs } => {
+            AgentEvent::SubagentFailed { id: _, goal, error, duration_secs } => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
-                    if drain_separator(&mut pending_separator) { println!(); }
+                    if drain_separator(&mut pending_separator) { println_counted!(""); }
                     let label = format!("  ✗ {} ({:.1}s): {}", goal, duration_secs, error);
-                    println!("{}", t.error.ansi().paint(label));
+                    println_counted!("{}", t.error.ansi().paint(label));
                     pending_separator = true;
                 }
+            }
+            AgentEvent::SubagentEvent { .. } => {
+                // Parallel-subagent feature: per-child live events are
+                // consumed by the TUI's panes; the line renderer keeps its
+                // compact summary output (lifecycle events below) and
+                // ignores the raw stream.
             }
             AgentEvent::DelegationBatchComplete { total, succeeded, failed, total_duration_secs } => {
                 if !opts.quiet {
                     // Feature 013 (T025/T026): drain before, set after.
-                    if drain_separator(&mut pending_separator) { println!(); }
+                    if drain_separator(&mut pending_separator) { println_counted!(""); }
                     let label = format!("  🤖 Batch: {}/{} succeeded, {} failed ({:.1}s)", succeeded, total, failed, total_duration_secs);
                     println!("{}", t.info_more_subtle.ansi().paint(label));
                     pending_separator = true;
@@ -984,7 +1237,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     continue;
                 }
                 // Feature 013 (T025): drain before the diff block.
-                if drain_separator(&mut pending_separator) { println!(); }
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
                 let t = theme();
                 // Path header: "  ◆ path  +N -M" with kind label.
                 let kind_label = match kind {
@@ -993,11 +1246,11 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     FileChangeKind::Edit => "",
                 };
                 let header = format!("  ◆ {}{}  {}", path, kind_label, diff.stat_line());
-                println!("{}", t.fg_subtle.ansi().paint(header));
+                println_counted!("{}", t.fg_subtle.ansi().paint(header));
 
                 if is_binary {
                     // T017: binary-file placeholder (FR-016).
-                    println!("{}", t.fg_most_subtle.ansi().paint("    binary file changed"));
+                    println_counted!("{}", t.fg_most_subtle.ansi().paint("    binary file changed"));
                     // Feature 013 (T026): set after the block rendered.
                     pending_separator = true;
                     continue;
@@ -1006,7 +1259,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 // T016: non-interactive / piped → plain text, no color, no truncation (FR-012).
                 if !opts.capability.is_interactive {
                     for line in diff.diff.lines() {
-                        println!("{}", line);
+                        println_counted!("{}", line);
                     }
                     // Feature 013 (T026): set after the block rendered.
                     pending_separator = true;
@@ -1026,18 +1279,20 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 let start = hidden;
                 for &line in &diff_lines[start..] {
                     let rendered = render_diff_line(line, &path, opts.syntax_highlighting, t);
-                    println!("{}", rendered);
+                    println_counted!("{}", rendered);
                 }
                 if hidden > 0 {
                     let affordance = format!("    … ({} earlier lines hidden)", hidden);
-                    println!("{}", t.fg_most_subtle.ansi().paint(affordance));
+                    println_counted!("{}", t.fg_most_subtle.ansi().paint(affordance));
                 }
                 // Feature 013 (T026): set after the block rendered.
                 pending_separator = true;
             }
             AgentEvent::Done { final_text: text, usage: _, iterations } => {
                 // Feature 013 (T028): close reasoning; set flag if closed.
-                if close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                if let Some(rows) = close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                    rows_since_capture += rows;
+                    if streamed_any { interleaved_output = true; }
                     pending_separator = true;
                 }
 
@@ -1055,7 +1310,22 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 // text contains markdown, clear the streamed region and re-print
                 // it once as formatted markdown. Only when interactive (cursor
                 // control is required). NonInteractive keeps the raw stream.
-                if streamed_any && animations_on && !text.is_empty() {
+                // SAFETY GATE (Done-reflow fix): additionally require the
+                // region to be contiguous (no interleaved arm output — every
+                // printing arm now marks it), bounded (overflow guard), and
+                // shorter than the screen height — otherwise the upward clear
+                // would walk past rows we did not draw and erase the
+                // prompt/input line.
+                if streamed_any
+                    && animations_on
+                    && !text.is_empty()
+                    && reflow_safe(
+                        streamed_line_count,
+                        interleaved_output,
+                        streamed_line_count_overflow(&streamed_line_count),
+                        current_term_height(),
+                    )
+                {
                     use crossterm::{cursor, queue, terminal};
                     let mut stdout = std::io::stdout();
                     // Move up and clear each streamed line (+1 for the current line).
@@ -1087,13 +1357,13 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 // Feature 013 (T025): drain before the turn summary so it is
                 // separated from the finalized text/previous element. NO set
                 // after — turn end; next turn starts fresh (Edge Case).
-                if drain_separator(&mut pending_separator) { println!(); }
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
                 // US5: Turn summary — printed on its own line below the
                 // finalized text. Uses plain println! (not cursor control),
                 // so it CANNOT overwrite streamed text. Includes turn duration
                 // (T048/US5-AC2) sourced from `turn_start`.
                 if !opts.quiet && iterations > 0 {
-                    println!();
+                    println_counted!("");
                     let dur_suffix = match turn_start {
                         Some(ts) => format!(
                             " · {}",
@@ -1110,85 +1380,128 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                         t.fg_subtle.ansi().paint(format_tokens(total_completion_tokens)),
                         dur_suffix,
                     );
-                    println!("{}", summary);
+                    println_counted!("{}", summary);
                 }
                 break;
             }
             AgentEvent::Failed(err) => {
                 // Feature 013 (T028): close reasoning; set flag if closed.
-                if close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                if let Some(rows) = close_reasoning(&mut reasoning_open, &mut reasoning_buf, &mut reasoning_line_count, reasoning_started.take()) {
+                    rows_since_capture += rows;
+                    if streamed_any { interleaved_output = true; }
                     pending_separator = true;
                 }
                 // Feature 013 (T025/T031): drain before the error line. The
                 // old `if streamed_any { println!() }` ad-hoc blank is subsumed
                 // by the flag (INV-1 dedup). NO set after — turn end.
-                if drain_separator(&mut pending_separator) { println!(); }
-                println!("{}", t.error.ansi().paint(format!("Error: {}", err)));
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
+                println_counted!("{}", t.error.ansi().paint(format!("Error: {}", err)));
                 break;
             }
             // ── OMO orchestration events (additive) ──
+            // NeuroCode events are TUI-panel payloads; the line renderer has
+            // no panel, so they're intentionally consumed silently here (the
+            // tier/tokens summary already reaches the log via tracing).
+            AgentEvent::NeuroCodeContext { .. }
+            | AgentEvent::NeuroCodeProgress { .. }
+            | AgentEvent::NeuroCodeGraph { .. }
+            | AgentEvent::NeuroCodeReindexed { .. }
+            | AgentEvent::NeuroCodeActive { .. } => {}
             AgentEvent::AgentModeChanged { agent_name, model: _ } => {
                 // Feature 013 (T025/T026): drain before, set after.
-                if drain_separator(&mut pending_separator) { println!(); }
-                println!("{} agent → {}",
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
+                println_counted!("{} agent → {}",
                     t.fg_subtle.ansi().paint("◆"),
                     t.fg_base.ansi().paint(&agent_name));
                 pending_separator = true;
             }
             AgentEvent::CategoryDelegation { category, model } => {
                 // Feature 013 (T025/T026): drain before, set after.
-                if drain_separator(&mut pending_separator) { println!(); }
-                println!("{} [{}] → {}",
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
+                println_counted!("{} [{}] → {}",
                     t.fg_subtle.ansi().paint("◇"),
                     category, model);
                 pending_separator = true;
             }
             AgentEvent::BoulderWorkStarted { plan_name, work_id: _ } => {
                 // Feature 013 (T025/T026): drain before, set after.
-                if drain_separator(&mut pending_separator) { println!(); }
-                println!("{} started work: {}",
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
+                println_counted!("{} started work: {}",
                     t.success.ansi().paint("▶"),
                     plan_name);
                 pending_separator = true;
             }
             AgentEvent::BoulderWorkResumed { plan_name, work_id: _ } => {
                 // Feature 013 (T025/T026): drain before, set after.
-                if drain_separator(&mut pending_separator) { println!(); }
-                println!("{} resumed work: {}",
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
+                println_counted!("{} resumed work: {}",
                     t.fg_subtle.ansi().paint("↻"),
                     plan_name);
                 pending_separator = true;
             }
             AgentEvent::BoulderWorkCompleted { plan_name, work_id: _ } => {
                 // Feature 013 (T025/T026): drain before, set after.
-                if drain_separator(&mut pending_separator) { println!(); }
-                println!("{} completed: {}",
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
+                println_counted!("{} completed: {}",
                     t.success.ansi().paint("✓"),
                     plan_name);
                 pending_separator = true;
             }
             AgentEvent::GoalSet { objective } => {
                 // Feature 013 (T025/T026): drain before, set after.
-                if drain_separator(&mut pending_separator) { println!(); }
-                println!("{} goal set: {}",
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
+                println_counted!("{} goal set: {}",
                     t.success.ansi().paint("◎"),
                     objective);
                 pending_separator = true;
             }
             AgentEvent::GoalCleared => {
                 // Feature 013 (T025/T026): drain before, set after.
-                if drain_separator(&mut pending_separator) { println!(); }
-                println!("{} goal cleared", t.fg_subtle.ansi().paint("○"));
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
+                println_counted!("{} goal cleared", t.fg_subtle.ansi().paint("○"));
                 pending_separator = true;
             }
             AgentEvent::WisdomAccumulated { learnings_count } => {
                 // Feature 013 (T025/T026): drain before, set after.
-                if drain_separator(&mut pending_separator) { println!(); }
-                println!("{} {} learnings accumulated",
+                if drain_separator(&mut pending_separator) { println_counted!(""); }
+                println_counted!("{} {} learnings accumulated",
                     t.fg_subtle.ansi().paint("✦"),
                     learnings_count);
                 pending_separator = true;
             }
+            // Spec 018 (T018/FR-010): terminal contention badge. Renders near
+            // the active-tool line, ONLY while queued > 0 (contention-only —
+            // no persistent chrome, spec clarification Q2). The one-shot CLI
+            // renderer prints linearly, so the badge appears as its own line
+            // on the transition into contention and on queue-depth changes
+            // while contention persists; draining the queue renders nothing
+            // (the next printed line naturally supersedes the badge, exactly
+            // like the append-only ToolEnd fallback path).
+            AgentEvent::TerminalQueueState { active, queued } => {
+                // Last-value-wins snapshot (producer already throttles to the
+                // 50ms budget); the badge is rendered from this state.
+                terminal_active = active;
+                terminal_queued = queued;
+                if !opts.quiet && opts.tool_progress != "off" {
+                    match terminal_queue_badge(terminal_active, terminal_queued) {
+                        Some(line) => {
+                            println_counted!("{}", line);
+                            badge_visible = true;
+                        }
+                        None => {
+                            // queued == 0: contention cleared. Nothing to
+                            // print (no persistent chrome to erase on an
+                            // append-only renderer).
+                            badge_visible = false;
+                        }
+                    }
+                }
+                let _ = badge_visible;
+            }
+            // Additive events (spec 018 T016 pattern): no line-renderer
+            // output; consumers render contention indicators only while
+            // queued > 0.
+            _ => {}
                 }
             }
             // ── Tick arm: advance live animations (FR-010) ──
@@ -1246,7 +1559,26 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 // ── T041/T046: Per-tool spinner ──
                 // Repaint the running spinner ON the captured row, keeping the
                 // tool name (+ summary) visible while the tool executes.
+                // SAFETY GATE: validate the captured row against scroll and
+                // resize before repainting — a stale absolute row would draw
+                // spinner text over unrelated content (e.g. the reedline
+                // prompt/input line once the turn ends).
                 if let Some((tool_row, state, tool_name, tool_summary)) = active_tool.as_mut() {
+                    if state.running
+                        && !tool_row_repaint_safe(
+                            *tool_row,
+                            rows_since_capture,
+                            capture_height,
+                            current_term_height(),
+                        )
+                    {
+                        // Row invalidated (scrolled off / resized / unknown
+                        // size): stop in-place animation entirely. The
+                        // ToolEnd arm's append-only summary line is the
+                        // fallback (it prints below the cursor).
+                        *tool_row = u16::MAX;
+                        state.running = false;
+                    }
                     if state.running {
                         state.advance(tool_profile);
                         let row = *tool_row;
@@ -1717,7 +2049,7 @@ pub fn checkpoint_reverted(number: usize) {
 mod tests {
     use super::*;
     use crate::capability::{Capability, RenderCapability};
-    use joey_agent_core::events::{FileChangeKind, AgentEvent};
+    use joey_agent_core::events::AgentEvent;
     use joey_providers::Usage;
     use tokio::sync::mpsc;
 
@@ -2269,6 +2601,53 @@ mod tests {
         assert!(tool_body_lines("").is_empty());
     }
 
+    // ── Spec 018 T018: terminal contention badge gating ──
+    // FR-010 + contracts/events.md: badge visible only while queued > 0;
+    // no persistent chrome when the queue is drained (spec Q2).
+    #[test]
+    fn terminal_queue_badge_visible_only_under_contention() {
+        // queued > 0 → badge line present with both counts.
+        let line = terminal_queue_badge(3, 2).expect("badge must render while queued > 0");
+        let plain = strip_ansi(&line);
+        assert!(plain.contains('⧗'), "badge glyph missing: {}", plain);
+        assert!(
+            plain.contains("terminal: 3 active, 2 queued"),
+            "counts missing from badge: {}",
+            plain
+        );
+    }
+
+    #[test]
+    fn terminal_queue_badge_absent_when_queue_drained() {
+        // queued == 0 → no badge at all (None), regardless of active count:
+        // an idle governor must not paint persistent chrome.
+        assert!(terminal_queue_badge(0, 0).is_none());
+        assert!(terminal_queue_badge(4, 0).is_none());
+    }
+
+    // ── Spec 018 T018: stream regression — TerminalQueueState events flow
+    //    through render_turn without disturbing the final-text contract. ──
+    #[test]
+    fn terminal_queue_events_preserve_final_text() {
+        let opts = opts_for(Capability::NonInteractive);
+        let text = run_turn(
+            vec![
+                AgentEvent::TurnStart { max_iterations: 1 },
+                AgentEvent::TerminalQueueState { active: 1, queued: 0 },
+                AgentEvent::TerminalQueueState { active: 2, queued: 3 },
+                AgentEvent::TerminalQueueState { active: 2, queued: 0 },
+                AgentEvent::ContentDelta("Done.".to_string()),
+                AgentEvent::Done {
+                    final_text: "Done.".to_string(),
+                    usage: Usage::default(),
+                    iterations: 1,
+                },
+            ],
+            opts,
+        );
+        assert_eq!(text, "Done.");
+    }
+
     // ── T023: regression — reasoning visibility gate preserved ──
     // FR-011, spec US1 acceptance scenario 5. When show_reasoning is false the
     // reasoning box must not open; the turn still returns correct final_text.
@@ -2464,7 +2843,9 @@ mod tests {
     /// drain; ApiCallEnd sets flag; next element drains.
     #[test]
     fn trailing_metadata_no_drain_before_set_after() {
-        let mut pending = false;
+        // Start uninitialized (models "no flag yet"); the first assignment
+        // below is the previous element setting the flag.
+        let mut pending;
 
         // 1. Previous element (e.g. a tool block) renders and sets flag.
         pending = true;
@@ -2580,5 +2961,181 @@ mod tests {
             opts,
         );
         assert_eq!(text, "Final answer.");
+    }
+
+    // ══ Tool-spinner row-staleness + Done-reflow regression tests ══
+    // (user report: "tool call printed into my text input" — stale absolute
+    // row repainted after scroll/resize, and Done reflow erasing the prompt
+    // line via miscounted streamed lines).
+
+    /// G1–G4: the pure row-invalidation rule. The captured tool row may only
+    /// be repainted in place while the screen provably did not scroll or
+    /// resize since capture.
+    #[test]
+    fn tool_row_repaint_safe_gates() {
+        // G1: degenerate/unknown height at either endpoint → unsafe.
+        assert!(!tool_row_repaint_safe(5, 0, 0, 24), "G1 capture height 0");
+        assert!(!tool_row_repaint_safe(5, 0, 24, 0), "G1 current height 0");
+
+        // G4: resize since capture → unsafe (rows reflowed arbitrarily).
+        assert!(!tool_row_repaint_safe(5, 0, 24, 30), "G4 resize down");
+        assert!(!tool_row_repaint_safe(5, 0, 30, 24), "G4 resize up");
+
+        // G2: row off-screen → unsafe.
+        assert!(!tool_row_repaint_safe(24, 0, 24, 24), "G2 row == height");
+        assert!(!tool_row_repaint_safe(30, 0, 24, 24), "G2 row > height");
+
+        // Happy path: row on screen, nothing emitted since, no scroll.
+        assert!(tool_row_repaint_safe(10, 0, 24, 24), "fresh capture is safe");
+        // Cursor moves to tool_row+1 after the entry newline; repaint stays
+        // safe while tool_row + 1 + rows < height.
+        assert!(tool_row_repaint_safe(10, 12, 24, 24), "row 10 + 12 + 1 < 24");
+        // G3: exactly reaching the bottom row is safe, one past is not.
+        assert!(tool_row_repaint_safe(10, 12, 24, 24) == ((10 + 12 + 1) < 24));
+        assert!(!tool_row_repaint_safe(10, 13, 24, 24), "10 + 13 + 1 == 24 scrolled");
+        // Scroll from a tall capture position at the bottom of the screen.
+        assert!(!tool_row_repaint_safe(22, 1, 24, 24), "22 + 1 + 1 == 24 scrolled");
+        // Bottom-row capture: the entry line's own newline sits on the bottom
+        // row and scrolls immediately — even zero further rows is unsafe.
+        assert!(!tool_row_repaint_safe(23, 0, 24, 24), "23 + 0 + 1 == 24 scrolled");
+        assert!(!tool_row_repaint_safe(23, 1, 24, 24), "23 + 1 + 1 > 24 scrolled");
+        // Large counts must not overflow u16 math (u64 widening inside).
+        assert!(!tool_row_repaint_safe(0, u32::MAX, 24, 24), "u32::MAX rows scrolled");
+    }
+
+    /// Done-reflow gate: the upward clear must be skipped when the streamed
+    /// region is interleaved, unbounded (overflow guard), or taller than the
+    /// screen — each of those would erase rows the renderer did not draw
+    /// (e.g. the reedline prompt/input line).
+    #[test]
+    fn reflow_safe_gates() {
+        // Happy path: contiguous, bounded, fits on screen.
+        assert!(reflow_safe(5, false, false, 24));
+        // Interleaved output between deltas → never clear.
+        assert!(!reflow_safe(5, true, false, 24), "interleaved must skip reflow");
+        // Overflow guard tripped → skip.
+        assert!(!reflow_safe(5, false, true, 24), "overflow must skip reflow");
+        // Unknown terminal height → skip (can't bound the clear).
+        assert!(!reflow_safe(5, false, false, 0), "height 0 must skip reflow");
+        // Streamed region (+1 for the current line) exactly fits → safe.
+        assert!(reflow_safe(23, false, false, 24), "23 + 1 == 24 fits");
+        // One row taller than the screen → unsafe.
+        assert!(!reflow_safe(24, false, false, 24), "24 + 1 > 24 must skip reflow");
+        // Tall stream on a tall screen is still fine.
+        assert!(reflow_safe(199, false, false, 200));
+        assert!(!reflow_safe(200, false, false, 200));
+    }
+
+    /// The row-accounting primitives: strip_ansi removes CSI sequences so
+    /// styled payloads are measured by visible width only, and
+    /// count_visual_lines stays wrap-aware (reuse of the T044 helper).
+    #[test]
+    fn strip_ansi_removes_csi_sequences() {
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi("\x1b[1;38;2;10;20;30mgrad\x1b[0m"), "grad");
+        // Styled tool header line: stripped width feeds the row count.
+        let styled = generic_tool_header_line("read_file", "📖", "Cargo.toml", false, None, 0.1);
+        let stripped = strip_ansi(&styled);
+        assert!(!stripped.contains('\x1b'), "CSI must be stripped: {:?}", stripped);
+        assert!(stripped.contains("read_file"));
+        // Multi-line + wrapped payloads count the rows they will occupy.
+        assert_eq!(count_visual_lines(&stripped, 200), 1);
+        assert_eq!(
+            count_visual_lines("a\nb\nc", 80),
+            3,
+            "three newline-terminated rows"
+        );
+    }
+
+    /// Line-accounting integration: a Full-capability turn where output IS
+    /// printed between streamed deltas by a non-Tool arm (ApiCallEnd usage
+    /// line) must complete, mark the stream as interleaved, and return the
+    /// final text — the Done reflow is skipped rather than erasing the
+    /// interleaved rows (previously the reflow miscounted and drew over the
+    /// prompt line). Verified behaviorally: the turn completes and the final
+    //  text is intact (the accounting itself lives in loop-local state).
+    #[tokio::test]
+    async fn usage_line_between_deltas_disables_reflow_but_completes() {
+        let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = tx.send(AgentEvent::TurnStart { max_iterations: 2 });
+        let _ = tx.send(AgentEvent::ApiCallStart);
+        let _ = tx.send(AgentEvent::ContentDelta("first ".to_string()));
+        // Usage line printed BETWEEN deltas → interleaved output.
+        let _ = tx.send(AgentEvent::ApiCallEnd {
+            usage: Usage {
+                prompt_tokens: 30,
+                completion_tokens: 10,
+                ..Default::default()
+            },
+        });
+        let _ = tx.send(AgentEvent::ContentDelta("second".to_string()));
+        let _ = tx.send(AgentEvent::Done {
+            final_text: "first second".to_string(),
+            usage: Usage::default(),
+            iterations: 2,
+        });
+        drop(tx);
+        let opts = opts_for(Capability::Full);
+        let text = render_turn(rx, opts).await;
+        assert_eq!(text, "first second");
+    }
+
+    /// Line-accounting integration (reasoning path): reasoning lines printed
+    /// between streamed deltas must be accounted (close_reasoning now
+    /// returns its emitted-row count) — turn completes, final text intact.
+    #[tokio::test]
+    async fn reasoning_close_between_deltas_completes_under_full() {
+        let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = tx.send(AgentEvent::TurnStart { max_iterations: 1 });
+        let _ = tx.send(AgentEvent::ApiCallStart);
+        let _ = tx.send(AgentEvent::ReasoningDelta("thinking...\n".to_string()));
+        let _ = tx.send(AgentEvent::ContentDelta("answer".to_string()));
+        let _ = tx.send(AgentEvent::Done {
+            final_text: "answer".to_string(),
+            usage: Usage::default(),
+            iterations: 1,
+        });
+        drop(tx);
+        let mut opts = opts_for(Capability::Full);
+        opts.show_reasoning = true;
+        let text = render_turn(rx, opts).await;
+        assert_eq!(text, "answer");
+    }
+
+    /// ToolEnd fallback path: when the in-place row was invalidated (e.g.
+    /// capture_height == 0 — size unavailable — or row scrolled off), the
+    /// ToolEnd arm must print its summary via the append-only println path
+    /// and the turn must still complete. Under cargo-test (no raw-mode TTY)
+    /// the ToolStart DSR guard takes the no-position fallback and ToolEnd
+    /// exercises exactly this append-only branch.
+    #[tokio::test]
+    async fn tool_end_append_only_fallback_completes_under_full() {
+        let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = tx.send(AgentEvent::TurnStart { max_iterations: 1 });
+        let _ = tx.send(AgentEvent::ApiCallStart);
+        let _ = tx.send(AgentEvent::ToolStart {
+            name: "terminal".to_string(),
+            emoji: "⬛".to_string(),
+            summary: "ls -la".to_string(),
+        });
+        let _ = tx.send(AgentEvent::ToolEnd {
+            name: "terminal".to_string(),
+            is_error: false,
+            result_preview: "file_a\nfile_b".to_string(),
+            duration_secs: 0.2,
+            exit_code: Some(0),
+            full_result: String::new(),
+        });
+        let _ = tx.send(AgentEvent::ContentDelta("done".to_string()));
+        let _ = tx.send(AgentEvent::Done {
+            final_text: "done".to_string(),
+            usage: Usage::default(),
+            iterations: 1,
+        });
+        drop(tx);
+        let opts = opts_for(Capability::Full);
+        let text = render_turn(rx, opts).await;
+        assert_eq!(text, "done");
     }
 }

@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Shortcut</title></head>
+<body>
+  <h1>Keyboard Shortcut</h1>
+  <div id="report" data-marker="none">none</div>
+  <script>
+    document.addEventListener('keydown', e => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        document.getElementById('report').dataset.marker = 'cmd-enter';
+      }
+    });
+  </script>
+</body>
+</html>

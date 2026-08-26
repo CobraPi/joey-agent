@@ -246,7 +246,11 @@ impl Scheduler {
         }
         // The flock releases when `lock_file` drops at the end of this call.
 
-        let due_jobs = self.store.get_due_jobs()?;
+        // Store reads/writes go through blocking flock+file I/O (up to a
+        // 30s wait inside lock_jobs) — run them on the blocking pool so a
+        // contended jobs.json never stalls an async worker.
+        let store = self.store.clone();
+        let due_jobs = tokio::task::spawn_blocking(move || store.get_due_jobs()).await??;
         if due_jobs.is_empty() {
             tracing::debug!(
                 "{} - No jobs due",
@@ -263,10 +267,17 @@ impl Scheduler {
         // Advance next_run_at for all recurring due jobs FIRST, before any
         // execution begins — at-most-once semantics. mark_job_run overwrites
         // next_run_at on completion.
-        for job in &due_jobs {
-            if let Err(e) = self.store.advance_next_run(&job.id) {
-                tracing::warn!("advance_next_run failed for job {}: {}", job.id, e);
-            }
+        {
+            let store = self.store.clone();
+            let ids: Vec<String> = due_jobs.iter().map(|j| j.id.clone()).collect();
+            let _ = tokio::task::spawn_blocking(move || {
+                for id in ids {
+                    if let Err(e) = store.advance_next_run(&id) {
+                        tracing::warn!("advance_next_run failed for job {}: {}", id, e);
+                    }
+                }
+            })
+            .await;
         }
 
         let mut handles = Vec::new();

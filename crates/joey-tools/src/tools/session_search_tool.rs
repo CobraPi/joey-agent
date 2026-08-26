@@ -165,7 +165,9 @@ fn scroll_mode(
                         .iter()
                         .enumerate()
                         .min_by_key(|(_, m)| {
-                            (m.id.unwrap_or(0) - around_message_id).abs()
+                            m.id
+                                .unwrap_or(0)
+                                .abs_diff(around_message_id)
                         })
                         .map(|(i, _)| i)
                 });
@@ -271,5 +273,43 @@ mod tests {
         ).await;
         // Should get an error for nonexistent session.
         assert!(result.is_error());
+    }
+
+    #[tokio::test]
+    async fn scroll_mode_extreme_message_ids_do_not_overflow() {
+        // Regression test: `(m.id - around_message_id)` with extreme i64
+        // values used to panic in debug builds (integer overflow); the
+        // closest-message fallback must use overflow-free arithmetic.
+        let db_arc = make_db_with_messages();
+        let tool = SessionSearch::new(Some(db_arc.clone()));
+        let ctx = ToolContext::new(
+            std::env::temp_dir(),
+            joey_core::Config::defaults(),
+            "test",
+        );
+
+        let db = db_arc.lock().unwrap();
+        let sid = db
+            .list_sessions(1)
+            .unwrap()
+            .first()
+            .map(|s| s.id.clone())
+            .unwrap_or_default();
+        drop(db);
+
+        for extreme in [i64::MAX, i64::MIN, -1] {
+            let result = tool
+                .execute(
+                    json!({
+                        "query": "test",
+                        "session_id": sid,
+                        "around_message_id": extreme
+                    }),
+                    &ctx,
+                )
+                .await;
+            // Must not panic; may be a window result or an error, both fine.
+            let _ = result.is_error();
+        }
     }
 }

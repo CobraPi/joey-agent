@@ -1,0 +1,466 @@
+# joey-tui — Animated Terminal Dashboard
+
+The "busy yet elegant" synthwave-aurora terminal UI — the DEFAULT interactive
+interface (piped/non-terminal stdio falls back to the line REPL). Opt out with
+`joey --cli` or `JOEY_TUI=0`; `--tui` forces it back on against the env var.
+
+## Architecture
+
+Elm-like: `state::App` is the model (fed agent events via `App::apply`),
+`Tui` owns the terminal and animation timers, and joey-cli's `tui` module
+hosts the event/render loop. Key sources: `src/{app,state,theme,widgets,
+input,anim}.rs`.
+
+### GUI/compute decoupling (engine-actor model)
+
+All compute — agent turns, heavy slash jobs (`/neurocode index`), tool
+calls — runs on a dedicated **engine task** (`joey-cli/src/engine.rs`)
+that owns the `Agent`. The UI task never awaits engine work; the two
+communicate over channels:
+
+- UI → engine: `EngineCommand` (Submit / Interrupt / ForceKill /
+  SwitchAgent / HeavyJob)
+- engine → UI: `EngineEvent` (raw `AgentEvent`s, TurnFinished,
+  HeavyJobFinished, AgentSwitched, Notice, EngineGone)
+
+The UI loop is one `select!` over engine events, terminal input, and the
+frame timer — a hung tool or stuck turn can only block the engine task;
+the GUI keeps rendering at full frame rate.
+
+**Kill & restart**: Ctrl-C escalation — while busy, the 1st press
+cooperatively interrupts (the agent's interrupt flag); a 2nd press within
+2s **force-kills**: the UI abandons the engine task (deliberately leaked
+until process exit — even a hard-stuck blocking tool can't take the GUI
+down), sets the interrupt flag, and spawns a fresh engine around a
+rebuilt agent with history restored from the session DB. A notice
+("engine killed & restarted … GUI stayed live") confirms the restart,
+after which prompts and slash commands work immediately. Heavy jobs
+(`neurocode index` etc.) run on the engine's blocking pool under the same
+kill/restart regime. At idle, Ctrl-C/Esc quits as before.
+
+Pre-turn preprocessing (intent gate, `@plan`, agent switching) happens
+engine-side, where the agent lives; the UI applies resulting notices and
+model-label updates via events.
+
+- `state.rs` — `AppState`: the whole TUI state machine (phase, active
+  agents, transcript items, token stats, scroll).
+- `theme.rs` — the synthwave color palette + gradient helpers.
+- `widgets.rs` — the ratatui render functions.
+- `app.rs` — the event loop wiring state → widgets.
+
+## Views and panels (widgets.rs)
+
+Particle background, header (spinner + pulse), transcript with scrollbar
+and streaming assistant/reasoning text ("Thought for Ns" footer), reasoning
+panel, OMO agent panel, multi-line input editor, status bar (token
+accounting, elapsed), help overlay, search bar, agent picker, and a
+slash-command popup.
+
+## Animated header gradient bar (agent-active indicator)
+
+The header's gradient underline doubles as the "agent is running" status
+indicator (`anim::HeaderFlow`, drawn by `draw_header`):
+
+- **Idle** — the static gradient underline, byte-identical to the old look.
+- **While a turn runs** — a soft brightness wave glides across the bar
+  (~8s per traversal, raised-cosine profile, one wave visible at a time)
+  over a slightly brighter, gently breathing base. Gradient colors stay
+  fixed; only brightness moves — subtle but noticeable in peripheral
+  vision. Wave pace scales with the shared activity signal (more agents ⇒
+  slightly faster).
+- **Turn boundaries never snap**: the busy envelope eases in (~1s) and
+  settles out (~0.8s, clamped to exactly static), and the wave phase is
+  continuous across busy↔idle transitions.
+- Contract-tested: idle render == static render; busy render changes
+  across frames; adjacent cells stay graded (no color cliffs).
+
+## Agent stats page (maximized live context window)
+
+Clicking the header's RIGHT section (model · session · activity/tokens) or
+pressing **Ctrl+A** opens a maximized agent-stats page — the same
+transcript-strip-plus-takeover layout as the other maximized panels. It
+contains everything an agentic engineer wants at a glance, updating in
+realtime:
+
+- **Dashboard rows** (top):
+  - `context` — used / window (% of the model's context window) with a
+    progress bar that shifts green → amber (≥65%) → red (≥85%, "near
+    limit" warning), plus the compression threshold and compaction count.
+  - breakdown — system vs history tokens, message count, `compress@N`
+    threshold, `compacted Nx`.
+  - `session` — cumulative prompt/completion/total tokens, turns,
+    iterations.
+  - `calls` — a per-API-call usage sparkline (▁▂▃▅▇, most recent ~240
+    calls, prompt-token magnitude).
+- **Context stream** (below): one line per history message in send order —
+  index, role (user/asst/tool, color-coded), per-message token estimate,
+  and a bounded preview, with `⚒calls` / `⤳compressed` flags. This is the
+  literal contents of the next request's context window.
+- **Scroll semantics** (identical to the live reasoning panel):
+  auto-follows the tail by default; ↑ / PgUp / wheel-up freezes the view
+  at an absolute anchor (streaming no longer moves it); scrolling back to
+  the very bottom (or G / End) re-pins. hjkl / g / G work in transcript
+  focus. Footer shows `↑N above` / `↓N below · scroll to bottom to resume`
+  plus the live spinner and "updated Ns ago" while a turn runs.
+- **Esc** or **Ctrl+A** (or clicking the header section again) restores.
+  Printable keys still reach the input box.
+
+Backing data: the agent emits `AgentEvent::ContextSnapshot` at every
+history mutation (user turn, tool results, compactions, final message),
+carrying per-message entries + system/history token estimates + the
+compressor's window/threshold/count. The snapshot replaces prior state
+wholesale — it is always a complete projection of what will be sent to
+the model next.
+
+### Live reasoning panel (click to expand)
+
+While the model is thinking, the live reasoning stream docks as an 8-row
+strip at the bottom of the conversation area (header with a live thinking
+timer, tail-pinned text, spinner + "↑N lines hidden" overflow footer).
+
+- **Click** the strip (anywhere, borders included) → the panel expands to
+  take over the main screen (a live transcript strip stays at the top so
+  assistant streaming remains visible); click again to dock it back.
+- **Esc** collapses the expanded view. The wheel over the panel scrolls it
+  (up walks away from the live tail, down re-pins); wheel elsewhere scrolls
+  the transcript as before.
+- When the reasoning block closes, an expanded panel auto-docks: the full
+  text is committed as a transcript item with its own three-state expand
+  affordance (collapsed → tail-window → full, Space/x or click).
+- No-op when nothing is live. NeuroCode's context feed (which can also
+  expand onto the main screen) keeps priority for the takeover slot: while
+  it is expanded, the reasoning strip isn't drawn and its click target is
+  disabled; dock the feed to get the reasoning strip back.
+
+## Expandable tool, terminal, and diff blocks
+
+Every tool call, terminal command block, and inline file diff is
+expandable in place, all rendered in crush-style code views:
+
+- **Tool output bodies** show the payload — never the raw JSON envelope
+  (`{"output":"…","exit_code":…}` is unwrapped to its `output`; error
+  envelopes to their message) — in a line-numbered gutter view
+  (`12 │ …`, dimmed `│` separator). Results that are themselves JSON
+  are pretty-printed (2-space indent): no literal `\n` runs, readable
+  structure.
+- **Collapsed** — the first 10 output lines (tools) or last 50 diff
+  lines, with an affordance line ("… N more lines"). Blank lines are
+  preserved as numbered rows (editor fidelity).
+- **Expanded** — the FULL formatted result (tail-anchored, 200-line
+  window); file diffs show the entire diff.
+- **File diffs** carry dual old/new line-number gutters (crush
+  diffview.go semantics): context lines show both numbers, deletions
+  show the old number with a blank new column, insertions the reverse;
+  hunk headers render as `… …` dividers. +/- markers are colored.
+- **Toggle**: mouse click on the block (hit-tested), or **Space / x** in
+  transcript focus (Ctrl+T / Shift+Up / PgUp to focus) — the key resolves
+  the item at the viewport center via the same hit-test machinery clicks
+  use, falling back to the first expandable visible item when the center
+  lands on a non-expandable line. Reasoning blocks keep their three-state
+  cycle (collapsed → tail-window → full).
+- **Maximize**: clicking ANY tool block (or Ctrl+O) opens the maximized
+  code viewer (below) instead of the inline expand; diffs/reasoning keep
+  the inline toggle.
+
+## Live terminal output streaming + maximized viewer
+
+While a `terminal` tool call RUNS, its output streams into the transcript
+in realtime (no more waiting for the call to finish to see anything):
+
+- Each command block shows a **live tail** with absolute line numbers as
+  output arrives, plus a `⣿ streaming · N lines · Ctrl+O or click to
+  maximize` hint. Silent commands show `⣿ running…`.
+- Chunks flow `terminal` tool → `ToolContext::emit_output` →
+  `AgentEvent::ToolOutput` → per-item bounded accumulator (128 KB tail
+  ring, eviction at line boundaries). The `AgentEvent::ToolProgress`
+  path is unchanged (status/heartbeats) and is ignored for terminal
+  items to avoid duplication.
+- **Ctrl+O** (or clicking any tool block — terminal OR generic) opens the
+  **maximized code viewer**: the formatted output takes over the main
+  screen below a live transcript strip. It's a text-editor-like view:
+  line-numbered gutter, JSON pretty-printed (2-space indent), terminal
+  envelopes unwrapped to their payload — no literal `\n` runs anywhere.
+  - Header: `$ <command> (exit N) N.Ns` for terminal; `<tool> <summary>`
+    for generic tools.
+  - **Auto-follow**: the view is pinned to the live tail; ↑ / PgUp / wheel
+    up freezes it at an absolute anchor, scrolling back to the bottom
+    (or G / End) re-pins. hjkl / g / G work in transcript focus.
+  - While open and following, each NEW tool call retargets the viewer
+    automatically — consecutive calls keep streaming without re-opening.
+  - Works after completion too: opening the viewer on a finished tool
+    replays its formatted full output.
+  - **Esc** or **Ctrl+O** restores the normal layout. Printable keys
+    still reach the input box, so you can queue a message while
+    watching.
+
+## Subagent panes (parallel-subagent feature)
+
+When the agent delegates (`delegate_task`), each spawned child gets a
+**pane** (`state.rs::SubagentPane`) with its own transcript, streaming
+accumulators, and view state. A vertical **tab rail** on the right lists
+the panes; clicking a tab focuses it, retargeting the main transcript
+area (and the maximized stats/output-viewer windows) to that child's
+stream. The bottom pinned rail tab (or **Ctrl+P**) returns to the
+orchestrator view. **Ctrl+N** or a title click widens the rail from its
+collapsed 19-col tab strip to a 48-col detail view — clamped back down
+whenever the main column would drop below 60 cols. **Alt+↑ / Alt+↓**
+scroll the rail's tab window itself (pane tabs take priority over the
+NeuroCode feed when both exist), and focusing a pane auto-reveals its
+tab with the minimum rail scroll needed.
+
+A focused pane has **full orchestrator-screen parity** — same keys, same
+chrome, same state model, achieved by routing pane arms through the same
+helpers the main view uses (`parity by construction`):
+
+- **Scrolling** — ↑/k, ↓/j (transcript focus), Shift+Up (1 line, from
+  input focus), PgUp/PgDn (10 lines), Ctrl+B/Ctrl+F (half page, 15
+  lines), g/G/Home/End (top/bottom), and the mouse wheel over the pane
+  area (3 lines per notch). All of it moves the PANE's transcript; the
+  orchestrator's scroll anchor is untouched.
+- **Follow-tail semantics** (subtle): the pane is pinned to the live
+  tail only while `scroll == None`. Any scroll up freezes it at an
+  absolute offset — new items arriving do NOT move the view — and the
+  only way appends resume live-tracking is scrolling back to the very
+  bottom (G/End, or PgDn/wheel-down until it lands). Reaching the
+  bottom also returns keyboard focus to the input box, reading the
+  PANE's anchor (not the orchestrator's). Offsets are clamped against a
+  render-time bound, so a stale-high pin (ring eviction shrank the
+  transcript) re-clamps at the next scroll mutation.
+- **Chrome** — header ` ◆ subagent: <goal> [<model>] · live|done|failed|queued `,
+  plus the shared scroll-info segment ` N messages · P% from top `
+  (scrolled) / ` N messages · live ` (following) on the header's
+  bottom-right, a right-edge scrollbar (gold thumb while pinned), the
+  ` ↓ N lines below ` badge, and the identical live streaming tail
+  block (`◆ agent` header + indented wrapped text) — all the same
+  helper functions the orchestrator's transcript composes.
+- **Expand/collapse** — every reasoning block, tool/terminal block, and
+  file diff uses the same three-state cycle (Collapsed → TailWindow →
+  Full, with redundancy skips: ≤10 lines collapses to everything, so
+  the cycle jumps straight to Full; ≤200 lines makes TailWindow == Full
+  so it's skipped). Collapsed shows the first 10 lines (tools) / last
+  50 (diffs); TailWindow shows the last 200; Full shows everything
+  (diffs: the entire diff). Toggled by **Space / x** (resolves the
+  viewport-CENTER item via the same hit-test machinery clicks use,
+  falling back to the first expandable item at/below the top) or by
+  clicking the block. **Ctrl+E** cycles the most-recent reasoning block
+  and **Ctrl+G** the most-recent tool block — both retarget to the
+  focused pane.
+- **File diffs** — `FileChange` events render as inline `FileDiff`
+  items in panes through the exact builder the main transcript uses:
+  dual old/new line-number gutters (deletions blank the new column,
+  insertions the old), colored +/- markers, `… …` hunk-header dividers,
+  and a `binary file changed` placeholder for binary files.
+- **Copy** — **y / Y** in transcript focus copy the pane's most recent
+  assistant / user message (regardless of scroll position) via
+  `TuiAction::CopyPaneItem` (pane id + pane-relative index). The
+  joey-cli side resolves it through the SAME item→text mapping as the
+  main transcript's `CopyItem` and hands it to the host clipboard:
+  `pbcopy` / `xclip -selection clipboard` / `wl-copy`, falling back to
+  an OSC 52 escape sequence; a `✓ Copied N chars` transcript notice (or
+  error) confirms. Out-of-range pane/index is a safe no-op.
+- **Search** — **Ctrl+S** (input focus) or **/** (transcript focus)
+  opens the search bar over the pane; typing runs live, **Enter** jumps
+  to the first (newest) match, **n / N** walk matches with wrap-around.
+  The bar's title mirrors the PANE's match state (`search · match found
+  (n=next N=prev)` / `search · no matches`) — match-indicator ONLY:
+  search never highlights text in-place. A no-match (or empty) query
+  never moves the view. The walk pins the pane's scroll, clamped to the
+  render-time bound; the orchestrator's own search state is never
+  consulted for a pane search.
+- **Maximized panels** — **Ctrl+O** retargets the maximized output
+  viewer to the pane's tool output (spanning the full main column while
+  open; it opens even when the main transcript holds no tool but the
+  pane does, so the key never silently no-ops); **Ctrl+A** opens the
+  agent-stats page driven by the pane's own context-window snapshot and
+  per-pane stats anchor; **Ctrl+R**'s docked live-reasoning strip
+  renders under the pane transcript while the child is thinking (same
+  `draw_reasoning` widget, retargeted). Takeover precedence inside the
+  pane view: stats > output viewer > reasoning > mode explorer. The
+  **F1 / ?** help overlay is global and identical everywhere.
+- **Mode-specific explorers** (e.g. NeuroCode's fullscreen graph
+  explorer) render in a pane view ONLY when that mode spawned the pane
+  (`spawned_by_neurocode`, snapshotted at spawn time) — a plain
+  delegation pane never shows the mode explorer even when the mode is
+  active.
+- **Ctrl+L** keeps its original meaning — clear the orchestrator
+  transcript, resetting its scroll to follow-tail — and now ALSO clears
+  the panes and rail entirely, returning focus to the orchestrator view
+  (the per-pane geometry cells — `last_pane_max_scroll`, pane text-area
+  rect, tab rects — reset to pristine values so a fresh pane never clamps
+  against a ghost bound).
+
+**State preservation across focus switches**: scroll offset, stats-view
+anchor, expanded context entries, search state (open latch, query,
+match indicator), and per-item expand states all live ON the pane, so
+switching focus away and back preserves each pane's view exactly; the
+orchestrator keeps its own separate scroll/search state throughout.
+Only the render-time geometry cells (the max-scroll bound and text-area
+rect) are view-global — they describe whichever pane is focused and are
+reset by Ctrl+L.
+
+### Subagent view keymap (parity table)
+
+Non-regression guarantee first: every transcript-targeted key resolves
+through ONE router (`Tui::resolve_transcript_target` →
+`TranscriptTarget::{Main, Pane}`). With **no pane focused the target is
+always Main**, so all of these keys act on the orchestrator transcript
+byte-identically to the pre-pane behavior — pane routing is a pure
+retarget, never a new binding scheme.
+
+| Key | Focus | Action with a pane focused |
+|---|---|---|
+| ↑ / k, ↓ / j | transcript | pane scroll ±1 line |
+| Shift+↑ | any | pane scroll up 1 line, switches to transcript focus |
+| PgUp / PgDn | any | pane scroll ±10 lines; PgDn reaching the tail returns focus to input |
+| Ctrl+B / Ctrl+F | any | pane scroll ±15 lines (half page) |
+| g / Home | transcript | pin to top (`Some(last_pane_max_scroll)`, the render-time bound) |
+| G / End | transcript | re-pin to the live tail (`scroll = None`) |
+| mouse wheel over pane | — | pane scroll ±3 lines; up from input flips to transcript focus, hitting the tail returns it |
+| Space / x | transcript | expand-toggle the viewport-CENTER item (shared `transcript_hit_test_core`, first-expandable-at/below-top fallback) |
+| click a block | — | same hit-test expand toggle |
+| Ctrl+E | any | cycle the pane's most-recent reasoning block |
+| Ctrl+G | any | toggle the pane's most-recent tool block's expand |
+| Ctrl+O | any | maximized output viewer over the pane's tool output (opens on the pane even when the main transcript has no tool) |
+| Ctrl+A | any | agent-stats page driven by the pane's own context snapshot + per-pane anchor |
+| Ctrl+R | any | docked live-reasoning strip under the pane transcript |
+| y / Y | transcript | copy the pane's most recent assistant / user message (`TuiAction::CopyPaneItem`) |
+| Ctrl+S | input | open the search bar over the pane (fresh per-pane query) |
+| / | transcript | same, from transcript focus |
+| n / N | transcript | walk the pane's matches (wrap-around; pins pane scroll) |
+| Esc (in search) | search | close the bar (pane latch state kept on the pane) |
+| Ctrl+P | any | release focus back to the orchestrator view |
+| Ctrl+N | any | widen/narrow the pane rail (19 ↔ 48 cols) |
+| Alt+↑ / Alt+↓ | any | scroll the rail's tab window (pane rail outranks the NeuroCode feed) |
+| Ctrl+L | any | clear orchestrator transcript AND panes/rail, focus back to orchestrator |
+| F1 / ? | any | the one global help overlay — identical content everywhere |
+
+(With the pane stats page open, ↑/↓/j/k/g/G/Home/End/PgUp/PgDn and the
+wheel over it scroll the pane's stats context stream instead — same
+retargeting rule.)
+
+### Spawn-surface universality
+
+Every surface that spawns children — `delegate_task`, OMO delegation
+(`call_omo_agent` / Atlas), `/hypercode` pipelines, `dispatch_batch` —
+runs through the single `SubagentManager` → `set_event_tap` →
+`AgentEvent::SubagentEvent { id, .. }` → `pane_apply` funnel, so all
+panes behave identically regardless of who spawned them; the only
+per-surface difference is the mode-explorer gate
+(`spawned_by_neurocode`, snapshotted at `SubagentSpawn`). The
+requirements corpus for this parity work is
+`specs/017-please-modify-joey/spec.md` (FR-001…FR-013).
+
+## Animations (anim.rs)
+
+Particle field, spinners, equalizer, pulse, activity signal — all paced by
+one global `Activity` signal: **animation speed scales live with the number
+of active agents**, easing to a calm shimmer when idle.
+
+## RunMode
+
+Input / Busy (turn in progress, busy input styling) / Quitting.
+
+## Input history recall (CLI parity)
+
+Plain ↑ / ↓ in the input box walks the shared input history
+(`~/.joey/.joey_history`) — the exact same file, format (reedline
+newline-escaped), and recall semantics as the line REPL:
+
+- ↑ on a single-line draft (or with the cursor on the first line of a
+  multi-line draft) recalls the previous (older) entry; the in-progress
+  draft is saved first.
+- ↓ on the last line recalls the next (newer) entry; moving past the
+  newest entry restores the saved draft.
+- Submitting records the input (consecutive-duplicate dedup, 10 000-entry
+  cap) and resets recall state — entries made in either surface (CLI or
+  TUI) are recallable in both.
+- Inside a multi-line draft, ↑ / ↓ move the cursor between lines (the
+  boundary rule above still triggers history at the first/last line).
+- Transcript scrolling that plain ↑ used to trigger moved to
+  Shift+Up / Ctrl+T / PgUp (j/k also work in transcript focus).
+
+## Smart completions (Hermes parity)
+
+Both surfaces share one completion engine (`joey-tools::completion`, ported
+from upstream `hermes_cli/commands.py::SlashCommandCompleter`):
+
+- **Slash commands** — Tab popup (CLI) / auto-popup (TUI) with names,
+  aliases, descriptions, arg hints, implemented status.
+- **Subcommands** — after `/cmd ` the first argument word completes against
+  the command's pipe-encoded args_hint (`/timestamps <Tab>` → on/off/status;
+  `/llm-selector st` → status). Offered for implemented commands only.
+- **@-context refs** — Claude-Code-style `@diff`, `@staged`, `@file:`,
+  `@folder:`, `@git:`, `@url:` static references; bare `@query` runs a
+  fuzzy project-wide file search (rg-listed, 5s cache, scoring: exact 100 /
+  prefix 80 / substring 60 / path 40 / boundary-initials 35).
+- **Path completions** — words starting `./`, `../`, `~/`, `/` or containing
+  `/` (URLs excluded) list directory entries, dirs first, with size labels.
+- **Ghost text (CLI)** — fish-style inline hints as you type: unique
+  slash-name remainder (`/hel`→`p`), subcommand remainder, or the newest
+  matching history entry's tail.
+
+CLI (reedline): Tab opens the description menu (fixed to
+`only_buffer_difference(false)` — the upstream default left the menu
+perpetually empty); ↑/↓ navigate, Enter accepts. TUI: popups render above
+the input box; ↑/↓/Tab navigate, Enter accepts, Esc closes; accepting a
+completion dismisses it until the next edit; @-search file listings refresh
+on a background thread (never stalls a frame).
+
+## NeuroCode live context panel (feature 015)
+
+When the NeuroCode engine is active (`neurocode.enabled: true` in config):
+
+- **Status badge** — `⚡NEUROCODE` appears in the status bar whenever the
+  engine is wired, so context-graph injection is never silent. A transcript
+  notice on startup announces it too.
+- **Live context feed** — the right sidebar splits: the OMO panel keeps the
+  top, and a `neurocode · context feed` panel anchors the bottom-right. On
+  every model dispatch it shows exactly what NeuroCode fed the agent — the
+  same string prepended to the system prompt (`AgentEvent::NeuroCodeContext`):
+  the serving tier, estimated tokens, graph-expanded node count, a `COLD`
+  badge in degraded (un-indexed) mode, and the full context text
+  (hard-wrapped, tail-anchored). **Alt+↑ / Alt+↓** scroll the feed without
+  leaving the input box.
+- **Click to expand** — clicking the docked feed moves its content onto the
+  main screen: the transcript (including the live streaming tail) keeps a
+  strip at the top, and the expanded feed fills the rest. Clicking it again
+  (or pressing Esc) docks it back to the bottom-right panel. The mouse wheel
+  over the feed scrolls the feed itself in either mode; streaming updates
+  keep flowing live in both.
+- The panel yields entirely on narrow/short terminals or when NeuroCode is
+  off — the layout is byte-identical to pre-feature when inactive.
+
+## Mid-turn messaging (Hermes parity)
+
+Three distinct behaviors when a turn is running (upstream `busy_input_mode`
+semantics, default `interrupt`):
+
+- **Plain message + Enter** — interrupts the running turn; your message
+  runs as the next turn ("⚡ interrupting — your message runs next").
+- **`/steer <message>`** — does NOT interrupt: the text is injected into
+  the current turn's last tool result, wrapped in the upstream
+  `[OUT-OF-BAND USER MESSAGE]` marker so the model treats it as a genuine
+  user instruction (not tool output). It lands after the current tool
+  batch / before the next model call; multiple steers concatenate. A NEW
+  user message drops pending steers (they were meant for the aborted turn).
+  The system prompt carries the upstream STEER_CHANNEL_NOTE so the model
+  trusts the marker and ignores lookalikes in tool output.
+- **`/queue <prompt>`** — queues for the NEXT turn; never interrupts.
+
+The steer slot is Arc-shared (`Agent::steer_handle` /
+`steer_via_handle`), so the engine task can receive steers mid-turn while
+the turn future holds the agent borrow.
+
+## Slash commands
+
+Full slash menu including `/neurocode` (alias `/nc`) — run asynchronously
+off the UI task (e.g. `/neurocode index` parses the whole tree) so the GUI
+keeps rendering; Ctrl-C twice force-exits.
+
+`/neurocode ingest` accepts TWO forms: the strict
+`ingest <category> <path> [--version <v>] [--provenance <p>]`, and
+**natural language** — describe what to ingest ("ingest the framework docs
+in docs/spring as version 3.2", "ingest this postmortem: <pasted text>")
+and an agent turn takes over: it locates (or writes, for pasted knowledge,
+under `.neurocode/sources/`) the source, picks the category, and calls
+`neurocode_ingest` itself.

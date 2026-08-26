@@ -220,8 +220,9 @@ it is intended to match upstream exactly.
   `JOEY_INFERENCE_MODEL` honored only here.
 - REPL: Ctrl-C interrupt (second press within 2s force-exits), the full
   upstream slash-command registry (73 names; `/q` = `/queue`, unique-prefix
-  expansion, upstream unknown/ambiguous texts; ~22 implemented, the rest
-  answer honestly that they're not available yet), persistent
+  expansion, upstream unknown/ambiguous texts; ALL commands implemented as
+  of 2026-08-19 — see the "Slash-command completion" feature entry),
+  persistent
   `~/.joey/.joey_history`, `❯` prompt, exit outro with resume hints, banner
   with model/context/cwd/session/tools/tips, dim Reasoning box + tool-progress
   modes, interactive streaming overlay.
@@ -341,6 +342,162 @@ the observable contract is preserved:
 
 Feature spec/tracking: `specs/009-terminal-async-perf/`.
 
+## Live terminal output streaming + maximized TUI viewer (2026-08-16)
+
+Additive follow-up to feature 009: realtime in-GUI terminal output. While a
+`terminal` tool call runs, its output now live-streams into the TUI
+transcript (last-10-line tail per command block) and a maximized full-
+screen viewer shows the complete stream. Upstream Hermes streams terminal
+output through the same `tool_progress` callback; Joey originally did too,
+but the TUI could only show a one-line summary overwrite — raw output was
+invisible until `ToolEnd`. The fix adds a dedicated surface while keeping
+the upstream-visible one intact:
+
+- **`ToolContext`**: new additive `output_sender:
+  Option<UnboundedSender<String>>` (+ `with_output_sender` / `emit_output`,
+  no-op when unset — existing callers unaffected). The terminal tool's
+  `flush_chunk` now emits each throttled chunk on BOTH channels (progress
+  for upstream-parity consumers, output for live-view consumers).
+- **`AgentEvent::ToolOutput { name, chunk }`**: new additive variant,
+  forwarded by a per-dispatch task in `ctx_for_tool` alongside the
+  existing ToolProgress forwarder. The one-shot CLI renderer ignores it
+  (verbose mode already shows the chunks via ToolProgress); the TUI
+  accumulates it.
+- **TUI**: `TranscriptItem::Tool` carries a bounded live-output accumulator
+  (128 KB tail ring, line-boundary eviction); terminal items render a live
+  tail while Running; Ctrl+O / clicking a terminal block opens the
+  maximized viewer (takeover of the main screen below a transcript strip,
+  same pattern as the expanded reasoning panel / NeuroCode explorer —
+  explicit viewer wins precedence). Auto-follow tail pinning with
+  freeze-on-scroll (↑/PgUp/wheel-up), hjkl/g/G in transcript focus,
+  auto-retarget to each NEW terminal call while open, replay of finished
+  calls' full output, Esc/Ctrl+O restores. Terminal ToolProgress events
+  are ignored in the TUI (they'd duplicate the output stream).
+- **Untouched**: terminal result schema, timeouts, CWD markers, redaction,
+  background reaper, ToolProgress consumers (CLI verbose, gateway).
+  Tests: `context.rs` (7), `terminal_streaming.rs` (2),
+  `agent.rs` (2 incl. a real-bash end-to-end ordering test),
+  `state.rs` (10), `app.rs` key tests (4), `widgets.rs` render tests (3).
+
+## Animated header gradient bar (2026-08-16, TUI-only)
+
+Joey-native TUI feature (no upstream equivalent to port): the header's
+gradient underline is now an agent-active indicator. `anim::HeaderFlow`
+drives a slow traveling brightness wave across the bar while a turn runs
+(raised-cosine bump, ~8s traversal, breathing base lift; gradient colors
+fixed — only brightness moves), with an asymmetric eased busy envelope
+(~1s engage / ~0.8s settle, clamped to exactly-static when idle) and
+phase continuity across busy↔idle transitions. `draw_header` takes the
+animator as `Option<&HeaderFlow>` (None = the old static render,
+backward-compatible for non-Tui callers); `Tui::tick_animations[_with_dt]`
+latches `app.is_busy()` into it alongside the other animators, riding the
+shared activity speed. Contract tests: idle == static byte-identical,
+busy animates across frames, adjacent-cell color deltas stay graded.
+Purely additive; no state-schema, event, or config changes.
+
+## Agent stats page — live context-window stream (2026-08-16)
+
+Joey-native TUI feature (no upstream equivalent): clicking the header's
+right section (or Ctrl+A) maximizes an agent-stats page with a realtime
+stream of the full context window. Backing surface: new additive
+`AgentEvent::ContextSnapshot` (plus `ContextEntry` projection type) emitted
+by `Agent::emit_context_snapshot` at every history mutation the turn loop
+makes — user turn appended, each tool round flushed, pre-API and
+post-tool compactions, final assistant message. The payload carries
+per-message role/token/preview entries, system+history rough token
+estimates (`estimate_tokens`), and the compressor's context window /
+threshold / compression count. Purely observational: nothing about the
+request path, wire format, or persistence changes; the one-shot CLI
+renderer ignores it.
+
+TUI side: `App` stores the latest snapshot (entries + aggregates + a
+bounded 240-sample per-API-call usage series + turn count);
+`draw_stats_page` renders a dashboard (context-usage bar with
+green/amber/red thresholds, system-vs-history breakdown, session token
+totals, per-call usage sparkline) above a one-line-per-message context
+stream with the reasoning-panel scroll semantics (auto-follow tail,
+freeze-on-scroll-up, re-pin at bottom; ↑↓/PgUp·PgDn/Home/End + hjkl/g/G in
+transcript focus; wheel-over-page scrolls it). The header's right section
+records a hit-test rect (`last_header_right_rect`) — the click target —
+and the page takes main-screen precedence over the output viewer /
+NeuroCode explorer / reasoning panels. Tests: agent-core end-to-end
+(turn drives ≥3 snapshots with correct roles/growth), TUI state (5),
+key/mouse (5), render (3).
+
+## Crush-style tool output & diff formatting (2026-08-16, TUI-only)
+
+Ported Crush's tool-result display conventions (`internal/ui/chat/tools.go`,
+`unified_diff.go`, `ui/diffview/diffview.go`) onto Joey's transcript:
+
+- **Envelope unwrapping** (`state::display_result_content`): tool bodies and
+  the maximized viewer show the payload, never the JSON envelope —
+  `{"output":…,"exit_code":…}` → its `output` string, `{"error":…}` → the
+  message. Non-JSON results pass through unchanged.
+- **JSON pretty-printing** (`state::pretty_json_if_parses` /
+  `format_tool_result_for_display`): results that are themselves JSON
+  (MCP/list outputs, tool args) render with 2-space indent — no literal
+  `\n` escape runs. `serde_json` added to joey-tui (already a workspace dep).
+- **Line-numbered code gutters**: terminal live tails (absolute numbers
+  across the tail window), finished collapsed bodies, expanded tool
+  results/args, and the maximized viewer all render `N │ content` rows with
+  a dimmed separator; blank lines are preserved as numbered rows (fixed a
+  pre-existing `wrap()` bug that dropped them via textwrap collapse).
+- **Dual-gutter diffs** (`parse_diff_lines` + FileDiff rendering): unified
+  diffs carry old/new line numbers parsed from hunk headers — context shows
+  both, deletions old-only (new blank), insertions new-only (old blank),
+  hunk headers render as `… …` dividers with colored +/- markers, exactly
+  crush's diffview semantics.
+- **Viewer generalization**: the maximized viewer now handles ANY tool call
+  (terminal or generic), header adapting (`$ cmd (exit N)` vs
+  `tool summary`); clicking any tool block opens it; live-follow retargets
+  to each new tool call.
+
+Tests: formatting helpers (4), gutter/envelope render contracts (8),
+visual end-to-end rows (2); two legacy indent tests updated to the gutter
+contract. No event/schema/config changes — display-layer only.
+
+
+## Rayon parallelization of CPU-bound hot paths (2026-08-16)
+
+Added `rayon 1.12` as a workspace dependency (already in the lockfile
+transitively via sysinfo — zero binary-size cost) and moved the
+CPU-intensive, non-async-appropriate work onto the rayon pool:
+
+- **Terminal tool** (`joey-tools`): the post-command pipeline (head/tail
+  truncation → ANSI strip → secret redaction → file-mutation detection)
+  now runs inside `spawn_blocking`, with the internals parallelized —
+  `strip_ansi_par` (line-boundary chunking, 256 KB threshold) and
+  per-file stat+hash fan-out for mutation snapshots/detection.
+- **Redaction** (`joey-core`): `redact_secrets_par` — line-boundary
+  chunked rayon map over the ~30-pattern regex cascade (512 KB
+  threshold); every pattern class is line-local so chunking is safe.
+- **Diff engine** (`joey-tools::file_tracker`): `generate_diff` rebuilt
+  with parallel line hashing (rayon::join), common prefix/suffix
+  trimming (a one-line edit in a 50 K-line file collapses the quadratic
+  LCS core to a tiny region instead of a 2.5×10⁹-cell table), hash-based
+  equality in the LCS hot loop, and a wholesale-rewrite guard that caps
+  memory on pathological inputs. `drain_pending_diffs` fans the per-file
+  read+decode+diff work across cores (order-preserving collect).
+  Byte-identical to the original algorithm — pinned by a reference-oracle
+  test across 8 edit shapes plus fast/bounded tests for 50 K-line edits
+  and 20 K-line rewrites.
+- **NeuroCode ingestion** (`joey-neurocode`): `ingest_project` split into
+  a parallel phase-1 (per-file read + tree-sitter parse via par_iter,
+  order-preserving) and the unchanged sequential phase-2 graph upserts.
+  Measured on a frozen copy of this repo's tree: identical output
+  (2744 artifacts / 3842 edges), 2.64 s → 1.69 s (~1.56× faster).
+- **Agent turn loop** (`joey-agent-core`): parallel tool-batch
+  post-processing (untrusted-content wrapping + preview extraction +
+  exit-code parsing fan out per result on the rayon pool; event emission
+  and history pushes stay sequential for byte-identical ordering), and
+  `estimate_messages_tokens_rough` parallelizes per-message shadow-JSON
+  serialization above a 24-message threshold.
+
+All parallel/sequential equivalence points are contract-tested
+(strip_ansi, redaction, generate_diff vs a reference oracle). Rayon work
+never runs on tokio's async workers: call sites wrap the pool in
+`spawn_blocking` where they're on the async runtime.
+
 ## Deliberate deviations (not oversights)
 
 - **Anthropic OAuth "Claude Code" impersonation is NOT ported.** Upstream,
@@ -418,8 +575,12 @@ Feature spec/tracking: `specs/009-terminal-async-perf/`.
   `config check|migrate`, `doctor --ack`, `mcp serve/catalog/login/reauth`,
   `skills` beyond `list`, `tools post-setup`, and the version update check
   answer with honest not-available messages. `--image`, `-w/--worktree`,
-  `--accept-hooks`, `--checkpoints`, `--tui/--cli/--dev`, `--no-restore-cwd`
-  are not offered.
+  `--accept-hooks`, `--checkpoints`, `--no-restore-cwd` are not offered.
+  `--tui/--cli` exist but with joey-native semantics (upstream's trio also
+  includes `--dev`): the TUI is the DEFAULT interactive interface;
+  `--cli` selects the line REPL (`--cli` beats `--tui`; `JOEY_TUI=0|false`
+  env-opts-out, any other value or unset → TUI; non-terminal stdio falls
+  back to the line REPL). `--dev` is not offered.
 - **Skills self-improvement** (curator, `skill_manage` authoring/patching)
   is not ported; skills are discovered, indexed into the prompt, and viewable.
 
@@ -471,8 +632,18 @@ mandatory. Round-trip + partial-line-tolerance + migration-stub tests in
 - The FastAPI dashboard / web server and the Electron desktop app.
 - The TUI-gateway JSON-RPC protocol, ACP editor adapter, relay/connector.
 - Kanban multi-agent coordination, projects, blueprints, memory providers
-  (Honcho/mem0/…), computer-use, TTS/STT/voice, image/video generation,
-  browser automation.
+  (Honcho/mem0/…), computer-use, TTS/STT/voice, image/video generation.
+- ~~Browser automation~~ — **implemented (feature 016, 2026-08-17)**: the
+  declared `browser_*` tool names are now functional via the new
+  `joey-browser` crate (CDP attach/managed-launch, shadow/frame-piercing
+  snapshots, cascading-target actions, settle detection, overlay policy,
+  SoM visual fallback, feed deltas) + `vision_analyze` + per-provider
+  image-model keys (`model.image_model` / `providers.<id>.image_model`).
+  This is a native-Rust CDP implementation, not a port of upstream's
+  browser tooling — declared tool names and toolset membership are kept
+  compatible; 4 additive verbs (`browser_hover`, `browser_select_option`,
+  `browser_drag`, `browser_click_coords`) extend the declared surface.
+  See docs/browser.md and specs/016-please-modify-joey/.
 - The 6 terminal backends beyond `local` (docker/ssh/singularity/modal/daytona).
 - Research tooling: batch runner, trajectory compressor, mini-swe runner.
 
@@ -574,3 +745,495 @@ A future improvement could translate MSYS paths to native Windows paths.
 **Audit note**: the rest of the codebase (joey-core, joey-mcp, joey-cron,
 joey-cli, joey-tools sibling files) was already correctly cfg-guarded before
 this feature — the terminal tool was the sole compile blocker.
+
+## NeuroCode — Enterprise Java & Pega Rule System Coding Agent (feature 015, 2026-08-13)
+
+**Status**: Deliberate-deviation subsystem (Joey-original, no upstream
+equivalent).
+
+`joey-neurocode` is a new library crate (`crates/joey-neurocode/`, Constitution
+I) that gives the agent dependency-graph-aware context, complexity-tier
+routing that composes with `specs/011`'s `ModelAllocator`, and a build/verify
+feedback loop for enterprise Java and Pega Platform codebases. It consumes
+`joey-llm-selector`'s trait upward and is consumed by `joey-agent-core` via a
+narrow `NeuroCodeEngine` trait (Constitution VI) and by `joey-cli` for the
+`/neurocode` command.
+
+**Deliberate deviation — no Qdrant; SQLite + FTS5 instead.** The source plan
+proposed Qdrant (a separate vector database server). This is rejected for this
+workspace: Qdrant adds a second storage engine, a runtime server/dependency,
+and deployment complexity. The workspace already bundles SQLite with FTS5
+(`SCHEMA_VERSION = 22`; `joey-core::state` probes/uses FTS5), so the structural
+knowledge graph is stored in a per-project SQLite DB
+(`~/.joey/neurocode/<project-hash>/graph.db`). FTS5 with BM25 ranking and
+symbol-aware tokenization handles FR-007's retrieval, and the graph edges
+(implements/injects/references) are exact-match typed traversals — not
+nearest-neighbor searches — for which a vector store adds no value (Constitution
+VIII, lean deps). Embedding-model retrieval is deferred to a future trait
+extension (research.md §2, §6).
+
+**Deliberate deviation — tree-sitter for AST parsing.** Upstream's source
+plan uses a Python-based parsing approach. Joey adds `tree-sitter = "0.26"`
+plus one grammar crate per supported language — every programming language
+with a grammar under the tree-sitter org
+(https://tree-sitter.github.io/tree-sitter/): Java, Python, JS/TS/TSX, Go,
+Rust, Ruby, PHP, C#, C, C++, Scala, Haskell, Julia, OCaml, Bash, Verilog,
+Agda (`crates/joey-neurocode/src/parse/registry.rs` is the authoritative
+list; long-tail languages fall back to the heuristic extractor) — each
+~150-300KB compiled, no transitive runtime deps, C source bundled via `cc`
+— to satisfy FR-006's mandate for deterministic, syntax-aware parsing
+(type/method/field boundaries, annotations, imports, injection points)
+that does not rely on the LLM to guess structure. Regex heuristics fail on
+generics/annotations/nested classes; a hand-written Rust parser is rejected
+as enormous and less correct than the maintained grammars (research.md §3).
+Markup/data grammars on the tree-sitter supported list (CSS, HTML, JSON,
+JSDoc, Regex, embedded-template) are deliberately not compiled in: they
+produce no type/method/import structure for the dependency graph.
+
+**On-disk format**: per-project SQLite DB at
+`~/.joey/neurocode/<project-hash>/graph.db` (machine-global across profiles via
+`process_joey_home()`), schema v2 (tables: `code_artifacts` with the additive
+`signature` column — declaration headers for methods/fields, migrated in place
+on open; `graph_edges` including the `MemberOf` edge kind for member→type
+membership, distinct from `Injects`; `code_artifacts_fts`, `patterns`,
+`anti_patterns`, `domain_knowledge`, `domain_knowledge_fts`, `schema_meta`).
+Round-trip + acyclic-DAG + disabled-state regression tests in
+`crates/joey-neurocode/tests/`.
+
+**Disabled state is byte-identical to today**: with `neurocode.enabled = false`
+the engine's `classify()`/`assemble_context()` are never called, no messages are
+injected, and the system prompt bytes are unchanged (FR-020, SC-008 — asserted in
+`tests/regression_disabled.rs`).
+
+Full design trail and every dependency decision against the constitution:
+`specs/015-neurocode-enterprise-java/research.md`.
+
+**Follow-up (2026-08-16) — context-quality overhaul ("useful context for the
+LLM")**. The assembly pipeline was rebuilt around what the model actually
+receives:
+
+- **Request-text discovery** (`context::discovery`): backtick-quoted spans,
+  CamelCase/snake identifiers, dotted/`::` references, and file-path mentions
+  are extracted from the free-text request. Identifiers seed target lookup
+  (`CodingRequest.active_symbols`) and the classifier's scope-fanout signal;
+  file mentions become `active_file`. Previously the intercept passed empty
+  symbols and FTS-matched every ≥3-char word with AND semantics — mostly empty
+  or noisy results.
+- **Symbol-match ranking** (`best_symbol_match` / `resolve_query_node`): FTS
+  also indexes `declared_dependencies` text, so dependents' FQCNs crowd the
+  true node out of a small limit. Both lookups now fetch generously and
+  re-rank in Rust: type-level exact → qualified suffix → exact member → first
+  type-level → first hit.
+- **Ranked, budget-capped best-first expansion**: a `BinaryHeap` frontier
+  ordered by `ExpansionReason::rank` (inherits > implements > members >
+  injects > exchanges > references) replaces arbitrary `Vec::pop()` BFS — the
+  implemented interface always survives a tight budget ahead of dependents.
+  Members render inside their type's roster, not as separate artifacts. A
+  defensive pop cap (12× render budget) bounds hub-node traversal.
+- **Rendering with actionable detail**: file paths (model can `read_file`
+  directly), member rosters with captured declaration signatures
+  (`public User findById(Long id)`), fan-in blast-radius warnings (≥5
+  dependents), and an index-staleness note when a target file's mtime
+  postdates `indexed_at` (paths resolve against the project root).
+- **Schema v2** (`NEUROCODE_SCHEMA_VERSION = 2`): additive `signature` column
+  (migrated in place; rows keep NULL until re-indexed) + `MemberOf` edge kind.
+- **Signatures captured by every extractor**: Java/Python/JS-TS/Go/Rust
+  tree-sitter grammars emit declaration headers; the heuristic extractor
+  stores the trimmed source line.
+- **Spring ≥4.3 implicit constructor injection**: a single-constructor class
+  has its object-typed params recorded as declared dependencies (no
+  `@Autowired` needed — the dominant modern style).
+- **Tier routing follows classification**: `DefaultEngine` caches the last
+  classified tier; `resolve_tier_model` now returns the tier model for the
+  tier that actually served the request (previously always the ambiguous
+  default — the core premise of tier routing was broken).
+- **Per-turn assembly dedupe**: the agent-core intercept keys on the user
+  text; retries and tool-loop iterations reuse the stashed context instead of
+  re-running assembly (which also re-bumped anti-pattern hit counts). New
+  user turns clear the key.
+- **Query surface**: `definition` (exact declaration lookup with span +
+  signature) and `references` (alias of dependents) query types implemented —
+  previously advertised by the tool schema but rejected by the engine.
+- **Tier budgets raised**: economical depth 2 / 2 primaries / 8 expanded;
+  frontier depth 3 / 3 primaries / 24 expanded (was 1/1/5 and 2/3/20).
+- **Conservative token estimation** (`context::tokens`): ~3.5 chars/token
+  blended with a word-count floor (was `len()/4`, undercounting symbol-dense
+  text).
+
+Regression tests: `crates/joey-neurocode/tests/context_enrichment.rs` (9
+cases: discovery, rendering, ranking, tier routing, staleness, hub warnings,
+determinism).
+
+**Follow-up (2026-08-15) — realtime assembly progress feed.** Assembly is now
+streamable: `ContextAssembler::assemble_with_progress(request, tier, progress)`
+invokes a callback with short stage descriptions ("locating artifacts" →
+"expanded graph: N nodes pulled in" → "surfacing known anti-patterns" →
+"surfacing domain knowledge", plus a "cold mode" notice), and the plain
+`assemble` delegates to it with a no-op callback (byte-identical result —
+asserted by `streaming_assembly_is_identical_and_reports_stages`). The
+`NeuroCodeEngine` trait gained a default `assemble_context_with_progress`
+(source-compatible; existing impls unchanged), overridden by `DefaultEngine`
+to forward through `with_graph`. The agent-core intercept emits a new
+`AgentEvent::NeuroCodeProgress { stage }` per stage live during assembly
+(before the final `NeuroCodeContext` blob), and the TUI context panel renders
+the current stage with an animated spinner plus a "↻ updated Ns ago" refresh
+stamp (`state.neurocode_stage` / `neurocode_stage_at` / `neurocode_updated_at`;
+cleared on deactivate). The line renderer consumes the new event silently
+(same treatment as `NeuroCodeContext`). Regression tests:
+`crates/joey-neurocode/tests/context_assembly.rs` (streaming parity + stage
+coverage), `joey-agent-core/src/agent.rs` (`active_engine_streams_progress_events`
+— streaming engine double verifies every stage forwards as a live event),
+`joey-tui/src/state.rs` (`live_stage_streams_into_panel` + refresh stamp).
+
+## Copilot reverse-proxy integration (2026-08-14)
+
+**Status**: Deliberate-deviation extension (Joey-original, no upstream
+equivalent). Uncommitted working-tree feature completed and verified 2026-08-14.
+
+`COPILOT_API_BASE_URL` pointing at a host **off** `githubcopilot.com` (e.g. a
+local AI Usage HUD reverse proxy on `127.0.0.1:8317` that owns upstream
+Copilot auth, token refresh, and usage capture) activates a "custom
+Copilot-compatible endpoint" mode (`joey-providers::copilot::custom_endpoint`):
+
+- **No GitHub token exchange**: `CopilotAuth::with_endpoint` pins the endpoint
+  and `credentials()` returns the raw GitHub credential (env var / `gh auth
+  token`) + the pinned base URL; `build_client` constructs the pinned auth
+  when the copilot profile's base URL is off-host. The proxy accepts the raw
+  credential and owns upstream auth.
+- **Routing magnet**: `resolve_profile` resolves EVERY `auto`-provider request
+  to the `copilot` profile (vendor prefixes, bare family names, and foreign
+  base_url hosts alike) so no request escapes the proxy — the proxy serves
+  every model family. Explicit non-`auto` provider settings still win.
+  `llm_selector::resolve_provider_name` mirrors the magnet so the Feature 011
+  candidate pool targets the proxy's `/models` catalog.
+- **Catalog via proxy**: `fetch_model_catalog` fetches `/models` from the
+  pinned endpoint with the raw credential (60 s in-process cache — consulted
+  per client build and by the OMO model set); `AvailableModelSet::
+  from_connected_with_catalog` seeds every proxy catalog model id into the OMO
+  model set (used by the REPL, TUI roster, and agent switching).
+- **On-disk formats unchanged**; no schema/version bumps. Graceful
+  degradation: unset var → identical to native behavior; unreachable proxy →
+  catalog fetch fails, active model + static fallbacks still used.
+
+Tests: `copilot.rs` (custom-endpoint detection, pinned-credential
+no-exchange, catalog filtering), `profile.rs` (magnet covers all auto paths,
+natively-routed otherwise — env-var tests share `TEST_ENV_LOCK`), `llm_
+selector.rs`, `joey-omo/src/models.rs` (degradation). Verified end-to-end
+against a live proxy: `-z` one-shot through `127.0.0.1:8317` logged
+`JoeyAgent/1.0` requests with exact model passthrough (`gpt-5.4 → gpt-5.4`).
+
+## `ai-usage-hud` first-class provider (2026-08-14)
+
+**Status**: Deliberate-deviation extension (Joey-original). Promotes the AI
+Usage HUD reverse proxy (~/Development/ai-usage-hud, `127.0.0.1:8317`) from
+an env-var-only mode to a named provider, on top of the custom-endpoint
+machinery above.
+
+- **Profile**: `ai-usage-hud` (aliases `usage-hud`, `ai-usage`) registered in
+  `joey-providers::profile` — Copilot wire semantics, base URL
+  `http://127.0.0.1:8317`, env override `AI_USAGE_HUD_BASE_URL`, same GitHub
+  credential resolution (`COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`
+  / `gh auth token`).
+- **Single source of truth for copilot-family dispatch**:
+  `profile::is_copilot_wire(name)` replaces every hardcoded
+  `name == "copilot"` check in `build_client`, `ProviderClient` (auth attach,
+  chat/responses/messages header paths), `wire_model_name`, `doctor`,
+  `llm_selector`, and `model_catalog` — new Copilot-wire providers can't
+  silently drift from the registry.
+- **Env-var magnet**: `AI_USAGE_HUD_BASE_URL` set (off githubcopilot.com)
+  magnetizes `auto` resolution to the `ai-usage-hud` profile (the existing
+  `COPILOT_API_BASE_URL` magnet keeps precedence for the copilot profile).
+  `copilot::hud_endpoint()` is the shared resolver; `custom_endpoint()`
+  falls through to it.
+- **Setup wizard**: `flow_ai_usage_hud` — proxy health check
+  (`copilot::hud_health_check` probing `/api/health`, fail-fast with the
+  deploy remediation), GitHub credential prompt (device flow or manual
+  token), catalog + model selection through the proxy, persists
+  `model.provider=ai-usage-hud` + the proxy base URL. Listed in
+  `CANONICAL_ORDER` for the `joey model` picker.
+- **OMO**: `AvailableModelSet::from_connected_with_catalog` always seeds from
+  the proxy catalog when the profile is `ai-usage-hud`; BC-010 billing
+  aliases (`github-copilot`, `copilot`, `usage-hud`, `ai-usage`) registered
+  for requiresProvider gating.
+- **On-disk formats unchanged**; no schema bumps. Explicit provider settings
+  (`--provider zai`) still win over the magnet.
+
+Tests: `profile.rs` (registration, aliases, is_copilot_wire, explicit + magnet
++ real-host-guard resolution), `client.rs` (pinned proxy client, no
+exchange, env override), `copilot.rs` (hud_endpoint, precedence, health
+check), `llm_selector.rs`, `joey-omo/src/models.rs` (catalog seeding +
+billing aliases). Verified live: `joey --model gpt-5.4 -z` served
+`gpt-5.4 → gpt-5.4` via `/responses` with usage recorded in the proxy's DB
+(neurocode tier override temporarily disabled for the clean-path check).
+
+## Copilot-wire claude thinking via /chat/completions (2026-08-21)
+
+**Status**: Deliberate-deviation extension (Joey extension beyond upstream
+Hermes parity; no upstream equivalent). Completed and live-verified
+2026-08-21 against the live Copilot chat endpoint and the HUD proxy.
+
+Copilot-wire claude models (any `claude*` model except haiku — see
+`profile::is_copilot_wire` + `copilot::model_api_mode`) ride the OpenAI
+Chat Completions wire, where upstream has no thinking support at all:
+
+- **Request side** (`chat.rs`): top-level
+  `{"thinking":{"type":"enabled","budget_tokens":N}}` parameter for
+  copilot-wire claude models (budget from reasoning effort, haiku exempt).
+- **Response side** (`client.rs`): the endpoint answers with a
+  `reasoning_text` field (delta-level in streams, message-level
+  non-streaming) that upstream's first-non-null
+  `reasoning_content`/`reasoning` pair never reads. Joey appends
+  `reasoning_text` as a third first-non-null fallback in both
+  chat-completions parsers — never appended alongside a sibling, precedence
+  preserved (`reasoning` > `reasoning_content` > `reasoning_text`).
+  Existing upstream citations (`chat_completion_helpers.py:2813`,
+  `chat_completions.py:714`) kept intact in the adjacent comments.
+
+Tests: `client.rs` streaming
+(`copilot_chat_stream_emits_reasoning_text_deltas`,
+`copilot_chat_stream_reasoning_first_non_null_beats_reasoning_text`) and
+non-streaming (`openai_response_reasoning_text_copilot_extension`).
+
+
+## UX parity & robustness passes (2026-08-15)
+
+Four user-facing features plus a workspace-wide audit, all
+regression-tested; workspace 0 warnings, ~1,440 tests green.
+
+1. **TUI input history recall** — plain ↑/↓ in the TUI walks the shared
+   `~/.joey/.joey_history` (same reedline-format file as the CLI;
+   recall semantics ported from readline/reedline incl. draft
+   save/restore). Transcript scrolling moved to Shift+Up / Ctrl+T / PgUp.
+
+2. **Smart completions (port of `hermes_cli/commands.py::
+   SlashCommandCompleter` + `SlashCommandAutoSuggest`)** — shared engine
+   in `joey-tools::completion`: slash names/aliases, pipe-hint
+   subcommands (`SUBCOMMANDS` parity), @-context refs (`@diff/@staged/
+   @file:/@folder:/@git:/@url:` + fuzzy project file search with the
+   upstream scoring tiers), path completions, size labels. CLI: reedline
+   description menu (fixed a pre-existing `only_buffer_difference`
+   misconfig that left the menu empty) + fish-style ghost-text Hinter
+   (slash/subcommand remainder, history fallback). TUI: auto-popup +
+   subcommand stage + @/path completion popup, background-refreshed file
+   cache.
+
+3. **NeuroCode live context panel** — new `AgentEvent::NeuroCodeContext/
+   NeuroCodeActive` emitted from the turn-loop intercept; TUI renders a
+   bottom-right live feed (tier/tokens/nodes/COLD + full context text,
+   Alt+↑/↓ scroll) and a `⚡NEUROCODE` status badge.
+
+4. **TUI engine-actor decoupling** — `joey-cli/src/engine.rs`: the Agent
+   lives on a dedicated engine task; UI ↔ engine over EngineCommand/
+   EngineEvent channels; UI loop is one `select!` (events / input /
+   frames) and never awaits compute. Ctrl-C escalation: 1st press
+   interrupt, 2nd within 2s = force-kill (abandon the task, rebuild the
+   agent from the session DB, respawn). Heavy jobs (`/neurocode index`)
+   run on the engine's blocking pool under the same regime.
+
+5. **ai-usage-hud wire fixes** — Responses-wire input items now carry
+   `type:"message"` (typeless items are silently dropped by the Responses
+   API and the HUD proxy — every prompt previously got the same generic
+   greeting); new `AgentConfig.model_pinned` (`--model`, `/model`,
+   agent picker, delegation) blocks NeuroCode tier rewrites of explicit
+   model choices.
+
+6. **Workspace robustness audit** — 19 real bugs found and fixed across
+   all crates, highlights: inverted checkpoint-retention pruners (deleted
+   the NEWEST snapshots; rewritten via commit-tree chain rebuild),
+   PreToolUse-denied tools executed anyway, loop-nudge phantom
+   tool_call_id (Anthropic 400), engine busy-deadlock, completion-engine
+   pipe deadlock >64KB, concurrent history-file corruption (now
+   lock-guarded + atomic), presigned-S3 signature redaction gap, MCP
+   wire-prefix collisions (deterministic disambiguation registry),
+   unbounded MCP frame reads (32 MiB cap), OMO blind-first fallback-chain
+   resolution, non-atomic boulder.json writes, multibyte cursor-position
+   slice panics in the completer/hinter, hook-stdin timeout escape.
+
+## Mid-turn messaging: /steer, /queue, interrupt-with-message (2026-08-15)
+
+Hermes parity for user input while a turn is running:
+
+- **`Agent::steer`** (joey-agent-core, port of run_agent.py:2853-2886):
+  Arc-shared pending-steer slot (`steer_handle`/`steer_via_handle` so hosts
+  can steer from another task mid-borrow); concatenating; drained at TWO
+  injection points (conversation_loop.py:933-975 pre-API and the post-tool-
+  batch `apply_pending_steer_to_tool_results`), appended to the LAST tool
+  result wrapped in the verbatim upstream `[OUT-OF-BAND USER MESSAGE]`
+  markers; re-stashed when no tool message exists yet; DROPPED when a new
+  user turn starts (interrupted turns never see stale steers).
+- **STEER_CHANNEL_NOTE** (guidance.rs, verbatim) appended to the stable
+  system prompt when tools are loaded — teaches the model to trust only
+  the exact marker.
+- **Engine/TUI semantics** (busy_input_mode=interrupt, the upstream
+  default): plain Enter mid-turn = interrupt + the message runs as the
+  next turn; `/steer` = EngineCommand::Steer → agent steer slot (no
+  interrupt); `/queue` = queue for the next turn (never interrupts).
+  Read-only slash commands (/status, /help, /copy, /model, /version) still
+  answer inline while busy.
+- The line REPL dispatches between turns, so its `/steer` degrades to a
+  queued message with a hint (reedline input is blocking; concurrent input
+  reading is not portable).
+
+Tests: agent-core steer_tests (5: injection helper, restash, concat/empty,
+  new-turn drop, marker format), engine steer-command routing, live TUI
+  E2E (steer no-interrupt, plain-message interrupt+next-turn, queue).
+
+## Expandable tool/terminal/diff blocks in the TUI (2026-08-15)
+
+- Terminal-tool expanded view now shows the FULL result (tail-anchored
+  200-line window + "… N earlier lines hidden" affordance) instead of just
+  the one-line preview; generic tools keep args + full result.
+- FileDiff items gained an `expanded` toggle (collapsed = last 50 lines,
+  expanded = whole diff).
+- Keyboard expansion: Space / x in transcript focus resolves the item at
+  the viewport center via the mouse hit-test machinery (single source of
+  truth for click/key parity), falling back to the first expandable
+  visible item. Mouse clicks keep working via hit-testing.
+
+## Natural-language /neurocode ingest (2026-08-15)
+
+`/neurocode ingest` now accepts two forms: the strict
+`<category> <path> [--version] [--provenance]` (unchanged, direct engine
+call) and free text — anything whose first token isn't a category+path.
+The NL form composes a workflow prompt (`ingest_agent_prompt`: teaches the
+neurocode_ingest tool contract, file-location via read_file/search_files,
+pasted-knowledge → write `.neurocode/sources/<slug>.md` then ingest with
+provenance `user-provided`, honest failure over guessing) and runs it as a
+full agent turn: REPL via run_turn_interactive, TUI via engine Submit
+(strict form keeps the HeavyJob path). `neurocode_slash_outcome` returns
+NeurocodeOutcome::{Text, AgentIngest}; the plain-text wrapper (engine
+heavy jobs, tests) degrades to usage guidance. Tests: 5 routing + 2 tool
+integration (registry registration + backend ingest roundtrip).
+
+## ai-usage-hud provider resilience fixes (2026-08-17)
+
+**Status**: Deliberate-deviation extension (proxy-side fix; joey-agent unchanged).
+
+Trigger: user could not use the `ai-usage-hud` provider at all — every request
+503'd `no_copilot_credentials`. Root-cause audit of the proxy (installed
+Electron bundle + repo) found the failures were structural, exposed by (not
+caused by) a simultaneous GitHub Copilot major outage:
+
+1. **Auth wedge**: every proxy router hard-gated on
+   `getAuthState() !== 'connected'`. One failed background token refresh
+   flipped the state permanently; every subsequent request then 503'd in ~2ms
+   without ever retrying the exchange.
+2. **Client credential ignored**: joey sends `Authorization: Bearer ghu_…`
+   (its raw GitHub OAuth token) on every request, but the proxy only used its
+   own discovered credential — which was dead (apps.json token revoked → 401).
+3. **`/models` hang**: no timeout on the live-catalog fetch; during auth
+   trouble it hung ~12s then fell back to a 12-model static alias list (no
+   gpt-5.x/gemini), degrading joey's model picker and OMO catalog.
+
+Proxy fixes (repo `~/Development/ai-usage-hud`, deployed via
+`SKIP_TESTS=1 npm run deploy`):
+
+- `copilot-auth.js`: candidate-walking `getCopilotToken(clientToken)` —
+  sticky (last-successful) credential → discovered token → client-supplied
+  credentials (Authorization header, GitHub-shaped prefixes only), deduped,
+  with per-credential cooldowns (60s hard-rejected / 10s transient);
+  single-flight exchange; 3-attempt retry with backoff for transient errors;
+  typed `ExchangeError`/`NoCopilotCredentialsError`. Refresh-timer failures no
+  longer flip the auth state; a still-valid cached token keeps serving.
+- Routers (openai/responses/anthropic/native): hard gates removed — every
+  request threads its Authorization header as an exchange candidate via
+  `githubTokenFromAuthHeader`; error mappers emit 503
+  `no_copilot_credentials`/`upstream_unavailable` with actionable messages
+  instead of opaque 500s.
+- `copilot-client.js`: `refreshModelRegistry` bounded by a 10s timeout,
+  serves the stale in-memory registry on failure, and persists the registry to
+  `data/model-registry.json` so a restart during an outage still serves the
+  last-known catalog (verified: fresh process during total mock outage served
+  the persisted catalog in 7ms). `/models` also accepts the client credential.
+- `GITHUB_TOKEN_EXCHANGE_URL` env override (tests/gateways).
+- New regression suite `test/copilot-auth-resilience.test.js` (5 tests:
+  header parsing, non-GitHub rejection, dead-credential + client-credential
+  recovery, sticky serving, transient-failure non-wedge). Full suite
+  187/188 (1 pre-existing parallel-run flake in aggregate.test.js, verified
+  failing identically before these changes).
+
+E2E verification (mocked upstream on spare ports, real joey binary, all three
+wire paths): `joey --provider ai-usage-hud --model gpt-5.4` → `/responses` →
+`E2E_RESPONSES_OK`; `--model claude-sonnet-5` → `/chat/completions` →
+`E2E_MOCK_OK`; direct native `/v1/messages` → `NATIVE_ANTHROPIC_OK`; dead
+server credential + live client credential → recovery in one request;
+`/models` bounded and persisted.
+
+Real-backend E2E was blocked by the GitHub Copilot major outage (503/502 on
+the token-exchange endpoint for ALL credentials, including `gh api` with gh's
+own token — githubstatus: `Copilot → major_outage`). The deployed bundle
+verifiably runs the new code: requests now attempt the exchange (multi-second
+retry cycle) and surface GitHub's real error instead of the 2ms wedge.
+
+joey-agent side needed no changes — provider resolution, wire routing
+(`/responses` for gpt-5.x via `model_api_mode`, `/chat/completions`
+otherwise, native `/v1/messages` when the catalog lists it exclusively), and
+the client-credential Authorization header were already correct; the fixes
+were all proxy-side. Once GitHub recovers, `joey --provider ai-usage-hud`
+works end-to-end with usage captured in the HUD dashboard.
+
+## Slash-command + CLI-stub completion (2026-08-19)
+
+**Status**: Complete. Every "not available in joey-agent yet" surface now has a
+functional implementation; nothing answers the old deferral string anymore.
+
+**Slash commands (48 newly implemented, REPL + TUI parity via new
+`crates/joey-cli/src/slash_extra.rs` shared handlers):**
+
+- Session/state: /redraw /save (markdown export to ~/.joey/saves/) /retry
+  /prompt ($EDITOR; TUI leaves/re-enters the alternate screen via new
+  `Tui::enter_from_leave`) /undo (new `SessionDb::rewind_last_user_exchanges`
+  soft-archive + resubmit; engine ReloadHistory mirrors it into the live
+  agent) /title /branch (session fork) /snapshot (zip create/restore/prune of
+  config+.env; new `zip` workspace dep, deflate-only) /stop (kills
+  process-tool registry sessions) /background /journey (derives from .omo/
+  goals+boulder+notepads) /moa (3-proposal + synthesizer prompt through
+  delegate_task) /subgoal (new `GoalState.subgoals` + `parse_subgoal_command`
+  in joey-omo, additive serde) /whoami /profile /handoff (honest: no adapters).
+- Config-backed: /codex-runtime /personality (persona overlays) /statusbar
+  (TUI `App::show_status_bar` gates the bottom bar live) /footer /yolo
+  (JOEY_YOLO_MODE) /fast /skin /indicator /voice (honest: STT/TTS deferred)
+  /busy (display.busy_enter — the TUI busy-Enter path now honors
+  queue/steer/interrupt, upstream busy_input_mode).
+- Tools/skills/info: /memory (file + approval-gate state) /bundles /pet /hatch
+  /learn (agent drafts SKILL.md) /cron (full CRUD against joey-cron)
+  /suggestions /blueprint /curator /kanban /reload (load_joey_dotenv re-read)
+  /reload-mcp (config re-read + listing) /reload-skills /plugins
+  /subscription /topup (BYOK honesty) /insights (new
+  `SessionDb::usage_over_days` cross-session aggregation) /platforms /paste
+  (macOS osascript clipboard-PNG export) /image (new additive
+  `Agent::attach_image`/`pending_image_count`/`take_pending_images_into` —
+  next user turn carries multimodal content_parts; TUI routes through new
+  `EngineCommand::AttachImage`) /update /debug (local report, never uploads).
+
+**CLI subcommands:** `joey config check` (parse + secret-hygiene + type-shape
++ .env perms) and `config migrate` (documented renames, idempotent);
+`joey doctor --ack <id>` (marker files under ~/.joey/doctor/acks/);
+`joey cron edit` ($EDITOR on jobs.json with envelope validation, no-save on
+invalid) and `cron runs [job]` (per-job output/ retention listing);
+`joey mcp configure [name]` + `mcp catalog` (curated offline catalog; serve/
+picker/install/login/reauth explain exactly what they need);
+`joey skills inspect|enable|disable|config` (skills.disabled list);
+`joey tools post-setup` (toolset→tool resolution summary); `joey tools
+enable|disable <server>:<tool>` writes mcp_servers.<s>.tools.include/exclude.
+
+**Deliberate honesty preserved**: commands whose upstream backends don't exist
+here (voice STT/TTS, marketplace, Nous-account billing, platform adapters,
+petdex media generation, kanban coordination) do their maximal local behavior
+and state precisely what's deferred — no fabricated success.
+
+## Terminal concurrency governor (feature 018, 2026-08-24)
+
+**Status**: Deliberate deviation — Joey extension (no upstream Hermes
+counterpart; upstream has no multi-agent terminal cap).
+
+Caps concurrently running agent-initiated terminal processes and queues the
+rest: a global cap (`terminal.max_concurrent`, default `auto` =
+clamp(CPU cores, 4, 16); positive integer pins it; env
+`TERMINAL_MAX_CONCURRENT` overrides), per-agent round-robin admission so
+waiting agents take turns, admission-time timeouts (a request that cannot
+be admitted times out rather than running overtime), cancellation cleanup
+for queued/in-flight calls, and queue-state events surfaced as CLI/TUI
+indicators while requests are waiting. Upstream's terminal executor has no
+equivalent subsystem, so this is Joey-original additive surface; spec and
+tracking live in `specs/018-please-fully-implement/`.

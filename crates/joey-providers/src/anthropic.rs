@@ -22,7 +22,9 @@ use crate::types::{FinishReason, NormalizedResponse, ToolCall, ToolSchema, Usage
 
 /// Manual thinking budgets by effort (anthropic_adapter.py:58). Unknown
 /// efforts fall back to 8000 (`THINKING_BUDGET.get(effort, 8000)`).
-fn thinking_budget(effort: &str) -> u64 {
+/// pub(crate): reused by the copilot-wire claude chat thinking mapping
+/// (chat.rs `apply_reasoning_shape`) so both wires share one budget table.
+pub(crate) fn thinking_budget(effort: &str) -> u64 {
     match effort {
         "xhigh" => 32000,
         "high" => 16000,
@@ -779,17 +781,28 @@ fn convert_user_message(content: &Value) -> Value {
         let converted = convert_content_to_anthropic(content);
         let blocks = converted.as_array().cloned().unwrap_or_default();
         // Upstream check verbatim: empty list, or every *text* block blank
-        // (vacuously true when there are no text blocks), → placeholder.
-        let all_text_blank = blocks
-            .iter()
-            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-            .all(|b| {
-                b.get("text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .is_empty()
-            });
+        // → placeholder. Vacuous truth when there are NO text blocks is the
+        // upstream bug: an images-only message (vision input) was replaced
+        // by "(empty message)", silently dropping the images. Guard: only
+        // apply the placeholder when there are no non-text payload blocks
+        // (image/document/tool_result) either.
+        let has_payload_block = blocks.iter().any(|b| {
+            matches!(
+                b.get("type").and_then(|t| t.as_str()),
+                Some("image") | Some("document") | Some("tool_result")
+            )
+        });
+        let all_text_blank = !has_payload_block
+            && blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .all(|b| {
+                    b.get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                });
         let final_blocks = if blocks.is_empty() || all_text_blank {
             vec![json!({"type": "text", "text": "(empty message)"})]
         } else {

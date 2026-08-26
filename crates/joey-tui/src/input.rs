@@ -45,6 +45,15 @@ impl Input {
         self.cursor_col = 0;
     }
 
+    /// Replace the entire contents with `text` (single- or multi-line) and
+    /// place the cursor at the end. Used by history recall and slash-popup
+    /// command acceptance.
+    pub fn set_text(&mut self, text: &str) {
+        self.clear();
+        self.insert_str(text);
+        // insert_str already advanced the cursor through every character.
+    }
+
     pub fn is_empty(&self) -> bool {
         self.lines.len() == 1 && self.lines[0].is_empty()
     }

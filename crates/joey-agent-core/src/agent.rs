@@ -26,13 +26,30 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use rayon::prelude::*;
 
 use crate::compression::{self, ContextCompressor};
 use crate::events::AgentEvent;
 use crate::prompt::{build_system_prompt, PromptInputs};
 
+/// Mid-turn steer markers (upstream prompt_builder.py STEER_MARKER_OPEN/
+/// CLOSE). The wrapper attributes the text to the real user so the model
+/// treats it as a genuine instruction, not tool output / injection.
+pub const STEER_MARKER_OPEN: &str = "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered mid-turn; not tool output]";
+pub const STEER_MARKER_CLOSE: &str = "[/OUT-OF-BAND USER MESSAGE]";
+
+/// Wrap a mid-turn steer for appending to a tool result.
+pub fn format_steer_marker(steer_text: &str) -> String {
+    format!("\n\n{STEER_MARKER_OPEN}\n{steer_text}\n{STEER_MARKER_CLOSE}")
+}
+
 /// Retry-After cap: 600s (conversation_loop.py:4309-4317, #26293).
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(600);
+
+/// Per-tool timeout for parallel (read-only) tool dispatch. A hung
+/// read-only tool (e.g. web_extract against a black-holed host) must not
+/// block the turn indefinitely.
+const PARALLEL_TOOL_TIMEOUT_SECS: u64 = 300;
 
 /// Read-only tools with no shared mutable session state — safe to run
 /// concurrently within a batch (tool_dispatch_helpers.py `_PARALLEL_SAFE_TOOLS`,
@@ -97,6 +114,10 @@ pub struct AgentConfig {
     /// Include the `Session ID:` line in the system prompt (upstream
     /// `pass_session_id`, default off; `--pass-session-id`).
     pub pass_session_id: bool,
+    /// The model was chosen EXPLICITLY by the user (`--model` flag, `/model`
+    /// switch, agent picker). When true, dynamic model routing (NeuroCode
+    /// tier Mode 2) must NOT rewrite it — the user's choice always wins.
+    pub model_pinned: bool,
 }
 
 impl AgentConfig {
@@ -120,6 +141,7 @@ impl AgentConfig {
             max_tokens: None,
             stream: cfg.get_bool("display.streaming", false),
             pass_session_id: false,
+            model_pinned: false,
         }
     }
 }
@@ -172,6 +194,36 @@ fn parse_fallback_chain(cfg: &Config) -> Vec<FallbackEntry> {
         .collect()
 }
 
+/// Family prefix of a model id — the vendor/model-family segment that must
+/// match between a requested model and the echoed one ("gpt", "claude",
+/// "gemini", "glm", …). Version digits are ignored: gpt-5.4 vs gpt-5.6 is
+/// legitimate proxy behavior (same family), but glm-5.2 answered by
+/// claude-sonnet-5 is a silent substitution.
+fn model_family(id: &str) -> &str {
+    let bare = id.trim().split_once('/').map_or(id.trim(), |(_, tail)| tail);
+    bare.split(['-', '.'])
+        .next()
+        .filter(|s| !s.is_empty() && s.chars().next().is_some_and(char::is_alphabetic))
+        .unwrap_or("unknown")
+}
+
+/// True when the served model belongs to a DIFFERENT family than the one
+/// requested — the signature of a proxy silently substituting its default
+/// model. Same-family echoes (including version remaps like gpt-5.4→5.6)
+/// are normal and do not trip this.
+fn model_family_mismatch(requested: &str, echoed: &str) -> bool {
+    let r = model_family(requested);
+    let s = model_family(echoed);
+    // OpenAI reasoning-series aliases (o1/o3/o4) are gpt-family answers.
+    if matches!(r, "o1" | "o3" | "o4") && s == "gpt" {
+        return false;
+    }
+    if matches!(s, "o1" | "o3" | "o4") && r == "gpt" {
+        return false;
+    }
+    r != s
+}
+
 /// Provider abstraction so the loop can be driven by a scripted mock in tests.
 #[async_trait]
 pub trait Transport: Send + Sync {
@@ -203,6 +255,11 @@ pub struct TurnResult {
     pub usage: Usage,
     pub iterations: usize,
     pub interrupted: bool,
+    /// True when the turn ended in a FATAL provider error (auth exhausted,
+    /// unrecoverable overflow, etc.) as opposed to a clean finish or a user
+    /// interrupt. Delegation consumers use this to report child failure
+    /// instead of mistaking an empty fatal turn for success.
+    pub fatal: bool,
 }
 
 /// How a provider call block ended without a response.
@@ -243,6 +300,14 @@ pub struct Agent {
     synthetic_indices: std::collections::HashSet<usize>,
     /// Cooperative interrupt flag (upstream `_interrupt_requested`).
     interrupt: Arc<AtomicBool>,
+    /// Pending mid-turn /steer text (upstream `_pending_steer`): stashed by
+    /// the host, drained after the current tool batch and appended to the
+    /// last tool result wrapped in the out-of-band user-message marker.
+    /// Multiple steers concatenate with newlines; interrupts drop it.
+    /// Arc-shared so hosts can steer from another task while the turn
+    /// future holds the mutable agent borrow (steer is thread-safe by
+    /// design — upstream guards it with a lock for exactly this reason).
+    pending_steer: std::sync::Arc<std::sync::Mutex<String>>,
     fallback_chain: Vec<FallbackEntry>,
     fallback_index: usize,
     /// Consecutive turns whose tool calls were ALL invalid (3-strike abort).
@@ -291,6 +356,26 @@ pub struct Agent {
     /// of using `config.model` verbatim. When None or inactive, behavior is
     /// byte-identical to pre-feature-011 (Constitution VII).
     pub(crate) model_allocator: Option<Arc<dyn joey_llm_selector::ModelAllocator>>,
+    /// Optional NeuroCode engine (feature 015). When set and active, the main
+    /// turn's model id is resolved per-tier by the engine's classifier + the
+    /// configured tier model, and a dependency-aware context graph is assembled
+    /// and prepended to the request. When None or inactive, behavior is
+    /// byte-identical to pre-feature-015 (Constitution VII, FR-020).
+    pub(crate) neurocode_engine: Option<Arc<dyn joey_neurocode::NeuroCodeEngine>>,
+    /// One-shot NeuroCode context prepend for the current request (FR-007).
+    /// Set by the turn-loop intercept, consumed by build_request.
+    pub(crate) neurocode_context: std::sync::Mutex<Option<String>>,
+    /// The user text the current NeuroCode context was assembled for — the
+    /// per-turn dedupe key for `apply_neurocode_intercept` (retries and
+    /// tool-loop iterations reuse the stash instead of re-assembling, which
+    /// would also re-bump anti-pattern hit counts). Cleared at run_turn
+    /// start so every user turn re-assembles.
+    pub(crate) neurocode_assembled_for: std::sync::Mutex<Option<String>>,
+    /// Pending image attachments for the NEXT user turn (`/image`, `/paste`).
+    /// Data-URL strings (data:image/png;base64,...) merged into the user
+    /// message's `content_parts` by `run_turn`, then cleared. Additive:
+    /// None/empty → behavior identical to before.
+    pending_images: std::sync::Mutex<Vec<String>>,
 }
 
 impl Agent {
@@ -371,6 +456,7 @@ impl Agent {
             session_id: None,
             synthetic_indices: std::collections::HashSet::new(),
             interrupt: Arc::new(AtomicBool::new(false)),
+            pending_steer: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             fallback_chain,
             fallback_index: 0,
             invalid_tool_strikes: 0,
@@ -390,7 +476,85 @@ impl Agent {
             loop_detector: crate::loop_detection::LoopDetector::new(),
             hooks: None,
             model_allocator: None,
+            neurocode_engine: None,
+            neurocode_context: std::sync::Mutex::new(None),
+            neurocode_assembled_for: std::sync::Mutex::new(None),
+            pending_images: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Queue an image attachment for the NEXT user turn (`/image <path>`,
+    /// `/paste`). Accepts a data URL (`data:image/...;base64,...`) directly,
+    /// or an https/file reference passed through verbatim. Consumed and
+    /// cleared by the next `run_turn`.
+    pub fn attach_image(&self, data_url: impl Into<String>) {
+        let url = data_url.into();
+        if url.is_empty() {
+            return;
+        }
+        self.pending_images
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(url);
+    }
+
+    /// Number of images queued for the next turn (for UI feedback).
+    pub fn pending_image_count(&self) -> usize {
+        self.pending_images
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
+    /// Drain queued images, folding them into the user message about to be
+    /// pushed (multimodal `content_parts`). Private to run_turn.
+    fn take_pending_images_into(&self, user_input: &str) -> Message {
+        let images = {
+            let mut guard = self.pending_images.lock().unwrap_or_else(|p| p.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        if images.is_empty() {
+            return Message::user(user_input);
+        }
+        let mut parts = vec![joey_providers::types::ContentPart::Text {
+            text: user_input.to_string(),
+        }];
+        for url in images {
+            parts.push(joey_providers::types::ContentPart::ImageUrl {
+                image_url: joey_providers::types::ImageUrl { url },
+            });
+        }
+        Message {
+            role: "user".to_string(),
+            content: Some(user_input.to_string()),
+            content_parts: Some(parts),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+            reasoning_details: None,
+            anthropic_content_blocks: None,
+            compressed_summary: false,
+            synthetic: false,
+        }
+    }
+
+    /// Set the NeuroCode engine (feature 015). When set and active, the main
+    /// turn calls engine.classify() + engine.assemble_context() before model
+    /// dispatch. When None or inactive, behavior is byte-identical to
+    /// pre-feature-015 (Constitution VII, FR-020).
+    pub fn set_neurocode_engine(&mut self, engine: Arc<dyn joey_neurocode::NeuroCodeEngine>) {
+        self.neurocode_engine = Some(engine);
+    }
+
+    /// Set OR CLEAR the NeuroCode engine (`/model` switch path): a None
+    /// clears the override so tier routing stops applying when NeuroCode
+    /// is disabled in config at switch time.
+    pub fn set_neurocode_engine_opt(
+        &mut self,
+        engine: Option<Arc<dyn joey_neurocode::NeuroCodeEngine>>,
+    ) {
+        self.neurocode_engine = engine;
     }
 
     /// Set the dynamic LLM model allocator (feature 011). When set, the main
@@ -508,6 +672,107 @@ impl Agent {
         self.interrupt.clone()
     }
 
+    /// Inject a user message into the next tool result WITHOUT interrupting
+    /// (upstream `steer`, run_agent.py:2853-2886). The text is stashed; the
+    /// turn loop appends it to the last tool result (wrapped in the
+    /// out-of-band marker) after the current tool batch / before the next
+    /// API call. Multiple steers concatenate with newlines. Empty text is
+    /// ignored (returns false).
+    pub fn steer(&self, text: &str) -> bool {
+        let cleaned = text.trim();
+        if cleaned.is_empty() {
+            return false;
+        }
+        let mut slot = self.pending_steer.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_empty() {
+            *slot = cleaned.to_string();
+        } else {
+            slot.push('\n');
+            slot.push_str(cleaned);
+        }
+        true
+    }
+
+    /// A shareable handle for hosts to call [`Agent::steer`] from another
+    /// task while a turn is running (the turn holds the agent borrow).
+    pub fn steer_handle(&self) -> std::sync::Arc<std::sync::Mutex<String>> {
+        self.pending_steer.clone()
+    }
+
+    /// Steer via a handle produced by [`Agent::steer_handle`] (same
+    /// semantics as [`Agent::steer`]).
+    pub fn steer_via_handle(handle: &std::sync::Arc<std::sync::Mutex<String>>, text: &str) -> bool {
+        let cleaned = text.trim();
+        if cleaned.is_empty() {
+            return false;
+        }
+        let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_empty() {
+            *slot = cleaned.to_string();
+        } else {
+            slot.push('\n');
+            slot.push_str(cleaned);
+        }
+        true
+    }
+
+    /// Drain and return the pending steer text (empty string when none).
+    /// Called by the turn loop at the injection points.
+    fn drain_pending_steer(&self) -> String {
+        let mut slot = self.pending_steer.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut *slot)
+    }
+
+    /// Drain any pending steer and append it (wrapped in the out-of-band
+    /// marker) to the LAST tool-role message in history. When no tool
+    /// message exists yet (first iteration), the text is re-stashed —
+    /// injecting into a user message would break role alternation
+    /// (upstream apply_pending_steer_to_tool_results + pre-API drain).
+    fn apply_pending_steer_to_last_tool_result(&mut self) {
+        let text = self.drain_pending_steer();
+        if text.is_empty() {
+            return;
+        }
+        // Find the last tool-role message.
+        let target = self.history.iter().rposition(|m| m.role == "tool");
+        match target {
+            Some(idx) => {
+                let marker = format_steer_marker(&text);
+                if let Some(m) = self.history.get_mut(idx) {
+                    let appended = match &m.content {
+                        Some(c) => format!("{c}{marker}"),
+                        None => marker,
+                    };
+                    m.content = Some(appended);
+                }
+                tracing::debug!(
+                    target: "joey_agent",
+                    "steer injected into tool result at index {idx}"
+                );
+            }
+            None => {
+                // No tool message to piggyback on — keep it pending for the
+                // post-tool-batch injection point.
+                self.restore_pending_steer(&text);
+            }
+        }
+    }
+
+    /// Put text back into the steer slot (injection point found no tool
+    /// message to piggyback on — upstream re-stashes for the next chance).
+    fn restore_pending_steer(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut slot = self.pending_steer.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_empty() {
+            *slot = text.to_string();
+        } else {
+            slot.push('\n');
+            slot.push_str(text);
+        }
+    }
+
     fn interrupted(&self) -> bool {
         self.interrupt.load(Ordering::SeqCst)
     }
@@ -539,6 +804,17 @@ impl Agent {
                 combined.push_str(extra);
             }
         }
+        // Feature 015 (NeuroCode): prepend the assembled dependency-aware
+        // context graph when the engine is active. Only present when
+        // neurocode_engine.is_active() — byte-identical when off (FR-020).
+        if let Ok(ctx_guard) = self.neurocode_context.lock() {
+            if let Some(nc_ctx) = ctx_guard.as_ref() {
+                if !nc_ctx.is_empty() {
+                    combined.push_str("\n\n");
+                    combined.push_str(nc_ctx);
+                }
+            }
+        }
         combined
     }
 
@@ -551,6 +827,47 @@ impl Agent {
     /// Reset the loop detector (call on new user turn).
     pub fn reset_loop_detector(&mut self) {
         self.loop_detector.reset();
+    }
+
+    /// Feature 015 follow-up (dynamic context): run the automatic
+    /// re-index when the engine's edit tracker has crossed the
+    /// "large edits" threshold. Called at turn end (every exit path of
+    /// `run_turn`) BEFORE the final `Done` event so the re-index notice
+    /// lands inside the turn's event stream.
+    ///
+    /// The rebuild itself is blocking I/O (walks the project tree), so it
+    /// runs on the blocking pool via `spawn_blocking`; on failure the
+    /// previous index stays in place (additive degradation — the next
+    /// turn's assembly still works, with its staleness note intact).
+    async fn neurocode_auto_reindex(&self, tx: &mpsc::UnboundedSender<AgentEvent>) {
+        let Some(engine) = &self.neurocode_engine else {
+            return;
+        };
+        if !engine.is_active() || !engine.should_reindex() {
+            return;
+        }
+        let progress = engine.auto_index_progress().unwrap_or_default();
+        let engine = Arc::clone(engine);
+        let result = tokio::task::spawn_blocking(move || engine.reindex_now()).await;
+        match result {
+            Ok(Some(stats)) => {
+                tracing::info!(
+                    target: "neurocode",
+                    files_scanned = stats.files_scanned,
+                    artifacts = stats.artifacts_seen,
+                    "auto re-index completed after large edits"
+                );
+                let _ = tx.send(AgentEvent::NeuroCodeReindexed {
+                    files_scanned: stats.files_scanned,
+                    files_edited: progress.files,
+                    lines_edited: progress.lines,
+                });
+            }
+            Ok(None) => {} // engine doesn't support re-indexing
+            Err(e) => {
+                tracing::warn!(target: "neurocode", "auto re-index task failed: {}", e);
+            }
+        }
     }
 
     /// Set (or clear with `None`) the extra-instructions overlay appended to
@@ -628,11 +945,84 @@ impl Agent {
         self.history.push(msg);
     }
 
+    /// Build the display projection of one history message for a
+    /// [`AgentEvent::ContextSnapshot`].
+    fn context_entry(msg: &Message) -> crate::events::ContextEntry {
+        let text = msg.text_content();
+        let first_line = text.lines().next().unwrap_or("").trim();
+        // Collapse runs of whitespace in the preview and bound it.
+        let collapsed: String = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview: String = collapsed.chars().take(80).collect();
+        // Expandable-stats feature: carry the full content. Assistant
+        // tool-request messages carry their calls rendered as indented JSON
+        // (their text content is empty, so there'd be nothing to expand
+        // otherwise).
+        let full_content = if !text.is_empty() {
+            text.clone()
+        } else if !msg.tool_calls.is_empty() {
+            msg.tool_calls
+                .iter()
+                .map(|tc| {
+                    format!(
+                        "{}({}):\n{}",
+                        tc.function.name,
+                        tc.id,
+                        serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                            .ok()
+                            .and_then(|v| joey_core::utils::pretty_json_for_display(
+                                &v.to_string()
+                            ))
+                            .unwrap_or_else(|| tc.function.arguments.clone())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        } else {
+            String::new()
+        };
+        crate::events::ContextEntry {
+            role: msg.role.clone(),
+            tokens: joey_core::utils::estimate_tokens(&text) as u64,
+            preview,
+            has_tool_calls: !msg.tool_calls.is_empty(),
+            is_compressed_summary: msg.compressed_summary,
+            full_content,
+        }
+    }
+
+    /// Emit a live [`AgentEvent::ContextSnapshot`] — the realtime
+    /// context-window view for agent-stats UIs. Called at turn start and
+    /// after every history mutation the turn loop makes; additive and
+    /// purely observational (never touches the request path).
+    fn emit_context_snapshot(&self, tx: &mpsc::UnboundedSender<AgentEvent>) {
+        let entries: Vec<crate::events::ContextEntry> =
+            self.history.iter().map(Self::context_entry).collect();
+        let history_tokens = entries.iter().map(|e| e.tokens).sum();
+        let _ = tx.send(AgentEvent::ContextSnapshot {
+            entries,
+            system_tokens: joey_core::utils::estimate_tokens(&self.system_prompt) as u64,
+            history_tokens,
+            context_window: self.compressor.context_length.max(0) as u64,
+            compression_threshold: self.compressor.threshold_tokens.max(0) as u64,
+            compactions: self.compressor.compression_count,
+            model: self.config.model.clone(),
+        });
+    }
+
     /// Append WITHOUT persistence (ephemeral recovery scaffolding —
     /// run_agent.py `_is_ephemeral_scaffolding` rows never reach the DB).
     fn push_synthetic(&mut self, msg: Message) {
         self.synthetic_indices.insert(self.history.len());
         self.history.push(msg);
+    }
+
+    /// Adopt a compacted transcript as the live history, invalidating the
+    /// synthetic-index map. After compaction the old indices alias arbitrary
+    /// positions in the shorter history, so `drop_trailing_synthetic_scaffolding`
+    /// could otherwise pop REAL messages it mistakes for synthetic scaffolding.
+    pub(crate) fn adopt_compressed_history(&mut self, compressed: Vec<Message>) {
+        self.synthetic_indices.clear();
+        self.history = compressed;
     }
 
     /// Drop trailing scaffolding (and the tool/assistant pair it orphaned)
@@ -799,6 +1189,10 @@ impl Agent {
         }
         let client = build_client(provider, base_url, model, api_key.clone())?;
         let old_model = std::mem::replace(&mut self.config.model, model.to_string());
+        // An explicit runtime switch pins the model — dynamic routing
+        // (NeuroCode tier Mode 2) must not silently rewrite the user's
+        // choice on the next turn.
+        self.config.model_pinned = true;
         let old_provider =
             std::mem::replace(&mut self.provider_name, client.profile().name.to_string());
         self.config.provider = provider.to_string();
@@ -834,9 +1228,69 @@ impl Agent {
         &self.config.model
     }
 
+    /// Replace the enabled-tool list on the LIVE agent (runtime mode
+    /// switches, e.g. HyperCode orchestrator mode toggling between
+    /// delegate_task-only and the full surface). Takes effect on the next
+    /// request — `tool_schemas()` filters through this list, and dispatch
+    /// resolves against the registry the same way. Model/provider identity,
+    /// history, and the session store are untouched.
+    ///
+    /// NOTE: this alone does NOT refresh the baked system prompt — its
+    /// tool-guidance section still lists the pre-toggle tools. Call
+    /// [`Agent::rebuild_system_prompt`] afterwards when the mode switch
+    /// should also be reflected in the prompt (the orchestrator toggle does).
+    pub fn set_enabled_tools(&mut self, tools: Vec<String>) {
+        self.config.enabled_tools = tools;
+    }
+
+    /// The live enabled-tool list.
+    pub fn enabled_tools(&self) -> &[String] {
+        &self.config.enabled_tools
+    }
+
+    /// Recompute the baked system prompt from the CURRENT
+    /// `config.enabled_tools`, using the exact construction path as
+    /// `Agent::new` (valid_tool_names → build_system_prompt). One-shot
+    /// maintenance for mid-session mode switches (e.g. the /hypercode
+    /// orchestrator toggle): after `set_enabled_tools`, the previously baked
+    /// prompt's tool-guidance section still describes the OLD tool surface,
+    /// contradicting the reduced schemas and any overlay — this makes the
+    /// prompt self-consistent again.
+    ///
+    /// This is NOT a per-turn rebuild: the prompt stays session-stable
+    /// between explicit calls, preserving provider prompt-prefix caches
+    /// except at toggle time (which already invalidates them via the
+    /// overlay/`set_extra_instructions`). The caller is expected to have
+    /// called `set_enabled_tools` first — this reads whatever is current.
+    /// Honors `pass_session_id`/`session_id` exactly like the init-time
+    /// build. History and the session store are untouched.
+    pub fn rebuild_system_prompt(&mut self) {
+        let valid_tools =
+            valid_tool_names(&self.registry, &self.config.enabled_tools, &self.ctx);
+        self.system_prompt = build_system_prompt(&PromptInputs {
+            ctx: &self.ctx,
+            model: &self.config.model,
+            provider: &self.provider_name,
+            enabled_tools: &valid_tools,
+            pass_session_id: self.config.pass_session_id,
+            session_id: self.session_id.as_deref(),
+        });
+    }
+
     /// The active provider (canonical profile name).
     pub fn provider_name(&self) -> &str {
         &self.provider_name
+    }
+
+    /// The model id the next main turn would dispatch with: NeuroCode
+    /// tier-routed, allocator-resolved (feature 011), or image-routed when
+    /// those are active and the model is not pinned; falls back to
+    /// `config.model`. Read-only exposure of `resolve_main_turn_model` for
+    /// callers outside the turn loop (e.g. HyperCode parent-model
+    /// inheritance in joey-cli). Resolution is a pure lookup — no state
+    /// mutation, no provider calls.
+    pub fn effective_main_turn_model(&self) -> String {
+        self.resolve_main_turn_model(false)
     }
 
     /// Point the cached prompt's `Model:`/`Provider:` lines at the active
@@ -867,15 +1321,29 @@ impl Agent {
             .filter_map(|d| serde_json::from_value::<ToolSchema>(d).ok())
             .collect()
     }
-
-    fn build_request(&self, tools: &[ToolSchema]) -> ProviderRequest {
+    fn build_request(&self, tools: &[ToolSchema], tx: Option<&mpsc::UnboundedSender<AgentEvent>>) -> ProviderRequest {
         // A one-shot output-cap override from the overflow handler wins
         // (upstream `_ephemeral_max_output_tokens`).
         let max_tokens = self.ephemeral_max_output_tokens.or(self.config.max_tokens);
+
+        // Feature 015 (NeuroCode): when the engine is wired and active,
+        // classify the request's complexity, assemble dependency-aware context,
+        // and prepend it. When None or inactive, byte-identical (FR-020).
+        self.apply_neurocode_intercept(tx);
+
         // Feature 011: when a dynamic model allocator is wired and active,
         // resolve the main-turn model per-module. When None or inactive,
         // `config.model` is used verbatim (byte-identical to pre-feature-011).
         let model = self.resolve_main_turn_model(!tools.is_empty());
+        // Request-model observability: one INFO line per provider call.
+        // Tier/allocator/image routing all funnel through here, so this is
+        // the single point where the RESOLVED model (vs config.model) is
+        // greppable. Kept cheap: two field captures, no formatting.
+        tracing::info!(
+            provider = %self.provider_name,
+            model = %model,
+            "provider request model resolved"
+        );
         ProviderRequest::new(model, self.history.clone())
             .with_system(Some(self.effective_system_prompt()))
             .with_tools(tools.to_vec())
@@ -884,9 +1352,135 @@ impl Agent {
             .streaming(self.config.stream)
     }
 
+    /// NeuroCode intercept (feature 015, FR-020). Before model dispatch, if
+    /// the engine is wired and active, classify the request, assemble context,
+    /// and stash the context string for prepending. No-op when None/inactive
+    /// (byte-identical to pre-feature-015 — Constitution VII).
+    ///
+    /// Idempotent per user turn: retries and tool-loop iterations within the
+    /// same turn reuse the already-assembled context instead of re-running
+    /// graph assembly (and re-bumping anti-pattern hit counts) on every API
+    /// call. A new user message resets the dedupe key via `run_turn`.
+    fn apply_neurocode_intercept(&self, tx: Option<&mpsc::UnboundedSender<AgentEvent>>) {
+        let Some(engine) = &self.neurocode_engine else {
+            if let Ok(mut ctx) = self.neurocode_context.lock() {
+                *ctx = None;
+            }
+            if let Ok(mut key) = self.neurocode_assembled_for.lock() {
+                *key = None;
+            }
+            return;
+        };
+        if !engine.is_active() {
+            if let Ok(mut ctx) = self.neurocode_context.lock() {
+                *ctx = None;
+            }
+            if let Ok(mut key) = self.neurocode_assembled_for.lock() {
+                *key = None;
+            }
+            return;
+        }
+        // Build a CodingRequest from the latest user message.
+        let last_user_text = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let last_user_text = match last_user_text {
+            Some(t) if !t.is_empty() => t,
+            _ => return,
+        };
+        // Same user text as the assembly we already stashed (retry or
+        // tool-loop iteration) — keep the stash, skip the work.
+        if let Ok(key) = self.neurocode_assembled_for.lock() {
+            if key.as_deref() == Some(last_user_text.as_str()) {
+                return;
+            }
+        }
+        // Discovery hints from the request text: identifiers seed the
+        // assembler's target lookup and the classifier's scope-fanout
+        // signal; file mentions become the active file.
+        let hints =
+            joey_neurocode::context::discovery::extract_hints(&last_user_text);
+        let request = joey_neurocode::CodingRequest {
+            text: last_user_text.clone(),
+            active_file: hints.file_paths.first().cloned(),
+            active_symbols: hints.identifiers,
+            project_root: self.ctx.cwd().to_path_buf(),
+            token_budget_hint: 0,
+        };
+        let route = engine.classify(&request);
+        // Tier transparency (FR-002/SC-002): the developer greps the log to see
+        // which tier served a request and why.
+        tracing::info!(
+            target: "neurocode",
+            tier = %route.tier,
+            overridden = route.overridden,
+            reasoning = %route.reasoning,
+            "neurocode routed request"
+        );
+        let mut assembled = if let Some(tx) = tx {
+            // Streaming path (feature 015 follow-up): emit one
+            // NeuroCodeProgress event per assembly stage so the TUI context
+            // feed updates in realtime as the graph is located, expanded,
+            // and formatted — not just once at the end.
+            engine.assemble_context_with_progress(&request, route.tier, &|stage| {
+                let _ = tx.send(AgentEvent::NeuroCodeProgress {
+                    stage: stage.to_string(),
+                });
+            })
+        } else {
+            engine.assemble_context(&request, route.tier)
+        };
+        if let Ok(mut key) = self.neurocode_assembled_for.lock() {
+            *key = Some(last_user_text);
+        }
+        if !assembled.formatted_context.is_empty() {
+            tracing::debug!(
+                target: "neurocode",
+                expanded_nodes = assembled.expanded_nodes.len(),
+                token_estimate = assembled.token_estimate,
+                cold_mode = assembled.cold_mode,
+                "neurocode context assembled"
+            );
+            if let Ok(mut ctx) = self.neurocode_context.lock() {
+                *ctx = Some(assembled.formatted_context.clone());
+            }
+            // Live feed (feature 015 follow-up): surface exactly what NeuroCode
+            // is feeding the model so UIs can render it (TUI context panel).
+            if let Some(tx) = tx {
+                let _ = tx.send(AgentEvent::NeuroCodeContext {
+                    tier: format!("{:?}", route.tier),
+                    token_estimate: assembled.token_estimate,
+                    expanded_nodes: assembled.expanded_nodes.len(),
+                    cold_mode: assembled.cold_mode,
+                    formatted_context: assembled.formatted_context,
+                });
+                // Interactive visualization payload: the structured graph
+                // snapshot for the fullscreen explorer. Only when the
+                // assembler actually produced one (populated graph).
+                if let Some(snapshot) = assembled.snapshot.take() {
+                    let _ = tx.send(AgentEvent::NeuroCodeGraph { snapshot });
+                }
+            }
+        }
+    }
+
+    /// Config access for image-model routing (feature 016). Loads the
+    /// layered config lazily; returns (provider_id, config). None when the
+    /// config subsystem is unavailable (routing degrades to primary model).
+    fn provider_config_for_image_routing(&self) -> Option<(String, joey_core::config::Config)> {
+        let cfg = joey_core::config::Config::load().ok()?;
+        Some((self.provider_name.clone(), cfg))
+    }
+
     /// Resolve the model id for the main turn. When the dynamic allocator is
     /// wired and active (feature 011), it picks the model; otherwise the
     /// configured model is used verbatim (Constitution VII non-regression).
+    /// Feature 015 (NeuroCode): when the engine is active and classified a tier,
+    /// and 011 is not active, the tier model is resolved from config (Mode 2).
     fn resolve_main_turn_model(&self, needs_tools: bool) -> String {
         if let Some(allocator) = &self.model_allocator {
             if allocator.is_active() {
@@ -906,7 +1500,108 @@ impl Agent {
                     needs_tools,
                     0, // token_budget_hint: 0 = no hard gate from the call site
                 );
-                return alloc.model_id;
+                // A copilot-wire client cannot serve vendor families the
+                // Copilot backend never carries (glm-, deepseek-, …): the
+                // proxy would silently substitute its default model. Fall
+                // back to the configured model instead.
+                if !alloc.model_id.is_empty()
+                    && joey_providers::profile::is_copilot_wire(&self.provider_name)
+                    && !joey_providers::profile::copilot_servable(&alloc.model_id)
+                {
+                    tracing::warn!(
+                        allocated = %alloc.model_id,
+                        "allocator model not servable by the copilot-wire provider; keeping configured model"
+                    );
+                } else {
+                    return alloc.model_id;
+                }
+            }
+        }
+        // Feature 015 (NeuroCode Mode 2): when 011 is not active but NeuroCode
+        // is, resolve the tier model from config. Falls back to config.model
+        // when the tier model is unconfigured or NeuroCode is off. An
+        // EXPLICITLY chosen model (model_pinned: --model flag, /model switch,
+        // agent picker) always wins — tier routing only applies to implicit/
+        // config-default models.
+        // Feature 016 (FR-016): when the turn carries image content and a
+        // dedicated image model is configured, serve the turn with it.
+        // Resolution order per contracts/image-model-routing.md; when no
+        // keys are set and the primary is vision-capable this is a no-op
+        // (primary_if_vision → same model id, byte-identical request).
+        // An explicitly pinned model (--model) always wins — image-model
+        // routing only applies to unpinned turns.
+        if !self.config.model_pinned {
+            let turn_has_images = self.history.iter().any(|m| {
+                m.content_parts
+                    .as_ref()
+                    .map(|parts| {
+                        parts.iter().any(|p| {
+                            matches!(p, joey_providers::types::ContentPart::ImageUrl { .. })
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            if turn_has_images {
+                if let Some((provider_id, cfg)) = self.provider_config_for_image_routing() {
+                    // Catalog default (step 3): joey-llm-selector's vision
+                    // capability data for the active provider, when a default
+                    // multimodal model is configured in the catalog module.
+                    let catalog_default = None::<&str>; // catalog exposes capability, not a default pick; selection via keys (T068)
+                    match crate::image_model::resolve_image_model(
+                        &cfg,
+                        &provider_id,
+                        &self.config.model,
+                        catalog_default,
+                        Some(joey_llm_selector::candidate::supports_vision_by_id(
+                            &self.config.model,
+                        )),
+                    ) {
+                        crate::image_model::ImageModelResolution::Available(r) => {
+                            if r.model_id != self.config.model {
+                                tracing::debug!(
+                                    image_model = %r.model_id,
+                                    source = r.source.as_str(),
+                                    "routing image turn to dedicated image model (served_by)"
+                                );
+                                return r.model_id;
+                            }
+                        }
+                        crate::image_model::ImageModelResolution::Unavailable(reason) => {
+                            tracing::warn!("{reason}");
+                        }
+                    }
+                }
+            }
+        }
+        if !self.config.model_pinned {
+            if let Some(engine) = &self.neurocode_engine {
+                if engine.is_active() {
+                    // The context was already assembled by apply_neurocode_intercept.
+                    // Mode 2: NeuroCode resolves the tier model from its own config.
+                    if let Some(model_id) = engine.resolve_tier_model() {
+                        // Servability guard, scoped to the REAL GitHub Copilot
+                        // backend only (canonical provider id "copilot"): it
+                        // cannot serve vendor families it never carries (glm-,
+                        // deepseek-, …) and would silently substitute its
+                        // default model. The ai-usage-hud reverse proxy serves
+                        // the full model catalog behind its own routing, so it
+                        // gets parity with every non-copilot provider (z.ai,
+                        // openrouter, …): the tier-resolved model is returned
+                        // as-is. is_copilot_wire is deliberately NOT consulted
+                        // here — it sweeps the HUD proxy back into the guard,
+                        // which silently downgraded frontier tiers to
+                        // config.model (regression observed 2026-08-21).
+                        if self.provider_name != "copilot"
+                            || joey_providers::profile::copilot_servable(&model_id)
+                        {
+                            return model_id;
+                        }
+                        tracing::warn!(
+                            tier_model = %model_id,
+                            "NeuroCode tier model not servable by the copilot-wire provider; keeping configured model"
+                        );
+                    }
+                }
             }
         }
         self.config.model.clone()
@@ -989,12 +1684,32 @@ impl Agent {
         let mut retry_count: usize = 0;
         loop {
             let req = if with_tools {
-                self.build_request(tools)
+                self.build_request(tools, Some(tx))
             } else {
-                self.build_request(&[])
+                self.build_request(&[], Some(tx))
             };
             match self.transport_call(&req, tx).await {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    // Silent-substitution guard: some proxies (notably the
+                    // ai-usage-hud Copilot reverse proxy's mapModel fallback)
+                    // replace an unservable requested model with their default
+                    // and still return 200. Surface that loudly instead of
+                    // letting a different model answer unnoticed.
+                    if let Some(echoed) = resp.model.as_deref() {
+                        if model_family_mismatch(&req.model, echoed) {
+                            tracing::warn!(
+                                requested = %req.model,
+                                served = %echoed,
+                                "provider served a different model family than requested"
+                            );
+                            let _ = tx.send(AgentEvent::Notice(format!(
+                                "⚠️ Provider served {} when {} was requested — the configured endpoint may not carry that model.",
+                                echoed, req.model
+                            )));
+                        }
+                    }
+                    return Ok(resp);
+                }
                 Err(e) => {
                     retry_count += 1;
                     // Interrupt beats any retry decision
@@ -1394,6 +2109,25 @@ impl Agent {
         }
         // Per-turn resets.
         self.interrupt.store(false, Ordering::SeqCst);
+        // A one-shot output-cap override from a PREVIOUS turn (set while
+        // parsing an overflow error, only cleared on success) must not leak
+        // into this turn: an aborted turn (Fatal/Interrupted) would otherwise
+        // pin every later request to max_tokens=1-style caps. Clear it here;
+        // the overflow handler re-arms it within THIS turn when needed.
+        self.ephemeral_max_output_tokens = None;
+        // New user turn → the NeuroCode intercept's dedupe key is stale;
+        // clear it so THIS turn's request assembles fresh context (even if
+        // the user repeats the same text verbatim).
+        if let Ok(mut key) = self.neurocode_assembled_for.lock() {
+            *key = None;
+        }
+        // A turn interrupted by a NEW USER MESSAGE drops pending steers —
+        // they were meant for the interrupted turn's tool loop, which will
+        // no longer happen (run_agent.py:2845-2851).
+        {
+            let mut slot = self.pending_steer.lock().unwrap_or_else(|p| p.into_inner());
+            slot.clear();
+        }
         self.ctx.state().memory_consolidation_failures = 0;
         self.invalid_tool_strikes = 0;
         self.loop_detector.reset();
@@ -1463,7 +2197,10 @@ impl Agent {
             self.push_message(Message::user(notice), None);
         }
 
-        self.push_message(Message::user(user_input), None);
+        self.push_message(self.take_pending_images_into(user_input), None);
+
+        // Live context view: baseline snapshot with the user turn appended.
+        self.emit_context_snapshot(&tx);
 
         let tools = self.tool_schemas();
         let mut total_usage = Usage::default();
@@ -1482,13 +2219,22 @@ impl Agent {
         while api_calls < self.config.max_turns {
             if self.interrupted() {
                 self.close_interrupted_tool_sequence("");
+                self.neurocode_auto_reindex(&tx).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: final_text.clone(),
                     usage: total_usage.clone(),
                     iterations: api_calls,
                 });
-                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true };
+                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false };
             }
+
+            // ── Pre-API /steer drain (conversation_loop.py:933-975) ────────
+            // A steer that arrived while the previous API call was streaming
+            // is injected now — before the next request — so the model sees
+            // it on THIS iteration. Without this, a steer sent during an API
+            // call would only land after the NEXT tool batch, which may
+            // never come if the model returns a final response.
+            self.apply_pending_steer_to_last_tool_result();
 
             // ── Pre-API pressure check (conversation_loop.py:1110-1185): a
             // single turn can grow by many large tool results and leave no
@@ -1536,6 +2282,8 @@ impl Agent {
                 )));
                 self.compress_context(Some(request_pressure_tokens), None, false, Some(&tx))
                     .await;
+                // Live context view: pre-API compaction shrank the history.
+                self.emit_context_snapshot(&tx);
                 // Reset retry/empty-response state so the compacted request
                 // gets a fresh chance (conversation_loop.py:1162-1169), and
                 // don't charge an iteration for the compaction pass.
@@ -1563,20 +2311,22 @@ impl Agent {
                 Err(TurnAbort::Interrupted(text)) => {
                     self.drop_trailing_synthetic_scaffolding();
                     self.close_interrupted_tool_sequence(&text);
+                    self.neurocode_auto_reindex(&tx).await;
                     let _ = tx.send(AgentEvent::Done {
                         final_text: text.clone(),
                         usage: total_usage.clone(),
                     iterations: api_calls,
                     });
-                    return TurnResult { final_text: text, usage: total_usage, iterations: api_calls, interrupted: true };
+                    return TurnResult { final_text: text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false };
                 }
                 Err(TurnAbort::Fatal(err)) => {
                     self.drop_trailing_synthetic_scaffolding();
                     // Keep the session resumable: append an assistant error
                     // message (conversation_loop.py:5775-5778).
                     self.push_message(Message::assistant(err.clone()), None);
+                    self.neurocode_auto_reindex(&tx).await;
                     let _ = tx.send(AgentEvent::Failed(err));
-                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false };
+                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: true };
                 }
             };
             accumulate_usage(&mut total_usage, &self.usage_or_estimate(&resp));
@@ -1673,6 +2423,7 @@ impl Agent {
                             usage: total_usage,
                             iterations: api_calls,
                             interrupted: false,
+                            fatal: true,
                         };
                     }
                     // Error-result every call so the model can self-correct
@@ -1730,14 +2481,25 @@ impl Agent {
                 // Successful tool round: re-arm the post-tool empty nudge
                 // (conversation_loop.py:4995).
                 post_tool_empty_retried = false;
+                // Live context view: tool results are now in the history.
+                self.emit_context_snapshot(&tx);
+                if !batch_interrupted {
+                    // ── /steer injection (upstream apply_pending_steer_
+                    // to_tool_results): append pending steer text to the
+                    // LAST tool result so the model sees the user's mid-turn
+                    // message on the next iteration. Role alternation is
+                    // preserved — only existing tool content is modified.
+                    self.apply_pending_steer_to_last_tool_result();
+                }
                 if batch_interrupted {
                     self.close_interrupted_tool_sequence("");
+                    self.neurocode_auto_reindex(&tx).await;
                     let _ = tx.send(AgentEvent::Done {
                         final_text: final_text.clone(),
                         usage: total_usage.clone(),
                     iterations: api_calls,
                     });
-                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true };
+                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false };
                 }
 
                 // ── Post-tool-round compression check (conversation_loop.py:
@@ -1760,6 +2522,8 @@ impl Agent {
                     let _ = tx.send(AgentEvent::Notice("  ⟳ compacting context…".to_string()));
                     let approx = self.compressor.last_prompt_tokens;
                     self.compress_context(Some(approx), None, false, Some(&tx)).await;
+                    // Live context view: the history just shrank — refresh.
+                    self.emit_context_snapshot(&tx);
                 }
                 continue;
             }
@@ -1790,12 +2554,13 @@ impl Agent {
                 let _ = tx.send(AgentEvent::Notice(
                     "Response remained truncated after 4 continuation attempts".to_string(),
                 ));
+                self.neurocode_auto_reindex(&tx).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: partial.clone(),
                     usage: total_usage.clone(),
                     iterations: api_calls,
                 });
-                return TurnResult { final_text: partial, usage: total_usage, iterations: api_calls, interrupted: false };
+                return TurnResult { final_text: partial, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false };
             }
 
             let content = resp.content.clone();
@@ -1854,12 +2619,13 @@ impl Agent {
                     "❌ Model returned no content after all retries".to_string(),
                 ));
                 final_text = "(empty)".to_string();
+                self.neurocode_auto_reindex(&tx).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: final_text.clone(),
                     usage: total_usage.clone(),
                     iterations: api_calls,
                 });
-                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false };
+                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false };
             }
 
             // Final response.
@@ -1867,12 +2633,15 @@ impl Agent {
             self.push_message(assistant_msg, Some(finish_str));
             final_text = visible.trim().to_string();
             let _ = tx.send(AgentEvent::AssistantMessage(final_text.clone()));
+            // Live context view: the final assistant message is in history.
+            self.emit_context_snapshot(&tx);
+            self.neurocode_auto_reindex(&tx).await;
             let _ = tx.send(AgentEvent::Done {
                 final_text: final_text.clone(),
                 usage: total_usage.clone(),
                     iterations: api_calls,
             });
-            return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false };
+            return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false };
         }
 
         // ── Iteration budget exhausted: one summary call with tools
@@ -1905,6 +2674,7 @@ impl Agent {
         } else {
             self.push_message(Message::assistant(summary.clone()), Some("stop"));
         }
+        self.neurocode_auto_reindex(&tx).await;
         let _ = tx.send(AgentEvent::AssistantMessage(summary.clone()));
         let _ = tx.send(AgentEvent::Done {
             final_text: summary.clone(),
@@ -1916,6 +2686,7 @@ impl Agent {
             usage: total_usage,
             iterations: api_calls,
             interrupted: false,
+            fatal: false,
         }
     }
 
@@ -1984,9 +2755,16 @@ impl Agent {
         // ── PreToolUse hooks (crush-style) ───────────────────────────────
         // Run hooks for each tool call before execution. Halt stops the turn;
         // Deny returns an error result to the model for that call.
+        // Input rewrites are keyed BY CALL ID: storing only the last hook's
+        // patch and shallow-merging it into every non-denied call
+        // cross-contaminated arguments (a `path` rewrite meant for
+        // write_file landed on a terminal call in the same batch).
+        let hooks_updated_inputs: std::sync::Mutex<
+            std::collections::HashMap<String, Value>,
+        > = std::sync::Mutex::new(std::collections::HashMap::new());
+        let mut denied_calls: Vec<(usize, String)> = Vec::new();
         if let Some(ref hooks) = self.hooks {
             if !hooks.is_empty() {
-                let mut denied_calls: Vec<(usize, String)> = Vec::new();
                 for (idx, tc) in tool_calls.iter().enumerate() {
                     let args: Value = serde_json::from_str(&tc.function.arguments)
                         .unwrap_or(Value::Null);
@@ -2026,6 +2804,11 @@ impl Agent {
                             agg.reasons.join("; ")
                         };
                         denied_calls.push((idx, reason));
+                    } else if agg.updated_input.is_some() {
+                        hooks_updated_inputs
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(tc.id.clone(), agg.updated_input.clone().unwrap_or(Value::Null));
                     }
                 }
                 // Emit error results for denied calls.
@@ -2043,22 +2826,53 @@ impl Agent {
                         None,
                     );
                 }
-                if !denied_calls.is_empty() {
-                    // If all calls were denied, return false (not interrupted).
-                    // The model will see the error results and adjust.
-                    if denied_calls.len() == tool_calls.len() {
-                        return false;
-                    }
-                    // Otherwise, filter out denied calls and continue with the rest.
-                    // We can't mutate the slice, so we handle this below by
-                    // skipping denied indices during execution.
-                }
-                let _ = &denied_calls; // suppress unused warning if empty
             }
         }
 
-        let segments = plan_tool_segments(tool_calls);
-        let total = tool_calls.len();
+        // Filter hook-denied calls out of the executed batch (their error
+        // results were already pushed above) and apply input rewrites.
+        let denied_ids: std::collections::HashSet<&str> = denied_calls
+            .iter()
+            .map(|(idx, _)| tool_calls[*idx].id.as_str())
+            .collect();
+        let rewritten: Vec<ToolCall> = if let Some(ref hooks) = self.hooks {
+            if !hooks.is_empty() {
+                let patches = hooks_updated_inputs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                tool_calls
+                    .iter()
+                    .filter(|tc| !denied_ids.contains(tc.id.as_str()))
+                    .map(|tc| {
+                        let mut tc = tc.clone();
+                        if let Some(patch) = patches.get(&tc.id) {
+                            if let Some(obj) = patch.as_object() {
+                                let mut args: Value =
+                                    serde_json::from_str(&tc.function.arguments)
+                                        .unwrap_or_else(|_| serde_json::json!({}));
+                                if let Some(args_obj) = args.as_object_mut() {
+                                    for (k, v) in obj {
+                                        args_obj.insert(k.clone(), v.clone());
+                                    }
+                                    tc.function.arguments = args.to_string();
+                                }
+                            }
+                        }
+                        tc
+                    })
+                    .collect()
+            } else {
+                tool_calls.to_vec()
+            }
+        } else {
+            tool_calls.to_vec()
+        };
+        if rewritten.is_empty() {
+            return false;
+        }
+
+        let segments = plan_tool_segments(&rewritten);
+        let total = rewritten.len();
         let mut executed = 0usize;
 
         for (parallel, calls) in segments {
@@ -2085,25 +2899,60 @@ impl Agent {
                         registry.dispatch_call(&name, args, &ctx, &id).await
                     }));
                 }
+                // Collect all results first (join in call order), then run
+                // the CPU-bound post-processing for the WHOLE batch through
+                // rayon in one fan-out: untrusted wrapping, previews, and
+                // exit-code extraction are independent per result. Event
+                // emission + history pushes stay sequential after, so the
+                // stream ordering is byte-identical to the sequential path.
+                let mut results = Vec::with_capacity(calls.len());
                 for (idx, (tc, handle)) in calls.iter().zip(handles).enumerate() {
-                    let (content, is_error) = match handle.await {
-                        Ok(result) => (result.to_content_string(), result.is_error()),
-                        Err(e) => (
+                    // Per-tool timeout (F6): a hung read-only tool must not
+                    // block the turn indefinitely. The detached task is
+                    // abandoned on timeout — read-only tools hold no
+                    // exclusive resources beyond their ctx clone.
+                    let bounded = tokio::time::timeout(
+                        std::time::Duration::from_secs(PARALLEL_TOOL_TIMEOUT_SECS),
+                        handle,
+                    )
+                    .await;
+                    let (content, is_error) = match bounded {
+                        Ok(Ok(result)) => (result.to_content_string(), result.is_error()),
+                        Ok(Err(e)) => (
                             format!("Error executing tool '{}': {}", tc.function.name, e),
                             true,
                         ),
+                        Err(_) => (
+                            format!(
+                                "Tool '{}' timed out after {}s (parallel read-only dispatch)",
+                                tc.function.name, PARALLEL_TOOL_TIMEOUT_SECS
+                            ),
+                            true,
+                        ),
                     };
-                    let duration = start_times[idx].elapsed().as_secs_f64();
-                    let wrapped = maybe_wrap_untrusted(&tc.function.name, &content);
-                    let preview = preview_result(&content);
+                    results.push((content, is_error, start_times[idx].elapsed().as_secs_f64()));
+                }
+                let processed: Vec<(String, String, Option<i64>)> = results
+                    .par_iter()
+                    .zip(&calls)
+                    .map(|((content, _, _), tc)| {
+                        let wrapped = maybe_wrap_untrusted(&tc.function.name, content);
+                        let preview = preview_result(content);
+                        let exit = extract_exit_code(&tc.function.name, content);
+                        (wrapped, preview, exit)
+                    })
+                    .collect();
+                for (((content, is_error, duration), tc), (wrapped, preview, exit)) in
+                    results.iter().zip(&calls).zip(processed)
+                {
                     // Feature 005 (T011): emit FileChange events before ToolEnd.
-                    emit_pending_file_changes(tx, &tc.function.name, &content);
+                    emit_pending_file_changes(tx, &tc.function.name, content, self.neurocode_engine.as_ref());
                     let _ = tx.send(AgentEvent::ToolEnd {
                         name: tc.function.name.clone(),
-                        is_error,
+                        is_error: *is_error,
                         result_preview: preview,
-                        duration_secs: duration,
-                        exit_code: extract_exit_code(&tc.function.name, &content),
+                        duration_secs: *duration,
+                        exit_code: exit,
                         full_result: content.clone(),
                     });
                     self.push_message(
@@ -2131,7 +2980,7 @@ impl Agent {
                     let content_raw = result.to_content_string();
                     let preview = preview_result(&content_raw);
                     // Feature 005 (T011): emit FileChange events before ToolEnd.
-                    emit_pending_file_changes(tx, &tc.function.name, &content_raw);
+                    emit_pending_file_changes(tx, &tc.function.name, &content_raw, self.neurocode_engine.as_ref());
                     let _ = tx.send(AgentEvent::ToolEnd {
                         name: tc.function.name.clone(),
                         is_error,
@@ -2156,12 +3005,12 @@ impl Agent {
                         let _ = tx.send(AgentEvent::Notice(
                             "🔁 Loop detected — injecting nudge to change approach".into()
                         ));
-                        // Inject the nudge as a user-role tool result so the
-                        // model sees it on the next iteration.
+                        // Inject the nudge as a user-role message. It must NOT
+                        // be a tool result: its tool_call_id would be declared
+                        // by no assistant message, which strict providers
+                        // reject with a 400.
                         self.push_message(
-                            Message::tool_result(
-                                format!("{}_loop_nudge", tc.id),
-                                "loop_detection",
+                            Message::user(
                                 crate::loop_detection::LoopDetector::nudge_message().to_string(),
                             ),
                             None,
@@ -2170,7 +3019,7 @@ impl Agent {
 
                     // Interrupt between sequential calls: skip the rest
                     if self.interrupted() && executed < total {
-                        let remaining: Vec<&ToolCall> = tool_calls[executed..].iter().collect();
+                        let remaining: Vec<&ToolCall> = rewritten[executed..].iter().collect();
                         let _ = tx.send(AgentEvent::Notice(format!(
                             "⚡ Interrupt: skipping {} remaining tool call(s)",
                             remaining.len()
@@ -2193,7 +3042,7 @@ impl Agent {
                             .sleep_with_interrupt(Duration::from_secs_f64(self.config.tool_delay))
                             .await
                     {
-                            let remaining: Vec<&ToolCall> = tool_calls[executed..].iter().collect();
+                            let remaining: Vec<&ToolCall> = rewritten[executed..].iter().collect();
                             for skipped in remaining {
                                 let content = format!(
                                     "[Tool execution skipped — {} was not started. User sent a new message]",
@@ -2212,14 +3061,15 @@ impl Agent {
         false
     }
 
-    /// Build a per-tool-call [`ToolContext`] clone with a progress channel
-    /// and the cooperative-interrupt flag wired in. Creates a
-    /// `mpsc::unbounded_channel`, spawns a forwarding task that maps incoming
-    /// `String` progress → `AgentEvent::ToolProgress`, attaches the sender to
-    /// the context clone, and shares the agent's Ctrl-C `AtomicBool` so
-    /// streaming tools (e.g. `terminal`) can cancel mid-run. Tools that don't
-    /// use either are unaffected — the channel never receives anything and
-    /// the flag is simply never polled.
+    /// Build a per-tool-call [`ToolContext`] clone with progress + raw-output
+    /// channels and the cooperative-interrupt flag wired in. Creates one
+    /// `mpsc::unbounded_channel` per surface and spawns forwarding tasks that
+    /// map incoming `String`s to `AgentEvent::ToolProgress` (status/heartbeat
+    /// deltas) and `AgentEvent::ToolOutput` (live raw output chunks), attaches
+    /// the senders to the context clone, and shares the agent's Ctrl-C
+    /// `AtomicBool` so streaming tools (e.g. `terminal`) can cancel mid-run.
+    /// Tools that don't use any of these are unaffected — the channels never
+    /// receive anything and the flag is simply never polled.
     fn ctx_for_tool(
         &self,
         tool_name: &str,
@@ -2227,18 +3077,68 @@ impl Agent {
     ) -> ToolContext {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
         let name = tool_name.to_string();
+        let progress_tx_agent = tx.clone();
         tokio::spawn(async move {
             while let Some(delta) = progress_rx.recv().await {
-                let _ = tx.send(AgentEvent::ToolProgress {
+                let _ = progress_tx_agent.send(AgentEvent::ToolProgress {
                     name: name.clone(),
                     progress: delta,
                 });
             }
         });
+        // Terminal-governor queue-state forwarding (spec 018, T017/US3):
+        // symmetric third channel. The terminal tool pushes `(active,
+        // queued)` snapshots on governor admission/release transitions
+        // (producer-side throttled to the 50ms coalescing budget, SC-005);
+        // this task maps them to `AgentEvent::TerminalQueueState` — a
+        // session-global snapshot, so unlike ToolProgress/ToolOutput it
+        // carries no tool name. Channel and forwarding task exist for
+        // every tool call; tools that never emit queue state simply never
+        // send (the task parks on recv and exits when the sender drops).
+        // Declared BEFORE the output task below, which moves `tx`.
+        let (queue_tx, mut queue_rx) = mpsc::unbounded_channel::<(usize, usize)>();
+        let queue_tx_agent = tx.clone();
+        tokio::spawn(async move {
+            while let Some((active, queued)) = queue_rx.recv().await {
+                let _ = queue_tx_agent.send(AgentEvent::TerminalQueueState { active, queued });
+            }
+        });
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel::<String>();
+        let out_name = tool_name.to_string();
+        tokio::spawn(async move {
+            while let Some(chunk) = output_rx.recv().await {
+                let _ = tx.send(AgentEvent::ToolOutput {
+                    name: out_name.clone(),
+                    chunk,
+                });
+            }
+        });
+        // Terminal-governor fairness key (spec 018, US2/T013): stable per
+        // agent lifetime and distinct between agents. The ToolContext's
+        // session id IS that identity — the CLI session id for the main
+        // agent (repl.rs), a fresh `subagent-<uuid>` for orchestration
+        // children (subagent.rs `child_context`), and `cron-<job.id>` for
+        // background cron runs (cron_cmd.rs). It is fixed at context
+        // construction and shared by every clone, so every tool call from
+        // one agent maps to the same governor queue for round-robin
+        // admission. An empty id leaves `queue_key` unset — the governor
+        // then resolves its shared default key (no fallback duplicated
+        // here).
+        let queue_key: Option<std::sync::Arc<str>> = {
+            let sid = self.ctx.session_id();
+            if sid.is_empty() {
+                None
+            } else {
+                Some(std::sync::Arc::from(sid))
+            }
+        };
         self.ctx
             .clone()
             .with_progress_sender(Some(progress_tx))
+            .with_output_sender(Some(output_tx))
+            .with_queue_state_sender(Some(queue_tx))
             .with_interrupt_flag(Some(self.interrupt.clone()))
+            .with_queue_key(queue_key)
     }
 }
 
@@ -2623,10 +3523,16 @@ fn extract_exit_code(tool_name: &str, content: &str) -> Option<i64> {
 /// drain entirely for them (avoids a needless lock acquire + disk read).
 /// `content_raw` is checked for embedded unified-diff text (FR-005) and, if
 /// found, emits a `Detected`-source `FileChange`.
+///
+/// Feature 015 follow-up (dynamic context): when a NeuroCode engine is
+/// wired, each observed edit also feeds the engine's auto-index tracker
+/// (via `neurocode_engine`), so large-edit thresholds accumulate across
+/// the turn. Pure bookkeeping — no I/O on this path.
 fn emit_pending_file_changes(
     tx: &tokio::sync::mpsc::UnboundedSender<AgentEvent>,
     tool_name: &str,
     content_raw: &str,
+    neurocode_engine: Option<&Arc<dyn joey_neurocode::NeuroCodeEngine>>,
 ) {
     use joey_tools::file_tracker::{FileTracker, PendingDiffKind};
 
@@ -2645,6 +3551,15 @@ fn emit_pending_file_changes(
             } else {
                 crate::events::FileChangeSource::FileTool
             };
+            // Feed the NeuroCode auto-index tracker (best-effort; the
+            // engine records path + added/removed line counts).
+            if let Some(engine) = neurocode_engine {
+                engine.record_file_edit(
+                    &d.path,
+                    d.diff.added,
+                    d.diff.removed,
+                );
+            }
             let _ = tx.send(AgentEvent::FileChange {
                 path: d.path.clone(),
                 kind,
@@ -2774,6 +3689,16 @@ mod tests {
         }
     }
 
+    /// A response that ECHOES a model id — as real providers do on the wire.
+    fn text_resp_model(text: &str, model: &str) -> NormalizedResponse {
+        NormalizedResponse {
+            content: text.to_string(),
+            finish_reason: FinishReason::Stop,
+            model: Some(model.to_string()),
+            ..NormalizedResponse::empty()
+        }
+    }
+
     fn tool_resp(calls: Vec<ToolCall>, finish: FinishReason) -> NormalizedResponse {
         NormalizedResponse {
             tool_calls: calls,
@@ -2855,6 +3780,29 @@ mod tests {
         }
     }
 
+    /// A tool that streams RAW OUTPUT chunks (the terminal live-view path).
+    struct StreamingOutputTool;
+    #[async_trait]
+    impl Tool for StreamingOutputTool {
+        fn name(&self) -> &str {
+            "streamout"
+        }
+        fn toolset(&self) -> &str {
+            "test"
+        }
+        fn description(&self) -> &str {
+            "emits raw output chunks"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: Value, ctx: &ToolContext) -> ToolResult {
+            ctx.emit_output("chunk-a\n");
+            ctx.emit_output("chunk-b\n");
+            ToolResult::Text("ok".to_string())
+        }
+    }
+
     struct Fixture {
         agent: Agent,
         transport: Arc<ScriptedTransport>,
@@ -2893,11 +3841,103 @@ mod tests {
             max_tokens: None,
             stream: false,
             pass_session_id: false,
+            model_pinned: false,
         };
         let mut agent = Agent::new(config, registry, ctx).expect("agent");
         let transport = ScriptedTransport::new(script);
         agent.set_transport_for_tests(transport.clone());
         Fixture { agent, transport, _home: home, _cwd: cwd, _guard: guard }
+    }
+
+    // ── set_enabled_tools + rebuild_system_prompt (orchestrator toggle) ──
+
+    /// A tool NAMED `memory` (prompt guidance gates on the name, not the
+    /// implementation) — exercises the MEMORY_GUIDANCE block.
+    struct NamedTool(&'static str);
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn toolset(&self) -> &str {
+            "test"
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::Text("ok".to_string())
+        }
+    }
+
+    fn toggle_fixture_agent(
+        enabled: Vec<&str>,
+    ) -> (Agent, tempfile::TempDir, tempfile::TempDir, joey_core::constants::HomeOverrideGuard)
+    {
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf(), Config::defaults(), "test-session");
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(NamedTool("memory")));
+        registry.register(Arc::new(NamedTool("session_search")));
+        let config = AgentConfig {
+            model: "test-model".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: None,
+            max_turns: 5,
+            api_max_retries: 1,
+            tool_delay: 0.0,
+            reasoning: None,
+            enabled_tools: enabled.into_iter().map(|s| s.to_string()).collect(),
+            max_tokens: None,
+            stream: false,
+            pass_session_id: false,
+            model_pinned: false,
+        };
+        let agent = Agent::new(config, registry, ctx).expect("agent");
+        (agent, home, cwd, guard)
+    }
+
+    /// Regression (orchestrator toggle): after `set_enabled_tools` +
+    /// `rebuild_system_prompt`, the effective system prompt's tool guidance
+    /// reflects ONLY the enabled tools — the stale baked section (e.g.
+    /// MEMORY_GUIDANCE when `memory` was dropped) must not survive the
+    /// rebuild, while guidance for still-enabled tools and generic
+    /// tool guidance remain.
+    #[test]
+    fn rebuild_system_prompt_reflects_current_enabled_tools() {
+        let (mut agent, _home, _cwd, _guard) = toggle_fixture_agent(vec!["memory", "session_search"]);
+
+        // Baked at init with the full surface: both guidance blocks present.
+        assert!(agent.system_prompt().contains("persistent memory"));
+        assert!(agent.system_prompt().contains("session_search to recall"));
+
+        // Toggle to a reduced surface WITHOUT rebuilding: the baked prompt
+        // keeps the stale guidance (the bug rebuild_system_prompt fixes).
+        agent.set_enabled_tools(vec!["session_search".to_string()]);
+        assert!(agent.system_prompt().contains("persistent memory"));
+
+        // Rebuild: tool guidance now matches the enabled set exactly.
+        agent.rebuild_system_prompt();
+        let rebuilt = agent.effective_system_prompt();
+        assert!(
+            !rebuilt.contains("persistent memory"),
+            "stale MEMORY_GUIDANCE survived the rebuild"
+        );
+        assert!(rebuilt.contains("session_search to recall"));
+        // Generic tool guidance stays (tools are still loaded).
+        assert!(rebuilt.contains("working artifact backed by real tool output"));
+
+        // Toggle OFF restores the full surface in the prompt as well.
+        agent.set_enabled_tools(vec!["memory".to_string(), "session_search".to_string()]);
+        agent.rebuild_system_prompt();
+        assert!(agent.system_prompt().contains("persistent memory"));
+        assert!(agent.system_prompt().contains("session_search to recall"));
     }
 
     fn drain(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
@@ -2917,6 +3957,58 @@ mod tests {
     }
 
     // ── Loop tests ────────────────────────────────────────────────────
+
+    /// Silent model substitution (ai-usage-hud mapModel fallback): when the
+    /// provider answers with a model from a DIFFERENT family than requested,
+    /// the loop must surface a Notice instead of letting the swap pass
+    /// silently (observed live 2026-08-18: requested glm-5.2, served
+    /// claude-sonnet-5, HTTP 200).
+    #[tokio::test]
+    async fn model_family_substitution_surfaces_notice() {
+        let _l = lock();
+        let mut fx = fixture(
+            vec![Ok(text_resp_model("done", "claude-sonnet-5"))],
+            10,
+            3,
+            None,
+        );
+        fx.agent.config.model = "glm-5.2".to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        let events = drain(&mut rx);
+        let noticed = events.iter().any(|e| match e {
+            AgentEvent::Notice(msg) => {
+                msg.contains("served claude-sonnet-5") && msg.contains("glm-5.2 was requested")
+            }
+            _ => false,
+        });
+        assert!(noticed, "expected a substitution Notice, got: {events:?}");
+    }
+
+    /// Same-family echoes (version remaps like gpt-5.4 → gpt-5.6) are normal
+    /// proxy behavior and must NOT trip the notice.
+    #[tokio::test]
+    async fn same_family_echo_does_not_notice() {
+        let _l = lock();
+        let mut fx = fixture(
+            vec![Ok(text_resp_model("done", "gpt-5.6-luna"))],
+            10,
+            3,
+            None,
+        );
+        fx.agent.config.model = "gpt-5.4".to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(_) )),
+            "same-family echo must not notice: {events:?}"
+        );
+    }
 
     /// tool_calls execute REGARDLESS of finish_reason
     /// (conversation_loop.py:4707).
@@ -3016,6 +4108,196 @@ mod tests {
                 .any(|(n, p)| n == "progress" && p == "delta-2"),
             "expected ToolProgress(delta-2) forwarded, got {:?}",
             progress_events
+        );
+    }
+
+    /// Live context view: the turn loop emits `AgentEvent::ContextSnapshot`
+    /// at every history mutation — user message at turn start, tool results
+    /// mid-turn, and the final assistant message — so a UI can stream the
+    /// exact context window in realtime.
+    #[tokio::test]
+    async fn context_snapshots_stream_during_turn() {
+        let _l = lock();
+        let mut fx = fixture(
+            vec![
+                Ok(tool_resp(
+                    vec![ToolCall::new("call_1", "echo", r#"{"text": "hi"}"#)],
+                    FinishReason::ToolCalls,
+                )),
+                Ok(text_resp("done")),
+            ],
+            10,
+            3,
+            None,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("hello context", tx).await;
+        assert_eq!(result.final_text, "done");
+
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            events.extend(drain(&mut rx));
+            let done = events.iter().any(|e| matches!(e, AgentEvent::Done { .. }));
+            let snaps = events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::ContextSnapshot { .. }))
+                .count();
+            if done && snaps >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let snapshots: Vec<(usize, u64)> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ContextSnapshot { entries, history_tokens, .. } => {
+                    Some((entries.len(), *history_tokens))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(snapshots.len() >= 3, "expected >= 3 snapshots, got {}", snapshots.len());
+        // Snapshot 1: just the user message.
+        assert_eq!(snapshots[0].0, 1, "first snapshot has the user turn only");
+        assert!(snapshots[0].1 > 0, "history tokens estimated");
+        // Later snapshots include the tool exchange and grow.
+        let max_msgs = snapshots.iter().map(|(n, _)| *n).max().unwrap();
+        assert!(max_msgs >= 3, "tool exchange + final visible: {snapshots:?}");
+        // Entries carry roles and previews.
+        let last = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                AgentEvent::ContextSnapshot { entries, .. } => Some(entries.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(last.iter().any(|e| e.role == "user" && e.preview.contains("hello context")));
+        assert!(last.iter().any(|e| e.role == "tool"));
+        assert!(last.iter().any(|e| e.role == "assistant"));
+    }
+
+    /// Live terminal streaming: a tool's raw output chunks are forwarded to
+    /// the event stream as `AgentEvent::ToolOutput` (the channel wired in
+    /// `ctx_for_tool` via `with_output_sender`), distinct from ToolProgress.
+    #[tokio::test]
+    async fn tool_output_forwarded_as_agent_event() {
+        let _l = lock();
+        let mut fx = fixture(
+            vec![
+                Ok(tool_resp(
+                    vec![ToolCall::new("call_1", "streamout", "{}")],
+                    FinishReason::Stop,
+                )),
+                Ok(text_resp("done")),
+            ],
+            10,
+            3,
+            Some(Arc::new(StreamingOutputTool)),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        // The output→AgentEvent forwarder is a spawned task; accumulate
+        // until chunk-b lands (same flush pattern as the progress test).
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            async {
+                let mut all = Vec::new();
+                loop {
+                    all.extend(drain(&mut rx));
+                    if all.iter().any(|e| matches!(
+                        e,
+                        AgentEvent::ToolOutput { chunk, .. } if chunk == "chunk-b\n"
+                    )) {
+                        return all;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("output events did not flush in time");
+        let output_chunks: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolOutput { name, chunk } => Some((name.clone(), chunk.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(output_chunks, vec![
+            ("streamout".to_string(), "chunk-a\n".to_string()),
+            ("streamout".to_string(), "chunk-b\n".to_string()),
+        ], "expected both raw output chunks in order");
+        // And they are NOT echoed on the progress channel.
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::ToolProgress { progress, .. } if progress.contains("chunk"))),
+            "raw output must not leak into ToolProgress"
+        );
+    }
+
+    /// End-to-end with the REAL terminal tool (spawns a real bash process
+    /// through the production `stream_output` path): the tool's output must
+    /// arrive as `AgentEvent::ToolOutput` chunks DURING the call, before the
+    /// turn's ToolEnd/final text.
+    #[tokio::test]
+    async fn real_terminal_tool_streams_live_output_events() {
+        let _l = lock();
+        let real_terminal: std::sync::Arc<dyn Tool> = joey_tools::ToolRegistry::with_builtins()
+            .get("terminal")
+            .expect("terminal builtin registered");
+        let mut fx = fixture(
+            vec![
+                Ok(tool_resp(
+                    vec![ToolCall::new(
+                        "call_1",
+                        "terminal",
+                        r#"{"command": "echo live-marker-1; sleep 1; echo live-marker-2"}"#,
+                    )],
+                    FinishReason::Stop,
+                )),
+                Ok(text_resp("done")),
+            ],
+            10,
+            3,
+            Some(real_terminal),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        // Wait until the turn end event, then assert on ordering: at least
+        // one ToolOutput carrying live-marker-1 must precede ToolEnd.
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            events.extend(drain(&mut rx));
+            let done = events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Done { .. }));
+            let got_m2 = events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolOutput { chunk, .. } if chunk.contains("live-marker-2")
+            ));
+            if done && got_m2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let pos_first_output = events.iter().position(|e| matches!(
+            e,
+            AgentEvent::ToolOutput { chunk, .. } if chunk.contains("live-marker-1")
+        ));
+        let pos_tool_end = events.iter().position(|e| matches!(
+            e,
+            AgentEvent::ToolEnd { name, .. } if name == "terminal"
+        ));
+        assert!(pos_first_output.is_some(), "live-marker-1 streamed via ToolOutput");
+        assert!(pos_tool_end.is_some(), "terminal ToolEnd seen");
+        assert!(
+            pos_first_output.unwrap() < pos_tool_end.unwrap(),
+            "output streamed DURING the call, before ToolEnd"
         );
     }
 
@@ -3226,6 +4508,136 @@ mod tests {
             e,
             AgentEvent::Notice(n) if n.contains("nudging to continue")
         )));
+    }
+
+
+    // ── Audit 2026-08: hook-denial + loop-nudge regressions ───────────
+
+    /// A PreToolUse hook Deny on a subset of a batch must prevent execution
+    /// of the denied call; only the error result the hook produced may be
+    /// recorded. (The old code pushed the deny result and then executed the
+    /// tool anyway.)
+    #[tokio::test]
+    async fn hook_denied_tool_is_not_executed() {
+        let _l = lock();
+        let exec_flag = Arc::new(Mutex::new(false));
+        struct FlagTool(Arc<Mutex<bool>>);
+        #[async_trait]
+        impl Tool for FlagTool {
+            fn name(&self) -> &str { "flager" }
+            fn toolset(&self) -> &str { "test" }
+            fn description(&self) -> &str { "records execution" }
+            fn parameters(&self) -> Value {
+                json!({"type": "object", "properties": {}})
+            }
+            async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
+                *self.0.lock().unwrap() = true;
+                ToolResult::Text("ran".to_string())
+            }
+        }
+        let mut fx = fixture(
+            vec![
+                Ok(tool_resp(
+                    vec![
+                        ToolCall::new("c1", "flager", "{}"),
+                        ToolCall::new("c2", "echo", r#"{"text": "ok"}"#),
+                    ],
+                    FinishReason::ToolCalls,
+                )),
+                Ok(text_resp("done")),
+            ],
+            10,
+            3,
+            Some(Arc::new(FlagTool(exec_flag.clone()))),
+        );
+        let hooks = crate::hooks::PreToolUseRunner::new(
+            vec![crate::hooks::HookConfig {
+                name: "deny-flager".into(),
+                event: crate::hooks::EVENT_PRE_TOOL_USE.into(),
+                matcher: "flager".into(),
+                command: "exit 2".into(),
+                timeout_secs: None,
+            }],
+            "/tmp",
+        );
+        fx.agent.set_hooks(Some(hooks));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        assert!(
+            !*exec_flag.lock().unwrap(),
+            "denied tool must NOT execute"
+        );
+        // The deny error result IS recorded for the model.
+        let deny_row = fx
+            .agent
+            .history()
+            .iter()
+            .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("c1"))
+            .expect("deny result recorded");
+        assert!(deny_row
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("blocked by PreToolUse hook"));
+        let _ = drain(&mut rx);
+    }
+
+    /// The loop-detection nudge must be delivered as a user-role message
+    /// (or another valid position), NOT a tool result whose tool_call_id was
+    /// never declared by any assistant message — strict providers reject
+    /// unknown tool_call_ids with a 400.
+    #[tokio::test]
+    async fn loop_nudge_is_not_a_phantom_tool_result() {
+        let _l = lock();
+        let exec_count = Arc::new(Mutex::new(0u32));
+        struct CountTool(Arc<Mutex<u32>>);
+        #[async_trait]
+        impl Tool for CountTool {
+            fn name(&self) -> &str { "counter" }
+            fn toolset(&self) -> &str { "test" }
+            fn description(&self) -> &str { "counts" }
+            fn parameters(&self) -> Value {
+                json!({"type": "object", "properties": {}})
+            }
+            async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
+                let mut n = self.0.lock().unwrap();
+                *n += 1;
+                // Identical output every call so the loop signature repeats.
+                ToolResult::Text("same output".to_string())
+            }
+        }
+        // 7 identical tool-call responses, then a final text answer. With
+        // window=10/max=5 defaults, the 6th identical call trips the nudge.
+        let mut script = Vec::new();
+        for i in 0..7 {
+            script.push(Ok(tool_resp(
+                vec![ToolCall::new(format!("c{}", i), "counter", "{}")],
+                FinishReason::ToolCalls,
+            )));
+        }
+        script.push(Ok(text_resp("done")));
+        let mut fx = fixture(script, 20, 3, Some(Arc::new(CountTool(exec_count.clone()))));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        // Every tool message must reference a tool_call_id declared by some
+        // assistant message.
+        let declared: std::collections::HashSet<String> = fx
+            .agent
+            .history()
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().map(|tc| tc.id.clone()))
+            .collect();
+        for m in fx.agent.history().iter().filter(|m| m.role == "tool") {
+            let id = m.tool_call_id.clone().unwrap_or_default();
+            assert!(
+                declared.contains(&id),
+                "tool result with undeclared id {:?} (loop nudge phantom)",
+                id
+            );
+        }
+        let _ = drain(&mut rx);
     }
 
     /// Empty responses with no prior tool call retry 3x then fail honestly
@@ -3548,6 +4960,7 @@ mod tests {
             max_tokens: None,
             stream: false,
             pass_session_id: false,
+            model_pinned: false,
         };
         let mut agent = Agent::new(config, registry, ctx).expect("agent");
         let transport = CyclingTransport::new();
@@ -3724,5 +5137,753 @@ mod tests {
             history_len_before + 2,
             "history grew only by user+assistant — no synthetic messages injected"
         );
+    }
+
+    // ── Feature 015 (NeuroCode) regression tests (T067, FR-020/SC-008) ──
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Counting NeuroCode engine: counts classify()/assemble_context() calls
+    /// and reports a configurable active/inactive state (T067 test double).
+    struct CountingEngine {
+        active: bool,
+        classify_count: AtomicUsize,
+        assemble_count: AtomicUsize,
+    }
+
+    impl CountingEngine {
+        fn new(active: bool) -> Self {
+            Self {
+                active,
+                classify_count: AtomicUsize::new(0),
+                assemble_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl joey_neurocode::NeuroCodeEngine for CountingEngine {
+        fn classify(&self, _request: &joey_neurocode::CodingRequest) -> joey_neurocode::ComplexityRoute {
+            self.classify_count.fetch_add(1, AtomicOrdering::SeqCst);
+            joey_neurocode::ComplexityRoute {
+                tier: joey_neurocode::ComplexityTier::Economical,
+                reasoning: "counting-engine test route".to_string(),
+                overridden: false,
+                override_tier: None,
+                signals: Vec::new(),
+            }
+        }
+
+        fn assemble_context(
+            &self,
+            _request: &joey_neurocode::CodingRequest,
+            tier: joey_neurocode::ComplexityTier,
+        ) -> joey_neurocode::AssembledContext {
+            self.assemble_count.fetch_add(1, AtomicOrdering::SeqCst);
+            joey_neurocode::AssembledContext {
+                primary_nodes: Vec::new(),
+                expanded_nodes: Vec::new(),
+                formatted_context: if self.active {
+                    "## NeuroCode Test Context\n\ncounting-engine assembled context".to_string()
+                } else {
+                    String::new()
+                },
+                tier,
+                token_estimate: 64,
+                cold_mode: false,
+                notice: None,
+                snapshot: None,
+            }
+        }
+
+        fn is_active(&self) -> bool {
+            self.active
+        }
+    }
+
+    /// Auto-index tracking engine double (feature 015 follow-up: dynamic
+    /// context). Records edits into the real `AutoIndexState` so threshold
+    /// behavior is exercised through the genuine state machine, and counts
+    /// `reindex_now` invocations.
+    struct AutoIndexEngine {
+        edits: std::sync::Mutex<joey_neurocode::AutoIndexState>,
+        reindex_count: AtomicUsize,
+        last_reindex_stats: std::sync::Mutex<Option<joey_neurocode::parse::IngestionResult>>,
+    }
+
+    impl AutoIndexEngine {
+        fn new(config: &joey_neurocode::config::AutoIndexConfig) -> Self {
+            Self {
+                edits: std::sync::Mutex::new(joey_neurocode::AutoIndexState::new(config)),
+                reindex_count: AtomicUsize::new(0),
+                last_reindex_stats: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    impl joey_neurocode::NeuroCodeEngine for AutoIndexEngine {
+        fn classify(&self, _request: &joey_neurocode::CodingRequest) -> joey_neurocode::ComplexityRoute {
+            joey_neurocode::ComplexityRoute {
+                tier: joey_neurocode::ComplexityTier::Economical,
+                reasoning: "auto-index test".to_string(),
+                overridden: false,
+                override_tier: None,
+                signals: Vec::new(),
+            }
+        }
+
+        fn assemble_context(
+            &self,
+            _request: &joey_neurocode::CodingRequest,
+            tier: joey_neurocode::ComplexityTier,
+        ) -> joey_neurocode::AssembledContext {
+            joey_neurocode::AssembledContext {
+                formatted_context: "## auto-index ctx".to_string(),
+                tier,
+                ..Default::default()
+            }
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+
+        fn record_file_edit(&self, path: &str, added: usize, removed: usize) {
+            self.edits
+                .lock()
+                .unwrap()
+                .record_edit(path, added, removed);
+        }
+
+        fn should_reindex(&self) -> bool {
+            self.edits.lock().unwrap().should_reindex()
+        }
+
+        fn reindex_now(&self) -> Option<joey_neurocode::parse::IngestionResult> {
+            self.reindex_count.fetch_add(1, AtomicOrdering::SeqCst);
+            let stats = joey_neurocode::parse::IngestionResult {
+                files_scanned: 7,
+                artifacts_seen: 42,
+                edges_created: 60,
+                errors: Vec::new(),
+            };
+            self.edits.lock().unwrap().note_reindexed();
+            *self.last_reindex_stats.lock().unwrap() = Some(stats.clone());
+            Some(stats)
+        }
+
+        fn auto_index_progress(&self) -> Option<joey_neurocode::AutoIndexProgress> {
+            Some(self.edits.lock().unwrap().progress())
+        }
+    }
+
+    /// T067 / FR-020 / SC-008 case 1: with NO engine wired, the system prompt
+    /// is byte-identical before and after a full build_request path (run_turn),
+    /// and no NeuroCode context is ever stashed.
+    #[tokio::test]
+    async fn engine_absent_system_prompt_byte_identical() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        assert!(fx.agent.neurocode_engine.is_none(), "no engine wired by default");
+
+        let prompt_before = fx.agent.effective_system_prompt();
+        let base_before = fx.agent.system_prompt().to_string();
+
+        // Simulate the build_request path via the public turn surface.
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("refactor this", tx).await;
+
+        assert_eq!(
+            fx.agent.effective_system_prompt(),
+            prompt_before,
+            "effective system prompt must be byte-identical with no engine"
+        );
+        assert_eq!(
+            fx.agent.system_prompt(),
+            base_before,
+            "base system prompt must be byte-identical with no engine"
+        );
+        assert!(
+            fx.agent.neurocode_context.lock().unwrap().is_none(),
+            "no NeuroCode context may be stashed with no engine"
+        );
+    }
+
+    /// T067 / FR-020 / SC-008 case 2: an INSTALLED but INACTIVE engine is a
+    /// complete no-op — no classify, no assemble_context, no injected context,
+    /// system prompt bytes unchanged.
+    #[tokio::test]
+    async fn inactive_engine_is_noop() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        let prompt_before = fx.agent.effective_system_prompt();
+        let base_before = fx.agent.system_prompt().to_string();
+
+        let engine = Arc::new(CountingEngine::new(false));
+        fx.agent.set_neurocode_engine(engine.clone());
+
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("refactor this module", tx).await;
+
+        assert_eq!(engine.classify_count.load(AtomicOrdering::SeqCst), 0, "inactive engine must not classify");
+        assert_eq!(
+            engine.assemble_count.load(AtomicOrdering::SeqCst), 0,
+            "inactive engine must not assemble context"
+        );
+        assert!(
+            fx.agent.neurocode_context.lock().unwrap().is_none(),
+            "inactive engine must not stash context"
+        );
+        assert_eq!(
+            fx.agent.effective_system_prompt(),
+            prompt_before,
+            "inactive engine must leave the effective system prompt byte-identical"
+        );
+        assert_eq!(
+            fx.agent.system_prompt(),
+            base_before,
+            "inactive engine must never mutate the base system prompt"
+        );
+    }
+
+    /// T067 / FR-020 case 3: an ACTIVE engine intercepts exactly once —
+    /// classify + assemble each fire once, the context is stashed and appears
+    /// in effective_system_prompt(), while the byte-stable base system_prompt
+    /// field itself is NEVER mutated.
+    #[tokio::test]
+    async fn active_engine_intercepts() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        let base_before = fx.agent.system_prompt().to_string();
+        let prompt_before = fx.agent.effective_system_prompt();
+
+        let engine = Arc::new(CountingEngine::new(true));
+        fx.agent.set_neurocode_engine(engine.clone());
+
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("refactor this module", tx).await;
+
+        assert_eq!(engine.classify_count.load(AtomicOrdering::SeqCst), 1, "active engine classifies exactly once");
+        assert_eq!(
+            engine.assemble_count.load(AtomicOrdering::SeqCst), 1,
+            "active engine assembles context exactly once"
+        );
+        let ctx = fx
+            .agent
+            .neurocode_context
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            ctx,
+            Some("## NeuroCode Test Context\n\ncounting-engine assembled context".to_string()),
+            "active engine stashes the assembled context"
+        );
+        let effective = fx.agent.effective_system_prompt();
+        assert!(
+            effective.contains("## NeuroCode Test Context"),
+            "effective system prompt must contain the NeuroCode context"
+        );
+        assert_ne!(effective, prompt_before, "effective prompt gains the NeuroCode section");
+        assert_eq!(
+            fx.agent.system_prompt(),
+            base_before,
+            "the base system_prompt field must NEVER be mutated by the intercept"
+        );
+    }
+
+    /// Streaming engine double (feature 015 follow-up): implements
+    /// `assemble_context_with_progress` directly to verify the intercept
+    /// routes through it and forwards every stage as a live event.
+    struct StreamingEngine {
+        stages_emitted: Mutex<Vec<String>>,
+    }
+
+    impl StreamingEngine {
+        fn new() -> Self {
+            Self {
+                stages_emitted: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl joey_neurocode::NeuroCodeEngine for StreamingEngine {
+        fn classify(&self, _request: &joey_neurocode::CodingRequest) -> joey_neurocode::ComplexityRoute {
+            joey_neurocode::ComplexityRoute {
+                tier: joey_neurocode::ComplexityTier::Frontier,
+                reasoning: "streaming test".to_string(),
+                overridden: false,
+                override_tier: None,
+                signals: Vec::new(),
+            }
+        }
+
+        fn assemble_context(
+            &self,
+            _request: &joey_neurocode::CodingRequest,
+            tier: joey_neurocode::ComplexityTier,
+        ) -> joey_neurocode::AssembledContext {
+            // Feature 015 follow-up (interactive viz): carry a small
+            // snapshot so the emission path can be verified end-to-end.
+            let mut snapshot = joey_neurocode::ContextGraphSnapshot::default();
+            snapshot.tier = format!("{:?}", tier);
+            snapshot.nodes.push(joey_neurocode::NodeSnapshot {
+                id: 1,
+                name: "UserServiceImpl".into(),
+                fqcn: "com.x.UserServiceImpl".into(),
+                kind: "Class".into(),
+                primary: true,
+                ..Default::default()
+            });
+            snapshot.nodes.push(joey_neurocode::NodeSnapshot {
+                id: 2,
+                name: "UserService".into(),
+                fqcn: "com.x.UserService".into(),
+                kind: "Interface".into(),
+                primary: false,
+                reason: Some("implements".into()),
+                via: Some("UserServiceImpl".into()),
+                depth: 1,
+                ..Default::default()
+            });
+            snapshot.edges.push(joey_neurocode::EdgeSnapshot {
+                from: 0,
+                to: 1,
+                kind: "Implements".into(),
+            });
+            joey_neurocode::AssembledContext {
+                formatted_context: "## streaming ctx".to_string(),
+                tier,
+                snapshot: Some(snapshot),
+                ..Default::default()
+            }
+        }
+
+        fn assemble_context_with_progress(
+            &self,
+            request: &joey_neurocode::CodingRequest,
+            tier: joey_neurocode::ComplexityTier,
+            progress: &dyn Fn(&str),
+        ) -> joey_neurocode::AssembledContext {
+            self.stages_emitted.lock().unwrap().extend([
+                "locating target nodes".to_string(),
+                "expanded graph: 3 nodes pulled in".to_string(),
+            ]);
+            progress("locating target nodes");
+            progress("expanded graph: 3 nodes pulled in");
+            self.assemble_context(request, tier)
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    /// Feature 015 follow-up (realtime feed): when an event channel is
+    /// present, the intercept must call `assemble_context_with_progress`
+    /// and forward each stage as `AgentEvent::NeuroCodeProgress` — emitted
+    /// BEFORE the final `NeuroCodeContext` blob.
+    #[tokio::test]
+    async fn active_engine_streams_progress_events() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        let engine = Arc::new(StreamingEngine::new());
+        fx.agent.set_neurocode_engine(engine.clone());
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("refactor this module", tx).await;
+
+        // Drain all events, find the NeuroCode ones.
+        let mut neuro_progress: Vec<String> = Vec::new();
+        let mut saw_context_blob = false;
+        let mut graph_event_order: Vec<&'static str> = Vec::new();
+        let mut graph_snapshot_nodes = 0usize;
+        while let Some(ev) = rx.try_recv().ok() {
+            match ev {
+                AgentEvent::NeuroCodeProgress { stage } => neuro_progress.push(stage),
+                AgentEvent::NeuroCodeContext { .. } => {
+                    saw_context_blob = true;
+                    graph_event_order.push("context");
+                }
+                AgentEvent::NeuroCodeGraph { snapshot } => {
+                    graph_snapshot_nodes = snapshot.nodes.len();
+                    graph_event_order.push("graph");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            engine.stages_emitted.lock().unwrap().len(),
+            2,
+            "streaming path invoked"
+        );
+        assert!(
+            neuro_progress.contains(&"locating target nodes".to_string()),
+            "stage events forwarded, got: {:?}",
+            neuro_progress
+        );
+        assert!(
+            neuro_progress.contains(&"expanded graph: 3 nodes pulled in".to_string()),
+            "expand stage forwarded, got: {:?}",
+            neuro_progress
+        );
+        assert!(
+            saw_context_blob,
+            "final NeuroCodeContext blob still arrives after progress events"
+        );
+        // Feature 015 follow-up (interactive viz): the structured graph
+        // snapshot event arrives right AFTER the context blob, carrying
+        // the assembly's nodes/edges.
+        assert_eq!(
+            graph_event_order,
+            vec!["context", "graph"],
+            "NeuroCodeGraph emitted directly after NeuroCodeContext"
+        );
+        assert_eq!(
+            graph_snapshot_nodes, 2,
+            "graph event carries the snapshot nodes"
+        );
+    }
+
+    /// Feature 015 follow-up (auto re-index → dynamic context): when the
+    /// agent's tool loop produces enough edits, the turn end triggers a
+    /// re-index (NeuroCodeReindexed event), and the NEXT user turn
+    /// re-assembles context fresh (assemble called again — not the
+    /// deduped stash from turn 1).
+    #[tokio::test]
+    async fn large_edits_trigger_reindex_and_next_turn_reassembles() {
+        let _l = lock();
+        let mut fx = fixture(
+            vec![
+                Ok(tool_resp(
+                    vec![ToolCall::new("c1", "edit_sim", r#"{}"#)],
+                    FinishReason::Stop,
+                )),
+                Ok(text_resp("turn one done")),
+                Ok(text_resp("turn two done")),
+            ],
+            10,
+            3,
+            None,
+        );
+        // Tiny thresholds so the single scripted edit crosses them.
+        let auto_cfg = joey_neurocode::config::AutoIndexConfig {
+            enabled: true,
+            file_threshold: 1,
+            line_threshold: 1,
+            min_interval_secs: 0.0,
+        };
+        let engine = Arc::new(AutoIndexEngine::new(&auto_cfg));
+        fx.agent.set_neurocode_engine(engine.clone());
+
+        // ── Turn 1: a mutating tool runs; its FileChange feeds the tracker.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("refactor this module", tx).await;
+        let events = drain(&mut rx);
+        // Simulate the edit the tool would have produced: the fixture's
+        // EchoTool isn't a file tool, so record one directly (the agent
+        // path calls engine.record_file_edit via FileTracker drains).
+        joey_neurocode::NeuroCodeEngine::record_file_edit(&*engine, "src/lib.rs", 120, 80);
+        // No re-index during turn 1: the edit happened after... actually
+        // record via the turn: assert no reindex event yet (recorded after
+        // the turn in this fixture — the real path records during it).
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::NeuroCodeReindexed { .. })),
+            "no re-index before the threshold is crossed"
+        );
+
+        // ── Turn 2: turn end sees the accumulated edit pressure → re-index.
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("continue the refactor", tx2).await;
+        let events2 = drain(&mut rx2);
+        let reindexed: Vec<_> = events2
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::NeuroCodeReindexed { files_scanned, files_edited, lines_edited } => {
+                    Some((*files_scanned, *files_edited, *lines_edited))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reindexed.len(),
+            1,
+            "exactly one re-index at turn end after large edits"
+        );
+        assert_eq!(reindexed[0].0, 7, "engine's fake ingestion stats forwarded");
+        assert_eq!(reindexed[0].1, 1, "one edited file reported");
+        assert_eq!(reindexed[0].2, 200, "added+removed lines reported");
+        assert_eq!(
+            engine.reindex_count.load(AtomicOrdering::SeqCst),
+            1,
+            "engine reindexed exactly once"
+        );
+        // Context was re-assembled for the NEW turn (dynamic context).
+        assert_eq!(
+            engine
+                .last_reindex_stats
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|s| s.files_scanned),
+            Some(7)
+        );
+    }
+
+    /// Feature 015 follow-up: small edits never trigger a re-index.
+    #[tokio::test]
+    async fn small_edits_do_not_reindex() {
+        let _l = lock();
+        let mut fx = fixture(
+            vec![Ok(text_resp("done"))],
+            5,
+            3,
+            None,
+        );
+        let auto_cfg = joey_neurocode::config::AutoIndexConfig {
+            enabled: true,
+            file_threshold: 5,
+            line_threshold: 1000,
+            min_interval_secs: 0.0,
+        };
+        let engine = Arc::new(AutoIndexEngine::new(&auto_cfg));
+        fx.agent.set_neurocode_engine(engine.clone());
+        joey_neurocode::NeuroCodeEngine::record_file_edit(&*engine, "src/one.rs", 5, 5);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("small tweak", tx).await;
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::NeuroCodeReindexed { .. })),
+            "below-threshold edits don't re-index"
+        );
+        assert_eq!(engine.reindex_count.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    // ── NeuroCode tier-model servability guard (regression, 2026-08-21) ──
+    //
+    // The guard that rejects non-Copilot-servable tier models applies ONLY to
+    // the real GitHub Copilot backend (canonical provider id "copilot"). The
+    // ai-usage-hud reverse proxy routes the full catalog itself, so it gets
+    // parity with every other provider (z.ai, openrouter, …): the
+    // tier-resolved model is returned as-is, never servability-rejected and
+    // never silently downgraded to config.model.
+
+    /// Engine double with a FIXED tier-model resolution, for exercising the
+    /// servability guard in resolve_main_turn_model without config files.
+    struct TierModelEngine(String);
+
+    impl joey_neurocode::NeuroCodeEngine for TierModelEngine {
+        fn classify(&self, _request: &joey_neurocode::CodingRequest) -> joey_neurocode::ComplexityRoute {
+            joey_neurocode::ComplexityRoute {
+                tier: joey_neurocode::ComplexityTier::Frontier,
+                reasoning: "tier-model guard test".to_string(),
+                overridden: false,
+                override_tier: None,
+                signals: Vec::new(),
+            }
+        }
+
+        fn assemble_context(
+            &self,
+            _request: &joey_neurocode::CodingRequest,
+            tier: joey_neurocode::ComplexityTier,
+        ) -> joey_neurocode::AssembledContext {
+            joey_neurocode::AssembledContext {
+                formatted_context: "## tier-model guard ctx".to_string(),
+                tier,
+                ..Default::default()
+            }
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+
+        fn resolve_tier_model(&self) -> Option<String> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// ai-usage-hud + a tier model that FAILS the copilot prefix list
+    /// (my-custom-frontier-… matches no gpt-/claude-/gemini-/o1/o3/o4/
+    /// mai-code- family): the tier model must be served anyway — z.ai parity.
+    /// Verified both via direct resolution and end-to-end through run_turn
+    /// (the wire request must carry the tier model, not config.model).
+    #[tokio::test]
+    async fn tier_model_ai_usage_hud_serves_non_servable_tier_model() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        fx.agent.provider_name = "ai-usage-hud".to_string();
+        fx.agent
+            .set_neurocode_engine(Arc::new(TierModelEngine("my-custom-frontier-alias".to_string())));
+
+        // Direct: no servability rejection, no silent fallback.
+        assert_eq!(
+            fx.agent.resolve_main_turn_model(false),
+            "my-custom-frontier-alias",
+            "ai-usage-hud must return the tier-resolved model as-is (z.ai parity)"
+        );
+
+        // End-to-end: the main-turn provider request carries the tier model.
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let _ = fx.agent.run_turn("refactor this module", tx).await;
+        assert_eq!(fx.transport.request_count(), 1);
+        assert_eq!(
+            fx.transport.request(0).model,
+            "my-custom-frontier-alias",
+            "the wire request must carry the tier model, not config.model"
+        );
+    }
+
+    /// ai-usage-hud + a SERVABLE tier model (gpt-…): still returned (sanity —
+    /// the guard skip must not somehow break the pass-through path).
+    #[test]
+    fn tier_model_ai_usage_hud_serves_servable_tier_model() {
+        let mut fx = fixture(vec![], 5, 3, None);
+        fx.agent.provider_name = "ai-usage-hud".to_string();
+        fx.agent
+            .set_neurocode_engine(Arc::new(TierModelEngine("gpt-5.4".to_string())));
+        assert_eq!(
+            fx.agent.resolve_main_turn_model(false),
+            "gpt-5.4",
+            "servable tier model passes through unchanged"
+        );
+    }
+
+    /// copilot (GitHub Copilot backend) + the SAME non-servable tier model:
+    /// the existing guard must be preserved — warn + fall back to the
+    /// configured model instead of letting Copilot silently substitute.
+    #[test]
+    fn tier_model_copilot_falls_back_when_not_servable() {
+        let mut fx = fixture(vec![], 5, 3, None);
+        fx.agent.provider_name = "copilot".to_string();
+        fx.agent
+            .set_neurocode_engine(Arc::new(TierModelEngine("my-custom-frontier-alias".to_string())));
+        assert_eq!(
+            fx.agent.resolve_main_turn_model(false),
+            "test-model",
+            "copilot must keep the warn-and-fallback guard for non-servable tier models"
+        );
+    }
+
+    /// z.ai (never copilot-wire) + a non-servable tier model: returned as-is —
+    /// the parity anchor the ai-usage-hud fix aligns with.
+    #[test]
+    fn tier_model_zai_serves_non_servable_tier_model() {
+        let mut fx = fixture(vec![], 5, 3, None);
+        fx.agent.provider_name = "zai".to_string();
+        fx.agent
+            .set_neurocode_engine(Arc::new(TierModelEngine("my-custom-frontier-alias".to_string())));
+        assert_eq!(
+            fx.agent.resolve_main_turn_model(false),
+            "my-custom-frontier-alias",
+            "non-copilot providers were never guarded — must stay that way"
+        );
+    }
+
+    /// effective_main_turn_model (public accessor for HyperCode
+    /// parent-model inheritance): tier-routed when the engine is active and
+    /// the model is UNPINNED; config.model once the user pins an explicit
+    /// choice (--model, /model switch).
+    #[test]
+    fn effective_main_turn_model_tier_routed_unpinned_config_when_pinned() {
+        let mut fx = fixture(vec![], 5, 3, None);
+        fx.agent.provider_name = "zai".to_string();
+        fx.agent
+            .set_neurocode_engine(Arc::new(TierModelEngine("gpt-5.6-sol".to_string())));
+        assert_eq!(
+            fx.agent.effective_main_turn_model(),
+            "gpt-5.6-sol",
+            "active engine + unpinned → the tier-routed model is exposed to callers"
+        );
+        fx.agent.config.model_pinned = true;
+        assert_eq!(
+            fx.agent.effective_main_turn_model(),
+            "test-model",
+            "pinned model wins — the accessor must not rewrite the user's choice"
+        );
+    }
+
+    mod steer_tests {
+        use super::*;
+
+        /// The injection helper: pending steer -> appended to last tool msg
+        /// with the marker; original tool output preserved; applied once.
+        #[tokio::test]
+        async fn injection_helper_appends_marker_to_last_tool_result() {
+            let mut fx = fixture(
+                vec![
+                    Ok(tool_resp(
+                        vec![ToolCall::new("c1", "echo", r#"{"text":"hi"}"#)],
+                        FinishReason::ToolCalls,
+                    )),
+                    Ok(text_resp("done")),
+                ],
+                10,
+                3,
+                None,
+            );
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let _ = fx.agent.run_turn("start", tx).await;
+            fx.agent.steer("USE BLUE PAINT");
+            fx.agent.apply_pending_steer_to_last_tool_result();
+            let injected = fx
+                .agent
+                .history()
+                .iter()
+                .rev()
+                .find(|m| m.role == "tool")
+                .and_then(|m| m.content.clone())
+                .unwrap_or_default();
+            assert!(injected.contains(STEER_MARKER_OPEN), "marker present");
+            assert!(injected.contains("USE BLUE PAINT"));
+            assert!(injected.contains(STEER_MARKER_CLOSE));
+            assert!(injected.contains("hi"), "original tool output preserved");
+            fx.agent.apply_pending_steer_to_last_tool_result();
+            let count = fx
+                .agent
+                .history()
+                .iter()
+                .filter(|m| m.role == "tool" && m.content.as_deref().map(|c| c.contains("USE BLUE PAINT")).unwrap_or(false))
+                .count();
+            assert_eq!(count, 1, "steer applied exactly once");
+        }
+
+        /// Steer with no tool message in history: re-stashed, not dropped.
+        #[tokio::test]
+        async fn steer_without_tool_message_is_restashed() {
+            let mut fx = fixture(vec![Ok(text_resp("ok"))], 10, 3, None);
+            fx.agent.steer("LATER");
+            fx.agent.apply_pending_steer_to_last_tool_result();
+            assert_eq!(fx.agent.drain_pending_steer(), "LATER");
+        }
+
+        /// steer() API: empty rejected, multiple concatenate with newlines.
+        #[tokio::test]
+        async fn steer_api_concatenates_and_rejects_empty() {
+            let fx = fixture(vec![Ok(text_resp("ok"))], 10, 3, None);
+            assert!(!fx.agent.steer("   "));
+            assert!(fx.agent.steer("first"));
+            assert!(fx.agent.steer("second"));
+            assert_eq!(fx.agent.drain_pending_steer(), "first\nsecond");
+        }
+
+        /// A NEW user turn drops steers stashed for the aborted turn.
+        #[tokio::test]
+        async fn new_turn_clears_pending_steer() {
+            let mut fx = fixture(vec![Ok(text_resp("ok"))], 10, 3, None);
+            fx.agent.steer("STALE");
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let _ = fx.agent.run_turn("fresh", tx).await;
+            assert_eq!(fx.agent.drain_pending_steer(), "", "cleared on new turn");
+        }
+
+        /// The steer marker format matches upstream prompt_builder.py.
+        #[test]
+        fn steer_marker_format() {
+            let m = format_steer_marker("hello");
+            assert!(m.starts_with("\n\n[OUT-OF-BAND USER MESSAGE"));
+            assert!(m.contains("hello"));
+            assert!(m.ends_with("[/OUT-OF-BAND USER MESSAGE]"));
+        }
     }
 }

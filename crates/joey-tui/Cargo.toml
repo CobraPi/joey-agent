@@ -6,11 +6,15 @@ license.workspace = true
 
 [dependencies]
 joey-agent-core.workspace = true
+joey-core.workspace = true
 joey-omo.workspace = true
+joey-tools.workspace = true
+joey-neurocode.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true
 textwrap.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 joey-providers.workspace = true

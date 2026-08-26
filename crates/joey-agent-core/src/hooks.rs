@@ -314,15 +314,17 @@ impl PreToolUseRunner {
             }
         };
 
-        // Write stdin.
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(stdin_json.as_bytes()).await;
-            let _ = stdin.shutdown().await;
-        }
-
-        // Wait with timeout.
-        let output = match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await
-        {
+        // Write stdin AND wait inside the same timeout: a hook that never
+        // reads stdin would otherwise block the write on the pipe buffer
+        // past its deadline (or forever, for a non-exiting child).
+        let write_and_wait = async {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(stdin_json.as_bytes()).await;
+                let _ = stdin.shutdown().await;
+            }
+            child.wait_with_output().await
+        };
+        let output = match timeout(Duration::from_secs(timeout_secs), write_and_wait).await {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
                 tracing::warn!("Hook '{}' wait failed: {}", hook.config.name, e);
@@ -549,6 +551,34 @@ mod tests {
         let agg = runner.run("terminal", &serde_json::json!({}), "s1").await;
         assert!(agg.is_halted());
         assert_eq!(agg.hooks_run, 2);
+    }
+
+
+    /// A hook whose process neither reads stdin nor exits must still be
+    /// bounded by its timeout: a >64KB tool_input makes the stdin write
+    /// block on the pipe buffer, and that write used to happen OUTSIDE the
+    /// timeout wrapper — hanging the tool call until the child exited.
+    #[tokio::test]
+    async fn huge_stdin_does_not_outlive_timeout() {
+        let hooks = vec![HookConfig {
+            name: "sleepy".into(),
+            event: EVENT_PRE_TOOL_USE.into(),
+            matcher: "".into(),
+            // Never reads stdin; outlives the timeout.
+            command: "sleep 10".into(),
+            timeout_secs: Some(1),
+        }];
+        let runner = PreToolUseRunner::new(hooks, "/tmp");
+        let big_input = serde_json::json!({ "command": "x".repeat(200_000) });
+        let start = std::time::Instant::now();
+        let agg = runner.run("terminal", &big_input, "s1").await;
+        let elapsed = start.elapsed();
+        assert_eq!(agg.action, HookAction::Allow); // timed out → allow
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "hook ran {:?} — stdin write escaped the timeout",
+            elapsed
+        );
     }
 
     #[tokio::test]

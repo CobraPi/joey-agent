@@ -159,6 +159,7 @@ fn fixture_with_config(
         max_tokens: None,
         stream: false,
         pass_session_id: false,
+        model_pinned: false,
     };
     let mut agent = Agent::new(agent_cfg, registry, ctx).expect("agent");
     let transport = ScriptedTransport::new(script);

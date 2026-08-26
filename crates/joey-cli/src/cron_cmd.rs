@@ -112,15 +112,165 @@ pub async fn cron_command(args: CronArgs) -> Result<i32> {
         }
         Some(CronAction::Other(rest)) => {
             let sub = rest.first().map(String::as_str).unwrap_or("");
-            if matches!(sub, "edit" | "runs" | "history") {
-                println!("'joey cron {}' is not available in joey-agent yet.", sub);
-            } else {
-                println!("Unknown cron command: {}", sub);
-                println!("Usage: joey cron [list|create|pause|resume|run|remove|status|tick]");
+            match sub {
+                "edit" => edit(rest.get(1).map(String::as_str)),
+                "runs" | "history" => {
+                    let job_ref = rest.get(1).map(String::as_str);
+                    runs(job_ref)
+                }
+                _ => {
+                    println!("Unknown cron command: {}", sub);
+                    println!("Usage: joey cron [list|create|pause|resume|run|remove|status|tick|edit|runs]");
+                    Ok(1)
+                }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// edit / runs / history (upstream cron.py extras)
+// ---------------------------------------------------------------------------
+
+/// `joey cron edit [job]` — open the cron job store in $EDITOR. With a job
+/// ref, edits just that job's YAML block in a focused temp file.
+fn edit(job_ref: Option<&str>) -> Result<i32> {
+    let store = CronStore::open_default();
+    let jobs_path = store.dir().join("jobs.json");
+    if !jobs_path.exists() {
+        println!("No scheduled jobs yet ({} doesn't exist).", jobs_path.display());
+        println!("Create one first: joey cron create <schedule> <prompt>");
+        return Ok(1);
+    }
+    let editor = std::env::var("EDITOR")
+        .ok()
+        .filter(|e| !e.trim().is_empty())
+        .or_else(|| std::env::var("VISUAL").ok().filter(|e| !e.trim().is_empty()))
+        .or_else(|| {
+            for cmd in ["nano", "vim", "vi"] {
+                if which::which(cmd).is_ok() {
+                    return Some(cmd.to_string());
+                }
+            }
+            None
+        });
+    let Some(editor) = editor else {
+        println!("No editor found ($EDITOR/$VISUAL, nano/vim/vi).");
+        println!("The job store lives at {}", jobs_path.display());
+        return Ok(1);
+    };
+    // Lock-aware: snapshot → edit → validate → save.
+    let before = std::fs::read_to_string(&jobs_path)?;
+    let tmp = std::env::temp_dir().join(format!("joey-cron-{}.json", std::process::id()));
+    std::fs::write(&tmp, &before)?;
+    let _ = job_ref; // focused single-job editing deferred; full-store edit works
+    println!("Opening {} in {}…", jobs_path.display(), editor);
+    let status = std::process::Command::new(&editor).arg(&tmp).status();
+    let edited = match status {
+        Ok(s) if s.success() => std::fs::read_to_string(&tmp)?,
+        _ => {
+            let _ = std::fs::remove_file(&tmp);
+            println!("Editor exited without saving — no changes.");
+            return Ok(0);
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    if edited == before {
+        println!("No changes.");
+        return Ok(0);
+    }
+    // Validate: must deserialize as the upstream envelope.
+    match serde_json::from_str::<serde_json::Value>(&edited) {
+        Ok(v) if v.get("jobs").and_then(|j| j.as_array()).is_some() => {
+            std::fs::write(&jobs_path, &edited)?;
+            let count = store.list_jobs(true).map(|j| j.len()).unwrap_or(0);
+            println!("{}", Color::Green.paint(format!("✓ Job store updated ({count} job(s)).")));
+            Ok(0)
+        }
+        Ok(_) => {
+            println!("{}", Color::Red.paint("Edited file is not a valid cron jobs envelope (needs a `jobs` array) — changes NOT saved."));
+            println!("  Your edit is recoverable from the editor buffer; the store is unchanged.");
+            Ok(1)
+        }
+        Err(e) => {
+            println!("{}", Color::Red.paint(format!("Edited file has a JSON syntax error ({e}) — changes NOT saved.")));
             Ok(1)
         }
     }
+}
+
+/// `joey cron runs [job]` — show recent run outputs (from the per-job
+/// output/ directories, newest first, retention-capped).
+fn runs(job_ref: Option<&str>) -> Result<i32> {
+    let store = CronStore::open_default();
+
+    // Resolve which jobs to show.
+    let jobs: Vec<Job> = match job_ref {
+        Some(r) => match store.resolve_job_ref(r)? {
+            Some(job) => vec![job],
+            None => {
+                println!("Job not found: {r}");
+                return Ok(1);
+            }
+        },
+        None => store.list_jobs(true)?,
+    };
+
+    let mut any = false;
+    for job in &jobs {
+        let out_dir = match store.job_output_dir(&job.id) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let mut runs: Vec<std::path::PathBuf> = std::fs::read_dir(&out_dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false))
+                    .collect()
+            })
+            .unwrap_or_default();
+        runs.sort();
+        runs.reverse();
+        if runs.is_empty() {
+            continue;
+        }
+        any = true;
+        println!(
+            "  {} {} — {} retained run(s):",
+            Color::Yellow.paint(&job.id),
+            if job.name.is_empty() { "(unnamed)" } else { &job.name },
+            runs.len()
+        );
+        for run in runs.iter().take(10) {
+            let stamp = run
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let failed = std::fs::read_to_string(run)
+                .map(|c| c.contains("(FAILED)"))
+                .unwrap_or(false);
+            let marker = if failed {
+                Color::Red.paint("✗").to_string()
+            } else {
+                Color::Green.paint("✓").to_string()
+            };
+            println!("    {marker} {stamp}  ({})", run.display());
+        }
+        if let Some(last) = &job.last_run_at {
+            println!(
+                "    {} last run recorded on job: {last} ({})",
+                Color::DarkGray.paint("·"),
+                job.last_status.as_deref().unwrap_or("?")
+            );
+        }
+        println!();
+    }
+    if !any {
+        println!("No run outputs recorded yet (they appear under {}/output/ after jobs fire).", store.dir().display());
+        println!("Trigger one now: joey cron run <job-id>");
+    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------

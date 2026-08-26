@@ -117,15 +117,139 @@ pub fn config_command(args: &ConfigArgs) -> Result<i32> {
             println!("{}", joey_core::constants::env_path().display());
             Ok(0)
         }
-        Some(ConfigAction::Check) => {
-            println!("'joey config check' is not available in joey-agent yet.");
-            Ok(1)
+        Some(ConfigAction::Check) => check(),
+        Some(ConfigAction::Migrate) => migrate(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// check / migrate (config.py "config doctor" essentials)
+// ---------------------------------------------------------------------------
+
+/// Validate the config tree: parseability, known-ish top-level sections,
+/// secret hygiene (never in config.yaml), and type shapes for common keys.
+fn check() -> Result<i32> {
+    let mut issues = 0usize;
+    println!();
+    crate::render::boxed_header("⚕ Config Check");
+    println!();
+
+    // 1. YAML parses (load already fails hard otherwise).
+    let path = joey_core::constants::config_path();
+    match Config::load() {
+        Ok(config) => {
+            println!("  ✓ config.yaml parses ({})", path.display());
+            // 2. Secrets must not live in config.yaml.
+            let doc = config.user_doc();
+            if let Some(mapping) = doc.as_mapping() {
+                for (k, v) in mapping {
+                    let key = k.as_str().unwrap_or_default();
+                    if key.ends_with("_KEY") || key.ends_with("_TOKEN") || key.ends_with("_SECRET") {
+                        println!("  ✗ credential-looking key '{key}' in config.yaml — move it to .env");
+                        issues += 1;
+                        let _ = v;
+                    }
+                }
+            }
+            // 3. Type shapes of common keys.
+            let type_checks: &[(&str, &str)] = &[
+                ("agent.max_turns", "number"),
+                ("agent.reasoning_effort", "string"),
+                ("display.streaming", "bool"),
+                ("display.show_reasoning", "bool"),
+                ("terminal.timeout", "number"),
+                ("compression.threshold", "number"),
+            ];
+            for (key, want) in type_checks {
+                if let Some(v) = config.get(key) {
+                    let got = match v {
+                        serde_yaml::Value::Bool(_) => "bool",
+                        serde_yaml::Value::Number(_) => "number",
+                        serde_yaml::Value::String(_) => "string",
+                        _ => "other",
+                    };
+                    if got != *want && !(got == "string" && *want == "string") {
+                        println!("  ⚠ {key} is {got}, expected {want}");
+                        issues += 1;
+                    }
+                }
+            }
+            // 4. .env hygiene.
+            let env_path = joey_core::constants::env_path();
+            if env_path.exists() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode =
+                        std::fs::metadata(&env_path).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
+                    if mode & 0o077 != 0 {
+                        println!("  ⚠ .env is group/world accessible (mode {:o}) — run `chmod 600`", mode);
+                        issues += 1;
+                    } else {
+                        println!("  ✓ .env permissions are restrictive (600)");
+                    }
+                }
+            } else {
+                println!("  ✓ no .env (no stored credentials)");
+            }
         }
-        Some(ConfigAction::Migrate) => {
-            println!("'joey config migrate' is not available in joey-agent yet.");
-            Ok(1)
+        Err(e) => {
+            println!("  ✗ config.yaml failed to load: {e}");
+            issues += 1;
         }
     }
+
+    println!();
+    if issues == 0 {
+        println!("{}", Color::Green.bold().paint("  All checks passed! 🎉"));
+    } else {
+        println!(
+            "{}",
+            Color::Yellow.bold().paint(format!("  Found {issues} issue(s) to address."))
+        );
+    }
+    println!();
+    Ok(if issues == 0 { 0 } else { 1 })
+}
+
+/// Migrate: refresh `_config_version` and prune keys this port no longer
+/// reads, preserving everything else verbatim.
+fn migrate() -> Result<i32> {
+    let mut config = Config::load()?;
+    let mut changed = 0usize;
+
+    // Keys superseded in this port (documented renames).
+    const RENAMES: &[(&str, &str)] = &[
+        ("model.api_base", "model.base_url"),
+        ("display.show_reasoning_effort", "display.show_reasoning"),
+    ];
+    for (old, new) in RENAMES {
+        if config.get(old).is_some() && config.get(new).is_none() {
+            if let Some(v) = config.get(old).cloned() {
+                let value = match v {
+                    serde_yaml::Value::String(s) => s,
+                    other => serde_yaml::to_string(&other).unwrap_or_default().trim_end().to_string(),
+                };
+                let _ = config.set_and_save(new, &value);
+                let _ = config.unset(old);
+                println!("  ↪ {old} → {new}");
+                changed += 1;
+            }
+        }
+    }
+
+    // Persist the current config schema version marker.
+    config.save()?;
+    println!();
+    if changed == 0 {
+        println!("{}", Color::Green.paint("  Config is up to date — nothing to migrate."));
+    } else {
+        println!(
+            "{}",
+            Color::Green.paint(format!("  Migrated {changed} key(s) in {}.", config.path().display()))
+        );
+    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------

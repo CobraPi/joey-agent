@@ -20,10 +20,11 @@
 pub mod anim;
 pub mod app;
 pub mod input;
+pub mod neurocode_viz;
 pub mod state;
 pub mod theme;
 pub mod widgets;
 
 pub use app::{Tui, TuiAction};
-pub use state::{App as AppState, RunMode, TranscriptItem};
+pub use state::{App as AppState, RunMode, SlashCommandInfo, TranscriptItem};
 pub use theme::{gradient_spans, Theme};

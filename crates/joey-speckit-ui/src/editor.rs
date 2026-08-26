@@ -86,7 +86,7 @@ pub fn apply_edit(
         }
     };
 
-    match std::fs::write(path, &resolved) {
+    match crate::patch::transaction::atomic_write(path, &resolved) {
         Ok(()) => EditorResult::Success {
             new_hash: content_hash(&resolved),
         },
@@ -282,6 +282,14 @@ pub fn apply_cst_patch(
     artifact: &str,
     ops: Vec<PatchOp>,
 ) -> EditorResult {
+    // Path-traversal guard: both components land in a filesystem path.
+    if !crate::parser::discovery::is_safe_feature_id(feature_id)
+        || !crate::parser::discovery::is_safe_artifact_name(artifact)
+    {
+        return EditorResult::Error(
+            "feature id or artifact name is not a safe path component".to_string(),
+        );
+    }
     let artifact_path = format!("specs/{feature_id}/{artifact}");
     let full_path = repo_root.join(&artifact_path);
 

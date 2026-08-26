@@ -221,6 +221,15 @@ impl ToolRegistry {
     pub fn with_builtins() -> Self {
         let mut r = Self::new();
         crate::builtins::register_all(&mut r);
+        // Browser tools (feature 016): registered with the shared global
+        // handle; hidden (check() → false) until `/browser connect` or first
+        // browser-tool use connects a session.
+        crate::tools::browser_tools::register_browser_tools(
+            &mut r,
+            Some(crate::tools::browser_tools::shared_browser_handle()),
+        );
+        // vision_analyze (declared core name, feature 016).
+        crate::tools::vision_tools::register_vision_tools(&mut r);
         r
     }
 

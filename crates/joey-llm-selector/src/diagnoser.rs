@@ -103,7 +103,13 @@ impl DiagnoserClient for LlmDiagnoser {
             if s.len() <= MAX_EXCERPT {
                 s.to_string()
             } else {
-                format!("{}…[truncated]", &s[..MAX_EXCERPT])
+                // Snap to a UTF-8 char boundary: a multibyte char
+                // straddling the cut would panic on the byte slice.
+                let mut end = MAX_EXCERPT;
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…[truncated]", &s[..end])
             }
         };
         let prompt = format!(

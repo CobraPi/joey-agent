@@ -295,6 +295,236 @@ impl Default for Pulse {
     }
 }
 
+// ── HeaderFlow ───��──────────────────────────────────────────────────────────
+//
+// The header's gradient underline animator — the "agent is running" status
+// indicator. While a turn is busy the underline becomes a slow, elegant
+// traveling wave: a soft brightness pulse glides across the bar (gradient
+// colors themselves stay fixed — only brightness moves), and the whole bar
+// breathes slightly brighter overall. When the turn ends, the motion eases
+// OUT over ~1.5s back to the static underline — never a hard snap.
+//
+// Design constraints (per the repo's "quiet status signal, not a light
+// show" animation philosophy): no flicker, no color cycling beyond the
+// existing gradient, one wave visible at a time, ~8s per full traversal
+// (subtle but noticeable in peripheral vision), and phase-continuous —
+// starting/stopping the turn never jumps the wave position.
+
+/// The header gradient bar animator ("agent active" indicator).
+pub struct HeaderFlow {
+    /// Unbounded phase accumulator (seconds of animation time). Never reset
+    /// so the wave position is continuous across busy↔idle transitions.
+    phase: f32,
+    /// 0 = fully idle (static bar), 1 = fully running. Eased toward the
+    /// busy flag each tick — this is the fade-in/out envelope.
+    amount: f32,
+    /// The busy flag from the app, latched for tick().
+    busy: bool,
+}
+
+impl HeaderFlow {
+    /// Seconds for the brightness wave to traverse the bar once. Slow on
+    /// purpose: it should read as "alive", not "flashing".
+    const WAVE_PERIOD: f32 = 8.0;
+    /// Ease-in/out time constant for the busy envelope (seconds). ~1.2s to
+    /// full intensity, ~1.5s back to static.
+    const EASE: f32 = 1.2;
+
+    pub fn new() -> Self {
+        Self { phase: 0.0, amount: 0.0, busy: false }
+    }
+
+    /// Latch the busy state (call before tick each frame).
+    pub fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+    }
+
+    /// Advance the animator. `speed_mult` is the activity speed() so the
+    /// wave pace scales gently with agent count like every other animator.
+    pub fn tick(&mut self, dt: Duration, speed_mult: f32) {
+        // Phase advances continuously; when idle the envelope is 0 so it has
+        // no visible effect, but the position continuity is preserved.
+        let advance = dt.as_secs_f32() * speed_mult;
+        self.phase += advance;
+        // Asymmetric exponential ease toward the busy target: ~1s to visibly
+        // engage, ~0.8s to visibly settle (decay constant is ~3x steeper so
+        // the indicator responds promptly when a turn ends).
+        let target = if self.busy { 1.0 } else { 0.0 };
+        let rate = if self.busy { 1.25 } else { 3.0 };
+        let k = 1.0 - (-advance * rate / Self::EASE).exp();
+        self.amount += (target - self.amount) * k;
+        // Clamp away float drift so "fully idle" is exactly static.
+        if self.amount < 0.004 {
+            self.amount = 0.0;
+        }
+    }
+
+    /// Per-cell brightness lift (0..1) for the column at `t` (0..=1 across
+    /// the bar). Static zero when idle. One soft Gaussian-ish pulse rides
+    /// the bar; the base lift adds a gentle whole-bar breath.
+    pub fn brightness(&self, t: f32) -> f32 {
+        if self.amount <= 0.0 {
+            return 0.0;
+        }
+        // Wave center position, wrapping (period in phase-seconds).
+        let center = ((self.phase / Self::WAVE_PERIOD) % 1.0 + 1.0) % 1.0;
+        // Wrapped distance along the bar from the wave center, so the pulse
+        // slides off the right edge and re-enters from the left seamlessly.
+        let raw = (t - center).abs();
+        let d = raw.min(1.0 - raw);
+        // Smooth pulse: raised-cosine bump of width ~0.30 of the bar.
+        let width = 0.30;
+        let x = (d / width).min(1.0);
+        let bump = 0.5 * (1.0 + (std::f32::consts::PI * x).cos()); // 1 at center → 0 at edge
+        // Gentle whole-bar breathing (the existing pulse feel, subtler).
+        let breath = 0.5 + 0.5 * (self.phase * 1.6).sin();
+        // Base lift: a slightly brighter bar overall while running.
+        let base = 0.05 + 0.05 * breath;
+        (base + bump * 0.22) * self.amount
+    }
+
+    /// The eased busy envelope (0..1) — exposed for tests and potential
+    /// future consumers (e.g. also tinting the logo while busy).
+    pub fn amount(&self) -> f32 {
+        self.amount
+    }
+}
+
+impl Default for HeaderFlow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod header_flow_tests {
+    use super::*;
+
+    fn secs(n: f32) -> Duration {
+        Duration::from_secs_f32(n)
+    }
+
+    #[test]
+    fn idle_flow_is_exactly_static() {
+        let mut flow = HeaderFlow::new();
+        flow.set_busy(false);
+        flow.tick(secs(10.0), 1.0);
+        assert_eq!(flow.amount(), 0.0);
+        assert_eq!(flow.brightness(0.0), 0.0);
+        assert_eq!(flow.brightness(0.5), 0.0);
+        assert_eq!(flow.brightness(1.0), 0.0);
+    }
+
+    #[test]
+    fn busy_envelope_eases_in_without_snap() {
+        let mut flow = HeaderFlow::new();
+        flow.set_busy(true);
+        // First frame: tiny but nonzero — no instant jump.
+        flow.tick(secs(1.0 / 30.0), 1.0);
+        let a1 = flow.amount();
+        assert!(a1 > 0.0 && a1 < 0.15, "first frame eases in, got {a1}");
+        // Two seconds of ticking approaches full intensity monotonically.
+        for _ in 0..60 {
+            flow.tick(secs(1.0 / 30.0), 1.0);
+        }
+        let a2 = flow.amount();
+        assert!(a2 > a1, "envelope rises: {a1} -> {a2}");
+        assert!(a2 > 0.8, "approaches full intensity, got {a2}");
+        assert!(a2 <= 1.0, "never exceeds 1");
+    }
+
+    #[test]
+    fn idle_again_eases_out_to_static() {
+        let mut flow = HeaderFlow::new();
+        flow.set_busy(true);
+        for _ in 0..120 {
+            flow.tick(secs(1.0 / 30.0), 1.0);
+        }
+        assert!(flow.amount() > 0.9);
+        flow.set_busy(false);
+        // ~2.5s of frames decays the envelope to the static clamp (decay is
+        // steeper than engage, so the indicator settles promptly).
+        for _ in 0..75 {
+            flow.tick(secs(1.0 / 30.0), 1.0);
+        }
+        assert_eq!(flow.amount(), 0.0, "clamped to exactly static");
+        assert_eq!(flow.brightness(0.3), 0.0);
+    }
+
+    #[test]
+    fn wave_brightness_is_bounded_and_peaks_near_center() {
+        let mut flow = HeaderFlow::new();
+        flow.set_busy(true);
+        for _ in 0..120 {
+            flow.tick(secs(1.0 / 30.0), 1.0);
+        }
+        // Sample the whole bar: bounded, and a clear peak exists (the wave).
+        let mut peak = 0.0f32;
+        let mut peak_t = 0.0f32;
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let b = flow.brightness(t);
+            assert!((0.0..=0.35).contains(&b), "brightness {b} out of range at t={t}");
+            if b > peak {
+                peak = b;
+                peak_t = t;
+            }
+        }
+        assert!(peak > 0.15, "wave must be noticeable: peak {peak}");
+        // The raised-cosine bump: brightness strictly decreases away from
+        // the peak (sampled away from the wrap seam).
+        let left = flow.brightness((peak_t - 0.15).max(0.0));
+        let right = flow.brightness((peak_t + 0.15).min(1.0));
+        assert!(left < peak, "left of peak is dimmer");
+        assert!(right < peak, "right of peak is dimmer");
+    }
+
+    #[test]
+    fn wave_travels_over_time() {
+        // The peak position must move across the bar as time passes
+        // (that's the "agent is active" signal).
+        let mut flow = HeaderFlow::new();
+        flow.set_busy(true);
+        for _ in 0..120 {
+            flow.tick(secs(1.0 / 30.0), 1.0);
+        }
+        let peak_at = |f: &HeaderFlow| {
+            (0..=100)
+                .map(|i| (f.brightness(i as f32 / 100.0), i as f32 / 100.0))
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+                .unwrap()
+                .1
+        };
+        let p0 = peak_at(&flow);
+        // Advance ~1.5s — 3/16 of a traversal; must register movement.
+        for _ in 0..45 {
+            flow.tick(secs(1.0 / 30.0), 1.0);
+        }
+        let p1 = peak_at(&flow);
+        let moved = (p1 - p0).abs().max(((p1 - p0).abs() - 1.0).abs());
+        assert!(moved > 0.02, "wave moved: {p0} -> {p1}");
+    }
+
+    #[test]
+    fn phase_survives_busy_idle_transitions() {
+        // Phase never resets: after busy→idle→busy the wave reappears where
+        // it would have been, not back at the start (no position jump).
+        let mut flow = HeaderFlow::new();
+        flow.set_busy(true);
+        for _ in 0..90 {
+            flow.tick(secs(1.0 / 30.0), 1.0);
+        }
+        flow.set_busy(false);
+        for _ in 0..30 {
+            flow.tick(secs(1.0 / 30.0), 1.0);
+        }
+        flow.set_busy(true);
+        flow.tick(secs(1.0 / 30.0), 1.0);
+        // Just assert it re-engages smoothly (no panic, envelope rising).
+        assert!(flow.amount() > 0.0);
+    }
+}
+
 // ── Tiny deterministic RNG ──────────────────────────────────────────────────
 //
 // xorshift32 — deterministic so the particle field looks stable across frames

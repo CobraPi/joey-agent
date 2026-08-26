@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Login Then DOM</title>
+<style>
+  /* Deterministic layout: canvas pinned at (0,0) so the coordinate click at
+     the drawn Enter button ((220..380, 70..130) canvas-relative) maps 1:1
+     to page coordinates — the test clicks (300,100). */
+  body { margin: 0; }
+  h1 { position: fixed; right: 8px; top: 8px; margin: 0; }
+</style></head>
+<body>
+  <h1>Opaque Then Readable</h1>
+  <div id="stage"></div>
+  <script>
+    // Phase 1: canvas-only content (structural scan finds nothing).
+    const stage = document.getElementById('stage');
+    const c = document.createElement('canvas');
+    c.width = 600; c.height = 200;
+    c.style.display = 'block';
+    stage.appendChild(c);
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#369'; ctx.fillRect(220, 70, 160, 60);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 20px sans-serif';
+    ctx.fillText('Enter', 265, 105);
+    c.addEventListener('click', () => {
+      // Phase 2: become DOM-driven (structural scan now works).
+      stage.innerHTML = '<button data-ground-truth="after-btn" onclick="document.body.dataset.after=\'clicked\'">After Login Button</button>';
+    });
+  </script>
+</body>
+</html>

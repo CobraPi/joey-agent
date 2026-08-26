@@ -5,7 +5,9 @@
 //!   - Diagnostics collection (publishes to the agent as a tool)
 //!   - Go-to-definition, references, document symbols, rename
 //!
-//! LSP servers are configured in `~/.joey/config.yaml`:
+//! LSP servers are configured in `~/.joey/config.yaml` — any language with
+//! a language server works; the examples below cover the languages joey
+//! parses with dedicated tree-sitter grammars:
 //!
 //! ```yaml
 //! lsp:
@@ -19,6 +21,35 @@
 //!     command: "typescript-language-server"
 //!     args: ["--stdio"]
 //!     file_types: ["ts", "tsx", "js", "jsx"]
+//!   go:
+//!     command: "gopls"
+//!     file_types: ["go"]
+//!   ruby:
+//!     command: "solargraph"
+//!     args: ["stdio"]
+//!     file_types: ["rb"]
+//!   php:
+//!     command: "intelephense"
+//!     args: ["--stdio"]
+//!     file_types: ["php"]
+//!   csharp:
+//!     command: "OmniSharp"
+//!     args: ["-lsp"]
+//!     file_types: ["cs"]
+//!   c:
+//!     command: "clangd"
+//!     file_types: ["c", "h"]
+//!   cpp:
+//!     command: "clangd"
+//!     file_types: ["cpp", "cc", "cxx", "hpp"]
+//!   haskell:
+//!     command: "haskell-language-server"
+//!     args: ["--lsp"]
+//!     file_types: ["hs"]
+//!   bash:
+//!     command: "bash-language-server"
+//!     args: ["start"]
+//!     file_types: ["sh", "bash"]
 //! ```
 //!
 //! The agent accesses LSP features via tools: `lsp_diagnostics`,
@@ -31,6 +62,11 @@ use std::process::{Child, Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+/// Maximum accepted JSON-RPC message size (16MB). The Content-Length
+/// header is server-controlled; without a cap a malicious/buggy server
+/// could make us attempt an unbounded allocation.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// LSP server configuration from config.yaml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,9 +240,16 @@ impl LspManager {
             .to_string();
         let client = self.ensure_client(&config_name)?;
         client.open_document(&abs)?;
-        // Give the server a moment to publish diagnostics.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        client.drain_notifications();
+        // Synchronize: fire a cheap request. Servers publish diagnostics
+        // after didOpen asynchronously; by the time they answer ANY
+        // subsequent request, the publishDiagnostics notification is already
+        // in the pipe — `request()`'s read loop captures it on the way past
+        // (the old code slept 500ms then drained nothing, so diagnostics
+        // were only ever captured incidentally).
+        let _ = client.request(
+            "textDocument/documentSymbol",
+            json!({ "textDocument": { "uri": path_to_uri(&abs) } }),
+        );
         Ok(client
             .diagnostics
             .get(&abs)
@@ -343,7 +386,10 @@ impl LspClient {
         cmd.args(&cfg.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // stderr to null: piped-but-never-read deadlocks verbose servers
+            // once the 64KB pipe buffer fills. Diagnostics-relevant chatter
+            // is not needed for protocol operation.
+            .stderr(Stdio::null())
             .current_dir(root);
 
         let mut process = cmd.spawn().map_err(|e| LspError::SpawnFailed {
@@ -425,7 +471,41 @@ impl LspClient {
     }
 
     /// Send a request and wait for the response.
+    ///
+    /// Bounded: a watchdog thread kills the server process after
+    /// `REQUEST_TIMEOUT`, which unblocks the reader with EOF — a hung
+    /// server can never hold the (manager-wide) LSP mutex forever. The
+    /// next call respawns the server (start is retried per call).
     fn request(&mut self, method: &str, params: Value) -> Result<Value, LspError> {
+        const REQUEST_TIMEOUT: u64 = 30;
+        let pid = self.process.id();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_flag = cancel.clone();
+        let watchdog = std::thread::spawn(move || {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(REQUEST_TIMEOUT);
+            loop {
+                if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return; // request completed — cancel
+                }
+                if std::time::Instant::now() >= deadline {
+                    // Still not done → kill the hung server (EOF unblocks
+                    // the reader; next call respawns).
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        let result = self.request_inner(method, params);
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = watchdog.join();
+        result
+    }
+
+    fn request_inner(&mut self, method: &str, params: Value) -> Result<Value, LspError> {
         let id = self.next_id;
         self.next_id += 1;
         let msg = json!({
@@ -461,13 +541,6 @@ impl LspClient {
             "params": params
         });
         self.send_message(&msg)
-    }
-
-    /// Drain pending notification messages (non-blocking).
-    fn drain_notifications(&mut self) {
-        // Best-effort: we can't easily do non-blocking reads on the stdout
-        // without more complex plumbing. For now, this is a no-op; diagnostics
-        // are captured during request/response cycles.
     }
 
     /// Handle a publishDiagnostics notification.
@@ -545,6 +618,12 @@ impl LspClient {
             }
         }
         let len = content_length.ok_or_else(|| LspError::Io("no Content-Length".into()))?;
+        if len > MAX_MESSAGE_BYTES {
+            return Err(LspError::Io(format!(
+                "LSP message too large: Content-Length {} exceeds cap of {} bytes",
+                len, MAX_MESSAGE_BYTES
+            )));
+        }
         let mut buf = vec![0u8; len];
         self.stdout
             .read_exact(&mut buf)

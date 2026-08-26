@@ -7,8 +7,23 @@ use joey_llm_selector::{
     render_status, CandidateModelPool, SelectorConfig, SelectorEngine,
 };
 
-/// Entry point for the `/llm-selector` slash command.
+/// Entry point for the `/llm-selector` slash command (printing form).
+///
+/// Renders via [`llm_selector_slash_text`] and writes the result to stdout.
+/// Used by the line REPL and the `joey llm-selector` CLI mirror, where
+/// direct printing is safe (reedline is not on screen during slash
+/// handling there, and no raw-mode alternate screen is held). The TUI
+/// calls the render-only [`llm_selector_slash_text`] instead and funnels
+/// the text into its transcript — printing under ratatui's raw-mode
+/// alternate screen staircases bare `\n`s over the frame.
 pub fn llm_selector_slash(args: &str) -> Result<(), String> {
+    llm_selector_slash_text(args).map(|out| print!("{out}"))
+}
+
+/// Render-only form of `/llm-selector`: builds and returns the exact text
+/// [`llm_selector_slash`] prints (each former `println!` line keeps its
+/// trailing `\n`; `status` keeps `render_status`'s bytes verbatim).
+pub fn llm_selector_slash_text(args: &str) -> Result<String, String> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     let sub = parts.first().copied().unwrap_or("status");
 
@@ -26,10 +41,7 @@ pub fn llm_selector_slash(args: &str) -> Result<(), String> {
         "enable" => cmd_enable(&engine),
         "disable" => cmd_disable(&engine),
         "refresh" => cmd_refresh(&engine),
-        "help" | "-h" | "--help" => {
-            cmd_help();
-            Ok(())
-        }
+        "help" | "-h" | "--help" => Ok(cmd_help()),
         _ => Err(format!(
             "unknown subcommand '{}'. Run /llm-selector help.",
             sub
@@ -50,8 +62,10 @@ pub fn llm_selector_slash(args: &str) -> Result<(), String> {
 pub(crate) fn fetch_candidate_pool(provider: &str) -> CandidateModelPool {
     use joey_llm_selector::candidate::{CatalogSource, consolidate_copilot, consolidate_models_dev};
 
-    if provider == "copilot" {
+    if joey_providers::profile::is_copilot_wire(provider) {
         // Copilot's catalog fetch is the canonical source (research.md §6).
+        // Covers the ai-usage-hud reverse proxy too: it serves the same
+        // Copilot wire catalog from its own /models endpoint.
         match joey_providers::copilot::fetch_model_catalog(std::time::Duration::from_secs(10)) {
             Ok(raw) => {
                 let (models, _dropped) = consolidate_copilot(&raw);
@@ -154,6 +168,16 @@ fn resolve_provider_name(config: &joey_core::Config) -> String {
     if !provider.is_empty() && provider != "auto" {
         return provider;
     }
+    // Custom Copilot-compatible endpoint active: every model is served by the
+    // proxy through a copilot-wire profile, so the candidate-pool fetch must
+    // target the copilot catalog source regardless of the model's vendor
+    // prefix (mirrors the resolve_profile magnet in joey-providers).
+    if joey_providers::copilot::hud_endpoint().is_some() {
+        return "ai-usage-hud".to_string();
+    }
+    if joey_providers::copilot::custom_endpoint().is_some() {
+        return "copilot".to_string();
+    }
     // Provider is "auto" or unset: derive from the model string's vendor
     // prefix (e.g. "anthropic/claude-..." → "anthropic").
     let model = config.model();
@@ -194,50 +218,54 @@ fn build_engine() -> SelectorEngine {
     engine
 }
 
-fn cmd_status(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_status(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let q = SelectorQuery::new(engine);
     let report = q.status();
-    print!("{}", render_status(&report));
-    Ok(())
+    // Verbatim render_status bytes — the old printer used `print!` with no
+    // added newline, so neither do we.
+    Ok(render_status(&report))
 }
 
-fn cmd_pool(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_pool(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
+    let mut out = String::new();
     let q = SelectorQuery::new(engine);
     let pool = q.pool();
     if pool.is_empty() {
-        println!("Candidate pool is empty (no catalog-exposing provider active).");
+        out.push_str("Candidate pool is empty (no catalog-exposing provider active).\n");
     } else {
-        println!("Candidate pool ({} models):", pool.len());
+        out.push_str(&format!("Candidate pool ({} models):\n", pool.len()));
         for m in &pool {
-            println!(
-                "  {:<30} {:<12} ctx={:<6} {:<10} {}{}",
+            out.push_str(&format!(
+                "  {:<30} {:<12} ctx={:<6} {:<10} {}{}\n",
                 m.id,
                 m.tier,
                 m.context_window / 1000,
                 m.provider,
                 if m.supports_tools { "[tools]" } else { "" },
                 if m.supports_vision { "[vision]" } else { "" },
-            );
+            ));
         }
     }
-    Ok(())
+    Ok(out)
 }
 
-fn cmd_enable(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_enable(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let q = SelectorQuery::new(engine);
     q.enable();
-    println!("LLM Selector enabled. Select the 'auto' model to engage dynamic allocation.");
-    Ok(())
+    Ok(
+        "LLM Selector enabled. Select the 'auto' model to engage dynamic allocation.\n"
+            .to_string(),
+    )
 }
 
 /// `/llm-selector refresh` (T071, contracts/llm-selector-command.md row 11):
 /// force-refresh the candidate pool from the live catalog. Re-fetches using
 /// the active provider, replaces the pool, and reports the new size. Exits
 /// with an error (non-zero) when the refresh yields an empty pool (degraded).
-fn cmd_refresh(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_refresh(engine: &SelectorEngine) -> Result<String, String> {
     // Use the provider recorded at construction (handles the `auto` model case
     // where the model string has no vendor prefix).
     let provider = engine.provider();
@@ -256,16 +284,14 @@ fn cmd_refresh(engine: &SelectorEngine) -> Result<(), String> {
             provider
         ));
     }
-    println!("Candidate pool refreshed: {} models.", n);
-    Ok(())
+    Ok(format!("Candidate pool refreshed: {n} models.\n"))
 }
 
-fn cmd_disable(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_disable(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let q = SelectorQuery::new(engine);
     q.disable();
-    println!("LLM Selector disabled. Using the configured model for all modules.");
-    Ok(())
+    Ok("LLM Selector disabled. Using the configured model for all modules.\n".to_string())
 }
 
 /// Parse a module argument using ModuleId::parse (contracts/llm-selector-command.md
@@ -275,14 +301,15 @@ fn parse_module(s: Option<&str>) -> Result<joey_llm_selector::ModuleId, String> 
     joey_llm_selector::ModuleId::parse(s)
 }
 
-fn cmd_allocations(engine: &SelectorEngine) -> Result<(), String> {
+fn cmd_allocations(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
+    let mut out = String::new();
     let q = SelectorQuery::new(engine);
     let report = q.status();
     if report.entries.is_empty() {
-        println!("No allocations yet (selector has not resolved any modules).");
+        out.push_str("No allocations yet (selector has not resolved any modules).\n");
     } else {
-        println!("Allocation map:");
+        out.push_str("Allocation map:\n");
         for e in &report.entries {
             let flags = match (e.pinned, e.implicit_pin) {
                 (true, _) => " [pinned]",
@@ -294,22 +321,22 @@ fn cmd_allocations(engine: &SelectorEngine) -> Result<(), String> {
                 .map(|p| format!(" p_j={:.2}", p))
                 .unwrap_or_default();
             let updated = e.updated_at.as_deref().unwrap_or("");
-            println!(
-                "  {:<14} -> {:<24}{}{}",
+            out.push_str(&format!(
+                "  {:<14} -> {:<24}{}{}\n",
                 e.module, e.model_id, flags, perf
-            );
+            ));
             if !e.reason.is_empty() {
-                println!("                 reason: {}", e.reason);
+                out.push_str(&format!("                 reason: {}\n", e.reason));
             }
             if !updated.is_empty() {
-                println!("                 updated: {}", updated);
+                out.push_str(&format!("                 updated: {}\n", updated));
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
-fn cmd_diagnostics(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
+fn cmd_diagnostics(engine: &SelectorEngine, args: &[&str]) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     // Parse optional `-n <count>`.
     let mut limit: usize = 20;
@@ -329,24 +356,25 @@ fn cmd_diagnostics(engine: &SelectorEngine, args: &[&str]) -> Result<(), String>
     }
     let q = SelectorQuery::new(engine);
     let rows = q.diagnostics(limit);
+    let mut out = String::new();
     if rows.is_empty() {
-        println!("No diagnostics recorded.");
+        out.push_str("No diagnostics recorded.\n");
     } else {
-        println!("Diagnostics (last {}):", rows.len());
+        out.push_str(&format!("Diagnostics (last {}):\n", rows.len()));
         for d in &rows {
-            println!(
-                "  [{}] module={} signal={} model={}",
+            out.push_str(&format!(
+                "  [{}] module={} signal={} model={}\n",
                 d.at, d.module, d.signal, d.implicated_model
-            );
+            ));
             if !d.rationale.is_empty() {
-                println!("         {}", d.rationale);
+                out.push_str(&format!("         {}\n", d.rationale));
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
-fn cmd_pin(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
+fn cmd_pin(engine: &SelectorEngine, args: &[&str]) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let module = parse_module(args.first().copied())?;
     let model_id = args
@@ -355,20 +383,20 @@ fn cmd_pin(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
         .to_string();
     let q = SelectorQuery::new(engine);
     q.pin(module, model_id.clone())?;
-    println!("Pinned module to model '{}'. Exempt from reallocation.", model_id);
-    Ok(())
+    Ok(format!(
+        "Pinned module to model '{model_id}'. Exempt from reallocation.\n"
+    ))
 }
 
-fn cmd_unpin(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
+fn cmd_unpin(engine: &SelectorEngine, args: &[&str]) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let module = parse_module(args.first().copied())?;
     let q = SelectorQuery::new(engine);
     q.unpin(&module)?;
-    println!("Unpinned module {}.", module);
-    Ok(())
+    Ok(format!("Unpinned module {module}.\n"))
 }
 
-fn cmd_budget(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
+fn cmd_budget(engine: &SelectorEngine, args: &[&str]) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let n_str = args
         .first()
@@ -380,14 +408,13 @@ fn cmd_budget(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
     let q = SelectorQuery::new(engine);
     q.set_budget(n);
     if n == 0 {
-        println!("Learning budget set to 0 — learning disabled (routing from cold-start map only).");
+        Ok("Learning budget set to 0 — learning disabled (routing from cold-start map only).\n".to_string())
     } else {
-        println!("Learning budget set to {}.", n);
+        Ok(format!("Learning budget set to {n}.\n"))
     }
-    Ok(())
 }
 
-fn cmd_diagnoser(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
+fn cmd_diagnoser(engine: &SelectorEngine, args: &[&str]) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     // No args: show current diagnoser model.
     if args.is_empty() {
@@ -398,42 +425,179 @@ fn cmd_diagnoser(engine: &SelectorEngine, args: &[&str]) -> Result<(), String> {
         } else {
             &report.diagnoser_model
         };
-        println!("Diagnoser model: {}", m);
-        return Ok(());
+        return Ok(format!("Diagnoser model: {m}\n"));
     }
     // Otherwise: set the diagnoser model.
     let model_id = args[0];
     let q = SelectorQuery::new(engine);
     q.set_diagnoser_model(model_id)?;
-    println!("Diagnoser model set to '{}'.", model_id);
-    Ok(())
+    Ok(format!("Diagnoser model set to '{model_id}'.\n"))
 }
 
-fn cmd_help() {
-    println!("Usage: /llm-selector <subcommand>");
-    println!();
-    println!("Subcommands:");
-    println!("  status                 Show enabled/disabled state, pool size, diagnoser model");
-    println!("  pool                   List all candidate models in the active catalog");
-    println!("  allocations            Print the full allocation map (per module -> model)");
-    println!("  diagnostics [-n <n>]   Print the last N diagnoser judgments (default 20)");
-    println!("  pin <module> <model>   Pin a module to a model; exempt from reallocation");
-    println!("  unpin <module>         Remove a user pin");
-    println!("  budget <n>             Set the learning budget (0 disables learning)");
-    println!("  diagnoser [<model>]    Show or set the diagnoser model (versatile tier only)");
-    println!("  enable                 Enable dynamic allocation (engages when model is 'auto')");
-    println!("  disable                Disable dynamic allocation (fall back to configured model)");
-    println!("  refresh                Force-refresh the candidate pool from the live catalog");
-    println!("  help                   Show this help message");
-    println!();
-    println!("Module argument: main_turn | compression | subagent | custom:<name>");
-    println!();
-    println!("Alias: /llm-s (prefix abbreviation)");
+fn cmd_help() -> String {
+    let lines = [
+        "Usage: /llm-selector <subcommand>",
+        "",
+        "Subcommands:",
+        "  status                 Show enabled/disabled state, pool size, diagnoser model",
+        "  pool                   List all candidate models in the active catalog",
+        "  allocations            Print the full allocation map (per module -> model)",
+        "  diagnostics [-n <n>]   Print the last N diagnoser judgments (default 20)",
+        "  pin <module> <model>   Pin a module to a model; exempt from reallocation",
+        "  unpin <module>         Remove a user pin",
+        "  budget <n>             Set the learning budget (0 disables learning)",
+        "  diagnoser [<model>]    Show or set the diagnoser model (versatile tier only)",
+        "  enable                 Enable dynamic allocation (engages when model is 'auto')",
+        "  disable                Disable dynamic allocation (fall back to configured model)",
+        "  refresh                Force-refresh the candidate pool from the live catalog",
+        "  help                   Show this help message",
+        "",
+        "Module argument: main_turn | compression | subagent | custom:<name>",
+        "",
+        "Alias: /llm-s (prefix abbreviation)",
+    ];
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shared lock for tests that touch the process-global environment
+    /// (COPILOT_API_BASE_URL / AI_USAGE_HUD_BASE_URL / JOEY_HOME) — directly
+    /// or transitively via `Config::load()`, whose `.env` import applies user
+    /// values with OVERRIDE semantics (a concurrent env WRITE). Sibling test
+    /// modules in this binary also call `Config::load()` without knowing
+    /// about these vars, so every reader must hold this lock too: otherwise
+    /// a parallel help/nonsense test's dotenv import re-sets
+    /// AI_USAGE_HUD_BASE_URL between a magnet test's scrub and its assert.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII test-env guard. While held:
+    /// 1. ENV_LOCK is held, serializing every env-touching test in this
+    ///    module (writers AND readers — `resolve_provider_name` reads
+    ///    hud_endpoint()/custom_endpoint() from the live process env).
+    ///    joey-core's cross-crate TEST_HOME_OVERRIDE_LOCK is held for the
+    ///    guard's whole lifetime too, so the process-global home override
+    ///    can't race other test modules that install one (e.g.
+    ///    model_catalog.rs).
+    /// 2. The two endpoint env vars are scrubbed and restored on drop, so
+    ///    the developer's real shell / `~/.joey/.env` exports can't leak
+    ///    into magnetization assertions (mirrors joey-providers'
+    ///    copilot::EndpointEnvGuard, which serializes on its TEST_ENV_LOCK).
+    /// 3. A HomeOverrideGuard pins `joey_home()` to a fresh tempdir. The
+    ///    override beats both the JOEY_HOME env var and the platform
+    ///    default and is re-read on every call, so NO concurrent env
+    ///    mutation can make the models.dev disk cache resolve to the REAL
+    ///    ~/.joey (whose stale cache would trigger a live
+    ///    https://models.dev/api.json fetch). This is the race-free seam
+    ///    replacing reliance on the env var alone.
+    /// 4. JOEY_HOME is still pointed at that same temp dir (restored on
+    ///    drop): `load_joey_dotenv` (joey-core config.rs) resolves the
+    ///    `.env` to import from the env var, NOT from the home override,
+    ///    so this env redirect is what keeps any `Config::load()` under
+    ///    the guard (transitively, via build_engine /
+    ///    try_build_allocator, or in sibling engine.rs actor tests, whose
+    ///    engine_switch_model calls Config::load unconditionally)
+    ///    importing an EMPTY `.env` instead of the developer's real one —
+    ///    eliminating the dotenv OVERRIDE-write race without weakening any
+    ///    assertion. If load_joey_dotenv ever honors the override, this
+    ///    env machinery can be dropped entirely.
+    /// 5. A fresh empty models_dev_cache.json is seeded in that temp home
+    ///    so `fetch_candidate_pool`'s models.dev path is served from disk
+    ///    and never fetches https://models.dev/api.json over the network
+    ///    (the disk cache resolves through the overridden home; freshness
+    ///    < TTL short-circuits stage 3). The copilot path stays pinned to
+    ///    the instantly-refused 127.0.0.1:1 endpoints the tests set.
+    ///
+    /// Drop order: the manual Drop body restores the env vars while both
+    /// locks are still held; fields then drop in declaration order — the
+    /// home override releases BEFORE TEST_HOME_OVERRIDE_LOCK, and ENV_LOCK
+    /// (declared last) releases last.
+    struct TestEnvGuard {
+        _home: joey_core::constants::HomeOverrideGuard,
+        _override_lock: std::sync::MutexGuard<'static, ()>,
+        prev_copilot: Option<String>,
+        prev_hud: Option<String>,
+        prev_home: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestEnvGuard {
+        fn new() -> Self {
+            // ENV_LOCK is a static, so the guard's lifetime is 'static.
+            // Lock order ENV_LOCK → TEST_HOME_OVERRIDE_LOCK matches every
+            // other taker of the pair in the workspace — no inversion.
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _override_lock = joey_core::constants::TEST_HOME_OVERRIDE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev_home = std::env::var_os("JOEY_HOME");
+            let dir = tempfile::tempdir().expect("temp joey home");
+            std::fs::write(dir.path().join(".env"), "").expect("seed empty .env");
+            // Seed a fresh (mtime=now) empty models.dev disk cache: stage 2
+            // of fetch_models_dev serves it within the 1h TTL and stage 3
+            // (network fetch of https://models.dev/api.json) is unreachable.
+            std::fs::write(dir.path().join("models_dev_cache.json"), "{\"_\":{}}")
+                .expect("seed models.dev disk cache");
+            // Race-free home redirect FIRST: every `joey_home()` reader
+            // (models_dev_cache_path et al.) now sees the tempdir even if
+            // the env var below is momentarily unset or restored by a
+            // concurrent guard, so the stale-real-cache models.dev fetch
+            // can never fire.
+            let _home =
+                joey_core::constants::HomeOverrideGuard::new(dir.path().to_path_buf());
+            // The env var still matters for `load_joey_dotenv` (it resolves
+            // `.env` from the env var, not the override): redirect it to the
+            // SAME tempdir so any concurrent sibling `Config::load()`
+            // (engine.rs tests call it without knowing about this module's
+            // env vars) imports the EMPTY temp `.env` — an OVERRIDE write
+            // of nothing — instead of the developer's real one, so it can
+            // no longer resurrect AI_USAGE_HUD_BASE_URL after the scrub
+            // below.
+            std::env::set_var("JOEY_HOME", dir.path());
+            // Now scrub the endpoint vars (saved for restore-on-drop).
+            let prev_copilot = std::env::var("COPILOT_API_BASE_URL").ok();
+            let prev_hud = std::env::var("AI_USAGE_HUD_BASE_URL").ok();
+            std::env::remove_var("COPILOT_API_BASE_URL");
+            std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+            Self {
+                _home,
+                _override_lock,
+                prev_copilot,
+                prev_hud,
+                prev_home,
+                _dir: dir,
+                _lock,
+            }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            // Env restores run first, while both locks are still held; the
+            // fields below then release the override and the locks.
+            match &self.prev_home {
+                Some(v) => std::env::set_var("JOEY_HOME", v),
+                None => std::env::remove_var("JOEY_HOME"),
+            }
+            for (k, v) in [
+                ("COPILOT_API_BASE_URL", &self.prev_copilot),
+                ("AI_USAGE_HUD_BASE_URL", &self.prev_hud),
+            ] {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
 
     /// Constitution VII non-regression: `try_build_allocator` returns None when
     /// the selector is neither enabled nor engaged via the `auto` sentinel.
@@ -441,6 +605,7 @@ mod tests {
     /// the agent never wires the intercept and uses the configured model verbatim.
     #[test]
     fn try_build_allocator_none_when_disabled_and_not_auto() {
+        let _g = TestEnvGuard::new();
         let mut cfg = joey_core::Config::defaults();
         // Concretely configured model, selector not enabled.
         cfg.set_model_override("gpt-4o");
@@ -455,6 +620,7 @@ mod tests {
     /// state and the intercept is ready the moment `auto` engages.
     #[test]
     fn try_build_allocator_some_when_auto_active() {
+        let _g = TestEnvGuard::new();
         let mut cfg = joey_core::Config::defaults();
         cfg.set_model_override("auto");
         assert_eq!(cfg.model(), "auto");
@@ -465,6 +631,7 @@ mod tests {
     /// exit 0 on `help` (T024).
     #[test]
     fn llm_selector_help_succeeds() {
+        let _g = TestEnvGuard::new();
         assert!(llm_selector_slash("help").is_ok());
         // The `-h` / `--help` aliases also succeed.
         assert!(llm_selector_slash("-h").is_ok());
@@ -474,6 +641,7 @@ mod tests {
     /// Unknown subcommand returns an error (non-zero exit).
     #[test]
     fn llm_selector_unknown_subcommand_errors() {
+        let _g = TestEnvGuard::new();
         assert!(llm_selector_slash("nonsense").is_err());
     }
 
@@ -484,6 +652,7 @@ mod tests {
     #[test]
     fn resolve_provider_name_reads_model_provider_key() {
         use tempfile::NamedTempFile;
+        let _g = TestEnvGuard::new();
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "model:\n  provider: zai\n  model: glm-5.2\n").unwrap();
         let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
@@ -491,10 +660,17 @@ mod tests {
     }
 
     /// `resolve_provider_name` falls back to the model's vendor prefix when
-    /// provider is "auto" (e.g. "anthropic/claude-..." → "anthropic").
+    /// provider is "auto" (e.g. "anthropic/claude-...” → "anthropic").
     #[test]
     fn resolve_provider_name_falls_back_to_model_vendor() {
         use tempfile::NamedTempFile;
+        let _g = TestEnvGuard::new();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        // A prior test's Config::load() may have loaded ~/.joey/.env with
+        // OVERRIDE semantics into the process env — scrub the HUD var too,
+        // or the magnet in resolve_provider_name fires and we get
+        // "ai-usage-hud" instead of the vendor prefix.
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
@@ -503,5 +679,115 @@ mod tests {
         .unwrap();
         let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
         assert_eq!(resolve_provider_name(&cfg), "anthropic");
+    }
+
+    /// Custom Copilot-compatible endpoint active: the auto-derived provider
+    /// is magnetized to "copilot" so the candidate-pool fetch targets the
+    /// proxy's catalog regardless of the model's vendor prefix (mirrors the
+    /// resolve_profile magnet in joey-providers).
+    #[test]
+    fn resolve_provider_name_magnetizes_to_copilot_on_custom_endpoint() {
+        use tempfile::NamedTempFile;
+        let _g = TestEnvGuard::new();
+        std::env::set_var("COPILOT_API_BASE_URL", "http://127.0.0.1:8317");
+        // HUD takes precedence over the copilot magnet — scrub it so this
+        // test observes the copilot path even when ~/.joey/.env set it.
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "model:\n  provider: auto\n  default: anthropic/claude-sonnet-4\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(resolve_provider_name(&cfg), "copilot");
+        std::env::remove_var("COPILOT_API_BASE_URL");
+    }
+
+    /// AI_USAGE_HUD_BASE_URL active: the auto-derived provider magnetizes to
+    /// "ai-usage-hud" (its own copilot-wire profile).
+    #[test]
+    fn resolve_provider_name_magnetizes_to_hud_on_hud_env_var() {
+        use tempfile::NamedTempFile;
+        let _g = TestEnvGuard::new();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317");
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "model:\n  provider: auto\n  default: anthropic/claude-sonnet-4\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(resolve_provider_name(&cfg), "ai-usage-hud");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+    }
+
+    /// The copilot-wire catalog fetch covers ai-usage-hud: with the HUD env
+    /// var set, fetch_candidate_pool returns a pool from the proxy catalog
+    /// (empty is acceptable when the proxy is down — FR-017 auto-disable).
+    #[test]
+    fn candidate_pool_fetch_targets_hud_via_copilot_wire() {
+        let _g = TestEnvGuard::new();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:1");
+        // is_copilot_wire dispatch — unreachable endpoint yields an empty
+        // pool, not a panic or a models.dev lookup.
+        let pool = fetch_candidate_pool("ai-usage-hud");
+        assert!(pool.is_empty());
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+    }
+
+    /// Render-only refactor (TUI transcript routing) regression: the
+    /// render-only entry point returns the exact bytes the old printers
+    /// emitted. The printing wrapper `llm_selector_slash` delegates here,
+    /// so the line-REPL and `joey llm-selector` CLI paths stay
+    /// byte-identical to the pre-refactor output.
+    #[test]
+    fn llm_selector_slash_text_matches_printer_output() {
+        let _g = TestEnvGuard::new();
+        // help: golden-ish full-shape check (one \n per line, exact ends).
+        let out = llm_selector_slash_text("help").expect("help renders");
+        assert!(out.starts_with("Usage: /llm-selector <subcommand>\n\nSubcommands:\n"));
+        assert!(
+            out.contains(
+                "  refresh                Force-refresh the candidate pool from the live catalog\n"
+            )
+        );
+        assert!(out.ends_with("Alias: /llm-s (prefix abbreviation)\n"));
+        assert_eq!(out.matches('\n').count(), out.lines().count());
+        // status: render_status bytes verbatim, non-empty.
+        assert!(!llm_selector_slash_text("status").unwrap().is_empty());
+    }
+
+    /// The guard pins home to a tempdir (empty models.dev cache, refused
+    /// copilot endpoints), so the pool is empty (FR-017) and `pool`
+    /// renders the empty-pool line exactly as the old println! did.
+    #[test]
+    fn llm_selector_slash_text_pool_empty_golden() {
+        let _g = TestEnvGuard::new();
+        assert_eq!(
+            llm_selector_slash_text("pool").unwrap(),
+            "Candidate pool is empty (no catalog-exposing provider active).\n"
+        );
+    }
+
+    /// enable/disable/diagnoser confirmations keep their exact bytes
+    /// (trailing newline included) for the printing wrapper's byte parity.
+    #[test]
+    fn llm_selector_slash_text_confirmation_lines_golden() {
+        let _g = TestEnvGuard::new();
+        assert_eq!(
+            llm_selector_slash_text("enable").unwrap(),
+            "LLM Selector enabled. Select the 'auto' model to engage dynamic allocation.\n"
+        );
+        assert_eq!(
+            llm_selector_slash_text("disable").unwrap(),
+            "LLM Selector disabled. Using the configured model for all modules.\n"
+        );
+        assert_eq!(
+            llm_selector_slash_text("diagnoser").unwrap(),
+            "Diagnoser model: (unset)\n"
+        );
     }
 }

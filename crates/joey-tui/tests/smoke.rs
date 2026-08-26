@@ -705,6 +705,7 @@ fn cli_flags_and_config_shapes_remain_valid() {
         max_tokens: None,
         stream: false,
         pass_session_id: false,
+        model_pinned: false,
     };
     assert_eq!(ac.model, "custom-flag-model");
 
@@ -731,12 +732,14 @@ fn job_board_renders_during_atlas_execution() {
         work_id: "w1".into(),
     });
     app.apply(AgentEvent::SubagentSpawn {
+        id: 1,
         goal: "Task 1: Implement auth".into(),
         model: "glm-5".into(),
         toolset_summary: "file".into(),
         depth: 1,
     });
     app.apply(AgentEvent::SubagentSpawn {
+        id: 2,
         goal: "Task 2: Write tests".into(),
         model: "glm-5".into(),
         toolset_summary: "file".into(),

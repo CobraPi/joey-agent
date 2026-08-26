@@ -29,6 +29,31 @@ pub fn lsp_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Run a blocking LSP manager operation on the blocking thread pool.
+///
+/// LSP calls do synchronous subprocess I/O (and `diagnostics` includes a
+/// 500ms settle sleep) while holding the global manager mutex. Running that
+/// directly inside `async fn execute` stalls a tokio worker thread and —
+/// under parallel tool dispatch — starves the whole runtime (UI freezes).
+/// `spawn_blocking` keeps the async workers free; the mutex still serializes
+/// LSP servers themselves, which are single-threaded by protocol design.
+async fn with_manager<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut LspManager) -> Result<T, crate::lsp::LspError> + Send + 'static,
+{
+    let mgr = match LSP_MANAGER.get() {
+        Some(m) => m.clone(),
+        None => return Err("No LSP manager registered".into()),
+    };
+    tokio::task::spawn_blocking(move || {
+        let mut guard = mgr.lock().map_err(|e| format!("LSP lock error: {}", e))?;
+        f(&mut guard).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("LSP task failed: {}", e))?
+}
+
 /// Helper to format diagnostics for the tool result.
 fn format_diagnostics(diags: &[crate::lsp::Diagnostic]) -> Value {
     let counts = diags.iter().fold(
@@ -108,18 +133,11 @@ impl Tool for LspDiagnostics {
     }
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
-        let mgr = match LSP_MANAGER.get() {
-            Some(m) => m,
-            None => return ToolResult::Error("No LSP manager registered".into()),
-        };
-        let result = match mgr.lock() {
-            Ok(mut mgr) => mgr.diagnostics(path),
-            Err(e) => return ToolResult::Error(format!("LSP lock error: {}", e)),
-        };
-        match result {
+        let path = path.to_string();
+        match with_manager(move |mgr| mgr.diagnostics(&path)).await {
             Ok(diags) => ToolResult::Text(crate::pyjson::dumps(&format_diagnostics(diags.as_slice()))),
             Err(e) => ToolResult::Text(crate::pyjson::dumps(&json!({
-                "error": e.to_string()
+                "error": e
             }))),
         }
     }
@@ -150,18 +168,10 @@ impl Tool for LspDefinition {
     }
     fn check(&self, _ctx: &ToolContext) -> bool { lsp_available() }
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let character = args.get("character").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let mgr = match LSP_MANAGER.get() {
-            Some(m) => m,
-            None => return ToolResult::Error("No LSP manager registered".into()),
-        };
-        let result = match mgr.lock() {
-            Ok(mut mgr) => mgr.definition(path, line, character),
-            Err(e) => return ToolResult::Error(format!("LSP lock error: {}", e)),
-        };
-        match result {
+        match with_manager(move |mgr| mgr.definition(&path, line, character)).await {
             Ok(locs) if locs.is_empty() => {
                 ToolResult::Text(crate::pyjson::dumps(&json!({
                     "message": "No definitions found"
@@ -175,7 +185,7 @@ impl Tool for LspDefinition {
                 })).collect();
                 ToolResult::Text(crate::pyjson::dumps(&json!({ "definitions": arr })))
             }
-            Err(e) => ToolResult::Text(crate::pyjson::dumps(&json!({ "error": e.to_string() }))),
+            Err(e) => ToolResult::Text(crate::pyjson::dumps(&json!({ "error": e }))),
         }
     }
 }
@@ -205,18 +215,10 @@ impl Tool for LspReferences {
     }
     fn check(&self, _ctx: &ToolContext) -> bool { lsp_available() }
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let character = args.get("character").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let mgr = match LSP_MANAGER.get() {
-            Some(m) => m,
-            None => return ToolResult::Error("No LSP manager registered".into()),
-        };
-        let result = match mgr.lock() {
-            Ok(mut mgr) => mgr.references(path, line, character),
-            Err(e) => return ToolResult::Error(format!("LSP lock error: {}", e)),
-        };
-        match result {
+        match with_manager(move |mgr| mgr.references(&path, line, character)).await {
             Ok(locs) if locs.is_empty() => {
                 ToolResult::Text(crate::pyjson::dumps(&json!({ "message": "No references found" })))
             }
@@ -228,7 +230,7 @@ impl Tool for LspReferences {
                 })).collect();
                 ToolResult::Text(crate::pyjson::dumps(&json!({ "references": arr, "count": arr.len() })))
             }
-            Err(e) => ToolResult::Text(crate::pyjson::dumps(&json!({ "error": e.to_string() }))),
+            Err(e) => ToolResult::Text(crate::pyjson::dumps(&json!({ "error": e }))),
         }
     }
 }
@@ -256,16 +258,8 @@ impl Tool for LspSymbols {
     }
     fn check(&self, _ctx: &ToolContext) -> bool { lsp_available() }
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
-        let mgr = match LSP_MANAGER.get() {
-            Some(m) => m,
-            None => return ToolResult::Error("No LSP manager registered".into()),
-        };
-        let result = match mgr.lock() {
-            Ok(mut mgr) => mgr.document_symbols(path),
-            Err(e) => return ToolResult::Error(format!("LSP lock error: {}", e)),
-        };
-        match result {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        match with_manager(move |mgr| mgr.document_symbols(&path)).await {
             Ok(syms) if syms.is_empty() => {
                 ToolResult::Text(crate::pyjson::dumps(&json!({ "message": "No symbols found" })))
             }
@@ -278,7 +272,7 @@ impl Tool for LspSymbols {
                 })).collect();
                 ToolResult::Text(crate::pyjson::dumps(&json!({ "symbols": arr, "count": arr.len() })))
             }
-            Err(e) => ToolResult::Text(crate::pyjson::dumps(&json!({ "error": e.to_string() }))),
+            Err(e) => ToolResult::Text(crate::pyjson::dumps(&json!({ "error": e }))),
         }
     }
 }

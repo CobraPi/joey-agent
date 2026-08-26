@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Frames Fixture</title></head>
+<body>
+  <h1>Frames Host</h1>
+  <button data-ground-truth="host-btn">Host Button</button>
+  <!-- Same-origin nested child -->
+  <iframe name="child" src="frame-child.html" width="400" height="200" data-ground-truth-frame="child"></iframe>
+  <!-- Cross-origin child: test harness rewrites this port -->
+  <iframe name="remote" src="http://127.0.0.1:__XPORT__/cross-origin-child.html" width="400" height="200" data-ground-truth-frame="remote"></iframe>
+</body>
+</html>

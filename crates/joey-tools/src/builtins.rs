@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::registry::ToolRegistry;
 use crate::tools::*;
+use crate::tools::neurocode_tools::NeuroCodeBackend;
 
 /// Register the self-contained built-in tools. Tools that need broader context
 /// (session DB, the agent itself, the cron store) are registered by the higher
@@ -31,6 +32,16 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register(Arc::new(lsp_tools::LspSymbols));
 }
 
+/// Register the browser automation tools (feature 016). Each tool is hidden
+/// until its shared BrowserHandle is connected (check() → false), so passing
+/// `None` registers nothing visible — call this unconditionally.
+pub fn register_browser_tools(
+    registry: &mut ToolRegistry,
+    handle: Option<Arc<crate::tools::browser_tools::BrowserHandle>>,
+) {
+    crate::tools::browser_tools::register_browser_tools(registry, handle);
+}
+
 /// Register the session_search tool with an optional session DB handle.
 /// Conditionally registers (the tool's `check()` returns false when DB is None).
 pub fn register_session_tools(
@@ -49,4 +60,16 @@ pub fn register_clarify_tool(
     clarify_tx: Option<tokio::sync::mpsc::UnboundedSender<clarify_tool::ClarifyRequest>>,
 ) {
     registry.register(Arc::new(clarify_tool::Clarify::new(clarify_tx)));
+}
+
+/// Register the four NeuroCode tools (index, query, status, ingest) with an
+/// optional backend. When `backend` is `None`, the tools are registered but
+/// remain disabled (their `check()` returns false), so they are hidden from
+/// the model. The concrete backend is supplied by higher crates that own the
+/// `NeuroCodeEngine` handle (joey-tools cannot depend on joey-neurocode — DAG).
+pub fn register_neurocode_tools(
+    registry: &mut ToolRegistry,
+    backend: Option<Arc<dyn NeuroCodeBackend>>,
+) {
+    neurocode_tools::register_neurocode_tools(registry, backend);
 }

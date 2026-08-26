@@ -7,6 +7,7 @@
 //! tools (file, terminal, todo, memory, web, skills).
 
 pub mod builtins;
+pub mod completion;
 pub mod context;
 pub mod difflib;
 pub mod file_tracker;

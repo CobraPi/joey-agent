@@ -33,6 +33,29 @@ pub enum FileChangeSource {
     Detected,
 }
 
+/// One message in a live context-window snapshot (see
+/// [`AgentEvent::ContextSnapshot`]). A display-oriented projection of a
+/// `Message`: role, rough size, and a bounded single-line preview.
+#[derive(Debug, Clone)]
+pub struct ContextEntry {
+    /// Message role: user / assistant / tool (provider-neutral string).
+    pub role: String,
+    /// Rough token estimate for this message.
+    pub tokens: u64,
+    /// Bounded preview (first line, ~80 chars).
+    pub preview: String,
+    /// Whether this message carries tool_calls (assistant tool-request).
+    pub has_tool_calls: bool,
+    /// Whether this entry is a context-compaction summary (compressed).
+    pub is_compressed_summary: bool,
+    /// The FULL text content of the message (expandable-stats feature).
+    /// Populated from the message's text content; assistant tool-request
+    /// messages (empty text) carry the tool_calls rendered as indented
+    /// JSON instead. UIs that only need the one-line preview can ignore
+    /// this — it is purely additive.
+    pub full_content: String,
+}
+
 /// An event emitted during a turn. The CLI/gateway renders these live.
 ///
 /// Ordering guarantees: `ContentDelta`/`ReasoningDelta` stream during a
@@ -48,6 +71,7 @@ pub enum FileChangeSource {
 /// these; the render layer consumes them. See
 /// `specs/005-expandable-diff-ui/contracts/agent-event.md`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AgentEvent {
     // ── Streaming deltas ───────────────────────────────────────────────
     /// A chunk of assistant text.
@@ -77,6 +101,37 @@ pub enum AgentEvent {
     },
     /// Incremental progress from a running tool (upstream `tool_progress`).
     ToolProgress { name: String, progress: String },
+    /// A chunk of RAW output streamed live from a running tool (feature:
+    /// realtime terminal output). Emitted between `ToolStart` and `ToolEnd`
+    /// for the same tool name, carrying lossy-UTF-8 text chunks exactly as
+    /// the subprocess produced them (throttled to the same 50ms window as
+    /// `ToolProgress`). UIs that want a live terminal view accumulate these
+    /// per tool call; UIs that don't can ignore them (additive variant —
+    /// `ToolEnd.full_result` still carries the complete output).
+    ToolOutput { name: String, chunk: String },
+    /// A complete live snapshot of the agent's context window (feature:
+    /// realtime agent-stats page). Emitted at every history mutation the
+    /// turn loop makes (user message appended, assistant/tool messages
+    /// flushed, post-compaction) plus turn start, so a UI can render a
+    /// live-streaming view of exactly what will be sent to the model.
+    /// Additive: UIs that don't care can ignore it — nothing about the
+    /// request itself changes.
+    ContextSnapshot {
+        /// Entries in send order (oldest first), one per history message.
+        entries: Vec<ContextEntry>,
+        /// Rough token estimate for the system prompt (stable per session).
+        system_tokens: u64,
+        /// Rough token estimate for the whole history.
+        history_tokens: u64,
+        /// The compressor's context window (0 = unknown).
+        context_window: u64,
+        /// The effective compression threshold in tokens (0 = unknown).
+        compression_threshold: u64,
+        /// Number of prior compactions this session.
+        compactions: u32,
+        /// Model id the next request will use.
+        model: String,
+    },
     /// A tool call finished (name, whether it errored, result preview).
     ToolEnd {
         name: String,
@@ -96,6 +151,19 @@ pub enum AgentEvent {
         /// renders it when expanded, instead of the one-line `result_preview`.
         /// `result_preview` stays as the always-shown collapsed summary.
         full_result: String,
+    },
+    /// Terminal-governor queue state changed (spec 018, T016, US3/FR-007).
+    /// Emitted on admission/release transitions with a live snapshot of the
+    /// process-global governor's counters: how many terminal commands are
+    /// actively running and how many are waiting for a slot. Additive
+    /// variant per the pattern above — UIs that don't care can ignore it;
+    /// consumers that do render contention indicators only while
+    /// `queued > 0`. See `specs/018-please-fully-implement/contracts/events.md`.
+    TerminalQueueState {
+        /// Terminal commands currently holding an execution slot.
+        active: usize,
+        /// Terminal commands currently waiting for a slot.
+        queued: usize,
     },
 
     // ── File changes (feature 005) ────────────────────────────────────
@@ -154,8 +222,11 @@ pub enum AgentEvent {
     },
 
     // ── Orchestration events ──────────────────────────────────────────
-    /// A subagent was spawned (per child).
+    /// A subagent was spawned (per child). `id` is stable for the child's
+    /// whole lifetime and correlates the [`AgentEvent::SubagentEvent`]
+    /// stream, completion, and the TUI's per-subagent pane.
     SubagentSpawn {
+        id: u64,
         goal: String,
         model: String,
         toolset_summary: String,
@@ -163,6 +234,7 @@ pub enum AgentEvent {
     },
     /// A subagent completed successfully.
     SubagentComplete {
+        id: u64,
         goal: String,
         success: bool,
         summary_preview: String,
@@ -171,6 +243,7 @@ pub enum AgentEvent {
     },
     /// A subagent failed with an error.
     SubagentFailed {
+        id: u64,
         goal: String,
         error: String,
         duration_secs: f64,
@@ -182,12 +255,84 @@ pub enum AgentEvent {
         failed: usize,
         total_duration_secs: f64,
     },
+    /// A live event produced by a running subagent, tagged with the child's
+    /// stable id (parallel-subagent feature). The orchestration layer wraps
+    /// EVERY event the child `Agent` emits — `ContentDelta`, `ToolStart`,
+    /// `ContextSnapshot`, even the child's own `Done` — so a UI can render a
+    /// dedicated per-subagent view without those events contaminating the
+    /// parent's transcript or turn state. Consumers that don't care about
+    /// per-subagent detail can ignore this variant entirely; the plain
+    /// `SubagentSpawn`/`SubagentComplete`/`SubagentFailed` lifecycle events
+    /// still arrive unwrapped alongside it.
+    SubagentEvent {
+        /// Stable child id (matches `SubagentSpawn.id`).
+        id: u64,
+        /// The child's own event.
+        event: Box<AgentEvent>,
+    },
 
     // ── OMO orchestration events ─────────────────────────────────────
     /// The active agent mode changed via Tab picker (T035, BC-015).
     AgentModeChanged {
         agent_name: String,
         model: String,
+    },
+    /// Feature 015 (NeuroCode): the pre-dispatch intercept assembled a
+    /// dependency-aware context graph for the upcoming request. Emitted
+    /// BEFORE the model call so UIs can show a live feed of exactly what
+    /// context NeuroCode is feeding the agent. Only fired when the engine
+    /// is wired AND active (byte-identical when off).
+    NeuroCodeContext {
+        /// The complexity tier that served the request (e.g. "frontier").
+        tier: String,
+        /// Estimated tokens in the assembled context.
+        token_estimate: usize,
+        /// Number of graph-expanded nodes included.
+        expanded_nodes: usize,
+        /// Whether the project was cold/un-indexed (degraded mode).
+        cold_mode: bool,
+        /// The full formatted context text fed to the model (the live feed
+        /// payload; UIs truncate for display).
+        formatted_context: String,
+    },
+    /// Feature 015 (NeuroCode) follow-up: live assembly progress emitted
+    /// DURING `assemble_context_with_progress` (before the final
+    /// `NeuroCodeContext` blob) so UIs can stream the context feed in
+    /// realtime — one event per assembly stage (locate → expand → format →
+    /// anti-patterns → domain knowledge). Only fired when the engine is
+    /// wired AND active (byte-identical when off).
+    NeuroCodeProgress {
+        /// Short human-readable stage description (e.g. "expanded graph: 7 nodes pulled in").
+        stage: String,
+    },
+    /// Feature 015 follow-up (interactive context visualization): the
+    /// structured node/edge snapshot of the assembled context graph, emitted
+    /// right after [`AgentEvent::NeuroCodeContext`]. UIs use this to render
+    /// an interactive graph view of the expansion window. Only fired when
+    /// the engine produced a snapshot (populated graph); the CLI renderer
+    /// consumes it silently.
+    NeuroCodeGraph {
+        /// Pure-data projection of primary + expanded nodes and the edges
+        /// among them (no graph-store handle inside).
+        snapshot: joey_neurocode::ContextGraphSnapshot,
+    },
+    /// Feature 015 (NeuroCode): the engine's active/inactive state changed
+    /// (wired + enabled). Lets UIs show/hide the NeuroCode indicator without
+    /// polling config.
+    NeuroCodeActive { active: bool },
+    /// Feature 015 follow-up (auto re-index): the structural graph was
+    /// rebuilt after large edits, so subsequent assemblies reflect the
+    /// current codebase. Emitted after the re-index completes at turn end;
+    /// UIs show a brief notice. The turn's already-assembled context is
+    /// NOT retroactively rewritten — the next user turn re-assembles
+    /// against the fresh index.
+    NeuroCodeReindexed {
+        /// Distinct source files re-scanned.
+        files_scanned: usize,
+        /// Edit-pressure that triggered the pass (files / lines tracked
+        /// before the reset).
+        files_edited: usize,
+        lines_edited: usize,
     },
     /// A category-based delegation was dispatched (T059).
     CategoryDelegation {

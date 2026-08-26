@@ -20,6 +20,7 @@ fn make_agent_config() -> AgentConfig {
         max_tokens: None,
         stream: false,
         pass_session_id: false,
+        model_pinned: false,
     }
 }
 
@@ -64,6 +65,8 @@ async fn context_field_is_passed_to_subagent() {
         model: None,
         toolsets: vec![],
         max_turns: None,
+        reasoning: None,
+        max_tokens: None,
         persist: false,
         role: joey_orchestration::SubagentRole::Leaf,
         workdir: None,

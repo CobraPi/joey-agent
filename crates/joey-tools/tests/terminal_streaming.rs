@@ -122,17 +122,19 @@ async fn terminal_emits_progress_during_long_command() {
 async fn terminal_progress_arrives_before_completion() {
     // A progress delta must arrive DURING the run, not only at the end.
     // We race the command against a timer: if streaming works, we observe a
-    // delta well before the (3s) command finishes.
+    // delta well before the (1s) command finishes.
     let tool = terminal();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let ctx = ctx().with_progress_sender(Some(tx));
 
     let run = tokio::spawn(async move {
-        tool.execute(json!({ "command": "echo early; sleep 3; echo late" }), &ctx)
+        tool.execute(json!({ "command": "echo early; sleep 1; echo late" }), &ctx)
             .await
     });
 
-    // Within 1.5s we should have seen the "early" delta.
+    // Within 1.5s we should have seen the "early" delta (the 1s command
+    // duration stays under this window even with the reader-stall quirk).
+
     let got_early = tokio::time::timeout(
         std::time::Duration::from_millis(1500),
         async {
@@ -151,8 +153,58 @@ async fn terminal_progress_arrives_before_completion() {
         "expected an 'early' progress delta before the command finished"
     );
 
-    // Cancel the long command so the test does not wait the full 3s+.
+    // Cancel the command so the test does not wait for the full run.
     run.abort();
+}
+
+// ── Live output channel (realtime terminal view) ─────────────────────────
+
+#[tokio::test]
+async fn terminal_emits_raw_output_chunks_during_long_command() {
+    // The dedicated output channel mirrors progress: raw chunks arrive
+    // DURING the run (not only at completion), carrying the same text.
+    let tool = terminal();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let ctx = ctx().with_output_sender(Some(tx));
+
+    let run = tokio::spawn(async move {
+        tool.execute(json!({ "command": "echo early; sleep 1; echo late" }), &ctx)
+            .await
+    });
+
+    // Within 1.5s we should have seen the "early" raw chunk (the 1s command
+    // duration stays under this window even with the reader-stall quirk).
+    let got_early = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        async {
+            loop {
+                match rx.recv().await {
+                    Some(msg) if msg.contains("early") => return true,
+                    Some(_) => continue,
+                    None => return false,
+                }
+            }
+        },
+    )
+    .await;
+    assert!(
+        got_early.unwrap_or(false),
+        "expected an 'early' raw output chunk before the command finished"
+    );
+
+    run.abort();
+}
+
+#[tokio::test]
+async fn terminal_output_channel_noop_without_sender() {
+    // Backward compatibility: no output sender wired → the tool still works.
+    let tool = terminal();
+    let result = tool
+        .execute(json!({ "command": "echo no_sender" }), &ctx())
+        .await;
+    let v = parse_result(&result.to_content_string());
+    assert_eq!(v["exit_code"], json!(0));
+    assert!(v["output"].as_str().unwrap().contains("no_sender"));
 }
 
 // ── T011: temp-file round-trip for > 4 KB output ─────────────────────────
@@ -190,12 +242,12 @@ async fn terminal_interrupt_cancels_long_command() {
     let flag = Arc::new(AtomicBool::new(false));
     let ctx = ctx().with_interrupt_flag(Some(flag.clone()));
 
-    // Start a 30s command.
+    // Start a command that outlives the interrupt request below (3s vs 1s).
     let handle = {
         let tool = tool.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            tool.execute(json!({ "command": "sleep 30" }), &ctx).await
+            tool.execute(json!({ "command": "sleep 3" }), &ctx).await
         })
     };
 
@@ -204,7 +256,7 @@ async fn terminal_interrupt_cancels_long_command() {
     flag.store(true, Ordering::SeqCst);
 
     // The tool must return within ~5s of the interrupt — well under the
-    // remaining ~29s of the command. This proves the streaming loop honored
+    // remaining ~2s of the command. This proves the streaming loop honored
     // the interrupt instead of blocking until process exit.
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
         .await
@@ -242,10 +294,14 @@ async fn terminal_without_interrupt_flag_runs_to_completion() {
 async fn terminal_silent_command_emits_elapsed_heartbeat() {
     // A command that produces NO output for several seconds should emit a
     // "running… Ns" heartbeat so the user knows it's still working.
+    // NOTE: the heartbeat interval is 2s and the child spawns slightly
+    // BEFORE the heartbeat timer starts, so the sleep must strictly exceed
+    // 2s (a `sleep 2` would let EOF beat the first tick) — 3s keeps a 1s
+    // margin while still exercising the silent-command path.
     let tool = terminal();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let ctx = ctx().with_progress_sender(Some(tx));
-    let result = tool.execute(json!({ "command": "sleep 4" }), &ctx).await;
+    let result = tool.execute(json!({ "command": "sleep 3" }), &ctx).await;
     let v = parse_result(&result.to_content_string());
     assert_eq!(v["exit_code"], json!(0));
 

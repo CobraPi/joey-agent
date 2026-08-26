@@ -152,12 +152,23 @@ fn parse_copilot_entry(entry: &Value) -> Option<CandidateModel> {
 }
 
 fn copilot_context_window(entry: &Value, id: &str) -> u64 {
-    // copilot.rs catalog_context_window reads capabilities.limits.max_prompt_tokens
-    let from_cat = entry
+    // Mirrors copilot.rs catalog_context_window: prefer
+    // capabilities.limits.max_context_window_tokens (the full window;
+    // max_prompt_tokens is a smaller prompt-only budget), fall back to
+    // max_prompt_tokens for older catalogs without the window field.
+    let limits = entry
         .get("capabilities")
-        .and_then(|c| c.get("limits"))
-        .and_then(|l| l.get("max_prompt_tokens"))
-        .and_then(|v| v.as_u64());
+        .and_then(|c| c.get("limits"));
+    let from_cat = limits
+        .and_then(|l| l.get("max_context_window_tokens"))
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0)
+        .or_else(|| {
+            limits
+                .and_then(|l| l.get("max_prompt_tokens"))
+                .and_then(|v| v.as_u64())
+                .filter(|v| *v > 0)
+        });
     from_cat.unwrap_or_else(|| default_context_length(id))
 }
 
@@ -472,6 +483,24 @@ mod tests {
         assert_eq!(models[0].id, "m1");
         assert_eq!(models[0].context_window, 64000);
         assert!(models[0].supports_tools);
+    }
+
+    #[test]
+    fn test_copilot_context_window_prefers_full_window() {
+        let raw = serde_json::json!([
+            {"id": "m1", "capabilities": {"type": "chat", "limits": {"max_context_window_tokens": 264000, "max_prompt_tokens": 200000}, "supported_endpoints": ["chat/completions"]}},
+            {"id": "m2", "capabilities": {"type": "chat", "limits": {"max_prompt_tokens": 128000}, "supported_endpoints": ["chat/completions"]}},
+            {"id": "m3", "capabilities": {"type": "chat", "limits": {"max_context_window_tokens": 0, "max_prompt_tokens": 64000}, "supported_endpoints": ["chat/completions"]}},
+        ]);
+        let arr = raw.as_array().unwrap();
+        let (models, _) = consolidate_copilot(arr);
+        assert_eq!(models.len(), 3);
+        // Full window wins over the prompt-only budget.
+        assert_eq!(models[0].context_window, 264_000);
+        // Fallback when the window field is absent.
+        assert_eq!(models[1].context_window, 128_000);
+        // Zero/invalid window falls back to max_prompt_tokens.
+        assert_eq!(models[2].context_window, 64_000);
     }
 
     #[test]

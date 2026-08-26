@@ -784,6 +784,11 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     if !tool_guidance.is_empty() {
         stable_parts.push(tool_guidance.join(" "));
     }
+    // Mid-turn steering channel note (system_prompt.py:244) — appended
+    // whenever tools are loaded (steers piggyback on tool results).
+    if has_tools {
+        stable_parts.push(STEER_CHANNEL_NOTE.to_string());
+    }
 
     // 6. Model-family guidance (tool-use enforcement + per-family blocks).
     if has_tools && tool_use_enforcement_applies(ctx, inputs.model) {

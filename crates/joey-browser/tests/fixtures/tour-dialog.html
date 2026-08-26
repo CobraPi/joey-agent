@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Tour Dialog</title><style>
+#tour{position:fixed;top:40%;left:30%;width:40%;z-index:9000;background:#fff;border:2px solid #456;box-shadow:0 4px 24px rgba(0,0,0,.3);padding:20px}
+</style></head>
+<body>
+  <h1>First-Run Tour</h1>
+  <button data-ground-truth="target-btn" id="target" onclick="document.body.dataset.target='clicked'">The Real Target</button>
+  <div id="tour" role="dialog">
+    <p>Welcome! Take the tour?</p>
+    <!-- Task-relevant dialog: the dismissal button IS the tour's next-step
+         button; conservative policy must FLAG, not auto-dismiss. -->
+    <button data-ground-truth="tour-next" id="next" onclick="document.body.dataset.tour='next'">Next: see the target</button>
+    <button id="skip" onclick="document.getElementById('tour').remove()">Skip tour</button>
+  </div>
+</body>
+</html>

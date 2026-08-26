@@ -5,11 +5,17 @@
 //! and structured lifecycle events. Ported from Hermes Agent's delegate_task
 //! and Crush's coordinator patterns.
 
+pub mod capacity;
 pub mod delegation_tool;
 pub mod manager;
 pub mod subagent;
+pub mod tap;
 pub mod types;
 
+pub use capacity::{
+    capacity_children, capacity_requests, SystemCapacity, DEFAULT_MEM_MAX_FRACTION,
+    DEFAULT_MEM_RESERVE_MB_PER_CHILD, HARD_CHILD_CEILING,
+};
 pub use delegation_tool::{CallOmoAgent, DelegateTask};
 pub use manager::{ManagerConfig, SubagentManager};
 pub use types::{DelegationRequest, DelegationResult, SubagentRole, TaskSpec};
@@ -101,20 +107,23 @@ fn register_orchestration_inner(
         parent_config_tree.clone(),
         base_registry.clone(),
         event_tx.clone(),
-        resolver,
+        resolver.clone(),
     );
     if let Some(alloc) = allocator {
         delegate.set_model_allocator(alloc);
     }
     registry.register(std::sync::Arc::new(delegate));
-    // Register call_omo_agent without resolver (T153).
+    // Register call_omo_agent WITH the resolver: it requires
+    // `subagent_type` resolution to succeed — a None resolver made the
+    // tool permanently error ("requires an OMO category resolver"),
+    // killing Junior's research path (T153) entirely.
     registry.register(std::sync::Arc::new(CallOmoAgent::new(
         manager,
         parent_config,
         parent_config_tree,
         base_registry,
         event_tx,
-        None,
+        resolver,
     )));
 }
 

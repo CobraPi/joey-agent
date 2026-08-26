@@ -109,6 +109,34 @@ fn error_body(code: &str, message: impl Into<String>) -> Json<serde_json::Value>
     Json(json!({ "error": code, "message": message.into() }))
 }
 
+/// Whole-token containment: true when `needle` appears in `haystack` bounded
+/// by non-alphanumeric characters (or string edges). Plain `contains` made
+/// "FR-01" match "FR-011"'s line and "T001" match "T0010" — editing the wrong
+/// requirement/task row.
+fn contains_id_token(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return false;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric();
+    let mut start = 0usize;
+    while start + n.len() <= h.len() {
+        if &h[start..start + n.len()] == n {
+            let before_ok = start == 0 || !is_word(h[start - 1]);
+            let after = start + n.len();
+            let after_ok = after == h.len() || !is_word(h[after]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        // Advance to the next possible start (avoid quadratic pathologies on
+        // pathological repeats by skipping to next boundary on full match).
+        start += 1;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------
 // GET /api/features
 // ---------------------------------------------------------------------
@@ -293,7 +321,7 @@ async fn patch_spec(
     let current = std::fs::read_to_string(&spec_path).unwrap_or_default();
     let target_line = current
         .lines()
-        .find(|l| l.trim_start().contains(body.target.id.as_str()))
+        .find(|l| contains_id_token(l.trim_start(), body.target.id.as_str()))
         .map(|l| l.to_string());
 
     let Some(target_line) = target_line else {
@@ -366,7 +394,7 @@ async fn patch_task(
     let current = std::fs::read_to_string(&tasks_path).unwrap_or_default();
     let target_line = current
         .lines()
-        .find(|l| l.trim_start().contains(task_id.as_str()))
+        .find(|l| contains_id_token(l.trim_start(), task_id.as_str()))
         .map(|l| l.to_string());
 
     let Some(target_line) = target_line else {
@@ -1703,6 +1731,14 @@ async fn post_setup_commit(
     State(state): State<AppState>,
     Json(req): Json<SetupCommitRequest>,
 ) -> impl IntoResponse {
+    // Body-controlled feature id lands in a filesystem path — validate.
+    if !crate::parser::discovery::is_safe_feature_id(&req.feature_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            error_body("invalid_path", "feature_id is not a safe path component"),
+        )
+            .into_response();
+    }
     let feature_dir = state.repo_root.join("specs").join(&req.feature_id);
     if feature_dir.exists() {
         return (
@@ -2173,6 +2209,18 @@ async fn post_patch(
     AxPath(id): AxPath<String>,
     Json(req): Json<PatchRequest>,
 ) -> impl IntoResponse {
+    // Path-traversal guard: `id` and `req.artifact` are request-controlled
+    // and land in a filesystem path unchecked (percent-encoded `..` passes
+    // axum's path decoding).
+    if !crate::parser::discovery::is_safe_feature_id(&id)
+        || !crate::parser::discovery::is_safe_artifact_name(&req.artifact)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            error_body("invalid_path", "feature id or artifact name is not a safe path component"),
+        )
+            .into_response();
+    }
     let artifact_path = format!("specs/{id}/{}", req.artifact);
     let full_path = state.repo_root.join(&artifact_path);
 
@@ -2380,6 +2428,14 @@ async fn post_board_toggle(
     State(state): State<AppState>,
     AxPath((id, task_id)): AxPath<(String, String)>,
 ) -> impl IntoResponse {
+    // Path-traversal guard (see post_patch).
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            error_body("invalid_path", "feature id is not a safe path component"),
+        )
+            .into_response();
+    }
     let artifact_path = format!("specs/{id}/tasks.md");
     let full_path = state.repo_root.join(&artifact_path);
 
@@ -2406,7 +2462,7 @@ async fn post_board_toggle(
             crate::cst::CstProps::ListItem { text, .. } => text,
             _ => return false,
         };
-        text.contains(&task_id)
+        contains_id_token(text, &task_id)
     });
 
     let node = match target_node {
@@ -2425,7 +2481,11 @@ async fn post_board_toggle(
     let expected = &node.expected_bytes;
     let (old_box, new_box) = if expected.contains("[ ]") {
         ("[ ]", "[x]")
-    } else if expected.contains("[x]") || expected.contains("[X]") {
+    } else if expected.contains("[X]") {
+        // Uppercase checked form — replacen("[x]") would never match it
+        // (silent no-op reported as Applied).
+        ("[X]", "[ ]")
+    } else if expected.contains("[x]") {
         ("[x]", "[ ]")
     } else {
         return (
