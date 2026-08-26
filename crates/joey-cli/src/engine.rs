@@ -1582,7 +1582,13 @@ mod actor_tests {
 
         let mut saw_planning_progress = false;
         let mut finished_text: Option<String> = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // T027: 60s tripped under heavy ambient load (load avg ~8-10 during
+        // full-suite convergence runs, 2026-08-25) — the pipeline's child
+        // phases (planner/explorer/implementor) and this test's event loop
+        // all slow down together. The deadline is a meta-budget: the
+        // assertions below check event content and ordering, not speed.
+        // 3x headroom instead of racing ambient load.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
         while finished_text.is_none() && std::time::Instant::now() < deadline {
             match ev_rx.try_recv() {
                 Ok(EngineEvent::HypercodeProgress { phase, .. }) => {

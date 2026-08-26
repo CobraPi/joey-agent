@@ -3086,6 +3086,23 @@ impl Agent {
                 });
             }
         });
+        // Terminal-governor queue-state forwarding (spec 018, T017/US3):
+        // symmetric third channel. The terminal tool pushes `(active,
+        // queued)` snapshots on governor admission/release transitions
+        // (producer-side throttled to the 50ms coalescing budget, SC-005);
+        // this task maps them to `AgentEvent::TerminalQueueState` — a
+        // session-global snapshot, so unlike ToolProgress/ToolOutput it
+        // carries no tool name. Channel and forwarding task exist for
+        // every tool call; tools that never emit queue state simply never
+        // send (the task parks on recv and exits when the sender drops).
+        // Declared BEFORE the output task below, which moves `tx`.
+        let (queue_tx, mut queue_rx) = mpsc::unbounded_channel::<(usize, usize)>();
+        let queue_tx_agent = tx.clone();
+        tokio::spawn(async move {
+            while let Some((active, queued)) = queue_rx.recv().await {
+                let _ = queue_tx_agent.send(AgentEvent::TerminalQueueState { active, queued });
+            }
+        });
         let (output_tx, mut output_rx) = mpsc::unbounded_channel::<String>();
         let out_name = tool_name.to_string();
         tokio::spawn(async move {
@@ -3096,11 +3113,32 @@ impl Agent {
                 });
             }
         });
+        // Terminal-governor fairness key (spec 018, US2/T013): stable per
+        // agent lifetime and distinct between agents. The ToolContext's
+        // session id IS that identity — the CLI session id for the main
+        // agent (repl.rs), a fresh `subagent-<uuid>` for orchestration
+        // children (subagent.rs `child_context`), and `cron-<job.id>` for
+        // background cron runs (cron_cmd.rs). It is fixed at context
+        // construction and shared by every clone, so every tool call from
+        // one agent maps to the same governor queue for round-robin
+        // admission. An empty id leaves `queue_key` unset — the governor
+        // then resolves its shared default key (no fallback duplicated
+        // here).
+        let queue_key: Option<std::sync::Arc<str>> = {
+            let sid = self.ctx.session_id();
+            if sid.is_empty() {
+                None
+            } else {
+                Some(std::sync::Arc::from(sid))
+            }
+        };
         self.ctx
             .clone()
             .with_progress_sender(Some(progress_tx))
             .with_output_sender(Some(output_tx))
+            .with_queue_state_sender(Some(queue_tx))
             .with_interrupt_flag(Some(self.interrupt.clone()))
+            .with_queue_key(queue_key)
     }
 }
 

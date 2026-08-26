@@ -97,6 +97,11 @@ halt tool calls — see [HOOKS.md](HOOKS.md).
 - `--safe-mode` — disables user config and MCP servers entirely.
 - `terminal.timeout` (180s default) / hard foreground max 600s; env
   overrides `TERMINAL_TIMEOUT` / `TERMINAL_MAX_FOREGROUND_TIMEOUT`.
+- `terminal.max_concurrent` caps how many agent terminal processes run at
+  once (`auto` = clamp(CPU cores, 4, 16); a positive integer pins the cap;
+  malformed values fall back to `auto`; env `TERMINAL_MAX_CONCURRENT`).
+  Excess requests queue (per-agent round-robin) instead of exhausting the
+  process table / file descriptors.
 - Per-profile homes fully isolate config, credentials, sessions, and logs
   (`-p/--profile`).
 

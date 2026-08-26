@@ -1221,3 +1221,19 @@ enable|disable <server>:<tool>` writes mcp_servers.<s>.tools.include/exclude.
 here (voice STT/TTS, marketplace, Nous-account billing, platform adapters,
 petdex media generation, kanban coordination) do their maximal local behavior
 and state precisely what's deferred — no fabricated success.
+
+## Terminal concurrency governor (feature 018, 2026-08-24)
+
+**Status**: Deliberate deviation — Joey extension (no upstream Hermes
+counterpart; upstream has no multi-agent terminal cap).
+
+Caps concurrently running agent-initiated terminal processes and queues the
+rest: a global cap (`terminal.max_concurrent`, default `auto` =
+clamp(CPU cores, 4, 16); positive integer pins it; env
+`TERMINAL_MAX_CONCURRENT` overrides), per-agent round-robin admission so
+waiting agents take turns, admission-time timeouts (a request that cannot
+be admitted times out rather than running overtime), cancellation cleanup
+for queued/in-flight calls, and queue-state events surfaced as CLI/TUI
+indicators while requests are waiting. Upstream's terminal executor has no
+equivalent subsystem, so this is Joey-original additive surface; spec and
+tracking live in `specs/018-please-fully-implement/`.

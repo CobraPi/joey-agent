@@ -1459,12 +1459,22 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
                     "set theClipboard to the clipboard as «class PNGf»\nset theFile to open for access POSIX file \"{}\" with write permission\nwrite theClipboard to theFile\nclose access theFile",
                     out_path.display()
                 );
-                let status = std::process::Command::new("osascript")
-                    .arg("-e")
-                    .arg(&script)
-                    .stderr(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .status();
+                // Run the osascript subprocess off the async hot path
+                // (same spawn_blocking pattern as /neurocode and the
+                // auto-checkpoint git work above).
+                let status = tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("osascript")
+                        .arg("-e")
+                        .arg(&script)
+                        .stderr(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .status()
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    render::error(&format!("clipboard export task failed: {e}"));
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, "join error"))
+                });
                 let ok = matches!(status, Ok(s) if s.success()) && out_path.exists();
                 if ok {
                     match crate::slash_extra::image_data_url(out_path.to_str().unwrap_or_default()) {
@@ -2323,6 +2333,11 @@ fn show_status(st: &ReplState) {
         commafy_i64(comp.threshold_tokens),
         comp.compression_count
     );
+    // Terminal governor snapshot (on-demand poll; /status is an on-demand
+    // command so reading stats() at invocation is correct — no event
+    // subscription needed). T020, specs/018 tasks.md Phase 5.
+    let (term_active, term_queued) = joey_tools::tools::terminal_governor::terminal_governor().stats();
+    println!("Terminal:  active: {}, queued: {}", term_active, term_queued);
     let elapsed = st.session_start.elapsed().as_secs();
     println!("Uptime:    {}m {}s", elapsed / 60, elapsed % 60);
     println!(

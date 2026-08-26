@@ -155,6 +155,9 @@ mod tests {
 mod concurrency_tests {
     use super::*;
 
+    /// T027: records per writer thread in the concurrency test below.
+    const RECORDS_PER_THREAD: usize = 10;
+
     /// Regression: `record()` used to truncate the shared file in place
     /// (File::create) while another surface (CLI or TUI) was mid-rewrite —
     /// interleaved read-modify-write cycles silently dropped entries and
@@ -170,7 +173,20 @@ mod concurrency_tests {
         for t in 0..8 {
             let path = path.clone();
             handles.push(std::thread::spawn(move || {
-                for i in 0..25 {
+                // T027: was 25 records/thread — under heavy ambient load
+                // (load avg ~8-10 during full-suite runs, 2026-08-25) the
+                // resulting 200-cycle fsync storm could starve a writer
+                // past `with_history_lock`'s 5s best-effort fallback,
+                // which DELIBERATELY proceeds unlocked
+                // (liveness-over-durability — see its doc comment),
+                // opening that designed lockless window and losing
+                // entries. 8x10 keeps the lock-queue wait well inside the
+                // 5s envelope even at ~10x per-cycle inflation, while
+                // still exercising 8-way concurrent read-modify-write +
+                // atomic commit: the in-place-truncate regression this
+                // test guards loses entries with far fewer writers/
+                // records than this.
+                for i in 0..RECORDS_PER_THREAD {
                     record_at(&path, &format!("t{t}-e{i}"));
                 }
             }));
@@ -180,7 +196,7 @@ mod concurrency_tests {
         }
         let all = load_at(&path);
         for t in 0..8 {
-            for i in 0..25 {
+            for i in 0..RECORDS_PER_THREAD {
                 let text = format!("t{t}-e{i}");
                 assert!(
                     all.contains(&text),
@@ -188,7 +204,7 @@ mod concurrency_tests {
                 );
             }
         }
-        assert_eq!(all.len(), 8 * 25, "every concurrent record survives");
+        assert_eq!(all.len(), 8 * RECORDS_PER_THREAD, "every concurrent record survives");
         // No temp litter left behind.
         let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()

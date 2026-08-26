@@ -71,6 +71,7 @@ pub struct ContextEntry {
 /// these; the render layer consumes them. See
 /// `specs/005-expandable-diff-ui/contracts/agent-event.md`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AgentEvent {
     // ── Streaming deltas ───────────────────────────────────────────────
     /// A chunk of assistant text.
@@ -150,6 +151,19 @@ pub enum AgentEvent {
         /// renders it when expanded, instead of the one-line `result_preview`.
         /// `result_preview` stays as the always-shown collapsed summary.
         full_result: String,
+    },
+    /// Terminal-governor queue state changed (spec 018, T016, US3/FR-007).
+    /// Emitted on admission/release transitions with a live snapshot of the
+    /// process-global governor's counters: how many terminal commands are
+    /// actively running and how many are waiting for a slot. Additive
+    /// variant per the pattern above — UIs that don't care can ignore it;
+    /// consumers that do render contention indicators only while
+    /// `queued > 0`. See `specs/018-please-fully-implement/contracts/events.md`.
+    TerminalQueueState {
+        /// Terminal commands currently holding an execution slot.
+        active: usize,
+        /// Terminal commands currently waiting for a slot.
+        queued: usize,
     },
 
     // ── File changes (feature 005) ────────────────────────────────────

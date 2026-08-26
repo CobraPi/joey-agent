@@ -102,7 +102,14 @@ Keys actually read in code (defaults in the embedded config):
 `agent.parallel_tool_call_guidance`, `agent.task_completion_guidance`.
 
 **terminal**: `terminal.backend` ("local"), `terminal.cwd` ("."),
-`terminal.timeout` (180).
+`terminal.timeout` (180), `terminal.max_concurrent` ("auto" — global cap on
+concurrently running agent-initiated terminal processes; `auto`/absent/`0` =
+clamp(CPU cores, 4, 16), a positive integer N pins the cap at N, invalid
+values fall back to `auto` via the existing malformed-config warning path;
+env override `TERMINAL_MAX_CONCURRENT`, precedence env > config > auto,
+mirroring `TERMINAL_TIMEOUT`; requests beyond the cap queue with per-agent
+round-robin admission — a lone agent's calls stay sequential and never
+queue).
 
 **toolsets**: `toolsets` (list; default `["joey-cli"]`).
 

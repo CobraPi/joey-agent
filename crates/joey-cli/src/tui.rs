@@ -229,6 +229,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
 
     // Single-query mode: submit, pump until done, hand the answer back.
     if let Some(query) = &opts.query {
+        let (bg_items_tx, bg_items_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut session = TuiSession {
             tui,
             ev_rx,
@@ -244,6 +245,8 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
             busy_enter_mode: joey_core::Config::load()
                 .map(|c| c.get_str("display.busy_enter", "interrupt"))
                 .unwrap_or_else(|_| "interrupt".to_string()),
+            bg_items_tx,
+            bg_items_rx,
         };
         session.submit(query.clone());
         loop {
@@ -276,6 +279,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     }
 
     // Interactive loop.
+    let (bg_items_tx, bg_items_rx) = tokio::sync::mpsc::unbounded_channel();
     let session = TuiSession {
         tui,
         ev_rx,
@@ -291,6 +295,8 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         busy_enter_mode: joey_core::Config::load()
             .map(|c| c.get_str("display.busy_enter", "interrupt"))
             .unwrap_or_else(|_| "interrupt".to_string()),
+        bg_items_tx,
+        bg_items_rx,
     };
     let (result, outro) = interactive_loop(session).await;
 
@@ -388,6 +394,13 @@ pub struct TuiSession {
     /// "interrupt" (backed by config display.busy_enter; upstream default
     /// interrupt).
     pub busy_enter_mode: String,
+    /// UI-side mailbox for transcript items produced by spawned background
+    /// work (T008: `/paste`'s osascript). The sender clone is handed to the
+    /// spawned task; pump_one drains the receiver alongside engine/tap
+    /// events, so a slow subprocess never blocks rendering or input. The
+    /// session keeps its own sender so the channel never reads as closed.
+    pub bg_items_tx: tokio::sync::mpsc::UnboundedSender<TranscriptItem>,
+    pub bg_items_rx: tokio::sync::mpsc::UnboundedReceiver<TranscriptItem>,
 }
 
 impl TuiSession {
@@ -897,6 +910,15 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
 
     let ev = tokio::select! {
         ev = session.ev_rx.recv() => ev,
+        bg_item = session.bg_items_rx.recv() => {
+            // T008: transcript items from spawned background work (/paste's
+            // osascript) land here — applied to the App exactly like engine
+            // events, without the pump ever awaiting the subprocess.
+            if let Some(item) = bg_item {
+                session.tui.app_mut().push_item(item);
+            }
+            return None;
+        }
         tap_ev = session.tap_rx.recv() => {
             // Parallel-subagent feature: delegation tap events (spawn /
             // wrapped child stream / complete) update the App directly.
@@ -1426,10 +1448,13 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                         app.transcript.len(),
                     )
                 };
+                // Terminal governor snapshot, polled on demand (T020).
+                let (term_active, term_queued) =
+                    joey_tools::tools::terminal_governor::terminal_governor().stats();
                 self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: format!(
-                        "session {} | model {} | tokens in:{} out:{} api:{} | messages {}",
-                        sid, mdl, tok_prompt, tok_comp, tok_iter, msg_count,
+                        "session {} | model {} | tokens in:{} out:{} api:{} | messages {} | terminal active:{} queued:{}",
+                        sid, mdl, tok_prompt, tok_comp, tok_iter, msg_count, term_active, term_queued,
                     ),
                     kind: NoticeKind::Info,
                 });
@@ -2224,6 +2249,15 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                 }
             }
             "paste" => {
+                // T008: the osascript subprocess used to run synchronously
+                // here — inside pump_one's single UI task — stalling ALL
+                // rendering and input for its whole duration. The command
+                // construction, args, stdio nulls, success check, cleanup,
+                // and messages are byte-identical to the old inline path;
+                // only the execution moved to spawn_blocking, with results
+                // delivered back through the pumped bg_items mailbox
+                // (transcript items) and the engine command channel
+                // (AttachImage) — the same routes handle_slash already uses.
                 #[cfg(target_os = "macos")]
                 {
                     let dir = std::env::temp_dir();
@@ -2232,32 +2266,52 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                         "set theClipboard to the clipboard as «class PNGf»\nset theFile to open for access POSIX file \"{}\" with write permission\nwrite theClipboard to theFile\nclose access theFile",
                         out_path.display()
                     );
-                    let status = std::process::Command::new("osascript")
-                        .arg("-e")
-                        .arg(&script)
-                        .stderr(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .status();
-                    let ok = matches!(status, Ok(s) if s.success()) && out_path.exists();
-                    if ok {
-                        match crate::slash_extra::image_data_url(out_path.to_str().unwrap_or_default()) {
-                            Ok(url) => {
-                                if let Some(engine) = &self.engine {
-                                    engine.send(crate::engine::EngineCommand::AttachImage(url.clone()));
+                    let items_tx = self.bg_items_tx.clone();
+                    // Same channel `engine.send` uses — a clone lets the
+                    // spawned task queue AttachImage without touching the
+                    // (UI-owned) EngineHandle. None when the engine is dead:
+                    // the send is skipped exactly like the old inline path.
+                    let cmd_tx = self
+                        .engine
+                        .as_ref()
+                        .map(|e| e.cmd_tx.clone());
+                    // Instant feedback while the subprocess runs (the
+                    // /neurocode & /browser precedent for engine-offloaded
+                    // work); the final notice still arrives below.
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "⧗ reading clipboard image… (GUI stays live)".into(),
+                        kind: NoticeKind::Busy,
+                    });
+                    tokio::task::spawn_blocking(move || {
+                        let status = std::process::Command::new("osascript")
+                            .arg("-e")
+                            .arg(&script)
+                            .stderr(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .status();
+                        let ok = matches!(status, Ok(s) if s.success()) && out_path.exists();
+                        if ok {
+                            match crate::slash_extra::image_data_url(out_path.to_str().unwrap_or_default()) {
+                                Ok(url) => {
+                                    if let Some(cmd_tx) = &cmd_tx {
+                                        let _ = cmd_tx.send(crate::engine::EngineCommand::AttachImage(url.clone()));
+                                    }
+                                    let _ = std::fs::remove_file(&out_path);
+                                    let _ = items_tx.send(TranscriptItem::Notice {
+                                        text: "✓ Clipboard image attached — it goes with your next message.".into(),
+                                        kind: NoticeKind::Success,
+                                    });
                                 }
-                                let _ = std::fs::remove_file(&out_path);
-                                self.tui.app_mut().push_item(TranscriptItem::Notice {
-                                    text: "✓ Clipboard image attached — it goes with your next message.".into(),
-                                    kind: NoticeKind::Success,
-                                });
+                                Err(e) => {
+                                    let _ = items_tx.send(TranscriptItem::Error { text: e });
+                                }
                             }
-                            Err(e) => self.tui.app_mut().push_item(TranscriptItem::Error { text: e }),
+                        } else {
+                            let _ = items_tx.send(TranscriptItem::Error {
+                                text: "no image on the clipboard (or clipboard access denied)".into(),
+                            });
                         }
-                    } else {
-                        self.tui.app_mut().push_item(TranscriptItem::Error {
-                            text: "no image on the clipboard (or clipboard access denied)".into(),
-                        });
-                    }
+                    });
                 }
                 #[cfg(not(target_os = "macos"))]
                 {

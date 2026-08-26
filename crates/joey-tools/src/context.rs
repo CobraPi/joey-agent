@@ -180,6 +180,21 @@ pub struct ToolContext {
     /// streaming tools (e.g. `terminal`) poll [`Self::is_interrupted`] in
     /// their read loop and stop early so long-running commands cancel promptly.
     interrupt_flag: Option<Arc<AtomicBool>>,
+    /// Optional per-agent queue key used by the terminal concurrency
+    /// governor for fair round-robin admission. `None` by default —
+    /// additive, existing callers are unaffected (the governor falls back
+    /// to a single shared default key). The agent sets this on a
+    /// per-dispatch clone via [`with_queue_key`] from the agent's stable
+    /// identity (main agent id, subagent child id, background task id).
+    queue_key: Option<Arc<str>>,
+    /// Optional channel for terminal-governor queue-state snapshots
+    /// (spec 018, T017). `None` by default — additive, existing callers
+    /// unaffected. The agent sets this on a per-dispatch clone via
+    /// [`with_queue_state_sender`]; the terminal tool pushes `(active,
+    /// queued)` pairs on governor admission/release transitions, forwarded
+    /// as `AgentEvent::TerminalQueueState` so UIs can render contention
+    /// indicators. Producer-side throttled to 50ms (SC-005).
+    queue_state_sender: Option<QueueStateSender>,
 }
 
 /// A background-process completion awaiting delivery to the agent's next
@@ -210,6 +225,14 @@ pub type ProgressSender = tokio::sync::mpsc::UnboundedSender<String>;
 /// Distinct from [`ProgressSender`], which carries short status/heartbeat
 /// lines (`AgentEvent::ToolProgress`).
 pub type OutputSender = tokio::sync::mpsc::UnboundedSender<String>;
+
+/// Type alias for the terminal-governor queue-state channel sender
+/// (spec 018, T017). The terminal tool pushes `(active, queued)` snapshots
+/// on governor admission/release transitions; the agent loop forwards them
+/// as `AgentEvent::TerminalQueueState`. Emissions are producer-side
+/// throttled to the 50ms coalescing budget (SC-005), so bursts of
+/// transitions cannot flood the channel.
+pub type QueueStateSender = tokio::sync::mpsc::UnboundedSender<(usize, usize)>;
 
 struct ContextInner {
     cwd: PathBuf,
@@ -249,6 +272,8 @@ impl ToolContext {
             progress_sender: None,
             output_sender: None,
             interrupt_flag: None,
+            queue_key: None,
+            queue_state_sender: None,
         }
     }
 
@@ -269,6 +294,8 @@ impl ToolContext {
             progress_sender: None,
             output_sender: None,
             interrupt_flag: None,
+            queue_key: None,
+            queue_state_sender: None,
         }
     }
 
@@ -345,6 +372,52 @@ impl ToolContext {
         self.interrupt_flag
             .as_ref()
             .map_or(false, |f| f.load(Ordering::SeqCst))
+    }
+
+    /// Set the per-agent queue key used by the terminal concurrency
+    /// governor for fair (round-robin) admission. The agent turn loop
+    /// shares its stable agent identity here (main agent id, subagent
+    /// child id, background task id) on a per-dispatch clone, symmetric to
+    /// [`with_interrupt_flag`]. Existing callers that never call this get
+    /// `None`, and the governor treats that as a single shared default key.
+    ///
+    /// **Backward compatibility**: additive — never calling this is a no-op.
+    pub fn with_queue_key(mut self, key: Option<Arc<str>>) -> Self {
+        self.queue_key = key;
+        self
+    }
+
+    /// Returns the per-agent queue key, if one was set via
+    /// [`with_queue_key`]. `None` means the caller should fall back to a
+    /// shared default key (the backward-compatible default).
+    pub fn queue_key(&self) -> Option<&Arc<str>> {
+        self.queue_key.as_ref()
+    }
+
+    /// Set the terminal-governor queue-state channel sender (spec 018,
+    /// T017). Called by the agent turn loop on a per-dispatch clone,
+    /// symmetric to [`with_output_sender`]. Additive: callers that never
+    /// call this get `None` and [`Self::emit_queue_state`] is a no-op.
+    pub fn with_queue_state_sender(mut self, sender: Option<QueueStateSender>) -> Self {
+        self.queue_state_sender = sender;
+        self
+    }
+
+    /// Returns the queue-state sender, if one was set via
+    /// [`with_queue_state_sender`].
+    pub fn queue_state_sender(&self) -> Option<&QueueStateSender> {
+        self.queue_state_sender.as_ref()
+    }
+
+    /// Convenience: push a `(active, queued)` governor snapshot to the
+    /// queue-state channel, if a sender is set. Silently does nothing
+    /// otherwise (backward-compatible no-op — zero cost with no sender
+    /// attached). The producer (terminal tool) is responsible for
+    /// coalescing emissions to the 50ms budget (SC-005).
+    pub fn emit_queue_state(&self, active: usize, queued: usize) {
+        if let Some(tx) = &self.queue_state_sender {
+            let _ = tx.send((active, queued));
+        }
     }
 
     /// Push a background-process completion into the session-persistent queue.
@@ -692,5 +765,41 @@ mod tests {
         // The newest entries survive (oldest dropped).
         let last = drained.last().unwrap();
         assert_eq!(last.session_id, format!("proc-{}", PENDING_COMPLETIONS_MAX + 49));
+    }
+
+    // ── Regression: queue_key backward compatibility (T005) ────────────────
+
+    #[test]
+    fn queue_key_defaults_to_none() {
+        // ToolContext::new must not set a queue key — existing callers that
+        // never call with_queue_key must see None (governor falls back to
+        // the shared default key).
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        assert!(ctx.queue_key().is_none());
+    }
+
+    #[test]
+    fn with_queue_key_sets_key() {
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        let key: Arc<str> = Arc::from("agent-42");
+        let ctx = ctx.with_queue_key(Some(key.clone()));
+        assert_eq!(ctx.queue_key(), Some(&key));
+        assert_eq!(ctx.queue_key().map(|k| &**k), Some("agent-42"));
+    }
+
+    #[test]
+    fn queue_key_survives_clone_but_not_with_interactive() {
+        // Clone is the per-dispatch path (agent clones then attaches), so a
+        // set key must survive Clone; with_interactive rebuilds the context
+        // and must not inherit a stale key (mirrors the other Option fields).
+        let ctx = ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "s");
+        let ctx = ctx.with_queue_key(Some(Arc::from("subagent-7")));
+        let clone = ctx.clone();
+        assert!(clone.queue_key().is_some(), "Clone must preserve queue_key");
+        let rebuilt = clone.with_interactive(false);
+        assert!(
+            rebuilt.queue_key().is_none(),
+            "with_interactive must not inherit a stale queue_key"
+        );
     }
 }

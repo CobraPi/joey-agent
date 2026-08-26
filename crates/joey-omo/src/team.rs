@@ -313,6 +313,11 @@ pub const DEFAULT_TMUX_SESSION: &str = "joey-omo-team";
 /// This keeps the optional P3 feature from ever breaking a normal run — the
 /// config flag being met is sufficient for FR-044, and visualization is purely
 /// additive.
+///
+/// T009: all tmux subprocess work (availability probe + commands) runs on
+/// tokio's blocking pool, so the lifecycle methods are `async` and never
+/// stall an async worker; `Drop`-time teardown stays sync and delegates to a
+/// detached OS thread.
 #[derive(Debug)]
 pub struct TmuxVisualizer {
     session: String,
@@ -337,14 +342,11 @@ impl TmuxVisualizer {
     }
 
     /// True if tmux is available on PATH. Used to short-circuit every op.
-    pub fn tmux_available() -> bool {
-        std::process::Command::new("tmux")
-            .arg("info")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+    ///
+    /// T009: the subprocess probe runs on tokio's blocking pool so it never
+    /// stalls an async worker.
+    pub async fn tmux_available() -> bool {
+        tokio::task::spawn_blocking(tmux_probe).await.unwrap_or(false)
     }
 
     /// Create (or reset) a detached tmux session with one pane per member.
@@ -352,17 +354,19 @@ impl TmuxVisualizer {
     /// Layout: tiled panes, each pre-labeled with the member's name. Returns
     /// Ok(true) if a session was created, Ok(false) if tmux is unavailable
     /// (no-op), or an error on a real tmux failure.
-    pub fn start(&mut self) -> Result<bool, String> {
+    ///
+    /// Async (T009): every tmux subprocess runs on the blocking pool.
+    pub async fn start(&mut self) -> Result<bool, String> {
         if !self.enabled || self.panes.is_empty() {
             return Ok(false);
         }
-        if !Self::tmux_available() {
+        if !Self::tmux_available().await {
             // Graceful no-op when tmux is not installed.
             self.enabled = false;
             return Ok(false);
         }
         // Kill any stale session from a prior run, then create fresh.
-        let _ = self.run_tmux(&["kill-session", "-t", &self.session]);
+        let _ = self.run_tmux(&["kill-session", "-t", &self.session]).await;
         let res = self.run_tmux(&[
             "new-session",
             "-d",
@@ -374,7 +378,7 @@ impl TmuxVisualizer {
             "200",
             "-y",
             "50",
-        ]);
+        ]).await;
         if res.is_err() {
             self.enabled = false;
             return Ok(false);
@@ -391,9 +395,9 @@ impl TmuxVisualizer {
             ordered
         };
         for _ in 1..names.len() {
-            let _ = self.run_tmux(&["split-window", "-t", &self.session, "-h"]);
+            let _ = self.run_tmux(&["split-window", "-t", &self.session, "-h"]).await;
             // Re-tile so panes stay readable as they're added.
-            let _ = self.run_tmux(&["select-layout", "-t", &self.session, "tiled"]);
+            let _ = self.run_tmux(&["select-layout", "-t", &self.session, "tiled"]).await;
         }
         for (i, name) in names.iter().enumerate() {
             if name.is_empty() {
@@ -401,6 +405,7 @@ impl TmuxVisualizer {
             }
             let select = self
                 .run_tmux(&["select-pane", "-t", &format!("{}:{}", self.session, i)])
+                .await
                 .is_ok();
             if select {
                 let _ = self.run_tmux(&[
@@ -409,27 +414,27 @@ impl TmuxVisualizer {
                     &format!("{}:{}", self.session, i),
                     "-T",
                     name,
-                ]);
+                ]).await;
                 let _ = self.render_pane(i, &MemberActivity {
                     name: name.clone(),
                     ..Default::default()
-                });
+                }).await;
             }
         }
         Ok(true)
     }
 
     /// Update one member's pane with fresh activity.
-    pub fn render_member(&self, name: &str, activity: &MemberActivity) {
+    pub async fn render_member(&self, name: &str, activity: &MemberActivity) {
         if !self.enabled {
             return;
         }
         if let Some(&idx) = self.panes.get(name) {
-            let _ = self.render_pane(idx, activity);
+            let _ = self.render_pane(idx, activity).await;
         }
     }
 
-    fn render_pane(&self, pane: usize, activity: &MemberActivity) -> Result<(), String> {
+    async fn render_pane(&self, pane: usize, activity: &MemberActivity) -> Result<(), String> {
         // `display-message -p` with `-a` lets us send arbitrary text; use
         // pipe-pane-free approach: clear + send the block as keys.
         let block = activity.render_block();
@@ -441,7 +446,7 @@ impl TmuxVisualizer {
             "C-c",
             "clear",
             "Enter",
-        ])?;
+        ]).await?;
         // Write the block line-by-line to keep tmux quoting simple.
         for line in block.lines() {
             // Escape characters tmux send-keys would interpret. The simplest
@@ -454,17 +459,24 @@ impl TmuxVisualizer {
                 &format!("{}:{}", self.session, pane),
                 &format!("printf '%s\\n' '{}'", safe),
                 "Enter",
-            ])?;
+            ]).await?;
         }
         Ok(())
     }
 
     /// Tear down the tmux session (idempotent; no-op if disabled).
+    ///
+    /// Stays synchronous because `Drop` cannot await (T009): the
+    /// kill-session exec runs on a detached OS thread so dropping a
+    /// visualizer never blocks an async worker.
     pub fn stop(&self) {
         if !self.enabled {
             return;
         }
-        let _ = self.run_tmux(&["kill-session", "-t", &self.session]);
+        let args: Vec<String> = vec!["kill-session".into(), "-t".into(), self.session.clone()];
+        std::thread::spawn(move || {
+            let _ = run_tmux_blocking(&args);
+        });
     }
 
     /// Whether this visualizer will actually render (tmux present + enabled).
@@ -472,23 +484,50 @@ impl TmuxVisualizer {
         self.enabled
     }
 
-    fn run_tmux(&self, args: &[&str]) -> Result<std::process::Output, String> {
-        std::process::Command::new("tmux")
-            .args(args)
-            .output()
-            .map_err(|e| format!("tmux {:?}: {}", args, e))
-            .and_then(|o| {
-                if o.status.success() {
-                    Ok(o)
-                } else {
-                    Err(format!(
-                        "tmux {:?} failed: {}",
-                        args,
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    ))
-                }
-            })
+    /// Run one tmux command (T009): the subprocess spawn+wait executes on
+    /// tokio's blocking pool, never on an async worker.
+    async fn run_tmux(&self, args: &[&str]) -> Result<std::process::Output, String> {
+        let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        let display = owned.clone();
+        match tokio::task::spawn_blocking(move || run_tmux_blocking(&owned)).await {
+            Ok(res) => res,
+            Err(e) => Err(format!("tmux {:?}: blocking task join failed: {}", display, e)),
+        }
     }
+}
+
+/// Raw (blocking) tmux availability probe — only ever run via
+/// `spawn_blocking` (see [`TmuxVisualizer::tmux_available`]).
+fn tmux_probe() -> bool {
+    std::process::Command::new("tmux")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Raw (blocking) tmux invocation — only ever run via `spawn_blocking`
+/// (see [`TmuxVisualizer::run_tmux`]) or a detached thread (see
+/// [`TmuxVisualizer::stop`]).
+fn run_tmux_blocking(args: &[String]) -> Result<std::process::Output, String> {
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    std::process::Command::new("tmux")
+        .args(&refs)
+        .output()
+        .map_err(|e| format!("tmux {:?}: {}", refs, e))
+        .and_then(|o| {
+            if o.status.success() {
+                Ok(o)
+            } else {
+                Err(format!(
+                    "tmux {:?} failed: {}",
+                    refs,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ))
+            }
+        })
 }
 
 impl Drop for TmuxVisualizer {
@@ -502,15 +541,15 @@ impl Drop for TmuxVisualizer {
 /// Activate team mode for a validated team spec.
 ///
 /// Returns `Ok(Some(visualizer))` when team mode is enabled and tmux
-/// visualization is requested (the caller drives `render_member` updates and
-/// drops the visualizer to tear it down), `Ok(None)` when team mode is enabled
-/// but visualization is off or tmux is unavailable, and an `Err` if a member
-/// fails eligibility (FR-042).
+/// visualization is requested (the caller drives `render_member` updates,
+/// awaiting each one, and drops the visualizer to tear it down), `Ok(None)`
+/// when team mode is enabled but visualization is off or tmux is
+/// unavailable, and an `Err` if a member fails eligibility (FR-042).
 ///
 /// This is the single entry point that honors both `enabled` (FR-041) and
 /// `tmux_visualization` (FR-044): when disabled, team infrastructure stays
 /// invisible.
-pub fn activate_team(
+pub async fn activate_team(
     config: &TeamModeConfig,
     spec: &TeamSpec,
 ) -> Result<Option<TmuxVisualizer>, TeamActivationError> {
@@ -547,7 +586,7 @@ pub fn activate_team(
     }
     let names: Vec<&str> = spec.members.iter().map(|m| m.name.as_str()).collect();
     let mut viz = TmuxVisualizer::new(&names);
-    match viz.start() {
+    match viz.start().await {
         Ok(true) => Ok(Some(viz)),
         // tmux unavailable → visualization is a no-op, team still runs.
         Ok(false) => Ok(None),
@@ -645,14 +684,14 @@ mod tests {
     /// `start()` degrades to a no-op (returns Ok(false), disables itself)
     /// when tmux is not on PATH — the config flag is met, visualization is
     /// purely additive and must never break a run.
-    #[test]
-    fn tmux_visualizer_noops_without_tmux() {
+    #[tokio::test]
+    async fn tmux_visualizer_noops_without_tmux() {
         // Only exercise the no-tmux path when tmux really is absent; if tmux
         // is installed in this environment we still assert the contract holds
         // by constructing but not starting, then checking the disabled path.
         let mut viz = TmuxVisualizer::new(&["solo"]);
-        if !TmuxVisualizer::tmux_available() {
-            let started = viz.start().expect("no-op must not error");
+        if !TmuxVisualizer::tmux_available().await {
+            let started = viz.start().await.expect("no-op must not error");
             assert!(!started, "no session created without tmux");
             assert!(!viz.is_active(), "disabled after no-op start");
             // render_member is a no-op on a disabled visualizer.
@@ -663,12 +702,117 @@ mod tests {
                     status: "running".into(),
                     ..Default::default()
                 },
-            );
+            )
+            .await;
         } else {
             // tmux present: we don't actually spawn in a unit test (would
             // create real sessions), just verify the availability probe.
-            assert!(TmuxVisualizer::tmux_available());
+            assert!(TmuxVisualizer::tmux_available().await);
         }
+    }
+
+    /// T009 graceful degradation: with tmux stripped from PATH, the
+    /// availability probe returns false quickly, the full team-start path
+    /// (`activate_team`) returns a clean `Ok(None)` (no panic, no error, no
+    /// hang), and a sibling heartbeat task keeps making progress the whole
+    /// time — proof the tmux subprocess work never blocks the runtime.
+    #[tokio::test]
+    async fn team_start_degrades_gracefully_when_tmux_absent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // Point PATH at a directory guaranteed to have no tmux binary.
+        let empty_dir = std::env::temp_dir().join("joey-omo-test-no-tmux");
+        std::fs::create_dir_all(&empty_dir).expect("create empty PATH dir");
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", &empty_dir);
+
+        // Heartbeat sibling: increments while the main task awaits. If tmux
+        // ops ever blocked the runtime thread, this counter would freeze.
+        // The worst inter-beat gap is tracked as the real stall signal:
+        // a sync-blocking tmux call freezes the sibling for its whole
+        // duration, while the async/blocking-pool path keeps every gap at
+        // heartbeat scale (5ms).
+        let beats = Arc::new(AtomicUsize::new(0));
+        let worst_gap_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let heartbeat = {
+            let beats = Arc::clone(&beats);
+            let worst_gap_ms = Arc::clone(&worst_gap_ms);
+            tokio::spawn(async move {
+                let mut last = tokio::time::Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    beats.fetch_add(1, Ordering::SeqCst);
+                    let now = tokio::time::Instant::now();
+                    let gap = (now - last).as_millis() as u64;
+                    worst_gap_ms.fetch_max(gap, Ordering::SeqCst);
+                    last = now;
+                }
+            })
+        };
+
+        // Probe resolves false quickly (bounded by timeout, not a hang).
+        let probe = tokio::time::timeout(
+            Duration::from_secs(5),
+            TmuxVisualizer::tmux_available(),
+        )
+        .await
+        .expect("tmux_available must resolve, not hang, without tmux");
+        assert!(!probe, "probe must be false on a PATH without tmux");
+
+        // Full team-start path with visualization requested: clean
+        // degradation — Ok(None), never a panic, error, or hang.
+        let cfg = TeamModeConfig {
+            enabled: true,
+            tmux_visualization: true,
+            ..Default::default()
+        };
+        let spec = team_with("quick");
+        // Settle: on a machine where degradation resolves instantly (PATH
+        // miss), the start completes faster than a single heartbeat tick.
+        // Give the sibling a bounded window to tick at least once DURING or
+        // after the start so the "kept making progress" signal is
+        // observable; the timeout keeps a wedged start failing hard.
+        let beats_before = beats.load(Ordering::SeqCst);
+        let started = tokio::time::timeout(Duration::from_secs(10), activate_team(&cfg, &spec))
+            .await
+            .expect("team start must not hang without tmux");
+        let mut beats_after = beats.load(Ordering::SeqCst);
+        for _ in 0..100 {
+            if beats_after > beats_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            beats_after = beats.load(Ordering::SeqCst);
+        }
+        let worst_gap = worst_gap_ms.load(Ordering::SeqCst);
+
+        // Restore PATH before asserting so a failure doesn't poison other tests.
+        std::env::set_var("PATH", &orig_path);
+        heartbeat.abort();
+
+        match started {
+            Ok(None) => {} // degraded to no visualization — the team still runs
+            Ok(Some(_)) => panic!("no visualizer can be created without tmux"),
+            Err(e) => panic!("team start must degrade cleanly, not error: {}", e),
+        }
+        assert!(
+            beats_after > beats_before,
+            "sibling task kept making progress during team start ({} -> {} beats)",
+            beats_before, beats_after
+        );
+        // The real stall signal: no inter-beat gap may approach the sync-
+        // blocking scale. A tmux subprocess on the async/blocking-pool path
+        // keeps gaps at heartbeat scale even when it misses PATH; a
+        // sync `Command::status()` on a worker thread would freeze the
+        // sibling for the full subprocess duration (tens of ms+). 150ms
+        // matches the SC-001 responsiveness budget with generous margin
+        // for a loaded machine.
+        assert!(
+            worst_gap < 150,
+            "sibling heartbeat stalled {worst_gap}ms during team start \
+             (sync blocking suspected)",
+        );
     }
 
     /// `MemberActivity::render_block` emits a pane-style status block with the
@@ -743,18 +887,18 @@ mod tests {
 
     /// FR-041: disabled team mode → activate_team returns None and never
     /// touches tmux.
-    #[test]
-    fn activate_team_disabled_returns_none() {
+    #[tokio::test]
+    async fn activate_team_disabled_returns_none() {
         let cfg = TeamModeConfig::default(); // enabled = false
         let spec = team_with("quick");
-        let viz = activate_team(&cfg, &spec).expect("disabled must not error");
+        let viz = activate_team(&cfg, &spec).await.expect("disabled must not error");
         assert!(viz.is_none(), "no visualizer when disabled");
     }
 
     /// Enabled + tmux_visualization on → a visualizer is returned (Some) when
     /// tmux is present, or None when it's not. Either way, no error.
-    #[test]
-    fn activate_team_enabled_viz_returns_visualizer_or_none() {
+    #[tokio::test]
+    async fn activate_team_enabled_viz_returns_visualizer_or_none() {
         let mut cfg = TeamModeConfig {
             enabled: true,
             tmux_visualization: true,
@@ -762,7 +906,7 @@ mod tests {
         };
         cfg.enabled = true;
         let spec = team_with("quick");
-        let res = activate_team(&cfg, &spec);
+        let res = activate_team(&cfg, &spec).await;
         assert!(res.is_ok(), "must not error on tmux-absent environments");
         match res.unwrap() {
             Some(viz) => {
@@ -778,8 +922,8 @@ mod tests {
 
     /// FR-042: enabled team with a hard-rejected member (oracle via
     /// subagent_type) → IneligibleMember error, no visualizer.
-    #[test]
-    fn activate_team_rejects_ineligible_member() {
+    #[tokio::test]
+    async fn activate_team_rejects_ineligible_member() {
         let cfg = TeamModeConfig {
             enabled: true,
             tmux_visualization: true,
@@ -795,7 +939,7 @@ mod tests {
                 prompt: None,
             }],
         };
-        let err = activate_team(&cfg, &spec).unwrap_err();
+        let err = activate_team(&cfg, &spec).await.unwrap_err();
         let msg = format!("{}", err);
         match err {
             TeamActivationError::IneligibleMember { member, agent } => {
@@ -807,15 +951,15 @@ mod tests {
     }
 
     /// Enabled + tmux_visualization OFF → None (no tmux even probed).
-    #[test]
-    fn activate_team_enabled_without_viz_returns_none() {
+    #[tokio::test]
+    async fn activate_team_enabled_without_viz_returns_none() {
         let cfg = TeamModeConfig {
             enabled: true,
             tmux_visualization: false,
             ..Default::default()
         };
         let spec = team_with("quick");
-        let viz = activate_team(&cfg, &spec).expect("no error");
+        let viz = activate_team(&cfg, &spec).await.expect("no error");
         assert!(viz.is_none(), "no visualizer without tmux_visualization");
     }
 }

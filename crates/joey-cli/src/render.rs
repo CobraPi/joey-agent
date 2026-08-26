@@ -307,6 +307,25 @@ fn terminal_header_line(summary: &str, is_error: bool, exit_code: Option<i64>, d
     )
 }
 
+/// Spec 018 (T018/FR-010): Build the terminal contention badge line
+/// (`⧗ terminal: A active, Q queued`). Pure function extracted so the
+/// gating rule is directly unit-testable: Some(line) only while queued > 0,
+/// None when the queue is drained — no persistent chrome (spec
+/// clarification Q2, contracts/events.md consumer obligations).
+fn terminal_queue_badge(active: usize, queued: usize) -> Option<String> {
+    if queued == 0 {
+        return None;
+    }
+    let t = theme();
+    Some(format!(
+        "  {} {}",
+        t.warning.ansi().paint("⧗"),
+        t.fg_more_subtle
+            .ansi()
+            .paint(format!("terminal: {} active, {} queued", active, queued)),
+    ))
+}
+
 /// Spec 008 (T020/FR-007): Build the generic tool-call header line (status icon
 /// + emoji + bold name + primary param + duration + optional exit badge). Pure
 /// function extracted from the `ToolEnd` arm for direct unit testing.
@@ -570,6 +589,15 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
     // at a time because the agent loop is sequential. The summary is retained
     // so the running repaint (T046) can keep the name + summary visible.
     let mut active_tool: Option<(u16, crate::animation::AnimationState, String, String)> = None;
+
+    // ── Spec 018 (T018/FR-010): terminal contention badge state ──
+    // Latest TerminalQueueState snapshot (last-value-wins; producer already
+    // throttles to the 50ms budget). The badge prints ONLY on transitions
+    // into/out of contention (queued > 0), right where the active-tool line
+    // renders — there is no persistent chrome while queued == 0.
+    let mut terminal_queued: usize = 0;
+    let mut terminal_active: usize = 0;
+    let mut badge_visible: bool = false;
 
     // ── T042/T047: Persistent in-flight usage indicator ──
     // While a turn is in progress, the accumulated token counts are surfaced
@@ -1441,6 +1469,39 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     learnings_count);
                 pending_separator = true;
             }
+            // Spec 018 (T018/FR-010): terminal contention badge. Renders near
+            // the active-tool line, ONLY while queued > 0 (contention-only —
+            // no persistent chrome, spec clarification Q2). The one-shot CLI
+            // renderer prints linearly, so the badge appears as its own line
+            // on the transition into contention and on queue-depth changes
+            // while contention persists; draining the queue renders nothing
+            // (the next printed line naturally supersedes the badge, exactly
+            // like the append-only ToolEnd fallback path).
+            AgentEvent::TerminalQueueState { active, queued } => {
+                // Last-value-wins snapshot (producer already throttles to the
+                // 50ms budget); the badge is rendered from this state.
+                terminal_active = active;
+                terminal_queued = queued;
+                if !opts.quiet && opts.tool_progress != "off" {
+                    match terminal_queue_badge(terminal_active, terminal_queued) {
+                        Some(line) => {
+                            println_counted!("{}", line);
+                            badge_visible = true;
+                        }
+                        None => {
+                            // queued == 0: contention cleared. Nothing to
+                            // print (no persistent chrome to erase on an
+                            // append-only renderer).
+                            badge_visible = false;
+                        }
+                    }
+                }
+                let _ = badge_visible;
+            }
+            // Additive events (spec 018 T016 pattern): no line-renderer
+            // output; consumers render contention indicators only while
+            // queued > 0.
+            _ => {}
                 }
             }
             // ── Tick arm: advance live animations (FR-010) ──
@@ -2538,6 +2599,53 @@ mod tests {
     #[test]
     fn tool_body_empty_produces_no_lines() {
         assert!(tool_body_lines("").is_empty());
+    }
+
+    // ── Spec 018 T018: terminal contention badge gating ──
+    // FR-010 + contracts/events.md: badge visible only while queued > 0;
+    // no persistent chrome when the queue is drained (spec Q2).
+    #[test]
+    fn terminal_queue_badge_visible_only_under_contention() {
+        // queued > 0 → badge line present with both counts.
+        let line = terminal_queue_badge(3, 2).expect("badge must render while queued > 0");
+        let plain = strip_ansi(&line);
+        assert!(plain.contains('⧗'), "badge glyph missing: {}", plain);
+        assert!(
+            plain.contains("terminal: 3 active, 2 queued"),
+            "counts missing from badge: {}",
+            plain
+        );
+    }
+
+    #[test]
+    fn terminal_queue_badge_absent_when_queue_drained() {
+        // queued == 0 → no badge at all (None), regardless of active count:
+        // an idle governor must not paint persistent chrome.
+        assert!(terminal_queue_badge(0, 0).is_none());
+        assert!(terminal_queue_badge(4, 0).is_none());
+    }
+
+    // ── Spec 018 T018: stream regression — TerminalQueueState events flow
+    //    through render_turn without disturbing the final-text contract. ──
+    #[test]
+    fn terminal_queue_events_preserve_final_text() {
+        let opts = opts_for(Capability::NonInteractive);
+        let text = run_turn(
+            vec![
+                AgentEvent::TurnStart { max_iterations: 1 },
+                AgentEvent::TerminalQueueState { active: 1, queued: 0 },
+                AgentEvent::TerminalQueueState { active: 2, queued: 3 },
+                AgentEvent::TerminalQueueState { active: 2, queued: 0 },
+                AgentEvent::ContentDelta("Done.".to_string()),
+                AgentEvent::Done {
+                    final_text: "Done.".to_string(),
+                    usage: Usage::default(),
+                    iterations: 1,
+                },
+            ],
+            opts,
+        );
+        assert_eq!(text, "Done.");
     }
 
     // ── T023: regression — reasoning visibility gate preserved ──

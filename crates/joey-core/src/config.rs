@@ -42,6 +42,11 @@ terminal:
   backend: "local"
   cwd: "."
   timeout: 180
+  # Max concurrently executing agent-initiated terminal commands
+  # (feature 018). "auto" = clamp(CPU cores, 4, 16); a positive
+  # integer pins the cap. Env TERMINAL_MAX_CONCURRENT overrides,
+  # mirroring TERMINAL_TIMEOUT.
+  max_concurrent: auto
 toolsets:
   - "joey-cli"
 compression:
@@ -1446,6 +1451,54 @@ mod tests {
         // never auto-routed to .env.
         assert!(!is_env_config_key("model.image_model"));
         assert!(!is_env_config_key("providers.zai.image_model"));
+    }
+
+    // ── Feature 018: terminal.max_concurrent config key ──
+
+    #[test]
+    fn terminal_max_concurrent_defaults_to_auto() {
+        // Default merge must surface the key as the string "auto"
+        // (auto-derived limit = clamp(CPU cores, 4, 16)); consumers
+        // resolve it via get_i64(..., 0) with 0 meaning auto.
+        let cfg = Config::defaults();
+        assert_eq!(cfg.get_str("terminal.max_concurrent", ""), "auto");
+        // The rest of the terminal block is untouched.
+        assert_eq!(cfg.get_str("terminal.backend", ""), "local");
+        assert_eq!(cfg.get_i64("terminal.timeout", 0), 180);
+    }
+
+    #[test]
+    fn terminal_max_concurrent_invalid_value_falls_back_to_auto() {
+        // Contract (specs/018-please-fully-implement/contracts/config.md):
+        // an invalid value resolves to auto, using ONLY existing machinery —
+        // no per-key fallback or warning code is added for this key. Two
+        // already-existing paths provide the fallback:
+        //
+        // 1. Valid YAML carrying a malformed VALUE: the raw string survives
+        //    the merge untouched (no silent load-time coercion), and the
+        //    established consumer read pattern
+        //    get_i64("terminal.max_concurrent", 0) hits
+        //    value_as_i64 → None → default 0 — the auto sentinel (see
+        //    terminal_max_concurrent_defaults_to_auto; consumers map <= 0
+        //    to auto, mirroring delegation.max_concurrent_children). A
+        //    negative number likewise resolves to <= 0 at the consumer.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "terminal:\n  max_concurrent: not-a-number\n").unwrap();
+        let cfg = Config::load_from(path).unwrap();
+        // The malformed raw value is preserved in the merged tree...
+        assert_eq!(cfg.get_str("terminal.max_concurrent", ""), "not-a-number");
+        // ...but the typed consumer read falls back to 0 (= auto).
+        assert_eq!(cfg.get_i64("terminal.max_concurrent", 0), 0);
+
+        // 2. Whole-file malformed YAML: the existing warn_config_parse_failure
+        //    / last-known-good path (config.rs load_from, port of
+        //    config.py:7345-7397) serves the defaults, whose terminal block
+        //    pins max_concurrent: auto.
+        let bad = dir.path().join("broken.yaml");
+        std::fs::write(&bad, ":\n  - [unbalanced:\n    bracket:\n").unwrap();
+        let cfg = Config::load_from(bad).unwrap();
+        assert_eq!(cfg.get_str("terminal.max_concurrent", ""), "auto");
     }
 
     fn defaults_match_upstream() {

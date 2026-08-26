@@ -9,6 +9,7 @@ pub mod neurocode_tools;
 pub mod process_tool;
 pub mod session_search_tool;
 pub mod skills_tool;
+pub mod terminal_governor;
 pub mod terminal_tool;
 pub mod todo_tool;
 pub mod vision_tools;

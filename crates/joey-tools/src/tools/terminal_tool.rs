@@ -10,6 +10,7 @@
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd as _;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use rayon::prelude::*;
@@ -24,6 +25,7 @@ use crate::context::ToolContext;
 use crate::guards::strip_ansi_par as strip_ansi;
 use crate::pyjson::dumps;
 use crate::registry::{Tool, ToolResult};
+use crate::tools::terminal_governor::{auto_limit, default_queue_key, terminal_governor, AcquireError};
 use crate::truncate;
 
 /// Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT.
@@ -43,6 +45,176 @@ fn default_timeout(ctx: &ToolContext) -> u64 {
         }
     }
     ctx.config().get_i64("terminal.timeout", 180).max(1) as u64
+}
+
+/// Once-guard for governor limit resolution (feature 018, task T014).
+///
+/// Resolution happens exactly once per process, at the FIRST terminal
+/// admission: the resolved limit (env > config > auto, per
+/// contracts/config.md) is applied to the process-global singleton via
+/// `TerminalGovernor::set_limit`. Every later admission pays only this
+/// cheap `OnceLock` check (SC-004: lone agents never notice the governor).
+static GOVERNOR_LIMIT_RESOLVED: OnceLock<()> = OnceLock::new();
+
+/// Resolve the terminal concurrency limit: `TERMINAL_MAX_CONCURRENT` env >
+/// `terminal.max_concurrent` config > [`auto_limit`] (contracts/config.md).
+///
+/// Mirrors the `TERMINAL_TIMEOUT` env pattern above. Semantics per the
+/// contract table: absent / "auto" / 0 (or any value <= 0) → auto;
+/// positive integer N → N; invalid (non-numeric/negative) → fall through
+/// to config/auto, never panic.
+fn resolved_concurrency_limit(ctx: &ToolContext) -> usize {
+    if let Ok(v) = std::env::var("TERMINAL_MAX_CONCURRENT") {
+        if let Ok(n) = v.parse::<i64>() {
+            if n > 0 {
+                return n as usize;
+            }
+        }
+    }
+    let configured = ctx.config().get_i64("terminal.max_concurrent", 0);
+    if configured > 0 {
+        configured as usize
+    } else {
+        auto_limit()
+    }
+}
+
+/// Apply the resolved limit to the process-global governor once, at the
+/// first terminal admission (T014). `OnceLock::get_or_init` guarantees
+/// thread-safe one-shot execution: racing callers block until the winner
+/// finishes, so `set_limit` is applied exactly once and the env var is read
+/// at that first-admission moment only.
+fn ensure_governor_limit_resolved(ctx: &ToolContext) {
+    GOVERNOR_LIMIT_RESOLVED.get_or_init(|| {
+        terminal_governor().set_limit(resolved_concurrency_limit(ctx));
+    });
+}
+
+// ── Governor queue-state events (spec 018, T017, US3/FR-007) ──────────────
+
+/// Queue-state emission coalescing window (SC-005): identical to the
+/// `THROTTLE_MS` producer budget in `stream_output` (~:1114 region) —
+/// bursty admission/release transitions coalesce to ≤ ~20 updates/sec.
+const QUEUE_STATE_THROTTLE_MS: u64 = 50;
+
+/// Process-global last-emission timestamp for queue-state events.
+/// Admission/release transitions fire from every governed terminal call in
+/// the process (all agents share the process-global governor), so the
+/// throttle must be process-global too — a per-call timestamp would let N
+/// concurrent calls emit N events per window. `Mutex<Option<Instant>>`
+/// over `None` = "emit immediately" mirrors `flush_chunk`'s `last_emit`
+/// semantics: the very first snapshot is never delayed/coalesced away.
+static QUEUE_STATE_LAST_EMIT: Lazy<std::sync::Mutex<Option<std::time::Instant>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
+
+/// Trailing-flush guard state (T026): `Some(fire_at)` while exactly one
+/// trailing-flush task is scheduled process-wide to run at `fire_at`.
+/// Suppressed transitions never schedule a second task while one is
+/// pending — the pending flush reads a FRESH governor snapshot at fire
+/// time, so it inherently covers every transition suppressed before it
+/// fires (last-value-wins on the consumer side).
+static QUEUE_STATE_TRAILING_AT: Lazy<std::sync::Mutex<Option<std::time::Instant>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
+
+/// Emit a governor `(active, queued)` snapshot on the queue-state channel,
+/// throttled to the 50ms coalescing budget (SC-005).
+///
+/// - **Zero cost with no sender**: the sender check happens FIRST, so
+///   calls without one (back-compat path) never touch the throttle state.
+/// - **Burst coalescing + trailing flush**: emissions within 50ms of the
+///   previous one are suppressed on the producer side, but — unlike a
+///   plain last-value-dropped throttle — the FIRST suppression in a
+///   window schedules exactly one trailing flush at the end of that
+///   window ([`QUEUE_STATE_TRAILING_AT`]). The flush re-reads a fresh
+///   governor snapshot at fire time and emits only if the window has
+///   actually elapsed, so a drain-to-zero (`queued == 0`) transition
+///   landing inside a window is always delivered and a UI's contention
+///   indicator can never go permanently stale (T026). A real emission
+///   before fire time supersedes the flush: it updates the last-emit
+///   timestamp, and the flush's window re-check makes it a no-op.
+/// - Standard-time `Instant` (not tokio): emission sites are async but
+///   never cross an await while holding the lock. The trailing task alone
+///   uses `tokio::time::sleep` so it participates in the runtime's clock.
+fn emit_queue_state_throttled(ctx: &ToolContext) {
+    if ctx.queue_state_sender().is_none() {
+        return; // back-compat: zero cost when no sender is attached
+    }
+    let mut last = QUEUE_STATE_LAST_EMIT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let now = std::time::Instant::now();
+    if let Some(t) = *last {
+        if now.duration_since(t).as_millis() as u64 >= QUEUE_STATE_THROTTLE_MS {
+            let (active, queued) = terminal_governor().stats();
+            ctx.emit_queue_state(active, queued);
+            *last = Some(now);
+        } else {
+            // Within the 50ms window — suppressed (coalesced into the
+            // previous emission's budget). T026 trailing-flush guard:
+            // schedule the one process-wide flush at window end so the
+            // FINAL state of the burst is still delivered. Lock order is
+            // always LAST_EMIT → TRAILING_AT (the flush task takes them
+            // in separate scopes, never nested the other way).
+            let fire_at = t + Duration::from_millis(QUEUE_STATE_THROTTLE_MS);
+            let mut pending = QUEUE_STATE_TRAILING_AT
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if pending.is_none() {
+                // Spawn only from inside a tokio runtime; with no runtime
+                // handle (sync/embedded callers) fall back to the old
+                // last-value-dropped behavior (back-compat, T026 guard).
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    *pending = Some(fire_at);
+                    let tx = ctx
+                        .queue_state_sender()
+                        .expect("sender checked above")
+                        .clone();
+                    handle.spawn(async move {
+                        let delay = fire_at.saturating_duration_since(std::time::Instant::now());
+                        tokio::time::sleep(delay).await;
+                        queue_state_trailing_flush(tx);
+                    });
+                }
+            }
+        }
+    } else {
+        // First emission ever — emit immediately (flush_chunk semantics).
+        let (active, queued) = terminal_governor().stats();
+        ctx.emit_queue_state(active, queued);
+        *last = Some(now);
+    }
+}
+
+/// T026 trailing flush: runs at the end of a coalescing window in which at
+/// least one transition was suppressed. Reads a FRESH governor snapshot at
+/// fire time (never the suppressed value) and emits it only if the throttle
+/// window has actually elapsed since the last real emission — a real
+/// emission in the meantime supersedes this flush (its fresher snapshot
+/// already covered the suppressed transitions). Finally releases the
+/// process-wide dedup slot so the next suppressed transition may schedule a
+/// new flush. Sync (no awaits): called from a spawned task, but lock scope
+/// discipline forbids crossing an await while holding either mutex.
+fn queue_state_trailing_flush(tx: crate::context::QueueStateSender) {
+    let now = std::time::Instant::now();
+    {
+        let mut last = QUEUE_STATE_LAST_EMIT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let elapsed = match *last {
+            Some(t) => now.duration_since(t).as_millis() as u64,
+            None => QUEUE_STATE_THROTTLE_MS, // no emission ever — flush
+        };
+        if elapsed >= QUEUE_STATE_THROTTLE_MS {
+            let (active, queued) = terminal_governor().stats();
+            let _ = tx.send((active, queued));
+            *last = Some(now);
+        }
+        // Else: a real emission already re-synchronized consumers within
+        // this window — the flush is superseded, skip.
+    }
+    *QUEUE_STATE_TRAILING_AT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 // ── Shell selection (feature 014: Windows platform support) ──────────────
@@ -453,6 +625,53 @@ impl Tool for Terminal {
 
         // cwd was computed above (before the background check).
 
+        // Feature 018 (T012): governor admission BEFORE any spawn path.
+        //
+        // - Slot acquisition uses the per-agent queue key when wired,
+        //   falling back to the shared default key (back-compat: identity-
+        //   less callers all share one FIFO queue, research.md D6).
+        // - The cooperative interrupt flag is passed straight through: while
+        //   PARKED IN THE QUEUE the governor itself races the flag on a
+        //   100ms cadence (matching stream_output's INTERRUPT_POLL) and
+        //   deregisters the waiter on interrupt, so an interrupted queued
+        //   call returns promptly without ever holding a slot.
+        // - The per-call timeout deadline is stamped INSIDE run_command
+        //   (after spawn), i.e. strictly AFTER admission resolves — queue
+        //   wait never eats into the timeout budget (FR-005).
+        // - The guard is held across spawn → stream → finish and released
+        //   here on every exit path: normal completion, non-zero exit,
+        //   timeout, spawn failure, and interrupt all flow through the
+        //   `run_command` return below; panics unwind through SlotGuard's
+        //   Drop. Background mode (execute_background) returned earlier and
+        //   is governed by the ProcessRegistry instead.
+        let governor = terminal_governor();
+        ensure_governor_limit_resolved(ctx);
+        let queue_key = ctx.queue_key().cloned().unwrap_or_else(default_queue_key);
+        let slot = match governor
+            .acquire(queue_key, ctx.interrupt_flag().cloned())
+            .await
+        {
+            Ok(guard) => guard,
+            Err(AcquireError::Interrupted) => {
+                return ToolResult::Text(dumps(&json!({
+                    "output": "",
+                    "exit_code": 124,
+                    "error": "Command interrupted by user while waiting for a terminal slot",
+                })));
+            }
+            Err(e) => {
+                return ToolResult::Text(dumps(&json!({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": format!("Failed to acquire terminal execution slot: {}", e),
+                })));
+            }
+        };
+        // Governor transition: admission just resolved (this call now holds
+        // a slot; any freed slot may have admitted a queued waiter). Emit
+        // the post-admission snapshot (T017, SC-005-throttled).
+        emit_queue_state_throttled(ctx);
+
         // Feature 005 (T012): snapshot known-read files before running the
         // command so we can detect terminal-caused mutations afterward.
         // Blocking + parallel (rayon) — off the async workers.
@@ -462,6 +681,21 @@ impl Tool for Terminal {
 
         let (raw_output, returncode, timed_out, interrupted) =
             run_command(&command, &cwd, effective_timeout, ctx).await;
+
+        // Release the governor slot before the CPU-bound post-processing
+        // pipeline (truncate/strip/redact/mutation fan-out) so that work
+        // never holds an execution slot other agents could use.
+        slot.release();
+        // Governor transition: the slot was just released (this call's
+        // count dropped; a queued waiter may have been admitted in the same
+        // release). Emit the post-release snapshot (T017, SC-005-throttled;
+        // suppressed transitions get a trailing flush at window end — T026).
+        // NOTE: the SlotGuard drop-only path (panic unwind / early returns
+        // that bypass `slot.release()`) does not emit — the explicit release
+        // covers every normal exit path (documented deviation, acceptable
+        // per task brief; the T026 trailing flush bounds staleness at 50ms
+        // even with no later transition).
+        emit_queue_state_throttled(ctx);
 
         // Spawn/exec failures surface in the error field (upstream:
         // {"output": "", "exit_code": -1, "error": "Command execution failed: ..."}).
@@ -1514,6 +1748,162 @@ mod tests {
         assert!(body.contains("__JOEY_STATUS=$?"));
         assert!(body.contains("exit $__JOEY_STATUS"));
         assert!(body.contains(CWD_MARKER));
+    }
+
+    // ── T026: queue-state throttle trailing-flush guard ─────────────────
+
+    /// Serializes the T026 tests: they drive the process-global throttle
+    /// static (`QUEUE_STATE_LAST_EMIT`) and would race each other under
+    /// cargo's parallel test threads.
+    static QS_T026_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Reset the process-global queue-state throttle timestamp so each
+    /// T026 test starts with a clean window (first emission immediate).
+    fn reset_queue_state_throttle() {
+        *QUEUE_STATE_LAST_EMIT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Park the real governor into a contended `(active=limit, queued>=1)`
+    /// state: one holder task per slot (aborted to release) plus one
+    /// parked waiter. Returns the holder JoinHandles and the waiter's.
+    async fn park_governor_contended()
+    -> (Vec<tokio::task::JoinHandle<()>>, tokio::task::JoinHandle<()>) {
+        let gov = terminal_governor();
+        let limit = gov.limit();
+        // Hold every slot so the waiter must park in the queue.
+        let mut holders = Vec::new();
+        for _ in 0..limit {
+            let gov2 = gov.clone();
+            holders.push(tokio::spawn(async move {
+                let _guard = gov2.acquire(default_queue_key(), None).await;
+                // Hold the slot until the task is aborted.
+                std::future::pending::<()>().await;
+            }));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while gov.active() < limit && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(gov.active(), limit, "all slots must be held");
+        let waiter = {
+            let gov = gov.clone();
+            tokio::spawn(async move {
+                // The guard is dropped at task end, releasing the slot.
+                let _ = gov.acquire(default_queue_key(), None).await;
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while gov.queued() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(gov.queued() >= 1, "waiter must park in the governor queue");
+        (holders, waiter)
+    }
+
+    /// T026 regression: a drain-to-zero (queued → 0) transition landing
+    /// INSIDE a 50ms coalescing window is suppressed by the throttle, and
+    /// without a trailing flush nothing ever re-delivers it — a UI's
+    /// contention indicator stays stale at the last emitted queued>0
+    /// value forever. The trailing-flush guard must deliver a fresh
+    /// snapshot (queued==0) at the end of the window.
+    #[tokio::test]
+    async fn queue_state_drain_to_zero_inside_window_is_trailing_flushed() {
+        let _serial = QS_T026_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ctx().with_queue_state_sender(Some(tx));
+        reset_queue_state_throttle();
+
+        // Contended state: first emission (window reset → immediate) must
+        // carry the parked waiter (queued >= 1).
+        let (holders, waiter) = park_governor_contended().await;
+        emit_queue_state_throttled(&ctx);
+        let first = rx
+            .try_recv()
+            .expect("first emission must be immediate after a window reset");
+        assert!(
+            first.1 >= 1,
+            "first emission must show the queued waiter, got {first:?}"
+        );
+
+        // Drain: abort the holders (each abort releases its slot and
+        // admits the parked waiter), then let the waiter's own guard drop
+        // → the governor drains back to queued == 0.
+        for h in holders {
+            h.abort();
+        }
+        let _ = waiter.await;
+        let gov = terminal_governor();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while gov.queued() > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Force the drain-to-zero transition INSIDE a fresh 50ms window:
+        // seeding the throttle timestamp makes the suppression
+        // deterministic (no timing race on the setup above).
+        *QUEUE_STATE_LAST_EMIT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
+        emit_queue_state_throttled(&ctx); // suppressed by the window
+        assert!(
+            rx.try_recv().is_err(),
+            "in-window emission must not deliver immediately"
+        );
+
+        // Let the 50ms coalescing window (plus a wide margin) elapse so
+        // any trailing flush can fire.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut last = None;
+        while let Ok(v) = rx.try_recv() {
+            last = Some(v);
+        }
+        assert_eq!(
+            last.map(|v| v.1),
+            Some(0),
+            "the trailing flush must deliver a fresh snapshot with queued==0; \
+             without it the drain-to-zero transition is dropped and the UI \
+             stays stale at queued>=1 (last={last:?})"
+        );
+    }
+
+    /// T026 dedup: repeated in-window suppressions schedule exactly ONE
+    /// trailing flush — after the window ends the channel sees a single
+    /// fresh event, not one per suppressed transition.
+    #[tokio::test]
+    async fn queue_state_in_window_burst_coalesces_to_single_trailing_flush() {
+        let _serial = QS_T026_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ctx().with_queue_state_sender(Some(tx));
+        reset_queue_state_throttle();
+
+        emit_queue_state_throttled(&ctx); // window reset → immediate
+        assert!(rx.try_recv().is_ok(), "first emission must be immediate");
+
+        // Three transitions inside one fresh window → all suppressed.
+        *QUEUE_STATE_LAST_EMIT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
+        for _ in 0..3 {
+            emit_queue_state_throttled(&ctx);
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "in-window emissions must not deliver immediately"
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(
+            count, 1,
+            "exactly one trailing flush must fire at window end (got {count} events)"
+        );
     }
 
     /// T021: resolve_shell() does not panic on any platform and returns

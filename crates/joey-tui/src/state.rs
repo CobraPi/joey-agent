@@ -1108,6 +1108,15 @@ pub struct App {
     /// Whether the bottom status bar renders (toggled by /statusbar; backed
     /// by config key display.statusbar, default true).
     pub show_status_bar: bool,
+    // ── Terminal governor contention (spec 018, T019) ──
+    /// Latest snapshot from `AgentEvent::TerminalQueueState` — how many
+    /// terminal commands hold an execution slot. Last-value-wins: each
+    /// event overwrites both counters wholesale.
+    pub terminal_active: usize,
+    /// Terminal commands currently waiting for a slot. The status-bar
+    /// contention span renders ONLY while this is > 0 (FR-011: no
+    /// persistent chrome).
+    pub terminal_queued: usize,
 }
 
 /// One entry of the slash-command catalog shown in the TUI popup. Injected by
@@ -1480,6 +1489,8 @@ impl App {
             history_pos: None,
             history_draft: String::new(),
             show_status_bar: true,
+            terminal_active: 0,
+            terminal_queued: 0,
         }
     }
 
@@ -2237,6 +2248,18 @@ impl App {
                 self.mode = RunMode::Input;
                 self.turn_started = None;
             }
+            // Spec 018 (T019): terminal governor contention snapshot.
+            // Last-value-wins — each event overwrites both counters, so
+            // intermediate snapshots are naturally coalesced to whatever
+            // the latest event said by the time a frame draws (same
+            // pattern as ToolOutput chunk accumulation: cheap apply, the
+            // frame_budget-paced draw renders the current state).
+            AgentEvent::TerminalQueueState { active, queued } => {
+                self.terminal_active = active;
+                self.terminal_queued = queued;
+            }
+            // Additive events with no TUI state: ignored.
+            _ => {}
         }
     }
 

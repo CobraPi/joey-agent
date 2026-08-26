@@ -3115,6 +3115,16 @@ pub fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: Theme, elapsed: 
         ));
         spans.push(Span::raw("  "));
     }
+    // Terminal governor contention (spec 018, T019 / FR-011): shown ONLY
+    // while commands are queued — no persistent chrome when the governor
+    // is uncontended.
+    if app.terminal_queued > 0 {
+        spans.push(Span::styled(
+            format!("⚙ {} active, {} queued", app.terminal_active, app.terminal_queued),
+            Style::default().fg(theme.warning.to_color()),
+        ));
+        spans.push(Span::raw("  "));
+    }
     // token total
     spans.push(Span::styled(
         format!(" Σ {}", fmt_tokens(app.tokens.total())),
@@ -3630,6 +3640,52 @@ mod tests {
             .take(100) // first header row only
             .map(|c| c.symbol().to_string())
             .collect()
+    }
+
+    /// Status bar (spec 018, T019): render draw_status through TestBackend
+    /// and collect the first row's text so span gating can be asserted.
+    fn status_text(app: &App) -> String {
+        use ratatui::backend::TestBackend;
+        let theme = Theme::aurora();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 1)).unwrap();
+        terminal
+            .draw(|f| {
+                draw_status(f, f.area(), app, theme, Duration::from_secs(2));
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .take(120)
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn status_terminal_span_shows_only_while_queued() {
+        // FR-011: uncontended governor → no span at all.
+        let mut app = App::new("sess", "model");
+        let idle = status_text(&app);
+        assert!(!idle.contains("queued"), "no span when nothing queued: {idle}");
+        assert!(!idle.contains("active,"), "no span when nothing queued: {idle}");
+
+        // Contended: A active, Q queued → span present with both counts.
+        app.apply(joey_agent_core::AgentEvent::TerminalQueueState {
+            active: 2,
+            queued: 3,
+        });
+        let busy = status_text(&app);
+        assert!(busy.contains("2 active, 3 queued"), "span renders counts: {busy}");
+
+        // Contention clears → span disappears again.
+        app.apply(joey_agent_core::AgentEvent::TerminalQueueState {
+            active: 1,
+            queued: 0,
+        });
+        let cleared = status_text(&app);
+        assert!(!cleared.contains("queued"), "span gone once queue drains: {cleared}");
     }
 
     #[test]
