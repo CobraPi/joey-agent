@@ -538,6 +538,11 @@ pub fn summarize_tool_result(tool_name: &str, tool_args: &str, tool_content: &st
             }
             format!("[delegate_task] '{}' ({} chars result)", goal, commafy(content_len))
         }
+        "subagent_control" => {
+            let action = display_arg(&args, "action", "?");
+            let id = display_arg(&args, "id", "?");
+            format!("[subagent_control] {} id={}", action, id)
+        }
         "execute_code" => {
             let code_str = str_arg(&args, "code");
             let mut code_preview = char_prefix(&code_str, 60).replace('\n', " ");

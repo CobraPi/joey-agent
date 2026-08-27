@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::anim::{Equalizer, ParticleField, Pulse, Spinner};
+use crate::app::SteerOverlay;
 use crate::input::Input;
 use crate::state::{
     AgentPhase, App, DisplayAgent, NoticeKind, RunMode, SlashCommandInfo, SubagentStatus,
@@ -1367,6 +1368,8 @@ fn pane_header_title(
         SubagentStatus::Done => "· done",
         SubagentStatus::Failed => "· failed",
         SubagentStatus::Pending => "· queued",
+        // Spec 020 (T030): halted before completing its goal.
+        SubagentStatus::Stopped => "· stopped",
     };
     let base = format!(
         " ◆ subagent: {} [{}] {} ",
@@ -1502,6 +1505,37 @@ mod t036_pane_header_title_tests {
             "segment rides the bottom-right corner at min geometry"
         );
         assert!(h.title.contains("subagent: parity child"));
+    }
+
+    /// Spec 020 (T030, FR-016): a pane in the terminal `Stopped` state
+    /// renders the "· stopped" status word in its header — the stopped
+    /// state must be distinguishable from done/failed in listings.
+    #[test]
+    fn t030_stopped_pane_header_shows_stopped_status() {
+        let mut p = pane("parity child", "test-model");
+        p.status = SubagentStatus::Stopped;
+        let h = pane_header_title(&p, &scroll_info_40_live(), false, 140);
+        // The STATUS word sits right after the model bracket; the trailing
+        // "· live" belongs to the scroll-info segment ("40 messages ·
+        // live" = auto-follow), not the status.
+        assert!(
+            h.title.contains("[test-model] · stopped"),
+            "header carries the stopped status word: {:?}",
+            h.title
+        );
+        assert!(
+            !h.title.contains("· done") && !h.title.contains("· failed"),
+            "no other status word bleeds in: {:?}",
+            h.title
+        );
+        // Boundary parity: the bare title (fallback path) also shows it.
+        p.status = SubagentStatus::Stopped;
+        let bare = pane_header_title(&p, &scroll_info_40_live(), false, 43);
+        assert!(
+            bare.title.contains("· stopped"),
+            "bare/fallback title carries it too: {:?}",
+            bare.title
+        );
     }
 }
 
@@ -2801,6 +2835,8 @@ pub fn draw_omo_panel(
                 SubagentStatus::Running => ("⟳", theme.busy),
                 SubagentStatus::Done => ("✓", theme.success),
                 SubagentStatus::Failed => ("✗", theme.error),
+                // Spec 020 (T030): halted — warning, not error.
+                SubagentStatus::Stopped => ("■", theme.warning),
             };
             let elapsed = entry.started.elapsed().as_secs();
             let label = truncate_str(&entry.agent_type, cw.saturating_sub(14));
@@ -2841,6 +2877,9 @@ pub fn draw_omo_panel(
                 SubagentStatus::Running => ("►", "running", theme.busy),
                 SubagentStatus::Done => ("✓", "done", theme.success),
                 SubagentStatus::Failed => ("✗", "failed", theme.error),
+                // Spec 020 (T030, FR-016): distinguishable stopped state;
+                // the stop reason rides the entry phase line below.
+                SubagentStatus::Stopped => ("■", "stopped", theme.warning),
             };
             // Title line: marker + task title (or agent_type fallback).
             let title = entry
@@ -3320,6 +3359,59 @@ pub fn draw_search_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Span::raw(" "),
         Span::styled(
             &app.search_query,
+            Style::default().fg(theme.fg_base.to_color()),
+        ),
+        Span::styled(
+            "▏",
+            Style::default().fg(theme.accent.to_color()),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(prompt_line), inner);
+}
+
+// ── Steer overlay bar (T023 / US6, FR-017, spec 020) ───────────────────────
+
+/// T023 (US6, FR-017, spec 020): render the steer overlay as a bottom
+/// text-input bar, mirroring [`draw_search_bar`]'s chrome (3-row Clear +
+/// focused gradient block). The title carries the bound child's goal
+/// (truncated) plus the Esc/Enter hints — `goal` is used for the title
+/// only, per `SteerOverlay`'s contract; the prompt line always shows the
+/// live draft with the accent cursor caret.
+pub(crate) fn draw_steer_bar(f: &mut Frame, area: Rect, steer: &SteerOverlay, theme: &Theme) {
+    let theme = *theme;
+
+    // Bottom 3-row bar.
+    let h = 3u16;
+    let y = area.y + area.height.saturating_sub(h);
+    let steer_area = Rect::new(area.x, y, area.width, h);
+    f.render_widget(Clear, steer_area);
+
+    // Title: the bound child's goal (tail-truncated to keep the key hints
+    // visible) + the same Esc-hint convention as the search bar.
+    let goal = steer.goal.trim();
+    let goal_prefix = if goal.chars().count() > 32 {
+        let cut: String = goal.chars().take(31).collect();
+        format!("{cut}… ")
+    } else if goal.is_empty() {
+        String::new()
+    } else {
+        format!("{goal} ")
+    };
+    let title = format!(" steer {goal_prefix}(Esc cancel · Enter send) ");
+    let block = gradient_block_focused(&title, theme, 0.7);
+    let inner = block.inner(steer_area);
+    f.render_widget(block, steer_area);
+
+    let prompt_line = Line::from(vec![
+        Span::styled(
+            "»",
+            Style::default()
+                .fg(theme.gold.to_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            steer.text.as_str(),
             Style::default().fg(theme.fg_base.to_color()),
         ),
         Span::styled(
@@ -5720,6 +5812,8 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 SubagentStatus::Done => ("✓", theme.success),
                 SubagentStatus::Failed => ("✗", theme.error),
                 SubagentStatus::Pending => ("·", theme.fg_more_subtle),
+                // Spec 020 (T030): halted before completing its goal.
+                SubagentStatus::Stopped => ("■", theme.warning),
             };
             // Task title (falls back to the goal) truncated to the card.
             let title_src = app
@@ -5783,6 +5877,8 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                     SubagentStatus::Done => "done".to_string(),
                     SubagentStatus::Failed => "failed".to_string(),
                     SubagentStatus::Pending => "queued".to_string(),
+                    // Spec 020 (T030): partial-result terminal state.
+                    SubagentStatus::Stopped => "stopped".to_string(),
                 });
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
@@ -5827,6 +5923,8 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 SubagentStatus::Done => ("✓", theme.success),
                 SubagentStatus::Failed => ("✗", theme.error),
                 SubagentStatus::Pending => ("·", theme.fg_more_subtle),
+                // Spec 020 (T030): halted before completing its goal.
+                SubagentStatus::Stopped => ("■", theme.warning),
             };
             let goal_line: String = pane.goal.chars().take(label_w.max(4)).collect();
             let tab_area = Rect::new(inner.x, tab_y, content_w, 2);

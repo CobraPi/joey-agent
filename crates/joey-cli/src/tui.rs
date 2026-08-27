@@ -103,7 +103,19 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     };
     let restored_count = history.len();
 
-    let agent = crate::repl::build_agent(&config, &cwd, &overrides, &session_id, history)?;
+    // T024 (spec 020): build via build_agent_parts so the session keeps the
+    // SAME SubagentManager the agent's delegate_task tool holds — the engine
+    // routes operator stop/steer through it (FR-017) and the exit path
+    // winds its children down (T025, FR-015).
+    let agent_parts = crate::repl::build_agent_parts(
+        &config,
+        &cwd,
+        &overrides,
+        &session_id,
+        history,
+    )?;
+    let agent = agent_parts.agent;
+    let subagent_manager = agent_parts.subagent_manager;
 
     let provider_name: &'static str = agent.client().profile().name;
     let model_name = crate::repl::build_agent_config(&config, &overrides).model;
@@ -215,6 +227,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         cwd: cwd.clone(),
         overrides: overrides.clone(),
         session_id: session_id.clone(),
+        subagent_manager: subagent_manager.clone(),
     };
     let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<crate::engine::EngineEvent>();
     let (engine, interrupt) = crate::engine::spawn_engine(agent, engine_spec.clone(), ev_tx);
@@ -267,6 +280,13 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         let final_text = session.tui.app().last_final_text.clone();
         let _ = session.tui.leave();
         drop(session.tui);
+        // T025 wind-down (FR-015): bounded child shutdown before exit —
+        // the single query's turn may have backgrounded delegations.
+        session
+            .engine_spec
+            .subagent_manager
+            .shutdown(session.engine_spec.wind_down_timeout())
+            .await;
         if !final_text.is_empty() {
             println!("{}", final_text);
         }
@@ -898,6 +918,24 @@ pub enum PumpOutcome {
     Action(TuiAction),
 }
 
+/// Does this delegation-tap event warrant an idle wake (spec 020 T013)?
+/// True ONLY for terminal child lifecycle events — a background child
+/// finished (success, failure, or stop) or a batch resolved — because those
+/// are exactly the events that leave a completion notice pending in the
+/// agent's completions queue. Non-terminal events (spawn, wrapped child
+/// stream deltas) never wake: mid-flight activity is not a deliverable
+/// notice. Pure decision, unit-tested below.
+fn delegation_event_wakes_engine(ev: &joey_agent_core::AgentEvent) -> bool {
+    use joey_agent_core::AgentEvent;
+    matches!(
+        ev,
+        AgentEvent::SubagentComplete { .. }
+            | AgentEvent::SubagentFailed { .. }
+            | AgentEvent::SubagentStopped { .. }
+            | AgentEvent::DelegationBatchComplete { .. }
+    )
+}
+
 /// The unified UI pump: ONE select over engine events / terminal input /
 /// frame timer. The UI task never awaits engine compute — this is the core
 /// of the GUI/compute decoupling.
@@ -925,7 +963,19 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
             // They never carry the parent's turn lifecycle, so they cannot
             // wedge the busy state.
             if let Some(agent_ev) = tap_ev {
-                session.tui.app_mut().apply(agent_ev);
+                session.tui.app_mut().apply(agent_ev.clone());
+                // Idle wake (spec 020 T013, FR-003): a terminal child
+                // lifecycle event with no turn/heavy job running means a
+                // completion notice is now pending in the agent's
+                // completions queue — wake the engine so it starts a turn
+                // and drains it. While busy, the next turn boundary
+                // delivers it (FR-003 mid-turn routing); the engine-side
+                // handler is a no-op anyway (defense in depth).
+                if !session.busy && delegation_event_wakes_engine(&agent_ev) {
+                    if let Some(engine) = &session.engine {
+                        engine.send(crate::engine::EngineCommand::DelegationNoticePending);
+                    }
+                }
             }
             return None;
         }
@@ -1147,6 +1197,26 @@ fn pane_item_clipboard_text(app: &AppState, pane: usize, idx: usize) -> Option<S
         .and_then(transcript_item_clipboard_text)
 }
 
+/// T024 (US6, FR-017, spec 020): map a subagent-control TuiAction to its
+/// EngineCommand. Pure so the UI-side routing is unit-testable without an
+/// engine or terminal. `None` means "nothing to send" (whitespace-only
+/// steer text — the overlay should never produce it, but the empty draft
+/// is a documented safe no-op, so degrade the same way here).
+fn map_subagent_action(action: TuiAction) -> Option<crate::engine::EngineCommand> {
+    match action {
+        TuiAction::StopSubagent { id } => Some(crate::engine::EngineCommand::StopSubagent { id }),
+        TuiAction::SteerSubagent { id, text } => {
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(crate::engine::EngineCommand::SteerSubagent { id, text: trimmed })
+            }
+        }
+        _ => None,
+    }
+}
+
 /// What Enter does while a turn is busy (`display.busy_enter`; upstream
 /// `busy_input_mode`). See [`BusyEnterAction::parse`].
 #[derive(Debug, PartialEq, Eq)]
@@ -1314,6 +1384,32 @@ async fn interactive_loop(mut session: TuiSession) -> (anyhow::Result<()>, Outro
                     }
                 }
             }
+            Some(PumpOutcome::Action(
+                action @ (TuiAction::StopSubagent { .. } | TuiAction::SteerSubagent { .. }),
+            )) => {
+                // T024 (US6, FR-017): focused-pane `x` / steer-overlay
+                // Enter — route ONE delegation child's control op to the
+                // engine (which owns the manager wiring), so the ack/error
+                // Notice lands in the transcript via the normal event pump.
+                // Never handled inline, never dropped.
+                match map_subagent_action(action) {
+                    Some(cmd) => {
+                        if let Some(engine) = &session.engine {
+                            engine.send(cmd);
+                        } else {
+                            session.tui.app_mut().push_item(TranscriptItem::Error {
+                                text: "cannot control subagent: engine not running".into(),
+                            });
+                        }
+                    }
+                    None => {
+                        session.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: "steer text was empty — nothing sent.".into(),
+                            kind: NoticeKind::Warning,
+                        });
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1321,6 +1417,18 @@ async fn interactive_loop(mut session: TuiSession) -> (anyhow::Result<()>, Outro
     // Quit: leave the terminal, end the session, snapshot the outro.
     let session_id = session.engine_spec.session_id.clone();
     let _ = session.tui.leave();
+    // T025 wind-down (FR-015): await a BOUNDED shutdown of the session's
+    // delegation children BEFORE final teardown — no fire-and-forget. The
+    // bound is the manager's own config (delegation.wind_down_timeout_secs,
+    // default 10s): children get SessionEnd stops, then up to that long to
+    // leave the registry; stragglers are force-finalized. The engine's
+    // channel drops with the session, so an in-flight parent turn also
+    // unwinds (its interrupt flag shares the Arc the manager signals).
+    session
+        .engine_spec
+        .subagent_manager
+        .shutdown(session.engine_spec.wind_down_timeout())
+        .await;
     end_session_by_id(&session_id, "user_exit");
     let (message_count, user_messages, tool_calls, title) = outro_stats(&session_id);
     (
@@ -2466,6 +2574,99 @@ fn slash_args_after<'a>(input: &'a str, command: &str) -> &'a str {
 
 #[cfg(test)]
 mod tui_tests {
+    use joey_agent_core::AgentEvent;
+    use joey_providers::Usage;
+
+    use super::*;
+
+    /// Idle-wake classifier (spec 020 T013): ONLY terminal child lifecycle
+    /// events wake the engine — those are the events that leave a
+    /// completion notice pending. Spawns and wrapped child stream deltas
+    /// must NOT wake (mid-flight activity is not a deliverable notice).
+    #[test]
+    fn delegation_wake_classifier_only_fires_on_terminal_events() {
+        let term = AgentEvent::SubagentComplete {
+            id: 1,
+            goal: "g".into(),
+            success: true,
+            summary_preview: "s".into(),
+            token_usage: Usage::default(),
+            duration_secs: 1.0,
+        };
+        assert!(delegation_event_wakes_engine(&term));
+        assert!(delegation_event_wakes_engine(&AgentEvent::SubagentFailed {
+            id: 2,
+            goal: "g".into(),
+            error: "e".into(),
+            duration_secs: 1.0,
+        }));
+        assert!(delegation_event_wakes_engine(&AgentEvent::SubagentStopped {
+            id: 3,
+            goal: "g".into(),
+            reason: "operator_requested".into(),
+            summary_preview: "s".into(),
+        }));
+        assert!(delegation_event_wakes_engine(
+            &AgentEvent::DelegationBatchComplete {
+                total: 2,
+                succeeded: 1,
+                failed: 1,
+                total_duration_secs: 2.0,
+            }
+        ));
+        // Non-terminal: spawn and wrapped child events never wake.
+        assert!(!delegation_event_wakes_engine(&AgentEvent::SubagentSpawn {
+            id: 4,
+            goal: "g".into(),
+            model: "m".into(),
+            toolset_summary: "t".into(),
+            depth: 1,
+        }));
+        assert!(!delegation_event_wakes_engine(&AgentEvent::SubagentEvent {
+            id: 5,
+            event: Box::new(AgentEvent::ContentDelta("x".into())),
+        }));
+        assert!(!delegation_event_wakes_engine(&AgentEvent::Notice("n".into())));
+    }
+
+    /// T024 (US6, FR-017, spec 020): subagent-control actions route 1:1 to
+    /// their EngineCommand (id preserved, steer text trimmed on the way
+    /// through), whitespace-only steer degrades to a documented no-op
+    /// (`None`), and non-control actions never map.
+    #[test]
+    fn map_subagent_action_routes_control_and_no_ops_blank_steer() {
+        match map_subagent_action(TuiAction::StopSubagent { id: 7 }) {
+            Some(crate::engine::EngineCommand::StopSubagent { id }) => assert_eq!(id, 7),
+            other => panic!("expected EngineCommand::StopSubagent, got {other:?}"),
+        }
+        match map_subagent_action(TuiAction::SteerSubagent { id: 7, text: "hi".into() }) {
+            Some(crate::engine::EngineCommand::SteerSubagent { id, text }) => {
+                assert_eq!(id, 7);
+                assert_eq!(text, "hi");
+            }
+            other => panic!("expected EngineCommand::SteerSubagent, got {other:?}"),
+        }
+        // Steer text is trimmed before routing ("  hi  " → "hi").
+        match map_subagent_action(TuiAction::SteerSubagent { id: 8, text: "  hi  ".into() }) {
+            Some(crate::engine::EngineCommand::SteerSubagent { id, text }) => {
+                assert_eq!(id, 8);
+                assert_eq!(text, "hi");
+            }
+            other => panic!("expected trimmed SteerSubagent, got {other:?}"),
+        }
+        // Empty/whitespace steer is the safe no-op — nothing to send.
+        assert!(
+            map_subagent_action(TuiAction::SteerSubagent { id: 7, text: String::new() })
+                .is_none()
+        );
+        assert!(
+            map_subagent_action(TuiAction::SteerSubagent { id: 7, text: "   ".into() })
+                .is_none()
+        );
+        // Non-control actions never map to a subagent command.
+        assert!(map_subagent_action(TuiAction::Interrupt).is_none());
+    }
+
     /// Read-only slash commands are UI-safe while the engine is busy;
     /// everything else (prompts, heavy commands) must queue.
     #[test]

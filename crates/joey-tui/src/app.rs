@@ -55,6 +55,17 @@ pub enum TuiAction {
     /// one — a bare `CopyItem` would copy the wrong text. Host owns the
     /// clipboard access.
     CopyPaneItem { pane: usize, idx: usize },
+    /// T023 (US6, FR-017, spec 020): stop the FOCUSED subagent pane's
+    /// child (operator-requested). `id` is the pane's stable child id
+    /// (correlates `SubagentSpawn.id`); the host routes it to the
+    /// delegation manager's stop path. Emitted by plain `x` while a
+    /// subagent pane is focused (Transcript focus).
+    StopSubagent { id: u64 },
+    /// T023 (US6, FR-017, spec 020): steer the FOCUSED subagent pane's
+    /// child — deliver `text` before the child's next action. Emitted by
+    /// the steer overlay's Enter (opened with plain `s` while a subagent
+    /// pane is focused, Transcript focus).
+    SteerSubagent { id: u64, text: String },
 }
 
 pub type FrameBackend = CrosstermBackend<Stdout>;
@@ -414,12 +425,31 @@ pub struct Tui<B: ratatui::backend::Backend = FrameBackend> {
     /// Set after accepting a completion: suppresses re-opening the popup
     /// until the next real edit (typing/backspace clears it).
     completion_suppressed: bool,
+    /// T023 (US6, FR-017, spec 020): the steer overlay's live draft, bound
+    /// to the focused pane's child (`None` = closed). Controller-owned
+    /// singleton overlay, exactly like `show_help`/search.
+    steer: Option<SteerOverlay>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
     Input,
     Transcript,
+}
+
+/// T023 (US6, FR-017, spec 020): the steer overlay's draft state — a
+/// small bottom text-input bar bound to the FOCUSED pane's child
+/// (mirrors the search bar's chrome). Lives on `Tui` (controller-owned overlay, like `show_help`); Esc cancels,
+/// Enter commits
+/// [`TuiAction::SteerSubagent`].
+pub(crate) struct SteerOverlay {
+    /// Stable child id of the focused pane at open time (frozen — later
+    /// focus switches never retarget a draft mid-type).
+    pub(crate) child_id: u64,
+    /// The pane's goal line, captured for the overlay title only.
+    pub(crate) goal: String,
+    /// The typed steering message.
+    pub(crate) text: String,
 }
 
 /// T003 (research.md D1/D3): the view a transcript-targeted key acts on.
@@ -514,6 +544,7 @@ impl Tui<FrameBackend> {
             completion_engine: joey_tools::completion::CompletionEngine::new(),
             completion_cwd: std::env::current_dir().unwrap_or_default(),
             completion_suppressed: false,
+            steer: None,
         })
     }
 
@@ -568,6 +599,7 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             completion_engine: joey_tools::completion::CompletionEngine::new(),
             completion_cwd: std::env::current_dir().unwrap_or_default(),
             completion_suppressed: false,
+            steer: None,
         }
     }
 
@@ -645,6 +677,7 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             header_flow,
             show_help,
             focus,
+            steer,
             ..
         } = self;
         let theme = *theme;
@@ -723,6 +756,12 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             if app.search_open {
                 widgets::draw_search_bar(f, area, app, &theme);
             }
+
+            // T023 (US6, FR-017, spec 020): the steer overlay renders last
+            // so it sits above the search bar's chrome when both are open.
+            if let Some(steer) = steer {
+                widgets::draw_steer_bar(f, area, steer, &theme);
+            }
         })?;
         Ok(())
     }
@@ -794,6 +833,13 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // Search overlay: route all keys to search input.
         if self.app.search_open {
             return self.handle_search_key(key);
+        }
+
+        // T023 (US6, FR-017, spec 020): steer overlay — while open it owns
+        // the keys (the search bar's swallow pattern): Esc cancels, Enter
+        // commits SteerSubagent, printables/Backspace edit the draft.
+        if self.steer.is_some() {
+            return self.handle_steer_key(key);
         }
 
         // NeuroCode fullscreen explorer: while expanded, navigation keys
@@ -906,6 +952,17 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 // Expandable-stats: Space/x toggles the context entry at the
                 // center of the visible window (keyboard parity with clicks;
                 // same resolution strategy as the transcript's Space).
+                // T023 (US6, FR-017, spec 020): with a pane focused (the
+                // page retargeted to that child), plain 'x' is repurposed
+                // to STOP the focused child — the pane-focused stop key
+                // must win over every legacy 'x' binding (precedence).
+                // Space keeps the expand on both views; the unfocused 'x'
+                // below is byte-identical to the pre-T023 behavior.
+                KeyCode::Char('x') if pane_focused => {
+                    if let Some(pane) = self.app.focused_pane() {
+                        return Some(TuiAction::StopSubagent { id: pane.child_id });
+                    }
+                }
                 KeyCode::Char(' ') | KeyCode::Char('x') => {
                     let (inner_y, _start) = if pane_focused {
                         self.app.last_pane_stats_window.get()
@@ -1444,94 +1501,110 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                     // viewport (mouse clicks also toggle, via hit-testing).
                     // Scroll so the tool/terminal block you want is the top
                     // visible item, then press Space/x.
-                    KeyCode::Char(' ') | KeyCode::Char('x') => {
+                    // T023 (US6, FR-017, spec 020): with a subagent pane
+                    // focused, 'x' is repurposed to STOP that child and 's'
+                    // opens the steer overlay bound to it — operator
+                    // per-subagent control (contracts/delegation-tools.md).
+                    // Both arms precede the legacy bindings (precedence), so
+                    // x never expands while a pane is focused; Space keeps
+                    // expanding and Ctrl+S keeps opening search.
+                    KeyCode::Char('x') if matches!(target, TranscriptTarget::Pane(_)) => {
+                        if let Some(pane) = self.app.focused_pane() {
+                            return Some(TuiAction::StopSubagent { id: pane.child_id });
+                        }
+                    }
+                    KeyCode::Char('s') if matches!(target, TranscriptTarget::Pane(_)) => {
+                        if let Some(pane) = self.app.focused_pane() {
+                            let (child_id, goal) = (pane.child_id, pane.goal.clone());
+                            self.open_steer(child_id, &goal);
+                        }
+                    }
+                    KeyCode::Char(' ') | KeyCode::Char('x') => match target {
                         // T011 (US2, FR-003): routed via `target` — the Pane
                         // arm mirrors the Main arm's resolution strategy
                         // (viewport-center hit-test via the shared
                         // `transcript_hit_test_core`, then the first-expandable-
                         // at/below-top fallback), just reading the focused
                         // pane's transcript and geometry.
-                        match target {
-                            TranscriptTarget::Pane(_) => {
-                                let (tx, ty, tw, th) = self.app.last_pane_text_area.get();
-                                let center_row = ty + th / 2;
-                                let max = self.app.last_pane_max_scroll.get();
-                                let area = (tx, ty, tw, th);
-                                let resolved = self
-                                    .app
-                                    .focused_pane()
-                                    .and_then(|pane| {
-                                        // Center row first (same machinery
-                                        // pane clicks use, so keyboard and
-                                        // mouse always agree).
-                                        widgets::transcript_hit_test_core(
+                        TranscriptTarget::Pane(_) => {
+                            let (tx, ty, tw, th) = self.app.last_pane_text_area.get();
+                            let center_row = ty + th / 2;
+                            let max = self.app.last_pane_max_scroll.get();
+                            let area = (tx, ty, tw, th);
+                            let resolved = self
+                                .app
+                                .focused_pane()
+                                .and_then(|pane| {
+                                    // Center row first (same machinery
+                                    // pane clicks use, so keyboard and
+                                    // mouse always agree).
+                                    widgets::transcript_hit_test_core(
+                                        &pane.transcript,
+                                        &pane.streaming_assistant,
+                                        pane.scroll,
+                                        max,
+                                        area,
+                                        self.theme,
+                                        center_row,
+                                    )
+                                    .filter(|&i| pane_item_is_expandable(&pane.transcript[i]))
+                                })
+                                .or_else(|| {
+                                    // Fall back to the first expandable
+                                    // item at or below the top of the
+                                    // view (the "whole transcript fits"
+                                    // case), mirroring the Main arm.
+                                    self.app.focused_pane().and_then(|pane| {
+                                        let top = widgets::transcript_hit_test_core(
                                             &pane.transcript,
                                             &pane.streaming_assistant,
                                             pane.scroll,
                                             max,
                                             area,
                                             self.theme,
-                                            center_row,
-                                        )
-                                        .filter(|&i| pane_item_is_expandable(&pane.transcript[i]))
-                                    })
-                                    .or_else(|| {
-                                        // Fall back to the first expandable
-                                        // item at or below the top of the
-                                        // view (the "whole transcript fits"
-                                        // case), mirroring the Main arm.
-                                        self.app.focused_pane().and_then(|pane| {
-                                            let top = widgets::transcript_hit_test_core(
-                                                &pane.transcript,
-                                                &pane.streaming_assistant,
-                                                pane.scroll,
-                                                max,
-                                                area,
-                                                self.theme,
-                                                ty,
-                                            );
-                                            top.and_then(|t0| {
-                                                (t0..pane.transcript.len()).find(|&i| {
-                                                    pane_item_is_expandable(&pane.transcript[i])
-                                                })
+                                            ty,
+                                        );
+                                        top.and_then(|t0| {
+                                            (t0..pane.transcript.len()).find(|&i| {
+                                                pane_item_is_expandable(&pane.transcript[i])
                                             })
                                         })
-                                    });
-                                if let Some(i) = resolved {
-                                    if let Some(p) = self.app.focused_pane_mut() {
-                                        p.toggle_item_expand(i);
-                                    }
+                                    })
+                                });
+                            if let Some(i) = resolved {
+                                if let Some(p) = self.app.focused_pane_mut() {
+                                    p.toggle_item_expand(i);
                                 }
                             }
-                            TranscriptTarget::Main => {
-                                // Expand the item under the viewport — reuse the
-                                // mouse hit-test resolution at the CENTER row of
-                                // the transcript (same machinery clicks use, so
-                                // keyboard and mouse always agree). When the center
-                                // lands on a non-expandable item, fall back to the
-                                // first expandable item at or below the top of the
-                                // view (the common "whole transcript fits" case:
-                                // Space expands the tool output you can see).
-                                let (_tx, ty, _tw, th) = self.app.last_text_area.get();
-                                let center_row = ty + th / 2;
-                                let center_col = 4; // inside the text area
-                                let idx = widgets::transcript_hit_test(
-                                    &self.app, self.theme, center_row, center_col,
-                                );
-                                let resolved = match idx {
-                                    Some(i) if self.app.item_is_expandable(i) => Some(i),
-                                    _ => {
-                                        let top = widgets::transcript_item_at_top(&self.app, self.theme);
-                                        match top {
-                                            Some(t0) => (t0..self.app.transcript.len())
-                                                .find(|&i| self.app.item_is_expandable(i)),
-                                            None => None,
-                                        }
+                        }
+                        TranscriptTarget::Main => {
+                            // Expand the item under the viewport — reuse the
+                            // mouse hit-test resolution at the CENTER row of
+                            // the transcript (same machinery clicks use, so
+                            // keyboard and mouse always agree). When the center
+                            // lands on a non-expandable item, fall back to the
+                            // first expandable item at or below the top of the
+                            // view (the common "whole transcript fits" case:
+                            // Space expands the tool output you can see).
+                            let (_tx, ty, _tw, th) = self.app.last_text_area.get();
+                            let center_row = ty + th / 2;
+                            let center_col = 4; // inside the text area
+                            let idx = widgets::transcript_hit_test(
+                                &self.app, self.theme, center_row, center_col,
+                            );
+                            let resolved = match idx {
+                                Some(i) if self.app.item_is_expandable(i) => Some(i),
+                                _ => {
+                                    let top = widgets::transcript_item_at_top(&self.app, self.theme);
+                                    match top {
+                                        Some(t0) => (t0..self.app.transcript.len())
+                                            .find(|&i| self.app.item_is_expandable(i)),
+                                        None => None,
                                     }
-                                };
-                                if let Some(i) = resolved {
-                                    self.app.toggle_item_expand_by_index(i);
                                 }
+                            };
+                            if let Some(i) = resolved {
+                                self.app.toggle_item_expand_by_index(i);
                             }
                         }
                     }
@@ -2012,6 +2085,59 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         for pane in &mut self.app.subagent_panes {
             pane.search_open = false;
             pane.search_query.clear();
+        }
+    }
+
+    /// T023 (US6, FR-017, spec 020): open the steer overlay bound to the
+    /// FOCUSED pane's child — fresh empty draft every time (an Esc'd draft
+    /// is never resurrected). The child id is frozen at open time, so later
+    /// focus switches never retarget a draft mid-type.
+    fn open_steer(&mut self, child_id: u64, goal: &str) {
+        self.steer = Some(SteerOverlay {
+            child_id,
+            goal: goal.to_string(),
+            text: String::new(),
+        });
+    }
+
+    /// T023 (US6, FR-017, spec 020): the steer overlay's key handler —
+    /// while open, the overlay owns the keys (the search bar's swallow
+    /// pattern): Esc cancels/discards, Enter commits
+    /// [`TuiAction::SteerSubagent`] and closes (an EMPTY draft is a safe
+    /// no-op that keeps the overlay open, mirroring Submit's empty-guard),
+    /// printables/Backspace edit the draft.
+    fn handle_steer_key(&mut self, key: KeyEvent) -> Option<TuiAction> {
+        match key.code {
+            KeyCode::Esc => {
+                self.steer = None;
+                None
+            }
+            KeyCode::Enter => {
+                // Empty draft: no-op close-less guard (overlay stays open).
+                let overlay = match self.steer.as_ref() {
+                    Some(o) if !o.text.is_empty() => o,
+                    _ => return None,
+                };
+                let action = TuiAction::SteerSubagent {
+                    id: overlay.child_id,
+                    text: overlay.text.clone(),
+                };
+                self.steer = None;
+                Some(action)
+            }
+            KeyCode::Backspace => {
+                if let Some(overlay) = self.steer.as_mut() {
+                    overlay.text.pop();
+                }
+                None
+            }
+            KeyCode::Char(c) => {
+                if let Some(overlay) = self.steer.as_mut() {
+                    overlay.text.push(c);
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -4880,9 +5006,10 @@ mod pane_expand_key_routing_tests {
         }
     }
 
-    /// Focused pane + Space/x: the viewport-center resolution lands on the
+    /// Focused pane + Space: the viewport-center resolution lands on the
     /// pane's tall Tool item and cycles it Collapsed → TailWindow → Full →
-    /// Collapsed (third press via `x` — same arm); the MAIN transcript's
+    /// Collapsed (third press via Space — T023 repurposed pane-focused `x`
+    /// to StopSubagent, so Space is the expander); the MAIN transcript's
     /// expandables never move (focused-view isolation).
     #[test]
     fn space_x_routes_to_focused_pane_tool_cycle() {
@@ -4912,11 +5039,11 @@ mod pane_expand_key_routing_tests {
             ReasoningExpandState::Full,
             "press 2 (Space): TailWindow → Full (220 > 200)"
         );
-        t.handle_key(plain(KeyCode::Char('x')));
+        t.handle_key(plain(KeyCode::Char(' ')));
         assert_eq!(
             expand_state_of(&t.app.subagent_panes[0].transcript[0]),
             ReasoningExpandState::Collapsed,
-            "press 3 (x, same arm): Full → Collapsed"
+            "press 3 (Space, same arm): Full → Collapsed"
         );
 
         main_all_collapsed(&t, "space/x on focused pane tool");
@@ -5771,6 +5898,379 @@ mod pane_viewer_key_tests {
                     "help overlay cell ({x},{y}) differs between pane and main views"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pane_stop_steer_key_tests {
+    //! T022 (US6, FR-017, spec 020): per-subagent operator control from
+    //! the live interface. With a subagent pane focused (Transcript
+    //! focus), plain `x` stops the FOCUSED child and plain `s` opens a
+    //! steer overlay bound to it; typing + Enter commits the steering
+    //! message. Precedence: while a pane is focused, x/s NEVER trigger
+    //! stats/transcript expand or search; with no pane focused the
+    //! existing x behavior (stats/transcript expand toggle) is unchanged
+    //! and plain s keeps typing into the input box.
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use joey_agent_core::events::AgentEvent;
+    use ratatui::backend::TestBackend;
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn char_key(c: char) -> KeyEvent {
+        plain(KeyCode::Char(c))
+    }
+
+    fn tui() -> Tui<TestBackend> {
+        let app = App::new("sess", "model");
+        let terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        Tui::new_for_test(app, Theme::aurora(), terminal)
+    }
+
+    /// Spawn two children (ids 7 and 9) and focus the SECOND pane, so the
+    /// tests prove the action carries the FOCUSED child's id, not just
+    /// "some" id.
+    fn spawn_two_panes_focused_on_second(t: &mut Tui<TestBackend>) {
+        for id in [7u64, 9u64] {
+            t.app.apply(AgentEvent::SubagentSpawn {
+                id,
+                goal: format!("child {id}"),
+                model: "m".into(),
+                toolset_summary: "file".into(),
+                depth: 0,
+            });
+        }
+        t.app.focus_subagent(Some(1));
+        t.focus = Focus::Transcript;
+    }
+
+    /// (a) Focused pane + `x` → StopSubagent with the FOCUSED child's id.
+    #[test]
+    fn focused_x_stops_focused_child() {
+        let mut t = tui();
+        spawn_two_panes_focused_on_second(&mut t);
+        assert!(matches!(
+            t.handle_key(char_key('x')),
+            Some(TuiAction::StopSubagent { id: 9 })
+        ));
+    }
+
+    /// (a, input-focus negative) `x` in Input focus keeps typing — the
+    /// binding is Transcript-focus-only (matching the existing x/Space
+    /// expand arms, which never fire from Input focus).
+    #[test]
+    fn focused_x_in_input_focus_still_types() {
+        let mut t = tui();
+        spawn_two_panes_focused_on_second(&mut t);
+        t.focus = Focus::Input;
+        assert!(t.handle_key(char_key('x')).is_none());
+        assert_eq!(t.input.text(), "x");
+    }
+
+    /// (b) Focused pane + `s` opens the steer overlay bound to the
+    /// focused child; typed chars land in the overlay; Enter commits
+    /// SteerSubagent{id, text}; the overlay closes.
+    #[test]
+    fn focused_s_opens_steer_overlay_and_enter_commits() {
+        let mut t = tui();
+        spawn_two_panes_focused_on_second(&mut t);
+
+        assert!(t.steer.is_none(), "overlay closed initially");
+        assert!(t.handle_key(char_key('s')).is_none(), "'s' opens, no action yet");
+        let overlay = t.steer.as_ref().expect("steer overlay opened");
+        assert_eq!(overlay.child_id, 9, "bound to the FOCUSED child");
+
+        for c in "go left".chars() {
+            assert!(t.handle_key(char_key(c)).is_none());
+        }
+        assert_eq!(t.steer.as_ref().unwrap().text, "go left");
+
+        let action = t.handle_key(plain(KeyCode::Enter));
+        assert!(matches!(
+            action,
+            Some(TuiAction::SteerSubagent { id: 9, text }) if text == "go left"
+        ));
+        assert!(t.steer.is_none(), "overlay closed after commit");
+    }
+
+    /// (b) Esc cancels the overlay: no action, draft discarded.
+    #[test]
+    fn steer_overlay_esc_cancels_without_action() {
+        let mut t = tui();
+        spawn_two_panes_focused_on_second(&mut t);
+        t.handle_key(char_key('s'));
+        for c in "drift".chars() {
+            t.handle_key(char_key(c));
+        }
+        assert!(t.handle_key(plain(KeyCode::Esc)).is_none(), "Esc emits no action");
+        assert!(t.steer.is_none(), "overlay closed");
+        // Focus is still on the pane; a fresh 's' reopens with an empty draft.
+        t.handle_key(char_key('s'));
+        assert_eq!(t.steer.as_ref().unwrap().text, "", "draft cleared on reopen");
+        assert_eq!(t.steer.as_ref().unwrap().child_id, 9);
+    }
+
+    /// (b) Enter on an EMPTY draft is a safe no-op (overlay stays open),
+    /// mirroring Submit's empty-guard.
+    #[test]
+    fn steer_overlay_empty_enter_is_noop() {
+        let mut t = tui();
+        spawn_two_panes_focused_on_second(&mut t);
+        t.handle_key(char_key('s'));
+        assert!(t.handle_key(plain(KeyCode::Enter)).is_none());
+        assert!(t.steer.is_some(), "empty Enter keeps the overlay open");
+    }
+
+    /// (b) While the overlay is open it owns the keys: the draft never
+    /// leaks into the input box, and no transcript key (e.g. 'y' copy or
+    /// '/' search) fires.
+    #[test]
+    fn steer_overlay_owns_keys_while_open() {
+        let mut t = tui();
+        spawn_two_panes_focused_on_second(&mut t);
+        t.handle_key(char_key('s'));
+        for c in "note".chars() {
+            t.handle_key(char_key(c));
+        }
+        assert!(t.input.is_empty(), "draft never lands in the input box");
+        assert!(t.handle_key(char_key('/')).is_none());
+        assert!(!t.app.search_open, "'/' inside the overlay doesn't open search");
+        assert!(t.steer.is_some(), "overlay still open");
+    }
+
+    /// (c) Precedence while a pane is focused: `x` does NOT toggle the
+    /// stats page's context-entry expansion, and `s` does NOT open the
+    /// search bar — even when the lower layers would happily act.
+    #[test]
+    fn focused_x_s_do_not_trigger_stats_expand_or_search() {
+        let mut t = tui();
+        spawn_two_panes_focused_on_second(&mut t);
+        // Stats page open (retargeted to the focused pane), with a seeded
+        // context entry + hit-test geometry so the OLD 'x' arm could act.
+        t.app.stats_open = true;
+        t.app.apply(AgentEvent::SubagentEvent {
+            id: 9,
+            event: Box::new(AgentEvent::ContextSnapshot {
+                entries: vec![joey_agent_core::events::ContextEntry {
+                    role: "user".into(),
+                    tokens: 40,
+                    preview: "seed".into(),
+                    full_content: "seed full".into(),
+                    has_tool_calls: false,
+                    is_compressed_summary: false,
+                }],
+                system_tokens: 10,
+                history_tokens: 40,
+                context_window: 1000,
+                compression_threshold: 800,
+                compactions: 0,
+                model: "m".into(),
+            }),
+        });
+        t.app.last_pane_stats_window.set((4, 0));
+        t.app.last_pane_stats_rect.set((0, 4, 100, 20));
+        // Seed the pane stats stream-rows so a center-row hit resolves:
+        // (entry 0 spans content rows 0..3).
+        *t.app.last_pane_stats_stream_rows.borrow_mut() = vec![(0usize, 0usize, 3usize)];
+
+        assert!(t.handle_key(char_key('x')).is_some(), "x emitted StopSubagent");
+        assert!(
+            t.app.focused_pane().unwrap().expanded_context.is_empty(),
+            "stats context entry NOT expanded (stop wins)"
+        );
+
+        // 's' must not open the search bar while a pane is focused.
+        assert!(!t.app.search_open);
+        assert!(t.handle_key(char_key('s')).is_none());
+        assert!(!t.app.search_open, "'s' did not open search (steer wins)");
+        assert!(t.steer.is_some(), "'s' opened the steer overlay instead");
+    }
+
+    /// (c) Precedence in the transcript layer: with a pane focused, `x`
+    /// no longer toggles the pane transcript's item expansion (the key is
+    /// repurposed to stop; Space remains the expander).
+    #[test]
+    fn focused_x_no_longer_expands_pane_transcript_items() {
+        let mut t = tui();
+        spawn_two_panes_focused_on_second(&mut t);
+        let result = (0..220)
+            .map(|j| format!("child tool line {j:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        t.app.subagent_panes[1].push_item(TranscriptItem::Tool {
+            name: "ctool".into(),
+            emoji: "🔧".into(),
+            summary: "child tool".into(),
+            status: crate::state::ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: result.clone(),
+            expand_state: crate::state::ReasoningExpandState::Collapsed,
+            full_args: None,
+            full_result: Some(result),
+            is_terminal: false,
+            exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
+        });
+        t.app.last_pane_text_area.set((0, 0, 100, 28));
+        t.app.last_pane_max_scroll.set(0);
+
+        let action = t.handle_key(char_key('x'));
+        assert!(matches!(action, Some(TuiAction::StopSubagent { .. })));
+        assert!(
+            !matches!(
+                t.app.subagent_panes[1].transcript.back(),
+                Some(TranscriptItem::Tool {
+                    expand_state: crate::state::ReasoningExpandState::TailWindow
+                        | crate::state::ReasoningExpandState::Full,
+                    ..
+                })
+            ),
+            "x stopped the child; the pane transcript item stayed Collapsed"
+        );
+    }
+
+    /// (c) Unfocused regression pin (constitution VII): with panes
+    /// present but NONE focused, `x` keeps the existing stats/transcript
+    /// expand behavior (verified via the stats-page arm) and plain `s`
+    /// keeps typing into the input box.
+    #[test]
+    fn unfocused_x_and_s_keep_existing_behavior() {
+        let mut t = tui();
+        t.app.apply(AgentEvent::SubagentSpawn {
+            id: 7,
+            goal: "child 7".into(),
+            model: "m".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+        t.focus = Focus::Transcript;
+        // NOT focusing the pane: Main transcript expand arm stays armed.
+        let result = (0..220)
+            .map(|j| format!("main tool line {j:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        t.app.push_item(TranscriptItem::Tool {
+            name: "mtool".into(),
+            emoji: "🔧".into(),
+            summary: "main tool".into(),
+            status: crate::state::ToolStatus::Done,
+            duration_secs: Some(0.5),
+            result_preview: result.clone(),
+            expand_state: crate::state::ReasoningExpandState::Collapsed,
+            full_args: None,
+            full_result: Some(result),
+            is_terminal: false,
+            exit_code: Some(0),
+            live_output: String::new(),
+            live_output_capacity: crate::state::LIVE_OUTPUT_CAPACITY,
+        });
+        t.app.last_text_area.set((0, 0, 98, 28));
+        t.app.last_max_scroll.set(0);
+
+        assert!(t.handle_key(char_key('x')).is_none(), "no pane focused → no action");
+        assert!(
+            matches!(
+                t.app.transcript.back(),
+                Some(TranscriptItem::Tool {
+                    expand_state: crate::state::ReasoningExpandState::TailWindow
+                        | crate::state::ReasoningExpandState::Full,
+                    ..
+                })
+            ),
+            "unfocused x still expands the MAIN transcript item (existing behavior)"
+        );
+
+        // Plain 's' in Input focus still types; no overlay.
+        t.focus = Focus::Input;
+        assert!(t.handle_key(char_key('s')).is_none());
+        assert_eq!(t.input.text(), "s");
+        assert!(t.steer.is_none());
+    }
+}
+
+#[cfg(test)]
+mod fr014_background_pane_parity_tests {
+    //! FR-014 pin (spec 020): background subagent activity MUST remain
+    //! visible in the operator interface exactly as blocking subagent
+    //! activity is — same event path, same live pane. `SubagentSpawn`
+    //! (the one lifecycle event the TUI consumes) carries no blocking/
+    //! background distinction, so any child — however dispatched —
+    //! materializes an identical live pane. This pins that single event
+    //! path so a future "background" fork cannot silently diverge.
+    use super::*;
+    use joey_agent_core::events::AgentEvent;
+
+    /// Two spawns with identical payloads except the id/goal produce
+    /// structurally identical panes (goal/id excepted): status Running,
+    /// empty transcript, tap not yet attached, same capacities.
+    #[test]
+    fn every_subagent_spawn_creates_identical_live_pane() {
+        let mut app = App::new("s", "m");
+        app.apply(AgentEvent::SubagentSpawn {
+            id: 11,
+            goal: "blocking-style child".into(),
+            model: "glm-5".into(),
+            toolset_summary: "read".into(),
+            depth: 1,
+        });
+        app.apply(AgentEvent::SubagentSpawn {
+            id: 12,
+            goal: "background-style child".into(),
+            model: "glm-5".into(),
+            toolset_summary: "read".into(),
+            depth: 1,
+        });
+        assert_eq!(app.subagent_panes.len(), 2, "one live pane per child");
+        let a = &app.subagent_panes[0];
+        let b = &app.subagent_panes[1];
+        assert_eq!(a.status, crate::state::SubagentStatus::Running);
+        assert_eq!(b.status, crate::state::SubagentStatus::Running);
+        assert!(a.transcript.is_empty() && b.transcript.is_empty());
+        assert_eq!(a.model, b.model);
+        assert_eq!(a.toolset_summary, b.toolset_summary);
+        assert_eq!(a.depth, b.depth);
+        assert_eq!(a.transcript_capacity, b.transcript_capacity);
+        assert!(!a.tap_attached && !b.tap_attached);
+        assert_eq!(a.child_id, 11);
+        assert_eq!(b.child_id, 12);
+        assert_eq!(a.goal, "blocking-style child");
+        assert_eq!(b.goal, "background-style child");
+    }
+
+    /// The live feed is id-keyed and dispatch-agnostic: SubagentEvent for
+    /// either child routes into THAT child's pane identically (the same
+    /// wrapping a blocking child's stream uses).
+    #[test]
+    fn subagent_events_route_identically_for_any_child() {
+        let mut app = App::new("s", "m");
+        for id in [21u64, 22u64] {
+            app.apply(AgentEvent::SubagentSpawn {
+                id,
+                goal: format!("child {id}"),
+                model: "m".into(),
+                toolset_summary: "all".into(),
+                depth: 0,
+            });
+        }
+        for id in [21u64, 22u64] {
+            app.apply(AgentEvent::SubagentEvent {
+                id,
+                event: Box::new(AgentEvent::ContentDelta("chunk ".into())),
+            });
+        }
+        for pane in &app.subagent_panes {
+            assert_eq!(pane.streaming_assistant, "chunk ", "same live stream shape");
+            assert!(pane.tap_attached, "id-matched attribution live");
         }
     }
 }

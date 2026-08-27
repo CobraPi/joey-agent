@@ -51,6 +51,8 @@ async fn batch_emits_all_lifecycle_events() {
             model: None,
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         },
         TaskSpec {
             goal: "Event task B".to_string(),
@@ -58,6 +60,8 @@ async fn batch_emits_all_lifecycle_events() {
             model: None,
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         },
     ];
 

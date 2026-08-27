@@ -280,13 +280,16 @@ impl Subagent {
         self,
         event_tx: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
     ) -> DelegationResult {
-        self.run_with_tap(0, event_tx, None).await
+        self.run_with_tap(0, event_tx, None, None).await
     }
 
     /// Run the subagent's turn loop, forwarding every child event to the
     /// tap wrapped as `AgentEvent::SubagentEvent { id, event }` (parallel-
     /// subagent feature) while the per-dispatch channel keeps receiving the
-    /// RAW events (legacy behavior preserved).
+    /// RAW events (legacy behavior preserved). T029: `recorder` is a second
+    /// internal tap (subagent_control's activity log) fed with the SAME
+    /// wrapped events — it never participates in tap resolution, so it
+    /// cannot shadow the external tap.
     ///
     /// Id `0` + no tap is byte-identical to the pre-feature `run`.
     pub(crate) async fn run_with_tap(
@@ -294,6 +297,7 @@ impl Subagent {
         id: u64,
         event_tx: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
         tap: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
+        recorder: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
     ) -> DelegationResult {
         let start = Instant::now();
         let goal = self.goal.clone();
@@ -346,18 +350,25 @@ impl Subagent {
         // forwarded raw to the legacy per-dispatch channel so existing
         // consumers are unaffected. Implementation: wrap the sender with a
         // fan-out via an mpsc channel + forwarding task.
-        let result: TurnResult = if tap.is_some() {
+        let result: TurnResult = if tap.is_some() || recorder.is_some() {
             let (child_tx, mut child_rx) =
                 tokio::sync::mpsc::unbounded_channel::<joey_agent_core::AgentEvent>();
-            let tap_tx = tap.cloned().unwrap();
+            let tap_tx = tap.cloned();
+            let recorder_tx = recorder.cloned();
             let legacy_tx = tx_for_run.clone();
             let fanout = tokio::spawn(async move {
                 while let Some(ev) = child_rx.recv().await {
                     if id != 0 {
-                        let _ = tap_tx.send(joey_agent_core::AgentEvent::SubagentEvent {
+                        let wrapped = joey_agent_core::AgentEvent::SubagentEvent {
                             id,
                             event: Box::new(ev.clone()),
-                        });
+                        };
+                        if let Some(tx) = tap_tx.as_ref() {
+                            let _ = tx.send(wrapped.clone());
+                        }
+                        if let Some(tx) = recorder_tx.as_ref() {
+                            let _ = tx.send(wrapped);
+                        }
                     }
                     let _ = legacy_tx.send(ev);
                 }
@@ -410,6 +421,7 @@ impl Subagent {
             model,
             iterations: result.iterations,
             persisted_session_id: session_id,
+            stop_reason: None,
         }
     }
 }

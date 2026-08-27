@@ -36,6 +36,8 @@ async fn mixed_model_batch_records_per_task_model() {
             model: Some("heavy-model".to_string()),
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         },
         TaskSpec {
             goal: "Light task A".to_string(),
@@ -43,6 +45,8 @@ async fn mixed_model_batch_records_per_task_model() {
             model: Some("light-model".to_string()),
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         },
         TaskSpec {
             goal: "Light task B".to_string(),
@@ -50,6 +54,8 @@ async fn mixed_model_batch_records_per_task_model() {
             model: Some("light-model".to_string()),
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         },
     ];
 

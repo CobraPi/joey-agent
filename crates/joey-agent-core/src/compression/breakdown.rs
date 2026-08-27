@@ -19,7 +19,7 @@ static SKILLS_BLOCK_RE: Lazy<Regex> =
     // SAFETY: the regex pattern is a compile-time constant literal.
     Lazy::new(|| Regex::new(r"(?s)<available_skills>.*?</available_skills>").unwrap());
 
-const SUBAGENT_TOOL_NAMES: &[&str] = &["delegate_task"];
+const SUBAGENT_TOOL_NAMES: &[&str] = &["delegate_task", "subagent_control"];
 
 /// context_breakdown.py `_CATEGORY_COLORS`.
 fn category_color(id: &str) -> &'static str {

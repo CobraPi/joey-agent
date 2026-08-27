@@ -55,6 +55,8 @@ async fn tap_receives_lifecycle_and_wrapped_child_events() {
             model: None,
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         })
         .collect();
 
@@ -118,6 +120,8 @@ async fn ids_are_unique_and_monotonic() {
             model: None,
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         })
         .collect();
     let _ = mgr
@@ -168,6 +172,8 @@ async fn child_ids_disjoint_across_concurrent_managers() {
             model: None,
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         })
         .collect();
 

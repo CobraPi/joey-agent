@@ -42,6 +42,8 @@ async fn batch_resilience_all_results_returned() {
             model: None,
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         },
         TaskSpec {
             goal: "Resilient task B".to_string(),
@@ -49,6 +51,8 @@ async fn batch_resilience_all_results_returned() {
             model: None,
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         },
         TaskSpec {
             goal: "Resilient task C".to_string(),
@@ -56,6 +60,8 @@ async fn batch_resilience_all_results_returned() {
             model: None,
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         },
     ];
 

@@ -66,6 +66,15 @@ When using a skill and finding it outdated, incomplete, or wrong, \
 patch it immediately with skill_manage(action='patch') — don't wait to be asked. \
 Skills that aren't maintained become liabilities.";
 
+/// Guidance for the `subagent_control` tool (feature 020, US3). Joey-side
+/// addition — no upstream counterpart; wording follows the delegation-tools
+/// contract (specs/020-async-delegation-control/contracts/delegation-tools.md).
+pub const SUBAGENT_CONTROL_GUIDANCE: &str = "When you have subagents running from delegate_task, use subagent_control to \
+keep them on track: steer (id, message) queues a steering message delivered \
+before that child's next action; stop (id) requests a graceful stop with reason \
+orchestrator-requested — only that child stops, and it yields a partial result \
+with the stop reason.";
+
 /// prompt_builder.py `TOOL_USE_ENFORCEMENT_GUIDANCE` — verbatim.
 pub const TOOL_USE_ENFORCEMENT_GUIDANCE: &str = "# Tool-use enforcement\n\
 You MUST use your tools to take action — do not describe what you would do \

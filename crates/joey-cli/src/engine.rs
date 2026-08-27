@@ -36,6 +36,17 @@ use tokio::sync::mpsc;
 
 use crate::repl::Overrides;
 
+/// The synthetic prompt the idle-wake turn runs with (T013, FR-003). Worded
+/// to look like a system notification, not a user request, and to avoid every
+/// intent-gate keyword (ultrawork/hyperplan/team) so `engine_pre_turn` never
+/// mutates overlays on a wake. The turn's real payload is the
+/// pending-completions drain at `run_turn` start; the prompt text merely
+/// gives the model something to acknowledge if it IS dispatched (credentialed
+/// provider) while keeping the early-exit path (no credentials) trivially
+/// harmless.
+pub(crate) const WAKE_PROMPT: &str =
+    "(system) A background delegation finished while you were idle. Review the completion notice above and act on it if warranted; otherwise acknowledge briefly.";
+
 /// Command from the UI to the engine task.
 #[allow(dead_code)] // variants are part of the command API (Interrupt used by hosts/tests)
 #[derive(Debug)]
@@ -98,6 +109,29 @@ pub enum EngineCommand {
     /// Queue an image data-URL onto the engine's agent for the next turn
     /// (`/image`, `/paste`).
     AttachImage(String),
+    /// A background delegation finished while the engine was idle (spec 020
+    /// T013, FR-003 "idle wake"). Sent by the TUI pump when the delegation
+    /// tap reports a terminal child lifecycle event and no turn/heavy job is
+    /// running. The engine starts a synthetic turn so `run_turn` drains the
+    /// agent's pending-completions queue (notices are injected as context at
+    /// turn start). Mid-turn it is a deliberate no-op: FR-003 routes
+    /// mid-turn completions to the next turn boundary, and a turn that is
+    /// already polling drains the queue when the NEXT turn starts.
+    DelegationNoticePending,
+    /// T024 (US6, FR-017, spec 020): stop the delegation child `id`
+    /// (operator-requested — focused-pane `x` in the TUI). Routed to the
+    /// session manager with `StopReason::OperatorRequested`; the engine
+    /// acks (or surfaces the manager's error) as an `EngineEvent::Notice`.
+    /// Handled IMMEDIATELY even mid-turn: control ops are synchronous and
+    /// never acquire a semaphore permit (SC-007), and the target is the
+    /// CHILD, not the parent turn.
+    StopSubagent { id: u64 },
+    /// T024 (US6, spec 020): steer the delegation child `id` — deliver
+    /// `text` before the child's next action (focused-pane `s` overlay in
+    /// the TUI). Routed to the session manager's `steer_child`; ordering
+    /// (steer lands before the child's next action) is the manager's
+    /// concern — the engine merely must not reorder or drop the command.
+    SteerSubagent { id: u64, text: String },
 }
 
 /// Event from the engine task to the UI.
@@ -171,6 +205,14 @@ pub struct EngineSpec {
     pub cwd: std::path::PathBuf,
     pub overrides: Overrides,
     pub session_id: String,
+    /// T024 (spec 020): the session's SubagentManager — the SAME Arc the
+    /// agent's `delegate_task` tool holds (from `repl::build_agent_parts`).
+    /// Children are keyed by process-global ids and tracked in the shared
+    /// registry, so a manager built independently of the agent's tools
+    /// would see an EMPTY registry and stop/steer would always miss. The
+    /// engine routes `StopSubagent`/`SteerSubagent` here (FR-017), and the
+    /// TUI exit path awaits its bounded `shutdown` (T025 wind-down).
+    pub subagent_manager: std::sync::Arc<joey_orchestration::SubagentManager>,
 }
 
 impl EngineSpec {
@@ -179,6 +221,15 @@ impl EngineSpec {
     pub fn build_agent(&self) -> anyhow::Result<Agent> {
         let history = crate::repl::restore_history_from_db(&self.session_id);
         crate::repl::build_agent(&self.config, &self.cwd, &self.overrides, &self.session_id, history)
+    }
+
+    /// Wind-down timeout (T025, FR-015) for the exit-path `shutdown` call:
+    /// the manager's own config (`delegation.wind_down_timeout_secs`,
+    /// default 10s) — the same bound `SubagentManager::shutdown` enforces.
+    pub fn wind_down_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.subagent_manager.config().wind_down_timeout_secs,
+        )
     }
 }
 
@@ -264,6 +315,12 @@ async fn engine_task(
     let mut orchestrator_on = crate::hypercode::orchestrator_active(&spec_config);
     let spec_cwd = spec.cwd;
     let spec_overrides = spec.overrides;
+    // T024: the session's SubagentManager for stop/steer routing (FR-017).
+    let spec_manager = spec.subagent_manager;
+    // T024: while a /hypercode pipeline runs, ITS manager (built fresh by
+    // hypercode_context_for_agent) owns the live children — stop/steer for
+    // ids the session manager doesn't know fall back to it.
+    let mut hypercode_manager: Option<std::sync::Arc<joey_orchestration::SubagentManager>> = None;
     // Queued prompts / jobs submitted while a turn runs.
     let mut queued: VecDeque<EngineCommand> = VecDeque::new();
     // True while a turn (or heavy job) is executing or commands sit in the
@@ -393,6 +450,28 @@ async fn engine_task(
                                         "🧭 Steer queued: lands after the current tool call".into(),
                                     ));
                                 }
+                                Some(EngineCommand::DelegationNoticePending) => {
+                                    // Mid-turn idle-wake request (T013):
+                                    // deliberate NO-OP. The pending-completions
+                                    // queue drains at the NEXT turn's start
+                                    // (run_turn drains before its first
+                                    // provider call), and FR-003 routes
+                                    // mid-turn completions to the next turn
+                                    // boundary — never preempts this turn.
+                                }
+                                Some(EngineCommand::StopSubagent { id }) => {
+                                    // T024: child control ops target the
+                                    // CHILD, not this turn — act immediately
+                                    // (permit-free, synchronous; SC-007)
+                                    // instead of queueing behind the turn.
+                                    engine_stop_subagent(&[spec_manager.clone()], id, &event_tx);
+                                }
+                                Some(EngineCommand::SteerSubagent { id, text }) => {
+                                    // T024: same immediacy for steer — the
+                                    // child must receive it before ITS next
+                                    // action, whenever that is.
+                                    engine_steer_subagent(&[spec_manager.clone()], id, &text, &event_tx);
+                                }
                                 Some(other) => queued.push_back(other),
                                 None => {
                                     // UI abandoned us: interrupt and keep
@@ -520,6 +599,11 @@ async fn engine_task(
                     let _ = prog_tx.send((phase.label().to_string(), detail.to_string()));
                 };
                 let manager = ctx.manager.clone();
+                // T024: the hypercode pipeline's children live in THIS
+                // manager's registry — record it so stop/steer routing
+                // (idle or mid-pipeline) consults both it and the session
+                // manager.
+                hypercode_manager = Some(manager.clone());
                 let mut abandoned = false;
                 let run = crate::hypercode::run_hypercode(
                     &ctx,
@@ -548,6 +632,25 @@ async fn engine_task(
                                     // returns an interrupted report.
                                     manager.signal_interrupt();
                                     interrupt.store(true, Ordering::SeqCst);
+                                }
+                                Some(EngineCommand::StopSubagent { id }) => {
+                                    // T024: operator stop of ONE hypercode
+                                    // child — not the whole pipeline. Act
+                                    // immediately (permit-free; SC-007).
+                                    engine_stop_subagent(
+                                        &[spec_manager.clone(), manager.clone()],
+                                        id,
+                                        &event_tx,
+                                    );
+                                }
+                                Some(EngineCommand::SteerSubagent { id, text }) => {
+                                    // T024: operator steer of one child.
+                                    engine_steer_subagent(
+                                        &[spec_manager.clone(), manager.clone()],
+                                        id,
+                                        &text,
+                                        &event_tx,
+                                    );
                                 }
                                 Some(other) => queued.push_back(other),
                                 None => {
@@ -657,12 +760,124 @@ async fn engine_task(
                     agent.pending_image_count()
                 )));
             }
+            EngineCommand::DelegationNoticePending => {
+                // Idle wake (spec 020 T013, FR-003): a background delegation
+                // finished while no turn was running. Start a synthetic turn
+                // whose ONLY job is to drain the agent's pending-completions
+                // queue — `run_turn` injects each notice into the
+                // conversation as context at turn start, so the orchestrator
+                // autonomously processes completions without user input.
+                // Reuses the Submit machinery (announce=true so the UI
+                // renders the wake prompt in causal order); if nothing is
+                // actually pending, the wake is harmless — a no-notice turn
+                // the UI records as an autonomous tick.
+                let _ = event_tx.send(EngineEvent::Notice(
+                    "🔔 background delegation finished — waking the orchestrator to process the completion notice.".into(),
+                ));
+                queued.push_front(EngineCommand::Submit {
+                    prompt: WAKE_PROMPT.to_string(),
+                    active_agent: "default".into(),
+                    announce: true,
+                });
+            }
+            EngineCommand::StopSubagent { id } => {
+                // T024 (US6, FR-017): operator stop of one delegation child.
+                // Synchronous control op — runs immediately even from idle.
+                let candidates = hypercode_manager
+                    .as_ref()
+                    .map(|m| vec![spec_manager.clone(), m.clone()])
+                    .unwrap_or_else(|| vec![spec_manager.clone()]);
+                engine_stop_subagent(&candidates, id, &event_tx);
+            }
+            EngineCommand::SteerSubagent { id, text } => {
+                // T024 (US6): operator steer of one delegation child.
+                let candidates = hypercode_manager
+                    .as_ref()
+                    .map(|m| vec![spec_manager.clone(), m.clone()])
+                    .unwrap_or_else(|| vec![spec_manager.clone()]);
+                engine_steer_subagent(&candidates, id, &text, &event_tx);
+            }
             EngineCommand::ForceKill => {
                 interrupt.store(true, Ordering::SeqCst);
                 return;
             }
         }
     }
+}
+
+/// T024 (US6, FR-017, spec 020): TUI-initiated child stop → the manager's
+/// control plane with the OPERATOR-requested reason. FR-017 distinguishes
+/// human stops from model stops in the child's terminal record, so this
+/// must be `StopReason::OperatorRequested` — never `OrchestratorRequested`
+/// (that variant is reserved for the model's own `subagent_control` tool).
+/// Synchronous and permit-free (SC-007): safe to run mid-turn without
+/// disturbing the parent's turn future. Acks/errors surface as
+/// `EngineEvent::Notice` so the operator sees them in the transcript.
+///
+/// `candidates` are the managers that may own the child (the session
+/// manager from the spec, plus the transient hypercode pipeline manager
+/// while one runs): the first that KNOWS the id (running or historical)
+/// gets the call; none knowing it yields the unknown-id error.
+fn engine_stop_subagent(
+    candidates: &[std::sync::Arc<joey_orchestration::SubagentManager>],
+    id: u64,
+    event_tx: &mpsc::UnboundedSender<EngineEvent>,
+) {
+    for manager in candidates {
+        if manager.child_status(id).is_some() {
+            match manager.stop_child(id, joey_orchestration::StopReason::OperatorRequested) {
+                Ok(()) => {
+                    let _ = event_tx.send(EngineEvent::Notice(format!(
+                        "🛑 stop requested for subagent {id} (operator) — winding down at its next checkpoint"
+                    )));
+                }
+                Err(e) => {
+                    let _ = event_tx.send(EngineEvent::Notice(format!(
+                        "🛑 cannot stop subagent {id}: {e}"
+                    )));
+                }
+            }
+            return;
+        }
+    }
+    let _ = event_tx.send(EngineEvent::Notice(format!(
+        "🛑 cannot stop subagent {id}: no such child in this session"
+    )));
+}
+
+/// T024 (US6, spec 020): TUI-initiated child steer → the manager's
+/// `steer_child`, which appends `text` to the child's steer slot for
+/// delivery before its next action. Ordering (steer-before-next-action)
+/// is the manager's concern; the engine's contract is only to route the
+/// command promptly (never queue it behind the running turn) and not drop
+/// it. Acks/errors surface as `EngineEvent::Notice`. Same candidate-manager
+/// resolution as [`engine_stop_subagent`].
+fn engine_steer_subagent(
+    candidates: &[std::sync::Arc<joey_orchestration::SubagentManager>],
+    id: u64,
+    text: &str,
+    event_tx: &mpsc::UnboundedSender<EngineEvent>,
+) {
+    for manager in candidates {
+        if manager.child_status(id).is_some() {
+            match manager.steer_child(id, text) {
+                Ok(()) => {
+                    let _ = event_tx.send(EngineEvent::Notice(format!(
+                        "🧭 steer queued for subagent {id} — lands before its next action"
+                    )));
+                }
+                Err(e) => {
+                    let _ = event_tx.send(EngineEvent::Notice(format!(
+                        "🛑 cannot steer subagent {id}: {e}"
+                    )));
+                }
+            }
+            return;
+        }
+    }
+    let _ = event_tx.send(EngineEvent::Notice(format!(
+        "🛑 cannot steer subagent {id}: no such child in this session"
+    )));
 }
 
 /// How the engine actor reacts to an Interrupt-family command, given
@@ -1000,7 +1215,7 @@ mod actor_tests {
     /// locks are still held; fields then drop in declaration order — the
     /// home override releases BEFORE TEST_HOME_OVERRIDE_LOCK, and ENV_LOCK
     /// (declared last) releases last.
-    struct TestEnvGuard {
+    pub(super) struct TestEnvGuard {
         _home: joey_core::constants::HomeOverrideGuard,
         _override_lock: std::sync::MutexGuard<'static, ()>,
         prev_copilot: Option<String>,
@@ -1011,7 +1226,9 @@ mod actor_tests {
     }
 
     impl TestEnvGuard {
-        fn new() -> Self {
+        // pub(super): shared with sibling #[cfg(test)] modules (e.g.
+        // subagent_control_tests) — test-only, never leaves the crate.
+        pub(super) fn new() -> Self {
             // ENV_LOCK is a static, so the guard's lifetime is 'static.
             // Lock order ENV_LOCK → TEST_HOME_OVERRIDE_LOCK matches every
             // other taker of the pair in the workspace — no inversion.
@@ -1096,6 +1313,9 @@ mod actor_tests {
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
             session_id: "engtest_00000000_0000_abc123".into(),
+            subagent_manager: std::sync::Arc::new(joey_orchestration::SubagentManager::new(
+                Default::default(),
+            )),
         };
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1139,6 +1359,9 @@ mod actor_tests {
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
             session_id: "engorch1_00000000_0000_abc123".into(),
+            subagent_manager: std::sync::Arc::new(joey_orchestration::SubagentManager::new(
+                Default::default(),
+            )),
         };
         let mut agent = spec.build_agent().expect("agent builds");
         // Sanity: build_agent_parts applied the overlay at construction.
@@ -1189,6 +1412,9 @@ mod actor_tests {
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
             session_id: "engorch2_00000000_0000_abc123".into(),
+            subagent_manager: std::sync::Arc::new(joey_orchestration::SubagentManager::new(
+                Default::default(),
+            )),
         };
         let mut agent = spec.build_agent().expect("agent builds");
         assert!(
@@ -1228,6 +1454,9 @@ mod actor_tests {
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
             session_id: "engmodel_00000000_0000_abc123".into(),
+            subagent_manager: std::sync::Arc::new(joey_orchestration::SubagentManager::new(
+                Default::default(),
+            )),
         };
         let agent = spec.build_agent().expect("agent builds");
         assert_eq!(agent.model(), "gpt-4o-mini");
@@ -1272,6 +1501,9 @@ mod actor_tests {
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
             session_id: "engkill_00000000_0000_abc123".into(),
+            subagent_manager: std::sync::Arc::new(joey_orchestration::SubagentManager::new(
+                Default::default(),
+            )),
         };
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1287,7 +1519,340 @@ mod actor_tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
-    fn unauth_spec(tag: &str) -> EngineSpec {
+    /// Idle wake (spec 020 T013, FR-003) — end-to-end through the REAL
+    /// completion path: turn 1 launches `terminal background=true
+    /// notify_on_complete=true` (via a scripted mock provider returning a
+    /// tool_call), the process reaper pushes a BackgroundCompletion into the
+    /// engine agent's ToolContext queue, and once the engine is idle a
+    /// DelegationNoticePending must start a wake turn that DRAINS the queue
+    /// (the completion Notice fires inside the wake turn) and finishes.
+    #[tokio::test]
+    async fn idle_wake_drains_pending_completion() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let _env_guard = TestEnvGuard::new();
+        // Credential the openai-api profile so the Submit arm's
+        // has_credentials gate passes and run_turn actually dispatches to
+        // the mock (restored manually; ENV_LOCK holds siblings off).
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        std::env::set_var("OPENAI_API_KEY", "test-key-wake");
+
+        // Scripted sequential mock provider: each connection gets the next
+        // response. Turn 1 = tool_call (background terminal) then final
+        // text; the wake turn = one final text.
+        let openai_tool_call = |args: &str| {
+            serde_json::json!({
+                "id": "chatcmpl-mock", "object": "chat.completion", "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant", "content": null,
+                        "tool_calls": [{
+                            "id": "call_wake1", "type": "function",
+                            "function": { "name": "terminal", "arguments": args }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+            })
+            .to_string()
+        };
+        let openai_text = |text: &str| {
+            serde_json::json!({
+                "id": "chatcmpl-mock", "object": "chat.completion", "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": text },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+            })
+            .to_string()
+        };
+        let spawn_args = serde_json::json!({
+            "command": "sleep 0.2",
+            "background": true,
+            "notify_on_complete": true
+        })
+        .to_string();
+        let script = vec![
+            openai_tool_call(&spawn_args),
+            openai_text("spawned the background job"),
+            openai_text("wake acknowledged"),
+        ];
+
+        async fn read_one_request(stream: &mut TcpStream) -> std::io::Result<()> {
+            let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos;
+                }
+                if buf.len() > 256 * 1024 {
+                    return Ok(());
+                }
+                let n = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await
+                {
+                    Ok(Ok(n)) => n,
+                    _ => return Ok(()),
+                };
+                if n == 0 {
+                    return Ok(());
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + 4 + content_length {
+                let n = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await
+                {
+                    Ok(Ok(n)) => n,
+                    _ => break,
+                };
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Ok(())
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for body in script {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let _ = read_one_request(&mut stream).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        // The atomic was removed; the script is strictly sequential per
+        // connection (each accept() consumes exactly one scripted body).
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            format!(
+                "model:\n  provider: openai-api\n  default: test-model\n  base_url: http://{addr}\nagent:\n  max_turns: 4\n  api_max_retries: 1\n  tool_delay: 0.0\ndisplay:\n  streaming: false\n"
+            ),
+        )
+        .unwrap();
+        let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let spec = EngineSpec {
+            config,
+            cwd: std::env::temp_dir(),
+            overrides: crate::repl::Overrides::default(),
+            session_id: "engwake1_00000000_0000_abc123".into(),
+            subagent_manager: std::sync::Arc::new(joey_orchestration::SubagentManager::new(
+                Default::default(),
+            )),
+        };
+        let agent = spec.build_agent().expect("agent builds");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, _int) = spawn_engine(agent, spec, ev_tx);
+
+        // Turn 1: launches the background process (mock returns the
+        // tool_call, then the post-tool final text). Wait it out fully.
+        handle.send(EngineCommand::Submit {
+            prompt: "start a background sleep".into(),
+            active_agent: "default".into(),
+            announce: false,
+        });
+        let mut turn1_done = false;
+        let mut saw_idle = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while (!turn1_done || !saw_idle) && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::TurnFinished { .. }) => turn1_done = true,
+                Ok(EngineEvent::Idle) => saw_idle = true,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert!(turn1_done, "turn 1 finished");
+        assert!(saw_idle, "engine announced idle after turn 1");
+
+        // Give the reaper time to observe the 0.2s process exit (50ms poll)
+        // and seed the agent's pending-completions queue.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // Idle wake: the TUI-side signal (tap terminal event + not busy).
+        handle.send(EngineCommand::DelegationNoticePending);
+
+        let mut finished_after_wake = 0;
+        let mut saw_wake_announce = false;
+        let mut saw_wake_prompt = false;
+        let mut saw_completion_notice = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while finished_after_wake < 1 && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::TurnFinished { .. }) => finished_after_wake += 1,
+                Ok(EngineEvent::Notice(t)) if t.contains("waking the orchestrator") => {
+                    saw_wake_announce = true;
+                }
+                Ok(EngineEvent::QueuedSubmitStarted { prompt }) => {
+                    assert_eq!(prompt, WAKE_PROMPT, "wake turn uses the synthetic prompt");
+                    saw_wake_prompt = true;
+                }
+                Ok(EngineEvent::Agent(AgentEvent::Notice(t))) => {
+                    if t.contains("completed: exit 0") {
+                        saw_completion_notice = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert_eq!(finished_after_wake, 1, "wake turn ran to completion");
+        assert!(saw_wake_announce, "wake announcement emitted");
+        assert!(saw_wake_prompt, "wake turn announced with the synthetic prompt");
+        assert!(
+            saw_completion_notice,
+            "pending completion was DRAINED inside the wake turn (Notice with the completion)"
+        );
+
+        match prev_key {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        handle.send(EngineCommand::ForceKill);
+    }
+
+    /// Idle wake, mid-turn arrival (T013): a DelegationNoticePending that
+    /// lands while a turn is being polled is a deliberate no-op — FR-003
+    /// routes mid-turn completions to the next turn boundary, and no extra
+    /// (wake) turn may preempt or follow the in-flight one.
+    #[tokio::test]
+    async fn mid_turn_delegation_notice_pending_is_noop() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let _env_guard = TestEnvGuard::new();
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        std::env::set_var("OPENAI_API_KEY", "test-key-wake2");
+
+        // One SLOW response: the single provider call of turn 1 takes ~1s,
+        // giving the test a guaranteed mid-turn window.
+        let body = serde_json::json!({
+            "id": "chatcmpl-mock", "object": "chat.completion", "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "slow turn done" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })
+        .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+                let mut chunk = [0u8; 4096];
+                // headers + body (single read pass is enough at this size)
+                let _ = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await;
+                buf.extend_from_slice(&chunk);
+                let _ = buf;
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            format!(
+                "model:\n  provider: openai-api\n  default: test-model\n  base_url: http://{addr}\nagent:\n  max_turns: 2\n  api_max_retries: 1\n  tool_delay: 0.0\ndisplay:\n  streaming: false\n"
+            ),
+        )
+        .unwrap();
+        let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let spec = EngineSpec {
+            config,
+            cwd: std::env::temp_dir(),
+            overrides: crate::repl::Overrides::default(),
+            session_id: "engwake2_00000000_0000_abc123".into(),
+            subagent_manager: std::sync::Arc::new(joey_orchestration::SubagentManager::new(
+                Default::default(),
+            )),
+        };
+        let agent = spec.build_agent().expect("agent builds");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, _int) = spawn_engine(agent, spec, ev_tx);
+
+        handle.send(EngineCommand::Submit {
+            prompt: "slow prompt".into(),
+            active_agent: "default".into(),
+            announce: false,
+        });
+
+        // Wait until the turn is provably mid-flight (TurnStart observed),
+        // then fire the wake command INTO the running turn.
+        let mut turn_started = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !turn_started && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::Agent(AgentEvent::TurnStart { .. })) => turn_started = true,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        assert!(turn_started, "turn 1 started");
+        handle.send(EngineCommand::DelegationNoticePending);
+
+        // Exactly ONE TurnFinished must ever arrive, and no wake turn may
+        // run (no QueuedSubmitStarted, no wake announcement) — not during
+        // the turn and not in the idle window after it.
+        let mut finished = 0;
+        let mut leaked_wake = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::TurnFinished { .. }) => finished += 1,
+                Ok(EngineEvent::QueuedSubmitStarted { .. }) => leaked_wake = true,
+                Ok(EngineEvent::Notice(t)) if t.contains("waking the orchestrator") => {
+                    leaked_wake = true;
+                }
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        assert_eq!(finished, 1, "exactly the original turn finished");
+        assert!(!leaked_wake, "mid-turn DelegationNoticePending must not spawn a wake turn");
+
+        match prev_key {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        handle.send(EngineCommand::ForceKill);
+    }
+
+    /// The synthetic wake prompt must never trip the intent gate (a wake
+    /// must not, e.g., enable ULTRAWORK) — pins the WAKE_PROMPT wording.
+    #[test]
+    fn wake_prompt_avoids_intent_gate_keywords() {
+        assert!(joey_omo::detect_keyword(WAKE_PROMPT).is_none());
+    }
+
+    pub(super) fn unauth_spec(tag: &str) -> EngineSpec {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "model:\n  provider: openai-api\n  default: gpt-4o-mini\n").unwrap();
         let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
@@ -1296,6 +1861,9 @@ mod actor_tests {
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
             session_id: format!("{tag}_00000000_0000_abc123"),
+            subagent_manager: std::sync::Arc::new(joey_orchestration::SubagentManager::new(
+                Default::default(),
+            )),
         }
     }
 
@@ -1648,6 +2216,87 @@ mod steer_command_tests {
         assert!(Agent::steer_via_handle(&handle, "two"));
         assert_eq!(*handle.lock().unwrap(), "one\ntwo");
         assert!(!Agent::steer_via_handle(&handle, "  "));
+    }
+}
+
+#[cfg(test)]
+mod subagent_control_tests {
+    use super::*;
+
+    /// T024 (US6, FR-017): StopSubagent for an id no candidate manager
+    /// knows surfaces as an EngineEvent::Notice carrying the error — the
+    /// operator always gets feedback, never a silent drop. Exercises the
+    /// full engine-actor path (idle top-level arm → engine_stop_subagent
+    /// → candidate resolution → unknown-id error Notice). ChildRegistry is
+    /// private cross-crate, so a REAL child can't be seeded here (that
+    /// path is covered by joey-orchestration's stop/steer tests); the
+    /// unknown-id arm is the reachable CLI-side contract.
+    #[tokio::test]
+    async fn engine_stop_subagent_unknown_id_yields_error_notice() {
+        let _env_guard = actor_tests::TestEnvGuard::new();
+        let spec = actor_tests::unauth_spec("engstop1");
+        let agent = spec.build_agent().expect("agent builds");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, _int) = spawn_engine(agent, spec, ev_tx);
+
+        // No child was ever dispatched: id 999999 can't exist.
+        handle.send(EngineCommand::StopSubagent { id: 999_999 });
+
+        let mut notice = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while notice.is_none() && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::Notice(t)) => notice = Some(t),
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+        let notice = notice.expect("engine must ack StopSubagent with a Notice");
+        assert!(
+            notice.contains("999999"),
+            "notice identifies the child id: {notice}"
+        );
+        assert!(
+            notice.contains("cannot stop"),
+            "notice is the unknown-id error path: {notice}"
+        );
+        handle.send(EngineCommand::ForceKill);
+    }
+
+    /// T024 (US6): SteerSubagent for an unknown id — same contract, the
+    /// steer arm's error Notice.
+    #[tokio::test]
+    async fn engine_steer_subagent_unknown_id_yields_error_notice() {
+        let _env_guard = actor_tests::TestEnvGuard::new();
+        let spec = actor_tests::unauth_spec("engsteer1");
+        let agent = spec.build_agent().expect("agent builds");
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, _int) = spawn_engine(agent, spec, ev_tx);
+
+        handle.send(EngineCommand::SteerSubagent {
+            id: 999_998,
+            text: "pivot to tests-only".into(),
+        });
+
+        let mut notice = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while notice.is_none() && std::time::Instant::now() < deadline {
+            match ev_rx.try_recv() {
+                Ok(EngineEvent::Notice(t)) => notice = Some(t),
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+        let notice = notice.expect("engine must ack SteerSubagent with a Notice");
+        assert!(
+            notice.contains("999998"),
+            "notice identifies the child id: {notice}"
+        );
+        assert!(
+            notice.contains("cannot steer"),
+            "notice is the unknown-id error path: {notice}"
+        );
+        handle.send(EngineCommand::ForceKill);
     }
 }
 

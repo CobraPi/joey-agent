@@ -195,7 +195,7 @@ static TOOLSETS: Lazy<HashMap<&'static str, Toolset>> = Lazy::new(|| {
         "delegation",
         Toolset {
             description: "Spawn subagents with isolated context for complex subtasks",
-            tools: &["delegate_task"],
+            tools: &["delegate_task", "subagent_control"],
             includes: &[],
         },
     );
@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(resolve("file"), vec!["patch", "read_file", "search_files", "write_file"]);
         assert_eq!(resolve("file-read"), vec!["read_file", "search_files"]);
         assert_eq!(resolve("search"), vec!["web_search"]);
-        assert_eq!(resolve("delegation"), vec!["delegate_task"]);
+        assert_eq!(resolve("delegation"), vec!["delegate_task", "subagent_control"]);
         assert_eq!(resolve("session_search"), vec!["session_search"]);
         assert_eq!(resolve("clarify"), vec!["clarify"]);
         assert_eq!(resolve("cronjob"), vec!["cronjob"]);

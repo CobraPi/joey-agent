@@ -275,7 +275,7 @@ pub struct ActiveSubagentEntry {
     pub agent_type: String,
     /// If category-spawned (e.g. "quick").
     pub category: Option<String>,
-    /// Pending, Running, Done, Failed.
+    /// Pending, Running, Done, Failed, Stopped (spec 020).
     pub status: SubagentStatus,
     /// "querying model", "running tool: X", "reasoning".
     pub phase: String,
@@ -774,6 +774,13 @@ pub enum SubagentStatus {
     Running,
     Done,
     Failed,
+    /// Spec 020 (T030): terminal state for a child halted before
+    /// completing its goal (operator stop, orchestrator request, budget
+    /// breach, session wind-down). Set by `SubagentStopped`, which is
+    /// emitted BEFORE the follow-up `SubagentComplete` — so the
+    /// Complete/Failed handlers must treat it as terminal and never
+    /// overwrite it.
+    Stopped,
 }
 
 /// Top-level run mode of the TUI.
@@ -1994,6 +2001,23 @@ impl App {
                     }
                 }
                 // Close out the pane's live state.
+                // Spec 020 (T030): Stopped is terminal — the orchestration
+                // layer emits SubagentStopped FIRST and then still fires
+                // SubagentComplete; a child already in Stopped keeps its
+                // stop reason + preview: no state change and no follow-up
+                // "done" notice (the stop notice already reported the
+                // terminal state, FR-016).
+                let already_stopped = self
+                    .subagent_panes
+                    .iter()
+                    .any(|p| p.child_id == id && p.status == SubagentStatus::Stopped)
+                    || self
+                        .subagent_entries
+                        .iter()
+                        .any(|e| e.child_id == id && e.status == SubagentStatus::Stopped);
+                if already_stopped {
+                    return;
+                }
                 if let Some(pane) = self.subagent_panes.iter_mut().find(|p| p.child_id == id) {
                     pane.status = if success {
                         SubagentStatus::Done
@@ -2029,6 +2053,20 @@ impl App {
                         break;
                     }
                 }
+                // Spec 020 (T030): Stopped is terminal — never overwrite it
+                // (Stopped-then-Complete emission order; see the
+                // SubagentComplete arm).
+                if self
+                    .subagent_panes
+                    .iter()
+                    .any(|p| p.child_id == id && p.status == SubagentStatus::Stopped)
+                    || self
+                        .subagent_entries
+                        .iter()
+                        .any(|e| e.child_id == id && e.status == SubagentStatus::Stopped)
+                {
+                    return;
+                }
                 if let Some(pane) = self.subagent_panes.iter_mut().find(|p| p.child_id == id) {
                     pane.status = SubagentStatus::Failed;
                     // T032: flush pending streamed reasoning before the error
@@ -2040,6 +2078,43 @@ impl App {
                 }
                 self.push_item(TranscriptItem::Notice {
                     text: format!("✗ {}: {}", goal, error),
+                    kind: NoticeKind::Warning,
+                });
+            }
+            // Spec 020 (T030): a child halted before completing its goal
+            // (operator stop, orchestrator request, budget breach, session
+            // wind-down). Emitted BEFORE the follow-up SubagentComplete —
+            // Stopped is the terminal state here and the Complete/Failed
+            // arms must not overwrite it.
+            AgentEvent::SubagentStopped { id, goal, reason, summary_preview } => {
+                // (a) Job-board entry: only a Running entry transitions
+                // (Stopped is terminal; a re-stop is a no-op).
+                for entry in self.subagent_entries.iter_mut().rev() {
+                    if entry.status == SubagentStatus::Running && entry.child_id == id
+                    {
+                        entry.status = SubagentStatus::Stopped;
+                        entry.phase = format!("stopped: {}", reason);
+                        break;
+                    }
+                }
+                // (b) Pane: final state = Stopped + the partial-result
+                // preview; flush the live streams exactly like the
+                // SubagentComplete close-out (T032) so a child stopped
+                // mid-stream keeps its reasoning + partial answer.
+                if let Some(pane) = self.subagent_panes.iter_mut().find(|p| p.child_id == id) {
+                    pane.status = SubagentStatus::Stopped;
+                    pane.summary_preview = Some(summary_preview.clone());
+                    pane_flush_reasoning(pane);
+                    if !pane.streaming_assistant.is_empty() {
+                        let text = std::mem::take(&mut pane.streaming_assistant);
+                        pane.push_item(TranscriptItem::Assistant { text });
+                    }
+                }
+                // (c) FR-016: the notice carries the raw reason string
+                // (budget_exceeded vs operator_requested vs …) plus the
+                // partial-result preview (FR-010).
+                self.push_item(TranscriptItem::Notice {
+                    text: format!("■ {}: stopped ({}) — {}", goal, reason, summary_preview),
                     kind: NoticeKind::Warning,
                 });
             }
@@ -5474,6 +5549,179 @@ mod pane_reasoning_closeout_tests {
         assert!(
             app.subagent_panes[0].reasoning_view.is_none(),
             "unfocused: panes untouched"
+        );
+    }
+}
+
+#[cfg(test)]
+mod subagent_stopped_tests {
+    //! Spec 020 (T030): `SubagentStopped` moves a child to the terminal
+    //! `Stopped` state (entry + pane) with the partial-result preview
+    //! surfaced, and — given the orchestration layer's
+    //! Stopped-then-Complete emission order — the follow-up
+    //! `SubagentComplete` must NOT clobber it back to Done.
+    use super::*;
+
+    fn spawn(app: &mut App, id: u64, goal: &str) {
+        app.apply(AgentEvent::SubagentSpawn {
+            id,
+            goal: goal.into(),
+            model: "m".into(),
+            toolset_summary: "all".into(),
+            depth: 0,
+        });
+    }
+
+    fn stop(id: u64, reason: &str) -> AgentEvent {
+        AgentEvent::SubagentStopped {
+            id,
+            goal: "explore the archive".into(),
+            reason: reason.into(),
+            summary_preview: "partial notes on sector 7".into(),
+        }
+    }
+
+    fn last_notice_text(app: &App) -> &str {
+        app.transcript
+            .iter()
+            .rev()
+            .find_map(|it| match it {
+                TranscriptItem::Notice { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("")
+    }
+
+    /// T030 (a): applying SubagentStopped moves the job-board entry AND the
+    /// pane to Stopped with summary_preview set, and the notice carries the
+    /// raw reason string (FR-016: budget_exceeded vs operator_requested
+    /// must be distinguishable) plus the preview (FR-010).
+    #[test]
+    fn subagent_stopped_marks_entry_and_pane_with_reason_notice() {
+        let mut app = App::new("s", "m");
+        spawn(&mut app, 7, "explore the archive");
+        assert_eq!(app.subagent_entries[0].status, SubagentStatus::Running);
+
+        app.apply(stop(7, "budget_exceeded"));
+
+        let entry = &app.subagent_entries[0];
+        assert_eq!(entry.status, SubagentStatus::Stopped, "entry → Stopped");
+        assert!(
+            entry.phase.contains("budget_exceeded"),
+            "stop reason recorded in the phase: {:?}",
+            entry.phase
+        );
+        let pane = &app.subagent_panes[0];
+        assert_eq!(pane.status, SubagentStatus::Stopped, "pane → Stopped");
+        assert_eq!(
+            pane.summary_preview.as_deref(),
+            Some("partial notes on sector 7"),
+            "FR-010: partial result surfaced"
+        );
+        let notice = last_notice_text(&app);
+        assert!(
+            notice.contains("budget_exceeded"),
+            "FR-016: notice carries the reason: {:?}",
+            notice
+        );
+        assert!(
+            notice.contains("partial notes on sector 7"),
+            "notice carries the preview: {:?}",
+            notice
+        );
+    }
+
+    /// T030 (a2): Stopped flushes the pane's live streams exactly like the
+    /// SubagentComplete close-out (T032 parity) — pending reasoning and a
+    /// partial assistant buffer are committed, not dropped.
+    #[test]
+    fn subagent_stopped_flushes_pending_pane_streams() {
+        let mut app = App::new("s", "m");
+        spawn(&mut app, 7, "explore the archive");
+        {
+            let pane = app.subagent_panes.iter_mut().find(|p| p.child_id == 7).unwrap();
+            pane.streaming_reasoning.push_str("mid-thought when stopped");
+            pane.streaming_assistant.push_str("partial answer");
+        }
+
+        app.apply(stop(7, "operator_requested"));
+
+        let pane = &app.subagent_panes[0];
+        assert!(pane.streaming_reasoning.is_empty(), "reasoning flushed");
+        assert!(pane.streaming_assistant.is_empty(), "assistant flushed");
+        assert_eq!(pane.transcript.len(), 2, "Reasoning + Assistant committed");
+        match &pane.transcript[0] {
+            TranscriptItem::Reasoning { text, .. } => {
+                assert_eq!(text, "mid-thought when stopped")
+            }
+            other => panic!("expected Reasoning, got {:?}", other),
+        }
+        match &pane.transcript[1] {
+            TranscriptItem::Assistant { text } => assert_eq!(text, "partial answer"),
+            other => panic!("expected Assistant, got {:?}", other),
+        }
+    }
+
+    /// T030 (b): the real emission order is SubagentStopped FIRST, then
+    /// SubagentComplete still fires — Stopped must win on BOTH the pane and
+    /// the job-board entry (no clobber back to Done, no duplicate terminal
+    /// notice).
+    #[test]
+    fn subagent_stopped_wins_over_followup_complete() {
+        let mut app = App::new("s", "m");
+        spawn(&mut app, 7, "explore the archive");
+        app.apply(stop(7, "session_end"));
+        let notice_after_stop = last_notice_text(&app).to_string();
+
+        app.apply(AgentEvent::SubagentComplete {
+            id: 7,
+            goal: "explore the archive".into(),
+            success: true,
+            summary_preview: "final summary".into(),
+            token_usage: joey_providers::Usage::default(),
+            duration_secs: 2.0,
+        });
+
+        let pane = &app.subagent_panes[0];
+        assert_eq!(pane.status, SubagentStatus::Stopped, "pane stays Stopped");
+        assert_eq!(
+            pane.summary_preview.as_deref(),
+            Some("partial notes on sector 7"),
+            "stop preview preserved, not replaced by Complete's"
+        );
+        assert_eq!(
+            app.subagent_entries[0].status,
+            SubagentStatus::Stopped,
+            "entry stays Stopped"
+        );
+        assert_eq!(
+            last_notice_text(&app),
+            notice_after_stop,
+            "no follow-up done notice after the stop notice"
+        );
+    }
+
+    /// T030 (b2): a late SubagentFailed equally must not overwrite Stopped.
+    #[test]
+    fn subagent_stopped_wins_over_followup_failed() {
+        let mut app = App::new("s", "m");
+        spawn(&mut app, 7, "explore the archive");
+        app.apply(stop(7, "orchestrator_requested"));
+        app.apply(AgentEvent::SubagentFailed {
+            id: 7,
+            goal: "explore the archive".into(),
+            error: "boom".into(),
+            duration_secs: 1.0,
+        });
+        assert_eq!(
+            app.subagent_panes[0].status,
+            SubagentStatus::Stopped,
+            "pane stays Stopped"
+        );
+        assert_eq!(
+            app.subagent_entries[0].status,
+            SubagentStatus::Stopped,
+            "entry stays Stopped"
         );
     }
 }

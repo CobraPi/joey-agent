@@ -103,6 +103,8 @@ async fn batch_completes_all_three_tasks() {
             model: None,
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         },
         TaskSpec {
             goal: "Task B".to_string(),
@@ -110,6 +112,8 @@ async fn batch_completes_all_three_tasks() {
             model: None,
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         },
         TaskSpec {
             goal: "Task C".to_string(),
@@ -117,6 +121,8 @@ async fn batch_completes_all_three_tasks() {
             model: None,
             toolsets: vec![],
             role: None,
+            background: false,
+            budgets: None,
         },
     ];
 

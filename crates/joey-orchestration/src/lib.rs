@@ -5,7 +5,9 @@
 //! and structured lifecycle events. Ported from Hermes Agent's delegate_task
 //! and Crush's coordinator patterns.
 
+pub mod background;
 pub mod capacity;
+pub mod control_tool;
 pub mod delegation_tool;
 pub mod manager;
 pub mod subagent;
@@ -16,9 +18,13 @@ pub use capacity::{
     capacity_children, capacity_requests, SystemCapacity, DEFAULT_MEM_MAX_FRACTION,
     DEFAULT_MEM_RESERVE_MB_PER_CHILD, HARD_CHILD_CEILING,
 };
+pub use control_tool::SubagentControl;
 pub use delegation_tool::{CallOmoAgent, DelegateTask};
 pub use manager::{ManagerConfig, SubagentManager};
-pub use types::{DelegationRequest, DelegationResult, SubagentRole, TaskSpec};
+pub use types::{
+    Budgets, DelegationOverview, DelegationRequest, DelegationResult, DelegationState,
+    StopReason, SubagentRole, TaskSpec, WorkHandle,
+};
 
 /// Result of resolving a category or subagent_type to its model + prompt_append.
 /// Returned by the CategoryResolver trait so joey-orchestration can resolve
@@ -113,6 +119,10 @@ fn register_orchestration_inner(
         delegate.set_model_allocator(alloc);
     }
     registry.register(std::sync::Arc::new(delegate));
+    // subagent_control (feature 020, US3): acts on the SAME manager
+    // registry as delegate_task — steer/stop any child this manager
+    // dispatched (blocking or background).
+    registry.register(std::sync::Arc::new(SubagentControl::new(manager.clone())));
     // Register call_omo_agent WITH the resolver: it requires
     // `subagent_type` resolution to succeed — a None resolver made the
     // tool permanently error ("requires an OMO category resolver"),

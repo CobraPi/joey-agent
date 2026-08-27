@@ -132,7 +132,17 @@ key `hygiene_hard_message_limit`), `compression.abort_on_summary_failure`
 **delegation**: `delegation.max_iterations` (50),
 `delegation.max_concurrent_children` (3), `delegation.max_spawn_depth` (1),
 `delegation.default_model`, `delegation.default_max_turns`,
-`delegation.default_persist`.
+`delegation.default_persist`,
+`delegation.parent_reserved_permits` (1; positive int, 0 disables —
+orchestrator's guaranteed minimum share of the delegation request
+permits: children acquire from a second pool sized
+`max(1, max_concurrent_requests − parent_reserved_permits)` so a
+saturated child wave can never starve the parent's own inspection and
+control actions),
+`delegation.wind_down_timeout_secs` (10; positive int — bounded wait in
+seconds when winding down still-running background children at session
+end, i.e. line-REPL `end_session` and TUI exit; children that don't
+finish are stopped with reason `session_end`).
 
 **code_execution**: `code_execution.mode` ("project").
 

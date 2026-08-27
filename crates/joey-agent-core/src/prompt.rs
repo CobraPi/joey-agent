@@ -781,6 +781,9 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     if has("skill_manage") {
         tool_guidance.push(SKILLS_GUIDANCE);
     }
+    if has("subagent_control") {
+        tool_guidance.push(SUBAGENT_CONTROL_GUIDANCE);
+    }
     if !tool_guidance.is_empty() {
         stable_parts.push(tool_guidance.join(" "));
     }

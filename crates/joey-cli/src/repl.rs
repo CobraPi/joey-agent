@@ -784,6 +784,13 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
 }
 
 fn end_session(st: &ReplState, reason: &str) {
+    // T025 (line-REPL half of FR-015): wind down any running subagent
+    // children BEFORE closing the session row — every child gets a
+    // SessionEnd signal and archives its final status in the manager
+    // registry. No-op when nothing is running.
+    if let Some(hc) = &st.hypercode {
+        wind_down_subagents(&hc.manager);
+    }
     if let Some(db) = st.agent.session_db() {
         let _ = db.end_session(&st.session_id, reason);
     }
@@ -791,6 +798,44 @@ fn end_session(st: &ReplState, reason: &str) {
     if let Some(cp) = &st.checkpoints {
         cp.cleanup();
     }
+}
+
+/// T025 (FR-015): bounded wind-down of all subagent children at session
+/// end. Signals every running child with `StopReason::SessionEnd` and
+/// waits — bounded by the manager's `delegation.wind_down_timeout_secs`
+/// (`shutdown` force-finalizes stragglers at the deadline, so this can
+/// never hang the exit) — then prints one summary line. No-op (no thread,
+/// no runtime) when no child is running.
+///
+/// The manager is `st.hypercode`'s — the SAME manager the agent's
+/// delegate_task tool dispatches through. `shutdown` is async while
+/// `end_session` is sync (and is reached from async REPL loops): drive it
+/// on a dedicated thread with its own current-thread runtime — the same
+/// pattern `crate::clipboard::copy_to_clipboard` uses to stay safe both
+/// inside and outside an ambient tokio runtime (`Handle::block_on` would
+/// panic on a runtime worker thread).
+fn wind_down_subagents(manager: &std::sync::Arc<joey_orchestration::SubagentManager>) {
+    use joey_orchestration::DelegationState;
+    let running = manager
+        .overview()
+        .iter()
+        .filter(|r| matches!(r.state, DelegationState::Running))
+        .count();
+    if running == 0 {
+        return;
+    }
+    let timeout = std::time::Duration::from_secs(manager.config().wind_down_timeout_secs);
+    let mgr = manager.clone();
+    // Bounded join: shutdown itself is deadline-capped, and a panicked or
+    // failed runtime build only skips the (already-archived) result vec.
+    let _ = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|rt| rt.block_on(async move { mgr.shutdown(timeout).await }))
+    })
+    .join();
+    render::info(&format!("wind-down: {running} subagent(s) finalized"));
 }
 
 enum LoopOutcome {
@@ -3336,5 +3381,79 @@ mod hypercode_args_tests {
             tokenize_quoted("x \"y z"),
             vec!["x".to_string(), "y z".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod wind_down_tests {
+    use super::*;
+
+    /// T025 (FR-015): session wind-down finalizes every running child as
+    /// `Stopped{SessionEnd}`.
+    ///
+    /// `dispatch_background_with_notices` pre-registers the child in the
+    /// registry SYNCHRONOUSLY (registry insert happens before any spawned
+    /// task is polled), so on a current-thread runtime with no awaits the
+    /// child stays `Running` and zero network occurs (the child task is
+    /// queued but never polled). `wind_down_timeout_secs: 0` exercises the
+    /// force-finalize path — the never-polled child cannot archive itself,
+    /// so shutdown's bounded wait expires immediately and finalizes it —
+    /// making the test deterministic with no real-time waiting.
+    #[tokio::test]
+    async fn wind_down_subagents_finalizes_running_children_as_session_end() {
+        use joey_orchestration::background::dispatch_background_with_notices;
+        use joey_orchestration::{
+            DelegationRequest, DelegationState, ManagerConfig, StopReason, SubagentManager,
+        };
+        use std::sync::Arc;
+
+        let manager = Arc::new(SubagentManager::new(ManagerConfig {
+            wind_down_timeout_secs: 0,
+            ..ManagerConfig::default()
+        }));
+        let parent_cfg = AgentConfig {
+            model: "test-model".to_string(),
+            provider: "openai".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: None,
+            max_turns: 5,
+            api_max_retries: 1,
+            tool_delay: 0.0,
+            reasoning: None,
+            enabled_tools: vec![],
+            max_tokens: None,
+            stream: false,
+            pass_session_id: false,
+            model_pinned: false,
+        };
+        let config_tree = Config::defaults();
+        let registry = ToolRegistry::with_builtins();
+        let ctx = ToolContext::new(std::env::temp_dir(), config_tree.clone(), "sess");
+
+        let handle = dispatch_background_with_notices(
+            &manager,
+            &DelegationRequest::single("wind-down probe"),
+            &parent_cfg,
+            &config_tree,
+            &registry,
+            None,
+            &ctx,
+        );
+        let id: u64 = handle.child_id.parse().expect("child id is numeric");
+        // Pre-registration happened synchronously: Running before any await.
+        assert!(matches!(
+            manager.child_status(id).map(|s| s.state),
+            Some(DelegationState::Running)
+        ));
+
+        wind_down_subagents(&manager);
+
+        let state = manager.child_status(id).expect("child archived").state;
+        assert!(matches!(
+            state,
+            DelegationState::Stopped {
+                reason: StopReason::SessionEnd
+            }
+        ));
     }
 }

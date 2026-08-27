@@ -1237,3 +1237,36 @@ for queued/in-flight calls, and queue-state events surfaced as CLI/TUI
 indicators while requests are waiting. Upstream's terminal executor has no
 equivalent subsystem, so this is Joey-original additive surface; spec and
 tracking live in `specs/018-please-fully-implement/`.
+
+## Async delegation & subagent control (feature 020, 2026-08-27)
+
+**Status**: Deliberate deviation — Joey extension (no upstream Hermes
+counterpart; upstream's delegate_task is blocking-only with no per-child
+control). Types and contracts are Joey-native (`Budgets`, `WorkHandle`,
+`StopReason`, `DelegationOverview`, the `subagent_control` schema —
+defined in `specs/020-async-delegation-control/`, not ported).
+
+Turns delegation non-blocking and adds live orchestrator/operator
+authority over running subagents: `delegate_task` gains additive
+`background` (bool, default false — blocking path byte-unchanged) and
+`budgets {max_turns, max_tokens, max_wall_clock_secs}` (validated > 0 at
+parse; top-level applies to a whole batch); background dispatch returns
+`[BACKGROUND] id=<child_id> goal=<goal> started` immediately and excess
+tasks queue under the same concurrency limits (never rejected).
+Completion notices (`[SUBAGENT COMPLETE|FAILED|STOPPED] id= goal=
+outcome= tokens= duration=s` + summary capped ~2000 chars) are delivered
+at the next turn boundary or via TUI/engine idle wake, on the existing
+cap-64 drop-oldest pending-completions queue. New `subagent_control`
+tool (actions list/status/log/wait/steer/stop; unknown-id and
+already-finished errors; bounded 256-line per-child log ring; stop
+reasons orchestrator_requested/operator_requested/budget_exceeded/
+session_end). Parent-side budget watcher stops a breaching child after
+≤1 more action. Two-pool semaphore (`delegation.parent_reserved_permits`,
+default 1, 0 disables) keeps orchestrator capacity under child
+saturation; `delegation.wind_down_timeout_secs` (default 10) bounds
+session-end wind-down. TUI focused-pane `x`=stop / `s`=steer overlay;
+`AgentEvent::SubagentStopped` emitted on non-natural stops. All state is
+in-memory session-lifetime — no SQLite/on-disk format changes.
+Documented deviation: the line REPL cannot be idle-woken (reedline owns
+stdin synchronously), so notices there arrive at the next interaction
+instead of proactively.

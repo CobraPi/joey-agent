@@ -52,6 +52,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "todo",
     "memory",
     "delegate_task",
+    "subagent_control",
     "process",
     "cronjob",
     "clarify",

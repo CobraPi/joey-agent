@@ -195,6 +195,27 @@ pub struct DelegateTask {
 }
 
 impl DelegateTask {
+    /// Parse + validate the top-level `budgets` tool arg (T021, FR-011).
+    ///
+    /// `None` when the caller omitted `budgets` entirely (no caps — byte-
+    /// identical to pre-feature dispatch). A present-but-invalid object
+    /// (unknown shape, negative value, or any value ≤ 0) is a clean
+    /// [`ToolResult::Error`] naming the offending field — caught here so the
+    /// serde rejection inside [`crate::types::Budgets`] never surfaces as a
+    /// panic, and NOTHING dispatches.
+    fn parse_budgets(args: &Value) -> Result<Option<crate::types::Budgets>, ToolResult> {
+        let Some(v) = args.get("budgets") else {
+            return Ok(None);
+        };
+        if v.is_null() {
+            return Ok(None);
+        }
+        match serde_json::from_value::<crate::types::Budgets>(v.clone()) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) => Err(ToolResult::Error(format!("Invalid budgets: {e}"))),
+        }
+    }
+
     pub fn new(
         manager: Arc<SubagentManager>,
         parent_config: AgentConfig,
@@ -241,6 +262,9 @@ impl Tool for DelegateTask {
          The parent receives only a concise summary from each child. By default, \
          subagent traces are ephemeral (discarded after summary); set persist=true \
          to store the child session for later session_search recall. \
+         BACKGROUND: set background=true to return a work handle immediately \
+         ('[BACKGROUND] id=<child_id> goal=<goal> started') while the child runs; \
+         blocking (default) waits for results. \
          PARALLELISM: batch `tasks` all launch simultaneously (bounded only by \
          system capacity) — for codebase exploration or multi-part implementation, \
          ALWAYS fan out one task per concern in a single batch call instead of \
@@ -294,6 +318,21 @@ impl Tool for DelegateTask {
                     "description": "If true, persist the subagent's full session trace to the session store for later session_search recall. Default: false (ephemeral).",
                     "default": false
                 },
+                "background": {
+                    "type": "boolean",
+                    "description": "If true, return immediately with a work handle per task ('[BACKGROUND] id=<child_id> goal=<goal> started') instead of blocking until the subagent finishes; the work runs under the same concurrency limits (excess queues). Check status later via subagent_control. Default: false (blocking).",
+                    "default": false
+                },
+                "budgets": {
+                    "type": "object",
+                    "description": "Per-child resource budgets (feature 020, FR-011). On breach the child is stopped with reason budget_exceeded (at most one in-flight action completes past detection). BATCH SEMANTICS: a top-level budgets object applies to EVERY child in the batch; per-task budgets overrides are out of scope. BLOCKING PATH: only max_turns is enforced (as the child's turn cap); max_tokens/max_wall_clock_secs are enforced on the background path only. Every present value must be > 0.",
+                    "properties": {
+                        "max_turns": {"type": "integer", "minimum": 1, "description": "Max child iterations; an iteration beyond this stops the child (BudgetExceeded)."},
+                        "max_tokens": {"type": "integer", "minimum": 1, "description": "Max cumulative tokens (prompt + completion). Exceeding stops the child (background path)."},
+                        "max_wall_clock_secs": {"type": "integer", "minimum": 1, "description": "Max wall-clock seconds for the child. Exceeding stops the child (background path)."}
+                    },
+                    "additionalProperties": false
+                },
                 "category": {
                     "type": "string",
                     "description": "OMO category name (e.g. 'quick', 'visual-engineering', 'deep'). When set, routes through Sisyphus-Junior with the category's resolved model and prompt_append. Mutually exclusive with 'subagent_type'."
@@ -311,13 +350,21 @@ impl Tool for DelegateTask {
         })
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
+        // T021: parse + validate budgets BEFORE any dispatch (FR-011): an
+        // invalid object (value ≤ 0, negative, unknown shape) errors cleanly
+        // naming the field and NOTHING dispatches — single AND batch paths.
+        let budgets = match Self::parse_budgets(&args) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+
         // Check if batch mode (tasks array provided).
         let tasks_value = args.get("tasks");
         let is_batch = tasks_value.is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty()));
 
         if is_batch {
-            return self.execute_batch(tasks_value.unwrap(), &args).await;
+            return self.execute_batch(tasks_value.unwrap(), &args, budgets).await;
         }
 
         // Single-task mode.
@@ -475,6 +522,47 @@ impl Tool for DelegateTask {
             }
         }
 
+        // T021 budgets. Background: the whole object rides the budgeted
+        // dispatcher — the T020 parent-side watcher enforces turns/tokens/
+        // wall-clock and stops the child with BudgetExceeded (FR-016 notice).
+        // Do NOT clamp req.max_turns here: the child's own turn cap would end
+        // it naturally at the boundary before the watcher ever sees
+        // IterationStart(max+1) — the watcher needs that headroom to be the
+        // enforcing leg (strict-> breach math, D6).
+
+        // Background mode (feature 020, FR-001): hand the child to the
+        // background dispatcher and return a handle line NOW (SC-001).
+        // background=false / unset keeps the blocking path below untouched
+        // (FR-002 byte parity — pinned by tests/background.rs T007).
+        if args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let handle = crate::background::dispatch_background_with_notices_and_budgets(
+                &self.manager,
+                &req,
+                &self.parent_config,
+                &self.parent_config_tree,
+                &self.base_registry,
+                self.event_tx.as_ref(),
+                ctx,
+                budgets,
+            );
+            return ToolResult::Text(format!(
+                "[BACKGROUND] id={} goal={} started",
+                handle.child_id, handle.goal
+            ));
+        }
+
+        // Blocking path (T021): no watcher exists here, so max_turns is
+        // enforced as the child's turn cap via req.max_turns (the one leg
+        // that requires no manager redesign — dispatch_single already
+        // honors req.max_turns over the delegation default). The cap ends
+        // the child at the boundary (natural agent stop). max_tokens /
+        // max_wall_clock_secs are DEFERRED on the blocking path: enforcing
+        // them needs a live usage observer, which only the background
+        // watcher provides.
+        if let Some(mt) = budgets.and_then(|b| b.max_turns) {
+            req.max_turns = Some(mt as usize);
+        }
+
         let result = self
             .manager
             .dispatch_single(
@@ -498,7 +586,12 @@ impl Tool for DelegateTask {
 }
 
 impl DelegateTask {
-    async fn execute_batch(&self, tasks_value: &Value, args: &Value) -> ToolResult {
+    async fn execute_batch(
+        &self,
+        tasks_value: &Value,
+        args: &Value,
+        budgets: Option<crate::types::Budgets>,
+    ) -> ToolResult {
         let task_specs: Vec<TaskSpec> = match serde_json::from_value(tasks_value.clone()) {
             Ok(specs) => specs,
             Err(e) => {
@@ -534,18 +627,116 @@ impl DelegateTask {
             }
         }
 
-        let results = self
-            .manager
-            .dispatch_batch_with_roles(
+        // Background mode (feature 020, FR-001 + contracts/delegation-tools.md):
+        // a top-level background=true applies to EVERY task in the batch —
+        // each dispatches as background and the tool returns one handle line
+        // per task, in order, immediately (SC-001). FR-013: nothing is
+        // rejected; permits are acquired inside the children under the same
+        // limits. background=false / unset keeps the blocking path below
+        // untouched (FR-002 byte parity — pinned by tests/background.rs T007).
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || task_specs.iter().any(|s| s.background);
+        if background {
+            // Same request construction the blocking batch path uses
+            // (model/toolsets/turns/persist defaults + HyperCode role
+            // routing), so background children run with identical config.
+            let mut requests = crate::subagent::specs_to_requests(
                 &task_specs,
                 batch_model.as_deref(),
                 &batch_toolsets,
+                Some(self.manager.config().default_max_turns),
+                self.manager.config().default_persist,
+                SubagentRole::Leaf,
+            );
+            if let Err(e) = crate::subagent::apply_batch_hyper_roles(
+                &mut requests,
+                &task_specs,
+                &self.parent_config_tree,
+                &self.parent_config.provider,
+            ) {
+                tracing::warn!("hypercode role routing failed: {e}");
+            }
+            // T021: a top-level budgets object applies to EVERY child in the
+            // wave (contracts/delegation-tools.md; per-task override out of
+            // scope). Do NOT bake budgets.max_turns into req.max_turns here:
+            // the child's own turn cap would end it naturally at the
+            // boundary before the T020 watcher sees the breach — the watcher
+            // is the enforcing leg.
+            let pairs: Vec<(DelegationRequest, Option<crate::types::Budgets>)> = requests
+                .into_iter()
+                .map(|r| (r, budgets))
+                .collect();
+            let handles = crate::background::dispatch_background_wave_budgeted(
+                &self.manager,
+                pairs,
                 &self.parent_config,
                 &self.parent_config_tree,
                 &self.base_registry,
                 self.event_tx.as_ref(),
-            )
-            .await;
+            );
+            let mut output = String::new();
+            for (i, handle) in handles.iter().enumerate() {
+                if i > 0 {
+                    output.push('\n');
+                }
+                output.push_str(&format!(
+                    "[BACKGROUND] id={} goal={} started",
+                    handle.child_id, handle.goal
+                ));
+            }
+            return ToolResult::Text(output);
+        }
+
+        // Blocking batch (T021): when budgets.max_turns is set, build the
+        // requests with the budgeted turn cap (same construction as
+        // dispatch_batch_with_roles, which is otherwise left untouched for
+        // the no-budgets byte-parity path). tokens/wall-clock are deferred
+        // on the blocking path (no watcher exists — see single path).
+        let budgeted_turns = budgets
+            .and_then(|b| b.max_turns)
+            .map(|t| t as usize);
+        let results = if let Some(mt) = budgeted_turns {
+            let mut requests = crate::subagent::specs_to_requests(
+                &task_specs,
+                batch_model.as_deref(),
+                &batch_toolsets,
+                Some(mt),
+                self.manager.config().default_persist,
+                SubagentRole::Leaf,
+            );
+            if let Err(e) = crate::subagent::apply_batch_hyper_roles(
+                &mut requests,
+                &task_specs,
+                &self.parent_config_tree,
+                &self.parent_config.provider,
+            ) {
+                tracing::warn!("hypercode role routing failed: {e}");
+            }
+            self.manager
+                .dispatch_requests(
+                    &requests,
+                    &self.parent_config,
+                    &self.parent_config_tree,
+                    &self.base_registry,
+                    self.event_tx.as_ref(),
+                )
+                .await
+        } else {
+            self.manager
+                .dispatch_batch_with_roles(
+                    &task_specs,
+                    batch_model.as_deref(),
+                    &batch_toolsets,
+                    &self.parent_config,
+                    &self.parent_config_tree,
+                    &self.base_registry,
+                    self.event_tx.as_ref(),
+                )
+                .await
+        };
 
         // Format results per the delegation-tool contract.
         let total = results.len();
@@ -769,9 +960,9 @@ mod role_tests {
     fn batch_role_routing_applies_per_task() {
         let tree = tree_with("");
         let tasks = vec![
-            TaskSpec { goal: "read thing".into(), context: None, model: None, toolsets: Vec::new(), role: Some("explorer".into()) },
-            TaskSpec { goal: "build thing".into(), context: None, model: None, toolsets: Vec::new(), role: Some("implementor".into()) },
-            TaskSpec { goal: "plain".into(), context: None, model: None, toolsets: Vec::new(), role: None },
+            TaskSpec { goal: "read thing".into(), context: None, model: None, toolsets: Vec::new(), role: Some("explorer".into()), background: false, budgets: None },
+            TaskSpec { goal: "build thing".into(), context: None, model: None, toolsets: Vec::new(), role: Some("implementor".into()), background: false, budgets: None },
+            TaskSpec { goal: "plain".into(), context: None, model: None, toolsets: Vec::new(), role: None, background: false, budgets: None },
         ];
         let mut reqs: Vec<DelegationRequest> = tasks.iter().map(|_| base_req()).collect();
         crate::subagent::apply_batch_hyper_roles(&mut reqs, &tasks, &tree, "p").unwrap();
@@ -783,7 +974,7 @@ mod role_tests {
     #[test]
     fn batch_role_routing_rejects_unknown_role() {
         let tree = tree_with("");
-        let tasks = vec![TaskSpec { goal: "x".into(), context: None, model: None, toolsets: Vec::new(), role: Some("wat".into()) }];
+        let tasks = vec![TaskSpec { goal: "x".into(), context: None, model: None, toolsets: Vec::new(), role: Some("wat".into()), background: false, budgets: None }];
         let mut reqs: Vec<DelegationRequest> = vec![base_req()];
         assert!(crate::subagent::apply_batch_hyper_roles(&mut reqs, &tasks, &tree, "p").is_err());
     }

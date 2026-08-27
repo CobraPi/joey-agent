@@ -248,6 +248,26 @@ pub enum AgentEvent {
         error: String,
         duration_secs: f64,
     },
+    /// A subagent stopped for a non-natural reason before completing its
+    /// goal (spec 020, T006): orchestrator-requested stop, operator stop,
+    /// budget breach, or session wind-down. Emitted INSTEAD of
+    /// `SubagentComplete` when the child is interrupted; the child's
+    /// partial work is described by `summary_preview`. `reason` is a
+    /// provider-neutral string form of the orchestration layer's stop
+    /// reason (e.g. "orchestrator_requested", "operator_requested",
+    /// "budget_exceeded", "session_end") — kept as `String` because this
+    /// crate sits below `joey-orchestration` in the dependency DAG and
+    /// cannot import its `StopReason` enum.
+    SubagentStopped {
+        /// Stable child id (matches `SubagentSpawn.id`).
+        id: u64,
+        /// The child's goal as given at spawn time.
+        goal: String,
+        /// Why the child stopped (string form of the StopReason).
+        reason: String,
+        /// Bounded preview of the child's partial result.
+        summary_preview: String,
+    },
     /// A batch delegation resolved (all children done or failed).
     DelegationBatchComplete {
         total: usize,
@@ -428,5 +448,51 @@ mod tests {
     fn file_change_sources_are_distinct() {
         assert_ne!(FileChangeSource::FileTool, FileChangeSource::Terminal);
         assert_ne!(FileChangeSource::Terminal, FileChangeSource::Detected);
+    }
+
+    #[test]
+    fn subagent_stopped_constructs_and_clones() {
+        // Spec 020 T006: the additive SubagentStopped variant must be
+        // constructible, cloneable, and debug-formattable (constitution
+        // Principle VII — regression coverage for new public surface).
+        let ev = AgentEvent::SubagentStopped {
+            id: 7,
+            goal: "refactor the parser".to_string(),
+            reason: "operator_requested".to_string(),
+            summary_preview: "renamed 3 symbols before stop".to_string(),
+        };
+        let cloned = ev.clone();
+        let _dbg = format!("{:?}", cloned);
+        match ev {
+            AgentEvent::SubagentStopped { id, goal, reason, summary_preview } => {
+                assert_eq!(id, 7);
+                assert_eq!(goal, "refactor the parser");
+                assert_eq!(reason, "operator_requested");
+                assert_eq!(summary_preview, "renamed 3 symbols before stop");
+            }
+            _ => panic!("expected SubagentStopped variant"),
+        }
+    }
+
+    #[test]
+    fn subagent_stopped_matches_via_wildcard_arm() {
+        // Consumers in joey-tui/joey-cli match AgentEvent with wildcard
+        // arms (the enum is #[non_exhaustive]); a wildcard arm plus a
+        // SubagentStopped event must compile and route without touching
+        // existing variants.
+        let ev = AgentEvent::SubagentStopped {
+            id: 1,
+            goal: "g".to_string(),
+            reason: "session_end".to_string(),
+            summary_preview: String::new(),
+        };
+        let routed = match ev {
+            AgentEvent::SubagentStopped { id, reason, .. } => {
+                format!("stopped:{id}:{reason}")
+            }
+            AgentEvent::Notice(n) => format!("notice:{n}"),
+            _ => "other".to_string(),
+        };
+        assert_eq!(routed, "stopped:1:session_end");
     }
 }
