@@ -247,14 +247,15 @@ fn tab_click_hit_routing() {
     a.apply(spawn(1, "one"));
     a.apply(spawn(2, "two"));
     // Simulate the rail recording rects (as the widget does per frame).
+    // The rail hugs the LEFT edge: tabs start at column 0 of the body.
     *a.last_subagent_tab_rects.borrow_mut() = vec![
-        (100, 1, 18, 1),
-        (100, 3, 18, 1),
+        (0, 1, 18, 1),
+        (0, 3, 18, 1),
     ];
-    assert_eq!(a.subagent_tab_hit(1, 105), Some(0));
-    assert_eq!(a.subagent_tab_hit(3, 105), Some(1));
-    assert_eq!(a.subagent_tab_hit(2, 105), None, "gap between tabs");
-    assert_eq!(a.subagent_tab_hit(1, 50), None, "outside the rail");
+    assert_eq!(a.subagent_tab_hit(1, 5), Some(0));
+    assert_eq!(a.subagent_tab_hit(3, 5), Some(1));
+    assert_eq!(a.subagent_tab_hit(2, 5), None, "gap between tabs");
+    assert_eq!(a.subagent_tab_hit(1, 50), None, "outside the rail (main pane column)");
 }
 
 /// The pinned orchestrator tab renders at the rail's bottom whenever the
@@ -276,7 +277,7 @@ fn orchestrator_tab_renders_and_records_click_rect() {
     // Hit-test: inside the rect → true; outside → false.
     assert!(a.orchestrator_tab_hit(y, x + 2));
     assert!(!a.orchestrator_tab_hit(y + 5, x + 2), "row below the tab");
-    assert!(!a.orchestrator_tab_hit(y, x + w + 2), "column right of the rail");
+    assert!(!a.orchestrator_tab_hit(y, x + w + 2), "column right of the rail (main pane)");
 }
 
 /// Clicking the orchestrator tab returns to the main view from a focused
@@ -361,6 +362,38 @@ fn rail_defaults_to_collapsed_19_cols() {
     let (title_w, tab_w) = rail_width_after_render(&a, 120, 30);
     assert_eq!(title_w, 18, "collapsed title row spans the 18-col inner rail");
     assert_eq!(tab_w, 18, "collapsed tab rows span the 18-col inner rail");
+}
+
+/// LEFT-EDGE PLACEMENT (regression): the rail hugs the far LEFT of the
+/// body area — its recorded rect starts at the body's column 0, and the
+/// main transcript starts to the rail's RIGHT (at rail x + width).
+#[test]
+fn rail_anchors_to_far_left_of_body() {
+    let mut a = app();
+    a.apply(spawn(1, "alpha task"));
+    render_frame(&a, 120, 30);
+    // Rail strip: starts at column 0, 19 cols wide (collapsed).
+    let (rx, ry, rw, rh) = a.last_subagent_rail_rect.get();
+    assert_eq!(rx, 0, "rail rect starts at the body's column 0");
+    assert_eq!(rw, 19, "collapsed rail is 19 cols");
+    assert!(rh > 0);
+    // Title + tab rects sit inside the left-anchored strip.
+    let (tx, ty, tw, th) = a.last_subagent_rail_title_rect.get();
+    assert_eq!(tx, rx + 1, "title starts inside the rail (after its inner edge)");
+    assert_eq!(tw, 18);
+    assert!(th > 0 && ty >= ry);
+    let tab = a.last_subagent_tab_rects.borrow()[0];
+    assert_eq!(tab.0, rx + 1, "tab rows start at the rail's inner left edge");
+    // Main transcript begins after the rail's right border.
+    let (mx, _, mw, _) = a.last_text_area.get();
+    assert!(mx >= rx + rw, "main transcript starts after the rail");
+    assert!(mw > 0);
+    // Expanded mode keeps the left anchor, widening to 48 cols.
+    a.toggle_subagent_rail();
+    render_frame(&a, 120, 30);
+    let (rx2, _, rw2, _) = a.last_subagent_rail_rect.get();
+    assert_eq!(rx2, 0, "expanded rail still anchors at column 0");
+    assert_eq!(rw2, 48, "expanded rail is 48 cols on a 120-col body");
 }
 
 /// Toggling via the state helper renders the wider rail (48 cols on a

@@ -197,7 +197,7 @@ in realtime (no more waiting for the call to finish to see anything):
 
 When the agent delegates (`delegate_task`), each spawned child gets a
 **pane** (`state.rs::SubagentPane`) with its own transcript, streaming
-accumulators, and view state. A vertical **tab rail** on the right lists
+accumulators, and view state. A vertical **tab rail** on the left lists
 the panes; clicking a tab focuses it, retargeting the main transcript
 area (and the maximized stats/output-viewer windows) to that child's
 stream. The bottom pinned rail tab (or **Ctrl+P**) returns to the

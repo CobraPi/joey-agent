@@ -18,6 +18,28 @@ fn char_len(line: &str) -> usize {
     line.chars().count()
 }
 
+/// States of the ANSI-escape stripper used by [`Input::insert_str`].
+///
+/// Recognizes (and drops) the escape forms a terminal can emit:
+/// - CSI: `ESC [` followed by parameter/intermediate bytes (0x20–0x3F)
+///   and terminated by a final byte (0x40–0x7E), e.g. `ESC [ 2 A`.
+/// - OSC: `ESC ]` ... terminated by BEL or ST (`ESC \` / U+009C).
+/// - Simple two-byte `ESC X` forms and `ESC <intermediate> <final>`.
+/// - A lone trailing (unterminated) ESC is dropped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StripState {
+    /// Normal text.
+    Ground,
+    /// Just saw ESC.
+    Esc,
+    /// Inside a CSI sequence.
+    Csi,
+    /// Inside an OSC string.
+    Osc,
+    /// Saw ESC while inside an OSC (maybe a terminating ST).
+    OscEsc,
+}
+
 #[derive(Clone)]
 pub struct Input {
     /// One string per logical line. Invariant: never empty.
@@ -70,8 +92,13 @@ impl Input {
         self.cursor_line
     }
 
-    /// Insert a character at the cursor.
+    /// Insert a character at the cursor. Control characters (including a
+    /// stray ESC) are ignored so terminal garbage can never materialize as
+    /// input text; every reachable call site only passes printable chars.
     pub fn insert_char(&mut self, c: char) {
+        if c.is_control() {
+            return;
+        }
         let at = byte_idx(&self.lines[self.cursor_line], self.cursor_col);
         self.lines[self.cursor_line].insert(at, c);
         self.cursor_col += 1;
@@ -79,20 +106,87 @@ impl Input {
 
     /// Insert a whole string at the cursor. Newlines split lines (so pasted
     /// blocks keep their shape); tabs become spaces (a raw \t breaks cell
-    /// width accounting).
+    /// width accounting); ANSI escape sequences are stripped so that stray
+    /// terminal output parsed as a paste can never land in the input box.
     pub fn insert_str(&mut self, s: &str) {
-        for c in s.replace("\r\n", "\n").chars() {
-            match c {
-                '\n' | '\r' => self.insert_newline(),
-                '\t' => {
-                    for _ in 0..4 {
-                        self.insert_char(' ');
+        let mut state = StripState::Ground;
+        'chars: for c in s.replace("\r\n", "\n").chars() {
+            loop {
+                match state {
+                    StripState::Ground => {
+                        match c {
+                            '\n' | '\r' => self.insert_newline(),
+                            '\t' => {
+                                for _ in 0..4 {
+                                    self.insert_char(' ');
+                                }
+                            }
+                            '\x1b' => state = StripState::Esc,
+                            c if c.is_control() => {}
+                            c => self.insert_char(c),
+                        }
+                        continue 'chars;
+                    }
+                    StripState::Esc => {
+                        let u = c as u32;
+                        if c == '[' {
+                            state = StripState::Csi;
+                        } else if c == ']' {
+                            state = StripState::Osc;
+                        } else if c == '\x1b' {
+                            // Consecutive ESC: keep waiting for the sequence
+                            // type byte.
+                        } else if (0x20..=0x2f).contains(&u) {
+                            // Intermediate bytes (e.g. the '(' of `ESC ( B`):
+                            // keep collecting until the final byte.
+                        } else if (0x30..=0x7e).contains(&u) {
+                            // Final byte of a simple ESC X / ESC interm final
+                            // form: the whole sequence is dropped.
+                            state = StripState::Ground;
+                        } else {
+                            // Malformed: bail out and reprocess this char as
+                            // normal text (controls get dropped in Ground).
+                            state = StripState::Ground;
+                            continue;
+                        }
+                        continue 'chars;
+                    }
+                    StripState::Csi => {
+                        let u = c as u32;
+                        if (0x40..=0x7e).contains(&u) {
+                            // Final byte: sequence complete, drop it all.
+                            state = StripState::Ground;
+                        } else if (0x20..=0x3f).contains(&u) {
+                            // Parameter / intermediate bytes: keep consuming.
+                        } else {
+                            // Malformed CSI: bail out and reprocess.
+                            state = StripState::Ground;
+                            continue;
+                        }
+                        continue 'chars;
+                    }
+                    StripState::Osc => {
+                        match c {
+                            '\x07' | '\u{9c}' => state = StripState::Ground, // BEL / C1 ST
+                            '\x1b' => state = StripState::OscEsc,
+                            _ => {} // consume OSC payload
+                        }
+                        continue 'chars;
+                    }
+                    StripState::OscEsc => {
+                        state = match c {
+                            '\\' => StripState::Ground, // ST complete
+                            '[' => StripState::Csi,
+                            ']' => StripState::Osc,
+                            '\x1b' => StripState::OscEsc,
+                            _ => StripState::Ground, // aborted OSC: drop char
+                        };
+                        continue 'chars;
                     }
                 }
-                c if c.is_control() => {}
-                c => self.insert_char(c),
             }
         }
+        // A lone trailing ESC (or an unterminated sequence) is dropped.
     }
 
     /// Insert a newline at the cursor.
@@ -362,5 +456,136 @@ mod tests {
         i.insert_str("fn main() {\r\n\tprintln!(\"hi\");\r\n}");
         assert_eq!(i.line_count(), 3);
         assert_eq!(i.text(), "fn main() {\n    println!(\"hi\");\n}");
+    }
+
+    #[test]
+    fn insert_str_plain_text_passthrough() {
+        let mut i = Input::new();
+        i.insert_str("plain text, punctuation !?; and digits 123");
+        assert_eq!(i.text(), "plain text, punctuation !?; and digits 123");
+    }
+
+    #[test]
+    fn insert_str_sed_command_unchanged() {
+        let mut i = Input::new();
+        i.insert_str("sed -i s/foo/bar/ file.txt");
+        assert_eq!(i.text(), "sed -i s/foo/bar/ file.txt");
+    }
+
+    #[test]
+    fn insert_str_strips_bracketed_paste_markers() {
+        let mut i = Input::new();
+        i.insert_str("\x1b[200~sed evil\x1b[201~");
+        assert_eq!(i.text(), "sed evil");
+    }
+
+    #[test]
+    fn insert_str_strips_raw_csi_and_decsed_garbage() {
+        let mut i = Input::new();
+        // Cursor-up + show-cursor junk around real text.
+        i.insert_str("\x1b[2Atext\x1b[?25h");
+        assert_eq!(i.text(), "text");
+        // Erase-display and SGR sequences interleaved with text.
+        i.clear();
+        i.insert_str("a\x1b[2Kbb\x1b[0m\x1b[3;4Hc");
+        assert_eq!(i.text(), "abc");
+        // CSI with sub-parameter colons and private-mode '?' prefix.
+        i.clear();
+        i.insert_str("\x1b[38:2:255:0:0mred\x1b[?1049h!");
+        assert_eq!(i.text(), "red!");
+    }
+
+    #[test]
+    fn insert_str_strips_osc_bel() {
+        let mut i = Input::new();
+        i.insert_str("\x1b]0;window title\x07after");
+        assert_eq!(i.text(), "after");
+    }
+
+    #[test]
+    fn insert_str_strips_osc_st() {
+        let mut i = Input::new();
+        i.insert_str("pre\x1b]52;c;base64==\x1b\\post");
+        assert_eq!(i.text(), "prepost");
+    }
+
+    #[test]
+    fn insert_str_strips_osc_c1_st() {
+        let mut i = Input::new();
+        // U+009C (C1 ST) terminator inside a Rust string literal.
+        i.insert_str("\x1b]8;;http://x\u{9c}link");
+        assert_eq!(i.text(), "link");
+    }
+
+    #[test]
+    fn insert_str_drops_lone_trailing_esc() {
+        let mut i = Input::new();
+        i.insert_str("ok\x1b");
+        assert_eq!(i.text(), "ok");
+        // Unterminated CSI / OSC also drop harmlessly.
+        i.clear();
+        i.insert_str("a\x1b[12");
+        assert_eq!(i.text(), "a");
+        i.clear();
+        i.insert_str("b\x1b]0;never terminated");
+        assert_eq!(i.text(), "b");
+    }
+
+    #[test]
+    fn insert_str_strips_two_byte_esc_forms() {
+        let mut i = Input::new();
+        // ESC ( B (charset), ESC M (reverse index), ESC 7 (save cursor).
+        i.insert_str("\x1b(BA\x1bMB\x1b7C");
+        assert_eq!(i.text(), "ABC");
+    }
+
+    #[test]
+    fn insert_str_tabs_still_expand_and_newlines_split() {
+        let mut i = Input::new();
+        i.insert_str("a\tb\nc");
+        assert_eq!(i.text(), "a    b\nc");
+        assert_eq!(i.line_count(), 2);
+    }
+
+    #[test]
+    fn insert_str_unicode_preserved() {
+        let mut i = Input::new();
+        i.insert_str("héllo wörld — 日本語 🦀 ✓ 漢字");
+        assert_eq!(i.text(), "héllo wörld — 日本語 🦀 ✓ 漢字");
+        // Unicode adjacent to stripped sequences.
+        i.clear();
+        i.insert_str("\x1b[1m太字\x1b[0mとplain");
+        assert_eq!(i.text(), "太字とplain");
+    }
+
+    #[test]
+    fn insert_str_malformed_escape_recovers_printable() {
+        let mut i = Input::new();
+        // ESC followed by a char outside the final-byte range (U+00E9 > 0x7E):
+        // the ESC is dropped and the char is reprocessed as plain text.
+        i.insert_str("\x1bé");
+        assert_eq!(i.text(), "é");
+        // Two-byte ESC X forms end at 0x7E, so '~' itself is consumed.
+        i.clear();
+        i.insert_str("\x1b~tilde");
+        assert_eq!(i.text(), "tilde");
+    }
+
+    #[test]
+    fn insert_str_osc_esc_then_csi() {
+        let mut i = Input::new();
+        // Aborted OSC whose ESC leads into a fresh CSI sequence.
+        i.insert_str("x\x1b]0;t\x1b[2Ky");
+        assert_eq!(i.text(), "xy");
+    }
+
+    #[test]
+    fn insert_char_ignores_control_chars() {
+        let mut i = Input::new();
+        i.insert_char('a');
+        i.insert_char('\x1b'); // stray ESC typed directly: dropped
+        i.insert_char('\x07'); // BEL
+        i.insert_char('b');
+        assert_eq!(i.text(), "ab");
     }
 }

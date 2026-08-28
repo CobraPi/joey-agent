@@ -102,9 +102,9 @@ fn render_body(
     spinner: &crate::anim::Spinner,
     equalizer: &crate::anim::Equalizer,
 ) {
-    // Parallel-subagent feature: the subagent tab rail occupies the RIGHT
+    // Parallel-subagent feature: the subagent tab rail occupies the LEFT
     // edge whenever panes exist (each spawned child stacks a vertical tab
-    // there; the orchestrator is the implicit leftmost tab = focus None).
+    // there; the orchestrator is the implicit topmost tab = focus None).
     let show_rail = !app.subagent_panes.is_empty() && area.width >= 96;
     let with_rail_area = if show_rail {
         // Collapsed (default): the fixed 19-col tab strip — byte-for-byte
@@ -128,10 +128,10 @@ fn render_body(
         };
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(rail_w)])
+            .constraints([Constraint::Length(rail_w), Constraint::Min(1)])
             .split(area);
-        widgets::draw_subagent_rail(f, cols[1], app, theme);
-        cols[0]
+        widgets::draw_subagent_rail(f, cols[0], app, theme);
+        cols[1]
     } else {
         app.last_subagent_tab_rects.borrow_mut().clear();
         app.last_orchestrator_tab_rect.set((0, 0, 0, 0));
@@ -392,6 +392,10 @@ fn restore_terminal() {
         DisableMouseCapture,
         LeaveAlternateScreen
     );
+    // Release the console: tracing stderr output goes back to the real
+    // stderr (was mirrored to logs/tui-console.log while we owned the TTY).
+    // Called from `leave`, Drop, and the panic hook — every restore path.
+    joey_core::logging::set_console_suppressed(false);
 }
 
 /// The TUI controller. Generic over the ratatui backend so tests can drive
@@ -522,6 +526,10 @@ impl Tui<FrameBackend> {
             let _ = disable_raw_mode();
             return Err(e);
         }
+        // The alternate screen now owns the TTY: redirect tracing's stderr
+        // console layer to logs/tui-console.log so verbose output can't
+        // paint into the TUI's input box. Cleared by restore_terminal.
+        joey_core::logging::set_console_suppressed(true);
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         let size = terminal.size()?;
@@ -563,6 +571,9 @@ impl Tui<FrameBackend> {
             EnableBracketedPaste,
             EnableMouseCapture
         )?;
+        // Re-owned the TTY after a `leave()`: suppress the console again
+        // (leave → restore_terminal cleared the flag).
+        joey_core::logging::set_console_suppressed(true);
         // Force a full repaint on the next draw (the screen was destroyed).
         self.terminal.clear()?;
         self.restored = false;

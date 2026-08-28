@@ -131,10 +131,14 @@ pub fn render_event(event: &AgentEvent) -> Option<String> {
     }
 }
 
-/// Print an event to stdout if it produces a summary line.
+/// Emit an event summary if it produces one.
+///
+/// Routed through tracing (not a bare `println!`) so the line lands in the
+/// log file — and never paints over the ratatui input box — if this is ever
+/// wired into a TUI-reachable callback.
 pub fn print_event(event: &AgentEvent) {
     if let Some(line) = render_event(event) {
-        println!("{}", line);
+        tracing::info!("{}", line);
     }
 }
 

@@ -5682,7 +5682,7 @@ mod visual_check_tests {
 
 use crate::state::SubagentPane;
 
-/// Draw the vertical subagent tab rail on the RIGHT edge of the body area.
+/// Draw the vertical subagent tab rail on the LEFT edge of the body area.
 /// Each pane gets one stacked tab (goal preview + status glyph). Records
 /// per-tab hit rects on the App for click routing.
 ///
@@ -5712,16 +5712,16 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let expanded = app.subagent_rail_expanded && area.width >= 24;
 
     // Collapsed keeps the original 18-of-19-cols geometry (19 total minus
-    // the 1-col LEFT border = 18 inner); expanded fills the wider
+    // the 1-col RIGHT border = 18 inner); expanded fills the wider
     // allocation render_body granted, capped at 48.
     let rail_w = if expanded { area.width.min(48) } else { 19u16.min(area.width) };
-    let rail = Rect::new(area.x + area.width - rail_w, area.y, rail_w, area.height);
+    let rail = Rect::new(area.x, area.y, rail_w, area.height);
     // Whole-strip rect for mouse-wheel routing (handle_mouse_scroll).
     app.last_subagent_rail_rect
         .set((rail.x, rail.y, rail.width, rail.height));
     // Panel background.
     let block = Block::default()
-        .borders(Borders::LEFT)
+        .borders(Borders::RIGHT)
         .border_style(Style::default().fg(theme.separator.to_color()))
         .style(Style::default().bg(theme.bg_panel.to_color()));
     let inner = block.inner(rail);

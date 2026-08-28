@@ -72,7 +72,15 @@ pub(crate) fn fetch_candidate_pool(provider: &str) -> CandidateModelPool {
                 CandidateModelPool::from_consolidated(models, CatalogSource::Copilot)
             }
             Err(e) => {
-                eprintln!("llm-selector: copilot catalog fetch failed: {e}");
+                // Route through tracing (file log) and gate the raw stderr
+                // copy on the TUI console-suppression guard: this fetch runs
+                // under the TUI via /llm-selector (llm_selector_slash_text ->
+                // build_engine -> here), where a bare eprintln would paint
+                // over ratatui's input box.
+                tracing::warn!("llm-selector: copilot catalog fetch failed: {e}");
+                if !joey_core::logging::is_console_suppressed() {
+                    eprintln!("llm-selector: copilot catalog fetch failed: {e}");
+                }
                 CandidateModelPool::default()
             }
         }
@@ -80,10 +88,14 @@ pub(crate) fn fetch_candidate_pool(provider: &str) -> CandidateModelPool {
         // models.dev covers the other catalog-exposing providers.
         let raw = crate::model_catalog::models_dev_entries_for_provider(provider);
         if raw.is_empty() {
-            eprintln!(
-                "llm-selector: no models.dev entries for provider '{}'",
-                provider
-            );
+            // Same TUI-safe routing as the copilot branch above.
+            tracing::warn!("llm-selector: no models.dev entries for provider '{}'", provider);
+            if !joey_core::logging::is_console_suppressed() {
+                eprintln!(
+                    "llm-selector: no models.dev entries for provider '{}'",
+                    provider
+                );
+            }
             return CandidateModelPool::default();
         }
         let (models, _dropped) = consolidate_models_dev(provider, &raw);
@@ -643,6 +655,20 @@ mod tests {
     fn llm_selector_unknown_subcommand_errors() {
         let _g = TestEnvGuard::new();
         assert!(llm_selector_slash("nonsense").is_err());
+    }
+
+    /// The render-only form (used by the TUI, which must never receive a raw
+    /// stdout write under ratatui's alternate screen) returns the help text
+    /// as a String instead of printing it.
+    #[test]
+    fn llm_selector_slash_text_returns_help_without_printing() {
+        let _g = TestEnvGuard::new();
+        let out = llm_selector_slash_text("help").expect("help must render");
+        assert!(out.contains("Usage: /llm-selector <subcommand>"));
+        assert!(out.ends_with('\n'));
+        // Unknown subcommands surface as Err (rendered by the caller), not
+        // printed.
+        assert!(llm_selector_slash_text("definitely-not-a-subcommand").is_err());
     }
 
     /// `resolve_provider_name` reads the provider from `model.provider` (not the

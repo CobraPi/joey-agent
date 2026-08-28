@@ -659,7 +659,12 @@ fn warn_config_parse_failure(path: &Path, err: &str, has_lkg: bool) {
         msg.push_str(&format!(" A copy of the corrupted file was saved to {}.", bp.display()));
     }
     tracing::warn!("{}", msg);
-    eprintln!("Warning: {}", msg);
+    // TUI-safe routing: always file-log; only touch stderr when the ratatui
+    // TUI does not own the terminal (Config::load runs inside TUI slash
+    // handlers, where a bare eprintln paints over the input box).
+    if !crate::logging::is_console_suppressed() {
+        eprintln!("Warning: {}", msg);
+    }
 }
 
 // ─── Dotted-path navigation (dict + list, port of _get/_set/_unset_nested) ──
@@ -1052,15 +1057,22 @@ fn sanitize_loaded_credentials() {
             }
         }
         let stripped = value.chars().count() - cleaned.chars().count();
-        eprintln!(
+        // TUI-safe warning routing: always file-log via tracing; copy to
+        // stderr only when the TUI console guard is clear (this runs on
+        // every Config::load, including inside TUI slash handlers).
+        let warn_line = format!(
             "  Warning: {} contained {} non-ASCII character{} — stripped so the key can be sent as an HTTP header.",
             key,
             stripped,
             if stripped != 1 { "s" } else { "" },
         );
-        eprintln!(
-            "  This usually means the key was copy-pasted from a PDF, rich-text editor, or web page that substituted lookalike\n  Unicode glyphs for ASCII letters. If authentication fails (e.g. \"API key not valid\"), re-copy the key from the\n  provider's dashboard and run `joey setup` (or edit the .env file in a plain-text editor)."
-        );
+        tracing::warn!("{}", warn_line);
+        if !crate::logging::is_console_suppressed() {
+            eprintln!("{}", warn_line);
+            eprintln!(
+                "  This usually means the key was copy-pasted from a PDF, rich-text editor, or web page that substituted lookalike\n  Unicode glyphs for ASCII letters. If authentication fails (e.g. \"API key not valid\"), re-copy the key from the\n  provider's dashboard and run `joey setup` (or edit the .env file in a plain-text editor)."
+            );
+        }
     }
 }
 
@@ -1267,12 +1279,19 @@ fn check_non_ascii_credential(key: &str, value: &str) -> String {
         }
     }
     let more = if bad.len() > 5 { "\n  ... and more" } else { "" };
-    eprintln!(
+    // TUI-safe warning routing: always file-log via tracing; copy to stderr
+    // only when the TUI console guard is clear (save_env_value /
+    // Config::load paths run under the TUI too).
+    let msg = format!(
         "\n  Warning: {} contains non-ASCII characters that will break API requests.\n  This usually happens when copy-pasting from a PDF, rich-text editor,\n  or web page that substitutes lookalike Unicode glyphs for ASCII letters.\n\n{}{}\n\n  The non-ASCII characters have been stripped automatically.\n  If authentication fails, re-copy the key from the provider's dashboard.\n",
         key,
         bad.iter().take(5).map(|l| format!("  {}", l)).collect::<Vec<_>>().join("\n"),
         more,
     );
+    tracing::warn!("{}", msg);
+    if !crate::logging::is_console_suppressed() {
+        eprintln!("{}", msg);
+    }
     sanitized
 }
 

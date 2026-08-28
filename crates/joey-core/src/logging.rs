@@ -12,9 +12,11 @@
 //! hits disk (port of `RedactingFormatter`). Console output is opt-in only
 //! (`init_verbose`), never always-on.
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use tracing::field::{Field, Visit};
@@ -29,6 +31,151 @@ use crate::{branding, constants, redact};
 /// The directory logs are written to (`~/.joey/logs`).
 pub fn logs_dir() -> PathBuf {
     constants::joey_home().join("logs")
+}
+
+// ---------------------------------------------------------------------------
+// TUI console suppression
+//
+// While the ratatui TUI owns the terminal (raw mode + alternate screen), any
+// direct write to stdout/stderr paints at the cursor — which the TUI parks
+// inside the input box — so verbose tracing lines appear in (and disrupt)
+// the text input area. A process-global flag lets the console fmt layer
+// redirect its output to a log file for the lifetime of the TUI session.
+// ---------------------------------------------------------------------------
+
+/// Process-global "the TUI owns the terminal" flag. While set, the console
+/// (stderr) fmt layer installed by [`init_verbose`] appends its output to
+/// `~/.joey/logs/tui-console.log` instead of writing to stderr.
+static CONSOLE_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Set/clear the TUI-active flag. Set by the TUI right after entering the
+/// alternate screen, cleared when the terminal is restored (including the
+/// panic path). Non-TUI behavior is untouched while the flag is clear.
+pub fn set_console_suppressed(suppressed: bool) {
+    CONSOLE_SUPPRESSED.store(suppressed, Ordering::SeqCst);
+}
+
+/// Whether the TUI currently owns the terminal (console output suppressed).
+pub fn is_console_suppressed() -> bool {
+    CONSOLE_SUPPRESSED.load(Ordering::SeqCst)
+}
+
+/// Lazily-opened append handle for the TUI console mirror file. `None`
+/// until the first suppressed write; stays `None` (writes dropped) if the
+/// file cannot be opened — never panic, never fall back to stderr while
+/// the TUI owns the terminal.
+static TUI_CONSOLE_FILE: Mutex<Option<File>> = Mutex::new(None);
+
+/// Path of the file console output is mirrored to while the TUI is active.
+fn tui_console_log_path() -> PathBuf {
+    logs_dir().join("tui-console.log")
+}
+
+/// Where a console-layer write goes right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsoleRoute {
+    /// Normal operation: stderr (byte-identical to the pre-TUI behavior).
+    Stderr,
+    /// TUI active: append to `logs/tui-console.log`.
+    TuiFile,
+}
+
+/// Routing decision consulted per event by [`GuardedConsoleMakeWriter`].
+fn console_route() -> ConsoleRoute {
+    if is_console_suppressed() {
+        ConsoleRoute::TuiFile
+    } else {
+        ConsoleRoute::Stderr
+    }
+}
+
+/// Strip ANSI escape sequences (CSI: `ESC '['` … final byte in `@`..`~`)
+/// from a buffer, so the mirrored file stays plain text even when the
+/// console layer was built with ANSI enabled (stderr was a tty).
+fn strip_ansi(buf: &[u8]) -> Cow<'_, [u8]> {
+    if !buf.contains(&0x1b) {
+        return Cow::Borrowed(buf);
+    }
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == 0x1b && i + 1 < buf.len() && buf[i + 1] == b'[' {
+            // CSI sequence: skip parameter/intermediate bytes, then the
+            // final byte (0x40..=0x7e).
+            i += 2;
+            while i < buf.len() && !(0x40..=0x7e).contains(&buf[i]) {
+                i += 1;
+            }
+            i += 1; // the final byte
+        } else {
+            out.push(buf[i]);
+            i += 1;
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Best-effort append to the TUI console mirror. Opening/creation errors
+/// are dropped (the write is lost, the process never panics) and retried
+/// on the next write.
+fn write_tui_console(buf: &[u8]) {
+    if let Ok(mut guard) = TUI_CONSOLE_FILE.lock() {
+        if guard.is_none() {
+            let dir = logs_dir();
+            if std::fs::create_dir_all(&dir).is_ok() {
+                *guard = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(tui_console_log_path())
+                    .ok();
+            }
+        }
+        if let Some(f) = guard.as_mut() {
+            // Errors are deliberately swallowed: while the TUI is active we
+            // must never write to stderr, and logging must never panic.
+            let _ = f.write_all(&strip_ansi(buf));
+            let _ = f.flush();
+        }
+    }
+}
+
+/// A single console-layer write target: stderr, or the TUI mirror file.
+struct ConsoleWriter {
+    route: ConsoleRoute,
+}
+
+impl std::io::Write for ConsoleWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.route {
+            ConsoleRoute::Stderr => std::io::stderr().write(buf),
+            ConsoleRoute::TuiFile => {
+                write_tui_console(buf);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.route {
+            ConsoleRoute::Stderr => std::io::stderr().flush(),
+            ConsoleRoute::TuiFile => Ok(()), // flushed on every write
+        }
+    }
+}
+
+/// `MakeWriter` for the console fmt layer: picks stderr or the TUI mirror
+/// file per event based on [`is_console_suppressed`]. With the flag clear,
+/// output is byte-identical to the plain `std::io::stderr` writer.
+struct GuardedConsoleMakeWriter;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for GuardedConsoleMakeWriter {
+    type Writer = ConsoleWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        ConsoleWriter {
+            route: console_route(),
+        }
+    }
 }
 
 thread_local! {
@@ -303,7 +450,11 @@ fn init_impl(component: &str, verbose: bool) -> Option<LogGuard> {
     let console_layer = if verbose {
         Some(
             tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
+                // Routes to stderr normally; to logs/tui-console.log while
+                // the TUI owns the terminal (set_console_suppressed(true)).
+                .with_writer(GuardedConsoleMakeWriter)
+                // ANSI only ever makes sense on the stderr path; the file
+                // path strips escape sequences before writing.
                 .with_ansi(atty_stderr()),
         )
     } else {
@@ -329,6 +480,36 @@ fn atty_stderr() -> bool {
     #[cfg(not(unix))]
     {
         true
+    }
+}
+
+/// Test-only: forget the cached TUI console file handle so the next
+/// suppressed write re-resolves `logs_dir()` (e.g. under a home override).
+#[cfg(test)]
+fn reset_tui_console_handle_for_test() {
+    if let Ok(mut guard) = TUI_CONSOLE_FILE.lock() {
+        *guard = None;
+    }
+}
+
+/// Test-only RAII flag setter: forces the flag to `value` and restores the
+/// prior value on drop (tests run in parallel threads of one process).
+#[cfg(test)]
+struct FlagGuard(bool);
+
+#[cfg(test)]
+impl FlagGuard {
+    fn new(value: bool) -> Self {
+        let prior = is_console_suppressed();
+        set_console_suppressed(value);
+        Self(prior)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FlagGuard {
+    fn drop(&mut self) {
+        set_console_suppressed(self.0);
     }
 }
 
@@ -378,5 +559,67 @@ mod tests {
         assert_eq!(level_name(&Level::INFO), "INFO");
         assert_eq!(parse_level_name("warning"), 30);
         assert_eq!(parse_level_name("bogus"), 20);
+    }
+
+    #[test]
+    fn console_route_tracks_suppression_flag() {
+        // One test walks clear → set → clear so parallel tests never race
+        // the process-global flag.
+        let _flag = FlagGuard::new(false);
+        assert!(!is_console_suppressed());
+        assert_eq!(console_route(), ConsoleRoute::Stderr, "flag off => stderr");
+
+        set_console_suppressed(true);
+        assert!(is_console_suppressed());
+        assert_eq!(console_route(), ConsoleRoute::TuiFile, "flag on => file");
+
+        set_console_suppressed(false);
+        assert_eq!(console_route(), ConsoleRoute::Stderr, "flag cleared => stderr again");
+    }
+
+    #[test]
+    fn suppressed_writes_land_in_tui_console_log() {
+        // Serialize against other tests that override the process-global
+        // home (JOEY_HOME semantics).
+        let _lock = crate::constants::TEST_HOME_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::constants::HomeOverrideGuard::new(dir.path().to_path_buf());
+        reset_tui_console_handle_for_test();
+
+        let _flag = FlagGuard::new(true);
+        let mut w = ConsoleWriter {
+            route: console_route(),
+        };
+        w.write_all(b"\x1b[32mINFO\x1b[0m hello from the tui\n").unwrap();
+        w.flush().unwrap();
+
+        let path = dir.path().join("logs").join("tui-console.log");
+        assert!(path.exists(), "tui-console.log created under overridden home");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("INFO hello from the tui"),
+            "ANSI stripped, payload present; got: {:?}",
+            content
+        );
+        assert!(!content.contains('\x1b'), "no escape bytes in the file");
+
+        reset_tui_console_handle_for_test();
+    }
+
+    #[test]
+    fn ansi_stripping_removes_csi_sequences() {
+        assert_eq!(strip_ansi(b"plain line\n").as_ref(), b"plain line\n".as_ref());
+        assert_eq!(
+            strip_ansi(b"\x1b[1;31mred\x1b[0m tail").as_ref(),
+            b"red tail".as_ref()
+        );
+        assert_eq!(
+            strip_ansi(b"\x1b[2Kcleared").as_ref(),
+            b"cleared".as_ref()
+        );
+        // A lone ESC that isn't a CSI start is preserved.
+        assert_eq!(strip_ansi(b"a\x1bb").as_ref(), b"a\x1bb".as_ref());
     }
 }
