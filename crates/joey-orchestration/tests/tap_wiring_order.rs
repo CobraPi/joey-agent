@@ -404,8 +404,8 @@ async fn global_tap_installed_after_control_sees_all_delegation_events() {
 /// shadowed by the recorder — a global tap installed later still resolves.
 #[test]
 fn control_recorder_does_not_shadow_external_tap_resolution() {
-    let mgr = SubagentManager::new(ManagerConfig::default());
-    let _control = SubagentControl::new(Arc::new(mgr.clone()));
+    let mgr = Arc::new(SubagentManager::new(ManagerConfig::default()));
+    let _control = SubagentControl::new(mgr.clone());
     // Pre-fix: the recorder sat in the LOCAL tap slot, so event_tap()
     // returned it (or None-forwarded) and a later global tap never resolved.
     assert!(
@@ -438,7 +438,7 @@ async fn local_tap_installed_after_control_still_receives_events() {
     let ctx = ToolContext::new(std::env::temp_dir(), Config::defaults(), "wiring-local");
     let delegate = DelegateTask::new(
         mgr.clone(),
-        agent_config(base),
+        agent_config(base.clone()),
         Config::defaults(),
         ToolRegistry::new(),
         None,
@@ -451,7 +451,7 @@ async fn local_tap_installed_after_control_still_receives_events() {
 
     // Blocking dispatch through the real manager plumbing.
     let req = DelegationRequest::single("local-order-target");
-    let cfg = agent_config("http://unused".to_string());
+    let cfg = agent_config(base);
     let result = mgr
         .dispatch_single(&req, &cfg, &Config::defaults(), &ToolRegistry::new(), None)
         .await;

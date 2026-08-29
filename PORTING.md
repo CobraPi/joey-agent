@@ -1270,3 +1270,98 @@ in-memory session-lifetime — no SQLite/on-disk format changes.
 Documented deviation: the line REPL cannot be idle-woken (reedline owns
 stdin synchronously), so notices there arrive at the next interaction
 instead of proactively.
+
+## NeuroCode RAG — semantic code retrieval (feature 021, 2026-08-28)
+
+**Status**: Deliberate-deviation subsystem (Joey-original, no upstream
+equivalent — this is a Joey-side extension, not upstream parity work;
+upstream Hermes has no RAG/semantic-search surface).
+
+`joey-neurocode-rag` is a new library crate (`crates/joey-neurocode-rag/`,
+Constitution I) layering local-first semantic retrieval over the existing
+`joey-neurocode` graph: hybrid dense+FTS5/BM25 search fused client-side via
+Reciprocal Rank Fusion (k=60, exact-symbol-first guarantee), symbol-aligned
+chunks with fallback coarse chunks from the parse layer (line-span extension,
+byte→line conversion at index time), fast incremental background re-indexing
+(mtime + SHA-256 change detection, git-CLI rename assist) with a single-
+transaction atomic snapshot swap, clamped context expansion, bounded-depth
+relationship expansion over the typed graph edges, and consent-gated remote
+embedding backends (OpenAI-compatible + Ollama) for otherwise-local projects.
+Module map: `config` (18 `neurocode.rag.*` keys), `consent` (per-project
+`consent.json` state machine beside `graph.db`), `parity`
+(byte-identical-when-disabled guard), `embed` (profiles, artifact integrity,
+LocalOnnx primary, HTTP secondaries), `index` (chunker, incremental, refresh
+worker), `search` (hybrid, rrf, expand), `vector` (BLOB store, scan, int8
+quantization). Surfaces: `/neurocode search|model|consent|status` in joey-cli,
+symbol-aligned vs fallback-chunk badges in joey-tui, the `neurocode_search`
+agent tool in joey-tools (registered only when `neurocode.rag.enabled`), and
+background refresh/prefetch wiring in joey-agent-core.
+
+**On-disk format**: `joey-neurocode`'s per-project `graph.db` migrates
+additively v2→v3 (`NEUROCODE_SCHEMA_VERSION = 3`; tables `rag_chunks`,
+`rag_vectors`, `rag_index_meta`, `rag_chunk_edges`, `rag_model_artifacts`;
+idempotent, v2 databases open unchanged and simply gain empty RAG tables —
+keyword/graph behavior is untouched until RAG is enabled). No joey-core
+`state.db` / SCHEMA_VERSION change.
+
+**Deliberate deviation — three pinned dependencies, no vendored binaries.**
+`ort =2.0.0-rc.13` (exact pin: pre-release with per-RC breaking changes;
+`default-features=false` + `ndarray` + `load-dynamic`), `tokenizers 0.23`
+(`default-features=false`), `ndarray 0.17`. With `load-dynamic` the ONNX
+Runtime dylib (~10–31 MB per platform) is loaded at RUNTIME — never embedded
+in or vendored with the binary (Constitution Principle 0; no new build-time
+C/C++ dependency) — resolving through the ladder
+`neurocode.rag.local.ort_dylib_path` → `ORT_DYLIB_PATH` env → system lookup
+→ fetched copy (`/neurocode model fetch --dylib`, SHA-256-verified per
+platform against project-recorded hashes from the project mirror; manual
+placement works too). `tokenizers` is offline-only
+(`Tokenizer::from_file`, padded `encode_batch`; the crate never fetches);
+it keeps the `fancy-regex` feature — the pure-Rust regex engine 0.23
+requires — to avoid the onig C lib (documented in the crate's Cargo.toml).
+`ndarray` is pinned by ort rc.13's own tensor interop (mean pooling + L2).
+Full Principle VIII ledger with rejected alternatives (candle, rig, Python
+sidecar, HTTP-daemon primary): `specs/021-please-enhance-neurocode/
+research.md` R6.
+
+**Deliberate deviation — no Hugging Face model distribution.** Nothing in
+the feature ever contacts huggingface.co / hf.co (any subdomain) for model
+artifacts — the fetch path carries a hard structural host guard pinned by
+tests. Artifacts arrive by manual placement into
+`~/.joey/neurocode/models/<profile>/` or via `/neurocode model fetch` from
+`neurocode.rag.local.mirror_url`, a project-controlled mirror that is EMPTY
+by default (no auto-download ever), with every file SHA-256-verified against
+project-recorded hashes before landing on disk; the embedder refuses
+mismatching files (research.md R8).
+
+**Disabled state is byte-identical**: with `neurocode.rag.enabled = false`
+(the default) no `neurocode_search` tool is registered, `/neurocode status`
+output and session context are unchanged, and existing neurocode tools,
+tier routing, and staleness reporting keep byte-stable outputs (FR-009/
+SC-005 parity tests in `crates/joey-neurocode-rag/tests/`).
+
+Design trail: `specs/021-please-enhance-neurocode/`.
+
+**Deliberate deviation (2026-08-28, T049) — planned `joey-tools` →
+`joey-neurocode-rag` edge not built; RAG rides the backend-injection
+seam instead.** The plan's Structure Decision specified a one-way
+registration edge `joey-tools` → `joey-neurocode-rag`. Implemented
+reality: `joey-tools` has NO dependency on `joey-neurocode-rag`. Rationale
+(pinned in the `crates/joey-tools/src/tools/neurocode_tools.rs` header):
+the planned edge would have created a cycle — `joey-neurocode-rag` itself
+depends on `joey-tools` — and a direct edge would drag the pinned
+`ort`/`tokenizers`/`ndarray` heavy deps into `joey-tools`, one of the
+lowest, most widely depended-upon crates. Instead the existing
+`Arc<dyn NeuroCodeBackend>` engine-handle seam (already used for the
+structural neurocode tools because `joey-neurocode` depends on
+`joey-tools`) gained a `search` method, and the `neurocode_search` tool
+delegates through it. The actual dependents of `joey-neurocode-rag` are
+`joey-cli` (`neurocode_rag_wiring.rs` — `execute_rag_search`, the shared
+hybrid-search path behind `neurocode_wiring::EngineBackend`, plus the
+production `RagRefreshWorker`/`RagPrefetchSource` injection impls for
+joey-agent-core, which deliberately does not depend on the rag crate
+either) and `joey-tui` (`neurocode_search.rs` calls
+`joey_neurocode_rag::search::hybrid` directly). Behavior parity is
+preserved: tool registration stays explicit via
+`register_neurocode_rag_tools` in `joey_tools::builtins` (builtins.rs
+~83-88), gated so that `neurocode.rag.enabled = false` (the default)
+registers nothing.

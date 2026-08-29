@@ -73,3 +73,17 @@ pub fn register_neurocode_tools(
 ) {
     neurocode_tools::register_neurocode_tools(registry, backend);
 }
+
+/// Register the RAG `neurocode_search` tool (spec 021, T014), gated on
+/// `neurocode.rag.enabled`. When `rag_enabled` is false (the default)
+/// NOTHING is registered — the tool is absent from the registry entirely,
+/// not merely check()-disabled (FR-009 parity). The backend is the same
+/// `Arc<dyn NeuroCodeBackend>` the caller already threaded into
+/// [`register_neurocode_tools`].
+pub fn register_neurocode_rag_tools(
+    registry: &mut ToolRegistry,
+    rag_enabled: bool,
+    backend: Option<Arc<dyn NeuroCodeBackend>>,
+) {
+    neurocode_tools::register_neurocode_rag_tools(registry, rag_enabled, backend);
+}

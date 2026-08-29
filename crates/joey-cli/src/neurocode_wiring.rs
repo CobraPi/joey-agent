@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use joey_neurocode::{DefaultEngine, NeuroCodeCommands, NeuroCodeConfig, NeuroCodeEngine};
 use joey_tools::tools::neurocode_tools::NeuroCodeBackend;
+use serde_json::json;
 
 /// Build a NeuroCode engine from the current joey config, scoped to the given
 /// project root (the cwd for the interactive REPL and oneshot paths).
@@ -127,7 +128,18 @@ impl NeuroCodeBackend for EngineBackend {
     }
 
     fn status(&self) -> String {
-        self.engine.status_text()
+        // T034 (FR-013): when `neurocode.rag.enabled` the tool's status
+        // gains a rag section mirroring the CLI's; disabled stays
+        // byte-identical to `engine.status_text()`.
+        let mut out = self.engine.status_text();
+        let config = joey_core::Config::load().unwrap_or_else(|_| joey_core::Config::defaults());
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if let Some(section) =
+            crate::commands::neurocode::rag_status_section(&config, &project_root)
+        {
+            out.push_str(&section);
+        }
+        out
     }
 
     fn ingest(
@@ -143,6 +155,84 @@ impl NeuroCodeBackend for EngineBackend {
 
     fn is_active(&self) -> bool {
         self.engine.is_active()
+    }
+
+    fn search(
+        &self,
+        query: &str,
+        file_filter: Option<&str>,
+        limit: Option<usize>,
+        expand_lines: Option<usize>,
+        relation_depth: Option<usize>,
+    ) -> String {
+        // T041b: bridge to the SAME production rag search path the CLI
+        // uses (backend resolution + dense leg + FR-008 degradation), then
+        // render the contract-shaped tool payload (Principle II parity).
+        let config = joey_core::Config::load().unwrap_or_else(|_| joey_core::Config::defaults());
+        let rag = joey_neurocode_rag::config::RagConfig::load(&config);
+        let expand = rag.effective_context_window(
+            expand_lines.map(|l| l.min(u32::MAX as usize) as u32),
+        );
+        let request = joey_neurocode_rag::search::hybrid::SearchRequest {
+            query: query.to_string(),
+            file_filter: file_filter.map(str::to_string),
+            limit: limit.unwrap_or(rag.top_k.max(1) as usize).min(50),
+            expand_lines: expand,
+            relation_depth: relation_depth
+                .map(|d| d.clamp(0, 2) as u8)
+                .unwrap_or(0),
+            include_fallback_chunks: rag.include_fallback_chunks,
+        };
+        let project_root = self.engine_project_root();
+        match crate::neurocode_rag_wiring::execute_rag_search(&rag, &project_root, &request) {
+            Ok(outcome) => {
+                let results: Vec<serde_json::Value> = outcome
+                    .results
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "file": r.file,
+                            "symbol": r.symbol,
+                            "kind": r.symbol_kind,
+                            "lines": [r.start_line, r.end_line],
+                            "chunk_kind": r.chunk_kind.as_str(),
+                            "score": r.fused_score,
+                            "context": r.context,
+                            "relations": r.relations.iter().map(|rel| serde_json::json!({
+                                "file": rel.file,
+                                "symbol": rel.symbol,
+                                "relation_kind": rel.relation_kind,
+                            })).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                json!({
+                    "results": results,
+                    "mode": outcome.mode.as_str(),
+                    "mode_reason": outcome.mode_reason,
+                })
+                .to_string()
+            }
+            Err(e) => {
+                // Never a hard error (FR-008): validation/store failures
+                // degrade to the keyword_only contract shape with the
+                // reason surfaced.
+                json!({
+                    "results": [],
+                    "mode": "keyword_only",
+                    "mode_reason": format!("{e}"),
+                })
+                .to_string()
+            }
+        }
+    }
+}
+
+impl EngineBackend {
+    /// The engine's project root for RAG paths (the engine scopes itself
+    /// to the CWD project; same derivation the CLI uses).
+    fn engine_project_root(&self) -> PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 }
 
@@ -383,6 +473,80 @@ mod tests {
         assert!(
             !tier_text.contains("legacy-frontier"),
             "scoped tier text must not fall back to flat legacy keys, got: {tier_text}"
+        );
+    }
+
+    // ─── T041b: EngineBackend::search bridges to the real rag path ──────
+
+    /// `EngineBackend::search` returns REAL results from the
+    /// rag-populated index (not the old stub shape): a JSON payload whose
+    /// `results[]` rows carry the contract fields and whose `mode` is
+    /// keyword_only with a mode_reason on the no-model path.
+    #[test]
+    fn backend_search_returns_real_results_from_rag_index() {
+        let _g = crate::commands::neurocode::production_wiring_tests::pinned_home_for_wiring();
+        let project =
+            crate::commands::neurocode::production_wiring_tests::scratch_project_for_wiring();
+
+        // Point the process CWD at the project (the backend derives its
+        // root from CWD, exactly like the production engine scope).
+        // RAII restore — the CWD must return even on assertion panic, or
+        // sibling parallel tests that derive roots from CWD flake.
+        struct CwdGuard(Option<std::path::PathBuf>);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                if let Some(p) = self.0.take() {
+                    let _ = std::env::set_current_dir(p);
+                }
+            }
+        }
+        let _cwd = CwdGuard(std::env::current_dir().ok());
+        std::env::set_current_dir(project.path()).unwrap();
+
+        // RAG-enabled config the backend loads itself (Config::load reads
+        // JOEY_HOME's config.yaml). neurocode.enabled is required for the
+        // ENGINE to build; rag.enabled gates the RAG surfaces.
+        let home = std::env::var("JOEY_HOME").unwrap();
+        std::fs::write(
+            std::path::Path::new(&home).join("config.yaml"),
+            "neurocode:\n  enabled: true\n  rag:\n    enabled: true\n",
+        )
+        .unwrap();
+
+        // Populate the index through the same production path the CLI uses.
+        let config = joey_core::Config::load().unwrap_or_else(|_| joey_core::Config::defaults());
+        let _ = crate::neurocode_rag_wiring::rag_index_text(&config, project.path(), true);
+
+        let engine = crate::neurocode_wiring::try_build_engine_scoped(
+            &config,
+            "zai",
+        )
+        .unwrap();
+        let backend = crate::neurocode_wiring::backend_for_engine(&engine);
+
+        let out = backend.search("validate_token", None, None, None, None);
+        let payload: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("tool payload must be JSON ({e}): {out}"));
+        // NOT the stub shape: real rows with the contract fields.
+        let results = payload["results"].as_array().expect("results array");
+        assert!(
+            results
+                .iter()
+                .any(|r| r["file"] == "src/token.rs" && r["symbol"] == "validate_token"),
+            "real result rows with file+symbol: {out}"
+        );
+        assert!(
+            results.iter().all(|r| r.get("lines").is_some() && r.get("chunk_kind").is_some()),
+            "contract fields present: {out}"
+        );
+        assert_eq!(payload["mode"], "keyword_only", "no-model path mode: {out}");
+        assert!(
+            payload["mode_reason"].as_str().unwrap_or("").contains("keyword-only"),
+            "degradation reason present: {out}"
+        );
+        assert!(
+            !out.contains("keyword_hint"),
+            "the old stub marker must be gone: {out}"
         );
     }
 }

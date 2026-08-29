@@ -10,6 +10,7 @@ joey-core.workspace = true
 joey-omo.workspace = true
 joey-tools.workspace = true
 joey-neurocode.workspace = true
+joey-neurocode-rag.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true

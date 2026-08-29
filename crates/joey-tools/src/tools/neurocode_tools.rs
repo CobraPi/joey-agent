@@ -19,6 +19,11 @@ use serde_json::{json, Value};
 use crate::context::ToolContext;
 use crate::registry::{Tool, ToolResult};
 
+/// `neurocode_search.expand_lines` contract maximum
+/// (contracts/neurocode-rag-tools.md; = `neurocode.rag.context_window_lines`
+/// clamp max — T027 pins the plumbing end-to-end).
+const EXPAND_LINES_MAX: u64 = 200;
+
 /// Abstract backend the NeuroCode tools delegate to.
 ///
 /// Implemented by higher crates over their concrete engine handle
@@ -54,6 +59,20 @@ pub trait NeuroCodeBackend: Send + Sync {
         source_path: &str,
         version_tag: Option<&str>,
         provenance: &str,
+    ) -> String;
+
+    /// Semantic (RAG) search over the indexed project (spec 021 / T014).
+    ///
+    /// Returns the contract-shaped JSON payload (`results`, `mode`,
+    /// `mode_reason`) — never a bare error: backend failures degrade to
+    /// `keyword_only` with a `mode_reason` (FR-008).
+    fn search(
+        &self,
+        query: &str,
+        file_filter: Option<&str>,
+        limit: Option<usize>,
+        expand_lines: Option<usize>,
+        relation_depth: Option<usize>,
     ) -> String;
 
     /// Whether NeuroCode is active for the current session.
@@ -358,6 +377,119 @@ impl Tool for NeuroCodeIngest {
     }
 }
 
+// ─── neurocode_search ────────────────────────────────────────────────
+
+/// The `neurocode_search` tool — semantic (RAG) code search (spec 021, T014).
+///
+/// Registered ONLY when `neurocode.rag.enabled == true` via
+/// [`register_neurocode_rag_tools`] — absent from the registry otherwise
+/// (FR-009 parity: the model never sees it in disabled state).
+pub struct NeuroCodeSearch {
+    backend: Option<Arc<dyn NeuroCodeBackend>>,
+}
+
+impl NeuroCodeSearch {
+    /// The `neurocode_search` JSON schema, byte-exact per
+    /// specs/021-please-enhance-neurocode/contracts/neurocode-rag-tools.md.
+    pub fn contract_schema() -> Value {
+        json!({
+            "name": "neurocode_search",
+            "description": "Semantic code search over the indexed project: natural-language and exact-symbol queries return ranked code locations with surrounding context and optional related entities.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query":        { "type": "string",  "description": "Natural language and/or exact symbol names" },
+                    "file_filter":  { "type": "string",  "description": "Glob restricting results to matching file paths" },
+                    "limit":        { "type": "integer", "description": "Max results (default: neurocode.rag.top_k)", "maximum": 50 },
+                    "expand_lines": { "type": "integer", "description": "± context lines (default: neurocode.rag.context_window_lines)", "maximum": 200 },
+                    "relation_depth": { "type": "integer", "description": "Relationship expansion depth 0-2", "minimum": 0, "maximum": 2 }
+                },
+                "required": ["query"]
+            }
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for NeuroCodeSearch {
+    fn name(&self) -> &str {
+        "neurocode_search"
+    }
+
+    fn toolset(&self) -> &str {
+        "coding"
+    }
+
+    fn emoji(&self) -> &str {
+        "🔎"
+    }
+
+    fn description(&self) -> &str {
+        "Semantic code search over the indexed project: natural-language and \
+         exact-symbol queries return ranked code locations with surrounding \
+         context and optional related entities."
+    }
+
+    fn parameters(&self) -> Value {
+        Self::contract_schema()["parameters"].clone()
+    }
+
+    fn check(&self, _ctx: &ToolContext) -> bool {
+        backend_active(&self.backend)
+    }
+
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
+        let Some(backend) = &self.backend else {
+            return no_backend_error();
+        };
+        // query is required; whitespace-only is a validation error with a
+        // clear message and NO backend call (contract: Errors section).
+        let query = match args.get("query").and_then(|v| v.as_str()) {
+            Some(q) if !q.trim().is_empty() => q,
+            Some(_) => {
+                return ToolResult::Error(
+                    "query must not be empty or whitespace-only: provide a \
+                     natural-language phrase and/or exact symbol name to \
+                     search for."
+                        .to_string(),
+                )
+            }
+            None => {
+                return ToolResult::Error(
+                    "query is required: provide a natural-language phrase \
+                     and/or exact symbol name to search for."
+                        .to_string(),
+                )
+            }
+        };
+        let file_filter = args.get("file_filter").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+        // T027: clamp expand_lines to the contract maximum 200
+        // (contracts/neurocode-rag-tools.md `"maximum": 200`). A negative
+        // number fails `as_u64` and is treated as absent (the schema pins
+        // no minimum — the backend default,
+        // `neurocode.rag.context_window_lines`, applies); 0 is a valid
+        // in-range value and passes through.
+        let expand_lines = args
+            .get("expand_lines")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.min(EXPAND_LINES_MAX) as usize);
+        let relation_depth = args
+            .get("relation_depth")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        // Backend errors NEVER hard-fail the turn — the backend itself
+        // degrades to a keyword_only payload with mode_reason (FR-008).
+        ToolResult::Text(backend.search(
+            query,
+            file_filter,
+            limit,
+            expand_lines,
+            relation_depth,
+        ))
+    }
+}
+
 /// Register the four NeuroCode tools, each wired to `backend`.
 ///
 /// When `backend` is `None` the tools are registered but remain disabled
@@ -376,6 +508,23 @@ pub fn register_neurocode_tools(
         backend: backend.clone(),
     }));
     registry.register(Arc::new(NeuroCodeIngest { backend }));
+}
+
+/// Register the RAG `neurocode_search` tool, gated on `rag_enabled`
+/// (`neurocode.rag.enabled`, spec 021 / T014).
+///
+/// When `rag_enabled` is false (the default) NOTHING is registered — the
+/// tool is absent from the registry entirely, not merely check()-disabled
+/// (FR-009 parity: the model never sees it in disabled state).
+pub fn register_neurocode_rag_tools(
+    registry: &mut crate::registry::ToolRegistry,
+    rag_enabled: bool,
+    backend: Option<Arc<dyn NeuroCodeBackend>>,
+) {
+    if !rag_enabled {
+        return;
+    }
+    registry.register(Arc::new(NeuroCodeSearch { backend }));
 }
 
 #[cfg(test)]
@@ -409,6 +558,76 @@ mod tests {
         }
         fn is_active(&self) -> bool {
             true
+        }
+        fn search(
+            &self,
+            query: &str,
+            file_filter: Option<&str>,
+            limit: Option<usize>,
+            expand_lines: Option<usize>,
+            relation_depth: Option<usize>,
+        ) -> String {
+            json!({
+                "results": [{
+                    "file": "src/auth/token.rs",
+                    "symbol": query,
+                    "context": format!("search: {}", query)
+                }],
+                "mode": "hybrid",
+                "mode_reason": null,
+                "_args": {
+                    "file_filter": file_filter,
+                    "limit": limit,
+                    "expand_lines": expand_lines,
+                    "relation_depth": relation_depth
+                }
+            })
+            .to_string()
+        }
+    }
+
+    /// A mock backend whose search always degrades to keyword_only —
+    /// simulates backend unhealthiness (FR-008).
+    struct DegradedBackend;
+
+    impl NeuroCodeBackend for DegradedBackend {
+        fn index(&self, _path: &str, _force: bool) -> String {
+            "indexed".to_string()
+        }
+        fn query(&self, _query_type: &str, _symbol: &str, _limit: usize) -> String {
+            "query".to_string()
+        }
+        fn status(&self) -> String {
+            "status-ok".to_string()
+        }
+        fn ingest(
+            &self,
+            _category: &str,
+            _source_path: &str,
+            _version_tag: Option<&str>,
+            _provenance: &str,
+        ) -> String {
+            "ingested".to_string()
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+        fn search(
+            &self,
+            query: &str,
+            _file_filter: Option<&str>,
+            _limit: Option<usize>,
+            _expand_lines: Option<usize>,
+            _relation_depth: Option<usize>,
+        ) -> String {
+            // Contract-shaped degradation: keyword_only + mode_reason, empty
+            // results — never a hard error.
+            json!({
+                "results": [],
+                "mode": "keyword_only",
+                "mode_reason": format!("vector backend unreachable: query {:?} served by keyword fallback", query)
+            })
+            .to_string()
         }
     }
 
@@ -633,5 +852,199 @@ mod tests {
             let tool = reg.get(expected).unwrap();
             assert!(!tool.check(&c), "{} should be disabled", expected);
         }
+    }
+
+    // ── neurocode_search (spec 021, T014) ───────────────────────────
+
+    /// Schema pinned byte-for-byte against the contract JSON (contract
+    /// "Test obligations" #1): name, description, and parameters asserted
+    /// as comparable JSON values with exact equality.
+    #[test]
+    fn search_schema_pinned_to_contract() {
+        let contract = serde_json::from_str::<Value>(
+            r#"{
+              "name": "neurocode_search",
+              "description": "Semantic code search over the indexed project: natural-language and exact-symbol queries return ranked code locations with surrounding context and optional related entities.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "query":        { "type": "string",  "description": "Natural language and/or exact symbol names" },
+                  "file_filter":  { "type": "string",  "description": "Glob restricting results to matching file paths" },
+                  "limit":        { "type": "integer", "description": "Max results (default: neurocode.rag.top_k)", "maximum": 50 },
+                  "expand_lines": { "type": "integer", "description": "± context lines (default: neurocode.rag.context_window_lines)", "maximum": 200 },
+                  "relation_depth": { "type": "integer", "description": "Relationship expansion depth 0-2", "minimum": 0, "maximum": 2 }
+                },
+                "required": ["query"]
+              }
+            }"#,
+        )
+        .unwrap();
+        let tool = NeuroCodeSearch { backend: None };
+        let actual = json!({
+            "name": tool.name(),
+            "description": tool.description(),
+            "parameters": tool.parameters(),
+        });
+        assert_eq!(actual, contract, "neurocode_search schema must match contract byte-for-byte");
+        assert_eq!(NeuroCodeSearch::contract_schema(), contract);
+    }
+
+    /// FR-009 parity: rag disabled ⇒ registry lacks neurocode_search;
+    /// rag enabled ⇒ present (and coding-toolsetted).
+    #[test]
+    fn rag_registration_gated_on_flag() {
+        let mut reg = crate::registry::ToolRegistry::new();
+        register_neurocode_rag_tools(&mut reg, false, Some(mock_backend()));
+        assert!(
+            !reg.names().contains(&"neurocode_search".to_string()),
+            "rag disabled must leave neurocode_search ABSENT from the registry"
+        );
+
+        let mut reg = crate::registry::ToolRegistry::new();
+        register_neurocode_rag_tools(&mut reg, true, Some(mock_backend()));
+        assert!(reg.names().contains(&"neurocode_search".to_string()));
+        assert_eq!(reg.get("neurocode_search").unwrap().toolset(), "coding");
+    }
+
+    /// Whitespace-only/missing query → validation error, no backend call.
+    #[tokio::test]
+    async fn search_whitespace_query_errors() {
+        let c = ctx();
+        let tool = NeuroCodeSearch {
+            backend: Some(mock_backend()),
+        };
+        for args in [json!({}), json!({"query": ""}), json!({"query": "   \n\t "})] {
+            let r = tool.execute(args, &c).await;
+            assert!(r.is_error(), "whitespace/missing query must be a validation error");
+            let msg = r.to_content_string();
+            assert!(
+                msg.contains("query"),
+                "error must name the query field: {msg}"
+            );
+        }
+    }
+
+    /// FR-008: backend degradation yields the keyword_only payload shape
+    /// with mode_reason — never a hard error.
+    #[tokio::test]
+    async fn search_degraded_backend_yields_keyword_only_shape() {
+        let c = ctx();
+        let tool = NeuroCodeSearch {
+            backend: Some(Arc::new(DegradedBackend)),
+        };
+        let r = tool
+            .execute(json!({"query": "validate token", "relation_depth": 1}), &c)
+            .await;
+        assert!(!r.is_error(), "degraded backend must not hard-fail");
+        let payload: Value =
+            serde_json::from_str(&r.to_content_string()).expect("payload is valid JSON");
+        assert!(payload.get("results").is_some(), "results key present");
+        assert_eq!(payload["mode"], "keyword_only");
+        assert!(
+            payload["mode_reason"].is_string() && !payload["mode_reason"].as_str().unwrap().is_empty(),
+            "mode_reason must be a non-empty string"
+        );
+    }
+
+    /// Happy path: args threaded through to the backend, hybrid payload.
+    #[tokio::test]
+    async fn search_calls_backend_with_args() {
+        let c = ctx();
+        let tool = NeuroCodeSearch {
+            backend: Some(mock_backend()),
+        };
+        let r = tool
+            .execute(
+                json!({
+                    "query": "token validation",
+                    "file_filter": "src/**/*.rs",
+                    "limit": 10,
+                    "expand_lines": 40,
+                    "relation_depth": 2
+                }),
+                &c,
+            )
+            .await;
+        let payload: Value = serde_json::from_str(&r.to_content_string()).unwrap();
+        assert_eq!(payload["mode"], "hybrid");
+        assert_eq!(payload["_args"]["file_filter"], "src/**/*.rs");
+        assert_eq!(payload["_args"]["limit"], 10);
+        assert_eq!(payload["_args"]["expand_lines"], 40);
+        assert_eq!(payload["_args"]["relation_depth"], 2);
+    }
+
+    /// T027: the expand_lines parameter is plumbed from tool args through
+    /// the backend trait search call — value 0 is valid and passes through
+    /// verbatim (MockBackend echoes `_args`).
+    #[tokio::test]
+    async fn search_expand_lines_zero_passes_through() {
+        let c = ctx();
+        let tool = NeuroCodeSearch {
+            backend: Some(mock_backend()),
+        };
+        let r = tool
+            .execute(json!({"query": "q", "expand_lines": 0}), &c)
+            .await;
+        let payload: Value = serde_json::from_str(&r.to_content_string()).unwrap();
+        assert_eq!(payload["_args"]["expand_lines"], 0, "0 is a valid window");
+    }
+
+    /// T027: expand_lines > 200 is clamped AT THIS SURFACE per the
+    /// contract `"maximum": 200` (contracts/neurocode-rag-tools.md) —
+    /// the backend never sees an out-of-contract window.
+    #[tokio::test]
+    async fn search_expand_lines_above_200_clamps_at_tool_surface() {
+        let c = ctx();
+        let tool = NeuroCodeSearch {
+            backend: Some(mock_backend()),
+        };
+        for (input, expected) in [(201u64, 200u64), (250, 200), (9999, 200)] {
+            let r = tool
+                .execute(json!({"query": "q", "expand_lines": input}), &c)
+                .await;
+            let payload: Value = serde_json::from_str(&r.to_content_string()).unwrap();
+            assert_eq!(
+                payload["_args"]["expand_lines"], expected,
+                "expand_lines {input} must clamp to {expected} at the tool surface"
+            );
+        }
+        // The boundary itself passes through untouched.
+        let r = tool
+            .execute(json!({"query": "q", "expand_lines": 200}), &c)
+            .await;
+        let payload: Value = serde_json::from_str(&r.to_content_string()).unwrap();
+        assert_eq!(payload["_args"]["expand_lines"], 200);
+    }
+
+    /// T027: a negative expand_lines fails `as_u64` and is treated as
+    /// absent — `None` reaches the backend so the
+    /// `neurocode.rag.context_window_lines` default applies downstream
+    /// (the schema declares no minimum; JSON Schema integers are unbounded
+    /// below, so the pass-through is the permissive default).
+    #[tokio::test]
+    async fn search_expand_lines_negative_is_treated_as_absent() {
+        let c = ctx();
+        let tool = NeuroCodeSearch {
+            backend: Some(mock_backend()),
+        };
+        let r = tool
+            .execute(json!({"query": "q", "expand_lines": -5}), &c)
+            .await;
+        let payload: Value = serde_json::from_str(&r.to_content_string()).unwrap();
+        assert!(
+            payload["_args"]["expand_lines"].is_null(),
+            "negative expand_lines → None (config default applies downstream)"
+        );
+    }
+
+    /// check() gating mirrors the sibling tools.
+    #[test]
+    fn search_check_gates_on_backend() {
+        let c = ctx();
+        assert!(!NeuroCodeSearch { backend: None }.check(&c));
+        assert!(NeuroCodeSearch {
+            backend: Some(mock_backend())
+        }
+        .check(&c));
     }
 }

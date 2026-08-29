@@ -485,10 +485,12 @@ mod tests {
         // Cursor-up + show-cursor junk around real text.
         i.insert_str("\x1b[2Atext\x1b[?25h");
         assert_eq!(i.text(), "text");
-        // Erase-display and SGR sequences interleaved with text.
+        // Erase-display and SGR sequences interleaved with text. Strip-only:
+        // the sequences are dropped but NEVER consume adjacent literal text
+        // (the doubled "bb" pins that the final byte 'K' doesn't over-consume).
         i.clear();
         i.insert_str("a\x1b[2Kbb\x1b[0m\x1b[3;4Hc");
-        assert_eq!(i.text(), "abc");
+        assert_eq!(i.text(), "abbc");
         // CSI with sub-parameter colons and private-mode '?' prefix.
         i.clear();
         i.insert_str("\x1b[38:2:255:0:0mred\x1b[?1049h!");

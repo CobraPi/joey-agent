@@ -150,6 +150,7 @@ first turns are preserved verbatim, and archived rows remain searchable in `stat
 | `neurocode_query` | Query the NeuroCode graph: `dependencies`, `dependents`, or FTS symbol search. Enabled-only, like all NeuroCode tools |
 | `neurocode_status` | Engine status overview: enabled state, index size, tiers, patterns, domain sources |
 | `neurocode_ingest` | Ingest a domain-knowledge source (file or directory) into the graph's FTS registry |
+| `neurocode_search` | Semantic (RAG) code search: natural-language and exact-symbol queries return hybrid dense+BM25 ranked code locations with surrounding context and optional related entities. Registered only when `neurocode.rag.enabled = true` (absent from the registry otherwise, not merely disabled) |
 
 Tools are grouped into toolsets (`file`, `terminal`, `web`, `coding`, `joey-cli`, …) and
 resolved exactly like upstream, including recursive `includes`. `PreToolUse` hooks can
@@ -168,6 +169,7 @@ State lives under `~/.joey/` (override with `JOEY_HOME`):
 ~/.joey/skills/         installed Agent Skills (20 skills ship in-repo)
 ~/.joey/cron/jobs.json  scheduled jobs (hermes-compatible format)
 ~/.joey/neurocode/      per-project NeuroCode graph databases (when enabled)
+~/.joey/neurocode/models/  RAG embedding model artifacts (model.onnx + tokenizer.json)
 ~/.joey/logs/           size-rotated, secret-redacted logs
 ```
 
@@ -411,12 +413,71 @@ globally without affecting Rust/Python/JS projects.
 - Full design trail, constitution compliance, and every dependency decision:
   `specs/015-neurocode-enterprise-java/` (spec, plan, contracts, quickstart).
 
+### Semantic code search (RAG)
+
+`crates/joey-neurocode-rag/` (feature 021 — joey-native, like the rest of NeuroCode)
+layers local-first semantic retrieval over the graph: natural-language queries whose
+wording never appears in the code ("where is token validation handled") return ranked
+code locations — file, symbol, kind, line range — fused from a dense embedding leg and
+the existing FTS5/BM25 keyword leg via Reciprocal Rank Fusion (k=60, exact-symbol
+matches pinned first). Chunks are symbol-aligned from the parse layer with fallback
+coarse chunks for top-level code; results carry clamped surrounding-line context and
+optionally related entities (bounded-depth edge expansion). Re-indexing is incremental
+(mtime walk + SHA-256 confirmation, git rename assist) and swaps atomically in one
+SQLite transaction so searches never see torn state. **Off by default**
+(`neurocode.rag.enabled = false`), byte-identical when disabled — with RAG enabled but
+no model artifacts present, search degrades to keyword-only with an explicit
+`mode_reason`, never an implicit network call.
+
+The primary embedding backend is fully local: in-process ONNX inference via `ort`
+with a **runtime-loaded** ONNX Runtime dylib, plus offline tokenization. Optional
+OpenAI-compatible and Ollama HTTP backends exist for remote use, gated behind
+per-project recorded, revocable consent (`/neurocode consent show|ack|revoke`;
+loopback URLs are consent-free). Surfaces: `/neurocode search <query...>
+[--path] [--limit] [--expand-lines] [--relations 0-2] [--json]` and
+`/neurocode model fetch [<profile>] [--dylib]` in the CLI/TUI, the
+`neurocode_search` agent tool, and a rag section in `/neurocode status` (only when
+enabled — never present-but-empty).
+
+**Dependencies (three pinned, `crates/joey-neurocode-rag/Cargo.toml`):**
+
+- `ort =2.0.0-rc.13` (`default-features=false`, features `ndarray`, `load-dynamic`)
+  — exact pin (pre-release with per-RC breaking changes). `load-dynamic` means the
+  ONNX Runtime dylib (~10–31 MB per platform) is loaded at runtime and **never
+  embedded or vendored in the binary** — no vendored binaries, no new build-time
+  C/C++ dependency. The dylib resolves through the ladder
+  `neurocode.rag.local.ort_dylib_path` → `ORT_DYLIB_PATH` env → system lookup →
+  fetched copy, and can be fetched once via `/neurocode model fetch --dylib` from
+  the project mirror (SHA-256-verified per platform) or placed manually.
+- `tokenizers 0.23` (`default-features=false`) — offline `tokenizer.json` loading +
+  padded `encode_batch`; the crate never fetches anything from the network.
+  (Deviation from plain `default-features=false`: the `fancy-regex` feature is kept
+  — the pure-Rust regex engine tokenizers 0.23 requires — avoiding the onig C lib;
+  documented in the Cargo.toml.)
+- `ndarray 0.17` — tensor interop matching ort rc.13 (tensors pass straight into
+  `session.run`; used for mean pooling + L2 normalization).
+
+**No Hugging Face — model distribution policy.** Joey never contacts huggingface.co
+(or hf.co, any subdomain) for model artifacts: the fetch path carries a hard
+structural host guard. Model files arrive by (a) manual placement into
+`~/.joey/neurocode/models/<profile>/` from any source you're permitted to use, or
+(b) `/neurocode model fetch`, which downloads only from
+`neurocode.rag.local.mirror_url` — a project-controlled mirror that is **empty by
+default = no auto-download ever** — and verifies every file's SHA-256 against
+project-recorded hashes before anything lands on disk (a tampered mirror cannot
+poison the index). Both bundled profiles are permissively licensed
+(nomic-embed-text-v1.5 Apache-2.0, CodeRankEmbed MIT), so project re-hosting is
+lawful with attribution preserved.
+
+Design trail: `specs/021-please-enhance-neurocode/` (research.md R6 dependency
+ledger, R8 no-HF policy).
+
 ## Architecture
 
-A Cargo workspace of 14 crates. The first eight are direct ports of Hermes Agent
-modules; the remaining six (`joey-tui`, `joey-llm-selector`, `joey-orchestration`,
-`joey-omo`, `joey-speckit-ui`, `joey-neurocode`) are joey-native additions layered
-on top, not described by the upstream Python project:
+A Cargo workspace of 15 crates. The first eight are direct ports of Hermes Agent
+modules; the remaining seven (`joey-tui`, `joey-llm-selector`, `joey-orchestration`,
+`joey-omo`, `joey-speckit-ui`, `joey-neurocode`, `joey-neurocode-rag`) are joey-native
+additions layered on top, not described by the upstream Python project:
 
 | Crate | Ports | Responsibility |
 |-------|-------|----------------|
@@ -434,6 +495,7 @@ on top, not described by the upstream Python project:
 | `joey-omo` | — (joey-native) | "Oh My OpenAgent": 11-agent persona registry, category/subagent routing, Atlas plan execution, intent gating (ultrawork/hyperplan/team), goals, team mode |
 | `joey-speckit-ui` | — (joey-native) | Standalone HTTP+WebSocket backend for the SpecKit Visual UI (`specs/<feature>/{spec,plan,tasks}.md`); run separately with `cargo run -p joey-speckit-ui`, not embedded in the `joey` binary |
 | `joey-neurocode` | — (joey-native) | NeuroCode engine for enterprise codebases: complexity-tier routing, tree-sitter multi-language structural dependency graph in SQLite+FTS5 (all tree-sitter-supported languages; Pega-tuned for Java), dependency-aware context assembly, Pega rule awareness, verify-loop pattern memory. Consumed by `joey-agent-core` via the narrow `NeuroCodeEngine` trait; see the [NeuroCode](#neurocode-enterprise-java--pega-coding) section |
+| `joey-neurocode-rag` | — (joey-native) | Semantic code retrieval (RAG) layered over the NeuroCode graph: local ONNX embedding (runtime-loaded ORT dylib, offline tokenizers), hybrid dense+BM25 RRF search, incremental atomic re-indexing, consent-gated remote backends. Extends the graph store to schema v3 (`rag_*` tables); see the [Semantic code search (RAG)](#semantic-code-search-rag) section |
 
 `joey-tui`, `joey-llm-selector`, `joey-orchestration`, and `joey-omo` are all wired
 into the live `joey` binary (REPL, one-shot, and cron paths); `joey-neurocode` is

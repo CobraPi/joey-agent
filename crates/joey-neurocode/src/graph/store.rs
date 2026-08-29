@@ -88,6 +88,99 @@ impl GraphStore {
             }
         })?;
 
+        // v2 → v3 additive migration (spec 021, contracts/rag-store-schema.md):
+        // the RAG store. Pure `CREATE ... IF NOT EXISTS` — an existing v2 DB
+        // opens unchanged and simply gains empty RAG tables; re-running the
+        // migration is a no-op. DDL is mirrored verbatim from the contract.
+        //
+        // Chunk registry (both kinds; symbol fields NULL for fallback chunks)
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS rag_chunks (
+                chunk_id     TEXT PRIMARY KEY,
+                chunk_kind   TEXT NOT NULL CHECK (chunk_kind IN ('symbol','fallback')),
+                artifact_id  INTEGER REFERENCES code_artifacts(id) ON DELETE CASCADE,
+                source_path  TEXT NOT NULL,
+                start_line   INTEGER NOT NULL,
+                end_line     INTEGER NOT NULL,
+                language     TEXT,
+                symbol_name  TEXT,
+                symbol_kind  TEXT,
+                content_hash TEXT NOT NULL,
+                embed_model  TEXT,
+                embed_dim    INTEGER,
+                updated_at   TEXT              -- RFC 3339
+            );
+            CREATE INDEX IF NOT EXISTS rag_chunks_source_path ON rag_chunks(source_path);
+            CREATE INDEX IF NOT EXISTS rag_chunks_hash        ON rag_chunks(content_hash);
+            CREATE INDEX IF NOT EXISTS rag_chunks_artifact    ON rag_chunks(artifact_id);
+            "#,
+        )?;
+
+        // Dense vectors, 1:1 with chunks; purging a chunk cascades here
+        // (FR-005: no orphan vectors).
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS rag_vectors (
+                chunk_id     TEXT PRIMARY KEY
+                             REFERENCES rag_chunks(chunk_id) ON DELETE CASCADE,
+                dim          INTEGER NOT NULL,
+                quantization TEXT NOT NULL CHECK (quantization IN ('f32','int8')),
+                vector       BLOB NOT NULL
+            );
+            "#,
+        )?;
+
+        // Singleton index descriptor (id = 1 enforced by CHECK); pins the
+        // embedding profile in force so a config change is detectable.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS rag_index_meta (
+                id                  INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_version      INTEGER NOT NULL,
+                embed_profile       TEXT,
+                embed_model         TEXT,
+                embed_dim           INTEGER,
+                pooling             TEXT,             -- 'mean' | 'last_token'
+                prefix_query        TEXT,
+                prefix_document     TEXT,
+                quantization_policy TEXT,
+                chunk_count         INTEGER NOT NULL DEFAULT 0,
+                last_refresh_at     TEXT,
+                refresh_state       TEXT NOT NULL DEFAULT 'idle'
+                                    CHECK (refresh_state IN ('idle','refreshing')),
+                created_at          TEXT NOT NULL
+            );
+            "#,
+        )?;
+
+        // Artifact integrity for local-ONNX profiles (one row per profile)
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS rag_model_artifacts (
+                profile          TEXT PRIMARY KEY,
+                model_sha256     TEXT NOT NULL,
+                tokenizer_sha256 TEXT NOT NULL,
+                model_size_bytes INTEGER NOT NULL,
+                fetched_at       TEXT NOT NULL,       -- RFC 3339
+                mirror_url_used  TEXT                 -- NULL for manual placement
+            );
+            "#,
+        )?;
+
+        // Derived chunk-level edges (rebuildable; typed graph stays
+        // authoritative — no FK by design, cleanup is index-time logic).
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS rag_chunk_edges (
+                from_chunk_id TEXT NOT NULL,
+                to_chunk_id   TEXT NOT NULL,
+                edge_kind     TEXT NOT NULL,
+                PRIMARY KEY (from_chunk_id, to_chunk_id, edge_kind)
+            );
+            "#,
+        )?;
+
         // graph_edges
         conn.execute_batch(
             r#"

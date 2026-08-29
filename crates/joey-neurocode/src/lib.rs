@@ -54,4 +54,9 @@ pub use verify::runner::VerifyStep;
 /// v2: additive `signature` column on `code_artifacts` (declaration headers
 /// for methods/fields, surfaced in assembled context). v1 databases migrate
 /// in place on open; rows keep NULL signatures until re-indexed.
-pub const NEUROCODE_SCHEMA_VERSION: u32 = 2;
+/// v3: additive RAG tables (`rag_chunks`, `rag_vectors`, `rag_index_meta`,
+/// `rag_model_artifacts`, `rag_chunk_edges`) per spec 021
+/// (contracts/rag-store-schema.md). v2 databases migrate in place on open
+/// and simply gain empty RAG tables; keyword/graph behavior is unchanged
+/// until RAG is enabled.
+pub const NEUROCODE_SCHEMA_VERSION: u32 = 3;

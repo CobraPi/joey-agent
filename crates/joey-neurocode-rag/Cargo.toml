@@ -1,0 +1,57 @@
+[package]
+name = "joey-neurocode-rag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# --- Workspace path deps (sibling-crate pattern, cf. crates/joey-omo/Cargo.toml) ---
+joey-core.workspace = true
+joey-neurocode.workspace = true
+joey-tools.workspace = true
+
+# --- New pinned dependencies (specs/021-please-enhance-neurocode/research.md R6,
+# --- Principle VIII dependency ledger; justification recorded there) ---
+# ort: ONNX Runtime wrapper — in-process local inference, the R2 PRIMARY embedding
+# backend. EXACT pin `=2.0.0-rc.13` because it is a pre-release with per-RC
+# breaking changes. default-features=false + `load-dynamic`: the ONNX Runtime
+# dylib (~10-31 MB per platform) is loaded at RUNTIME via ORT_DYLIB_PATH /
+# neurocode.rag.local.ort_dylib_path — never embedded or vendored (Constitution
+# Principle 0; no new build-time C/C++ dep). Wrapper adds ~1-2 MB.
+# License: MIT OR Apache-2.0. Alternatives rejected in R6: candle (would require
+# hand-writing nomic's custom BERT + RoPE), HTTP-daemon primary (user direction),
+# rig (full LLM framework for one call).
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "load-dynamic"] }
+# tokenizers: offline `tokenizer.json` loading + padded `encode_batch(texts, true)`
+# (0.23 API confirmed in R6). default-features=false avoids the onig C lib and
+# hf-hub — the crate NEVER fetches (no-Hugging-Fetch policy, R8). The explicit
+# pure-Rust `fancy-regex` feature supplies the required regex engine (0.23
+# compile-errors without one of onig/fancy-regex; fancy-regex keeps us C-free).
+# Apache-2.0.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+# ndarray 0.17: tensor interop matching ort rc.13 — tensors pass straight into
+# `session.run` via the ort `ndarray` feature. No alternative: pinned by ort's
+# own interop version.
+ndarray = "0.17"
+
+# --- Existing workspace dependencies (research.md R6: everything else needed is
+# --- already a workspace dependency; listed here once so later tasks never
+# --- touch this file again) ---
+anyhow.workspace = true
+# async-trait: `EmbeddingBackend` is a dyn-compatible async trait (contract
+# pins `#[async_trait]`; T010). Workspace dep, MIT/Apache-2.0, no transitive
+# cost beyond the macro.
+async-trait.workspace = true
+chrono.workspace = true
+rayon.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+walkdir.workspace = true
+which.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

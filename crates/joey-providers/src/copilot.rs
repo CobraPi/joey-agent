@@ -659,6 +659,29 @@ static CATALOG_CACHE: Mutex<Option<(Vec<Value>, std::time::Instant)>> =
     Mutex::new(None);
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// Test-only: take the current catalog-cache entry (leaving it empty) so a
+/// test can assert on fetch behavior for a SPECIFIC endpoint from a cold
+/// cache. The cache is keyed by time only — NOT by endpoint — so without
+/// this, a sibling test in the same process that fetched through a
+/// different (reachable) proxy would serve a warm entry to a test whose
+/// own endpoint is deliberately unreachable. Pair with
+/// [`restore_catalog_cache_for_tests`].
+#[doc(hidden)]
+pub fn take_catalog_cache_for_tests() -> Option<(Vec<Value>, std::time::Instant)> {
+    CATALOG_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// Test-only counterpart to [`take_catalog_cache_for_tests`]: put the saved
+/// entry back so sibling tests observe the cache state they would have
+/// seen anyway.
+#[doc(hidden)]
+pub fn restore_catalog_cache_for_tests(saved: Option<(Vec<Value>, std::time::Instant)>) {
+    *CATALOG_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = saved;
+}
+
 /// Peek at the cached catalog WITHOUT fetching. Returns the cached entries
 /// regardless of TTL (a slightly-stale endpoint list is still a better
 /// routing signal than none) or an empty vec when never fetched.

@@ -757,9 +757,17 @@ mod tests {
         let _g = TestEnvGuard::new();
         std::env::remove_var("COPILOT_API_BASE_URL");
         std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:1");
+        // The catalog cache is process-global and NOT keyed by endpoint: a
+        // sibling test that ran against a REACHABLE HUD proxy (e.g. the
+        // developer's real one on 127.0.0.1:8317 — magnetization tests only
+        // resolve the provider name, but engine wiring may fetch) leaves a
+        // warm entry our unreachable-endpoint assert would be served from.
+        // Take it cold, restore the sibling's entry after.
+        let saved_cache = joey_providers::copilot::take_catalog_cache_for_tests();
         // is_copilot_wire dispatch — unreachable endpoint yields an empty
         // pool, not a panic or a models.dev lookup.
         let pool = fetch_candidate_pool("ai-usage-hud");
+        joey_providers::copilot::restore_catalog_cache_for_tests(saved_cache);
         assert!(pool.is_empty());
         std::env::remove_var("AI_USAGE_HUD_BASE_URL");
     }

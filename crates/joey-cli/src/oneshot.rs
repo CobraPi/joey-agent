@@ -274,7 +274,12 @@ async fn run_agent(
     );
     if let Some(engine) = &neurocode_engine {
         let backend = crate::neurocode_wiring::backend_for_engine(engine);
-        joey_tools::builtins::register_neurocode_tools(&mut registry, Some(backend));
+        joey_tools::builtins::register_neurocode_tools(&mut registry, Some(backend.clone()));
+        // Spec 021 (T014): register neurocode_search only when
+        // neurocode.rag.enabled — absent from the registry otherwise
+        // (FR-009 parity). Default false preserves pre-spec behavior.
+        let rag_enabled = config.get_bool("neurocode.rag.enabled", false);
+        joey_tools::builtins::register_neurocode_rag_tools(&mut registry, rag_enabled, Some(backend));
     }
 
     joey_orchestration::register_orchestration_with_allocator(
@@ -304,6 +309,11 @@ async fn run_agent(
     if let Some(engine) = neurocode_engine {
         agent.set_neurocode_engine(engine);
     }
+
+    // Spec 021 (T041b): production RAG refresh worker + pre-fetch source
+    // (adapters over the rag crate) when `neurocode.rag.enabled` — the
+    // default-off gate preserves zero-change parity (FR-009).
+    crate::neurocode_rag_wiring::install_rag_injections(&mut agent, config);
 
     if !agent.client().has_credentials() {
         anyhow::bail!(

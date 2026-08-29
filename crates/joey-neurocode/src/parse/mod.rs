@@ -21,6 +21,7 @@ pub mod pega;
 pub mod python;
 pub mod registry;
 pub mod rustlang;
+pub mod spans;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

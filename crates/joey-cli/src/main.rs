@@ -13,6 +13,7 @@ mod engine;
 mod history;
 mod hypercode;
 mod llm_selector;
+mod neurocode_rag_wiring;
 mod neurocode_wiring;
 mod slash_menu;
 mod auth_cmd;

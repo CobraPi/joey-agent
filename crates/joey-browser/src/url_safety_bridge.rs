@@ -62,9 +62,16 @@ pub fn url_safety_check(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// The bridge's `INSTALLED` is process-global state; tests that touch it
+    /// (or rely on the default) must not interleave. Serializes
+    /// `default_blocks_local_and_private` against `injected_check_is_used_then_restored`.
+    static BRIDGE_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_blocks_local_and_private() {
+        let _guard = BRIDGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(url_safety_check("http://127.0.0.1:8080/").is_err());
         assert!(url_safety_check("http://localhost/x").is_err());
         assert!(url_safety_check("http://192.168.1.1/").is_err());
@@ -76,6 +83,7 @@ mod tests {
 
     #[test]
     fn default_allows_public() {
+        let _guard = BRIDGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(url_safety_check("https://example.com/").is_ok());
         assert!(url_safety_check("https://portal.pega.com/").is_ok());
         // 172.32+ is public space — must NOT be blocked by the 172.16/31 rule.
@@ -85,6 +93,8 @@ mod tests {
     #[test]
     fn injected_check_is_used_then_restored() {
         use std::sync::atomic::Ordering;
+
+        let _guard = BRIDGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         static CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         fn mark_called(_u: &str) -> Result<(), String> {

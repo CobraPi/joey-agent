@@ -929,13 +929,24 @@ fn item_lines(item: &TranscriptItem, content_w: usize, theme: Theme) -> Vec<Line
                 NoticeKind::Success => theme.success,
                 NoticeKind::Busy => theme.busy,
             };
-            lines.push(Line::from(vec![
-                Span::styled("  · ", Style::default().fg(col.to_color())),
-                Span::styled(
+            let mut spans = vec![Span::styled("  · ", Style::default().fg(col.to_color()))];
+            // T043 (FR-010 + Constitution II): /neurocode search results
+            // arrive as one Notice per output line (joey-cli's
+            // HeavyJobFinished dump). Lines the CLI search renderer could
+            // have produced are re-rendered through the styled RAG view
+            // (FR-014 badge colors, result_line layout, FR-008 banner
+            // colors); every other notice keeps the exact plain rendering
+            // (byte-identical, round-trip-guarded — see
+            // neurocode_search::styled_notice_spans).
+            let body = match crate::neurocode_search::styled_notice_spans(text, theme) {
+                Some(styled) => styled,
+                None => vec![Span::styled(
                     one_line(text, content_w.saturating_sub(4)),
                     Style::default().fg(theme.fg_more_subtle.to_color()),
-                ),
-            ]));
+                )],
+            };
+            spans.extend(body);
+            lines.push(Line::from(spans));
             // Feature 013 (T006): uniform trailing blank separator (FR-001).
             lines.push(Line::from(vec![Span::raw("")]));
         }

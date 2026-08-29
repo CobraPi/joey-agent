@@ -377,13 +377,15 @@ fn rail_anchors_to_far_left_of_body() {
     assert_eq!(rx, 0, "rail rect starts at the body's column 0");
     assert_eq!(rw, 19, "collapsed rail is 19 cols");
     assert!(rh > 0);
-    // Title + tab rects sit inside the left-anchored strip.
+    // Title + tab rects sit inside the left-anchored strip. The strip's
+    // only border is on its RIGHT (the separator to the transcript), so
+    // the inner area starts AT column 0 — no left border to skip.
     let (tx, ty, tw, th) = a.last_subagent_rail_title_rect.get();
-    assert_eq!(tx, rx + 1, "title starts inside the rail (after its inner edge)");
+    assert_eq!(tx, rx, "title starts at the rail's inner left edge (right-only border)");
     assert_eq!(tw, 18);
     assert!(th > 0 && ty >= ry);
     let tab = a.last_subagent_tab_rects.borrow()[0];
-    assert_eq!(tab.0, rx + 1, "tab rows start at the rail's inner left edge");
+    assert_eq!(tab.0, rx, "tab rows start at the rail's inner left edge");
     // Main transcript begins after the rail's right border.
     let (mx, _, mw, _) = a.last_text_area.get();
     assert!(mx >= rx + rw, "main transcript starts after the rail");

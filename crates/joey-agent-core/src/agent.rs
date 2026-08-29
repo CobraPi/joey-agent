@@ -43,6 +43,198 @@ pub fn format_steer_marker(steer_text: &str) -> String {
     format!("\n\n{STEER_MARKER_OPEN}\n{steer_text}\n{STEER_MARKER_CLOSE}")
 }
 
+
+// ─── Feature 021 — neurocode.rag.* config key literals (T050) ───────────────
+//
+// `joey-agent-core` deliberately does NOT depend on `joey-neurocode-rag`
+// (keeps the workspace DAG lean; see RagGate docs above). The
+// `neurocode.rag.*` dotted paths used at the gate/refresh call sites below
+// therefore live here as PUBLIC consts so the cross-crate test
+// (`tests/rag_config_key_parity.rs`) can pin them verbatim against the
+// canonical `RagConfig` key table (`joey_neurocode_rag::config::
+// RAG_CONFIG_KEYS`, contracts/rag-config-keys.md). If either side drifts,
+// that test fails — the literals can no longer silently diverge from the
+// keys `RagConfig::load` actually reads.
+pub mod rag_keys {
+    /// Master switch (default `false`).
+    pub const ENABLED: &str = "neurocode.rag.enabled";
+    /// Pre-fetch opt-in (default `false`).
+    pub const PREFETCH_ENABLED: &str = "neurocode.rag.prefetch.enabled";
+    /// Backend selection (default `auto`).
+    pub const BACKEND: &str = "neurocode.rag.backend";
+    /// Embedding service base URL (default loopback).
+    pub const BASE_URL: &str = "neurocode.rag.base_url";
+    /// Embedding model profile name.
+    pub const MODEL: &str = "neurocode.rag.model";
+    /// Local ONNX model artifacts directory (empty = profile-scoped default).
+    pub const LOCAL_MODEL_DIR: &str = "neurocode.rag.local.model_dir";
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Feature 021 — NeuroCode RAG: background refresh worker wiring (T025) and
+// the pre-fetch gate (T033). Both are additive and gated on
+// `neurocode.rag.enabled` (default false): with the gate closed, agent
+// behavior is byte-identical to pre-enhancement (FR-009/SC-005,
+// Constitution VII).
+//
+// The refresh implementation lands in the `joey-neurocode-rag` crate
+// (`index/refresh_worker.rs`, T024: one refresh = one transaction writing
+// chunks + vectors + edges + `rag_index_meta`; COMMIT is the swap point).
+// The traits below are the minimal injection seams it plugs into — the
+// agent owns the gating, the fire-and-forget spawn, and the observable
+// state; the worker owns the refresh itself.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Observable phase of the RAG background refresh (T025, FR-004). The
+/// status surface (T034) reads this via [`Agent::rag_refresh_state`].
+///
+/// Mirrors the `rag_index_meta.refresh_state` lifecycle
+/// (idle → refreshing → idle): the agent-side phase is set when the
+/// background task starts and cleared when it finishes, so status
+/// reporting never needs to open the store mid-refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RagRefreshPhase {
+    /// No refresh running (the last committed snapshot is current).
+    #[default]
+    Idle,
+    /// A refresh is running in the background; `files_done`/`files_total`
+    /// expose cold-index progress (edge case 5: the first full index of a
+    /// large repository stays observable and never blocks the agent).
+    Refreshing {
+        files_done: usize,
+        files_total: usize,
+    },
+}
+
+/// What one RAG background refresh did — the agent-side projection of the
+/// rag crate's `RefreshOutcome` (fields mirrored so T024's worker adapts
+/// with a trivial conversion).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RagRefreshSummary {
+    pub files_indexed: usize,
+    pub files_reindexed: usize,
+    pub files_purged: usize,
+    pub files_renamed: usize,
+    pub chunks_embedded: usize,
+    pub chunks_skipped: usize,
+}
+
+/// Injection point for the RAG background refresh worker (T025 wiring).
+///
+/// `run_refresh` is BLOCKING and runs inside `tokio::task::spawn_blocking`;
+/// the agent turn NEVER awaits it (fire-and-forget, one refresh in flight
+/// at a time). `progress(files_done, files_total)` is invoked as work
+/// completes so cold-index progress stays observable (edge case 5).
+pub trait RagRefreshWorker: Send + Sync {
+    fn run_refresh(&self, progress: &dyn Fn(usize, usize)) -> Result<RagRefreshSummary, String>;
+}
+
+/// Per-turn RAG pre-fetch content source (T033, FR-015): given the current
+/// user prompt, produce the small context block to inject (e.g. a top
+/// symbols/files summary), or `None` to inject nothing this turn.
+///
+/// The agent owns the GATE; the source only supplies content. It is called
+/// ONLY when `neurocode.rag.enabled` + `neurocode.rag.prefetch.enabled`
+/// are set AND the backend is hard-verified local at runtime — anything
+/// else errors the pre-fetch OFF, never on (contracts/rag-config-keys.md
+/// `prefetch.enabled` row).
+pub trait RagPrefetchSource: Send + Sync {
+    fn prefetch_block(&self, user_prompt: &str) -> Option<String>;
+}
+
+/// Loopback check for `neurocode.rag.base_url` (the loopback default
+/// counts as fully local; the FR-012 consent gate shares the rule).
+fn is_loopback_base_url(base_url: &str) -> bool {
+    let rest = base_url.split_once("://").map(|(_, r)| r).unwrap_or(base_url);
+    let host = rest.split(|c| c == ':' || c == '/').next().unwrap_or("").trim();
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host == "[::1]"
+        || host == "127.0.0.1"
+        || host.starts_with("127.")
+}
+
+/// Presence probe for the local ONNX artifact set (contracts/
+/// embedding-backend.md § Local Model Artifacts layout: `model.onnx` +
+/// `tokenizer.json`). Filesystem-only — no hashing, no dylib, no network.
+/// Used by the pre-fetch gate's `auto` resolution: with artifacts present,
+/// `auto` resolves the in-process `LocalOnnx` backend (local); absent
+/// artifacts degrade the backend to keyword-only, which injects nothing
+/// (spec edge case: "pre-fetch enabled but backend degraded ⇒ nothing
+/// injected").
+fn rag_local_artifacts_present(model_dir: &std::path::Path) -> bool {
+    model_dir.join("model.onnx").is_file() && model_dir.join("tokenizer.json").is_file()
+}
+
+/// Resolved `neurocode.rag.*` gate inputs (feature 021). Read via the
+/// ordinary dotted-path getters on the session's `ToolContext` config —
+/// no bespoke accessor (contracts/rag-config-keys.md § Rules). Defaults
+/// mirror the contract table exactly, so an unconfigured session gates
+/// everything OFF (FR-009/SC-005 byte-identical parity).
+#[derive(Debug, Clone, Copy)]
+struct RagGate {
+    /// `neurocode.rag.enabled` (default false) — master switch.
+    enabled: bool,
+    /// `neurocode.rag.prefetch.enabled` (default false) — pre-fetch opt-in.
+    prefetch_enabled: bool,
+    /// The backend is HARD-verified local at runtime: `local_onnx` /
+    /// `auto` with the model artifacts present (in-process embedder), or
+    /// an HTTP backend whose `base_url` is loopback. Anything else —
+    /// including a degraded `auto` (missing artifacts) — is NOT local.
+    backend_local: bool,
+}
+
+impl RagGate {
+    /// Read the gate inputs from a loaded [`Config`] via the plain
+    /// dotted-path getters. Backend resolution:
+    /// - `local_onnx` → local (in-process embedder);
+    /// - `auto` → local ONLY when the `local.model_dir` artifacts verify
+    ///   (missing artifacts degrade to keyword-only, which is not a
+    ///   local semantic backend);
+    /// - `openai_compat` / `ollama` → local only when `base_url` is
+    ///   loopback (the loopback default counts as fully local);
+    /// - unknown values fall back to `auto`'s rule (config-layer
+    ///   behavior: never a crash).
+    ///
+    /// `local.model_dir` honors a leading `~`; the default resolves
+    /// through `joey_home()` so profile scoping is honored (mirrors the
+    /// rag crate's `RagConfig::load`, whose types this crate
+    /// deliberately does not depend on).
+    fn from_config(cfg: &Config) -> Self {
+        let enabled = cfg.get_bool(rag_keys::ENABLED, false);
+        let prefetch_enabled = cfg.get_bool(rag_keys::PREFETCH_ENABLED, false);
+        let backend = cfg.get_str(rag_keys::BACKEND, "auto");
+        let backend_local = match backend.trim() {
+            "local_onnx" => true,
+            "openai_compat" | "ollama" => {
+                is_loopback_base_url(&cfg.get_str(rag_keys::BASE_URL, "http://localhost:11434"))
+            }
+            // "auto" and any unknown value (config-layer fallback).
+            _ => {
+                let model = cfg.get_str(rag_keys::MODEL, "nomic-embed-text-v1.5");
+                let raw_dir = cfg.get_str(rag_keys::LOCAL_MODEL_DIR, "");
+                let dir = if raw_dir.trim().is_empty() {
+                    joey_core::joey_home().join("neurocode").join("models").join(&model)
+                } else {
+                    std::path::PathBuf::from(shellexpand::tilde(raw_dir.trim()).to_string())
+                };
+                rag_local_artifacts_present(&dir)
+            }
+        };
+        Self { enabled, prefetch_enabled, backend_local }
+    }
+
+    /// Pre-fetch is armed ONLY when opted-in AND the backend is hard
+    /// verified local (FR-015; contracts/rag-config-keys.md
+    /// `prefetch.enabled` row). Not armed ⇒ no injection AND the
+    /// pre-fetch itself stays disabled — never an error surfaced to the
+    /// turn.
+    fn prefetch_armed(&self) -> bool {
+        self.enabled && self.prefetch_enabled && self.backend_local
+    }
+}
+
 /// Retry-After cap: 600s (conversation_loop.py:4309-4317, #26293).
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(600);
 
@@ -376,6 +568,24 @@ pub struct Agent {
     /// message's `content_parts` by `run_turn`, then cleared. Additive:
     /// None/empty → behavior identical to before.
     pending_images: std::sync::Mutex<Vec<String>>,
+    /// ── Feature 021 (NeuroCode RAG) — T025/T033 wiring ────────────────
+    /// Background refresh worker (T025). None when RAG is disabled
+    /// (default) — every refresh call site is a no-op then.
+    pub(crate) rag_refresh_worker: Option<Arc<dyn RagRefreshWorker>>,
+    /// Pre-fetch content source (T033). None ⇒ no injection ever.
+    pub(crate) rag_prefetch_source: Option<Arc<dyn RagPrefetchSource>>,
+    /// Observable refresh phase for status reporting (T034 surface):
+    /// idle → refreshing{progress} → idle. Shared with the detached
+    /// background task so `rag_refresh_state()` reads live progress.
+    pub(crate) rag_refresh_phase: Arc<std::sync::Mutex<RagRefreshPhase>>,
+    /// The one-refresh-in-flight guard: Some(handle) while a refresh task
+    /// is detached; cleared when it finishes (checked opportunistically).
+    pub(crate) rag_refresh_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The pre-fetch block injected into THIS turn's session context, if
+    /// any. Set by `apply_rag_prefetch` before model dispatch; cleared at
+    /// run_turn start and whenever the gate closes. Never mutated after
+    /// the request is built (T033).
+    pub(crate) rag_prefetch_context: std::sync::Mutex<Option<String>>,
 }
 
 impl Agent {
@@ -480,6 +690,11 @@ impl Agent {
             neurocode_context: std::sync::Mutex::new(None),
             neurocode_assembled_for: std::sync::Mutex::new(None),
             pending_images: std::sync::Mutex::new(Vec::new()),
+            rag_refresh_worker: None,
+            rag_prefetch_source: None,
+            rag_refresh_phase: Arc::new(std::sync::Mutex::new(RagRefreshPhase::Idle)),
+            rag_refresh_handle: std::sync::Mutex::new(None),
+            rag_prefetch_context: std::sync::Mutex::new(None),
         })
     }
 
@@ -815,6 +1030,18 @@ impl Agent {
                 }
             }
         }
+        // Feature 021 (NeuroCode RAG): the pre-fetch block for THIS turn
+        // (T033, FR-015) — present ONLY when the gate is armed (enabled +
+        // opted-in + hard-verified local backend). Never stashed when the
+        // gate is closed, so the prompt stays byte-identical (FR-009).
+        if let Ok(rag_guard) = self.rag_prefetch_context.lock() {
+            if let Some(block) = rag_guard.as_ref() {
+                if !block.is_empty() {
+                    combined.push_str("\n\n");
+                    combined.push_str(block);
+                }
+            }
+        }
         combined
     }
 
@@ -867,6 +1094,161 @@ impl Agent {
             Err(e) => {
                 tracing::warn!(target: "neurocode", "auto re-index task failed: {}", e);
             }
+        }
+    }
+
+    // ── Feature 021 (NeuroCode RAG): background refresh + pre-fetch ────
+
+    /// Observable RAG refresh state for status reporting (T025/FR-004,
+    /// consumed by the T034 surface): `Idle`, or `Refreshing` with live
+    /// `files_done`/`files_total` progress shared by the detached
+    /// background task (edge case 5: a cold-index full build stays
+    /// observable and never blocks the agent).
+    pub fn rag_refresh_state(&self) -> RagRefreshPhase {
+        *self
+            .rag_refresh_phase
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Install (or clear with `None`) the RAG background refresh worker
+    /// (T025 wiring). The worker's blocking `run_refresh` is only ever
+    /// invoked through [`Agent::rag_auto_refresh`]'s detached
+    /// `spawn_blocking` task — never awaited by a turn.
+    pub fn set_rag_refresh_worker(&mut self, worker: Option<Arc<dyn RagRefreshWorker>>) {
+        self.rag_refresh_worker = worker;
+    }
+
+    /// Install (or clear with `None`) the per-turn RAG pre-fetch content
+    /// source (T033 wiring). [`Agent::apply_rag_prefetch`] calls it ONLY
+    /// when the gate is armed (enabled + opted-in + hard-verified local
+    /// backend).
+    pub fn set_rag_prefetch_source(&mut self, source: Option<Arc<dyn RagPrefetchSource>>) {
+        self.rag_prefetch_source = source;
+    }
+
+    /// The pre-fetch block injected into the current turn's context, if
+    /// any (T033 observability for tests + status surfaces).
+    pub fn rag_prefetch_context(&self) -> Option<String> {
+        self.rag_prefetch_context
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Fire-and-forget RAG background refresh (T025, FR-004). Mirrors
+    /// [`Agent::neurocode_auto_reindex`]'s trigger decision — the same
+    /// NeuroCode engine thresholds/debounce (`is_active` +
+    /// `should_reindex`) decide WHEN — but detaches instead of awaiting:
+    /// the turn NEVER waits on the refresh (SC-004).
+    ///
+    /// Guarded on `neurocode.rag.enabled` and a wired worker; the
+    /// one-in-flight rule is enforced via `rag_refresh_handle`: if a
+    /// refresh is already running (or its handle has not been reaped
+    /// yet), this call is a no-op. The task updates the shared
+    /// [`RagRefreshPhase`] (idle → refreshing{progress} → idle) so
+    /// `rag_refresh_state()` observes live progress.
+    fn rag_auto_refresh(&self) {
+        if !self.ctx.config().get_bool(rag_keys::ENABLED, false) {
+            return;
+        }
+        let Some(worker) = self.rag_refresh_worker.clone() else {
+            return;
+        };
+        // Reuse the engine's threshold/debounce decision (the exact
+        // `neurocode_auto_reindex` trigger conditions).
+        let Some(engine) = &self.neurocode_engine else {
+            return;
+        };
+        if !engine.is_active() || !engine.should_reindex() {
+            return;
+        }
+        // One refresh in flight: opportunistically reap a finished
+        // handle; a live one aborts here.
+        {
+            let mut guard = self
+                .rag_refresh_handle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(handle) = guard.as_mut() {
+                if handle.is_finished() {
+                    *guard = None;
+                } else {
+                    return;
+                }
+            }
+        }
+        let phase = Arc::clone(&self.rag_refresh_phase);
+        *phase.lock().unwrap_or_else(|p| p.into_inner()) =
+            RagRefreshPhase::Refreshing { files_done: 0, files_total: 0 };
+        let handle = tokio::task::spawn_blocking(move || {
+            let progress = |done: usize, total: usize| {
+                *phase.lock().unwrap_or_else(|p| p.into_inner()) =
+                    RagRefreshPhase::Refreshing { files_done: done, files_total: total };
+            };
+            match worker.run_refresh(&progress) {
+                Ok(summary) => {
+                    tracing::info!(
+                        target: "neurocode_rag",
+                        files_indexed = summary.files_indexed,
+                        files_reindexed = summary.files_reindexed,
+                        files_purged = summary.files_purged,
+                        files_renamed = summary.files_renamed,
+                        chunks_embedded = summary.chunks_embedded,
+                        chunks_skipped = summary.chunks_skipped,
+                        "rag background refresh completed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(target: "neurocode_rag", "rag background refresh failed: {}", e);
+                    // The last consistent snapshot stays in place
+                    // (additive degradation — FR-004).
+                }
+            }
+            *phase.lock().unwrap_or_else(|p| p.into_inner()) = RagRefreshPhase::Idle;
+        });
+        *self
+            .rag_refresh_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(handle);
+    }
+
+    /// Per-turn RAG pre-fetch (T033, FR-015), called from
+    /// `build_request` before model dispatch. Gate: `neurocode.rag.enabled`
+    /// AND `neurocode.rag.prefetch.enabled` AND a hard-verified-local
+    /// backend — anything else injects NOTHING and keeps the pre-fetch
+    /// itself disabled-off (never an error surfaced to the turn; session
+    /// context byte-identical when off).
+    ///
+    /// When armed, the source's block for the current user prompt is
+    /// stashed into `rag_prefetch_context`, which
+    /// `effective_system_prompt` appends (cleared at `run_turn` start).
+    fn apply_rag_prefetch(&self) {
+        let gate = RagGate::from_config(self.ctx.config());
+        if !gate.prefetch_armed() {
+            // Gate closed ⇒ nothing stashed, whatever was there is gone.
+            if let Ok(mut ctx) = self.rag_prefetch_context.lock() {
+                *ctx = None;
+            }
+            return;
+        }
+        let Some(source) = &self.rag_prefetch_source else {
+            return;
+        };
+        let prompt = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.text_content())
+            .unwrap_or_default();
+        let block = if prompt.trim().is_empty() {
+            None
+        } else {
+            source.prefetch_block(&prompt)
+        };
+        if let Ok(mut ctx) = self.rag_prefetch_context.lock() {
+            *ctx = block.filter(|b| !b.trim().is_empty());
         }
     }
 
@@ -1330,6 +1712,11 @@ impl Agent {
         // classify the request's complexity, assemble dependency-aware context,
         // and prepend it. When None or inactive, byte-identical (FR-020).
         self.apply_neurocode_intercept(tx);
+
+        // Feature 021 (NeuroCode RAG): per-turn pre-fetch gate (T033,
+        // FR-015). Armed only when enabled + opted-in + hard-verified
+        // local backend; otherwise a complete no-op (byte-identical).
+        self.apply_rag_prefetch();
 
         // Feature 011: when a dynamic model allocator is wired and active,
         // resolve the main-turn model per-module. When None or inactive,
@@ -2121,6 +2508,12 @@ impl Agent {
         if let Ok(mut key) = self.neurocode_assembled_for.lock() {
             *key = None;
         }
+        // Feature 021: a new user turn discards the previous turn's RAG
+        // pre-fetch block — THIS turn's build_request re-gates and, if
+        // armed, re-fetches for the new prompt (T033).
+        if let Ok(mut block) = self.rag_prefetch_context.lock() {
+            *block = None;
+        }
         // A turn interrupted by a NEW USER MESSAGE drops pending steers —
         // they were meant for the interrupted turn's tool loop, which will
         // no longer happen (run_agent.py:2845-2851).
@@ -2219,6 +2612,10 @@ impl Agent {
         while api_calls < self.config.max_turns {
             if self.interrupted() {
                 self.close_interrupted_tool_sequence("");
+                // RAG fire-and-forget FIRST: the legacy re-index below resets
+                // the shared engine debounce (`note_reindexed`), so the RAG
+                // trigger must read the pre-reindex tracker state.
+                self.rag_auto_refresh();
                 self.neurocode_auto_reindex(&tx).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: final_text.clone(),
@@ -2311,6 +2708,7 @@ impl Agent {
                 Err(TurnAbort::Interrupted(text)) => {
                     self.drop_trailing_synthetic_scaffolding();
                     self.close_interrupted_tool_sequence(&text);
+                    self.rag_auto_refresh();
                     self.neurocode_auto_reindex(&tx).await;
                     let _ = tx.send(AgentEvent::Done {
                         final_text: text.clone(),
@@ -2324,6 +2722,7 @@ impl Agent {
                     // Keep the session resumable: append an assistant error
                     // message (conversation_loop.py:5775-5778).
                     self.push_message(Message::assistant(err.clone()), None);
+                    self.rag_auto_refresh();
                     self.neurocode_auto_reindex(&tx).await;
                     let _ = tx.send(AgentEvent::Failed(err));
                     return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: true };
@@ -2493,6 +2892,7 @@ impl Agent {
                 }
                 if batch_interrupted {
                     self.close_interrupted_tool_sequence("");
+                    self.rag_auto_refresh();
                     self.neurocode_auto_reindex(&tx).await;
                     let _ = tx.send(AgentEvent::Done {
                         final_text: final_text.clone(),
@@ -2554,6 +2954,7 @@ impl Agent {
                 let _ = tx.send(AgentEvent::Notice(
                     "Response remained truncated after 4 continuation attempts".to_string(),
                 ));
+                self.rag_auto_refresh();
                 self.neurocode_auto_reindex(&tx).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: partial.clone(),
@@ -2619,6 +3020,7 @@ impl Agent {
                     "❌ Model returned no content after all retries".to_string(),
                 ));
                 final_text = "(empty)".to_string();
+                self.rag_auto_refresh();
                 self.neurocode_auto_reindex(&tx).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: final_text.clone(),
@@ -2635,6 +3037,7 @@ impl Agent {
             let _ = tx.send(AgentEvent::AssistantMessage(final_text.clone()));
             // Live context view: the final assistant message is in history.
             self.emit_context_snapshot(&tx);
+            self.rag_auto_refresh();
             self.neurocode_auto_reindex(&tx).await;
             let _ = tx.send(AgentEvent::Done {
                 final_text: final_text.clone(),
@@ -2674,6 +3077,7 @@ impl Agent {
         } else {
             self.push_message(Message::assistant(summary.clone()), Some("stop"));
         }
+        self.rag_auto_refresh();
         self.neurocode_auto_reindex(&tx).await;
         let _ = tx.send(AgentEvent::AssistantMessage(summary.clone()));
         let _ = tx.send(AgentEvent::Done {
@@ -5801,6 +6205,518 @@ mod tests {
             "test-model",
             "pinned model wins — the accessor must not rewrite the user's choice"
         );
+    }
+
+    // ── Feature 021 (NeuroCode RAG) tests — T025/T033 ──────────────────
+
+    /// Build a fixture whose `ToolContext` config comes from YAML (the
+    /// `neurocode.rag.*` keys under test), sharing caller-provided home +
+    /// cwd paths so two agents can be compared byte-for-byte.
+    fn rag_agent_at(
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+        config: Config,
+        script: Vec<Result<NormalizedResponse, ProviderError>>,
+    ) -> (Agent, Arc<ScriptedTransport>) {
+        let ctx = ToolContext::new(cwd.to_path_buf(), config, "rag-test-session");
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let agent_cfg = AgentConfig {
+            model: "test-model".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: None,
+            max_turns: 10,
+            api_max_retries: 3,
+            tool_delay: 0.0,
+            reasoning: None,
+            enabled_tools: vec!["echo".to_string()],
+            max_tokens: None,
+            stream: false,
+            pass_session_id: false,
+            model_pinned: false,
+        };
+        let mut agent = Agent::new(agent_cfg, registry, ctx).expect("agent");
+        let transport = ScriptedTransport::new(script);
+        agent.set_transport_for_tests(transport.clone());
+        (agent, transport)
+    }
+
+    fn rag_yaml_config(home: &std::path::Path, yaml: &str) -> Config {
+        let path = home.join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        Config::load_from(path).unwrap()
+    }
+
+    /// A refresh worker that BLOCKS until the test releases it — the
+    /// controllable slow worker for in-flight assertions. The Receiver is
+    /// `Send` but not `Sync`, so it is wrapped in a `std::sync::Mutex` to
+    /// satisfy the `Sync` supertrait of `RagRefreshWorker`.
+    struct GatedRagWorker {
+        started: Arc<AtomicUsize>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl GatedRagWorker {
+        fn new() -> (Arc<Self>, std::sync::mpsc::Sender<()>) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (
+                Arc::new(Self {
+                    started: Arc::new(AtomicUsize::new(0)),
+                    release: std::sync::Mutex::new(rx),
+                }),
+                tx,
+            )
+        }
+    }
+
+    impl RagRefreshWorker for GatedRagWorker {
+        fn run_refresh(&self, _progress: &dyn Fn(usize, usize)) -> Result<RagRefreshSummary, String> {
+            self.started.fetch_add(1, AtomicOrdering::SeqCst);
+            // Blocks until released (or sender dropped); the lock guard is
+            // held for the duration, which is fine — nothing else locks it.
+            let _ = self
+                .release
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .recv();
+            Ok(RagRefreshSummary {
+                files_indexed: 3,
+                ..RagRefreshSummary::default()
+            })
+        }
+    }
+
+    /// A cold-index worker over a synthetic repo: counts real files under
+    /// `root`, reporting progress after each so the phase is observable
+    /// mid-flight (edge case 5).
+    struct FullIndexRagWorker {
+        root: std::path::PathBuf,
+        files_touched: Arc<AtomicUsize>,
+    }
+
+    impl RagRefreshWorker for FullIndexRagWorker {
+        fn run_refresh(&self, progress: &dyn Fn(usize, usize)) -> Result<RagRefreshSummary, String> {
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&self.root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect();
+            files.sort();
+            let total = files.len();
+            for (i, _f) in files.iter().enumerate() {
+                progress(i + 1, total);
+                self.files_touched.fetch_add(1, AtomicOrdering::SeqCst);
+                std::thread::sleep(Duration::from_millis(4));
+            }
+            Ok(RagRefreshSummary {
+                files_indexed: total,
+                ..RagRefreshSummary::default()
+            })
+        }
+    }
+
+    /// A pre-fetch source that always produces a deterministic block and
+    /// counts calls (so closed gates can be proven to never call it).
+    struct CountingPrefetchSource {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RagPrefetchSource for CountingPrefetchSource {
+        fn prefetch_block(&self, user_prompt: &str) -> Option<String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Some(format!("## RAG Pre-fetch\n\nrelevant-to: {user_prompt}"))
+        }
+    }
+
+    /// Engine + tiny thresholds, pre-armed with one recorded edit so
+    /// `should_reindex()` is true at the first turn end.
+    fn armed_auto_index_engine() -> Arc<AutoIndexEngine> {
+        let engine = Arc::new(AutoIndexEngine::new(&joey_neurocode::config::AutoIndexConfig {
+            enabled: true,
+            file_threshold: 1,
+            line_threshold: 1,
+            min_interval_secs: 0.0,
+        }));
+        joey_neurocode::NeuroCodeEngine::record_file_edit(&*engine, "src/lib.rs", 10, 5);
+        engine
+    }
+
+    fn wait_for_rag_idle(agent: &Agent, max_ms: u64) -> RagRefreshPhase {
+        let mut waited = 0u64;
+        loop {
+            let phase = agent.rag_refresh_state();
+            if phase == RagRefreshPhase::Idle || waited >= max_ms {
+                return phase;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            waited += 5;
+        }
+    }
+
+    /// T025: a turn completes unaffected while a refresh is in flight, the
+    /// one-in-flight guard holds across turns, and the phase transitions
+    /// idle → refreshing → idle.
+    #[tokio::test]
+    async fn rag_turn_completes_while_refresh_in_flight() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let config = rag_yaml_config(
+            home.path(),
+            "neurocode:\n  rag:\n    enabled: true\n",
+        );
+        let (mut agent, _transport) = rag_agent_at(
+            home.path(),
+            cwd.path(),
+            config,
+            vec![Ok(text_resp("done one")), Ok(text_resp("done two"))],
+        );
+        let (worker, release) = GatedRagWorker::new();
+        agent.set_rag_refresh_worker(Some(worker.clone()));
+        agent.set_neurocode_engine(armed_auto_index_engine());
+
+        // Turn 1: completes normally EVEN THOUGH the refresh it spawned is
+        // still blocking (fire-and-forget, SC-004).
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = agent.run_turn("hello", tx).await;
+        assert_eq!(result.final_text, "done one");
+        assert!(!result.fatal, "refresh in flight must never fail the turn");
+        assert_eq!(
+            worker.started.load(AtomicOrdering::SeqCst),
+            1,
+            "turn end spawned exactly one refresh"
+        );
+        assert_eq!(
+            agent.rag_refresh_state(),
+            RagRefreshPhase::Refreshing { files_done: 0, files_total: 0 },
+            "refresh observable as in-flight right after the turn"
+        );
+
+        // Turn 2 while the first refresh still blocks: the turn completes
+        // AND the one-in-flight guard prevents a second spawn.
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let result2 = agent.run_turn("again", tx2).await;
+        assert_eq!(result2.final_text, "done two");
+        assert_eq!(
+            worker.started.load(AtomicOrdering::SeqCst),
+            1,
+            "one refresh in flight — second trigger is a no-op"
+        );
+
+        // Release: refreshing → idle.
+        drop(release);
+        let final_phase = wait_for_rag_idle(&agent, 2000);
+        assert_eq!(final_phase, RagRefreshPhase::Idle, "phase returns to idle");
+        let _ = guard;
+    }
+
+    /// T025: cold-index observable progress — a full index of a synthetic
+    /// repo reports files_done/files_total through the shared phase while
+    /// it runs, never blocking the agent.
+    #[tokio::test]
+    async fn rag_cold_index_progress_observable() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        // Synthetic repo: 20 source files.
+        let repo = cwd.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for i in 0..20 {
+            std::fs::write(repo.join(format!("file_{:02}.rs", i)), "fn main() {}\n").unwrap();
+        }
+        let config = rag_yaml_config(
+            home.path(),
+            "neurocode:\n  rag:\n    enabled: true\n",
+        );
+        let (mut agent, _transport) = rag_agent_at(
+            home.path(),
+            cwd.path(),
+            config,
+            vec![Ok(text_resp("done"))],
+        );
+        let files_touched = Arc::new(AtomicUsize::new(0));
+        let worker = Arc::new(FullIndexRagWorker {
+            root: repo.clone(),
+            files_touched: files_touched.clone(),
+        });
+        agent.set_rag_refresh_worker(Some(worker));
+        agent.set_neurocode_engine(armed_auto_index_engine());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = agent.run_turn("cold start", tx).await;
+        assert_eq!(result.final_text, "done", "agent turn never blocks on the index");
+        assert!(!result.fatal);
+
+        // Observe progress mid-flight: poll until a Refreshing phase with
+        // files_total == 20 and files_done >= 1 shows up (or it finishes).
+        // The spawner writes a {0, 0} sentinel before the worker's first
+        // progress report lands — that sentinel is not a worker report, so
+        // the file-count pin only applies to real reports.
+        let mut saw_progress = false;
+        let mut waited = 0u64;
+        let mut phase = agent.rag_refresh_state();
+        while waited < 2000 {
+            phase = agent.rag_refresh_state();
+            if let RagRefreshPhase::Refreshing { files_done, files_total } = phase {
+                if files_total > 0 {
+                    assert_eq!(files_total, 20, "worker reports the true file count");
+                }
+                if files_done >= 1 {
+                    saw_progress = true;
+                }
+                if files_done == 20 {
+                    break;
+                }
+            }
+            if phase == RagRefreshPhase::Idle {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            waited += 2;
+        }
+        assert!(
+            saw_progress || phase == RagRefreshPhase::Idle,
+            "cold-index progress was observable (last phase: {phase:?})"
+        );
+        let final_phase = wait_for_rag_idle(&agent, 2000);
+        assert_eq!(final_phase, RagRefreshPhase::Idle);
+        assert_eq!(
+            files_touched.load(AtomicOrdering::SeqCst),
+            20,
+            "the worker indexed every synthetic file"
+        );
+        let _ = guard;
+    }
+
+    /// T025: with `neurocode.rag.enabled` at its default false, the
+    /// fire-and-forget refresh is a complete no-op — even with a worker
+    /// wired and the engine's thresholds crossed (FR-009 parity).
+    #[tokio::test]
+    async fn rag_disabled_default_never_refreshes() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut agent, _transport) = rag_agent_at(
+            home.path(),
+            cwd.path(),
+            Config::defaults(),
+            vec![Ok(text_resp("done"))],
+        );
+        let (worker, _release) = GatedRagWorker::new();
+        agent.set_rag_refresh_worker(Some(worker.clone()));
+        agent.set_neurocode_engine(armed_auto_index_engine());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = agent.run_turn("hello", tx).await;
+        assert_eq!(result.final_text, "done");
+        assert_eq!(worker.started.load(AtomicOrdering::SeqCst), 0, "gate closed: worker never runs");
+        assert_eq!(agent.rag_refresh_state(), RagRefreshPhase::Idle);
+        let _ = guard;
+    }
+
+    /// T033: pre-fetch injects ONLY when opted-in AND hard-verified local —
+    /// local_onnx and loopback HTTP backends both count as local.
+    #[tokio::test]
+    async fn rag_prefetch_injects_when_opted_in_and_local() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+
+        for backend_yaml in [
+            "    backend: local_onnx\n",
+            "    backend: openai_compat\n    base_url: \"http://localhost:11434\"\n",
+        ] {
+            let yaml = format!(
+                "neurocode:\n  rag:\n    enabled: true\n    prefetch:\n      enabled: true\n{backend_yaml}"
+            );
+            let config = rag_yaml_config(home.path(), &yaml);
+            let (mut agent, transport) = rag_agent_at(
+                home.path(),
+                cwd.path(),
+                config,
+                vec![Ok(text_resp("done"))],
+            );
+            let source = Arc::new(CountingPrefetchSource {
+                calls: Arc::new(AtomicUsize::new(0)),
+            });
+            agent.set_rag_prefetch_source(Some(source.clone()));
+
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let result = agent.run_turn("find the parser entry point", tx).await;
+            assert_eq!(result.final_text, "done");
+            assert_eq!(source.calls.load(AtomicOrdering::SeqCst), 1, "source called exactly once");
+            assert_eq!(
+                agent.rag_prefetch_context(),
+                Some("## RAG Pre-fetch\n\nrelevant-to: find the parser entry point".to_string()),
+                "block stashed for THIS turn's prompt ({backend_yaml:?})"
+            );
+            let system = transport.request(0).system.expect("system present");
+            assert!(
+                system.contains("## RAG Pre-fetch\n\nrelevant-to: find the parser entry point"),
+                "injected into the request system context ({backend_yaml:?})"
+            );
+        }
+        let _ = guard;
+    }
+
+    /// T033: `auto` backend is local ONLY when the model artifacts verify —
+    /// the hard runtime check, not a config-label trust.
+    #[tokio::test]
+    async fn rag_prefetch_auto_backend_hard_verifies_artifacts() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let model_dir = cwd.path().join("models").join("nomic-embed-text-v1.5");
+
+        // ── Artifacts ABSENT: degraded auto ⇒ NOT local ⇒ no injection.
+        let yaml = format!(
+            "neurocode:\n  rag:\n    enabled: true\n    prefetch:\n      enabled: true\n    backend: auto\n    local:\n      model_dir: {:?}\n",
+            model_dir.display().to_string()
+        );
+        let config = rag_yaml_config(home.path(), &yaml);
+        let (mut agent, _transport) =
+            rag_agent_at(home.path(), cwd.path(), config, vec![Ok(text_resp("done"))]);
+        let source = Arc::new(CountingPrefetchSource {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        agent.set_rag_prefetch_source(Some(source.clone()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _ = agent.run_turn("query", tx).await;
+        assert_eq!(
+            source.calls.load(AtomicOrdering::SeqCst),
+            0,
+            "degraded auto backend never invokes the source"
+        );
+        assert!(agent.rag_prefetch_context().is_none());
+
+        // ── Artifacts PRESENT: auto resolves local_onnx ⇒ injection armed.
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.onnx"), b"onnx").unwrap();
+        std::fs::write(model_dir.join("tokenizer.json"), b"{}").unwrap();
+        let config = rag_yaml_config(home.path(), &yaml);
+        let (mut agent, _transport) =
+            rag_agent_at(home.path(), cwd.path(), config, vec![Ok(text_resp("done"))]);
+        let source = Arc::new(CountingPrefetchSource {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        agent.set_rag_prefetch_source(Some(source.clone()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _ = agent.run_turn("query", tx).await;
+        assert_eq!(
+            source.calls.load(AtomicOrdering::SeqCst),
+            1,
+            "auto + verified artifacts arms the pre-fetch"
+        );
+        assert!(agent.rag_prefetch_context().is_some());
+        let _ = guard;
+    }
+
+    /// T033/FR-009: a non-local backend with pre-fetch ON injects nothing —
+    /// the gate errors the pre-fetch OFF, never on — and the request
+    /// context is BYTE-IDENTICAL to a no-rag baseline agent's.
+    #[tokio::test]
+    async fn rag_prefetch_nonlocal_backend_no_injection_byte_identical() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+
+        // Baseline: no rag keys at all (pre-enhancement behavior).
+        let (baseline_agent, baseline_transport) = rag_agent_at(
+            home.path(),
+            cwd.path(),
+            Config::defaults(),
+            vec![Ok(text_resp("done"))],
+        );
+        let mut baseline_agent = baseline_agent;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _ = baseline_agent.run_turn("find the parser entry point", tx).await;
+        let baseline_system = baseline_transport.request(0).system.clone().unwrap();
+
+        // Non-local backend + prefetch ON.
+        let config = rag_yaml_config(
+            home.path(),
+            "neurocode:\n  rag:\n    enabled: true\n    prefetch:\n      enabled: true\n    backend: openai_compat\n    base_url: \"https://embed.example.internal\"\n",
+        );
+        let (mut agent, transport) = rag_agent_at(
+            home.path(),
+            cwd.path(),
+            config,
+            vec![Ok(text_resp("done"))],
+        );
+        let source = Arc::new(CountingPrefetchSource {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        agent.set_rag_prefetch_source(Some(source.clone()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = agent.run_turn("find the parser entry point", tx).await;
+        assert_eq!(result.final_text, "done", "closed gate never errors the turn");
+        assert_eq!(source.calls.load(AtomicOrdering::SeqCst), 0, "source never called");
+        assert!(agent.rag_prefetch_context().is_none(), "nothing stashed");
+        let system = transport.request(0).system.clone().unwrap();
+        assert_eq!(
+            system, baseline_system,
+            "non-local backend: request context byte-identical to the no-rag baseline"
+        );
+        let _ = guard;
+    }
+
+    /// T033/FR-009/SC-005: pre-fetch OFF (or rag disabled, or opted-out)
+    /// leaves the request context BYTE-IDENTICAL to the no-rag baseline —
+    /// pinned against the same agent's build_request output.
+    #[tokio::test]
+    async fn rag_prefetch_off_context_byte_identical() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+
+        // Baseline: pre-enhancement (defaults, no rag keys).
+        let (mut baseline_agent, baseline_transport) = rag_agent_at(
+            home.path(),
+            cwd.path(),
+            Config::defaults(),
+            vec![Ok(text_resp("done"))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _ = baseline_agent.run_turn("refactor this module", tx).await;
+        let baseline_system = baseline_transport.request(0).system.clone().unwrap();
+
+        // Rag enabled but pre-fetch NOT opted in.
+        for yaml in [
+            "neurocode:\n  rag:\n    enabled: true\n",
+            // opted in but the master switch is off
+            "neurocode:\n  rag:\n    enabled: false\n    prefetch:\n      enabled: true\n    backend: local_onnx\n",
+        ] {
+            let config = rag_yaml_config(home.path(), yaml);
+            let (mut agent, transport) = rag_agent_at(
+                home.path(),
+                cwd.path(),
+                config,
+                vec![Ok(text_resp("done"))],
+            );
+            // A source that WOULD inject if the gate were open.
+            agent.set_rag_prefetch_source(Some(Arc::new(CountingPrefetchSource {
+                calls: Arc::new(AtomicUsize::new(0)),
+            })));
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let _ = agent.run_turn("refactor this module", tx).await;
+            assert!(agent.rag_prefetch_context().is_none(), "gate closed stashes nothing ({yaml:?})");
+            let system = transport.request(0).system.clone().unwrap();
+            assert_eq!(
+                system, baseline_system,
+                "context must be byte-identical with pre-fetch off ({yaml:?})"
+            );
+        }
+        let _ = guard;
     }
 
     mod steer_tests {

@@ -34,3 +34,8 @@ hex.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+# T050: cross-crate key-parity test only. A NORMAL dependency is deliberately
+# avoided so agent-core's build graph never pulls the rag crate's pinned
+# ort/tokenizers/ndarray deps; a dev-dependency is DAG-legal (rag's tree —
+# joey-core/joey-neurocode/joey-tools — never depends on agent-core).
+joey-neurocode-rag.workspace = true
