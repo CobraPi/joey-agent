@@ -60,11 +60,19 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
 - `delegate_task`: single or parallel-batch subagents with isolated
   contexts, per-task model/toolset/budget, concurrency limits.
   → [orchestration.md](orchestration.md)
-- **HyperCode** (`/hypercode run <goal>`): a plan → explore → build
-  pipeline of parallel subagents (Planner decomposes into disjoint
-  workstreams; read-only Explorers brief each stream; Implementors build
-  them in parallel) executed on the SAME `SubagentManager` as
-  `delegate_task` — every child gets a live TUI pane, rail tab, and
+- **HyperCode** (`/hypercode run <goal>`): a plan → explore → build →
+  final-gate pipeline of parallel subagents with execution-only
+  children: the orchestrator side does ALL thinking and dispatches
+  fully-specified briefs (exact file paths, exact edits, exact
+  commands, expected outcomes). Read-only Explorers answer factual
+  questions only (paths, line numbers, quotes, command output — no
+  analysis); Implementors execute their brief verbatim — stopping to
+  report what's missing rather than guessing — and verify with
+  targeted checks only (`cargo build/test -p <crate>`), never the full
+  suite; after all implementors finish, the orchestrator runs the full
+  test suite exactly once as a final gate, dispatches one fix round on
+  failures, then synthesizes. Executed on the SAME `SubagentManager`
+  as `delegate_task` — every child gets a live TUI pane, rail tab, and
   job-board row via the orchestration event tap. Runs on the engine
   actor (Ctrl-C interrupts children cooperatively; phase shown live on
   the ⚡ badge). Per-role model/reasoning/token/turn budgets via

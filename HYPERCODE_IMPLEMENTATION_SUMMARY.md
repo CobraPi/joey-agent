@@ -1,8 +1,13 @@
 # HyperCode — Native delegate_task Integration
 
-`/hypercode run <goal>` executes a **plan → explore → build** pipeline of
-parallel subagents through the same `SubagentManager` machinery that the
-`delegate_task` tool uses. Subagents integrate natively in the TUI:
+`/hypercode run <goal>` executes a **plan → explore → build → final
+gate** pipeline of parallel subagents through the same
+`SubagentManager` machinery that the `delegate_task` tool uses. The
+workflow is execution-only: the orchestrator does ALL thinking,
+planning, and inference, and dispatches fully-specified briefs (exact
+file paths, exact edits, exact commands, expected outcomes) — Explorer
+subagents answer factual questions only, and Implementor subagents
+execute their brief verbatim. Subagents integrate natively in the TUI:
 
 - Every child (planner / explorer / implementor) appears as a **live pane
   on the right rail** (click / Ctrl+P to focus, full transcript streaming)
@@ -17,12 +22,24 @@ parallel subagents through the same `SubagentManager` machinery that the
 1. **Plan** — one Planner subagent (read-only `file` toolset) decomposes
    the goal into 1..N disjoint workstreams inside a machine-parsed
    `<workstreams>` block. Skip by passing `--stream "a;b;c"`.
-2. **Explore** — N parallel Explorer subagents (read-only) produce a
-   self-contained implementation brief per workstream.
-3. **Build** — N parallel Implementor subagents implement their stream,
-   fed by the matching brief. Instructed to stay within their stream's
-   files (siblings run concurrently).
-4. **Synthesize** — per-stream reports merged into a final summary
+2. **Explore (facts only)** — N parallel Explorer subagents (read-only)
+   answer factual questions only (paths, line numbers, quotes, command
+   output — no analysis or recommendations). The orchestrator composes
+   each workstream's fully-specified brief (exact file paths, exact
+   edits, exact commands, expected outcomes) from those facts.
+3. **Build (execution-only)** — N parallel Implementor subagents
+   execute their brief verbatim; if a brief is ambiguous or incomplete
+   they stop and report what's missing rather than guessing. Instructed
+   to stay within their stream's files (siblings run concurrently).
+   Implementors verify with targeted checks for what they touched only
+   (e.g. `cargo build -p <crate>`, `cargo test -p <crate> [filter]`) —
+   never the full test suite.
+4. **Final gate** — after ALL implementors finish, the orchestrator
+   runs the project's full test suite exactly once (e.g. `cargo test
+   --workspace`). On failures it dispatches one final fix round
+   (implementors verify fixes with targeted checks), optionally
+   confirming once more with the full suite.
+5. **Synthesize** — per-stream reports merged into a final summary
    (in-memory; no extra LLM call).
 
 ## Execution model

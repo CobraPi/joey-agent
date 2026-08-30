@@ -1,0 +1,164 @@
+//! Runtime smoke test for the local ONNX embedding backend (real model).
+//!
+//! Complements the inline unit tests (which never execute a session) with a
+//! RUNTIME proof against the real artifacts: auto->LocalOnnx resolution,
+//! load, embed (query/document prefixes), dims=768, unit-norm, semantic
+//! sanity (matching pair > non-matching pair).
+//!
+//! SKIP POLICY (research.md R8 — no Hugging Face, no downloads, ever):
+//! AUTO-SKIPS (prints the documented reason, returns Ok) when no verified
+//! local model artifacts are present — same knob/pattern as
+//! `retrieval_quality.rs` (`JOEY_RAG_MODEL_DIR` override, else the
+//! default model dir, filesystem-only probe). It NEVER downloads and
+//! never contacts huggingface.co.
+//!
+//! Unlike the SC-001 benchmark this test is NOT `#[ignore]`d: with the
+//! model absent it skips cleanly, so it is safe in the default suite.
+//! Run with output:
+//!
+//! ```text
+//! cargo test -p joey-neurocode-rag --test local_model_smoke -- --nocapture
+//! ```
+
+use std::path::PathBuf;
+
+use joey_neurocode_rag::config::{default_model_dir, RagBackend, RagConfig};
+use joey_neurocode_rag::embed::artifacts::compute_hashes;
+use joey_neurocode_rag::embed::local_onnx::{
+    check_input_surface, LocalOnnx, LocalOnnxSettings,
+};
+use joey_neurocode_rag::embed::profiles::default_profile;
+use joey_neurocode_rag::embed::{resolve_kind, BackendKind};
+
+/// Explicit opt-in artifact directory override (same knob the T040 bench
+/// honors). Never required, never fetched from.
+const ENV_MODEL_DIR: &str = "JOEY_RAG_MODEL_DIR";
+
+/// The documented auto-skip reason.
+pub const SKIP_REASON_PREFIX: &str =
+    "SKIP (local_model_smoke): no verified local model artifacts";
+
+/// Filesystem-only artifact probe — same gate as `retrieval_quality.rs`.
+fn artifacts_available() -> Option<PathBuf> {
+    let dir = std::env::var(ENV_MODEL_DIR)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_model_dir(default_profile().name));
+    compute_hashes(&dir).ok().map(|_| dir)
+}
+
+/// L2 norm of a vector.
+fn l2_norm(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// Cosine similarity (inputs are unit-norm post-profile-L2, so this is a
+/// dot product; the explicit norm division keeps it honest anyway).
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    dot / (l2_norm(a) * l2_norm(b))
+}
+
+/// Surface matrix pinned at runtime: 3-input surface accepted (+true),
+/// unknown input rejected, missing required rejected.
+#[test]
+fn input_surface_matrix() {
+    assert_eq!(
+        check_input_surface(&["input_ids", "attention_mask", "token_type_ids"]).unwrap(),
+        true
+    );
+    assert_eq!(
+        check_input_surface(&["input_ids", "attention_mask"]).unwrap(),
+        false
+    );
+    assert!(check_input_surface(&["input_ids", "attention_mask", "weird_input"]).is_err());
+    assert!(check_input_surface(&["attention_mask", "token_type_ids"]).is_err());
+    assert!(check_input_surface(&[]).is_err());
+    eprintln!("[local_model_smoke] input_surface_matrix: reject/accept paths OK");
+}
+
+/// Runtime smoke: auto resolves LocalOnnx, load + embed with the nomic
+/// query/document prefixes, dims/normalization/semantic sanity. AUTO-SKIPS
+/// (never an error, never a download) when artifacts are absent.
+#[test]
+fn local_onnx_auto_resolution_and_embed_runtime() {
+    let Some(model_dir) = artifacts_available() else {
+        eprintln!(
+            "{SKIP_REASON_PREFIX} at {} — this test NEVER downloads and never \
+             contacts huggingface.co (research.md R8). Place model.onnx + \
+             tokenizer.json manually (or set {ENV_MODEL_DIR}) to execute.",
+            default_model_dir(default_profile().name).display()
+        );
+        return;
+    };
+
+    // (b) auto -> LocalOnnx resolution, exactly the config path's call.
+    let resolved = resolve_kind(
+        RagBackend::Auto,
+        default_profile().name,
+        &model_dir,
+    )
+    .unwrap_or_else(|e| panic!("resolve_kind(auto): {e}"));
+    eprintln!(
+        "[local_model_smoke] backend kind = {:?} (degradation_reason={:?})",
+        resolved.kind, resolved.degradation_reason
+    );
+    assert_eq!(
+        resolved.kind,
+        BackendKind::LocalOnnx,
+        "auto must resolve LocalOnnx when artifacts are present, not KeywordOnly"
+    );
+
+    // (c) load + embed through the public API.
+    let settings = LocalOnnxSettings {
+        model_dir: model_dir.clone(),
+        ort_dylib_path: String::new(), // env/system rungs of the dylib ladder
+        batch_size: 64,
+    };
+    let profile = default_profile();
+    let model = LocalOnnx::load(profile, &settings, None)
+        .unwrap_or_else(|e| panic!("load at {}: {e}", model_dir.display()));
+
+    let query = "how is retry backoff delay computed".to_string();
+    let doc_match = "def calculate_backoff_with_jitter(attempt, base_ms, cap_ms, seed):\n    exponent = min(attempt - 1, 16)\n    delay = base_ms * (2 ** exponent)".to_string();
+    let doc_other = "fn render_markdown_table(rows: &[Vec<String>]) -> String {\n    let mut out = String::new();".to_string();
+
+    let q = &model.embed_queries(&[query]).unwrap()[0];
+    let d = &model.embed_documents(&[doc_match, doc_other]).unwrap();
+
+    for (name, v) in [("query", q), ("doc_match", &d[0]), ("doc_other", &d[1])] {
+        assert_eq!(v.len(), profile.dim as usize, "{name}: dim mismatch");
+        let n = l2_norm(v);
+        eprintln!("[local_model_smoke] {name}: dim={} |v|={n:.6}", v.len());
+        assert!(
+            (n - 1.0).abs() < 1e-3,
+            "{name}: expected unit norm (profile l2_normalize), got {n}"
+        );
+    }
+
+    let sim_match = cosine(q, &d[0]);
+    let sim_other = cosine(q, &d[1]);
+    eprintln!(
+        "[local_model_smoke] cosine(matching)={sim_match:.4} cosine(non-matching)={sim_other:.4}"
+    );
+    assert!(
+        sim_match > sim_other,
+        "semantic sanity violated: matching {sim_match:.4} !> non-matching {sim_other:.4}"
+    );
+    assert!(
+        sim_match > 0.3,
+        "matching pair suspiciously cold: {sim_match:.4}"
+    );
+    eprintln!("[local_model_smoke] PASS: auto->LocalOnnx, dims, unit-norm, semantic ordering");
+}
+
+/// `RagConfig` sanity (always runs): the default backend key is `auto` and
+/// `model_dir` points at the profile dir the smoke test probes.
+#[test]
+fn default_config_points_at_auto_backend() {
+    let cfg = RagConfig::default();
+    assert_eq!(cfg.backend, RagBackend::Auto);
+    let _ = RagBackend::parse("auto"); // used above via resolve_kind
+    eprintln!("[local_model_smoke] default backend = auto, model_dir = {:?}", cfg.model_dir);
+}

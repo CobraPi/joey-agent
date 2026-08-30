@@ -85,7 +85,7 @@ impl HyperRole {
 
     /// Toolsets the role operates with. Explorer is READ-ONLY on files but
     /// has terminal (diagnostic commands for the orchestrator); Implementor
-    /// owns the write path plus verification builds/tests.
+    /// owns the write path plus targeted verification (scoped builds/tests).
     fn toolsets(self) -> &'static [&'static str] {
         match self {
             HyperRole::Explorer => &["file-read", "terminal", "web"],
@@ -103,24 +103,32 @@ impl HyperRole {
 
 /// Role directives injected as the child's extra instructions. Wording kept
 /// in joey-orchestration (not joey-cli) so the tool is self-contained.
-pub(crate) const EXPLORER_DIRECTIVE: &str = "\
-You are an EXPLORER subagent. Your parent orchestrator has NO tools — you are \
-its eyes and hands for everything read-only.\n\
-- Investigate code, docs, and the environment; run read-only/diagnostic \
-commands (rg, ls, git log/diff, cargo check, --help) and report ACTUAL output.\n\
-- NEVER modify, create, or delete files. Never run state-changing commands.\n\
-- Your final message is the orchestrator's ONLY source of truth: exact paths, \
-symbols, command output, risks. Answer precisely what was asked.\n\
-- Keep it under 600 tokens; lead with the answer, then evidence.";
+pub(crate) const EXPLORER_DIRECTIVE: &str = "You are the EXPLORER agent: read-only, facts only.\n\
+Answer ONLY the questions in your brief, with evidence: exact file\n\
+paths, line numbers, short verbatim quotes, and real command output. Run\n\
+read-only/diagnostic commands as needed (rg, ls, git log/diff, cargo\n\
+check, --help, version probes). NEVER modify anything. Do not analyze\n\
+beyond the questions asked and do not propose solutions, plans, or\n\
+recommendations — the orchestrator does all planning and interpretation.\n\
+If a question cannot be answered from the code, say so plainly and\n\
+report the closest evidence you found. Keep your final summary under\n\
+500 tokens.";
 
-pub(crate) const IMPLEMENTOR_DIRECTIVE: &str = "\
-You are an IMPLEMENTOR subagent. You own the write path for your assigned task.\n\
-- Edit files AND run the builds/tests/commands that verify your own work; \
-report the real verification result.\n\
-- Follow the brief exactly; if something is missing, make the smallest \
-reasonable decision and note it.\n\
-- Touch only the files in your assignment; siblings work in parallel.\n\
-- Report exactly what changed, file by file, plus verification. Under 500 tokens.";
+pub(crate) const IMPLEMENTOR_DIRECTIVE: &str = "You are the IMPLEMENTOR agent: execution only.\n\
+Follow the brief EXACTLY. It specifies the file paths, the precise\n\
+edits to make, and the commands to run; every planning and design\n\
+decision was already made by the orchestrator — do not make, revise, or\n\
+second-guess decisions. If the brief is ambiguous, incomplete, or\n\
+conflicts with what you find (missing file, code differs from the\n\
+description), STOP: make no changes beyond what is unambiguous and\n\
+report back exactly what is missing or contradictory. Never guess,\n\
+infer, or fill gaps with your own judgment. Verify with TARGETED checks\n\
+only — build the crates you touched (cargo build -p <crate>) and run\n\
+only the scoped tests that cover your changes (cargo test -p <crate>\n\
+[filter]). NEVER run the full test suite (cargo test --workspace) or\n\
+any broad test run: the orchestrator runs that once, after all\n\
+implementors finish. Report exactly what you changed, file by file, and\n\
+the real scoped check output. Keep your final summary under 500 tokens.";
 
 /// Resolve a DelegationRequest patch for a HyperCode role: toolsets, role
 /// config (model/turns/tokens/reasoning) unless the caller set explicit
@@ -283,11 +291,11 @@ impl Tool for DelegateTask {
                 "role": {
                     "type": "string",
                     "enum": ["explorer", "implementor"],
-                    "description": "HyperCode role routing. 'explorer' = read-only investigation (file-read + terminal + web; runs diagnostic commands on your behalf; NEVER writes). 'implementor' = writes files AND runs builds/tests to verify its own work. When set, the role's configured model/turns/tokens/reasoning (hypercode.explorer / hypercode.implementor in config) apply unless explicitly overridden here."
+                    "description": "HyperCode role routing. 'explorer' = read-only investigation (file-read + terminal + web; runs diagnostic commands on your behalf; NEVER writes). 'implementor' = writes files and runs ONLY the targeted checks specified in its brief (scoped builds/tests); the single full-suite run belongs to the orchestrator after all implementors finish. When set, the role's configured model/turns/tokens/reasoning (hypercode.explorer / hypercode.implementor in config) apply unless explicitly overridden here."
                 },
                 "context": {
                     "type": "string",
-                    "description": "Additional context to pass to the subagent. Include file paths, error messages, project structure, constraints. The subagent knows nothing about the parent conversation."
+                    "description": "Additional context to pass to the subagent. Include file paths, error messages, project structure, constraints. The subagent knows nothing about the parent conversation. Briefs must be fully self-contained execution orders — the orchestrator has already made every planning decision; include exact paths, exact changes, and exact commands so the subagent needs no inference."
                 },
                 "tasks": {
                     "type": "array",
@@ -298,7 +306,7 @@ impl Tool for DelegateTask {
                             "context": {"type": "string"},
                             "model": {"type": "string"},
                             "toolsets": {"type": "array", "items": {"type": "string"}},
-                            "role": {"type": "string", "enum": ["explorer", "implementor"], "description": "HyperCode role routing for this task: 'explorer' (read-only + diagnostic commands) or 'implementor' (writes + verifies). Applies the role's config and directive unless overridden per-task."}
+                            "role": {"type": "string", "enum": ["explorer", "implementor"], "description": "HyperCode role routing for this task: 'explorer' (read-only + diagnostic commands) or 'implementor' (writes + targeted checks only). Applies the role's config and directive unless overridden per-task."}
                         },
                         "required": ["goal"]
                     },

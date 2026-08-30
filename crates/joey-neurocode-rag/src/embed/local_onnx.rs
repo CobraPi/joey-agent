@@ -43,10 +43,49 @@ use crate::embed::profiles::EmbedProfile;
 /// dylib is configured — the second rung of the ladder.
 pub const ENV_ORT_DYLIB_PATH: &str = "ORT_DYLIB_PATH";
 
-/// Model input names this backend feeds (contract §1 pins the BERT-style
-/// two-input surface; a graph requiring anything else is refused at load).
+/// Model input names this backend feeds: `input_ids` and `attention_mask`
+/// are REQUIRED; `token_type_ids` is ACCEPTED-OPTIONAL (the official nomic
+/// `optimum` ONNX export carries it — BERT token-type-embeddings convention;
+/// it is fed zeros at inference, the single-segment identity). A graph
+/// requiring any other input is refused at load.
 const INPUT_IDS: &str = "input_ids";
 const ATTENTION_MASK: &str = "attention_mask";
+const TOKEN_TYPE_IDS: &str = "token_type_ids";
+
+/// Validate a graph's input surface (pure — testable without a session):
+/// `Ok(true)` when the optional `token_type_ids` input is present (the
+/// caller must feed it zeros shaped exactly like `input_ids`), `Ok(false)`
+/// for the plain two-input surface, `Err` naming the offending input when
+/// the surface is unsupported (`input_ids`/`attention_mask` missing or an
+/// unknown input present).
+///
+/// Public for the runtime smoke test (`tests/local_model_smoke.rs`) so the
+/// surface matrix can be pinned against the REAL loaded graph's input
+/// names, not just the inline unit tests.
+pub fn check_input_surface(names: &[&str]) -> Result<bool, String> {
+    let (mut has_ids, mut has_mask, mut has_token_types) = (false, false, false);
+    for name in names {
+        match *name {
+            INPUT_IDS => has_ids = true,
+            ATTENTION_MASK => has_mask = true,
+            TOKEN_TYPE_IDS => has_token_types = true,
+            other => {
+                return Err(format!(
+                    "graph input {:?} not supported (expected {{{}, {}}}, optional {{{}}})",
+                    other, INPUT_IDS, ATTENTION_MASK, TOKEN_TYPE_IDS
+                ));
+            }
+        }
+    }
+    if !has_ids || !has_mask {
+        return Err(format!(
+            "graph missing required input(s): input_ids={} attention_mask={} \
+             (expected {{{}, {}}}, optional {{{}}})",
+            has_ids, has_mask, INPUT_IDS, ATTENTION_MASK, TOKEN_TYPE_IDS
+        ));
+    }
+    Ok(has_token_types)
+}
 
 // ---------------------------------------------------------------------------
 // Error taxonomy
@@ -69,7 +108,8 @@ pub enum LocalOnnxError {
     /// rejected — tokenizer load failure.
     TokenizerLoad(String),
     /// `model.onnx` unloadable by ort, or the graph's input surface is not
-    /// `{input_ids, attention_mask}` — session load failure.
+    /// `{input_ids, attention_mask}` (+ optional `token_type_ids`) —
+    /// session load failure.
     SessionLoad(String),
     /// A batch inference failed at run time (tokenize/tensorize/run/extract).
     Inference(String),
@@ -293,6 +333,10 @@ pub struct LocalOnnx {
     /// First output name captured from the loaded graph (works for
     /// `last_hidden_state` and any other single-output export).
     output_name: String,
+    /// Cached at load time by [`check_input_surface`]: the graph carries a
+    /// `token_type_ids` input, so every run must feed it zeros shaped
+    /// exactly like `input_ids` (single-segment BERT convention).
+    has_token_type_ids: bool,
 }
 
 impl std::fmt::Debug for LocalOnnx {
@@ -302,6 +346,7 @@ impl std::fmt::Debug for LocalOnnx {
             .field("model_dir", &self.model_dir)
             .field("batch_size", &self.batch_size)
             .field("output_name", &self.output_name)
+            .field("has_token_type_ids", &self.has_token_type_ids)
             .finish_non_exhaustive()
     }
 }
@@ -318,7 +363,8 @@ impl LocalOnnx {
     /// 3. Offline tokenizer from `tokenizer.json` (padding to batch-longest
     ///    with the tokenizer's own pad/unk id; truncation to profile ctx).
     /// 4. ONNX session from `model.onnx`, input-surface-checked against
-    ///    `{input_ids, attention_mask}`.
+    ///    `{input_ids, attention_mask}` (+ optional `token_type_ids`,
+    ///    accepted and fed zeros — the official nomic optimum export).
     pub fn load(
         profile: &'static EmbedProfile,
         settings: &LocalOnnxSettings,
@@ -352,14 +398,9 @@ impl LocalOnnx {
             .map_err(|e| {
                 LocalOnnxError::SessionLoad(format!("{}: {}", model_path.display(), e))
             })?;
-        for input in session.inputs() {
-            if input.name() != INPUT_IDS && input.name() != ATTENTION_MASK {
-                return Err(LocalOnnxError::SessionLoad(format!(
-                    "graph input {:?} not supported (expected {{{}, {}}})",
-                    input.name(), INPUT_IDS, ATTENTION_MASK
-                )));
-            }
-        }
+        let input_names: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
+        let has_token_type_ids =
+            check_input_surface(&input_names).map_err(LocalOnnxError::SessionLoad)?;
         let output_name = session
             .outputs()
             .first()
@@ -373,6 +414,7 @@ impl LocalOnnx {
             tokenizer,
             session: Mutex::new(session),
             output_name,
+            has_token_type_ids,
         })
     }
 
@@ -469,12 +511,29 @@ impl LocalOnnx {
         // pool everything before releasing the guard.
         let pooled: Vec<Vec<f32>> = {
             let mut session = self.session.lock().unwrap_or_else(|p| p.into_inner());
-            let outputs = session
-                .run(ort::inputs![
+            // Graphs with a `token_type_ids` input (load-time decision,
+            // cached in `has_token_type_ids`) get zeros shaped exactly like
+            // `input_ids` — single-segment BERT convention; graphs without
+            // it are fed exactly as before.
+            let run_result = if self.has_token_type_ids {
+                let token_types =
+                    ort::value::Tensor::from_array(([b as i64, seq as i64], vec![0i64; b * seq]))
+                        .map_err(|e| {
+                            LocalOnnxError::Inference(format!("token_type_ids tensor: {}", e))
+                        })?;
+                session.run(ort::inputs![
+                    INPUT_IDS => ids_tensor,
+                    ATTENTION_MASK => mask_tensor,
+                    TOKEN_TYPE_IDS => token_types,
+                ])
+            } else {
+                session.run(ort::inputs![
                     INPUT_IDS => ids_tensor,
                     ATTENTION_MASK => mask_tensor,
                 ])
-                .map_err(|e| LocalOnnxError::Inference(format!("session run: {}", e)))?;
+            };
+            let outputs =
+                run_result.map_err(|e| LocalOnnxError::Inference(format!("session run: {}", e)))?;
             let hidden = outputs[self.output_name.as_str()]
                 .try_extract_array::<f32>()
                 .map_err(|e| {
@@ -682,6 +741,37 @@ mod tests {
             "wrong error: {:?}",
             err
         );
+    }
+
+    // ── Graph input-surface acceptance (3-input BERT exports loadable) ────
+
+    /// Regression: the official nomic optimum ONNX export carries THREE
+    /// inputs {input_ids, attention_mask, token_type_ids} — the surface
+    /// check must ACCEPT it (zeros feed) while still refusing any other
+    /// input, and still requiring the canonical pair.
+    #[test]
+    fn input_surface_accepts_optional_token_type_ids() {
+        // Canonical two-input surface: accepted, no token-type feed.
+        assert_eq!(check_input_surface(&[INPUT_IDS, ATTENTION_MASK]).unwrap(), false);
+        // Three-input BERT export (input order must not matter): accepted.
+        assert_eq!(
+            check_input_surface(&[INPUT_IDS, ATTENTION_MASK, TOKEN_TYPE_IDS]).unwrap(),
+            true
+        );
+        assert_eq!(
+            check_input_surface(&[ATTENTION_MASK, TOKEN_TYPE_IDS, INPUT_IDS]).unwrap(),
+            true
+        );
+        // token_type_ids ALONE does not satisfy the required pair.
+        assert!(check_input_surface(&[TOKEN_TYPE_IDS]).is_err());
+        // Any other input is still refused — same error style as before.
+        let err = check_input_surface(&[INPUT_IDS, ATTENTION_MASK, "weird_input"]).unwrap_err();
+        assert!(err.contains("graph input \"weird_input\" not supported"), "{err}");
+        assert!(err.contains(INPUT_IDS) && err.contains(ATTENTION_MASK), "{err}");
+        // Required inputs must both be present.
+        assert!(check_input_surface(&[INPUT_IDS, "weird_input"]).is_err());
+        assert!(check_input_surface(&[ATTENTION_MASK]).is_err());
+        assert!(check_input_surface(&[]).is_err());
     }
 
     /// Settings projection carries the config values unmolested.

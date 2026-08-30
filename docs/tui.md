@@ -350,6 +350,13 @@ per-surface difference is the mode-explorer gate
 requirements corpus for this parity work is
 `specs/017-please-modify-joey/spec.md` (FR-001…FR-013).
 
+During a `/hypercode` run the children follow the execution-only
+workflow — explorers answer factual questions only, implementors
+execute fully-specified briefs verbatim and verify with targeted
+checks, and the orchestrator runs the full test suite exactly once as
+the final gate after all implementors finish — yet their panes are
+rendered exactly like any other child's.
+
 ## Animations (anim.rs)
 
 Particle field, spinners, equalizer, pulse, activity signal — all paced by
