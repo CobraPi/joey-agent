@@ -174,6 +174,21 @@ finish are stopped with reason `session_end`).
 `.ambiguous_default`, `neurocode.verify.max_fix_iterations`,
 `neurocode.pega.version`.
 
+### GitHub Copilot embeddings (provider-following)
+
+When `model.provider` selects a Copilot wire (`copilot`, `github-copilot`,
+`github-models`, `github`, or `ai-usage-hud`) and `neurocode.rag.backend`
+is `auto`, RAG embeddings switch from the local ONNX model to GitHub
+Copilot's OpenAI-compatible `POST {base}/embeddings` endpoint
+(`https://api.githubcopilot.com`; override via `COPILOT_API_BASE_URL` or
+`AI_USAGE_HUD_BASE_URL`). Auth reuses the Copilot chat credential
+(`neurocode.rag.api_key`, else `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/
+`GITHUB_TOKEN`, else `gh auth token`). Key: `neurocode.rag.copilot.model`
+(default `text-embedding-3-small`, 1536-dim). Because the endpoint is
+non-loopback, code egress still requires per-project consent
+(`/neurocode consent ack`). Setting `neurocode.rag.backend` explicitly
+(e.g. `local_onnx`) keeps the local model even under a Copilot provider.
+
 **mcp**: `mcp_servers` (mapping of server configs; also project-level
 `.joey/mcp.json` / `.mcp.json`).
 

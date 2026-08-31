@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use joey_agent_core::agent::{RagPrefetchSource, RagRefreshSummary, RagRefreshWorker};
 use joey_neurocode::graph::DependencyGraph;
-use joey_neurocode_rag::config::RagConfig;
+use joey_neurocode_rag::config::{RagBackend, RagConfig};
 use joey_neurocode_rag::embed::profiles;
 use joey_neurocode_rag::embed::{
     self, BackendKind, EmbedError, EmbeddingBackend, GatedRemoteBackend, LocalOnnxBackend,
@@ -121,7 +121,23 @@ pub(crate) fn resolve_query_backend(
     store: Option<&joey_neurocode::graph::GraphStore>,
 ) -> Result<(ResolvedBackend, Option<Arc<dyn EmbeddingBackend>>), EmbedError> {
     let profile = profiles::lookup(&rag.model).unwrap_or_else(profiles::default_profile);
-    let decision = embed::resolve_kind(rag.backend, profile.name, &rag.model_dir)?;
+    // Provider-following switch (Joey-native): when the LLM provider is a
+    // Copilot wire and the backend is `auto`, embeddings follow the provider
+    // onto Copilot's `/embeddings` endpoint instead of the local ONNX model.
+    // An EXPLICIT backend value always wins (opt-out: set `local_onnx` etc.).
+    let backend = if rag.backend == RagBackend::Auto && rag.copilot_provider_active {
+        RagBackend::Copilot
+    } else {
+        rag.backend
+    };
+    let profile_name = if backend == RagBackend::Copilot {
+        joey_neurocode_rag::embed::copilot::profile_for(&rag.copilot_model)
+            .name
+            .to_string()
+    } else {
+        profile.name.to_string()
+    };
+    let decision = embed::resolve_kind(backend, &profile_name, &rag.model_dir)?;
     let consent_dir = consent_dir_for_cwd();
     match decision.kind {
         BackendKind::KeywordOnly => Ok((decision, None)),
@@ -130,6 +146,16 @@ pub(crate) fn resolve_query_backend(
             let loaded = load_local_onnx_cached(profile, &settings, store)?;
             let backend: Arc<dyn EmbeddingBackend> =
                 Arc::new(LocalOnnxBackend::query(loaded));
+            Ok((decision, Some(backend)))
+        }
+        BackendKind::Copilot => {
+            let inner = joey_neurocode_rag::embed::copilot::CopilotEmbeddings::query(
+                rag.api_key.clone(),
+                rag.copilot_model.clone(),
+                rag.timeout_secs,
+            )?;
+            let backend: Arc<dyn EmbeddingBackend> =
+                Arc::new(GatedRemoteBackend::new(inner, rag.enabled, consent_dir));
             Ok((decision, Some(backend)))
         }
         BackendKind::OpenAiCompat => {
@@ -166,7 +192,23 @@ pub(crate) fn resolve_documents_backend(
     store: Option<&joey_neurocode::graph::GraphStore>,
 ) -> Result<(ResolvedBackend, Option<Arc<dyn EmbeddingBackend>>), EmbedError> {
     let profile = profiles::lookup(&rag.model).unwrap_or_else(profiles::default_profile);
-    let decision = embed::resolve_kind(rag.backend, profile.name, &rag.model_dir)?;
+    // Provider-following switch (Joey-native): when the LLM provider is a
+    // Copilot wire and the backend is `auto`, embeddings follow the provider
+    // onto Copilot's `/embeddings` endpoint instead of the local ONNX model.
+    // An EXPLICIT backend value always wins (opt-out: set `local_onnx` etc.).
+    let backend = if rag.backend == RagBackend::Auto && rag.copilot_provider_active {
+        RagBackend::Copilot
+    } else {
+        rag.backend
+    };
+    let profile_name = if backend == RagBackend::Copilot {
+        joey_neurocode_rag::embed::copilot::profile_for(&rag.copilot_model)
+            .name
+            .to_string()
+    } else {
+        profile.name.to_string()
+    };
+    let decision = embed::resolve_kind(backend, &profile_name, &rag.model_dir)?;
     let consent_dir = consent_dir_for_cwd();
     match decision.kind {
         BackendKind::KeywordOnly => Ok((decision, None)),
@@ -175,6 +217,16 @@ pub(crate) fn resolve_documents_backend(
             let loaded = load_local_onnx_cached(profile, &settings, store)?;
             let backend: Arc<dyn EmbeddingBackend> =
                 Arc::new(LocalOnnxBackend::documents(loaded));
+            Ok((decision, Some(backend)))
+        }
+        BackendKind::Copilot => {
+            let inner = joey_neurocode_rag::embed::copilot::CopilotEmbeddings::documents(
+                rag.api_key.clone(),
+                rag.copilot_model.clone(),
+                rag.timeout_secs,
+            )?;
+            let backend: Arc<dyn EmbeddingBackend> =
+                Arc::new(GatedRemoteBackend::new(inner, rag.enabled, consent_dir));
             Ok((decision, Some(backend)))
         }
         BackendKind::OpenAiCompat => {
@@ -684,4 +736,48 @@ pub(crate) fn install_rag_injections(agent: &mut joey_agent_core::Agent, config:
     }
     agent.set_rag_refresh_worker(Some(production_rag_refresh_worker()));
     agent.set_rag_prefetch_source(Some(production_rag_prefetch_source()));
+}
+
+#[cfg(test)]
+mod copilot_switch_tests {
+    use super::*;
+
+    fn rag_copilot_provider() -> RagConfig {
+        let mut rag = RagConfig::default();
+        rag.copilot_provider_active = true; // model.provider == copilot
+        rag
+    }
+
+    #[test]
+    fn auto_follows_copilot_provider() {
+        let rag = rag_copilot_provider();
+        let (decision, backend) = resolve_query_backend(&rag, None).unwrap();
+        assert_eq!(decision.kind, BackendKind::Copilot);
+        let info = backend.expect("backend constructed").describe_embedder();
+        assert_eq!(info.backend_kind, BackendKind::Copilot);
+        assert_eq!(info.model, "text-embedding-3-small");
+        assert_eq!(info.dim, 1536);
+        let (decision, backend) = resolve_documents_backend(&rag, None).unwrap();
+        assert_eq!(decision.kind, BackendKind::Copilot);
+        assert_eq!(backend.expect("backend").describe_embedder().model, "text-embedding-3-small");
+    }
+
+    #[test]
+    fn explicit_backend_wins_over_provider_following() {
+        let mut rag = rag_copilot_provider();
+        rag.backend = RagBackend::OpenAiCompat;
+        rag.base_url = "http://embed.example.invalid".into();
+        let (decision, backend) = resolve_query_backend(&rag, None).unwrap();
+        assert_eq!(decision.kind, BackendKind::OpenAiCompat);
+        assert_eq!(backend.expect("backend").describe_embedder().backend_kind, BackendKind::OpenAiCompat);
+    }
+
+    #[test]
+    #[ignore = "machine-state-dependent: resolves LocalOnnx (not KeywordOnly) when real model artifacts exist under the active JOEY_HOME; run explicitly with a clean JOEY_HOME"]
+    fn default_stays_local_ladder() {
+        let rag = RagConfig::default();
+        let (decision, backend) = resolve_query_backend(&rag, None).unwrap();
+        assert_eq!(decision.kind, BackendKind::KeywordOnly);
+        assert!(backend.is_none());
+    }
 }

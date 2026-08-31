@@ -1703,11 +1703,23 @@ fn backend_health_and_degradation(
     // Resolve the backend decision (filesystem-only; never a network call).
     let profile = joey_neurocode_rag::embed::profiles::lookup(&rag.model)
         .unwrap_or_else(joey_neurocode_rag::embed::profiles::default_profile);
-    let health = match joey_neurocode_rag::embed::resolve_kind(
-        rag.backend,
-        profile.name,
-        &rag.model_dir,
-    ) {
+    // Provider-following switch — mirror of neurocode_rag_wiring: `auto` +
+    // Copilot provider -> Copilot embeddings backend (explicit wins).
+    let backend = if rag.backend == joey_neurocode_rag::config::RagBackend::Auto
+        && rag.copilot_provider_active
+    {
+        joey_neurocode_rag::config::RagBackend::Copilot
+    } else {
+        rag.backend
+    };
+    let profile_name = if backend == joey_neurocode_rag::config::RagBackend::Copilot {
+        joey_neurocode_rag::embed::copilot::profile_for(&rag.copilot_model)
+            .name
+            .to_string()
+    } else {
+        profile.name.to_string()
+    };
+    let health = match joey_neurocode_rag::embed::resolve_kind(backend, &profile_name, &rag.model_dir) {
         Ok(resolved) => match resolved.kind {
             joey_neurocode_rag::embed::BackendKind::LocalOnnx => {
                 "reachable (local_onnx artifacts verified)".to_string()
@@ -1716,6 +1728,9 @@ fn backend_health_and_degradation(
                 degradation.push(resolved.degradation_reason.clone());
                 "degraded (keyword_only)".to_string()
             }
+            joey_neurocode_rag::embed::BackendKind::Copilot => {
+                "configured (copilot embeddings via provider)".to_string()
+            }
             _ => "unavailable".to_string(),
         },
         Err(e) => {
@@ -1723,12 +1738,18 @@ fn backend_health_and_degradation(
             "unavailable".to_string()
         }
     };
-    // consent note: remote base_url without Acknowledged consent degrades.
-    if !base_url_is_loopback(&rag.base_url) && consent_state != "acknowledged" {
+    // The remote base the consent gate will actually evaluate: the Copilot
+    // endpoint when the switch selected it, else the configured base_url.
+    let effective_base = if backend == joey_neurocode_rag::config::RagBackend::Copilot {
+        joey_neurocode_rag::embed::copilot::resolve_base_url()
+    } else {
+        rag.base_url.clone()
+    };
+    if !base_url_is_loopback(&effective_base) && consent_state != "acknowledged" {
         degradation.push(format!(
             "remote backend {} operates keyword-only until consent is acknowledged \
              (/neurocode consent ack)",
-            rag.base_url
+            effective_base
         ));
     }
     (health, degradation)

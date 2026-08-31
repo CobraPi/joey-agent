@@ -96,6 +96,9 @@ pub const KEY_REFRESH_MAX_FILES_PER_TURN: &str = "neurocode.rag.refresh.max_file
 pub const KEY_REFRESH_MAX_BYTES_PER_TURN: &str = "neurocode.rag.refresh.max_bytes_per_turn";
 /// HTTP timeout for embedding calls and model-fetch downloads.
 pub const KEY_TIMEOUT_SECS: &str = "neurocode.rag.timeout_secs";
+/// Model id on the Copilot embeddings wire (Joey-native provider-following
+/// extension; NOT part of the pinned 18-key contract table).
+pub const KEY_COPILOT_MODEL: &str = "neurocode.rag.copilot.model";
 
 /// Env var name `neurocode.rag.api_key` is persisted under (`.env`).
 /// Matches the contract example: `JOEY_NEUROCODE_RAG_API_KEY=***`.
@@ -120,6 +123,7 @@ pub const DEFAULT_QUANTIZE_THRESHOLD: i64 = 100000;
 pub const DEFAULT_REFRESH_MAX_FILES_PER_TURN: i64 = 50;
 pub const DEFAULT_REFRESH_MAX_BYTES_PER_TURN: i64 = 52428800;
 pub const DEFAULT_TIMEOUT_SECS: i64 = 30;
+pub const DEFAULT_COPILOT_MODEL: &str = "text-embedding-3-small";
 
 // ─── Contract table ──────────────────────────────────────────────────────────
 
@@ -127,7 +131,7 @@ pub const DEFAULT_TIMEOUT_SECS: i64 = 30;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RagValueKind {
     Bool,
-    /// Backend enum `auto | local_onnx | openai_compat | ollama`.
+    /// Backend enum `auto | local_onnx | openai_compat | ollama | copilot`.
     Backend,
     Str,
     /// Filesystem path with `~` expansion (`local.model_dir`).
@@ -193,6 +197,8 @@ pub enum RagBackend {
     OpenAiCompat,
     /// Ollama native `POST {base_url}/api/embed`.
     Ollama,
+    /// GitHub Copilot `POST {base}/embeddings` (provider-following). Copilot,
+    Copilot,
 }
 
 impl RagBackend {
@@ -204,6 +210,7 @@ impl RagBackend {
             "local_onnx" => Some(Self::LocalOnnx),
             "openai_compat" => Some(Self::OpenAiCompat),
             "ollama" => Some(Self::Ollama),
+            "copilot" => Some(Self::Copilot),
             _ => None,
         }
     }
@@ -214,6 +221,7 @@ impl RagBackend {
             Self::LocalOnnx => "local_onnx",
             Self::OpenAiCompat => "openai_compat",
             Self::Ollama => "ollama",
+            Self::Copilot => "copilot",
         }
     }
 }
@@ -271,6 +279,12 @@ pub struct RagConfig {
     pub refresh_max_bytes_per_turn: i64,
     /// `neurocode.rag.timeout_secs` (default 30).
     pub timeout_secs: i64,
+    /// `neurocode.rag.copilot.model` (default `text-embedding-3-small`).
+    pub copilot_model: String,
+    /// Derived at load: `model.provider` selects a Copilot wire (see
+    /// [`provider_selects_copilot`]) — the CLI wiring switches the `auto`
+    /// embedding backend to the Copilot embeddings endpoint when true.
+    pub copilot_provider_active: bool,
 }
 
 impl RagConfig {
@@ -285,7 +299,7 @@ impl RagConfig {
             None => {
                 warn_config(&format!(
                     "invalid {} value {:?}; falling back to {:?} (expected one of \
-                     auto | local_onnx | openai_compat | ollama)",
+                     auto | local_onnx | openai_compat | ollama | copilot)",
                     KEY_BACKEND, backend_raw, DEFAULT_BACKEND
                 ));
                 RagBackend::default()
@@ -309,6 +323,10 @@ impl RagConfig {
         };
 
         let batch_size = validate_batch_size(config.get_i64(KEY_BATCH_SIZE, DEFAULT_BATCH_SIZE));
+
+        let copilot_model = config.get_str(KEY_COPILOT_MODEL, DEFAULT_COPILOT_MODEL);
+        let copilot_provider_active =
+            provider_selects_copilot(&config.get_str("model.provider", "auto"));
 
         Self {
             enabled: config.get_bool(KEY_ENABLED, false),
@@ -339,6 +357,8 @@ impl RagConfig {
             refresh_max_bytes_per_turn: config
                 .get_i64(KEY_REFRESH_MAX_BYTES_PER_TURN, DEFAULT_REFRESH_MAX_BYTES_PER_TURN),
             timeout_secs: config.get_i64(KEY_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS),
+            copilot_model,
+            copilot_provider_active,
         }
     }
 
@@ -376,6 +396,16 @@ pub fn default_model_dir(profile: &str) -> PathBuf {
 /// (see module docs).
 pub fn is_env_routed_key(dotted: &str) -> bool {
     dotted == KEY_API_KEY
+}
+
+/// Whether a `model.provider` value selects a Copilot wire — the
+/// provider-following embedding switch. Aliases mirror joey-providers
+/// profile.rs (`is_copilot_wire` + the github-* alias set).
+pub fn provider_selects_copilot(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_lowercase().as_str(),
+        "copilot" | "github-copilot" | "github-models" | "github" | "ai-usage-hud"
+    )
 }
 
 /// Set a `neurocode.rag.*` key and persist, routing `neurocode.rag.api_key`
@@ -450,6 +480,20 @@ mod tests {
         assert_eq!(RagBackend::parse(""), None);
         assert_eq!(RagBackend::default(), RagBackend::Auto);
         assert_eq!(RagBackend::Ollama.to_string(), "ollama");
+    }
+
+    #[test]
+    fn copilot_extensions() {
+        assert_eq!(RagBackend::parse("copilot"), Some(RagBackend::Copilot));
+        assert_eq!(RagBackend::Copilot.as_str(), "copilot");
+        assert!(provider_selects_copilot("Copilot"));
+        assert!(provider_selects_copilot(" github-copilot "));
+        assert!(provider_selects_copilot("ai-usage-hud"));
+        assert!(!provider_selects_copilot("zai"));
+        assert!(!provider_selects_copilot("openai"));
+        let cfg = RagConfig::load(&Config::defaults());
+        assert_eq!(cfg.copilot_model, DEFAULT_COPILOT_MODEL);
+        assert!(!cfg.copilot_provider_active);
     }
 
     #[test]

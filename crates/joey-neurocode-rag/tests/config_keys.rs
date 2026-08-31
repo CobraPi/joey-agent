@@ -428,3 +428,13 @@ fn contract_table_kinds_match_expected_types() {
     );
     assert_eq!(by_key("neurocode.rag.timeout_secs").kind, RagValueKind::Int);
 }
+
+// ─── 6. Copilot extension default (Joey-native, outside the 18-key table) ───
+
+#[test]
+fn copilot_model_defaults_to_text_embedding_3_small() {
+    let _ctx = temp_home();
+    std::env::remove_var(ENV_API_KEY_NAME);
+    let rag = RagConfig::load(&Config::defaults());
+    assert_eq!(rag.copilot_model, "text-embedding-3-small");
+}

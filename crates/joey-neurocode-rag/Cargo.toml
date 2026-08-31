@@ -9,6 +9,7 @@ license.workspace = true
 joey-core.workspace = true
 joey-neurocode.workspace = true
 joey-tools.workspace = true
+joey-providers.workspace = true
 
 # --- New pinned dependencies (specs/021-please-enhance-neurocode/research.md R6,
 # --- Principle VIII dependency ledger; justification recorded there) ---

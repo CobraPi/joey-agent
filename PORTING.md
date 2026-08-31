@@ -536,6 +536,12 @@ never runs on tokio's async workers: call sites wrap the pool in
   The Anthropic flow's "Claude Pro/Max subscription (OAuth login)" option
   explains the standing impersonation decision and directs to API keys.
 
+### GitHub Copilot embeddings backend (provider-following) — 2026-08-30
+
+Status: Joey-native addition (no upstream counterpart; upstream Hermes has no Copilot embeddings path).
+
+When `model.provider` selects a Copilot wire (`copilot`, `github-copilot`, `github-models`, `github`, `ai-usage-hud`) and `neurocode.rag.backend` is `auto`, RAG embeddings switch from the local ONNX model (`nomic-embed-text-v1.5`) to GitHub Copilot's OpenAI-compatible `POST https://api.githubcopilot.com/embeddings` endpoint (`text-embedding-3-small`, 1536-dim, no task prefixes; `input` MUST be a JSON array). Auth reuses the chat provider's `CopilotAuth` token exchange (shared cached instance); headers mirror the copilot chat wire minus vision. New pieces: `joey-neurocode-rag` `embed::copilot` backend + `RagBackend::Copilot` + `neurocode.rag.copilot.model` config key + `text-embedding-3-small` embed profile; joey-cli wiring (`neurocode_rag_wiring.rs`, `/neurocode status` health) applies the switch with explicit-backend-wins semantics. Code egress stays behind the existing T032 consent gate (non-loopback endpoint requires `/neurocode consent ack`); `neurocode.rag.backend = local_onnx` opts out.
+
 ## Partial
 
 - **Providers:** OpenAI-compatible + Anthropic wire modes, plus the complete

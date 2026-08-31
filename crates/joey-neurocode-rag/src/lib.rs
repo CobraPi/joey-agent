@@ -9,7 +9,8 @@
 //! The semantic engine is a fully-local, in-process ONNX embedder (`ort` with a
 //! runtime-loaded ONNX Runtime dylib; no daemon, no network by default), with
 //! optional OpenAI-compatible and Ollama HTTP backends behind per-project
-//! recorded, revocable consent. The whole feature is default-off
+//! recorded, revocable consent, plus a provider-following GitHub Copilot
+//! embeddings backend (Joey-native extension). The whole feature is default-off
 //! (`neurocode.rag.enabled = false`) and byte-identical to pre-enhancement
 //! behavior while disabled (FR-009/SC-005).
 //!

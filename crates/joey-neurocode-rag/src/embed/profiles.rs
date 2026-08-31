@@ -129,9 +129,28 @@ pub const CODERANK_EMBED: EmbedProfile = EmbedProfile {
     license: "MIT",
 };
 
+/// Profile: `text-embedding-3-small` — GitHub Copilot's OpenAI-compatible
+/// REMOTE embedding model, served at `POST {base}/embeddings` when the
+/// LLM provider selects a Copilot wire (Joey-native extension; upstream
+/// Hermes has no Copilot embeddings path). 1536-dim; NO task prefixes
+/// (the service is instruction-free — unlike nomic, `search_query:`/
+/// `search_document:` prefixes MUST NOT be prepended); vectors are
+/// L2-normalized client-side after decode, pooling happens server-side.
+pub const TEXT_EMBEDDING_3_SMALL: EmbedProfile = EmbedProfile {
+    name: "text-embedding-3-small",
+    dim: 1536,
+    ctx: 8192,
+    pooling: Pooling::Mean,
+    l2_normalize: true,
+    prefix_query: "",
+    prefix_document: "",
+    license: "Proprietary — served via the GitHub Copilot subscription",
+};
+
 /// The accepted profile table. Lookup by name via [`lookup`]; the default
 /// resolution is [`default_profile`] ([`DEFAULT_PROFILE_NAME`]).
-pub const PROFILES: &[EmbedProfile] = &[NOMIC_EMBED_TEXT_V1_5, CODERANK_EMBED];
+pub const PROFILES: &[EmbedProfile] =
+    &[NOMIC_EMBED_TEXT_V1_5, CODERANK_EMBED, TEXT_EMBEDDING_3_SMALL];
 
 /// Default profile identity (research.md R2: nomic-embed-text-v1.5 is the
 /// default model profile; resolved whenever no explicit profile is set).

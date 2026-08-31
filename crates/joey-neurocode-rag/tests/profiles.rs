@@ -55,8 +55,13 @@ fn coderank_embed_profile_is_pinned() {
 fn both_profiles_are_768_dim() {
     assert_eq!(NOMIC_EMBED_TEXT_V1_5.dim, 768);
     assert_eq!(CODERANK_EMBED.dim, 768);
+    // The remote Copilot profile (Joey-native extension) is 1536-dim.
     for p in joey_neurocode_rag::embed::profiles::PROFILES {
-        assert_eq!(p.dim, 768, "profile {} must be 768-dim", p.name);
+        let expected = match p.name {
+            "text-embedding-3-small" => 1536,
+            _ => 768,
+        };
+        assert_eq!(p.dim, expected, "profile {} must be {}-dim", p.name, expected);
     }
 }
 
@@ -161,6 +166,17 @@ fn default_resolution_is_nomic_embed_text_v15() {
 // (contract: "Evaluated and REJECTED … Recorded so tasks do not
 // re-litigate"; research.md R2 alternatives considered)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn text_embedding_3_small_profile_pins() {
+    let p = lookup("text-embedding-3-small").expect("text-embedding-3-small must resolve");
+    assert_eq!(p.name, "text-embedding-3-small");
+    assert_eq!(p.dim, 1536);
+    assert_eq!(p.prefix_query, "");
+    assert_eq!(p.prefix_document, "");
+    assert_eq!(p.query_input("x"), "x");
+    assert_eq!(p.document_input("x"), "x");
+}
 
 #[test]
 fn rejected_nomic_embed_code_is_recorded_not_resolvable() {

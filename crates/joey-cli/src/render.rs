@@ -486,6 +486,7 @@ fn current_term_height() -> u16 {
 }
 
 /// Consume agent events and render them live. Returns the final text.
+#[allow(unused_assignments)] // row/interleave accounting locals are written via `println_counted!` in every loop arm; exit arms (Done/Failed) never read the last write
 pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: RenderOptions) -> String {
     let mut final_text = String::new();
     let mut streamed_any = false;
@@ -595,8 +596,8 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
     // throttles to the 50ms budget). The badge prints ONLY on transitions
     // into/out of contention (queued > 0), right where the active-tool line
     // renders — there is no persistent chrome while queued == 0.
-    let mut terminal_queued: usize = 0;
-    let mut terminal_active: usize = 0;
+    let mut terminal_queued: usize;
+    let mut terminal_active: usize;
     let mut badge_visible: bool = false;
 
     // ── T042/T047: Persistent in-flight usage indicator ──

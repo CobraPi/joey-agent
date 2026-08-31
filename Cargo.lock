@@ -2910,6 +2910,7 @@ dependencies = [
  "chrono",
  "joey-core",
  "joey-neurocode",
+ "joey-providers",
  "joey-tools",
  "ndarray",
  "ort",

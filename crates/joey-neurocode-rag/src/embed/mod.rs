@@ -31,6 +31,7 @@
 //!   mid-operation revocation stops egress immediately.
 
 pub mod artifacts;
+pub mod copilot;
 pub mod local_onnx;
 pub mod ollama;
 pub mod openai_compat;
@@ -63,6 +64,9 @@ pub enum BackendKind {
     /// SECONDARY — `POST {base_url}/api/embed`; loopback base_url = local,
     /// consent-free (T030).
     OllamaNative,
+    /// GitHub Copilot `POST {base}/embeddings` (provider-following,
+    /// consent-gated remote; Joey-native extension).
+    Copilot,
     /// Degradation marker — `auto` resolution with no verifiable local
     /// artifacts: the search pipeline runs its keyword (FTS5) leg only,
     /// with an explicit FR-008 indication. Resolving to this NEVER
@@ -79,6 +83,7 @@ impl BackendKind {
             Self::LocalOnnx => "local_onnx",
             Self::OpenAiCompat => "openai_compat",
             Self::OllamaNative => "ollama",
+            Self::Copilot => "copilot",
             Self::KeywordOnly => "keyword_only",
         }
     }
@@ -607,6 +612,7 @@ fn local_artifacts_present(model_dir: &Path) -> Result<bool, EmbedError> {
 /// |               |              | explicit choice never silently        |
 /// |               |              | degrades                              |
 /// | `openai_compat` / `ollama` | — | remote kind, no artifact probe      |
+/// | `copilot`     | —            | remote kind, no artifact probe      |
 ///
 /// `auto` NEVER constructs a network client: resolution is
 /// filesystem-only by construction (the probe touches no reqwest path —
@@ -660,6 +666,11 @@ pub fn resolve_kind(
         },
         RagBackend::Ollama => ResolvedBackend {
             kind: BackendKind::OllamaNative,
+            profile_name: profile_name.to_string(),
+            degradation_reason: String::new(),
+        },
+        RagBackend::Copilot => ResolvedBackend {
+            kind: BackendKind::Copilot,
             profile_name: profile_name.to_string(),
             degradation_reason: String::new(),
         },
@@ -741,6 +752,17 @@ pub fn resolve(
             );
             Ok((decision, Some(backend)))
         }
+        BackendKind::Copilot => {
+            let inner = crate::embed::copilot::CopilotEmbeddings::documents(
+                cfg.api_key.clone(),
+                cfg.copilot_model.clone(),
+                cfg.timeout_secs,
+            )?;
+            let backend: std::sync::Arc<dyn EmbeddingBackend> = std::sync::Arc::new(
+                GatedRemoteBackend::new(inner, cfg.enabled, consent_dir),
+            );
+            Ok((decision, Some(backend)))
+        }
     }
 }
 
@@ -779,7 +801,7 @@ pub fn default_model_dir_for(profile: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RagBackend::{Auto, LocalOnnx as ExplicitLocal, Ollama, OpenAiCompat};
+    use crate::config::RagBackend::{Auto, Copilot, LocalOnnx as ExplicitLocal, Ollama, OpenAiCompat};
     use crate::embed::profiles::{CODERANK_EMBED, NOMIC_EMBED_TEXT_V1_5};
     use crate::search::hybrid::{DenseLegError, EmbedFailure};
 
@@ -847,6 +869,9 @@ mod tests {
         let r = resolve_kind(Ollama, CODERANK_EMBED.name, nowhere).unwrap();
         assert_eq!(r.kind, BackendKind::OllamaNative);
         assert!(r.degradation_reason.is_empty());
+        let r = resolve_kind(Copilot, "text-embedding-3-small", nowhere).unwrap();
+        assert_eq!(r.kind, BackendKind::Copilot);
+        assert!(r.degradation_reason.is_empty());
     }
 
     /// T030/T032: full `resolve` constructs the gated HTTP backends —
@@ -873,6 +898,20 @@ mod tests {
         let (decision, backend) = resolve(&cfg, None).unwrap();
         assert_eq!(decision.kind, BackendKind::OllamaNative);
         assert_eq!(backend.unwrap().describe_embedder().backend_kind, BackendKind::OllamaNative);
+    }
+
+    #[test]
+    fn resolve_constructs_gated_copilot_backend() {
+        let mut cfg = crate::config::RagConfig::default();
+        cfg.backend = crate::config::RagBackend::Copilot;
+        cfg.copilot_model = "text-embedding-3-small".into();
+        cfg.enabled = true;
+        let (decision, backend) = resolve(&cfg, None).unwrap();
+        assert_eq!(decision.kind, BackendKind::Copilot);
+        let info = backend.expect("constructed").describe_embedder();
+        assert_eq!(info.backend_kind, BackendKind::Copilot);
+        assert_eq!(info.model, "text-embedding-3-small");
+        assert_eq!(info.dim, 1536);
     }
 
     /// FR-008/auto's structural no-network guarantee: the resolution path
