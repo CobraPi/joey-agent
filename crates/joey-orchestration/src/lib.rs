@@ -13,6 +13,7 @@ pub mod evidence;
 pub mod evaluator;
 pub mod joiner;
 pub mod manager;
+pub mod scheduler;
 pub mod subagent;
 pub mod task_graph;
 pub mod team;
