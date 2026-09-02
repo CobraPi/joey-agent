@@ -16,6 +16,7 @@
 //! trait; the graph store, ingestion pipeline, classifier internals, and
 //! feedback loop are all private to this crate (Constitution VI).
 
+pub mod analysis;
 pub mod classifier;
 pub mod config;
 pub mod context;
@@ -24,7 +25,10 @@ pub mod graph;
 pub mod memory;
 pub mod parse;
 pub mod pega;
+pub mod policy;
+pub mod risk;
 pub mod tier_resolver;
+pub mod verification_plan;
 pub mod verify;
 pub mod auto_index;
 

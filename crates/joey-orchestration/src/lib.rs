@@ -9,6 +9,8 @@ pub mod background;
 pub mod capacity;
 pub mod control_tool;
 pub mod delegation_tool;
+pub mod evidence;
+pub mod evaluator;
 pub mod manager;
 pub mod subagent;
 pub mod team;
