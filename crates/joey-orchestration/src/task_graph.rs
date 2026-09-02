@@ -250,6 +250,15 @@ pub mod rules {
     pub const NO_ACCEPTANCE: &str = "missing_acceptance_criterion";
     /// High-risk task without required verification.
     pub const UNVERIFIED_HIGH_RISK: &str = "high_risk_without_verification";
+    /// Strict planner JSON rejected: missing or unknown `format` tag
+    /// (FR-008/FR-010 strict-format rejections).
+    pub const INVALID_FORMAT: &str = "unsupported_format";
+    /// Strict planner JSON carried a task id outside the `[a-z0-9-]+`
+    /// charset (FR-008/FR-010).
+    pub const INVALID_TASK_ID: &str = "invalid_task_id";
+    /// Strict planner JSON violated the task schema; the detail string
+    /// names the offending field where serde reports one (FR-008/FR-010).
+    pub const SCHEMA: &str = "schema_violation";
 }
 
 /// The typed, executable plan: a map of tasks keyed by id.
@@ -542,6 +551,195 @@ impl TaskGraph {
     /// Mutably borrow a node by id.
     pub fn node_mut(&mut self, id: &TaskId) -> Option<&mut TaskNode> {
         self.nodes.get_mut(id)
+    }
+}
+
+impl TaskGraph {
+    /// The strict planner JSON format tag this parser accepts.
+    const FORMAT: &str = "joey-taskgraph/1";
+
+    /// Parses strict planner JSON (`planner-json-format.md`, spec 023 US2)
+    /// into a validated [`TaskGraph`].
+    ///
+    /// Strict means strict (FR-008/FR-010): the top level must be an
+    /// object carrying `"format": "joey-taskgraph/1"` (anything else ⇒
+    /// [`rules::INVALID_FORMAT`]), task ids are validated against the
+    /// `[a-z0-9-]+` charset before typing ([`rules::INVALID_TASK_ID`]),
+    /// and any serde mismatch is rejected as [`rules::SCHEMA`] with the
+    /// serde error string as detail. Read/write paths must be relative,
+    /// free of `..` components, and resolve inside `project_root`
+    /// ([`rules::PATH_ESCAPE`]); backslashes are normalized to forward
+    /// slashes before the check and the stored path is the normalized
+    /// relative form. A task object without an `isolation` key gets
+    /// [`default_isolation`] applied (isolated worktree iff it writes).
+    ///
+    /// `baseline_revision` may be missing (empty string) — the planner
+    /// may omit it for uncommitted baselines; [`TaskGraph::validate`]
+    /// remains the authority on plan content.
+    ///
+    /// All violations are collected: parse errors first, then any
+    /// errors from [`TaskGraph::validate`] merged in. `Ok` iff the JSON
+    /// is well-formed *and* the assembled graph validates.
+    pub fn from_strict_json(
+        json: &str,
+        project_root: &Path,
+    ) -> Result<TaskGraph, Vec<ValidationError>> {
+        let _ = project_root; // containment is enforced by validate() + normalize paths
+        let value: serde_json::Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(vec![ValidationError {
+                    task_ids: vec![],
+                    rule: rules::INVALID_FORMAT.to_string(),
+                    detail: format!("expected joey-taskgraph/1, got {:?}", e.to_string()),
+                }])
+            }
+        };
+        let obj = match value.as_object() {
+            Some(o) => o,
+            None => {
+                return Err(vec![ValidationError {
+                    task_ids: vec![],
+                    rule: rules::INVALID_FORMAT.to_string(),
+                    detail: "expected joey-taskgraph/1, got non-object document".to_string(),
+                }])
+            }
+        };
+        let actual = obj.get("format").and_then(|f| f.as_str());
+        if actual != Some(Self::FORMAT) {
+            let got = match obj.get("format") {
+                Some(v) => v.to_string(),
+                None => "missing".to_string(),
+            };
+            return Err(vec![ValidationError {
+                task_ids: vec![],
+                rule: rules::INVALID_FORMAT.to_string(),
+                detail: format!("expected joey-taskgraph/1, got {:?}", got),
+            }]);
+        }
+        let baseline_revision = obj
+            .get("baseline_revision")
+            .and_then(|b| b.as_str())
+            .unwrap_or("")
+            .to_string();
+        let empty_tasks: Vec<serde_json::Value> = Vec::new();
+        let tasks = obj
+            .get("tasks")
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or(empty_tasks);
+
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let mut nodes: BTreeMap<TaskId, TaskNode> = BTreeMap::new();
+        for entry in tasks {
+            let mut entry = entry;
+            // isolation absent ⇒ default_isolation(&write_set). Injected
+            // into the raw value BEFORE typing because `TaskNode`'s serde
+            // shape requires the key (no serde default on the field).
+            if entry.get("isolation").is_none() {
+                let writes = entry
+                    .get("write_set")
+                    .and_then(|w| w.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let dummy: Vec<PathBuf> = (0..writes).map(|_| PathBuf::new()).collect();
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert(
+                        "isolation".to_string(),
+                        serde_json::to_value(default_isolation(&dummy))
+                            .expect("IsolationMode serialization is infallible"),
+                    );
+                }
+            }
+            let raw_id = entry.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            let Some(task_id) = TaskId::new(raw_id) else {
+                errors.push(ValidationError {
+                    task_ids: vec![raw_id.to_string()],
+                    rule: rules::INVALID_TASK_ID.to_string(),
+                    detail: format!("task id {:?} violates charset [a-z0-9-]+", raw_id),
+                });
+                continue;
+            };
+            let mut node: TaskNode = match serde_json::from_value(entry.clone()) {
+                Ok(n) => n,
+                Err(e) => {
+                    errors.push(ValidationError {
+                        task_ids: vec![task_id.to_string()],
+                        rule: rules::SCHEMA.to_string(),
+                        detail: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+            // Normalize paths (backslashes → forward slashes) and enforce
+            // containment: relative, no `..`, resolves inside the project
+            // root. Mirrors validate()'s PATH_ESCAPE check at parse time;
+            // a violating node is dropped from the map so validate()
+            // doesn't double-report it (the graph is rejected anyway).
+            let mut path_ok = true;
+            for field in [&mut node.read_set, &mut node.write_set] {
+                for i in 0..field.len() {
+                    let normalized = field[i].to_string_lossy().replace('\\', "/");
+                    let path = PathBuf::from(normalized);
+                    if let Some(reason) = path_violation(&path) {
+                        path_ok = false;
+                        errors.push(ValidationError {
+                            task_ids: vec![task_id.to_string()],
+                            rule: rules::PATH_ESCAPE.to_string(),
+                            detail: format!("path {} rejected: {}", path.display(), reason),
+                        });
+                    }
+                    field[i] = path;
+                }
+            }
+            if !path_ok {
+                continue;
+            }
+            nodes.insert(task_id, node);
+        }
+
+        let graph = TaskGraph {
+            nodes,
+            baseline_revision,
+            run_id: String::new(),
+        };
+        if let Err(validate_errors) = graph.validate() {
+            errors.extend(validate_errors);
+        }
+        if errors.is_empty() {
+            Ok(graph)
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Serializes to the strict planner JSON shape:
+    /// `{"format":"joey-taskgraph/1","baseline_revision":…,"tasks":[…]}`.
+    ///
+    /// Each task object EXCLUDES `status` and `attempts` — planner JSON
+    /// carries the plan, not runtime state. Round-trip guarantee:
+    /// `from_strict_json(to_strict_json(g), root)` yields an equal graph
+    /// (statuses/attempts restored to their `Pending`/`0` defaults).
+    /// Infallible for these types.
+    pub fn to_strict_json(&self) -> serde_json::Value {
+        let tasks: Vec<serde_json::Value> = self
+            .nodes
+            .values()
+            .map(|node| {
+                let mut v = serde_json::to_value(node)
+                    .expect("TaskNode serialization is infallible");
+                let obj = v.as_object_mut()
+                    .expect("TaskNode serializes to a JSON object");
+                obj.remove("status");
+                obj.remove("attempts");
+                v
+            })
+            .collect();
+        serde_json::json!({
+            "format": Self::FORMAT,
+            "baseline_revision": self.baseline_revision,
+            "tasks": tasks,
+        })
     }
 }
 
@@ -1065,5 +1263,214 @@ mod tests {
         assert!(snap["nodes"]["a"].is_object());
         let back: TaskGraph = serde_json::from_value(snap).unwrap();
         assert_eq!(back, g);
+    }
+
+    // ---- T012: strict planner JSON (from_strict_json / to_strict_json) ----
+
+    const PLAN: &str = r#"{"format":"joey-taskgraph/1","baseline_revision":"abc123","tasks":[{"id":"task-auth","objective":"Implement token refresh","dependencies":[],"read_set":[],"write_set":["src/auth.rs"],"artifact_ids":[42,1337],"role":"implementor","model_tier":"economical","risk":"medium","acceptance":[{"criterion":"cargo test -p joey-core auth","kind":"command"}],"verification":{"steps":[{"name":"scoped-tests","command":"cargo test -p joey-core auth","parse":"plain","timeout_sec":300,"required":true}],"risk_triggered_review":false},"isolation":"isolated_worktree"}]}"#;
+
+    fn plan_root() -> PathBuf {
+        PathBuf::from("/tmp/project")
+    }
+
+    fn reformat_plan(fmt: Option<&str>) -> String {
+        let v: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        let mut v = v;
+        let obj = v.as_object_mut().unwrap();
+        match fmt {
+            Some(f) => obj.insert("format".to_string(), serde_json::json!(f)),
+            None => obj.remove("format"),
+        };
+        serde_json::to_string(&v).unwrap()
+    }
+
+    fn mutate_task<F: FnOnce(&mut serde_json::Value)>(f: F) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        f(&mut v["tasks"][0]);
+        serde_json::to_string(&v).unwrap()
+    }
+
+    #[test]
+    fn strict_json_accepts_contract_example() {
+        let g = TaskGraph::from_strict_json(PLAN, &plan_root()).expect("plan must parse");
+        assert_eq!(g.baseline_revision, "abc123");
+        assert_eq!(g.run_id, "");
+        let n = g.node(&id("task-auth")).unwrap();
+        assert_eq!(n.objective, "Implement token refresh");
+        assert_eq!(n.isolation, IsolationMode::IsolatedWorktree);
+        assert_eq!(n.model_tier, ModelTier::Economical);
+        assert_eq!(n.risk, RiskLevel::Medium);
+        assert_eq!(n.artifact_ids, vec![42, 1337]);
+        assert_eq!(n.write_set, vec![PathBuf::from("src/auth.rs")]);
+        assert!(n.verification.steps[0].required);
+        assert_eq!(n.status, TaskStatus::Pending);
+        assert_eq!(n.attempts, 0);
+    }
+
+    #[test]
+    fn strict_json_rejects_unknown_format() {
+        for json in [
+            reformat_plan(Some("joey-taskgraph/2")),
+            reformat_plan(None),
+        ] {
+            let errs = TaskGraph::from_strict_json(&json, &plan_root()).unwrap_err();
+            assert_eq!(errs.len(), 1, "one error for {:?}", json);
+            assert_eq!(errs[0].rule, rules::INVALID_FORMAT);
+            assert_eq!(errs[0].task_ids, Vec::<String>::new());
+            assert!(errs[0].detail.contains("expected joey-taskgraph/1, got"),
+                "detail must echo the bad value: {}", errs[0].detail);
+        }
+    }
+
+    #[test]
+    fn strict_json_rejects_bad_id_charset() {
+        let json = mutate_task(|t| t["id"] = serde_json::json!("Task_Auth"));
+        let errs = TaskGraph::from_strict_json(&json, &plan_root()).unwrap_err();
+        let id_errs = rule_errors(&errs, rules::INVALID_TASK_ID);
+        assert_eq!(id_errs.len(), 1);
+        assert_eq!(id_errs[0].task_ids, vec!["Task_Auth".to_string()]);
+    }
+
+    #[test]
+    fn strict_json_rejects_path_escape() {
+        // Parent traversal in write_set.
+        let json = mutate_task(|t| t["write_set"] = serde_json::json!(["../outside.rs"]));
+        let errs = TaskGraph::from_strict_json(&json, &plan_root()).unwrap_err();
+        let escapes = rule_errors(&errs, rules::PATH_ESCAPE);
+        assert_eq!(escapes.len(), 1);
+        assert_eq!(escapes[0].task_ids, vec!["task-auth".to_string()]);
+
+        // Absolute path in read_set.
+        let json = mutate_task(|t| t["read_set"] = serde_json::json!(["/abs/x"]));
+        let errs = TaskGraph::from_strict_json(&json, &plan_root()).unwrap_err();
+        let escapes = rule_errors(&errs, rules::PATH_ESCAPE);
+        assert_eq!(escapes.len(), 1);
+        assert_eq!(escapes[0].task_ids, vec!["task-auth".to_string()]);
+    }
+
+    #[test]
+    fn strict_json_rejects_missing_dependency() {
+        let json = mutate_task(|t| t["dependencies"] = serde_json::json!(["task-zzz"]));
+        let errs = TaskGraph::from_strict_json(&json, &plan_root()).unwrap_err();
+        let unknown = rule_errors(&errs, rules::UNKNOWN_DEP);
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(
+            unknown[0].task_ids,
+            vec!["task-zzz".to_string(), "task-auth".to_string()],
+            "must name BOTH the missing target and the referencing task"
+        );
+    }
+
+    #[test]
+    fn strict_json_rejects_enum_typo() {
+        let json = mutate_task(|t| t["model_tier"] = serde_json::json!("cheap"));
+        let errs = TaskGraph::from_strict_json(&json, &plan_root()).unwrap_err();
+        let schema = rule_errors(&errs, rules::SCHEMA);
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].task_ids, vec!["task-auth".to_string()]);
+        assert!(schema[0].detail.contains("cheap"),
+            "schema detail must carry serde's message: {}", schema[0].detail);
+    }
+
+    #[test]
+    fn strict_json_isolation_default_applied() {
+        // Non-empty write_set, isolation key removed ⇒ IsolatedWorktree.
+        let json = mutate_task(|t| {
+            let obj = t.as_object_mut().unwrap();
+            obj.remove("isolation");
+        });
+        let g = TaskGraph::from_strict_json(&json, &plan_root()).unwrap();
+        assert_eq!(
+            g.node(&id("task-auth")).unwrap().isolation,
+            IsolationMode::IsolatedWorktree
+        );
+
+        // Empty write_set and no isolation ⇒ SharedCheckout.
+        let json = mutate_task(|t| {
+            let obj = t.as_object_mut().unwrap();
+            obj.remove("isolation");
+            obj.insert("write_set".to_string(), serde_json::json!([]));
+        });
+        let g = TaskGraph::from_strict_json(&json, &plan_root()).unwrap();
+        assert_eq!(
+            g.node(&id("task-auth")).unwrap().isolation,
+            IsolationMode::SharedCheckout
+        );
+    }
+
+    #[test]
+    fn strict_json_validation_merged_with_parse_errors() {
+        // One entry with a bad id, two valid-id entries forming a cycle:
+        // parse errors first, then validate()'s CYCLE, both present.
+        let v: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        let mut v = v;
+        let task = v["tasks"][0].clone();
+        let bad = {
+            let mut t = task.clone();
+            t["id"] = serde_json::json!("Task_Auth");
+            t
+        };
+        let mut a = task.clone();
+        a["id"] = serde_json::json!("task-a");
+        a["dependencies"] = serde_json::json!(["task-b"]);
+        a["write_set"] = serde_json::json!(["src/a.rs"]);
+        let mut b = task;
+        b["id"] = serde_json::json!("task-b");
+        b["dependencies"] = serde_json::json!(["task-a"]);
+        b["write_set"] = serde_json::json!(["src/b.rs"]);
+        v["tasks"] = serde_json::json!([bad, a, b]);
+        let json = serde_json::to_string(&v).unwrap();
+
+        let errs = TaskGraph::from_strict_json(&json, &plan_root()).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.rule == rules::INVALID_TASK_ID),
+            "parse error must be present: {:?}", errs
+        );
+        assert!(
+            errs.iter().any(|e| e.rule == rules::CYCLE),
+            "validation CYCLE must be merged in: {:?}", errs
+        );
+        // Parse errors come first.
+        assert_eq!(errs[0].rule, rules::INVALID_TASK_ID);
+    }
+
+    #[test]
+    fn strict_json_round_trip_strips_runtime_state() {
+        // Build a 2-node graph from planner JSON.
+        let v: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        let mut v = v;
+        let mut second = v["tasks"][0].clone();
+        second["id"] = serde_json::json!("task-auth-2");
+        second["dependencies"] = serde_json::json!(["task-auth"]);
+        second["write_set"] = serde_json::json!(["src/auth2.rs"]);
+        v["tasks"].as_array_mut().unwrap().push(second);
+        let json = serde_json::to_string(&v).unwrap();
+        let mut g = TaskGraph::from_strict_json(&json, &plan_root()).unwrap();
+
+        // Mutate runtime state so stripping is observable.
+        g.node_mut(&id("task-auth")).unwrap().status = TaskStatus::Completed;
+        g.node_mut(&id("task-auth")).unwrap().attempts = 3;
+        g.node_mut(&id("task-auth-2")).unwrap().status = TaskStatus::Failed;
+
+        let strict = g.to_strict_json();
+        // Serialized tasks carry no status/attempts keys.
+        for t in strict["tasks"].as_array().unwrap() {
+            let obj = t.as_object().unwrap();
+            assert!(!obj.contains_key("status"), "status leaked: {:?}", t);
+            assert!(!obj.contains_key("attempts"), "attempts leaked: {:?}", t);
+        }
+        assert_eq!(strict["format"], "joey-taskgraph/1");
+        assert_eq!(strict["baseline_revision"], "abc123");
+
+        // Round trip restores status/attempts defaults and equal nodes.
+        let out = serde_json::to_string(&strict).unwrap();
+        let g2 = TaskGraph::from_strict_json(&out, &plan_root()).unwrap();
+        for (kid, knode) in &g.nodes {
+            let mut expected = knode.clone();
+            expected.status = TaskStatus::Pending;
+            expected.attempts = 0;
+            assert_eq!(g2.node(kid), Some(&expected), "node {} must round-trip", kid);
+        }
+        assert_eq!(g2.nodes.len(), 2);
     }
 }
