@@ -185,4 +185,36 @@ mod tests {
             "flat-frontier"
         );
     }
+
+    #[test]
+    fn rank_economical_below_frontier() {
+        assert!(ComplexityTier::Economical.rank() < ComplexityTier::Frontier.rank());
+    }
+
+    #[test]
+    fn rank_values() {
+        assert_eq!(ComplexityTier::Economical.rank(), 0);
+        assert_eq!(ComplexityTier::Frontier.rank(), 1);
+    }
+
+    #[test]
+    fn ambiguous_resolves_to_default() {
+        assert_eq!(ComplexityTier::AmbiguousDefault.rank(), ComplexityTier::Economical.rank());
+        assert_eq!(ComplexityTier::AmbiguousDefault.rank(), 0);
+    }
+}
+
+/// Exhaustion-ladder tier ranking (spec 023 FR-021, T022).
+/// Economical < Frontier; `AmbiguousDefault` has no rank of its own —
+/// it resolves to the crate default tier (Economical) before ranking,
+/// mirroring `ComplexityTier::default()`. Additive inherent method; no
+/// new trait impls on existing types.
+impl crate::classifier::ComplexityTier {
+    pub fn rank(&self) -> u8 {
+        match self.resolve_ambiguous(crate::classifier::ComplexityTier::Economical) {
+            crate::classifier::ComplexityTier::Economical => 0,
+            crate::classifier::ComplexityTier::Frontier => 1,
+            crate::classifier::ComplexityTier::AmbiguousDefault => 0,
+        }
+    }
 }
