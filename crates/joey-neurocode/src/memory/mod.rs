@@ -5,4 +5,5 @@ pub mod outcomes;
 pub mod patterns;
 
 pub use domain::{DomainKnowledge, KnowledgeCategory, KnowledgeSource};
+pub use outcomes::{OutcomeMemory, OutcomeMemoryBuffer, VerifiedOutcome};
 pub use patterns::{LearnedAntiPattern, LearnedPattern};

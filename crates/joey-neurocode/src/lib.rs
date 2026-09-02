@@ -54,6 +54,14 @@ pub use tier_resolver::TierModelResolver;
 pub use verify::parse::VerifyParseFormat;
 pub use verify::runner::VerifyStep;
 
+pub use analysis::{
+    AnalysisEngine, AnalysisTask, EnterpriseTaskAnalyzer, ExecutionHint, TaskAnalysis, TaskContext,
+};
+pub use policy::{PolicyBinding, PolicyLayer};
+pub use policy::resolver::{CombinedPolicy, PolicyConflict};
+pub use risk::{RiskAssessment, RiskFactor, RiskFactorKind, RiskLevel};
+pub use verification_plan::{VerificationPlan, VerificationStep};
+
 /// The on-disk NeuroCode schema version (contracts/graph-store-schema.md).
 /// v2: additive `signature` column on `code_artifacts` (declaration headers
 /// for methods/fields, surfaced in assembled context). v1 databases migrate

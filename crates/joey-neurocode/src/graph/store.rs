@@ -536,7 +536,7 @@ impl GraphStore {
         let mut stmt = self.conn.prepare(
             "SELECT * FROM code_artifacts
              WHERE source_path=?1 AND kind IN ('Class','Interface','Enum','PegaRule')
-               AND status='Active",
+               AND status='Active'",
         )?;
         let exact: Vec<CodeArtifactNode> =
             stmt.query_map(params![path], row_to_node)?.collect::<Result<_, _>>()?;

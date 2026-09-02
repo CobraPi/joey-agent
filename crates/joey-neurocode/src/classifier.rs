@@ -52,13 +52,13 @@ impl std::fmt::Display for ComplexityTier {
 }
 
 /// A single deterministic classification signal (research.md §5).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClassificationSignal {
     pub kind: SignalKind,
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SignalKind {
     /// A keyword match ("refactor", "test", "architecture", ...).
     Keyword,
@@ -69,7 +69,7 @@ pub enum SignalKind {
 }
 
 /// The result of classifying a coding request (spec Key Entity, data-model.md Entity 2).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ComplexityRoute {
     /// The resolved tier.
     pub tier: ComplexityTier,
