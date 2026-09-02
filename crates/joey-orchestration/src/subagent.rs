@@ -163,6 +163,7 @@ impl Subagent {
         workdir: Option<&std::path::Path>,
         interrupt: Arc<AtomicBool>,
         semaphore: Arc<tokio::sync::Semaphore>,
+        team_tools: Vec<Arc<dyn joey_tools::Tool>>,
     ) -> Result<Self, ProviderError> {
         let model = resolve_model(
             None,
@@ -170,6 +171,19 @@ impl Subagent {
             default_model,
             &parent_config.model,
         );
+
+        // Feature 022 (T006b): injected per-child team tools must survive
+        // BOTH filters — the enabled-tools list (definitions()) and the
+        // filtered registry — so append their names here and register the
+        // tool objects below.
+        let mut enabled_tools =
+            resolve_enabled_tools(req, base_registry, max_spawn_depth, depth);
+        for t in &team_tools {
+            let name = t.name().to_string();
+            if !enabled_tools.contains(&name) {
+                enabled_tools.push(name);
+            }
+        }
 
         let child_agent_cfg = AgentConfig {
             model: model.clone(),
@@ -182,7 +196,7 @@ impl Subagent {
             // HyperCode per-role overrides: request-level reasoning/token
             // limits win; otherwise inherit the parent's.
             reasoning: req.reasoning.clone().or_else(|| parent_config.reasoning.clone()),
-            enabled_tools: resolve_enabled_tools(req, base_registry, max_spawn_depth, depth),
+            enabled_tools,
             max_tokens: req.max_tokens.or(parent_config.max_tokens),
             stream: parent_config.stream,
             pass_session_id: false,
@@ -198,8 +212,13 @@ impl Subagent {
             &format!("subagent-{}", uuid::Uuid::new_v4().simple()),
         );
 
-        let child_registry =
+        let mut child_registry =
             filtered_registry(base_registry, &req.toolsets, req.role, depth, max_spawn_depth);
+        // Feature 022 (T006b): inject the per-child bound team tools AFTER
+        // filtering (they are team-bound instances, never in the base set).
+        for t in team_tools {
+            child_registry.register(t);
+        }
 
         let ts_sum = toolset_summary(&req.toolsets);
         let mut agent = Agent::new(child_agent_cfg, child_registry, child_ctx)?;
@@ -528,6 +547,8 @@ pub(crate) fn specs_to_requests(
         subagent_type: None,
         load_skills: Vec::new(),
         prompt_append: None,
+        team: None,
+        name: None,
     })
     .collect()
 }

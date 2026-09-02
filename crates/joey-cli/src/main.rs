@@ -9,6 +9,8 @@
 
 mod commands;
 mod clipboard;
+#[allow(unused)]
+mod copilot_cmd;
 mod engine;
 mod history;
 mod hypercode;
@@ -22,6 +24,7 @@ mod cron_cmd;
 mod discover;
 mod doctor_cmd;
 mod mcp_cmd;
+mod mcp_tools;
 mod model_catalog;
 mod animation;
 mod capability;
@@ -42,6 +45,10 @@ mod speckit_cmd;
 mod speckit_slash;
 mod tools_cmd;
 mod tui;
+
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod hypercode_tests;
 
 use std::sync::OnceLock;
 
@@ -205,6 +212,8 @@ enum Command {
     Mcp(mcp_cmd::McpArgs),
     /// Search, install, configure, and manage skills
     Skills(skills_cmd::SkillsArgs),
+    /// Install and manage GitHub Copilot plugins; parse the project's .github/
+    Copilot(copilot_cmd::CopilotArgs),
     /// Discover local model servers (Ollama, LM Studio, llama.cpp, etc.)
     Discover,
     /// Print the resolved home directory (joey extension)
@@ -573,6 +582,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Some(Command::Doctor(args)) => doctor_cmd::doctor_command(&args),
         Some(Command::Tools(args)) => tools_cmd::tools_command(&args),
         Some(Command::Skills(args)) => skills_cmd::skills_command(&args),
+        Some(Command::Copilot(args)) => copilot_cmd::copilot_command(&args),
         Some(Command::Discover) => {
             discover::run_discover().await;
             Ok(0)

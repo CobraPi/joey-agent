@@ -103,6 +103,7 @@ pub static REGISTRY: &[CommandDef] = &[
     cmd!("reload-skills", &["reload_skills"], "Re-scan ~/.joey/skills/ for newly installed or removed skills", "Tools & Skills", "", true),
     cmd!("browser", &[], "Connect browser tools to your live Chromium-family browser via CDP", "Tools & Skills", "[connect|disconnect|status]", true),
     cmd!("plugins", &[], "List installed plugins and their status", "Tools & Skills", "", true),
+    cmd!("copilot", &[], "GitHub Copilot integration: status of the project's .github/ (instructions, prompts, skills, mcp.json) + installed plugins", "Tools & Skills", "[status|list|install <src>|remove <name>|update [name]]", true),
     // Spec-Kit workflow (speckit_slash.rs — full lifecycle)
     cmd!("speckit-constitution", &[], "Create or update the project constitution from interactive Q&A", "Spec-Kit", "[guidelines...]", true),
     cmd!("speckit-specify", &[], "Create or update the feature specification from a description", "Spec-Kit", "<feature description>", true),
@@ -296,5 +297,20 @@ mod tests {
         let def = lookup("compact").unwrap();
         assert_eq!(def.name, "compress");
         assert!(def.implemented);
+    }
+
+    #[test]
+    fn copilot_command_is_registered_and_resolves() {
+        // /copilot (joey extension): registered, implemented, resolves with
+        // its subcommand preserved in the arg tail.
+        let def = lookup("copilot").expect("/copilot must be registered");
+        assert!(def.implemented);
+        match resolve("/copilot status") {
+            Resolution::Command { def, rest } => {
+                assert_eq!(def.name, "copilot");
+                assert_eq!(rest.trim(), "status");
+            }
+            _ => panic!("expected /copilot status to resolve"),
+        }
     }
 }

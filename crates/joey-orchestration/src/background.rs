@@ -260,6 +260,7 @@ pub(crate) fn format_completion_notice(
     goal: &str,
     stopped_reason: Option<StopReason>,
     result: &DelegationResult,
+    team_member: Option<&(String, String)>,
 ) -> String {
     let (tag, outcome, body) = if let Some(reason) = stopped_reason {
         // Stopped children keep their partial result as the body (FR-010).
@@ -277,12 +278,18 @@ pub(crate) fn format_completion_notice(
                 .unwrap_or_else(|| result.summary.clone()),
         )
     };
-    format!(
+    let mut s = format!(
         "[SUBAGENT {tag}] id={child_id} goal={goal} outcome={outcome} tokens={} duration={:.1}s\n{}",
         result.token_usage.total_tokens,
         result.wall_clock.as_secs_f64(),
         truncate_summary(&body),
-    )
+    );
+    // T008 (spec 022): team children identify their team/member. The
+    // None path stays byte-identical to the pre-team format (SC-005 parity).
+    if let Some((team, member)) = team_member {
+        s.push_str(&format!("\nteam: {team} member: {member}"));
+    }
+    s
 }
 
 /// Build the T012 completion tap: on each finished child, distill a notice
@@ -305,11 +312,14 @@ fn completion_notice_tap(manager: &SubagentManager, ctx: ToolContext) -> Backgro
             // result's own stop_reason (if a future wave populates it) wins.
             _ => completion.result.stop_reason,
         };
+        // T008 (spec 022): identify the team member for team children.
+        let team_member = crate::team::global_teams().member_by_child_id(completion.child_id);
         let notice = format_completion_notice(
             completion.child_id,
             &completion.result.goal,
             stopped_reason,
             &completion.result,
+            team_member.as_ref(),
         );
         ctx.push_background_completion(joey_tools::context::BackgroundCompletion {
             // Correlates the notice with the work handle's child_id.
@@ -663,4 +673,59 @@ fn spawn_wave(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_result() -> DelegationResult {
+        DelegationResult {
+            goal: "g".to_string(),
+            summary: "s".to_string(),
+            success: true,
+            error: None,
+            token_usage: joey_providers::Usage::default(),
+            wall_clock: std::time::Duration::from_secs(1),
+            model: "m".to_string(),
+            iterations: 1,
+            persisted_session_id: None,
+            stop_reason: None,
+        }
+    }
+
+    #[test]
+    fn completion_notice_identifies_team_member() {
+        let result = test_result();
+        // (a) No team: plain notice, no team line.
+        let plain = format_completion_notice(1, "g", None, &result, None);
+        assert!(
+            plain.contains("[SUBAGENT COMPLETE] id=1 goal=g"),
+            "unexpected notice: {plain:?}"
+        );
+        assert!(!plain.contains("team:"), "unexpected team line: {plain:?}");
+        // (b) Team child: appended team/member identification line.
+        let teamed = format_completion_notice(
+            1,
+            "g",
+            None,
+            &result,
+            Some(&("myteam".to_string(), "alice".to_string())),
+        );
+        assert!(
+            teamed.contains("\nteam: myteam member: alice"),
+            "missing team line: {teamed:?}"
+        );
+    }
+
+    #[test]
+    fn completion_notice_byte_parity_without_team() {
+        let result = test_result();
+        let notice = format_completion_notice(1, "g", None, &result, None);
+        // tokens=0 (Usage::default), duration=1.0s (from_secs(1)), body "s".
+        assert_eq!(
+            notice,
+            "[SUBAGENT COMPLETE] id=1 goal=g outcome=success tokens=0 duration=1.0s\ns"
+        );
+    }
 }

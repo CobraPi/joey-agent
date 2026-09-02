@@ -22,9 +22,9 @@ mod schema;
 mod security;
 
 pub use config::{
-    build_safe_env, interpolate_env_vars, load_server_configs, resolve_stdio_command,
-    ServerConfig, ToolsFilter, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TOOL_TIMEOUT,
-    MAX_BACKOFF_SECONDS, MAX_INITIAL_CONNECT_RETRIES,
+    build_safe_env, interpolate_env_vars, load_server_configs, merge_project_server_configs,
+    resolve_stdio_command, ServerConfig, ToolsFilter, DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_TOOL_TIMEOUT, MAX_BACKOFF_SECONDS, MAX_INITIAL_CONNECT_RETRIES,
 };
 pub use result::sanitize_error;
 pub use schema::{normalize_mcp_input_schema, strip_nullable_unions};

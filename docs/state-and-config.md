@@ -151,6 +151,18 @@ prompt on the same provider/model; N counts extra attempts after the initial
 run, 0 disables). Each retry is surfaced as an `AgentEvent::RetryAttempt` on
 the child's event stream.
 
+**hypercode.team** (feature 022, off by default):
+`hypercode.team.enabled` (false) — feature gate; disabled sessions behave
+byte-identically to plain delegation. `hypercode.team.lead_model` ("") —
+team-lead model override; empty inherits the orchestrator's effective
+model. `hypercode.team.max_members` (8) — hard cap on members per team.
+`hypercode.team.max_parallel_members` (4) — advisory cap on
+concurrently-running teammates (lead directive).
+`hypercode.team.message_limit` (10) — pending messages per inbox
+(drop-oldest). `hypercode.team.poll_interval_ms` (500) — teammate mailbox
+poll cadence hint. `hypercode.team.cleanup_days` (7) — retention window for
+persisted task lists.
+
 **code_execution**: `code_execution.mode` ("project").
 
 **display**: `display.compact` (false), `display.tool_progress` ("all"),
@@ -245,6 +257,7 @@ process-local override (profiles) → `JOEY_HOME` env → platform default
   hooks/               hooks
   image_cache/ audio_cache/
   profiles/<name>/     full per-profile homes (see §5)
+  teams/               feature 022: per-team config.json, tasks.json, inboxes/<member>.json
 ```
 
 `ensure_home()` creates this skeleton with 0700 dirs / 0600 SOUL.md, refuses

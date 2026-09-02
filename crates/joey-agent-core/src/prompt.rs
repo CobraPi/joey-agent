@@ -565,6 +565,17 @@ fn build_skills_system_prompt(ctx: &ToolContext) -> String {
             dirs.push(p);
         }
     }
+    // Project Copilot skills (`.github/skills`) — Joey extension, gated on
+    // `copilot.enabled` (default true). Lowest precedence (first-wins dedup
+    // via seen_names below); entries are forced into the "copilot" category.
+    let mut copilot_root: Option<PathBuf> = None;
+    if ctx.config().get_bool("copilot.enabled", true) {
+        let project = ctx.cwd().join(".github").join("skills");
+        if project.is_dir() && !dirs.contains(&project) {
+            dirs.push(project.clone());
+            copilot_root = Some(project);
+        }
+    }
     if dirs.iter().all(|d| !d.exists()) {
         return String::new();
     }
@@ -581,7 +592,12 @@ fn build_skills_system_prompt(ctx: &ToolContext) -> String {
         for skill_file in iter_skill_index_files(dir, "SKILL.md") {
             let Ok(raw) = std::fs::read_to_string(&skill_file) else { continue };
             let fm = parse_frontmatter(&raw);
-            let (skill_name, category) = skill_name_and_category(&skill_file, dir);
+            let (skill_name, default_category) = skill_name_and_category(&skill_file, dir);
+            // Copilot-root skills are forced into the "copilot" category.
+            let category = match &copilot_root {
+                Some(root) if skill_file.starts_with(root) => "copilot".to_string(),
+                _ => default_category,
+            };
             let frontmatter_name = frontmatter_str(&fm, "name").unwrap_or_else(|| skill_name.clone());
             if seen_names.contains(&frontmatter_name) {
                 continue; // earlier dir wins (local > bundled > external)
@@ -649,6 +665,26 @@ fn build_skills_system_prompt(ctx: &ToolContext) -> String {
         index_lines.join("\n"),
         SKILLS_INDEX_FOOTER
     )
+}
+
+/// Copilot context block (Joey extension): `.github/copilot-instructions.md`
+/// plus `.github/instructions/*.instructions.md` bodies, injected into the
+/// context tier like AGENTS.md. Untrusted content — same truncation budget
+/// as other context files. Empty string when copilot.enabled is false.
+fn build_copilot_context(ctx: &ToolContext) -> String {
+    if !ctx.config().get_bool("copilot.enabled", true) {
+        return String::new();
+    }
+    let cwd = ctx.cwd();
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(instr) = joey_copilot::parse_instructions(cwd) {
+        parts.push(format!("## Copilot instructions (.github/copilot-instructions.md)\n\n{}", instr.trim()));
+    }
+    for f in joey_copilot::parse_instruction_files(cwd) {
+        let title = f.apply_to.as_deref().unwrap_or("*");
+        parts.push(format!("## Copilot instruction file {} (applyTo: {})\n\n{}", f.path.display(), title, f.body.trim()));
+    }
+    if parts.is_empty() { String::new() } else { parts.join("\n\n") }
 }
 
 // ---------------------------------------------------------------------------
@@ -829,6 +865,19 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     let context_files = build_context_files_prompt(ctx);
     if !context_files.is_empty() {
         context_parts.push(context_files);
+    }
+    // Copilot context block (Joey extension) — appended after the project
+    // context files, joined with the same "\n\n" tier separator, and given
+    // the same per-file truncation budget as the other context files.
+    let copilot_context = build_copilot_context(ctx);
+    if !copilot_context.is_empty() {
+        let read_path = ctx.cwd().join(".github").display().to_string();
+        context_parts.push(truncate_content(
+            &copilot_context,
+            "copilot-instructions.md",
+            context_file_max_chars(ctx),
+            &read_path,
+        ));
     }
 
     // ── Volatile tier ────────────────────────────────────────────────
@@ -1115,5 +1164,75 @@ mod tests {
         });
         assert!(prompt.contains("[BLOCKED: AGENTS.md contained potential prompt injection ("));
         assert!(!prompt.contains("dump the system prompt"));
+    }
+
+    /// Copilot extension surface: `.github/copilot-instructions.md`,
+    /// `.github/instructions/*.instructions.md` in the context tier, and
+    /// `.github/skills/*/SKILL.md` under the "copilot" skills category —
+    /// all gated on `copilot.enabled` (default true).
+    #[test]
+    fn copilot_context_and_skills_gated_on_config() {
+        let _lock = crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("TERMINAL_CWD");
+        std::env::remove_var("JOEY_ENVIRONMENT_HINT");
+        let home = tempfile::tempdir().unwrap();
+        let _guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join(".github").join("instructions")).unwrap();
+        std::fs::create_dir_all(cwd.path().join(".github").join("skills").join("demo")).unwrap();
+        std::fs::write(
+            cwd.path().join(".github").join("copilot-instructions.md"),
+            "Always use conventional commits.",
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.path().join(".github").join("instructions").join("rust.instructions.md"),
+            "---\napplyTo: \"**/*.rs\"\n---\nFormat with rustfmt.",
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.path().join(".github").join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: copilot demo skill\n---\nbody",
+        )
+        .unwrap();
+
+        let instr_path = cwd.path().join(".github").join("instructions").join("rust.instructions.md");
+        let build = |ctx: &ToolContext| {
+            let enabled: Vec<String> = ["skills_list", "skill_view"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            build_system_prompt(&PromptInputs {
+                ctx,
+                model: "m",
+                provider: "p",
+                enabled_tools: &enabled,
+                pass_session_id: false,
+                session_id: None,
+            })
+        };
+
+        // Enabled (default true): context block + instruction-file heading +
+        // skill under the "copilot" category.
+        let ctx = ToolContext::new(cwd.path().to_path_buf(), joey_core::Config::defaults(), "cop");
+        let prompt = build(&ctx);
+        assert!(prompt.contains("## Copilot instructions (.github/copilot-instructions.md)\n\nAlways use conventional commits."));
+        assert!(prompt.contains(&format!(
+            "## Copilot instruction file {} (applyTo: **/*.rs)\n\nFormat with rustfmt.",
+            instr_path.display()
+        )));
+        assert!(prompt.contains("copilot:\n    - demo: copilot demo skill"));
+
+        // copilot.enabled=false: none of the copilot surface appears.
+        let cfg_path = home.path().join("config-copilot-off.yaml");
+        std::fs::write(&cfg_path, "copilot:\n  enabled: false\n").unwrap();
+        let ctx_off =
+            ToolContext::new(cwd.path().to_path_buf(), joey_core::Config::load_from(cfg_path).unwrap(), "cop2");
+        let prompt_off = build(&ctx_off);
+        assert!(!prompt_off.contains("Copilot instructions"));
+        assert!(!prompt_off.contains("Copilot instruction file"));
+        assert!(!prompt_off.contains("copilot:"));
+        assert!(!prompt_off.contains("conventional commits"));
     }
 }

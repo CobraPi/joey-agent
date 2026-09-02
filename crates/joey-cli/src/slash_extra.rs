@@ -1350,7 +1350,11 @@ pub fn kanban_lines(cwd: &std::path::Path) -> Lines {
 /// changes; live clients reconnect lazily.
 pub fn reload_mcp_lines() -> Lines {
     let config = Config::load().unwrap_or_else(|_| Config::defaults());
-    let servers = joey_mcp::load_server_configs(&config);
+    let mut servers = joey_mcp::load_server_configs(&config);
+    if config.get_bool("copilot.enabled", true) && std::env::var("JOEY_SAFE_MODE").map(|v| !v.is_empty() && v != "0").unwrap_or(false) == false {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        servers = joey_mcp::merge_project_server_configs(servers, joey_copilot::parse_mcp_servers(&cwd).as_ref());
+    }
     let mut out = Lines::default();
     if servers.is_empty() {
         out.push("No MCP servers configured (mcp_servers in config.yaml). Add one: joey mcp add <name> --command <cmd>");

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 joey-core.workspace = true
+joey-copilot.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

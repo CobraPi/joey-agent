@@ -1459,6 +1459,10 @@ async fn interactive_loop(mut session: TuiSession) -> (anyhow::Result<()>, Outro
         .subagent_manager
         .shutdown(session.engine_spec.wind_down_timeout())
         .await;
+    // Feature 022 (FR-012): team cleanup on TUI quit (same as REPL
+    // end_session).
+    joey_orchestration::team::global_teams()
+        .close_all(&session.engine_spec.subagent_manager);
     end_session_by_id(&session_id, "user_exit");
     let (message_count, user_messages, tool_calls, title) = outro_stats(&session_id);
     (
@@ -2325,6 +2329,14 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                     });
                 }
             }
+            "copilot" => {
+                let args_s = slash_args_after(input, "copilot");
+                let (sub, rest) = match args_s.split_once(' ') { Some((s, r)) => (s, r.trim()), None => (args_s.trim(), "") };
+                match crate::copilot_cmd::slash_response_lines(sub, rest) {
+                    Some(text) => { for line in text.lines() { self.tui.app_mut().push_item(TranscriptItem::Notice { text: line.to_string(), kind: NoticeKind::Info }); } }
+                    None => self.tui.app_mut().push_item(TranscriptItem::Error { text: format!("unknown /copilot subcommand: {sub}") }),
+                }
+            }
             "subscription" | "upgrade" => {
                 for l in crate::slash_extra::subscription_lines().0 {
                     self.tui.app_mut().push_item(TranscriptItem::Notice {
@@ -2473,6 +2485,39 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                 }
             }
             name => {
+                // Joey extension: fall back to Copilot prompt files
+                // (.github/prompts or installed plugins) — /name [args]
+                // expands to the prompt body and runs one agent turn on the
+                // engine (same submission path as the speckit lifecycle arm).
+                {
+                    let lower = name.to_lowercase();
+                    let user_args = slash_args_after(input, name).trim().to_string();
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    if let Some((body, _mode)) = crate::copilot_cmd::find_prompt_body(&lower, &cwd) {
+                        let prompt = if user_args.is_empty() { body } else { format!("{body}\n\n{user_args}") };
+                        self.tui.app_mut().push_item(TranscriptItem::Notice {
+                            text: format!("🧭 Copilot prompt '/{lower}' expanded — running"),
+                            kind: NoticeKind::Info,
+                        });
+                        if let Some(engine) = &self.engine {
+                            let active_agent = self
+                                .tui
+                                .app()
+                                .agent_roster
+                                .get(self.tui.app().active_agent_index)
+                                .map(|a| a.name.clone())
+                                .unwrap_or_else(|| "default".to_string());
+                            engine.send(crate::engine::EngineCommand::Submit {
+                                prompt,
+                                active_agent,
+                                announce: false,
+                            });
+                            self.busy = true;
+                            self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
+                        }
+                        return false;
+                    }
+                }
                 self.tui.app_mut().push_item(TranscriptItem::Notice {
                     text: format!(
                         "/{} isn't wired into the TUI yet — run joey --cli to use it.",

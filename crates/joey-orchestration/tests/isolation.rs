@@ -74,6 +74,8 @@ async fn context_field_is_passed_to_subagent() {
         subagent_type: None,
         load_skills: Vec::new(),
         prompt_append: None,
+        team: None,
+        name: None,
     };
 
     let result = mgr

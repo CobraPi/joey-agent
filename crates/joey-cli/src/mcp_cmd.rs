@@ -361,10 +361,57 @@ fn remove(name: &str) -> Result<i32> {
 
 fn list() -> Result<i32> {
     let config = joey_core::Config::load()?;
-    let servers = match config.get("mcp_servers") {
+    let mut servers = match config.get("mcp_servers") {
         Some(Value::Mapping(m)) => m.clone(),
         _ => Mapping::new(),
     };
+    // Joey extension: merge project MCP servers (.github/mcp.json) into the
+    // listing for display — user config wins on name clashes (same merge as
+    // /reload-mcp). Surviving project entries join the table below.
+    let mut project_merged = 0usize;
+    if config.get_bool("copilot.enabled", true)
+        && !std::env::var("JOEY_SAFE_MODE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    {
+        let base = joey_mcp::load_server_configs(&config);
+        let base_count = base.len();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let merged = joey_mcp::merge_project_server_configs(
+            base,
+            joey_copilot::parse_mcp_servers(&cwd).as_ref(),
+        );
+        // merge appends surviving project entries after the base ones, so the
+        // tail of the IndexMap is exactly what the project contributed.
+        project_merged = merged.len().saturating_sub(base_count);
+        for (name, sc) in merged.iter().skip(base_count) {
+            let mut entry = Mapping::new();
+            if let Some(url) = &sc.url {
+                entry.insert(skey("url"), Value::String(url.clone()));
+            }
+            if let Some(cmd) = &sc.command {
+                entry.insert(skey("command"), Value::String(cmd.clone()));
+            }
+            if !sc.args.is_empty() {
+                entry.insert(
+                    skey("args"),
+                    Value::Sequence(
+                        sc.args.iter().map(|a| Value::String(a.clone())).collect(),
+                    ),
+                );
+            }
+            let mut tools = Mapping::new();
+            if let Some(inc) = &sc.tools.include {
+                tools.insert(skey("include"), inc.clone());
+            } else if let Some(exc) = &sc.tools.exclude {
+                tools.insert(skey("exclude"), exc.clone());
+            }
+            if !tools.is_empty() {
+                entry.insert(skey("tools"), Value::Mapping(tools));
+            }
+            servers.insert(skey(name), Value::Mapping(entry));
+        }
+    }
     if servers.is_empty() {
         println!();
         info("No MCP servers configured.");
@@ -425,6 +472,10 @@ fn list() -> Result<i32> {
             Color::DarkGray.paint("✗ disabled").to_string()
         };
         println!("  {:<16} {:<30} {:<12} {}", name, transport, tools_str, status);
+    }
+    if project_merged > 0 {
+        println!();
+        println!("  (+{project_merged} from .github/mcp.json — project servers; user config wins on clashes)");
     }
     println!();
     Ok(0)

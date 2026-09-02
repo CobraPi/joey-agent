@@ -199,6 +199,14 @@ static TOOLSETS: Lazy<HashMap<&'static str, Toolset>> = Lazy::new(|| {
             includes: &[],
         },
     );
+    m.insert(
+        "team",
+        Toolset {
+            description: "Agent-team collaboration (feature 022): shared task list, member mailboxes, team status",
+            tools: &["team_status", "team_message", "team_tasks"],
+            includes: &[],
+        },
+    );
     // Scenario-specific toolsets
     m.insert(
         "debugging",
@@ -389,6 +397,14 @@ mod tests {
         assert_eq!(resolve("session_search"), vec!["session_search"]);
         assert_eq!(resolve("clarify"), vec!["clarify"]);
         assert_eq!(resolve("cronjob"), vec!["cronjob"]);
+    }
+
+    #[test]
+    fn team_toolset_resolves_three_tools() {
+        assert_eq!(
+            resolve("team"),
+            vec!["team_message", "team_status", "team_tasks"]
+        );
     }
 
     #[test]

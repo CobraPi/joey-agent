@@ -173,6 +173,13 @@ pub struct DelegationRequest {
     pub load_skills: Vec<String>,
     /// Text prepended to the subagent's system prompt (from category config).
     pub prompt_append: Option<String>,
+    /// Team mode (feature 022): when set, the spawned child registers as a
+    /// member of this team. The first spawn for a team name lazily creates
+    /// the team; that child is the lead (Orchestrator role).
+    pub team: Option<String>,
+    /// Member name (mailbox identity) when `team` is set. Defaults to the
+    /// child id at dispatch time.
+    pub name: Option<String>,
 }
 
 impl DelegationRequest {
@@ -194,6 +201,8 @@ impl DelegationRequest {
             subagent_type: None,
             load_skills: Vec::new(),
             prompt_append: None,
+            team: None,
+            name: None,
         }
     }
 }

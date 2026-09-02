@@ -89,6 +89,10 @@ subsystem you're working on:
     bundled skill workflows as agent turns, `/speckit-status` readiness.
 19. [`speckit-ui-launcher.md`](speckit-ui-launcher.md) — launch recipe for
     the SpecKit visual UI (`joey speckit`).
+20. [`copilot.md`](copilot.md) — native GitHub Copilot `.github/`
+    integration: copilot-instructions.md / instructions / prompts / skills
+    parsing, the `joey copilot` plugin installer, `/copilot` + `/<prompt>`
+    slash commands, and `.github/mcp.json` merge semantics.
 
 All pages were verified against workspace source in August 2026. If code
 and docs disagree, the code wins — and please fix the doc.

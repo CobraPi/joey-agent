@@ -11,6 +11,7 @@ pub mod control_tool;
 pub mod delegation_tool;
 pub mod manager;
 pub mod subagent;
+pub mod team;
 pub mod tap;
 pub mod types;
 
@@ -123,6 +124,18 @@ fn register_orchestration_inner(
     // registry as delegate_task — steer/stop any child this manager
     // dispatched (blocking or background).
     registry.register(std::sync::Arc::new(SubagentControl::new(manager.clone())));
+    // Feature 022 (agent teams): shared task list + mailbox tools.
+    // Registered unconditionally — exposure is scoped by the `team`
+    // toolset, and the spawn-time gate in delegate_task errors
+    // `team mode is disabled` unless hypercode.team.enabled is set, so
+    // team-disabled sessions stay byte-identical (SC-005) without a
+    // public register_* signature change.
+    let team_message_limit = parent_config_tree
+        .get_i64("hypercode.team.message_limit", 10)
+        .max(1) as usize;
+    registry.register(std::sync::Arc::new(team::TeamStatusTool::new()));
+    registry.register(std::sync::Arc::new(team::TeamMessageTool::new(team_message_limit)));
+    registry.register(std::sync::Arc::new(team::TeamTasksTool::new()));
     // Register call_omo_agent WITH the resolver: it requires
     // `subagent_type` resolution to succeed — a None resolver made the
     // tool permanently error ("requires an OMO category resolver"),

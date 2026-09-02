@@ -618,9 +618,32 @@ impl Tool for SubagentControl {
                 }
             }
             "stop" => match self.manager.stop_child(id, StopReason::OrchestratorRequested) {
-                Ok(()) => ToolResult::Text(format!(
-                    "stop requested for child {id} (reason: orchestrator-requested)"
-                )),
+                Ok(()) => {
+                    // Feature 022 (FR-015): a stopped team child's claimed
+                    // Running tasks return to Pending and become claimable.
+                    let mut msg = format!(
+                        "stop requested for child {id} (reason: orchestrator-requested)"
+                    );
+                    if let Some((team_name, member)) =
+                        crate::team::global_teams().member_by_child_id(id)
+                    {
+                        if let Some(rec) = crate::team::global_teams().get(&team_name) {
+                            let n = {
+                                let mut r = rec.lock().unwrap();
+                                r.release_member_tasks(&member)
+                            };
+                            if n > 0 {
+                                msg.push_str(&format!(
+                                    "; {n} team task(s) returned to Pending"
+                                ));
+                            }
+                            crate::team::global_teams().push_notice(format!(
+                                "[TEAM] {team_name}/{member} stopped by user"
+                            ));
+                        }
+                    }
+                    ToolResult::Text(msg)
+                }
                 Err(e) => ToolResult::Error(e),
             },
             "status" => self.action_status(id),
@@ -685,5 +708,69 @@ mod tests {
         assert_eq!(parse_id(Some(&json!("x"))), None);
         assert_eq!(parse_id(None), None);
         assert_eq!(parse_id(Some(&json!(-1))), None);
+    }
+
+    /// Feature 022 (FR-015): stopping a team child releases its claimed
+    /// Running tasks back to Pending. Env-guarded via JOEY_HOME because
+    /// register_spawn persists team state through default_home().
+    #[tokio::test]
+    async fn stop_releases_team_tasks_to_pending() {
+        let _env = crate::team::TEST_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("JOEY_HOME", home.path());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "hypercode:\n  team:\n    enabled: true\n").unwrap();
+        let tree = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+
+        let mgr = Arc::new(SubagentManager::new(crate::manager::ManagerConfig::default()));
+        mgr.pre_register_child(
+            9,
+            crate::types::TaskSpec {
+                goal: "t".into(),
+                context: None,
+                model: None,
+                toolsets: vec![],
+                role: None,
+                background: false,
+                budgets: None,
+            },
+        );
+        let team = format!("ctrl-stop-{}", uuid::Uuid::new_v4().simple());
+        crate::team::register_spawn(&tree, &team, None, "obj", "explorer").unwrap();
+        crate::team::register_spawn(&tree, &team, Some("alice"), "obj", "explorer").unwrap();
+        let rec = crate::team::global_teams().get(&team).expect("team exists");
+        let task_id = {
+            let mut r = rec.lock().unwrap();
+            let id = r.add_task("work", vec![]);
+            r.claim(&id, "alice").unwrap();
+            id
+        };
+        crate::team::record_member_child_id(&team, "alice", 9);
+
+        let tool = SubagentControl::new(mgr.clone());
+        let ctx = ToolContext::new(
+            std::env::temp_dir(),
+            joey_core::Config::defaults(),
+            "t".to_string(),
+        );
+        let out = tool
+            .execute(json!({"action": "stop", "id": 9}), &ctx)
+            .await;
+        match out {
+            ToolResult::Text(msg) => {
+                assert!(msg.contains("returned to Pending"), "msg: {msg}");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        {
+            let r = rec.lock().unwrap();
+            let t = r.tasks.iter().find(|t| t.id == task_id).unwrap();
+            assert_eq!(t.status, crate::team::TeamTaskStatus::Pending);
+            assert!(t.claimed_by.is_none());
+        }
+        // Clean up: close the team record (unique names avoid collisions,
+        // but closing keeps the one-active-team rule clear for later tests).
+        rec.lock().unwrap().close();
+        std::env::remove_var("JOEY_HOME");
     }
 }

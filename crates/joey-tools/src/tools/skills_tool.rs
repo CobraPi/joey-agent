@@ -83,6 +83,19 @@ pub fn discover_with(ctx: Option<&ToolContext>) -> Vec<SkillEntry> {
         dirs.push(bundled);
     }
     dirs.extend(external_dirs(ctx));
+    // Project Copilot skills (`.github/skills`) — Joey extension, gated on
+    // `copilot.enabled` (default true). Lowest precedence: user skills >
+    // bundled > external > project .github (first-name-wins dedup above).
+    let mut copilot_root: Option<PathBuf> = None;
+    if ctx.map(|c| c.config().get_bool("copilot.enabled", true)).unwrap_or(true) {
+        let project = ctx
+            .map(|c| c.cwd().join(".github").join("skills"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".github/skills"));
+        if project.is_dir() && !dirs.contains(&project) {
+            dirs.push(project.clone());
+            copilot_root = Some(project);
+        }
+    }
     let disabled = disabled_skills(ctx);
 
     let mut out: Vec<SkillEntry> = Vec::new();
@@ -150,7 +163,10 @@ pub fn discover_with(ctx: Option<&ToolContext>) -> Vec<SkillEntry> {
             out.push(SkillEntry {
                 name,
                 description,
-                category: category_from_path(&skill_md, &dir),
+                category: match &copilot_root {
+                    Some(root) if skill_md.starts_with(root) => Some("copilot".to_string()),
+                    _ => category_from_path(&skill_md, &dir),
+                },
                 path: skill_md,
             });
         }
@@ -734,5 +750,60 @@ mod tests {
         let v = parse(&SkillsList.execute(json!({}), &ctx).await);
         // The only skill is disabled → empty listing message.
         assert_eq!(v["message"], "No skills found in skills/ directory.");
+    }
+
+    // ── Copilot project skills (`.github/skills`) ───────────────────────
+
+    #[test]
+    fn copilot_project_skills_discovered_with_copilot_category() {
+        let (_ctx, _g, home) = setup_home();
+        let project = tempfile::tempdir().unwrap();
+        let skill_dir = project.path().join(".github").join("skills").join("demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: copilot demo skill\n---\n\n# demo\nBody.\n",
+        )
+        .unwrap();
+
+        // Enabled (default true): discovered under the forced "copilot" category.
+        let ctx = ToolContext::new(project.path().to_path_buf(), Config::defaults(), "s3");
+        let skills = discover_with(Some(&ctx));
+        let demo = skills.iter().find(|s| s.name == "demo").expect("demo discovered");
+        assert_eq!(demo.category.as_deref(), Some("copilot"));
+        assert!(demo.path.starts_with(&project.path()));
+
+        // copilot.enabled=false: the project skill is absent.
+        let cfg_path = home.join("config-disabled.yaml");
+        std::fs::write(&cfg_path, "copilot:\n  enabled: false\n").unwrap();
+        let ctx_off = ToolContext::new(
+            project.path().to_path_buf(),
+            Config::load_from(cfg_path).unwrap(),
+            "s4",
+        );
+        let skills_off = discover_with(Some(&ctx_off));
+        assert!(skills_off.iter().all(|s| s.name != "demo"), "demo must be gated off");
+    }
+
+    #[test]
+    fn copilot_skill_loses_name_clash_to_user_skills() {
+        let (_ctx, _g, home) = setup_home();
+        make_skill(&home, None, "clash", "user-dir version");
+        let project = tempfile::tempdir().unwrap();
+        let skill_dir = project.path().join(".github").join("skills").join("clash");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: clash\ndescription: copilot version\n---\n\n# clash\nBody.\n",
+        )
+        .unwrap();
+        let ctx = ToolContext::new(project.path().to_path_buf(), Config::defaults(), "s5");
+        let skills = discover_with(Some(&ctx));
+        let hits: Vec<&SkillEntry> = skills.iter().filter(|s| s.name == "clash").collect();
+        assert_eq!(hits.len(), 1, "first-name-wins dedup must collapse the clash");
+        assert!(
+            hits[0].path.starts_with(&home),
+            "user skills dir wins over project .github"
+        );
     }
 }

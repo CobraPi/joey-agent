@@ -231,3 +231,53 @@ custom categories, wires `OmoCategoryResolver` into delegate_task, detects
 intent keywords per message, injects active-goal context, and Tab/number
 switching between primary agents (`omo_render.rs`). The TUI adds an OMO
 agent panel.
+
+## 3. HyperCode Agent Teams (feature 022, `hypercode.team.*`)
+
+Execution layer for team mode — file-backed shared task list + per-member
+mailboxes hosted in `joey-orchestration/src/team.rs` (the joey-omo team
+mode above stays untouched, in-memory and unused by this path). OFF by
+default (`hypercode.team.enabled: false`); disabled sessions behave
+byte-identically to plain subagent delegation.
+
+### Starting a team
+
+`delegate_task` accepts two optional parameters: `team` (team name) and
+`name` (member mailbox identity). The first `team` reference lazily creates
+the team — that child is the LEAD: an Orchestrator-role child with the
+team-lead directive (decompose the objective → `team_tasks add` with
+dependencies → spawn teammates with explorer/implementor role profiles →
+synthesize) and the `delegation` + `team` toolsets. Later references spawn
+TEAMMATES: Leaf children keeping their role toolset plus `team` — they never
+receive `delegate_task` (no nested teams, no background subagents from
+mates). At most one team is active per session. Spawning errors
+`team mode is disabled` unless enabled.
+
+### Shared task list + mailboxes
+
+Toolset `team`: `team_status`, `team_message` (direct member-to-member
+delivery, drop-oldest at `hypercode.team.message_limit`), `team_tasks`
+(add/list/claim/complete/release; a claim requires Pending status and all
+dependencies Done — exactly one winner under concurrency). State persists
+synchronously under `~/.joey/teams/<team>/` (config.json, tasks.json,
+inboxes/<member>.json); an in-process registry is the claiming authority.
+
+### Lifecycle + visibility
+
+A stopped or failed team child releases its claimed Running tasks back to
+Pending; completion notices identify `team: <team> member: <member>`;
+`subagent_control stop` on a teammate likewise frees its tasks. Session end
+winds every active team down and removes config.json + inboxes/ while
+RETAINING tasks.json for resumption; startup purges team dirs older than
+`hypercode.team.cleanup_days` (default 7).
+
+### HyperCode routing
+
+The orchestrator overlay documents when to use teams (independent,
+parallelizable work) vs subagents (sequential, same-file, interdependent).
+`/hypercode run` routes to team mode when team mode is enabled and the
+planner decomposition yields ≥2 workstreams (no explicit workstreams); the
+lead runs on `hypercode.team.lead_model` (empty = inherit the
+orchestrator's effective model). Each run records its decision in
+`HypercodeReport.mode_decisions` as `mode=<subagent|team> task=<summary>
+rationale=<text>`.

@@ -462,6 +462,30 @@ pub struct SubagentManager {
     child_pool_owner: bool,
 }
 
+/// Feature 022 (FR-014/FR-015): a finishing team child releases its
+/// claimed tasks on failure and surfaces a team notice either way.
+pub(crate) fn team_child_finished(req: &DelegationRequest, success: bool) {
+    if let (Some(team_name), Some(member)) = (req.team.as_deref(), req.name.as_deref()) {
+        if let Some(rec) = crate::team::global_teams().get(team_name) {
+            let released = if !success {
+                let mut r = rec.lock().unwrap();
+                r.release_member_tasks(member)
+            } else {
+                0
+            };
+            let tail = if success {
+                String::new()
+            } else {
+                format!("; {released} task(s) returned to Pending")
+            };
+            crate::team::global_teams().push_notice(format!(
+                "[TEAM] {team_name}/{member} {}{tail}",
+                if success { "finished" } else { "failed" }
+            ));
+        }
+    }
+}
+
 impl SubagentManager {
     /// Create a top-level manager from config.
     pub fn new(config: ManagerConfig) -> Self {
@@ -889,6 +913,42 @@ impl SubagentManager {
         .await
     }
 
+    /// Feature 022 (T006b/T007): per-child team tools. Teammates get bound
+    /// team tools (identity = member name); an Orchestrator-role team child
+    /// (the lead) additionally gets delegate_task on a shared child manager
+    /// so it can spawn teammates (FR-017 role profiles; teammates never get
+    /// it — resolve_enabled_tools strips delegate_task for Leaf/depth-capped
+    /// children, and bound tools never include it).
+    fn team_tools_for(
+        &self,
+        req: &DelegationRequest,
+        parent_config: &AgentConfig,
+        parent_config_tree: &Config,
+        base_registry: &ToolRegistry,
+        event_tx: Option<&mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Vec<Arc<dyn joey_tools::Tool>> {
+        let Some(team_name) = req.team.as_deref() else {
+            return Vec::new();
+        };
+        let member = req.name.clone().unwrap_or_else(|| "lead".to_string());
+        let limit = parent_config_tree
+            .get_i64("hypercode.team.message_limit", 10)
+            .max(1) as usize;
+        let mut tools = crate::team::bound_team_tools(team_name, &member, limit);
+        if req.role == SubagentRole::Orchestrator {
+            let child_mgr = Arc::new(self.shared_child_manager());
+            tools.push(Arc::new(crate::delegation_tool::DelegateTask::new(
+                child_mgr,
+                parent_config.clone(),
+                parent_config_tree.clone(),
+                base_registry.clone(),
+                event_tx.cloned(),
+                None,
+            )));
+        }
+        tools
+    }
+
     /// Internal dispatch with explicit overrides (used by batch dispatch).
     /// `allocated_id` MUST come from [`SubagentManager::next_id`] (the
     /// process-global counter) — the caller mints it so batch dispatch can
@@ -949,6 +1009,7 @@ impl SubagentManager {
             None,
             self.interrupt.clone(),
             self.semaphore.clone(),
+            self.team_tools_for(req, parent_config, parent_config_tree, base_registry, event_tx),
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1062,6 +1123,11 @@ impl SubagentManager {
                     ChildHandle::new(task, child_interrupt.clone(), child_steer.clone()),
                 );
             }
+            // Feature 022 (T007): map the team member to this child id so
+            // team wind-down can stop the right child.
+            if let (Some(team_name), Some(member)) = (req.team.as_deref(), req.name.as_deref()) {
+                crate::team::record_member_child_id(team_name, member, id);
+            }
             // T005: a live child exists — make sure idle parent capacity can
             // be lent to the child pool while the parent stays idle.
             self.ensure_grant_back_watcher();
@@ -1142,6 +1208,8 @@ impl SubagentManager {
             }
         }
 
+        team_child_finished(req, result.success);
+
         // Emit completion/failure event (per-dispatch channel + live tap).
         let done_ev = if result.success {
             let preview: String = result.summary.chars().take(100).collect();
@@ -1176,13 +1244,13 @@ impl SubagentManager {
     /// Dispatch a batch of subagents in parallel (batch mode).
     ///
     /// PARALLEL-SUBAGENT FEATURE: all children in the batch are spawned as
-    /// ONE wave of tokio tasks — no `max_concurrent_children` chunking of
-    /// the waiting list. Admission to actually run is gated by the shared
-    /// provider-request `Semaphore` (each child's provider calls acquire
-    /// permits, FR-018), which is the correct throttle for network-bound
-    /// work; `max_concurrent_children` now only bounds how many children a
-    /// single batch may contain (excess tasks are chunked as before). One
-    /// failure does not cancel others.
+    /// ONE wave of tokio tasks — no fixed chunk barriers. Admission to
+    /// actually run is gated twice: a `max_concurrent_children` slot
+    /// semaphore admits at most that many children into their turn loops
+    /// at once (a finishing child hands its slot straight to the next
+    /// waiter), and the shared provider-request `Semaphore` (each child's
+    /// provider calls acquire permits, FR-018) throttles network-bound
+    /// work. One failure does not cancel others.
     #[allow(clippy::too_many_arguments)] // deviation: domain-shaped batch dispatch, parameter bag would be speculative abstraction
     pub async fn dispatch_batch(
         &self,
@@ -1249,9 +1317,10 @@ impl SubagentManager {
     /// (HyperCode entry point: planner/explorer/implementor children with
     /// different models, toolsets, budgets, and prompts in one wave).
     ///
-    /// Semantics identical to `dispatch_batch` — one concurrency wave
-    /// (chunked over `max_concurrent_children`), semaphore-gated provider
-    /// admission, stable result ordering by request index, and a closing
+    /// Semantics identical to `dispatch_batch` — every child spawned at
+    /// once, admission-gated by a `max_concurrent_children` slot
+    /// semaphore (no chunk barrier), semaphore-gated provider admission,
+    /// stable result ordering by request index, and a closing
     /// `DelegationBatchComplete` on the dispatch channel + tap.
     pub async fn dispatch_requests(
         &self,
@@ -1289,111 +1358,113 @@ impl SubagentManager {
         }
 
         let mut indexed_results: Vec<(usize, DelegationResult)> = Vec::with_capacity(total);
-        let mut dispatched_count = 0usize;
 
-        // Chunk only when the wave exceeds the children cap; within a
-        // chunk everything runs concurrently (semaphore-gated).
-        let chunks: Vec<Vec<DelegationRequest>> = requests
-            .to_vec()
-            .chunks(max_children)
-            .map(|c| c.to_vec())
-            .collect();
+        // Admission slots: every child spawns immediately, but at most
+        // `max_children` may enter their turn loop at once. Unlike the old
+        // fixed chunking (a barrier per chunk — every chunk paid its
+        // slowest member before the next chunk could start), a finishing
+        // child hands its slot straight to the next waiter: no barrier,
+        // same cap, same stable ordering.
+        let slots = Arc::new(Semaphore::new(max_children));
 
-        for chunk in chunks {
-            let mut join_set: JoinSet<(usize, DelegationResult)> = JoinSet::new();
+        let mut join_set: JoinSet<(usize, DelegationResult)> = JoinSet::new();
 
-            for (chunk_pos, req) in chunk.into_iter().enumerate() {
-                let parent_cfg = parent_config.clone();
-                let config_tree = parent_config_tree.clone();
-                let registry = base_registry.clone();
-                let dm = default_model.clone();
-                let tx = event_tx.cloned();
-                let sem = shared_semaphore.clone();
-                let child_sem = shared_child_semaphore.clone();
-                let grant_back = shared_grant_back.clone();
-                let child_registry = shared_registry.clone();
-                let interrupt = self.interrupt.clone();
-                let tap = tap.clone();
-                let recorder = recorder.clone();
-                let engine_slot = engine_slot.clone();
-                // Allocate the child's stable id from the PARENT manager's
-                // counter so ids are unique + monotonic across the whole
-                // batch (T033: same process-global counter the parent draws
-                // from, so the id the child manager starts from can never
-                // collide with any other manager's allocation).
-                let child_id = self.next_id();
-                // Original request index (for stable result ordering —
-                // JoinSet yields in COMPLETION order, not dispatch order).
-                let task_index = dispatched_count + chunk_pos;
+        for (task_index, req) in requests.to_vec().into_iter().enumerate() {
+            let parent_cfg = parent_config.clone();
+            let config_tree = parent_config_tree.clone();
+            let registry = base_registry.clone();
+            let dm = default_model.clone();
+            let tx = event_tx.cloned();
+            let sem = shared_semaphore.clone();
+            let child_sem = shared_child_semaphore.clone();
+            let grant_back = shared_grant_back.clone();
+            let child_registry = shared_registry.clone();
+            let interrupt = self.interrupt.clone();
+            let tap = tap.clone();
+            let recorder = recorder.clone();
+            let engine_slot = engine_slot.clone();
+            let slots = slots.clone();
+            // Allocate the child's stable id from the PARENT manager's
+            // counter so ids are unique + monotonic across the whole
+            // batch (T033: same process-global counter the parent draws
+            // from, so the id the child manager starts from can never
+            // collide with any other manager's allocation).
+            let child_id = self.next_id();
 
-                join_set.spawn(async move {
-                    // Each child shares the PARENT's pools + registry
-                    // (FR-018, T004): the transient manager points at the
-                    // top manager's child pool, shared interrupt, tap, and
-                    // child registry, so registry-driven per-child control
-                    // (stop/steer/status) sees batch children too.
-                    let mgr = SubagentManager {
-                        config: ManagerConfig::default(),
-                        semaphore: sem.clone(),
-                        child_semaphore: child_sem.clone(),
-                        grant_back: grant_back.clone(),
-                        registry: child_registry.clone(),
-                        child_pool_owner: true,
-                        depth,
-                        interrupt,
-                        event_tap: std::sync::Mutex::new(tap),
-                        // T029: shared by reference with the parent manager —
-                        // batch children feed the recorder alongside the tap.
-                        recorder_tap: recorder.clone(),
-                        // Feature 015 (hypercode cascade): shared by
-                        // reference — batch children reuse the SAME
-                        // graph.db (FR-021).
-                        neurocode_engine: engine_slot.clone(),
-                    };
-                    let result = mgr
-                        .dispatch_single_with_overrides(
-                            &req,
-                            &parent_cfg,
-                            &config_tree,
-                            &registry,
-                            tx.as_ref(),
-                            dm.as_deref(),
-                            max_turns,
-                            max_spawn_depth,
-                            child_id,
-                        )
-                        .await;
-                    (task_index, result)
-                });
-            }
-            dispatched_count += join_set.len();
+            join_set.spawn(async move {
+                // Wait for a child slot BEFORE entering the turn loop. The
+                // permit is held for the child's whole execution and is
+                // released on completion or panic (RAII), handing the
+                // slot to the next waiter immediately — no chunk barrier.
+                let _slot = slots
+                    .acquire()
+                    .await
+                    .expect("child slot semaphore closed");
+                // Each child shares the PARENT's pools + registry
+                // (FR-018, T004): the transient manager points at the
+                // top manager's child pool, shared interrupt, tap, and
+                // child registry, so registry-driven per-child control
+                // (stop/steer/status) sees batch children too.
+                let mgr = SubagentManager {
+                    config: ManagerConfig::default(),
+                    semaphore: sem.clone(),
+                    child_semaphore: child_sem.clone(),
+                    grant_back: grant_back.clone(),
+                    registry: child_registry.clone(),
+                    child_pool_owner: true,
+                    depth,
+                    interrupt,
+                    event_tap: std::sync::Mutex::new(tap),
+                    // T029: shared by reference with the parent manager —
+                    // batch children feed the recorder alongside the tap.
+                    recorder_tap: recorder.clone(),
+                    // Feature 015 (hypercode cascade): shared by
+                    // reference — batch children reuse the SAME
+                    // graph.db (FR-021).
+                    neurocode_engine: engine_slot.clone(),
+                };
+                let result = mgr
+                    .dispatch_single_with_overrides(
+                        &req,
+                        &parent_cfg,
+                        &config_tree,
+                        &registry,
+                        tx.as_ref(),
+                        dm.as_deref(),
+                        max_turns,
+                        max_spawn_depth,
+                        child_id,
+                    )
+                    .await;
+                (task_index, result)
+            });
+        }
 
-            while let Some(res) = join_set.join_next().await {
-                match res {
-                    Ok((idx, r)) => indexed_results.push((idx, r)),
-                    Err(join_err) => {
-                        // A panicked/aborted child must surface as a failure
-                        // row, not silently vanish (the [i/total] count would
-                        // mismatch with no explanation). It consumed no
-                        // dispatch slot we can identify, so park it at an
-                        // out-of-range index; it sorts to the end.
-                        let idx = usize::MAX;
-                        indexed_results.push((
-                            idx,
-                            DelegationResult {
-                                goal: format!("(child task panicked: {})", join_err),
-                                summary: String::new(),
-                                success: false,
-                                error: Some(format!("subagent task failed: {}", join_err)),
-                                token_usage: Default::default(),
-                                wall_clock: std::time::Duration::ZERO,
-                                model: String::new(),
-                                iterations: 0,
-                                persisted_session_id: None,
-                                stop_reason: None,
-                            },
-                        ));
-                    }
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok((idx, r)) => indexed_results.push((idx, r)),
+                Err(join_err) => {
+                    // A panicked/aborted child must surface as a failure
+                    // row, not silently vanish (the [i/total] count would
+                    // mismatch with no explanation). It consumed no
+                    // dispatch slot we can identify, so park it at an
+                    // out-of-range index; it sorts to the end.
+                    let idx = usize::MAX;
+                    indexed_results.push((
+                        idx,
+                        DelegationResult {
+                            goal: format!("(child task panicked: {})", join_err),
+                            summary: String::new(),
+                            success: false,
+                            error: Some(format!("subagent task failed: {}", join_err)),
+                            token_usage: Default::default(),
+                            wall_clock: std::time::Duration::ZERO,
+                            model: String::new(),
+                            iterations: 0,
+                            persisted_session_id: None,
+                            stop_reason: None,
+                        },
+                    ));
                 }
             }
         }
@@ -1889,5 +1960,60 @@ mod tests {
             1,
             "reserve clamped to N-1 → child pool keeps its last permit"
         );
+    }
+
+    #[test]
+    fn team_child_finished_releases_on_failure_and_notices_both_ways() {
+        // T025 / FR-006, FR-015, SC-003: failure releases the member's
+        // claimed tasks to Pending; a [TEAM] notice is posted on BOTH
+        // outcomes; success does NOT release a claimed (Running) task.
+        let _g = crate::team::TEST_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("JOEY_HOME", home.path());
+        let cfg_tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(cfg_tmp.path(), "hypercode:\n  team:\n    enabled: true\n").unwrap();
+        let tree = joey_core::Config::load_from(cfg_tmp.path().to_path_buf()).unwrap();
+        let team = format!("tcf-{}", std::process::id());
+        crate::team::register_spawn(&tree, &team, None, "obj", "lead").unwrap();
+        let rec = crate::team::global_teams().get(&team).expect("team registered");
+        let task_id = {
+            let mut r = rec.lock().unwrap();
+            let id = r.add_task("job", vec![]);
+            r.claim(&id, "teammate-a").unwrap();
+            id
+        };
+        let mut req = crate::DelegationRequest::single("goal".to_string());
+        req.team = Some(team.clone());
+        req.name = Some("teammate-a".to_string());
+        // Failure path: task released to Pending + 'failed' notice.
+        super::team_child_finished(&req, false);
+        {
+            let r = rec.lock().unwrap();
+            let t = r.tasks.iter().find(|t| t.id == task_id).unwrap();
+            assert_eq!(t.status, crate::team::TeamTaskStatus::Pending);
+            assert_eq!(t.claimed_by, None);
+        }
+        let notices = crate::team::global_teams().notice_board_tail(64);
+        assert!(
+            notices.iter().any(|n| n.contains(&format!("[TEAM] {team}/teammate-a failed"))
+                && n.contains("1 task(s) returned to Pending")),
+            "failure notice missing: {notices:?}"
+        );
+        // Success path: re-claim, finish -> task stays Running, 'finished' notice.
+        rec.lock().unwrap().claim(&task_id, "teammate-a").unwrap();
+        super::team_child_finished(&req, true);
+        {
+            let r = rec.lock().unwrap();
+            let t = r.tasks.iter().find(|t| t.id == task_id).unwrap();
+            assert_eq!(t.status, crate::team::TeamTaskStatus::Running);
+        }
+        let notices = crate::team::global_teams().notice_board_tail(64);
+        assert!(
+            notices.iter().any(|n| *n == format!("[TEAM] {team}/teammate-a finished")),
+            "success notice exact match missing: {notices:?}"
+        );
+        // Cleanup: close record so the global registry holds no active team.
+        rec.lock().unwrap().close();
+        std::env::remove_var("JOEY_HOME");
     }
 }

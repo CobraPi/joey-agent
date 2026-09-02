@@ -133,6 +133,7 @@ including names of unimplemented tools.
 | `session_search` | session_search | — |
 | `clarify` | clarify | — |
 | `delegation` | delegate_task | — |
+| `team` | team_status, team_message, team_tasks | — |
 | `debugging` | terminal, process | web, file |
 | `safe` | — (include-only) | web, vision, image_gen |
 | `vision` | vision_analyze | — |

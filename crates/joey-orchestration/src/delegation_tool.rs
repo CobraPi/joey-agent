@@ -353,6 +353,14 @@ impl Tool for DelegateTask {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Skill names to load and prepend to the subagent's system prompt. Only effective when 'category' is also specified."
+                },
+                "team": {
+                    "type": "string",
+                    "description": "Team mode (feature 022): team name. Registers the spawned child as a member of that team; the first reference lazily creates the team (that child is the lead). Errors `team mode is disabled` when hypercode.team.enabled is false."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Member name (mailbox identity) when `team` is set. Must be unique within the team. Defaults to 'lead' for a new team; required for later members."
                 }
             }
         })
@@ -367,11 +375,18 @@ impl Tool for DelegateTask {
             Err(e) => return e,
         };
 
+        // Feature 022 (agent teams): `team`/`name` args (single mode only).
+        let team_arg = args.get("team").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let name_arg = args.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+
         // Check if batch mode (tasks array provided).
         let tasks_value = args.get("tasks");
         let is_batch = tasks_value.is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty()));
 
         if is_batch {
+            if team_arg.is_some() {
+                return ToolResult::Error("team spawns do not support batch tasks".to_string());
+            }
             return self.execute_batch(tasks_value.unwrap(), &args, budgets).await;
         }
 
@@ -511,15 +526,19 @@ impl Tool for DelegateTask {
             subagent_type,
             load_skills,
             prompt_append,
+            team: None,
+            name: None,
         };
 
         // HyperCode role routing: `role: "explorer"|"implementor"` fills
         // toolsets/model/turns/tokens/reasoning from the role's config table
         // (gaps only — explicit args win) and injects the role directive.
         let mut req = req;
+        let mut hyper_role: Option<HyperRole> = None;
         if let Some(role_str) = args.get("role").and_then(|v| v.as_str()) {
             match HyperRole::parse(role_str) {
                 Some(role) => {
+                    hyper_role = Some(role);
                     apply_hyper_role(&mut req, role, &self.parent_config_tree, &self.parent_config.provider);
                 }
                 None => {
@@ -527,6 +546,52 @@ impl Tool for DelegateTask {
                         "Unknown role '{role_str}'. Use 'explorer' or 'implementor'."
                     ));
                 }
+            }
+        }
+
+        // Feature 022 (agent teams): gate + lazy-create / member-register
+        // BEFORE dispatch so failures reject the call outright (FR-009/FR-010).
+        if let Some(team_name) = team_arg {
+            let role_str = hyper_role.map(|r| r.table()).unwrap_or("explorer");
+            match crate::team::register_spawn(
+                &self.parent_config_tree,
+                &team_name,
+                name_arg.as_deref(),
+                &req.goal,
+                role_str,
+            ) {
+                Ok(spawn) => {
+                    req.team = Some(team_name.clone());
+                    req.name = Some(spawn.member.clone());
+                    let tree = &self.parent_config_tree;
+                    let max_members = tree.get_i64("hypercode.team.max_members", 8).max(1) as usize;
+                    let max_parallel = tree.get_i64("hypercode.team.max_parallel_members", 4).max(1) as usize;
+                    let poll_ms = tree.get_i64("hypercode.team.poll_interval_ms", 500).max(0) as u64;
+                    let directive = if spawn.is_lead {
+                        // The lead coordinates (Orchestrator role) with the
+                        // delegation + team toolsets; teammates keep their
+                        // role profile (FR-017) plus the team toolset.
+                        req.role = crate::types::SubagentRole::Orchestrator;
+                        req.toolsets = vec![
+                            "delegation".to_string(),
+                            "terminal".to_string(),
+                            "file-read".to_string(),
+                            "web".to_string(),
+                            "team".to_string(),
+                        ];
+                        crate::team::team_lead_directive(max_members, max_parallel)
+                    } else {
+                        if !req.toolsets.iter().any(|t| t == "team") {
+                            req.toolsets.push("team".to_string());
+                        }
+                        crate::team::teammate_directive(poll_ms)
+                    };
+                    req.prompt_append = Some(match req.prompt_append.take() {
+                        Some(p) => format!("{p}\n\n{directive}"),
+                        None => directive,
+                    });
+                }
+                Err(e) => return ToolResult::Error(e),
             }
         }
 
@@ -897,6 +962,8 @@ mod role_tests {
             subagent_type: None,
             load_skills: Vec::new(),
             prompt_append: None,
+            team: None,
+            name: None,
         }
     }
 
@@ -985,5 +1052,49 @@ mod role_tests {
         let tasks = vec![TaskSpec { goal: "x".into(), context: None, model: None, toolsets: Vec::new(), role: Some("wat".into()), background: false, budgets: None }];
         let mut reqs: Vec<DelegationRequest> = vec![base_req()];
         assert!(crate::subagent::apply_batch_hyper_roles(&mut reqs, &tasks, &tree, "p").is_err());
+    }
+
+    /// Feature 022 (T007): delegate_task advertises the `team`/`name`
+    /// parameters so models can discover team mode from the schema alone.
+    #[test]
+    fn parameters_advertise_team_and_name() {
+        let mgr = std::sync::Arc::new(crate::manager::SubagentManager::new(
+            crate::manager::ManagerConfig::default(),
+        ));
+        let tree = tree_with("");
+        let parent_config = joey_agent_core::AgentConfig {
+            model: "test-model".into(),
+            provider: "openai".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: None,
+            max_turns: 5,
+            api_max_retries: 1,
+            tool_delay: 0.0,
+            reasoning: None,
+            enabled_tools: Vec::new(),
+            max_tokens: None,
+            stream: false,
+            pass_session_id: false,
+            model_pinned: false,
+        };
+        let tool = DelegateTask::new(
+            mgr,
+            parent_config,
+            tree,
+            ToolRegistry::new(),
+            None,
+            None,
+        );
+        let params = tool.parameters();
+        assert_eq!(params["properties"]["team"]["type"], json!("string"));
+        assert!(params["properties"]["team"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("team mode is disabled"));
+        assert_eq!(params["properties"]["name"]["type"], json!("string"));
+        assert!(params["properties"]["name"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("unique"));
     }
 }

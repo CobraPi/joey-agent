@@ -17,6 +17,7 @@ members = [
     "crates/joey-omo",
     "crates/joey-neurocode",
     "crates/joey-neurocode-rag",
+    "crates/joey-copilot",
 ]
 
 [workspace.package]
@@ -41,6 +42,7 @@ joey-orchestration = { path = "crates/joey-orchestration" }
 joey-omo = { path = "crates/joey-omo" }
 joey-neurocode = { path = "crates/joey-neurocode" }
 joey-neurocode-rag = { path = "crates/joey-neurocode-rag" }
+joey-copilot = { path = "crates/joey-copilot" }
 
 # NeuroCode (feature 015): deterministic multi-language AST parsing (FR-006).
 # Originally Java-only (specs/015, ~270KB); generalized to a language registry

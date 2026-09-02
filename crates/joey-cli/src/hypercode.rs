@@ -57,6 +57,8 @@ pub struct HyperCodeConfig {
     /// main agent keeps delegate_task + process monitoring + read-only file
     /// peeks + web (default true).
     pub orchestrator_mode: bool,
+    /// Feature 022 (agent teams): `hypercode.team.*` settings.
+    pub team: TeamConfig,
 }
 
 /// Configuration for a HyperCode role (Explorer or Implementor).
@@ -79,6 +81,49 @@ pub type ExplorerConfig = RoleConfig;
 #[allow(dead_code)]
 pub type ImplementorConfig = RoleConfig;
 
+/// Feature 022 (agent teams): `hypercode.team.*` configuration
+/// (contracts/team-tools.md §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamConfig {
+    pub enabled: bool,
+    pub lead_model: String,
+    pub max_members: usize,
+    pub max_parallel_members: usize,
+    pub message_limit: usize,
+    pub poll_interval_ms: u64,
+    pub cleanup_days: i64,
+}
+
+impl Default for TeamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lead_model: String::new(),
+            max_members: 8,
+            max_parallel_members: 4,
+            message_limit: 10,
+            poll_interval_ms: 500,
+            cleanup_days: 7,
+        }
+    }
+}
+
+impl TeamConfig {
+    pub fn from_config(config: &joey_core::Config) -> Self {
+        Self {
+            enabled: config.get_bool("hypercode.team.enabled", false),
+            lead_model: config.get_str("hypercode.team.lead_model", ""),
+            max_members: config.get_i64("hypercode.team.max_members", 8).max(1) as usize,
+            max_parallel_members: config
+                .get_i64("hypercode.team.max_parallel_members", 4)
+                .max(1) as usize,
+            message_limit: config.get_i64("hypercode.team.message_limit", 10).max(1) as usize,
+            poll_interval_ms: config.get_i64("hypercode.team.poll_interval_ms", 500).max(0) as u64,
+            cleanup_days: config.get_i64("hypercode.team.cleanup_days", 7),
+        }
+    }
+}
+
 impl Default for HyperCodeConfig {
     fn default() -> Self {
         Self {
@@ -87,6 +132,7 @@ impl Default for HyperCodeConfig {
             implementor_configs: HashMap::new(),
             max_workstreams: 0,
             orchestrator_mode: true,
+            team: TeamConfig::default(),
         }
     }
 }
@@ -152,6 +198,7 @@ impl HyperCodeConfig {
         hc.enabled = config.get_bool("hypercode.enabled", false);
         hc.max_workstreams = config.get_i64("hypercode.max_workstreams", 0).max(0) as usize;
         hc.orchestrator_mode = config.get_bool("hypercode.orchestrator_mode", true);
+        hc.team = TeamConfig::from_config(config);
 
         // Load role configs per provider (explorer + implementor tables).
         for (table_key, target) in [
@@ -400,6 +447,8 @@ pub struct HypercodeReport {
     pub total_secs: f64,
     /// True when the run was interrupted before finishing.
     pub interrupted: bool,
+    /// FR-016: per-run mode decisions (format_mode_decision strings).
+    pub mode_decisions: Vec<String>,
 }
 
 impl HypercodeReport {
@@ -438,8 +487,97 @@ impl HypercodeReport {
                 }
             }
         }
+        if !self.mode_decisions.is_empty() {
+            out.push(String::from("Mode decisions:"));
+            for d in &self.mode_decisions {
+                out.push(format!("  {d}"));
+            }
+        }
         out
     }
+}
+
+/// FR-016: recorded per-run mode decision, format pinned by
+/// contracts/team-tools.md §5.
+pub fn format_mode_decision(mode: &str, task: &str, rationale: &str) -> String {
+    format!("mode={mode} task={task} rationale={rationale}")
+}
+
+/// Feature 022 (FR-019 + lead shape): build the lead child's delegation
+/// request. `model` stays None when `hypercode.team.lead_model` is empty so
+/// the lead inherits the orchestrator's effective model at dispatch.
+pub(crate) fn lead_request(
+    goal: &str,
+    team_name: &str,
+    member: &str,
+    cfg: &TeamConfig,
+) -> DelegationRequest {
+    let mut lead_req = DelegationRequest::single(goal.to_string());
+    if !cfg.lead_model.is_empty() {
+        lead_req.model = Some(cfg.lead_model.clone());
+    }
+    lead_req.role = joey_orchestration::SubagentRole::Orchestrator;
+    lead_req.toolsets = vec![
+        "delegation".to_string(),
+        "terminal".to_string(),
+        "file-read".to_string(),
+        "web".to_string(),
+        "team".to_string(),
+    ];
+    lead_req.team = Some(team_name.to_string());
+    lead_req.name = Some(member.to_string());
+    lead_req.prompt_append = Some(joey_orchestration::team::team_lead_directive(
+        cfg.max_members,
+        cfg.max_parallel_members,
+    ));
+    lead_req
+}
+
+/// Feature 022 (US1/US2 + FR-018): route decision + team-start attempt.
+/// Ok(Some((team, lead_member))) = spawn the lead; Ok(None) = subagents;
+/// Err(reason) = team start refused (e.g. one active team per session),
+/// fall back to subagents and record the refusal.
+pub(crate) fn try_team_run(
+    config: &joey_core::Config,
+    goal: &str,
+    team_enabled: bool,
+    explicit_workstreams: bool,
+    workstream_count: usize,
+) -> Result<Option<(String, String)>, String> {
+    if route_mode(team_enabled, explicit_workstreams, workstream_count) != ModeRoute::Team {
+        return Ok(None);
+    }
+    let team_name = team_slug(goal);
+    match joey_orchestration::team::register_spawn(config, &team_name, None, goal, "lead") {
+        Ok(spawn) => Ok(Some((team_name, spawn.member))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Deterministic team-vs-subagent route for the /hypercode run pipeline
+/// (research.md D5 — no keyword classifier; the planner's decomposition is
+/// the independence signal). Disabled => always subagents (SC-005 parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeRoute {
+    Subagent,
+    Team,
+}
+
+pub fn route_mode(team_enabled: bool, explicit_workstreams: bool, workstream_count: usize) -> ModeRoute {
+    if team_enabled && !explicit_workstreams && workstream_count >= 2 {
+        ModeRoute::Team
+    } else {
+        ModeRoute::Subagent
+    }
+}
+
+/// Deterministic team name for a /hypercode team run: `hc-<slug>` where
+/// slug is the first 24 goal chars, lowercased, team-filesystem-safe.
+pub fn team_slug(goal: &str) -> String {
+    let head: String = goal.chars().take(24).collect();
+    let slug = joey_orchestration::team::sanitize_name(&head.to_lowercase());
+    let slug = slug.trim_matches('_');
+    format!("hc-{slug}")
 }
 
 /// Explorer system prompt (read-only context gathering — including running
@@ -583,7 +721,17 @@ FINAL ANSWER: synthesize the subagent reports for the user: what was done,\n\
 files touched, verification results, and anything left open. Be honest\n\
 about failures — your own verification is the single full-suite final\n\
 gate; everything else you report comes from Implementors' targeted\n\
-checks, so attribute it as such.";
+checks, so attribute it as such.\n\
+\n\
+## Execution Modes (feature 022: agent teams)\n\
+\n\
+Choose the optimum execution mode per task. ALWAYS state your chosen mode with a one-to-two-sentence rationale before dispatching:\n\
+\n\
+- TEAMS (delegate_task with `team` + `name`, requires hypercode.team.enabled): for independent, parallelizable work — for example research in one area while implementation proceeds in another, or debugging with competing hypotheses across separate areas. The first `team` reference lazily starts the team: start it without asking the user for confirmation.\n\
+- SUBAGENTS or a single session: for sequential work, same-file edits, or heavily interdependent steps.\n\
+- When ambiguous, prefer the cheaper mode (subagents) and say that you did.\n\
+- While a team is active, keep routing new, unrelated tasks to subagents in parallel with the team — never queue work behind the team (one active team per session).\n\
+- If team mode is disabled in configuration, route the work to subagents and inform the user that team mode is disabled.";
 
 /// Planner prompt (decomposition into parallel workstreams).
 pub const PLANNER_PROMPT: &str = "\
@@ -730,6 +878,8 @@ fn planner_request(
         subagent_type: None,
         load_skills: Vec::new(),
         prompt_append: None,
+        team: None,
+        name: None,
     }
 }
 
@@ -770,6 +920,8 @@ fn explorer_request(
         subagent_type: None,
         load_skills: Vec::new(),
         prompt_append: Some(EXPLORER_PROMPT.to_string()),
+        team: None,
+        name: None,
     }
 }
 
@@ -813,6 +965,8 @@ fn implementor_request(
         subagent_type: None,
         load_skills: Vec::new(),
         prompt_append: Some(IMPLEMENTOR_PROMPT.to_string()),
+        team: None,
+        name: None,
     }
 }
 
@@ -877,6 +1031,21 @@ fn nonzero(n: usize) -> Option<u32> {
     }
 }
 
+/// AgentConfig the hypercode children run with: identical to the parent's
+/// except `tool_delay`. Children are short-lived purpose-built workers on
+/// curated toolsets; the parent's `agent.tool_delay` pacing (default 1s
+/// between sequential tool calls) is pure added latency for them.
+/// `hypercode.child_tool_delay` (default 0.0) disables it; set it to e.g.
+/// 1.0 to restore parent-style pacing.
+fn child_agent_config(ctx: &HypercodeContext) -> AgentConfig {
+    let mut cfg = ctx.agent_config.clone();
+    cfg.tool_delay = ctx
+        .config
+        .get_f64("hypercode.child_tool_delay", 0.0)
+        .max(0.0);
+    cfg
+}
+
 /// Run the full HyperCode pipeline. Every child dispatch flows through the
 /// manager (SubagentSpawn/SubagentEvent/SubagentComplete events hit the
 /// global tap → TUI panes + rail + job board natively).
@@ -908,10 +1077,18 @@ pub async fn run_hypercode(
     let parent_model = parent_model_for(ctx);
     let cap = effective_cap(&cfg, opts);
 
+    // Time-to-completion: children skip the parent's inter-tool pacing
+    // (see child_agent_config).
+    let child_agent_cfg = child_agent_config(ctx);
+
     let mut report = HypercodeReport::default();
 
     // ── Phase 1: Plan ─────────────────────────────────────────────────
+    // Feature 022: explicit user-supplied workstreams pin the plan→explore→
+    // build pipeline shape (never routed to team mode).
+    let mut explicit_workstreams = false;
     let workstreams: Vec<Workstream> = if !opts.workstreams.is_empty() {
+        explicit_workstreams = true;
         opts.workstreams
             .iter()
             .take(cap)
@@ -930,7 +1107,7 @@ pub async fn run_hypercode(
             .manager
             .dispatch_requests(
                 &[req],
-                &ctx.agent_config,
+                &child_agent_cfg,
                 &ctx.config,
                 &ctx.base_registry,
                 None,
@@ -959,6 +1136,59 @@ pub async fn run_hypercode(
         return report;
     }
 
+    // Feature 022 (US1/US2): route to team mode when the planner's
+    // decomposition shows >=2 independent workstreams, team mode is
+    // enabled, and the user did not pin explicit workstreams. The lead
+    // child (Orchestrator role) coordinates teammates via the shared
+    // task list + mailboxes; we block on its final synthesis (FR-019:
+    // hypercode.team.lead_model, empty = inherit orchestrator model).
+    let mut team_run: Option<(String, String)> = None;
+    match try_team_run(
+        &ctx.config,
+        goal,
+        cfg.team.enabled,
+        explicit_workstreams,
+        workstreams.len(),
+    ) {
+        Ok(Some(run)) => team_run = Some(run),
+        Ok(None) => {}
+        Err(e) => report.mode_decisions.push(format_mode_decision(
+            "subagent",
+            goal.lines()
+                .next()
+                .unwrap_or(goal)
+                .chars()
+                .take(60)
+                .collect::<String>()
+                .trim(),
+            &format!("team start refused ({e}); ran via subagents"),
+        )),
+    }
+    if let Some((team_name, member)) = team_run {
+        let lead_req = lead_request(goal, &team_name, &member, &cfg.team);
+        let results = ctx
+            .manager
+            .dispatch_requests(&[lead_req], &ctx.agent_config, &ctx.config, &ctx.base_registry, None)
+            .await;
+        report.mode_decisions.push(format_mode_decision(
+            "team",
+            goal.lines().next().unwrap_or(goal).chars().take(60).collect::<String>().trim(),
+            &format!(
+                "{} independent workstreams; lead coordinates teammates",
+                workstreams.len()
+            ),
+        ));
+        // Wind the team down (stop stragglers, keep tasks.json for
+        // resumption) before reporting (US3 scenario 4).
+        let _ = joey_orchestration::team::global_teams().stop_team(&team_name, &ctx.manager);
+        if let Some(r) = results.first() {
+            report.build_summaries.push(r.summary.clone());
+            report.successes.push(r.success);
+        }
+        report.total_secs = started.elapsed().as_secs_f64();
+        return report;
+    }
+
     // ── Phase 2: Explore (parallel) ───────────────────────────────────
     if let Some(cb) = progress {
         cb(
@@ -974,7 +1204,7 @@ pub async fn run_hypercode(
         .manager
         .dispatch_requests(
             &explorer_requests,
-            &ctx.agent_config,
+            &child_agent_cfg,
             &ctx.config,
             &ctx.base_registry,
             None,
@@ -1018,7 +1248,7 @@ pub async fn run_hypercode(
         .manager
         .dispatch_requests(
             &build_requests,
-            &ctx.agent_config,
+            &child_agent_cfg,
             &ctx.config,
             &ctx.base_registry,
             None,
@@ -1031,6 +1261,33 @@ pub async fn run_hypercode(
     // ── Phase 4: Synthesize (in-memory merge; no extra LLM call) ──────
     if let Some(cb) = progress {
         cb(Phase::Synthesizing, "merging workstream reports");
+    }
+
+    // Feature 022 (FR-016): record the pipeline's mode decision. The
+    // /hypercode pipeline itself always runs via subagents — its stages
+    // (plan → explore → build) are strictly interdependent, so team mode
+    // is never routed here even when enabled. Skipped when a decision was
+    // already recorded (team run above or a refused team start).
+    if report.mode_decisions.is_empty() {
+        let rationale = if !cfg.team.enabled {
+            "team mode is disabled; work ran via subagents"
+        } else if explicit_workstreams {
+            "explicit workstreams pin the plan→explore→build pipeline"
+        } else {
+            "pipeline stages are interdependent; team mode is reserved for independent parallel work"
+        };
+        report.mode_decisions.push(format_mode_decision(
+            "subagent",
+            goal
+                .lines()
+                .next()
+                .unwrap_or(goal)
+                .chars()
+                .take(60)
+                .collect::<String>()
+                .trim(),
+            rationale,
+        ));
     }
 
     report
@@ -1051,6 +1308,43 @@ mod tests {
         let impl_cfg = config.get_implementor_config("unknown-provider");
         assert_eq!(impl_cfg.model, "");
         assert_eq!(impl_cfg.max_turns, 12);
+    }
+
+    #[test]
+    fn child_agent_config_zeroes_tool_delay_by_default() {
+        let parent = AgentConfig {
+            model: "test-model".to_string(),
+            provider: "zai".to_string(),
+            base_url: String::new(),
+            api_key: None,
+            max_turns: 10,
+            api_max_retries: 3,
+            tool_delay: 1.0,
+            reasoning: None,
+            enabled_tools: vec![],
+            max_tokens: None,
+            stream: false,
+            pass_session_id: false,
+            model_pinned: false,
+        };
+        let ctx = HypercodeContext {
+            agent_config: parent.clone(),
+            config: joey_core::Config::defaults(),
+            base_registry: ToolRegistry::new(),
+            manager: std::sync::Arc::new(
+                joey_orchestration::SubagentManager::new(
+                    joey_orchestration::ManagerConfig::default(),
+                ),
+            ),
+            cwd: std::env::temp_dir(),
+            parent_effective_model: None,
+        };
+        assert_eq!(ctx.agent_config.tool_delay, 1.0);
+        let child = child_agent_config(&ctx);
+        assert_eq!(
+            child.tool_delay, 0.0,
+            "hypercode children skip the parent's inter-tool pacing by default"
+        );
     }
 
     #[test]
@@ -1138,6 +1432,7 @@ mod tests {
             successes: vec![true, false],
             total_secs: 12.3,
             interrupted: false,
+            mode_decisions: Vec::new(),
         };
         let lines = report.render();
         assert!(lines[0].contains("1/2 workstream(s) succeeded"));

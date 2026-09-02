@@ -122,7 +122,7 @@ pub fn validate_explicit_toolsets(
 }
 
 /// (enabled, disabled) MCP server names from `mcp_servers` in config.yaml.
-fn mcp_server_names(config: &Config) -> (Vec<String>, Vec<String>) {
+pub(crate) fn mcp_server_names(config: &Config) -> (Vec<String>, Vec<String>) {
     let mut enabled = Vec::new();
     let mut disabled = Vec::new();
     if let Some(serde_yaml::Value::Mapping(map)) = config.get("mcp_servers") {
@@ -236,7 +236,7 @@ pub async fn run_oneshot(opts: OneshotOptions) -> Result<i32> {
 
 async fn run_agent(
     config: &Config,
-    agent_cfg: AgentConfig,
+    mut agent_cfg: AgentConfig,
     cwd: PathBuf,
     prompt: &str,
 ) -> Result<(RunOutcome, UsageReport)> {
@@ -248,6 +248,12 @@ async fn run_agent(
         .ok()
         .map(|db| std::sync::Arc::new(std::sync::Mutex::new(db)));
     joey_tools::builtins::register_session_tools(&mut registry, session_db);
+
+    // Wire MCP servers (config `mcp_servers:`): discover catalogs and
+    // register proxy tools; admit their wire names to the session's
+    // enabled-tools set so registry.definitions() exposes them.
+    let mcp_wire_names = crate::mcp_tools::register_mcp_tools(&mut registry, config);
+    agent_cfg.enabled_tools.extend(mcp_wire_names.iter().cloned());
 
     // Wire orchestration.
     let mgr_config = joey_orchestration::ManagerConfig::from_config(config);

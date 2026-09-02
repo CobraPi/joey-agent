@@ -1393,3 +1393,65 @@ preserved: tool registration stays explicit via
 `register_neurocode_rag_tools` in `joey_tools::builtins` (builtins.rs
 ~83-88), gated so that `neurocode.rag.enabled = false` (the default)
 registers nothing.
+
+## GitHub Copilot `.github/` native integration — 2026-09-02
+
+**Status**: Deliberate-deviation extension (Joey-only, no upstream
+counterpart — Hermes has no `.github` parsing). New `joey-copilot` crate
+parses `.github/` (copilot-instructions.md, instructions/, prompts/,
+skills/, mcp.json) and surfaces it via existing machinery:
+system-prompt/context-tier injection + skills-index merge (`copilot.enabled`,
+default true), `mcp.json` merge into `mcp_servers` (exfiltration filter,
+`${ENV}` interpolation, user-wins, no auto-connect), and the
+`joey copilot` plugin-installer CLI + `/copilot` slash + `/<prompt>` fallback.
+Documented in `docs/copilot.md`.
+
+## Agent teams (feature 022, 2026-09-02)
+
+**Status**: Complete with deliberate deviations — parity target is Claude
+Code v2.1.178 "Agent Teams" (not upstream Hermes); implemented with
+Joey-native primitives per `specs/022-you-fully-implement/`.
+
+Mirrors the reference model — a lead coordinating named teammates over a
+shared, dependency-tracked task list, direct teammate messaging, and
+natural-language team start — on Joey primitives: the lead is a
+`SubagentRole::Orchestrator` child configured by `hypercode.team.lead_model`
+(empty inherits the orchestrator's effective model); `delegate_task` gains
+`team`/`name` params, the first reference lazily creating the team;
+teammates are Leaf children keeping the team tools
+(team_status/team_message/team_tasks) but never `delegate_task`. State is
+file-backed JSON under `~/.joey/teams/<team>/` (config.json, tasks.json,
+inboxes/<member>.json) with an in-process registry Mutex as claiming
+authority. Task ids are `task_<uuid-simple>`; a claim is valid only while
+Pending with all dependencies Done; stopping/failure releases Running
+tasks to Pending; session end retains tasks.json for resumption and
+removes config.json + inboxes/; startup purges teams older than
+`hypercode.team.cleanup_days` (default 7). Other `hypercode.team.*` keys:
+`max_members` 8, `max_parallel_members` 4, `poll_interval_ms` 500,
+`message_limit` 10 (inbox cap, drop-oldest).
+
+Routing is orchestrator guidance plus per-run recording in
+`HypercodeReport::mode_decisions` (no classifier); notifications reuse the
+background completion-notice path (cap 64), appending "team: <team>
+member: <member>". `crates/joey-omo/src/team.rs` is untouched. Deliberate
+deviations: no tmux panes (teammates are in-process subagent children, no
+terminal-split visualization); no TeamCreate/TeamDelete tools (removed
+upstream before v2.1.178; lazy creation via the first delegate_task
+instead); single-process claiming (in-process registry Mutex, not the
+reference's file locking — multi-process teams out of scope); and a
+disabled-by-default gate `hypercode.team.enabled`, threaded at spawn
+time, with byte-identical delegation behavior when off (SC-005).
+
+### Convergence audit additions (2026-09-02)
+
+Two further deltas vs plan.md, both shape-only (no behavior difference).
+(1) The plan's `crates/joey-cli/tests/hypercode_team.rs` integration-test
+path landed as `crates/joey-cli/src/tests/hypercode_team.rs` — the CLI is a
+binary crate, so the tests are wired as an inline-path module
+(`#[path = "tests/mod.rs"] mod hypercode_tests`), matching repo convention.
+(2) The plan-named `TeamTaskList` / `TeamMailbox` surfaces are implemented
+as methods on `TeamRecord` / `TeamRegistry` in
+`crates/joey-orchestration/src/team.rs` — same operations (add/claim/
+complete/release/list, send/receive/poll), different receiver shapes;
+`data-model.md` pins the entities, JSON layouts, and status enums (which
+match exactly), not Rust receiver shapes.

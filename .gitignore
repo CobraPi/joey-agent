@@ -6,3 +6,7 @@
 .DS_Store
 .idea/
 *.prof*
+*.tmp
+*.swp
+.vscode/
+Thumbs.db

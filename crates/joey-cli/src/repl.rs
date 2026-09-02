@@ -186,9 +186,27 @@ pub(crate) fn build_agent_parts(
         }
     }
 
+    // Wire MCP servers (config `mcp_servers:`): same discovery/proxy path
+    // as one-shot mode. HyperCode orchestrator mode stays pure — its
+    // enabled-tools list is not extended.
+    let mcp_wire_names = crate::mcp_tools::register_mcp_tools(&mut registry, config);
+    if !orchestrator_on {
+        agent_cfg.enabled_tools.extend(mcp_wire_names.iter().cloned());
+    }
+
     // Wire orchestration: construct SubagentManager and register delegate_task.
     let mgr_config = joey_orchestration::ManagerConfig::from_config(config);
     let manager = std::sync::Arc::new(joey_orchestration::SubagentManager::new(mgr_config));
+    // Feature 022 (FR-012): startup purge of team dirs older than the
+    // retention window (hypercode.team.cleanup_days, default 7).
+    {
+        let days = config.get_i64("hypercode.team.cleanup_days", 7);
+        let removed = joey_orchestration::team::global_teams()
+            .purge_expired(&joey_core::constants::joey_home(), days);
+        if removed > 0 {
+            tracing::info!("purged {removed} expired team dir(s)");
+        }
+    }
     // Snapshot the base registry (builtins only) for subagents to use.
     let base_registry = registry.clone();
     // Build OMO category resolver (T057/T135). Populated after agent construction
@@ -808,6 +826,12 @@ fn end_session(st: &ReplState, reason: &str) {
     if let Some(hc) = &st.hypercode {
         wind_down_subagents(&hc.manager);
     }
+    // Feature 022 (FR-012): clean up team resources at session end —
+    // members are stopped by wind-down above; close_all archives the
+    // task lists (tasks.json retained) and removes config/inboxes.
+    if let Some(hc) = &st.hypercode {
+        joey_orchestration::team::global_teams().close_all(&hc.manager);
+    }
     if let Some(db) = st.agent.session_db() {
         let _ = db.end_session(&st.session_id, reason);
     }
@@ -1045,6 +1069,21 @@ async fn handle_slash(input: &str, st: &mut ReplState) -> SlashOutcome {
     let lower_full = input.to_lowercase();
     match slash::resolve(input) {
         Resolution::Unknown => {
+            // Joey extension: fall back to Copilot prompt files (.github/prompts
+            // or installed plugins) — /name [args] expands to the prompt body.
+            let base = lower_full.trim().trim_start_matches('/');
+            let cmd_name = base.split_whitespace().next().unwrap_or("");
+            let user_args = base[cmd_name.len()..].trim().to_string();
+            if !cmd_name.is_empty() {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                if let Some((body, _mode)) = crate::copilot_cmd::find_prompt_body(cmd_name, &cwd) {
+                    let prompt = if user_args.is_empty() { body } else { format!("{body}\n\n{user_args}") };
+                    let chars = prompt.chars().count();
+                    render::info(&format!("Copilot prompt '/{cmd_name}' expanded ({chars} chars) — running…"));
+                    let _ = run_turn_interactive(st, &prompt).await;
+                    return SlashOutcome::Continue;
+                }
+            }
             println!("{}", Color::Red.bold().paint(format!("Unknown command: {}", lower_full)));
             println!("{}", Color::DarkGray.paint("Type /help for available commands"));
             SlashOutcome::Continue
@@ -1471,6 +1510,22 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         "plugins" => {
             for l in crate::slash_extra::plugins_lines().0 {
                 println!("{}", l);
+            }
+        }
+        "copilot" => {
+            let (sub, rest) = match args.split_once(' ') {
+                Some((s, r)) => (s, r.trim()),
+                None => (args.trim(), ""),
+            };
+            match crate::copilot_cmd::slash_response_lines(sub, rest) {
+                Some(text) => {
+                    println!();
+                    for line in text.lines() {
+                        println!("{}", Color::Cyan.paint(line));
+                    }
+                    println!();
+                }
+                None => render::error(&format!("unknown /copilot subcommand: {sub} (status|list|install|remove|update)")),
             }
         }
         "subscription" | "upgrade" => {

@@ -76,7 +76,19 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
   job-board row via the orchestration event tap. Runs on the engine
   actor (Ctrl-C interrupts children cooperatively; phase shown live on
   the ⚡ badge). Per-role model/reasoning/token/turn budgets via
-  `/hypercode configure`. Works additively with NeuroCode.
+  `/hypercode configure`. Works additively with NeuroCode. Children run
+  with `hypercode.child_tool_delay` (default `0.0`) instead of the
+  parent's `agent.tool_delay` pacing, and batch waves admit children
+  through a slot pool — a finished child's slot passes to the next
+  waiter immediately, with no chunk barrier.
+- **HyperCode Agent Teams** (feature 022, `hypercode.team.enabled`, off by
+  default): the orchestrator can route independent, parallelizable goals
+  to a lead-coordinated team — a shared file-backed task list with
+  dependencies, per-teammate mailboxes with direct delivery, and
+  role-profile teammates (explorer/implementor) — while sequential or
+  same-file work stays in subagent mode. Task lists persist under
+  `~/.joey/teams/` for resumption; a stopped teammate's tasks return to
+  the shared pool.
 - OMO (oh-my-openagent): 11 agent personas, 11 delegation categories,
   intent gating (ultrawork/hyperplan/team), goals, boulder plan execution,
   wisdom notepads, optional team mode. → [orchestration.md](orchestration.md)

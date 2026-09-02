@@ -113,8 +113,17 @@ cron:
 hypercode:
   enabled: false
   max_workstreams: 0
+  child_tool_delay: 0.0
   explorer: {}
   implementor: {}
+  team:
+    enabled: false
+    lead_model: ""
+    max_members: 8
+    max_parallel_members: 4
+    message_limit: 10
+    poll_interval_ms: 500
+    cleanup_days: 7
 _config_version: 33
 "#;
 
@@ -1543,6 +1552,28 @@ mod tests {
         assert!(cfg.get_bool("security.redact_secrets", false));
         assert_eq!(cfg.get_str("approvals.mode", ""), "smart");
         assert!(cfg.get("agent.verbose").is_none(), "agent.verbose is cli-tree-only upstream");
+    }
+
+    #[test]
+    fn hypercode_child_tool_delay_defaults_to_zero() {
+        let cfg = Config::defaults();
+        // Time-to-completion: hypercode children default to NO inter-tool
+        // pacing (the parent agent's agent.tool_delay does not apply).
+        assert_eq!(cfg.get_f64("hypercode.child_tool_delay", -1.0), 0.0);
+    }
+
+    #[test]
+    fn hypercode_team_defaults() {
+        let cfg = Config::defaults();
+        // Feature 022 (agent teams): disabled by default so delegation
+        // behavior is byte-identical until the flag is flipped.
+        assert!(!cfg.get_bool("hypercode.team.enabled", true));
+        assert_eq!(cfg.get_str("hypercode.team.lead_model", "unexpected"), "");
+        assert_eq!(cfg.get_i64("hypercode.team.max_members", -1), 8);
+        assert_eq!(cfg.get_i64("hypercode.team.max_parallel_members", -1), 4);
+        assert_eq!(cfg.get_i64("hypercode.team.message_limit", -1), 10);
+        assert_eq!(cfg.get_i64("hypercode.team.poll_interval_ms", -1), 500);
+        assert_eq!(cfg.get_i64("hypercode.team.cleanup_days", -1), 7);
     }
 
     #[test]
