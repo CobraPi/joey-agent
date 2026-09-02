@@ -13,6 +13,7 @@ pub mod evidence;
 pub mod evaluator;
 pub mod manager;
 pub mod subagent;
+pub mod task_graph;
 pub mod team;
 pub mod tap;
 pub mod types;
