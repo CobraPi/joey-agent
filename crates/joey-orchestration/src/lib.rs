@@ -11,6 +11,7 @@ pub mod control_tool;
 pub mod delegation_tool;
 pub mod evidence;
 pub mod evaluator;
+pub mod joiner;
 pub mod manager;
 pub mod subagent;
 pub mod task_graph;
