@@ -110,6 +110,9 @@ logging:
 timezone: ""
 cron:
   provider: ""
+neurocode:
+  enterprise_context:
+    enabled: false
 hypercode:
   enabled: false
   max_workstreams: 0
@@ -124,7 +127,11 @@ hypercode:
     message_limit: 10
     poll_interval_ms: 500
     cleanup_days: 7
-_config_version: 33
+  execution_graph:
+    enabled: false
+    max_concurrent_workers: 16
+    max_repair_attempts: 3
+_config_version: 34
 "#;
 
 /// Config schema version written on save (upstream `_config_version`).
@@ -1574,6 +1581,15 @@ mod tests {
         assert_eq!(cfg.get_i64("hypercode.team.message_limit", -1), 10);
         assert_eq!(cfg.get_i64("hypercode.team.poll_interval_ms", -1), 500);
         assert_eq!(cfg.get_i64("hypercode.team.cleanup_days", -1), 7);
+    }
+
+    #[test]
+    fn execution_graph_and_enterprise_context_defaults_per_spec023() {
+        let cfg = Config::defaults();
+        assert!(!cfg.get_bool("hypercode.execution_graph.enabled", true));
+        assert_eq!(cfg.get_i64("hypercode.execution_graph.max_concurrent_workers", -1), 16);
+        assert_eq!(cfg.get_i64("hypercode.execution_graph.max_repair_attempts", -1), 3);
+        assert!(!cfg.get_bool("neurocode.enterprise_context.enabled", true));
     }
 
     #[test]
