@@ -17,6 +17,7 @@ pub mod task_graph;
 pub mod team;
 pub mod tap;
 pub mod types;
+pub mod workspace;
 
 pub use capacity::{
     capacity_children, capacity_requests, SystemCapacity, DEFAULT_MEM_MAX_FRACTION,
