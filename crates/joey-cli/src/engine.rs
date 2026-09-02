@@ -301,6 +301,7 @@ pub(crate) fn hypercode_context_for_agent(
         manager,
         cwd: cwd.to_path_buf(),
         parent_effective_model,
+        execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
     }
 }
 

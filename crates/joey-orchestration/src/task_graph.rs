@@ -842,6 +842,84 @@ fn path_violation(path: &Path) -> Option<&'static str> {
     None
 }
 
+// ---- T013: legacy <workstreams> → TaskGraph conversion (FR-007) ----
+
+/// Legacy `<workstreams>` conversion input (FR-007). joey-cli's Workstream
+/// is not importable here (DAG), so callers adapt to this neutral shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacyWorkstream {
+    /// Source workstream identifier (numeric string from joey-cli).
+    pub id: String,
+    /// The workstream focus line; becomes the task objective.
+    pub focus: String,
+}
+
+impl TaskGraph {
+    /// Conservative legacy conversion (FR-007 + planner contract):
+    /// objective = focus; empty read/write sets mean UNDECLARED writes —
+    /// routed SingleWorker by the graph router and never scheduled
+    /// concurrently with any other writer.
+    ///
+    /// Each workstream becomes an independent Implementor node
+    /// (`workstream-<id>`, sanitized to the `[a-z0-9-]` charset when the
+    /// source id carries characters outside it — lowercase ascii letters
+    /// pass through, everything else becomes `-`; never panics because
+    /// the `workstream-` prefix always satisfies the charset) with a
+    /// single manual acceptance criterion (invariant 5 requires ≥1),
+    /// Economical tier, Low risk, and SharedCheckout isolation (write
+    /// set undeclared ⇒ [`default_isolation`] yields the shared
+    /// checkout).
+    pub fn from_workstreams(
+        workstreams: &[LegacyWorkstream],
+        baseline_revision: &str,
+    ) -> TaskGraph {
+        let mut nodes: BTreeMap<TaskId, TaskNode> = BTreeMap::new();
+        for w in workstreams {
+            // Sanitize per the conversion contract: lowercase, then any
+            // char outside [a-z0-9-] becomes '-'. Never panics: the
+            // "workstream-" prefix always satisfies the charset.
+            let raw = format!("workstream-{}", w.id).to_lowercase();
+            let sanitized: String = raw
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let id =
+                TaskId::new(&sanitized).expect("workstream- prefix keeps the id valid");
+            let node = TaskNode {
+                id: id.clone(),
+                objective: w.focus.clone(),
+                dependencies: vec![],
+                read_set: vec![],
+                write_set: vec![],
+                artifact_ids: vec![],
+                role: WorkerRole::Implementor,
+                model_tier: ModelTier::Economical,
+                risk: RiskLevel::Low,
+                acceptance: vec![AcceptanceCriterion {
+                    criterion: format!("Workstream delivered: {}", w.focus),
+                    kind: "manual".to_string(),
+                }],
+                verification: VerificationPlanView::default(),
+                isolation: default_isolation(&[]),
+                status: TaskStatus::Pending,
+                attempts: 0,
+            };
+            nodes.insert(id, node);
+        }
+        TaskGraph {
+            nodes,
+            baseline_revision: baseline_revision.to_string(),
+            run_id: String::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1472,5 +1550,64 @@ mod tests {
             assert_eq!(g2.node(kid), Some(&expected), "node {} must round-trip", kid);
         }
         assert_eq!(g2.nodes.len(), 2);
+    }
+
+    // ---- T013: from_workstreams (FR-007 legacy conversion) ----
+
+    #[test]
+    fn from_workstreams_converts_three_workstreams() {
+        let legacy = vec![
+            LegacyWorkstream { id: "1".to_string(), focus: "auth flows".to_string() },
+            LegacyWorkstream { id: "2".to_string(), focus: "db migration".to_string() },
+            LegacyWorkstream { id: "3".to_string(), focus: "docs".to_string() },
+        ];
+        let g = TaskGraph::from_workstreams(&legacy, "abc123");
+        assert_eq!(g.nodes.len(), 3);
+        assert_eq!(g.baseline_revision, "abc123");
+        assert_eq!(g.run_id, "");
+        for (i, w) in legacy.iter().enumerate() {
+            let key = id(&format!("workstream-{}", w.id));
+            let node = g.node(&key).expect("sanitized numeric id must survive");
+            assert_eq!(node.id, key);
+            assert_eq!(node.objective, w.focus, "objective = focus 1:1 (ws {})", i);
+            assert!(!node.acceptance.is_empty(), "invariant 5: >=1 criterion");
+            assert_eq!(
+                node.acceptance[0].criterion,
+                format!("Workstream delivered: {}", w.focus)
+            );
+            assert_eq!(node.acceptance[0].kind, "manual");
+            assert_eq!(node.isolation, IsolationMode::SharedCheckout);
+            assert!(node.write_set.is_empty(), "undeclared writes (ws {})", i);
+            assert!(node.read_set.is_empty());
+            assert!(node.dependencies.is_empty());
+            assert_eq!(node.role, WorkerRole::Implementor);
+            assert_eq!(node.model_tier, ModelTier::Economical);
+            assert_eq!(node.risk, RiskLevel::Low);
+            assert_eq!(node.status, TaskStatus::Pending);
+            assert_eq!(node.attempts, 0);
+        }
+        assert_eq!(g.validate(), Ok(()));
+    }
+
+    #[test]
+    fn from_workstreams_sanitizes_non_numeric_ids() {
+        let legacy = vec![
+            // Uppercase lowered, everything else outside [a-z0-9-] dashed.
+            LegacyWorkstream { id: "A_7".to_string(), focus: "x".to_string() },
+            LegacyWorkstream { id: "b.2/s".to_string(), focus: "y".to_string() },
+            LegacyWorkstream { id: "".to_string(), focus: "z".to_string() },
+        ];
+        let g = TaskGraph::from_workstreams(&legacy, "rev");
+        let keys: Vec<&str> = g.nodes.keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, vec!["workstream-", "workstream-a-7", "workstream-b-2-s"]);
+        assert_eq!(g.validate(), Ok(()), "sanitized ids always validate");
+    }
+
+    #[test]
+    fn from_workstreams_empty_input_is_valid_empty_graph() {
+        let g = TaskGraph::from_workstreams(&[], "baseline");
+        assert!(g.nodes.is_empty());
+        assert_eq!(g.baseline_revision, "baseline");
+        assert_eq!(g.validate(), Ok(()));
     }
 }

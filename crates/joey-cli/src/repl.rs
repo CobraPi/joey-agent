@@ -568,6 +568,7 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         manager: parts.subagent_manager.clone(),
         cwd: cwd.clone(),
         parent_effective_model: Some(parts.agent.effective_main_turn_model()),
+        execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
     let agent = parts.agent;
 
@@ -2050,6 +2051,7 @@ fn new_session(st: &mut ReplState, name: &str, quiet: bool) {
                 manager: parts.subagent_manager.clone(),
                 cwd: st.cwd.clone(),
                 parent_effective_model: Some(parts.agent.effective_main_turn_model()),
+                execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
             });
             st.agent = parts.agent;
             st.session_start = Instant::now();
@@ -2079,6 +2081,7 @@ fn rebuild_agent_preserving_history(st: &mut ReplState) -> Result<()> {
         manager: parts.subagent_manager.clone(),
         cwd: st.cwd.clone(),
         parent_effective_model: Some(parts.agent.effective_main_turn_model()),
+        execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
     });
     st.agent = parts.agent;
     Ok(())

@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use joey_agent_core::AgentConfig;
+use joey_orchestration::task_graph::{LegacyWorkstream, TaskGraph};
 use joey_orchestration::{DelegationRequest, SubagentManager, SubagentRole};
 use joey_providers::ReasoningEffort;
 use joey_tools::ToolRegistry;
@@ -418,6 +419,15 @@ pub struct HypercodeContext {
     /// a servable model). None = legacy behavior (children inherit
     /// `agent_config.model`).
     pub parent_effective_model: Option<String>,
+    /// Spec 023 (US2/T013): typed execution graph converted from the
+    /// planner's legacy `<workstreams>` decomposition (FR-007), gated by
+    /// `hypercode.execution_graph.enabled` (default false ⇒ SC-001 pure
+    /// no-op parity). `None` until a converted plan passes
+    /// [`TaskGraph::validate`]. `Arc<Mutex<…>>` because
+    /// [`run_hypercode`] receives `&HypercodeContext` (interior
+    /// mutability) while the context is freely cloned/shared by the
+    /// engine + REPL callers (Clone) — clones observe the same slot.
+    pub execution_graph: std::sync::Arc<std::sync::Mutex<Option<TaskGraph>>>,
 }
 
 impl std::fmt::Debug for HypercodeContext {
@@ -1130,6 +1140,52 @@ pub async fn run_hypercode(
     };
     report.workstreams = workstreams.clone();
 
+    // Spec 023 (US2/T013, FR-007): convert the legacy `<workstreams>`
+    // decomposition into a typed TaskGraph behind the
+    // `hypercode.execution_graph.enabled` flag. Flag off (default) ⇒
+    // pure no-op (SC-001); the pipeline below is untouched.
+    if ctx.config.get_bool("hypercode.execution_graph.enabled", false) {
+        let baseline = std::process::Command::new("git")
+            .arg("rev-parse")
+            .arg("HEAD")
+            .current_dir(&ctx.cwd)
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let legacy: Vec<LegacyWorkstream> = workstreams
+            .iter()
+            .map(|w| LegacyWorkstream {
+                id: w.id.to_string(),
+                focus: w.focus.clone(),
+            })
+            .collect();
+        let graph = TaskGraph::from_workstreams(&legacy, &baseline);
+        match graph.validate() {
+            Ok(()) => {
+                if let Ok(mut slot) = ctx.execution_graph.lock() {
+                    *slot = Some(graph);
+                }
+            }
+            Err(errors) => {
+                let report: Vec<String> = errors
+                    .iter()
+                    .map(|e| format!("  {:?}: {} ({})", e.task_ids, e.rule, e.detail))
+                    .collect();
+                eprintln!(
+                    "hypercode: converted workstream plan failed validation (FR-009):\n{}",
+                    report.join("\n")
+                );
+            }
+        }
+    }
+
     if ctx.manager.is_interrupted() {
         report.interrupted = true;
         report.total_secs = started.elapsed().as_secs_f64();
@@ -1338,6 +1394,7 @@ mod tests {
             ),
             cwd: std::env::temp_dir(),
             parent_effective_model: None,
+            execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         assert_eq!(ctx.agent_config.tool_delay, 1.0);
         let child = child_agent_config(&ctx);
@@ -1515,6 +1572,7 @@ mod tests {
             )),
             cwd: std::path::PathBuf::from("/tmp"),
             parent_effective_model: effective.map(|s| s.to_string()),
+            execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1733,5 +1791,67 @@ mod tests {
         assert!(im.toolsets.contains(&"file".to_string()), "implementor owns the write path");
         assert!(im.toolsets.contains(&"terminal".to_string()));
         assert!(im.prompt_append.as_deref().unwrap_or("").contains("Implementor agent"));
+    }
+
+    // ── Spec 023 T013: execution_graph conversion wiring ──────────────
+
+    /// SC-001 parity: the flag defaults OFF and a freshly built context
+    /// carries no execution graph — with the flag off the conversion
+    /// block in run_hypercode is a pure no-op (same gate expression the
+    /// block uses: `config.get_bool("hypercode.execution_graph.enabled", false)`).
+    #[test]
+    fn execution_graph_flag_gating_defaults_off_and_slot_empty() {
+        // Default config: flag off.
+        let defaults = joey_core::Config::defaults();
+        assert!(!defaults.get_bool("hypercode.execution_graph.enabled", false));
+
+        // Explicit on/off round-trips through the same accessor the
+        // run_hypercode block uses.
+        let on = config_with_yaml("hypercode:\n  execution_graph:\n    enabled: true\n");
+        assert!(on.get_bool("hypercode.execution_graph.enabled", false));
+        let off = config_with_yaml("hypercode:\n  execution_graph:\n    enabled: false\n");
+        assert!(!off.get_bool("hypercode.execution_graph.enabled", false));
+
+        // A context built the way every construction site builds it
+        // starts with NO graph — flag-off runs leave it None.
+        let ctx = model_ctx("zai", None);
+        assert!(
+            ctx.execution_graph.lock().unwrap().is_none(),
+            "execution_graph must start None (SC-001 flag-off parity)"
+        );
+    }
+
+    /// FR-007 equivalence, checked inline against the real parse path:
+    /// parse_workstreams output → LegacyWorkstream mapping (the exact
+    /// mapping run_hypercode uses) → TaskGraph nodes 1:1, focus preserved
+    /// as objective, validates Ok. Full-pipeline construction is heavy
+    /// (real subagent dispatch), so the conversion is exercised at the
+    /// same seam the flag-gated block sits on.
+    #[test]
+    fn execution_graph_from_workstreams_equivalence() {
+        let planner_out = "<workstreams>\n1. Add X to crates/foo/src/lib.rs\n2. Extend bar: crates/bar/src/m.rs\n</workstreams>";
+        let workstreams = parse_workstreams(planner_out, 5);
+        assert_eq!(workstreams.len(), 2);
+
+        let legacy: Vec<LegacyWorkstream> = workstreams
+            .iter()
+            .map(|w| LegacyWorkstream {
+                id: w.id.to_string(),
+                focus: w.focus.clone(),
+            })
+            .collect();
+        let graph = TaskGraph::from_workstreams(&legacy, "deadbeef");
+        assert_eq!(graph.nodes.len(), workstreams.len(), "1 workstream = 1 node");
+        for w in &workstreams {
+            let key = joey_orchestration::task_graph::TaskId::new(&format!(
+                "workstream-{}",
+                w.id
+            ))
+            .expect("numeric id is valid");
+            let node = graph.node(&key).expect("node exists per workstream");
+            assert_eq!(node.objective, w.focus, "focus preserved as objective");
+        }
+        assert_eq!(graph.baseline_revision, "deadbeef");
+        assert_eq!(graph.validate(), Ok(()), "converted plan must validate");
     }
 }
