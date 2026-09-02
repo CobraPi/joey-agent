@@ -174,16 +174,17 @@ impl DefaultEngine {
 
     /// Trigger ingestion of the project source tree (async, off hot path).
     pub fn index_project(&self) -> parse::IngestionResult {
-        let guard = self.graph.lock().ok();
-        if guard.is_none() {
-            return parse::IngestionResult {
-                files_scanned: 0,
-                artifacts_seen: 0,
-                edges_created: 0,
-                errors: vec!["graph lock poisoned".into()],
-            };
-        }
-        let mut guard = guard.unwrap();
+        let mut guard = match self.graph.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return parse::IngestionResult {
+                    files_scanned: 0,
+                    artifacts_seen: 0,
+                    edges_created: 0,
+                    errors: vec!["graph lock poisoned".into()],
+                };
+            }
+        };
         if guard.is_none() {
             match DependencyGraph::open_for_project(&self.project_root) {
                 Ok(g) => *guard = Some(g),

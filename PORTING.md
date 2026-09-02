@@ -540,7 +540,7 @@ never runs on tokio's async workers: call sites wrap the pool in
 
 Status: Joey-native addition (no upstream counterpart; upstream Hermes has no Copilot embeddings path).
 
-When `model.provider` selects a Copilot wire (`copilot`, `github-copilot`, `github-models`, `github`, `ai-usage-hud`) and `neurocode.rag.backend` is `auto`, RAG embeddings switch from the local ONNX model (`nomic-embed-text-v1.5`) to GitHub Copilot's OpenAI-compatible `POST https://api.githubcopilot.com/embeddings` endpoint (`text-embedding-3-small`, 1536-dim, no task prefixes; `input` MUST be a JSON array). Auth reuses the chat provider's `CopilotAuth` token exchange (shared cached instance); headers mirror the copilot chat wire minus vision. New pieces: `joey-neurocode-rag` `embed::copilot` backend + `RagBackend::Copilot` + `neurocode.rag.copilot.model` config key + `text-embedding-3-small` embed profile; joey-cli wiring (`neurocode_rag_wiring.rs`, `/neurocode status` health) applies the switch with explicit-backend-wins semantics. Code egress stays behind the existing T032 consent gate (non-loopback endpoint requires `/neurocode consent ack`); `neurocode.rag.backend = local_onnx` opts out.
+When `model.provider` selects a Copilot wire (`copilot`, `github-copilot`, `github-models`, `github`, `ai-usage-hud`) and `neurocode.rag.backend` is `auto`, RAG embeddings switch from the local ONNX model (`nomic-embed-text-v1.5`) to GitHub Copilot embeddings. Default is now `metis-1024-I16-Binary` (1024-dim, no task prefixes; changed 2026-08-31) — a joey-specific enhancement beyond upstream Hermes (upstream pins `text-embedding-3-small`): metis is served via the GitHub-native dotcom embeddings endpoint `POST {dotcom}/embeddings` (raw Copilot token; `{inputs, input_type, embedding_model}` JSON body; base URL overridable via `COPILOT_DOTCOM_EMBEDDINGS_BASE_URL`, default `https://api.github.com`), while `text-embedding-3-small` remains supported via the OpenAI-style CAPI path (`POST https://api.githubcopilot.com/embeddings`, 1536-dim, `input` MUST be a JSON array). Auth reuses the chat provider's `CopilotAuth` token exchange (shared cached instance); headers mirror the copilot chat wire minus vision. New pieces: `joey-neurocode-rag` `embed::copilot` backend + `RagBackend::Copilot` + `neurocode.rag.copilot.model` config key + `text-embedding-3-small` embed profile; joey-cli wiring (`neurocode_rag_wiring.rs`, `/neurocode status` health) applies the switch with explicit-backend-wins semantics. Code egress stays behind the existing T032 consent gate (non-loopback endpoint requires `/neurocode consent ack`); `neurocode.rag.backend = local_onnx` opts out. Copilot embeddings are proxy-aware: a pinned custom endpoint (AI_USAGE_HUD_BASE_URL/COPILOT_API_BASE_URL) resolves the default/Metis model to text-embedding-3-small and embedding errors surface the response body (2026-08-31).
 
 ## Partial
 
@@ -890,6 +890,19 @@ cleared on deactivate). The line renderer consumes the new event silently
 coverage), `joey-agent-core/src/agent.rs` (`active_engine_streams_progress_events`
 — streaming engine double verifies every stage forwards as a live event),
 `joey-tui/src/state.rs` (`live_stage_streams_into_panel` + refresh stamp).
+
+**Follow-up (2026-09-01) — subagent cascade engine sharing.** **Status**:
+Complete. The subagent cascade now shares the parent session's NeuroCode
+engine with orchestration children — `SubagentManager::set_neurocode_engine`
+(`manager.rs`) hands the `Arc<dyn NeuroCodeEngine>` to each dispatched child
+`Agent`, children open the same `graph.db` without re-indexing (FR-021) and
+get a task-targeted NeuroCode Context in their system prompt; wired at
+`repl.rs`/`oneshot.rs`/`hypercode_context_for_agent`; regression-tested in
+`crates/joey-orchestration/tests/neurocode_cascade.rs`. Two accompanying
+ingest fixes: `ingest_project` now counts edges only on successful upsert
+and surfaces edge/tombstone errors in `IngestionResult.errors`; anti-pattern
+hit bump + domain-source listing failures are logged via `tracing::warn`
+instead of silently swallowed.
 
 ## Copilot reverse-proxy integration (2026-08-14)
 
@@ -1270,7 +1283,16 @@ session_end). Parent-side budget watcher stops a breaching child after
 ≤1 more action. Two-pool semaphore (`delegation.parent_reserved_permits`,
 default 1, 0 disables) keeps orchestrator capacity under child
 saturation; `delegation.wind_down_timeout_secs` (default 10) bounds
-session-end wind-down. TUI focused-pane `x`=stop / `s`=steer overlay;
+session-end wind-down. Subagent self-recovery (2026-09-02): a child turn
+ending in a fatal PROVIDER error (unrecoverable overflow, non-retryable API
+error, or retries exhausted — `TurnResult::fatal_provider_error`, distinct
+from the behavioral invalid-tool-call fatal) is retried up to
+`delegation.subagent_recovery_attempts` times (default 1, 0 disables): the
+child's poisoned history is cleared and the turn re-runs from the initial
+prompt on the same Agent object (in-place reset keeps the manager's
+interrupt/steer bridges wired); each retry surfaces
+`AgentEvent::RetryAttempt`; usage and iterations accumulate across
+attempts. TUI focused-pane `x`=stop / `s`=steer overlay;
 `AgentEvent::SubagentStopped` emitted on non-natural stops. All state is
 in-memory session-lifetime — no SQLite/on-disk format changes.
 Documented deviation: the line REPL cannot be idle-woken (reedline owns

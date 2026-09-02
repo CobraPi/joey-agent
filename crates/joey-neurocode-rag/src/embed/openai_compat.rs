@@ -98,11 +98,51 @@ pub struct EmbeddingData {
 /// taxonomy): 401/403 → `AuthRejected`, 429 → `RateLimited`, any other
 /// non-success → `Unreachable` (no server-error class exists; the backend
 /// is not serving).
+// Kept for tests/future callers now that the embed paths fold the response
+// body in via `map_status_with_body`.
+#[allow(dead_code)]
 pub(crate) fn map_status(status: reqwest::StatusCode, url: &str) -> EmbedError {
     match status.as_u16() {
         401 | 403 => EmbedError::AuthRejected(format!("HTTP {} from {}", status.as_u16(), url)),
         429 => EmbedError::RateLimited(format!("HTTP 429 from {}", url)),
         other => EmbedError::Unreachable(format!("HTTP {} from {}", other, url)),
+    }
+}
+
+/// Extract the human-readable message from a standard OpenAI-style error
+/// body (`{"error":{"message": "..."}}`), if present and non-empty.
+fn error_message_from_body(body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let msg = parsed.get("error")?.get("message")?.as_str()?;
+    let trimmed = msg.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Whitespace-collapsed, length-bounded body snippet for error messages.
+fn body_snippet(body: &str, max_chars: usize) -> String {
+    body.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(max_chars).collect()
+}
+
+/// [`map_status`] with the response body folded into the message so 4xx
+/// diagnostics (e.g. a proxy's `Copilot API error: HTTP 400 — Bad Request`)
+/// reach the caller instead of a bare status line. Classification is
+/// identical to `map_status`; the message gains `: <detail>` when a
+/// non-empty body detail is available.
+pub fn map_status_with_body(status: reqwest::StatusCode, url: &str, body: &str) -> EmbedError {
+    let detail = error_message_from_body(body).unwrap_or_else(|| body_snippet(body, 300));
+    let msg = if detail.is_empty() {
+        format!("HTTP {} from {}", status.as_u16(), url)
+    } else {
+        format!("HTTP {} from {}: {}", status.as_u16(), url, detail)
+    };
+    match status.as_u16() {
+        401 | 403 => EmbedError::AuthRejected(msg),
+        429 => EmbedError::RateLimited(msg),
+        _ => EmbedError::Unreachable(msg),
     }
 }
 
@@ -244,7 +284,8 @@ impl EmbeddingBackend for OpenAiCompat {
         let resp = req.send().await.map_err(|e| map_send_error(e, &url))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(map_status(status, &url));
+            let body = resp.text().await.unwrap_or_default();
+            return Err(map_status_with_body(status, &url, &body));
         }
         let parsed: EmbeddingsResponse =
             resp.json().await.map_err(|e| map_send_error(e, &url))?;
@@ -652,5 +693,21 @@ mod tests {
             body,
             r#"{"model":"nomic-embed-text-v1.5","input":["search_document: health"]}"#
         );
+    }
+
+    #[test]
+    fn map_status_with_body_includes_error_detail() {
+        let e = map_status_with_body(reqwest::StatusCode::BAD_REQUEST, "http://x/e", "{\"error\":{\"message\":\"Copilot API error: HTTP 400 — Bad Request\",\"code\":\"bad_request\"}}");
+        assert!(matches!(e, EmbedError::Unreachable(_)));
+        let msg = e.to_string();
+        assert!(msg.contains("HTTP 400 from http://x/e"), "{msg}");
+        assert!(msg.contains("Copilot API error: HTTP 400 — Bad Request"), "{msg}");
+    }
+
+    #[test]
+    fn map_status_with_body_empty_body_matches_map_status() {
+        let e = map_status_with_body(reqwest::StatusCode::BAD_REQUEST, "http://x/e", "");
+        assert_eq!(e.to_string(), map_status(reqwest::StatusCode::BAD_REQUEST, "http://x/e").to_string());
+        assert!(matches!(map_status_with_body(reqwest::StatusCode::UNAUTHORIZED, "http://x/e", "boom"), EmbedError::AuthRejected(_)));
     }
 }

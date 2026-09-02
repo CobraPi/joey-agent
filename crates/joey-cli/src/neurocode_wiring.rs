@@ -397,6 +397,15 @@ mod tests {
     /// by `/model neurocode …` (under the live agent provider) are read back.
     #[test]
     fn engine_scopes_tier_resolution_to_ai_usage_hud_via_magnet() {
+        // Order-dependence guard: drain the process-global copilot catalog
+        // cache (other tests warm it via real HTTP) and SEED it with a catalog
+        // that contains "gpt-5.4", so copilot_servable is deterministic here.
+        let saved_catalog = joey_providers::copilot::take_catalog_cache_for_tests();
+        joey_providers::copilot::restore_catalog_cache_for_tests(Some((
+            vec![serde_json::json!({ "id": "gpt-5.4" })],
+            std::time::Instant::now(),
+        )));
+        assert!(joey_providers::profile::copilot_servable("gpt-5.4"));
         let _g = HudEnvGuard::new();
         std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:8317");
         // Agent triple: provider=auto, empty base_url, a Copilot-servable
@@ -425,6 +434,7 @@ mod tests {
             engine.resolve_tier_model().as_deref(),
             Some("legacy-frontier")
         );
+        joey_providers::copilot::restore_catalog_cache_for_tests(saved_catalog);
     }
 
     /// ai-usage-hud: a non-Copilot-servable agent model falls through the

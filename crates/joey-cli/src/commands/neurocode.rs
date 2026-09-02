@@ -78,6 +78,66 @@ pub fn neurocode_slash_provider_scoped_text(args: &str, live_provider: &str) -> 
     }
 }
 
+/// `/neurocode backend [value]` — show or persistently set the RAG
+/// embedding backend (`neurocode.rag.backend`). An explicit backend
+/// (e.g. `local_onnx` or `copilot`) overrides provider-following `auto`
+/// resolution, so the embedding backend can be switched regardless of the
+/// selected provider.
+pub fn neurocode_backend_command_text(
+    parts: &[&str],
+    config: &mut joey_core::Config,
+) -> String {
+    use joey_neurocode_rag::config::{DEFAULT_BACKEND, KEY_BACKEND};
+
+    match parts.first().copied() {
+        None | Some("") => {
+            let current = config.get_str(KEY_BACKEND, DEFAULT_BACKEND);
+            format!(
+                "Embedding backend: {current}\n\
+                 Set with: /neurocode backend <auto|local_onnx|openai_compat|ollama|copilot>\n\
+                 An explicit backend overrides provider-based auto selection."
+            )
+        }
+        Some(raw) => match joey_neurocode_rag::config::RagBackend::parse(raw.trim()) {
+            Some(value) => {
+                let previous = config.get_str(KEY_BACKEND, DEFAULT_BACKEND);
+                match config.set_and_save(KEY_BACKEND, value.as_str()) {
+                    Ok(()) => format!(
+                        "Embedding backend: {previous} -> {value} (saved)\n\
+                         Explicit backends override provider-based auto selection."
+                    ),
+                    Err(err) => format!("Failed to save embedding backend: {err}"),
+                }
+            }
+            None => format!(
+                "Unknown embedding backend: {raw}\n\
+                 Valid values: auto | local_onnx | openai_compat | ollama | copilot"
+            ),
+        },
+    }
+}
+
+/// Classify `/neurocode ingest <free text>` WITHOUT executing any command:
+/// returns the agent-turn prompt when the arguments route to a
+/// natural-language ingest, `None` for the strict form (and every other
+/// subcommand). The TUI uses this to route ingest off the UI task without
+/// running heavy work inline.
+pub fn neurocode_ingest_request(args: &str) -> Option<String> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.first().copied() != Some("ingest") {
+        return None;
+    }
+    let ingest_parts = &parts[1..];
+    if structured_ingest(ingest_parts) || ingest_parts.is_empty() {
+        return None;
+    }
+    let request = args
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or_default();
+    Some(ingest_agent_prompt(&request))
+}
+
 /// Compose the agent-turn workflow prompt for a natural-language ingest
 /// request (the user's free text after `/neurocode ingest`).
 pub fn ingest_agent_prompt(request: &str) -> String {
@@ -122,6 +182,10 @@ fn structured_ingest(parts: &[&str]) -> bool {
 /// run the agent path. Scopes the engine to the config-resolved provider
 /// (standalone/legacy path; interactive callers prefer the provider-scoped
 /// variant below).
+// The TUI now classifies via `neurocode_ingest_request` instead of running
+// this inline (freeze fix), so this is only exercised by the ingest-routing
+// tests today — kept as the standalone/legacy dispatch entry point.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn neurocode_slash_outcome(args: &str) -> NeurocodeOutcome {
     neurocode_dispatch(args, None)
 }
@@ -139,7 +203,7 @@ pub fn neurocode_slash_provider_scoped(args: &str, live_provider: &str) -> Neuro
 fn neurocode_dispatch(args: &str, live_provider: Option<&str>) -> NeurocodeOutcome {
     let parts: Vec<&str> = args.split_whitespace().collect();
     let sub = parts.first().copied().unwrap_or("status");
-    let config = load_config();
+    let mut config = load_config();
     let engine = build_engine_with(&config, live_provider);
 
     match sub {
@@ -165,6 +229,15 @@ fn neurocode_dispatch(args: &str, live_provider: Option<&str>) -> NeurocodeOutco
                 NeurocodeOutcome::Text(engine.tier_text(action, tier))
             }
         }
+
+        // `/neurocode backend [value]` — show or persistently set the RAG
+        // embedding backend. An explicit backend overrides provider-based
+        // `auto` resolution, so users can pin local_onnx or copilot
+        // regardless of the selected provider.
+        "backend" => NeurocodeOutcome::Text(neurocode_backend_command_text(
+            &parts[1..],
+            &mut config,
+        )),
 
         "index" => {
             let force = parts.iter().any(|p| *p == "--force" || *p == "-f");
@@ -1944,6 +2017,8 @@ fn help_text() -> String {
      \x20 search <query...>               Semantic code search over the indexed project\n\
      \x20   [--path <glob>] [--limit <n>] [--expand-lines <n>] [--relations <0-2>] [--json]\n\
      \x20 model fetch [<profile>] [--dylib]  Fetch embedding model artifacts (RAG)\n\
+     \x20 backend [auto|local_onnx|copilot|        Show or set the RAG embedding backend\n\
+     \x20   openai_compat|ollama]                  (explicit backend overrides provider)\n\
      \x20 consent show|ack|revoke [--yes]  Show/acknowledge/revoke remote-backend consent\n\
      \x20   --yes skips the ack confirmation (non-interactive; TUI-safe)\n\
      \x20 ingest <category> <path>        Ingest domain knowledge\n\
@@ -1959,6 +2034,35 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin JOEY_HOME to a temp dir under the shared override lock so the
+    /// fetched copy lands in a temp home, not the real `~/.joey`. The lock
+    /// also serializes the env-mutating tests below (the EnvGuard must
+    /// always be created AFTER a pinned_home in the same test).
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn pinned_home() -> HomeGuard {
+        let lock = joey_core::constants::TEST_HOME_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("JOEY_HOME");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("JOEY_HOME", dir.path());
+        HomeGuard { prev, _lock: lock, _dir: dir }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("JOEY_HOME", v),
+                None => std::env::remove_var("JOEY_HOME"),
+            }
+        }
+    }
 
     #[test]
     fn help_succeeds() {
@@ -1977,6 +2081,61 @@ mod tests {
     fn unknown_subcommand_reports_error() {
         let out = neurocode_slash_provider_scoped_text("nonsense", "zai");
         assert!(out.contains("Unknown subcommand"));
+    }
+
+    #[test]
+    fn ingest_request_classifies_strict_form_as_none() {
+        assert_eq!(neurocode_ingest_request("ingest FrameworkDocs ./docs"), None);
+    }
+
+    #[test]
+    fn ingest_request_extracts_natural_language() {
+        let got = neurocode_ingest_request("ingest the Spring Boot docs in ./docs/spring");
+        assert!(got.is_some());
+        assert!(got.unwrap().contains("the Spring Boot docs in ./docs/spring"));
+    }
+
+    #[test]
+    fn ingest_request_none_for_empty_and_other_subcommands() {
+        assert_eq!(neurocode_ingest_request(""), None);
+        assert_eq!(neurocode_ingest_request("ingest"), None);
+        assert_eq!(neurocode_ingest_request("index"), None);
+        assert_eq!(neurocode_ingest_request("index --force"), None);
+        assert_eq!(neurocode_ingest_request("status"), None);
+        assert_eq!(neurocode_ingest_request("backend copilot"), None);
+    }
+
+    #[test]
+    fn backend_unknown_value_is_rejected_with_usage() {
+        let mut config = joey_core::Config::defaults();
+        let out = neurocode_backend_command_text(&["nope"], &mut config);
+        assert!(out.contains("Unknown embedding backend"), "{out}");
+        assert!(out.contains("copilot"), "{out}");
+    }
+
+    #[test]
+    fn backend_show_reports_configured_value() {
+        let mut config = joey_core::Config::defaults();
+        let out = neurocode_backend_command_text(&[], &mut config);
+        assert!(out.contains("Embedding backend:"), "{out}");
+    }
+
+    #[test]
+    fn backend_set_persists_and_round_trips() {
+        let _g = pinned_home();
+        let out = {
+            let mut config = joey_core::Config::load()
+                .unwrap_or_else(|_| joey_core::Config::defaults());
+            neurocode_backend_command_text(&["copilot"], &mut config)
+        };
+        let reloaded = joey_core::Config::load()
+            .unwrap_or_else(|_| joey_core::Config::defaults());
+        assert!(out.contains("copilot"), "{out}");
+        assert!(out.contains("(saved)"), "{out}");
+        assert_eq!(
+            reloaded.get_str("neurocode.rag.backend", "auto"),
+            "copilot"
+        );
     }
 
     #[test]

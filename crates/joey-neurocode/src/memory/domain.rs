@@ -349,7 +349,10 @@ pub struct ConflictReport {
 pub fn resolve_conflicts(store: &GraphStore) -> Vec<ConflictReport> {
     let sources = match store.list_domain_sources() {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::warn!("neurocode: failed to list domain sources: {}", e);
+            return Vec::new();
+        }
     };
 
     // Group explicit-version sources by (category, version); collect

@@ -233,6 +233,11 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
         }
     }
     
+    // Rightmost column the left section (logo + optional badge) occupies;
+    // the right-aligned status must start after this so a long model name
+    // can never overwrite the wordmark.
+    let mut left_end_x = x;
+
     // HyperCode indicator (enabled/disabled badge).
     if app.hypercode_enabled {
         // Live phase label during a /hypercode run; static ⚡ otherwise.
@@ -272,31 +277,57 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
             badge.chars().count() as u16,
             1,
         ));
+        left_end_x = badge_start_x + UnicodeWidthStr::width(badge) as u16;
     }
     
-    // Render right portion, right-aligned.
+    // Render right portion, right-aligned into the region right of the
+    // logo/badge. When the status is wider than that region, drop its
+    // LEADING columns (the tail — session id + activity count — is the
+    // live information) instead of letting it overwrite the wordmark.
+    // The hit-test rect is recorded only when the status fits whole,
+    // preserving the existing "zero rect when it doesn't fit" contract.
     let right_len: usize = right_spans
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    let mut rx = inner.x + inner.width.saturating_sub(right_len as u16);
-    // Record the right section's rect for click hit-testing (opens the
-    // agent-stats page). Zero when it doesn't fit.
-    if right_len as u16 <= inner.width {
+    let right_region_w = (inner.x + inner.width).saturating_sub(left_end_x);
+    if right_len <= right_region_w as usize && right_len > 0 {
+        let mut rx = inner.x + inner.width - right_len as u16;
         app.last_header_right_rect
             .set((rx, inner.y, right_len as u16, 1));
+        for span in &right_spans {
+            for ch in span.content.chars() {
+                if rx >= inner.x + inner.width {
+                    break;
+                }
+                let cell = &mut buf[(rx, inner.y)];
+                cell.set_char(ch).set_style(span.style);
+                rx += 1;
+            }
+        }
+    } else if right_region_w > 0 {
+        // Too wide: draw only the trailing `right_region_w` columns,
+        // starting right after the logo/badge.
+        app.last_header_right_rect.set((0, 0, 0, 0));
+        let mut skip = right_len - right_region_w as usize;
+        let mut rx = left_end_x;
+        for span in &right_spans {
+            for ch in span.content.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+                if skip >= cw {
+                    skip -= cw;
+                    continue;
+                }
+                if rx >= inner.x + inner.width {
+                    break;
+                }
+                let cell = &mut buf[(rx, inner.y)];
+                cell.set_char(ch).set_style(span.style);
+                rx += cw as u16;
+            }
+        }
     } else {
         app.last_header_right_rect.set((0, 0, 0, 0));
-    }
-    for span in &right_spans {
-        for ch in span.content.chars() {
-            if rx >= inner.x + inner.width {
-                break;
-            }
-            let cell = &mut buf[(rx, inner.y)];
-            cell.set_char(ch).set_style(span.style);
-            rx += 1;
-        }
     }
 
     // Subtle gradient underline (only when the header has its second row).
@@ -2850,7 +2881,7 @@ pub fn draw_omo_panel(
                 SubagentStatus::Stopped => ("■", theme.warning),
             };
             let elapsed = entry.started.elapsed().as_secs();
-            let label = truncate_str(&entry.agent_type, cw.saturating_sub(14));
+            let label = truncate_width(&entry.agent_type, cw.saturating_sub(14));
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
@@ -2897,7 +2928,7 @@ pub fn draw_omo_panel(
                 .task_title
                 .clone()
                 .unwrap_or_else(|| entry.agent_type.clone());
-            let title_disp = truncate_str(&title, cw.saturating_sub(6));
+            let title_disp = truncate_width(&title, cw.saturating_sub(6));
             lines.push(Line::from(vec![
                 Span::raw("  │ "),
                 Span::styled(
@@ -2912,9 +2943,10 @@ pub fn draw_omo_panel(
             // Detail line: status + tool-call count + last tool.
             let mut detail = format!("    {}, {} calls", status_word, entry.tool_call_count);
             if let Some(ref lt) = entry.last_tool {
-                let lt_short = truncate_str(lt, 16);
+                let lt_short = truncate_width(lt, 16);
                 detail.push_str(&format!(" · {}", lt_short));
             }
+            let detail = truncate_width(&detail, cw);
             lines.push(Line::from(vec![Span::styled(
                 detail,
                 Style::default().fg(theme.fg_most_subtle.to_color()),
@@ -3007,6 +3039,34 @@ fn truncate_str(s: &str, max: usize) -> String {
         return "…".to_string();
     }
     format!("{}…", chars[..max - 1].iter().collect::<String>())
+}
+
+/// Truncate a string to at most `max` DISPLAY cells (unicode-width aware),
+/// appending an ellipsis if cut. Double-width glyphs (CJK, emoji) count as
+/// 2 cells. For pure-ASCII input this is identical to `truncate_str`
+/// (char count == cell count), so existing ASCII rendering is unchanged.
+fn truncate_width(s: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > max - 1 {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
 }
 
 // ── Input box ───────────────────────────────────────────────────────────────
@@ -3114,101 +3174,120 @@ pub fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: Theme, elapsed: 
     let bg_block = Block::default().style(Style::default().bg(bg));
     f.render_widget(bg_block, area);
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut content: Vec<Span<'static>> = Vec::new();
     // mode badge
     let (mode_text, mode_col) = match app.mode {
         RunMode::Input => (" INPUT ", theme.success),
         RunMode::Busy => (" BUSY ", theme.busy),
         RunMode::Quitting => (" QUIT ", theme.warning),
     };
-    spans.push(Span::styled(
+    content.push(Span::styled(
         mode_text.to_string(),
         Style::default().bg(mode_col.to_color()).fg(theme.bg_void.to_color()).add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::raw("  "));
     // active agent (OMO agent picker, T145). When the roster is populated,
     // show the active agent's colored display name so the status bar reflects
     // a Tab switch even when the picker overlay is closed.
     if let Some(agent) = app.agent_roster.get(app.active_agent_index) {
         if !agent.display_name.is_empty() {
-            spans.push(Span::styled(
+            content.push(Span::styled(
                 format!("◆ {}", agent.display_name),
                 Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::raw("  "));
         }
     }
     // NeuroCode active badge (feature 015): shown whenever the engine is
     // wired + active, so the user always knows context-graph injection is on.
     if app.neurocode_active {
-        spans.push(Span::styled(
+        content.push(Span::styled(
             " ⚡NEUROCODE ",
             Style::default()
                 .bg(theme.accent.to_color())
                 .fg(theme.bg_void.to_color())
                 .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::raw("  "));
     }
     // cwd
     let cwd_short = shorten_path(&app.cwd, 28);
-    spans.push(Span::styled(
+    content.push(Span::styled(
         format!(" {}", cwd_short),
         Style::default().fg(theme.fg_more_subtle.to_color()),
     ));
-    spans.push(Span::raw("  "));
     // provider
     if !app.provider.is_empty() {
-        spans.push(Span::styled(
+        content.push(Span::styled(
             app.provider.clone(),
             Style::default().fg(theme.keyword.to_color()),
         ));
-        spans.push(Span::raw("  "));
     }
     // Terminal governor contention (spec 018, T019 / FR-011): shown ONLY
     // while commands are queued — no persistent chrome when the governor
     // is uncontended.
     if app.terminal_queued > 0 {
-        spans.push(Span::styled(
+        content.push(Span::styled(
             format!("⚙ {} active, {} queued", app.terminal_active, app.terminal_queued),
             Style::default().fg(theme.warning.to_color()),
         ));
-        spans.push(Span::raw("  "));
     }
     // token total
-    spans.push(Span::styled(
+    content.push(Span::styled(
         format!(" Σ {}", fmt_tokens(app.tokens.total())),
         Style::default().fg(theme.info.to_color()),
     ));
-    spans.push(Span::raw("  "));
     // elapsed on current turn
     if app.is_busy() {
-        spans.push(Span::styled(
+        content.push(Span::styled(
             format!("⏱ {}", fmt_elapsed(elapsed)),
             Style::default().fg(theme.warning.to_color()),
         ));
     } else {
-        spans.push(Span::styled(
+        content.push(Span::styled(
             "ready".to_string(),
             Style::default().fg(theme.fg_more_subtle.to_color()),
         ));
     }
 
-    let line = Line::from(spans);
-    let para = Paragraph::new(line).style(Style::default().bg(bg));
-    f.render_widget(para, area);
-
-    // Right-aligned keymap hint (matches the actual bindings).
+    // Reserve the right-aligned keymap hint's region first so the left
+    // content is never rendered under it: trailing (lowest-priority)
+    // content spans are dropped until the remainder fits the left region.
     let hint = if app.is_busy() {
         "⏎ queue  Esc interrupt  ^T scroll  ^R reasoning  ? help"
     } else {
         "⏎ send  ⌥⏎ newline  ^T scroll  ^R reasoning  ? help  ^C quit"
     };
-    let hint_style = Style::default().fg(theme.fg_most_subtle.to_color());
     let hint_w = UnicodeWidthStr::width(hint) as u16;
     let hx = area.x + area.width.saturating_sub(hint_w + 1);
+    let show_hint = hx > area.x;
+    let left_w = if show_hint { hx - area.x } else { area.width };
+    let avail = left_w as usize;
+    let mut total: usize = content
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    total = total.saturating_add(2 * content.len().saturating_sub(1));
+    while content.len() > 1 && total > avail {
+        let dropped = content.pop().expect("len > 1 checked");
+        total = total.saturating_sub(UnicodeWidthStr::width(dropped.content.as_ref()) + 2);
+    }
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(content.len() * 2);
+    for (i, s) in content.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(s.clone());
+    }
+    let line = Line::from(spans);
+    let para = Paragraph::new(line).style(Style::default().bg(bg));
+    f.render_widget(
+        para,
+        Rect::new(area.x, area.y, left_w, area.height),
+    );
+
+    // Right-aligned keymap hint (matches the actual bindings), written
+    // only over the region the left content never occupies.
+    let hint_style = Style::default().fg(theme.fg_most_subtle.to_color());
     let hy = area.y;
-    if hx > area.x {
+    if show_hint {
         let buf = f.buffer_mut();
         for (xx, ch) in (hx..).zip(hint.chars()) {
             if xx >= area.x + area.width {
@@ -5019,7 +5098,7 @@ pub fn draw_slash_popup(f: &mut Frame, area: Rect, app: &App, input_text: &str, 
         let scroll = app.slash_menu_cursor.saturating_sub(VISIBLE_ROWS.saturating_sub(1));
         let visible: Vec<&String> = subs.iter().skip(scroll).take(VISIBLE_ROWS).collect();
 
-        let w = 56.min(area.width);
+        let w = 56.min(area.width.saturating_sub(1));
         let h = ((visible.len() + 3) as u16).min(area.height);
         if w < 30 || h < 4 {
             return;
@@ -5081,7 +5160,7 @@ pub fn draw_slash_popup(f: &mut Frame, area: Rect, app: &App, input_text: &str, 
         .collect();
 
     // Size: command column (fixed 22) + description; +2 borders, +1 footer.
-    let w = 66.min(area.width);
+    let w = 66.min(area.width.saturating_sub(1));
     let content_rows = visible.len();
     let h = ((content_rows + 3) as u16).min(area.height);
     if w < 30 || h < 4 {
@@ -5200,7 +5279,7 @@ pub fn draw_completion_popup(f: &mut Frame, area: Rect, app: &App, theme: Theme)
     let visible: Vec<&joey_tools::completion::CompletionItem> =
         app.completion_items.iter().skip(scroll).take(VISIBLE_ROWS).collect();
 
-    let w = 72.min(area.width);
+    let w = 72.min(area.width.saturating_sub(1));
     let h = ((visible.len() + 2) as u16).min(area.height);
     if w < 30 || h < 3 {
         return;
@@ -5769,10 +5848,11 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         app.last_subagent_rail_title_rect.set((0, 0, 0, 0));
     }
 
-    // Truncate a string to at most `w` chars (char-boundary safe, matching
-    // the collapsed tab's `chars().take()` policy).
+    // Truncate a string to at most `w` DISPLAY cells (unicode-width aware,
+    // ellipsis when cut) — double-width glyphs must not blow the rail's
+    // fixed column budget.
     fn trunc(s: &str, w: usize) -> String {
-        s.chars().take(w.max(0)).collect()
+        truncate_width(s, w)
     }
 
     // ── Scrollable tab window (overflow panes) ────────────────────────
@@ -5804,7 +5884,6 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         // Line 2: model · depth · API iterations.
         // Line 3: live phase (from the matched activity entry).
         // Line 4: last invoked tool, when known.
-        let label_w = content_w.saturating_sub(3) as usize;
         let detail_w = content_w.saturating_sub(3) as usize;
         for (vi, (i, pane)) in app
             .subagent_panes
@@ -5834,7 +5913,8 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 .find(|e| e.child_id == pane.child_id)
                 .and_then(|e| e.task_title.clone())
                 .unwrap_or_else(|| pane.goal.clone());
-            let title_line = trunc(&title_src, label_w);
+            let prefix_w = if focused { 3 } else { 2 };
+            let title_line = trunc(&title_src, (content_w as usize).saturating_sub(prefix_w + 1));
             let focus_style = if focused {
                 Style::default()
                     .bg(theme.primary.to_color())
@@ -5902,7 +5982,7 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
             if let Some(tool) = entry.and_then(|e| e.last_tool.clone()) {
                 f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
-                        format!("  ⚒ {}", trunc(&tool, detail_w)),
+                        format!("  ⚒ {}", trunc(&tool, detail_w.saturating_sub(2))),
                         dim,
                     )))
                     .style(Style::default().bg(theme.bg_panel.to_color())),
@@ -5916,7 +5996,6 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         }
     } else {
         // Tabs: 2 rows each, stacked vertically below the title.
-        let label_w = content_w.saturating_sub(2) as usize;
         for (vi, (i, pane)) in app
             .subagent_panes
             .iter()
@@ -5937,7 +6016,8 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 // Spec 020 (T030): halted before completing its goal.
                 SubagentStatus::Stopped => ("■", theme.warning),
             };
-            let goal_line: String = pane.goal.chars().take(label_w.max(4)).collect();
+            let prefix_w = if focused { 3 } else { 2 };
+            let goal_line = truncate_width(&pane.goal, (content_w as usize).saturating_sub(prefix_w + 1));
             let tab_area = Rect::new(inner.x, tab_y, content_w, 2);
             let style = if focused {
                 Style::default()

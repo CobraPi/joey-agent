@@ -154,6 +154,7 @@ types) for read-only consultation.
 | `delegation.default_model` | — | fallback child model |
 | `delegation.parent_reserved_permits` | 1 | orchestrator's guaranteed minimum share of `max_concurrent_requests` provider permits; children draw from a second pool of `max(1, N − reserve)` so the parent never starves under child saturation; 0 disables (child pool == parent pool, pre-feature behavior) |
 | `delegation.wind_down_timeout_secs` | 10 | bounded wait when stopping running children at session end (line REPL `end_session` + TUI exit; stop reason `session_end`) |
+| `delegation.subagent_recovery_attempts` | 1 | bounded self-recovery for a child whose turn dies with a fatal provider error: the child's poisoned history is cleared and the turn re-runs from the initial prompt on the same provider/model; N = extra attempts after the initial run (0 disables — pre-feature behavior); each retry surfaces an `AgentEvent::RetryAttempt`; usage/iterations accumulate across attempts |
 | `omo.background_task.defaultConcurrency` | 5 | OMO background tasks |
 | `omo.background_task.providerConcurrency` / `modelConcurrency` | — | per-name limit tables |
 

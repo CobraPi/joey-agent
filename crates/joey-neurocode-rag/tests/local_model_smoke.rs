@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use joey_neurocode_rag::config::{default_model_dir, RagBackend, RagConfig};
 use joey_neurocode_rag::embed::artifacts::compute_hashes;
 use joey_neurocode_rag::embed::local_onnx::{
-    check_input_surface, LocalOnnx, LocalOnnxSettings,
+    check_input_surface, LocalOnnx, LocalOnnxSettings, ENV_ORT_DYLIB_PATH,
 };
 use joey_neurocode_rag::embed::profiles::default_profile;
 use joey_neurocode_rag::embed::{resolve_kind, BackendKind};
@@ -46,6 +46,45 @@ fn artifacts_available() -> Option<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|| default_model_dir(default_profile().name));
     compute_hashes(&dir).ok().map(|_| dir)
+}
+
+/// Filesystem-only ONNX Runtime dylib probe, mirroring the runtime ladder
+/// (`neurocode.rag.local.ort_dylib_path` → `ORT_DYLIB_PATH` → system
+/// lookup): a dylib that exists nowhere ort looks cannot load, and ort's
+/// lazy dlopen PANICS (it does not return Err) — so gate the runtime test
+/// the same way the model probe above does. Config/env rungs check the
+/// exact configured file; the system rung checks ort's documented lookup
+/// locations. Purely a skip gate: never downloads, never dlopens.
+fn dylib_available() -> bool {
+    let cfg = joey_core::Config::load().unwrap_or_else(|_| joey_core::Config::defaults());
+    let rag = RagConfig::load(&cfg);
+    let configured = rag.ort_dylib_path.trim().to_string();
+    if !configured.is_empty() {
+        return PathBuf::from(&configured).is_file();
+    }
+    if let Ok(env_path) = std::env::var(ENV_ORT_DYLIB_PATH) {
+        let env_path = env_path.trim().to_string();
+        if !env_path.is_empty() {
+            return PathBuf::from(env_path).is_file();
+        }
+    }
+    // System rung: the dlopen search roots ort's error output documents
+    // (plus the dynamic-linker search paths). A dylib present in none of
+    // them cannot load — set the config/env rung when it lives elsewhere.
+    const NAMES: [&str; 2] = ["libonnxruntime.dylib", "libonnxruntime.so"];
+    let mut dirs: Vec<PathBuf> = ["/usr/local/lib", "/opt/homebrew/lib", "/usr/lib"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join("lib"));
+    }
+    for var in ["DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"] {
+        if let Ok(search) = std::env::var(var) {
+            dirs.extend(std::env::split_paths(&search));
+        }
+    }
+    dirs.iter().any(|d| NAMES.iter().any(|n| d.join(n).is_file()))
 }
 
 /// L2 norm of a vector.
@@ -93,6 +132,16 @@ fn local_onnx_auto_resolution_and_embed_runtime() {
         return;
     };
 
+    if !dylib_available() {
+        eprintln!(
+            "SKIP (local_model_smoke): ONNX Runtime dylib not found on any ladder rung \
+             (neurocode.rag.local.ort_dylib_path / {ENV_ORT_DYLIB_PATH} / system lookup) — \
+             ort's lazy dlopen would panic without it. Point a rung at libonnxruntime \
+             to execute this test."
+        );
+        return;
+    }
+
     // (b) auto -> LocalOnnx resolution, exactly the config path's call.
     let resolved = resolve_kind(
         RagBackend::Auto,
@@ -110,10 +159,14 @@ fn local_onnx_auto_resolution_and_embed_runtime() {
         "auto must resolve LocalOnnx when artifacts are present, not KeywordOnly"
     );
 
-    // (c) load + embed through the public API.
+    // (c) load + embed through the public API. Dylib ladder must match the
+    // probe above: config rung if set (committed via `ort::init_from`
+    // inside load), else empty = env/system rungs.
+    let cfg = joey_core::Config::load().unwrap_or_else(|_| joey_core::Config::defaults());
+    let ort_dylib_path = RagConfig::load(&cfg).ort_dylib_path.trim().to_string();
     let settings = LocalOnnxSettings {
         model_dir: model_dir.clone(),
-        ort_dylib_path: String::new(), // env/system rungs of the dylib ladder
+        ort_dylib_path,
         batch_size: 64,
     };
     let profile = default_profile();

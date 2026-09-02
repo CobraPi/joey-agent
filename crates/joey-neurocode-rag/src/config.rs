@@ -123,7 +123,7 @@ pub const DEFAULT_QUANTIZE_THRESHOLD: i64 = 100000;
 pub const DEFAULT_REFRESH_MAX_FILES_PER_TURN: i64 = 50;
 pub const DEFAULT_REFRESH_MAX_BYTES_PER_TURN: i64 = 52428800;
 pub const DEFAULT_TIMEOUT_SECS: i64 = 30;
-pub const DEFAULT_COPILOT_MODEL: &str = "text-embedding-3-small";
+pub const DEFAULT_COPILOT_MODEL: &str = "metis-1024-I16-Binary";
 
 // ─── Contract table ──────────────────────────────────────────────────────────
 
@@ -279,7 +279,10 @@ pub struct RagConfig {
     pub refresh_max_bytes_per_turn: i64,
     /// `neurocode.rag.timeout_secs` (default 30).
     pub timeout_secs: i64,
-    /// `neurocode.rag.copilot.model` (default `text-embedding-3-small`).
+    /// `neurocode.rag.copilot.model` (default `metis-1024-I16-Binary`,
+    /// 1024-dim, served via the GitHub-native embeddings endpoint;
+    /// `text-embedding-3-small` (1536-dim) remains supported via the
+    /// OpenAI-style endpoint).
     pub copilot_model: String,
     /// Derived at load: `model.provider` selects a Copilot wire (see
     /// [`provider_selects_copilot`]) — the CLI wiring switches the `auto`

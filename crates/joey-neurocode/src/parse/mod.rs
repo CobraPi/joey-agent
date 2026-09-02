@@ -251,8 +251,13 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
                 m_node.signature = method.signature.clone();
                 if let Ok(mid) = graph.upsert_node(&m_node) {
                     // Edge: member belongs to its enclosing type.
-                    let _ = graph.upsert_edge(mid, id, EdgeKind::MemberOf);
-                    result.edges_created += 1;
+                    if graph.upsert_edge(mid, id, EdgeKind::MemberOf).is_ok() {
+                        result.edges_created += 1;
+                    } else {
+                        result
+                            .errors
+                            .push(format!("{}: member edge upsert failed", rel_path));
+                    }
                 }
             }
 
@@ -270,8 +275,13 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
                 f_node.declared_dependencies = vec![field.type_name.clone()];
                 f_node.signature = field.signature.clone();
                 if let Ok(fid) = graph.upsert_node(&f_node) {
-                    let _ = graph.upsert_edge(fid, id, EdgeKind::MemberOf);
-                    result.edges_created += 1;
+                    if graph.upsert_edge(fid, id, EdgeKind::MemberOf).is_ok() {
+                        result.edges_created += 1;
+                    } else {
+                        result
+                            .errors
+                            .push(format!("{}: member edge upsert failed", rel_path));
+                    }
                 }
             }
         }
@@ -308,9 +318,21 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
                     .find(|(name, _, _)| name == iface || name.ends_with(iface.as_str()))
                     .map(|(_, _, id)| *id)
                 {
-                    let _ = graph.upsert_edge(from_id, to_id, EdgeKind::Implements);
-                    let _ = graph.upsert_edge(to_id, from_id, EdgeKind::IsImplementedBy);
-                    result.edges_created += 2;
+                    if graph.upsert_edge(from_id, to_id, EdgeKind::Implements).is_ok() {
+                        result.edges_created += 1;
+                    } else {
+                        result
+                            .errors
+                            .push(format!("{}: implements edge upsert failed", rel_path));
+                    }
+                    if graph.upsert_edge(to_id, from_id, EdgeKind::IsImplementedBy).is_ok() {
+                        result.edges_created += 1;
+                    } else {
+                        result.errors.push(format!(
+                            "{}: is-implemented-by edge upsert failed",
+                            rel_path
+                        ));
+                    }
                 } else {
                     // Cross-file: resolve post-walk by simple name.
                     pending_edges.push((from_id, iface.clone(), EdgeKind::Implements));
@@ -323,8 +345,13 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
                     .find(|(name, _, _)| name == dep || name.ends_with(&dep_base))
                     .map(|(_, _, id)| *id)
                 {
-                    let _ = graph.upsert_edge(from_id, to_id, EdgeKind::Injects);
-                    result.edges_created += 1;
+                    if graph.upsert_edge(from_id, to_id, EdgeKind::Injects).is_ok() {
+                        result.edges_created += 1;
+                    } else {
+                        result
+                            .errors
+                            .push(format!("{}: injects edge upsert failed", rel_path));
+                    }
                 } else if !dep_base.is_empty() {
                     pending_edges.push((from_id, dep_base, EdgeKind::Injects));
                 }
@@ -346,7 +373,9 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
     // not linger as Active: FTS and queries keep returning phantoms, and a
     // renamed file creates a duplicate under the new path while the old one
     // stays. Mark them Deleted.
-    let _ = graph.mark_absent_paths_deleted(project_root);
+    if let Err(e) = graph.mark_absent_paths_deleted(project_root) {
+        result.errors.push(format!("tombstone pass failed: {}", e));
+    }
 
     result
 }

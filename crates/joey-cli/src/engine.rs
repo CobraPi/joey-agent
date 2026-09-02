@@ -287,6 +287,13 @@ pub(crate) fn hypercode_context_for_agent(
     let manager = std::sync::Arc::new(joey_orchestration::SubagentManager::new(
         joey_orchestration::ManagerConfig::from_config(config),
     ));
+    // Feature 015 (hypercode cascade, FR-021): hypercode pipeline children
+    // share the parent session's NeuroCode engine — same graph.db, and a
+    // task-targeted NeuroCode Context assembled into each child's system
+    // prompt.
+    if let Some(engine) = agent.neurocode_engine() {
+        manager.set_neurocode_engine(engine);
+    }
     crate::hypercode::HypercodeContext {
         agent_config,
         config: config.clone(),
@@ -1163,7 +1170,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod actor_tests {
+pub(crate) mod actor_tests {
     use super::*;
 
     /// Shared lock for actor tests that (transitively) touch the
@@ -1176,7 +1183,7 @@ mod actor_tests {
     /// this binary also call `Config::load()` whose `.env` import applies
     /// user values with OVERRIDE semantics, so every actor test must hold
     /// this lock for its whole body to keep the scrubbed env stable.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// RAII test-env guard (self-contained port of llm_selector.rs's
     /// TestEnvGuard). While held:

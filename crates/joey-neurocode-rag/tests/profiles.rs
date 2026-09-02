@@ -55,10 +55,11 @@ fn coderank_embed_profile_is_pinned() {
 fn both_profiles_are_768_dim() {
     assert_eq!(NOMIC_EMBED_TEXT_V1_5.dim, 768);
     assert_eq!(CODERANK_EMBED.dim, 768);
-    // The remote Copilot profile (Joey-native extension) is 1536-dim.
+    // The remote Copilot profiles (Joey-native extension).
     for p in joey_neurocode_rag::embed::profiles::PROFILES {
         let expected = match p.name {
             "text-embedding-3-small" => 1536,
+            "metis-1024-I16-Binary" => 1024,
             _ => 768,
         };
         assert_eq!(p.dim, expected, "profile {} must be {}-dim", p.name, expected);
@@ -174,6 +175,18 @@ fn text_embedding_3_small_profile_pins() {
     assert_eq!(p.dim, 1536);
     assert_eq!(p.prefix_query, "");
     assert_eq!(p.prefix_document, "");
+    assert_eq!(p.query_input("x"), "x");
+    assert_eq!(p.document_input("x"), "x");
+}
+
+#[test]
+fn metis_profile_pins() {
+    let p = lookup("metis-1024-I16-Binary").expect("metis-1024-I16-Binary must resolve");
+    assert_eq!(p.name, "metis-1024-I16-Binary");
+    assert_eq!(p.dim, 1024);
+    assert_eq!(p.prefix_query, "");
+    assert_eq!(p.prefix_document, "");
+    assert!(p.l2_normalize);
     assert_eq!(p.query_input("x"), "x");
     assert_eq!(p.document_input("x"), "x");
 }

@@ -120,7 +120,6 @@ pub(crate) fn resolve_query_backend(
     rag: &RagConfig,
     store: Option<&joey_neurocode::graph::GraphStore>,
 ) -> Result<(ResolvedBackend, Option<Arc<dyn EmbeddingBackend>>), EmbedError> {
-    let profile = profiles::lookup(&rag.model).unwrap_or_else(profiles::default_profile);
     // Provider-following switch (Joey-native): when the LLM provider is a
     // Copilot wire and the backend is `auto`, embeddings follow the provider
     // onto Copilot's `/embeddings` endpoint instead of the local ONNX model.
@@ -130,13 +129,8 @@ pub(crate) fn resolve_query_backend(
     } else {
         rag.backend
     };
-    let profile_name = if backend == RagBackend::Copilot {
-        joey_neurocode_rag::embed::copilot::profile_for(&rag.copilot_model)
-            .name
-            .to_string()
-    } else {
-        profile.name.to_string()
-    };
+    let profile = effective_profile(rag, backend);
+    let profile_name = profile.name.to_string();
     let decision = embed::resolve_kind(backend, &profile_name, &rag.model_dir)?;
     let consent_dir = consent_dir_for_cwd();
     match decision.kind {
@@ -191,7 +185,6 @@ pub(crate) fn resolve_documents_backend(
     rag: &RagConfig,
     store: Option<&joey_neurocode::graph::GraphStore>,
 ) -> Result<(ResolvedBackend, Option<Arc<dyn EmbeddingBackend>>), EmbedError> {
-    let profile = profiles::lookup(&rag.model).unwrap_or_else(profiles::default_profile);
     // Provider-following switch (Joey-native): when the LLM provider is a
     // Copilot wire and the backend is `auto`, embeddings follow the provider
     // onto Copilot's `/embeddings` endpoint instead of the local ONNX model.
@@ -201,13 +194,8 @@ pub(crate) fn resolve_documents_backend(
     } else {
         rag.backend
     };
-    let profile_name = if backend == RagBackend::Copilot {
-        joey_neurocode_rag::embed::copilot::profile_for(&rag.copilot_model)
-            .name
-            .to_string()
-    } else {
-        profile.name.to_string()
-    };
+    let profile = effective_profile(rag, backend);
+    let profile_name = profile.name.to_string();
     let decision = embed::resolve_kind(backend, &profile_name, &rag.model_dir)?;
     let consent_dir = consent_dir_for_cwd();
     match decision.kind {
@@ -294,9 +282,15 @@ pub(crate) fn execute_rag_search(
 ) -> Result<SearchOutcome, SearchError> {
     let graph = DependencyGraph::open_for_project(project_root)
         .map_err(|e| SearchError::Store(format!("cannot open the project graph: {e}")))?;
-    let profile = profiles::lookup(&rag.model).unwrap_or_else(profiles::default_profile);
-
     let resolved = resolve_query_backend(rag, Some(graph.store()));
+    let profile = effective_profile(
+        rag,
+        if rag.backend == RagBackend::Auto && rag.copilot_provider_active {
+            RagBackend::Copilot
+        } else {
+            rag.backend
+        },
+    );
     match resolved {
         // Real backend: embed the query leg (the pipeline pre-applies the
         // profile QUERY prefix; strip it and let the backend re-apply it).
@@ -473,6 +467,44 @@ fn degraded_vectorless_rebuild(
     Ok((files_written, chunk_total))
 }
 
+/// The effective embedding profile for `rag` under backend resolution:
+/// Copilot embeddings serve `profile_for(copilot_model)` (1536d for
+/// text-embedding-3-small) REGARDLESS of `neurocode.rag.model`, which only
+/// names the local/openai/ollama models — using the raw `rag.model` profile
+/// for a copilot-backed index compares 768d-vs-768d, skips the rebuild, and
+/// dies mid-refresh with "vector dim mismatch" on the first 1536d vector.
+/// Behind a pinned custom endpoint the effective model (and dim) follows the
+/// proxy-aware resolution, matching what the backend actually embeds with.
+pub(crate) fn effective_profile(
+    rag: &RagConfig,
+    backend: RagBackend,
+) -> &'static profiles::EmbedProfile {
+    if backend == RagBackend::Copilot {
+        let model = joey_neurocode_rag::embed::copilot::effective_model(&rag.copilot_model);
+        joey_neurocode_rag::embed::copilot::profile_for(&model)
+    } else {
+        profiles::lookup(&rag.model).unwrap_or_else(profiles::default_profile)
+    }
+}
+
+/// A backend/profile switch (e.g. local_onnx 768d -> copilot 1536d) leaves
+/// the on-disk index embedded under the OLD profile. Refreshing under the
+/// new profile would either skip unchanged files (stale-dim vectors) or
+/// fail the per-chunk dim check mid-transaction ("vector dim mismatch").
+/// The index is a derived artifact — a profile change requires a full
+/// re-embed, exactly like `--force`.
+fn needs_backend_rebuild(
+    meta: Option<&vector_store::RagIndexMeta>,
+    profile: &profiles::EmbedProfile,
+) -> bool {
+    match meta {
+        Some(m) => m.embed_profile != profile.name || m.embed_dim != profile.dim,
+        // Missing meta with chunk rows present (pre-profile-pinning index):
+        // dimensions unknowable ⇒ rebuild rather than risk stale-dim rows.
+        None => true,
+    }
+}
+
 /// One production RAG refresh over the project at `root`:
 ///
 /// - real backend → the rag crate's atomic `run_refresh` (detect +
@@ -493,17 +525,35 @@ pub(crate) fn run_production_refresh(
     let graph = DependencyGraph::open_for_project(root)
         .map_err(|e| format!("cannot open the project graph: {e}"))?;
     let store = graph.store();
-    let profile = profiles::lookup(&rag.model).unwrap_or_else(profiles::default_profile);
+    // Effective profile for the RESOLVED backend (copilot ⇒ 1024d
+    // metis-1024-I16-Binary via copilot_model, not the 768d rag.model
+    // default) — the same resolution the embedder below will use.
+    let resolved_backend = if rag.backend == RagBackend::Auto && rag.copilot_provider_active {
+        RagBackend::Copilot
+    } else {
+        rag.backend
+    };
+    let profile = effective_profile(rag, resolved_backend);
 
     let resolved = resolve_documents_backend(rag, Some(store));
     match resolved {
         Ok((decision, Some(backend))) => {
-            if force {
+            let rebuild_for_switch = !force
+                && needs_backend_rebuild(
+                    vector_store::load_index_meta(store.conn()).ok().flatten().as_ref(),
+                    profile,
+                );
+            if force || rebuild_for_switch {
                 // Reset for a full re-embed: sidecar first (so detection
                 // sees "no previous"), then the chunk rows (cascade removes
                 // vectors; edges are fully derived and rewritten by the
                 // refresh). Brief empty window before the refresh commits —
                 // a user-invoked --force rebuild, not the hot path.
+                // `rebuild_for_switch` reaches here when the embedding
+                // profile changed since the index was written (e.g. a
+                // local_onnx <-> copilot backend switch): stale-dim vectors
+                // would fail the per-chunk dim check mid-refresh ("vector
+                // dim mismatch"), so the whole derived index is rebuilt.
                 let _ = std::fs::remove_file(fingerprint_sidecar_for(root));
                 store
                     .conn()
@@ -533,7 +583,15 @@ pub(crate) fn run_production_refresh(
                     chunks_embedded: report.outcome.chunks_embedded,
                     chunks_skipped: report.outcome.chunks_skipped,
                 },
-                backend_line: format!("backend {}", decision.kind.as_str()),
+                backend_line: if rebuild_for_switch {
+                    format!(
+                        "backend {} (index re-embedded: embedding profile changed, {}d)",
+                        decision.kind.as_str(),
+                        profile.dim
+                    )
+                } else {
+                    format!("backend {}", decision.kind.as_str())
+                },
                 files_deferred: report.outcome.files_deferred,
             })
         }
@@ -680,7 +738,14 @@ impl RagPrefetchSource for ProductionRagPrefetchSource {
         }
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let graph = DependencyGraph::open_for_project(&root).ok()?;
-        let profile = profiles::lookup(&rag.model).unwrap_or_else(profiles::default_profile);
+        let profile = effective_profile(
+            &rag,
+            if rag.backend == RagBackend::Auto && rag.copilot_provider_active {
+                RagBackend::Copilot
+            } else {
+                rag.backend
+            },
+        );
         let request = SearchRequest {
             query: tokens.join(" "),
             file_filter: None,
@@ -742,6 +807,25 @@ pub(crate) fn install_rag_injections(agent: &mut joey_agent_core::Agent, config:
 mod copilot_switch_tests {
     use super::*;
 
+    /// Serializes tests in this module that mutate the endpoint env vars
+    /// (COPILOT_API_BASE_URL / AI_USAGE_HUD_BASE_URL) — same convention as
+    /// llm_selector.rs / engine.rs ENV_LOCK and joey-providers'
+    /// `copilot::TEST_ENV_LOCK`: rust runs `#[test]` fns as parallel
+    /// threads in one process, so a sibling's set_var would otherwise land
+    /// inside another test's scrubbed-env window.
+    ///
+    /// Cross-module serialization: distinct modules' ENV_LOCKs do NOT
+    /// exclude each other, so this module's endpoint-env mutations are
+    /// additionally serialized against every OTHER joey-cli test module
+    /// that mutates the same vars by acquiring each mutating module's
+    /// ENV_LOCK in a FIXED alphabetical-by-file-path order:
+    /// `crate::engine::actor_tests::ENV_LOCK` (engine.rs), then
+    /// `crate::llm_selector::tests::ENV_LOCK` (llm_selector.rs).
+    /// (neurocode_wiring.rs's HudEnvGuard tests already serialize on
+    /// joey-core's single cross-crate TEST_HOME_OVERRIDE_LOCK, which our
+    /// tests never take, so no additional lock is needed for them.)
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn rag_copilot_provider() -> RagConfig {
         let mut rag = RagConfig::default();
         rag.copilot_provider_active = true; // model.provider == copilot
@@ -750,16 +834,69 @@ mod copilot_switch_tests {
 
     #[test]
     fn auto_follows_copilot_provider() {
+        // Hermetic: this machine may export AI_USAGE_HUD_BASE_URL (proxy),
+        // which flips the default Copilot model — detach from the ambient
+        // env for the duration (save/remove/restore, same pattern as the
+        // resolve_constructs_gated_copilot_backend test in embed/mod.rs).
+        // ENV_LOCK is taken BEFORE the save so no sibling's concurrent
+        // set_var can be captured or land inside the scrubbed window.
+        // The sibling module locks follow in the fixed alphabetical order
+        // documented on ENV_LOCK (engine.rs, then llm_selector.rs).
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard1 = crate::engine::actor_tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard2 = crate::llm_selector::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = (
+            std::env::var("COPILOT_API_BASE_URL").ok(),
+            std::env::var("AI_USAGE_HUD_BASE_URL").ok(),
+        );
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
         let rag = rag_copilot_provider();
         let (decision, backend) = resolve_query_backend(&rag, None).unwrap();
         assert_eq!(decision.kind, BackendKind::Copilot);
         let info = backend.expect("backend constructed").describe_embedder();
         assert_eq!(info.backend_kind, BackendKind::Copilot);
-        assert_eq!(info.model, "text-embedding-3-small");
-        assert_eq!(info.dim, 1536);
+        assert_eq!(info.model, "metis-1024-I16-Binary");
+        assert_eq!(info.dim, 1024);
         let (decision, backend) = resolve_documents_backend(&rag, None).unwrap();
         assert_eq!(decision.kind, BackendKind::Copilot);
+        assert_eq!(backend.expect("backend").describe_embedder().model, "metis-1024-I16-Binary");
+        if let Some(v) = saved.0 {
+            std::env::set_var("COPILOT_API_BASE_URL", v);
+        }
+        if let Some(v) = saved.1 {
+            std::env::set_var("AI_USAGE_HUD_BASE_URL", v);
+        }
+    }
+
+    #[test]
+    fn auto_follows_copilot_provider_behind_pinned_proxy() {
+        // ENV_LOCK serializes the endpoint-env mutations below against the
+        // sibling env-guard tests in this module (see ENV_LOCK docs), and
+        // the sibling module locks (fixed alphabetical order documented on
+        // ENV_LOCK: engine.rs, then llm_selector.rs) serialize them
+        // cross-module.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard1 = crate::engine::actor_tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard2 = crate::llm_selector::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_api = std::env::var("COPILOT_API_BASE_URL").ok();
+        let saved_hud = std::env::var("AI_USAGE_HUD_BASE_URL").ok();
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:9317"); // off-githubcopilot
+        let rag = rag_copilot_provider();
+        let (decision, backend) = resolve_query_backend(&rag, None).unwrap();
+        assert_eq!(decision.kind, BackendKind::Copilot);
+        let info = backend.expect("backend constructed").describe_embedder();
+        assert_eq!(info.model, "text-embedding-3-small");
+        assert_eq!(info.dim, 1536);
+        let (_, backend) = resolve_documents_backend(&rag, None).unwrap();
         assert_eq!(backend.expect("backend").describe_embedder().model, "text-embedding-3-small");
+        let profile = effective_profile(&rag, RagBackend::Copilot);
+        assert_eq!(profile.name, "text-embedding-3-small");
+        assert_eq!(profile.dim, 1536);
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+        if let Some(v) = saved_api { std::env::set_var("COPILOT_API_BASE_URL", v); }
+        if let Some(v) = saved_hud { std::env::set_var("AI_USAGE_HUD_BASE_URL", v); }
     }
 
     #[test]
@@ -770,6 +907,93 @@ mod copilot_switch_tests {
         let (decision, backend) = resolve_query_backend(&rag, None).unwrap();
         assert_eq!(decision.kind, BackendKind::OpenAiCompat);
         assert_eq!(backend.expect("backend").describe_embedder().backend_kind, BackendKind::OpenAiCompat);
+    }
+
+    #[test]
+    fn effective_profile_follows_copilot_model_not_rag_model() {
+        // Hermetic: effective_profile is proxy-aware; pin the NO-proxy
+        // endpoint mode for the duration (same save/remove/restore pattern
+        // as resolve_constructs_gated_copilot_backend in embed/mod.rs).
+        // ENV_LOCK taken BEFORE the save (see ENV_LOCK docs); the sibling
+        // module locks follow in the fixed alphabetical order documented on
+        // ENV_LOCK (engine.rs, then llm_selector.rs).
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard1 = crate::engine::actor_tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard2 = crate::llm_selector::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = (
+            std::env::var("COPILOT_API_BASE_URL").ok(),
+            std::env::var("AI_USAGE_HUD_BASE_URL").ok(),
+        );
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+        let rag = rag_copilot_provider();
+        let profile = effective_profile(&rag, RagBackend::Copilot);
+        assert_eq!(profile.name, "metis-1024-I16-Binary");
+        assert_eq!(profile.dim, 1024);
+        if let Some(v) = saved.0 {
+            std::env::set_var("COPILOT_API_BASE_URL", v);
+        }
+        if let Some(v) = saved.1 {
+            std::env::set_var("AI_USAGE_HUD_BASE_URL", v);
+        }
+    }
+
+    #[test]
+    fn effective_profile_non_copilot_uses_rag_model() {
+        let mut rag = RagConfig::default();
+        rag.copilot_provider_active = true; // must NOT matter for local backends
+        let profile = effective_profile(&rag, RagBackend::LocalOnnx);
+        assert_eq!(profile.name, profiles::default_profile().name);
+        assert_eq!(profile.dim, profiles::default_profile().dim);
+    }
+
+    #[test]
+    fn needs_backend_rebuild_true_when_meta_missing() {
+        assert!(needs_backend_rebuild(None, profiles::default_profile()));
+    }
+
+    #[test]
+    fn needs_backend_rebuild_false_on_matching_profile() {
+        let p = profiles::default_profile();
+        let meta = rag_index_meta_for(p.name, p.dim);
+        assert!(!needs_backend_rebuild(Some(&meta), p));
+    }
+
+    #[test]
+    fn needs_backend_rebuild_true_on_dim_change() {
+        // nomic (768d) index meta vs a 1536d profile (explicit
+        // text-embedding-3-small copilot model, not the metis default)
+        let meta = rag_index_meta_for(profiles::default_profile().name, 1536);
+        let copilot = joey_neurocode_rag::embed::copilot::profile_for("text-embedding-3-small");
+        assert_ne!(profiles::default_profile().dim, copilot.dim);
+        assert!(needs_backend_rebuild(Some(&meta), copilot));
+    }
+
+    #[test]
+    fn needs_backend_rebuild_true_on_profile_name_change() {
+        let meta = rag_index_meta_for("text-embedding-3-small", profiles::default_profile().dim);
+        assert!(needs_backend_rebuild(
+            Some(&meta),
+            profiles::default_profile()
+        ));
+    }
+
+    /// Minimal `RagIndexMeta` with the identity fields that matter here.
+    fn rag_index_meta_for(embed_profile: &str, embed_dim: u32) -> vector_store::RagIndexMeta {
+        vector_store::RagIndexMeta {
+            schema_version: 3,
+            embed_profile: embed_profile.to_string(),
+            embed_model: String::new(),
+            embed_dim,
+            pooling: String::new(),
+            prefix_query: String::new(),
+            prefix_document: String::new(),
+            quantization_policy: String::new(),
+            chunk_count: 0,
+            last_refresh_at: None,
+            refresh_state: String::new(),
+            created_at: String::new(),
+        }
     }
 
     #[test]

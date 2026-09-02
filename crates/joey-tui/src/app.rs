@@ -68,6 +68,22 @@ pub enum TuiAction {
     SteerSubagent { id: u64, text: String },
 }
 
+/// Buffer-level text-selection state (mouse drag → clipboard). Coordinates
+/// are (row, col) buffer cells. The selection persists after release (the
+/// highlight stays) until the next press or Esc.
+#[derive(Default)]
+pub(crate) struct TextSelection {
+    /// Anchor (press cell) and head (current/release cell); None = nothing
+    /// selected.
+    range: Option<((u16, u16), (u16, u16))>,
+    /// True while the button is held between Down and Up.
+    dragging: bool,
+    /// Set on drag-release: the NEXT draw extracts the selected text from
+    /// the buffer and stashes it into `App::pending_selection_copy` (only
+    /// the draw pass can read the rendered buffer on every backend).
+    pending_copy: bool,
+}
+
 pub type FrameBackend = CrosstermBackend<Stdout>;
 pub type FrameTerminal = Terminal<FrameBackend>;
 
@@ -433,6 +449,7 @@ pub struct Tui<B: ratatui::backend::Backend = FrameBackend> {
     /// to the focused pane's child (`None` = closed). Controller-owned
     /// singleton overlay, exactly like `show_help`/search.
     steer: Option<SteerOverlay>,
+    pub(crate) selection: TextSelection,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -553,6 +570,7 @@ impl Tui<FrameBackend> {
             completion_cwd: std::env::current_dir().unwrap_or_default(),
             completion_suppressed: false,
             steer: None,
+            selection: TextSelection::default(),
         })
     }
 
@@ -611,6 +629,7 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             completion_cwd: std::env::current_dir().unwrap_or_default(),
             completion_suppressed: false,
             steer: None,
+            selection: TextSelection::default(),
         }
     }
 
@@ -689,6 +708,7 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             show_help,
             focus,
             steer,
+            selection,
             ..
         } = self;
         let theme = *theme;
@@ -773,6 +793,62 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             if let Some(steer) = steer {
                 widgets::draw_steer_bar(f, area, steer, &theme);
             }
+
+            // ── Text-selection overlay (mouse drag) ─────────────────────────
+            // Buffer-level pass AFTER every widget: whatever cells the
+            // selection covers get the brand highlight — transcript, panes,
+            // stats page, popups, status bar: ALL on-screen text is
+            // selectable. On drag-release the selected text is extracted from
+            // the same buffer and stashed for the host's clipboard copy.
+            if let Some(((r1, c1), (r2, c2))) = selection.range {
+                let ((top, left), (bottom, right)) = if (r1, c1) <= (r2, c2) {
+                    ((r1, c1), (r2, c2))
+                } else {
+                    ((r2, c2), (r1, c1))
+                };
+                let area = f.area();
+                let bottom = bottom.min(area.height.saturating_sub(1));
+                let right = right.min(area.width.saturating_sub(1));
+                if top <= bottom && left <= right {
+                    // Line-wise bounds: the first row starts at the press
+                    // column, the last row ends at the release column, rows in
+                    // between span the full width.
+                    let row_from = |row: u16| if row == top { left } else { 0 };
+                    let row_to =
+                        |row: u16| if row == bottom { right + 1 } else { area.width };
+                    if selection.pending_copy {
+                        let mut text = String::new();
+                        for row in top..=bottom {
+                            let buf = f.buffer_mut();
+                            let mut line = String::new();
+                            for col in row_from(row)..row_to(row) {
+                                // Wide glyphs have empty symbols on their
+                                // continuation cells — concatenation skips them
+                                // naturally.
+                                line.push_str(buf[(col, row)].symbol());
+                            }
+                            text.push_str(line.trim_end());
+                            if row < bottom {
+                                text.push('\n');
+                            }
+                        }
+                        selection.pending_copy = false;
+                        if !text.trim().is_empty() {
+                            *app.pending_selection_copy.borrow_mut() = Some(text);
+                        }
+                    }
+                    // Highlight: brand-primary background with near-black
+                    // foreground — the same pairing the focused rail tab uses.
+                    let hl = Style::default()
+                        .bg(theme.primary.to_color())
+                        .fg(theme.bg_void.to_color());
+                    for row in top..=bottom {
+                        for col in row_from(row)..row_to(row) {
+                            f.buffer_mut()[(col, row)].set_style(hl);
+                        }
+                    }
+                }
+            }
         })?;
         Ok(())
     }
@@ -827,6 +903,13 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// keys that can't collide with typing (Esc, Tab, F1, PgUp/PgDn).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<TuiAction> {
         if key.kind != KeyEventKind::Press {
+            return None;
+        }
+
+        // Active text selection: Esc clears it before anything else (the
+        // most transient UI state goes first).
+        if self.selection.range.is_some() {
+            self.clear_selection();
             return None;
         }
 
@@ -1236,7 +1319,6 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                     // focused this is a no-op, so the departed pane KEEPS
                     // its own scroll across focus switches (FR-010); there
                     // is no shared anchor left to reset.
-                    self.app.set_focused_pane_stats_view(None);
                 }
                 return None;
             }
@@ -2353,7 +2435,6 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             self.app.focus_subagent(None);
             // T004: per-pane stats anchors — no shared anchor to reset; the
             // departed pane keeps its scroll (FR-010).
-            self.app.set_focused_pane_stats_view(None);
             return;
         }
         if let Some(idx) = self.app.subagent_tab_hit(row, col) {
@@ -2364,8 +2445,9 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             };
             self.app.focus_subagent(target);
             // T004: per-pane stats anchors — the newly focused pane keeps its
-            // own scroll; no shared reset (FR-010).
-            self.app.set_focused_pane_stats_view(None);
+            // own scroll (FR-010). The keyboard path (Ctrl+P / rail tab
+            // cycle) never clears anchors on focus switches; the click path
+            // must not either.
             return;
         }
         // Header right section (model/session/status): opens the maximized
@@ -2397,10 +2479,20 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // Expandable-stats: a click that resolves to a context-stream entry
         // toggles that entry's expansion (main window parity — every row is
         // expandable). Clicks on the dashboard header/footer are no-ops.
+        // T023 parity: while a pane is focused the page retargets to that
+        // child, so the PANE rect is the live one — gate on it (the main
+        // rect is stale/zero in pane mode and would silently drop the
+        // click), and resolve the target through the single routing point
+        // (D3) like every other stats handler.
         {
-            let (x, y, w, h) = self.app.last_stats_rect.get();
+            let pane_focused =
+                matches!(self.resolve_transcript_target(), TranscriptTarget::Pane(_));
+            let (x, y, w, h) = if pane_focused {
+                self.app.last_pane_stats_rect.get()
+            } else {
+                self.app.last_stats_rect.get()
+            };
             if w > 0 && h > 0 && row >= y && row < y + h && col >= x && col < x + w {
-                let pane_focused = self.app.focused_subagent.is_some();
                 let hit = if pane_focused {
                     self.app.pane_stats_context_entry_hit(row)
                 } else {
@@ -2484,6 +2576,68 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         if let Some(item_idx) = widgets::transcript_hit_test(&self.app, self.theme, row, col) {
             self.app.toggle_item_expand_by_index(item_idx);
         }
+    }
+
+    /// ── Text selection (mouse drag) ───────────────────────────────────
+    /// Left-button pressed: start a selection attempt at this cell. The
+    /// click action (if any) fires on RELEASE via [`Self::handle_mouse_up`],
+    /// so a drag never triggers a click.
+    pub fn handle_mouse_down(&mut self, row: u16, col: u16) {
+        self.selection = TextSelection {
+            range: Some(((row, col), (row, col))),
+            dragging: true,
+            pending_copy: false,
+        };
+    }
+
+    /// Left-button dragged: extend the selection head. No-op when no
+    /// selection drag is in progress.
+    pub fn handle_mouse_drag(&mut self, row: u16, col: u16) {
+        if self.selection.dragging {
+            if let Some((anchor, _)) = self.selection.range {
+                self.selection.range = Some((anchor, (row, col)));
+            }
+        }
+    }
+
+    /// Left-button released. Returns `true` when this was a plain CLICK
+    /// (press + release on the same cell, no drag) — the host then calls
+    /// [`Self::handle_mouse_click`] with the release coordinates, exactly
+    /// like the old press-based click. A drag-release instead commits the
+    /// selection and requests the clipboard copy (extracted on the next
+    /// draw). Returns `false` when no press was in progress.
+    pub fn handle_mouse_up(&mut self, row: u16, col: u16) -> bool {
+        if !self.selection.dragging {
+            return false;
+        }
+        self.selection.dragging = false;
+        match self.selection.range {
+            Some((anchor, _)) => {
+                if anchor == (row, col) {
+                    // Plain click: no selection — clear and let the host click.
+                    self.selection.range = None;
+                    true
+                } else {
+                    // Commit the selection at the release cell (some
+                    // terminals skip the final drag event at release).
+                    self.selection.range = Some((anchor, (row, col)));
+                    self.selection.pending_copy = true;
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// True while a selection is highlighted (during a drag or after
+    /// release).
+    pub fn has_selection(&self) -> bool {
+        self.selection.range.is_some()
+    }
+
+    /// Clear the selection highlight (Esc / new press).
+    pub fn clear_selection(&mut self) {
+        self.selection = TextSelection::default();
     }
 }
 
@@ -5123,6 +5277,106 @@ mod pane_expand_key_routing_tests {
             "pane item untouched while unfocused"
         );
     }
+
+    // ── Subagent context-window (stats) click parity ──────────────────
+
+    /// A focused pane's stats page must toggle entries on click using the
+    /// PANE rect — the main stats rect is never drawn in pane mode (it is
+    /// stale/zero there), so gating on it would silently drop the click.
+    #[test]
+    fn pane_stats_click_toggles_pane_entry_expansion() {
+        use joey_agent_core::events::ContextEntry;
+        let mut app = App::new("sess", "model");
+        app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id: 7,
+            goal: "pane stats click".into(),
+            model: "test-model".into(),
+            toolset_summary: "file".into(),
+            depth: 0,
+        });
+        let pane_idx = app.subagent_panes.len() - 1;
+        app.focus_subagent(Some(pane_idx));
+        app.toggle_stats();
+        // Feed the pane a context snapshot so the stream has an entry.
+        app.apply(joey_agent_core::AgentEvent::SubagentEvent {
+            id: 7,
+            event: Box::new(joey_agent_core::AgentEvent::ContextSnapshot {
+                entries: vec![ContextEntry {
+                    role: "tool".into(),
+                    tokens: 123,
+                    preview: "pane click entry".into(),
+                    has_tool_calls: false,
+                    is_compressed_summary: false,
+                    full_content: "pane click entry full".into(),
+                }],
+                system_tokens: 10,
+                history_tokens: 123,
+                context_window: 1000,
+                compression_threshold: 800,
+                compactions: 0,
+                model: "test-model".into(),
+            }),
+        });
+        // Simulate the frame having drawn: pane stats rect set, pane stream
+        // rows recorded for entry 0 at rows 0..1 with inner_y = 5.
+        app.last_pane_stats_rect.set((2, 4, 60, 20));
+        app.last_pane_stats_window.set((5, 0));
+        app.last_pane_stats_stream_rows.borrow_mut().clear();
+        app.last_pane_stats_stream_rows.borrow_mut().push((0, 0, 1));
+        // Main rect left stale-zero (never drawn in pane mode) — the click
+        // must still work via the pane rect.
+        app.last_stats_rect.set((0, 0, 0, 0));
+
+        let terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut t = Tui::new_for_test(app, Theme::aurora(), terminal);
+        t.handle_mouse_click(5, 10);
+        assert!(
+            t.app.focused_pane().unwrap().expanded_context.contains(&0),
+            "click inside pane stats rect toggles the pane entry"
+        );
+        // Click again on the same row — toggles back.
+        t.handle_mouse_click(5, 10);
+        assert!(
+            !t.app.focused_pane().unwrap().expanded_context.contains(&0),
+            "second click collapses the entry again"
+        );
+    }
+
+    /// Clicking a rail tab to switch panes must NOT reset the newly focused
+    /// pane's stats anchor (FR-010 parity with the keyboard path; the old
+    /// click path cleared it, contradicting its own comment).
+    #[test]
+    fn pane_tab_click_switch_preserves_new_pane_stats_anchor() {
+        let mut t = tui();
+        // Two panes.
+        for id in 1..=2 {
+            t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+                id,
+                goal: format!("child {id}"),
+                model: "m".into(),
+                toolset_summary: "file".into(),
+                depth: 0,
+            });
+        }
+        // Freeze pane 0's stats anchor.
+        t.app.focus_subagent(Some(0));
+        t.app.set_focused_pane_stats_view(Some(3));
+        // Switch to pane 1 by clicking its rail tab (simulate the drawn
+        // geometry: tab rects recorded for panes 0 and 1 on rows 2 and 4).
+        t.app.last_subagent_tab_rects.borrow_mut().clear();
+        t.app.last_subagent_tab_rects.borrow_mut().push((0, 2, 19, 1));
+        t.app.last_subagent_tab_rects.borrow_mut().push((0, 4, 19, 1));
+        t.handle_mouse_click(4, 5);
+        assert_eq!(t.app.focused_subagent, Some(1), "click switched to pane 1");
+        // Re-focus pane 0 via click and verify its anchor survived.
+        t.handle_mouse_click(2, 5);
+        assert_eq!(t.app.focused_subagent, Some(0));
+        assert_eq!(
+            t.app.focused_pane().unwrap().stats_view,
+            Some(3),
+            "pane 0's stats anchor preserved across the focus round trip"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6283,5 +6537,159 @@ mod fr014_background_pane_parity_tests {
             assert_eq!(pane.streaming_assistant, "chunk ", "same live stream shape");
             assert!(pane.tap_attached, "id-matched attribution live");
         }
+    }
+}
+
+#[cfg(test)]
+mod text_selection_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    /// Test-only adapter so the REAL `Tui::draw` path (whose bound is
+    /// `io::Error: From<B::Error>`) can run against `TestBackend`, whose
+    /// error type is `Infallible`. Every call forwards unchanged; the
+    /// impossible error is simply eliminated. (Same pattern as
+    /// `pane_viewer_key_tests::IoTestBackend`, which is module-private.)
+    struct IoTestBackend(TestBackend);
+
+    impl ratatui::backend::Backend for IoTestBackend {
+        type Error = std::io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.0.draw(content).map_err(|e| match e {})
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.0.hide_cursor().map_err(|e| match e {})
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.0.show_cursor().map_err(|e| match e {})
+        }
+
+        fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+            self.0.get_cursor_position().map_err(|e| match e {})
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.0.set_cursor_position(position).map_err(|e| match e {})
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.0.clear().map_err(|e| match e {})
+        }
+
+        fn clear_region(
+            &mut self,
+            clear_type: ratatui::backend::ClearType,
+        ) -> Result<(), Self::Error> {
+            self.0.clear_region(clear_type).map_err(|e| match e {})
+        }
+
+        fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+            self.0.size().map_err(|e| match e {})
+        }
+
+        fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+            self.0.window_size().map_err(|e| match e {})
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.0.flush().map_err(|e| match e {})
+        }
+    }
+
+    fn tui() -> Tui<IoTestBackend> {
+        let app = App::new("sess", "model");
+        let terminal = ratatui::Terminal::new(IoTestBackend(TestBackend::new(100, 30))).unwrap();
+        Tui::new_for_test(app, Theme::aurora(), terminal)
+    }
+
+    /// Drag across the header selects the wordmark and stashes the text
+    /// for the host's clipboard copy.
+    #[test]
+    fn drag_selects_and_copies_visible_text() {
+        let mut t = tui();
+        t.handle_mouse_down(0, 0);
+        t.handle_mouse_drag(0, 12);
+        assert!(
+            !t.handle_mouse_up(0, 12),
+            "drag-release is a selection, not a click"
+        );
+        t.draw().unwrap();
+        let text = t.app.take_pending_selection_copy().expect("selection text stashed");
+        assert!(text.contains("joey"), "selection captured the wordmark: {text:?}");
+        assert!(t.has_selection(), "selection stays highlighted after release");
+        // Draining is one-shot.
+        assert!(t.app.take_pending_selection_copy().is_none());
+    }
+
+    /// The highlight paints the selected cells brand-primary on the buffer.
+    #[test]
+    fn selection_highlight_renders_on_buffer() {
+        let mut t = tui();
+        t.handle_mouse_down(0, 2);
+        t.handle_mouse_drag(0, 8);
+        let _ = t.handle_mouse_up(0, 8);
+        t.draw().unwrap();
+        let buf = t.terminal.backend().0.buffer();
+        assert_eq!(
+            buf[(5, 0)].bg,
+            ratatui::style::Color::Rgb(0x22, 0xE4, 0xE8),
+            "selected cell highlighted brand cyan"
+        );
+        assert_ne!(
+            buf[(50, 0)].bg,
+            ratatui::style::Color::Rgb(0x22, 0xE4, 0xE8),
+            "cell outside the selection keeps its background"
+        );
+    }
+
+    /// Press + release on the same cell is a plain click: the host gets
+    /// `true` and runs the legacy click handler; nothing gets selected.
+    #[test]
+    fn plain_click_still_clicks_and_never_selects() {
+        let mut t = tui();
+        t.app.last_header_right_rect.set((70, 0, 28, 1));
+        t.handle_mouse_down(0, 85);
+        assert!(t.handle_mouse_up(0, 85), "press+release same cell is a click");
+        // Host behavior on Click=true: route through the legacy handler.
+        t.handle_mouse_click(0, 85);
+        assert!(t.app.stats_open, "click went through the legacy path");
+        assert!(!t.has_selection(), "a click never leaves a selection");
+        t.draw().unwrap();
+        assert!(t.app.take_pending_selection_copy().is_none());
+    }
+
+    /// A multi-row selection joins the rows with newlines.
+    #[test]
+    fn multi_row_selection_joins_lines() {
+        let mut t = tui();
+        t.handle_mouse_down(0, 0);
+        t.handle_mouse_drag(2, 30);
+        let _ = t.handle_mouse_up(2, 30);
+        t.draw().unwrap();
+        let text = t.app.take_pending_selection_copy().expect("text");
+        assert!(text.contains('\n'), "multi-row selection spans lines: {text:?}");
+    }
+
+    /// Esc clears an active selection.
+    #[test]
+    fn esc_clears_selection() {
+        let mut t = tui();
+        t.handle_mouse_down(0, 0);
+        t.handle_mouse_drag(0, 10);
+        let _ = t.handle_mouse_up(0, 10);
+        assert!(t.has_selection());
+        let _ = t.handle_key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Esc,
+        ));
+        assert!(!t.has_selection(), "Esc cleared the selection");
     }
 }

@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::embed::local_onnx::InputKind;
 use crate::embed::openai_compat::{
-    l2_normalize, map_send_error, map_status, prefixed_input,
+    l2_normalize, map_send_error, map_status_with_body, prefixed_input,
 };
 use crate::embed::profiles::{default_profile, lookup, EmbedProfile, Pooling};
 use crate::embed::{BackendKind, EmbedError, EmbedPrefixes, EmbedderInfo, EmbeddingBackend};
@@ -176,7 +176,8 @@ impl EmbeddingBackend for OllamaNative {
         let resp = req.send().await.map_err(|e| map_send_error(e, &url))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(map_status(status, &url));
+            let body = resp.text().await.unwrap_or_default();
+            return Err(map_status_with_body(status, &url, &body));
         }
         let parsed: EmbedResponse = resp.json().await.map_err(|e| map_send_error(e, &url))?;
 

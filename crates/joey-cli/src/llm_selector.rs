@@ -477,7 +477,7 @@ fn cmd_help() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Shared lock for tests that touch the process-global environment
@@ -488,7 +488,7 @@ mod tests {
     /// about these vars, so every reader must hold this lock too: otherwise
     /// a parallel help/nonsense test's dotenv import re-sets
     /// AI_USAGE_HUD_BASE_URL between a magnet test's scrub and its assert.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// RAII test-env guard. While held:
     /// 1. ENV_LOCK is held, serializing every env-touching test in this

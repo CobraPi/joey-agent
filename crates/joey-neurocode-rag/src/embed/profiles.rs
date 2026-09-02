@@ -147,10 +147,29 @@ pub const TEXT_EMBEDDING_3_SMALL: EmbedProfile = EmbedProfile {
     license: "Proprietary — served via the GitHub Copilot subscription",
 };
 
+/// `metis-1024-I16-Binary` — GitHub's 2025 Copilot-native embedding
+/// model (top-tier offered by Copilot). Served only by the GitHub
+/// dotcom embeddings endpoint; no task prefixes; vectors arrive as
+/// 1024-d float arrays.
+pub const METIS_1024_I16_BINARY: EmbedProfile = EmbedProfile {
+    name: "metis-1024-I16-Binary",
+    dim: 1024,
+    ctx: 8192,
+    pooling: Pooling::Mean,
+    l2_normalize: true,
+    prefix_query: "",
+    prefix_document: "",
+    license: "Proprietary — served via the GitHub Copilot subscription",
+};
+
 /// The accepted profile table. Lookup by name via [`lookup`]; the default
 /// resolution is [`default_profile`] ([`DEFAULT_PROFILE_NAME`]).
-pub const PROFILES: &[EmbedProfile] =
-    &[NOMIC_EMBED_TEXT_V1_5, CODERANK_EMBED, TEXT_EMBEDDING_3_SMALL];
+pub const PROFILES: &[EmbedProfile] = &[
+    NOMIC_EMBED_TEXT_V1_5,
+    CODERANK_EMBED,
+    TEXT_EMBEDDING_3_SMALL,
+    METIS_1024_I16_BINARY,
+];
 
 /// Default profile identity (research.md R2: nomic-embed-text-v1.5 is the
 /// default model profile; resolved whenever no explicit profile is set).

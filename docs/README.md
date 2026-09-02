@@ -62,7 +62,8 @@ subsystem you're working on:
 10. [`orchestration.md`](orchestration.md) — subagent delegation
     (`delegate_task`, SubagentManager) and OMO multi-agent orchestration
     (11 agents, 11 categories, intent gating, goals/boulder/notepads,
-    team mode).
+    team mode). Subagents inherit the parent's NeuroCode engine (same
+    graph.db; task-targeted context).
 11. [`cron.md`](cron.md) — the built-in scheduler: schedule kinds, job
     store format, delivery targets, script jobs, and the `joey cron` CLI.
 12. [`mcp.md`](mcp.md) — the MCP stdio client: server configuration,

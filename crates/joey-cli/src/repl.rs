@@ -219,6 +219,13 @@ pub(crate) fn build_agent_parts(
         let rag_enabled = config.get_bool("neurocode.rag.enabled", false);
         joey_tools::builtins::register_neurocode_rag_tools(&mut registry, rag_enabled, Some(backend));
     }
+    // Feature 015 (hypercode cascade, FR-021): share the engine with the
+    // orchestration manager so delegate_task children open the SAME
+    // graph.db (no re-indexing) and get a task-targeted NeuroCode Context
+    // in their system prompt.
+    if let Some(engine) = &neurocode_engine {
+        manager.set_neurocode_engine(engine.clone());
+    }
     joey_orchestration::register_orchestration_with_resolver_and_allocator(
         &mut registry,
         manager.clone(),

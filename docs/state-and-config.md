@@ -144,6 +144,13 @@ seconds when winding down still-running background children at session
 end, i.e. line-REPL `end_session` and TUI exit; children that don't
 finish are stopped with reason `session_end`).
 
+`delegation.subagent_recovery_attempts` (1; positive int — bounded
+self-recovery for a child whose turn dies with a fatal provider error: the
+child's poisoned history is cleared and the turn re-runs from the initial
+prompt on the same provider/model; N counts extra attempts after the initial
+run, 0 disables). Each retry is surfaced as an `AgentEvent::RetryAttempt` on
+the child's event stream.
+
 **code_execution**: `code_execution.mode` ("project").
 
 **display**: `display.compact` (false), `display.tool_progress` ("all"),
@@ -184,7 +191,18 @@ Copilot's OpenAI-compatible `POST {base}/embeddings` endpoint
 `AI_USAGE_HUD_BASE_URL`). Auth reuses the Copilot chat credential
 (`neurocode.rag.api_key`, else `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/
 `GITHUB_TOKEN`, else `gh auth token`). Key: `neurocode.rag.copilot.model`
-(default `text-embedding-3-small`, 1536-dim). Because the endpoint is
+— embeddings model for the copilot backend. Default:
+`metis-1024-I16-Binary` (GitHub dotcom embeddings endpoint,
+`api.github.com`). When a custom Copilot endpoint is pinned
+(`COPILOT_API_BASE_URL` or `AI_USAGE_HUD_BASE_URL` at an off-githubcopilot
+host, e.g. the AI Usage HUD proxy) the default resolves to
+`text-embedding-3-small`, because the proxy serves only the OpenAI-style
+embeddings API; Metis-family model ids are likewise resolved to
+`text-embedding-3-small` in that mode. To stay under the upstream
+embeddings size limits (8192 tokens per input, 300,000 tokens per
+request), the copilot backend truncates each embed input to ~23 KB and
+splits larger batches into sequential sub-requests (at most 64 items and
+~850 KB of input text each). Because the endpoint is
 non-loopback, code egress still requires per-project consent
 (`/neurocode consent ack`). Setting `neurocode.rag.backend` explicitly
 (e.g. `local_onnx`) keeps the local model even under a Copilot provider.

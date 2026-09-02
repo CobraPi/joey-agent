@@ -268,6 +268,19 @@ fn unknown_backend_falls_back_to_auto() {
     }
 }
 
+#[test]
+fn backend_round_trips_all_five_values() {
+    let ctx = temp_home();
+    std::env::remove_var(ENV_API_KEY_NAME);
+    for value in ["auto", "local_onnx", "openai_compat", "ollama", "copilot"] {
+        let rag = RagConfig::load(&config_with(
+            &ctx,
+            &format!("neurocode:\n  rag:\n    backend: {value}\n"),
+        ));
+        assert_eq!(rag.backend.as_str(), value, "backend {value} round-trips");
+    }
+}
+
 // ─── 3. `.env` routing for `neurocode.rag.api_key` ───────────────────────────
 
 #[test]
@@ -432,9 +445,9 @@ fn contract_table_kinds_match_expected_types() {
 // ─── 6. Copilot extension default (Joey-native, outside the 18-key table) ───
 
 #[test]
-fn copilot_model_defaults_to_text_embedding_3_small() {
+fn copilot_model_defaults_to_metis() {
     let _ctx = temp_home();
     std::env::remove_var(ENV_API_KEY_NAME);
     let rag = RagConfig::load(&Config::defaults());
-    assert_eq!(rag.copilot_model, "text-embedding-3-small");
+    assert_eq!(rag.copilot_model, "metis-1024-I16-Binary");
 }

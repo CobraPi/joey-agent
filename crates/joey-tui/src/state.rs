@@ -4,7 +4,7 @@
 //! that the widgets render each frame. This replaces the line-based
 //! `render_turn` with a live, animated view.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -921,6 +921,11 @@ pub struct App {
     /// view when a subagent is focused).
     pub last_pane_stats_window: Cell<(u16, usize)>,
     pub last_pane_stats_stream_rows: std::cell::RefCell<Vec<(usize, usize, usize)>>,
+    /// Text committed by a finished TUI mouse selection (drag-release),
+    /// stashed by the draw pass reading the rendered buffer. The host
+    /// drains this after each draw and copies it to the system clipboard
+    /// (joey-tui never touches the clipboard itself).
+    pub pending_selection_copy: RefCell<Option<String>>,
     /// Screen rect of the header's RIGHT section (model/session/status) as
     /// drawn by the last frame — the click target that opens the stats page.
     pub last_header_right_rect: Cell<(u16, u16, u16, u16)>,
@@ -1427,6 +1432,7 @@ impl App {
             last_stats_stream_rows: std::cell::RefCell::new(Vec::new()),
             last_pane_stats_window: Cell::new((0, 0)),
             last_pane_stats_stream_rows: std::cell::RefCell::new(Vec::new()),
+            pending_selection_copy: RefCell::new(None),
             last_header_right_rect: Cell::new((0, 0, 0, 0)),
             context_entries: Vec::new(),
             context_system_tokens: 0,
@@ -2593,6 +2599,13 @@ impl App {
         } else {
             self.open_stats();
         }
+    }
+
+    /// Take the text committed by a finished mouse selection, if any. The
+    /// TUI host calls this after every draw and copies the text to the
+    /// system clipboard.
+    pub fn take_pending_selection_copy(&self) -> Option<String> {
+        self.pending_selection_copy.borrow_mut().take()
     }
 
     /// Toggle the subagent rail between the collapsed 19-col tab strip and

@@ -945,6 +945,21 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
 
     session.tui.tick_animations();
     let _ = session.tui.draw();
+    // Finished mouse selection: the draw pass stashed the selected text;
+    // copy it to the system clipboard and confirm (same feedback wording
+    // as the `y` copy key).
+    if let Some(text) = session.tui.app_mut().take_pending_selection_copy() {
+        let chars = text.chars().count();
+        match crate::clipboard::copy_to_clipboard(&text) {
+            Ok(()) => session.tui.app_mut().push_item(TranscriptItem::Notice {
+                text: format!("✓ Copied {chars} chars to clipboard"),
+                kind: NoticeKind::Success,
+            }),
+            Err(e) => session.tui.app_mut().push_item(TranscriptItem::Error {
+                text: format!("Copy failed: {e}"),
+            }),
+        }
+    }
 
     let ev = tokio::select! {
         ev = session.ev_rx.recv() => ev,
@@ -1004,7 +1019,22 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
                                 session.tui.handle_mouse_scroll(m.row, m.column, false);
                             }
                             MouseEventKind::Down(MouseButton::Left) => {
-                                session.tui.handle_mouse_click(m.row, m.column);
+                                // Text selection: the press starts a selection attempt;
+                                // the click (if any) fires on RELEASE so a drag never
+                                // triggers a click.
+                                session.tui.handle_mouse_down(m.row, m.column);
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                session.tui.handle_mouse_drag(m.row, m.column);
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                // Press + release on the same cell = plain click →
+                                // legacy handler; drag-release commits the selection
+                                // (its text is extracted on the next draw and copied by
+                                // the drain below).
+                                if session.tui.handle_mouse_up(m.row, m.column) {
+                                    session.tui.handle_mouse_click(m.row, m.column);
+                                }
                             }
                             _ => {}
                         }
@@ -1725,52 +1755,48 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                 }
             }
             "neurocode" => {
-                // The handler builds its own engine and returns plain text —
-                // perfect for the transcript (Constitution II parity).
-                // Heavy subcommands (index/ingest strict form) parse the
-                // whole tree + bulk-upsert SQLite, so run the handler off
-                // the UI task — the GUI must not freeze. Natural-language
-                // ingest instead hands off to a full agent turn (submitted
-                // through the engine like any turn).
+                // Heavy /neurocode subcommands (index, search, query, …) must
+                // never execute on the UI task — running them inline froze the
+                // whole TUI. We only CLASSIFY the args here (cheap, no I/O):
+                // natural-language ingest routes to an agent turn; everything
+                // else is dispatched to the engine task, which runs it via
+                // spawn_blocking and reports back through HeavyJobFinished.
                 let args = slash_args_after(input, "neurocode").to_string();
-                match crate::commands::neurocode::neurocode_slash_outcome(&args) {
-                    crate::commands::neurocode::NeurocodeOutcome::AgentIngest(prompt) => {
-                        self.tui.app_mut().push_item(TranscriptItem::Notice {
-                            text: "🧭 natural-language ingest — the agent will locate the \
-                                   source and call neurocode_ingest"
-                                .into(),
-                            kind: NoticeKind::Info,
+                if let Some(prompt) = crate::commands::neurocode::neurocode_ingest_request(&args) {
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "🧭 natural-language ingest — the agent will locate the \
+                               source and call neurocode_ingest"
+                            .into(),
+                        kind: NoticeKind::Info,
+                    });
+                    if let Some(engine) = &self.engine {
+                        let active_agent = self
+                            .tui
+                            .app()
+                            .agent_roster
+                            .get(self.tui.app().active_agent_index)
+                            .map(|a| a.name.clone())
+                            .unwrap_or_else(|| "default".to_string());
+                        engine.send(crate::engine::EngineCommand::Submit {
+                            prompt,
+                            active_agent,
+                            announce: false,
                         });
-                        if let Some(engine) = &self.engine {
-                            let active_agent = self
-                                .tui
-                                .app()
-                                .agent_roster
-                                .get(self.tui.app().active_agent_index)
-                                .map(|a| a.name.clone())
-                                .unwrap_or_else(|| "default".to_string());
-                            engine.send(crate::engine::EngineCommand::Submit {
-                                prompt,
-                                active_agent,
-                                announce: false,
-                            });
-                            self.busy = true;
-                            self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
-                        }
-                    }
-                    crate::commands::neurocode::NeurocodeOutcome::Text(_) => {
                         self.busy = true;
                         self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
-                        self.tui.app_mut().push_item(TranscriptItem::Notice {
-                            text: "⧗ /neurocode running on the engine… (GUI stays live)".into(),
-                            kind: NoticeKind::Busy,
+                    }
+                } else {
+                    self.busy = true;
+                    self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
+                    self.tui.app_mut().push_item(TranscriptItem::Notice {
+                        text: "⧗ /neurocode running on the engine… (GUI stays live)".into(),
+                        kind: NoticeKind::Busy,
+                    });
+                    if let Some(engine) = &self.engine {
+                        engine.send(crate::engine::EngineCommand::HeavyJob {
+                            label: "neurocode".into(),
+                            args,
                         });
-                        if let Some(engine) = &self.engine {
-                            engine.send(crate::engine::EngineCommand::HeavyJob {
-                                label: "neurocode".into(),
-                                args,
-                            });
-                        }
                     }
                 }
             }

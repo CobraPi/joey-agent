@@ -580,15 +580,28 @@ impl RefreshBudgets {
     }
 }
 
-/// Load the stored chunk state for one source path: `(chunk_id, content_hash)`
-/// pairs, in rowid order — the chunk-hash skip's comparison set.
+/// Stored per-chunk comparison state: `(chunk_id, content_hash, embed_dim)`
+/// in rowid order — the chunk-hash skip's comparison set, plus the row's
+/// embedded dimension so chunks written by a different embedding profile are
+/// never mistaken for reusable.
+struct StoredChunk {
+    chunk_id: String,
+    content_hash: String,
+    embed_dim: Option<i64>,
+}
+
+/// Load the stored chunk state for one source path, in rowid order.
 fn stored_chunks_for_path(conn: &rusqlite::Connection, source_path: &str)
-    -> rusqlite::Result<Vec<(String, String)>> {
+    -> rusqlite::Result<Vec<StoredChunk>> {
     let mut stmt = conn.prepare(
-        "SELECT chunk_id, content_hash FROM rag_chunks WHERE source_path = ?1 ORDER BY rowid",
+        "SELECT chunk_id, content_hash, embed_dim FROM rag_chunks WHERE source_path = ?1 ORDER BY rowid",
     )?;
     let rows = stmt.query_map(rusqlite::params![source_path], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        Ok(StoredChunk {
+            chunk_id: r.get(0)?,
+            content_hash: r.get(1)?,
+            embed_dim: r.get(2)?,
+        })
     })?;
     rows.collect()
 }
@@ -617,6 +630,7 @@ fn compute_file_work(
     rel: &Path,
     store: &joey_neurocode::graph::GraphStore,
     options: &crate::index::chunker::ChunkOptions,
+    profile: &crate::embed::profiles::EmbedProfile,
 ) -> Option<FileWork> {
     let abs = root.join(rel);
     let source = std::fs::read_to_string(&abs).ok()?;
@@ -639,13 +653,27 @@ fn compute_file_work(
     // recomputed hash matches a stored one.
     let stored = stored_chunks_for_path(store.conn(), &source_path).unwrap_or_default();
     let stored_hashes: std::collections::HashSet<&str> =
-        stored.iter().map(|(_, h)| h.as_str()).collect();
+        stored.iter().map(|c| c.content_hash.as_str()).collect();
+    let profile_dim = profile.dim as i64;
 
     let mut work =
         FileWork { source_path, records, unchanged: Vec::new(), changed: Vec::new() };
     for (i, rec) in work.records.iter().enumerate() {
         if stored_hashes.contains(rec.content_hash.as_str()) {
-            work.unchanged.push(i);
+            // Hash matches a stored row — but only reuse it if that row was
+            // embedded with the CURRENT profile's dimension: a chunk carried
+            // over from another embedding profile (backend switch without a
+            // full rebuild) would otherwise skip re-embed and keep a stale,
+            // dimension-mismatched vector that breaks dense search.
+            let stored_dim = stored
+                .iter()
+                .find(|c| c.content_hash == rec.content_hash)
+                .and_then(|c| c.embed_dim);
+            if stored_dim == Some(profile_dim) {
+                work.unchanged.push(i);
+            } else {
+                work.changed.push(i);
+            }
         } else {
             work.changed.push(i);
         }
@@ -742,7 +770,7 @@ pub fn refresh_incremental(
             continue;
         }
 
-        let Some(work) = compute_file_work(root, &rel, store, chunk_options) else {
+        let Some(work) = compute_file_work(root, &rel, store, chunk_options, profile) else {
             // Unparseable/unreadable: not admitted against the budget, not
             // purged — the file keeps its previous chunks.
             continue;
@@ -777,8 +805,8 @@ pub fn refresh_incremental(
             work.records.iter().map(|r| r.chunk_id.as_str()).collect();
         let stale: Vec<String> = stored_chunks_for_path(&tx, &work.source_path)?
             .into_iter()
-            .filter(|(id, _)| !current_ids.contains(id.as_str()))
-            .map(|(id, _)| id)
+            .filter(|c| !current_ids.contains(c.chunk_id.as_str()))
+            .map(|c| c.chunk_id)
             .collect();
         for id in &stale {
             tx.execute("DELETE FROM rag_chunks WHERE chunk_id = ?1", rusqlite::params![id])?;
@@ -1501,5 +1529,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(big_rows, 0, "oversized file deferred whole");
+    }
+
+    #[test]
+    fn stale_profile_chunk_is_re_embedded_not_skipped() {
+        let (tmp, store) = temp_store();
+        let root = tmp.path();
+        write(root, "m.py", "def a():\n    return 1\n");
+        let profile = crate::embed::profiles::default_profile();
+        let mut first = CountingEmbedder::new(profile.dim as usize);
+        let added = delta_added(&["m.py"]);
+        refresh_incremental(
+            &store, root, &added, &mut first, profile, Quantization::F32,
+            &ChunkOptions::default(), &RefreshBudgets::default(),
+        ).unwrap();
+
+        // Simulate a chunk left over from a DIFFERENT embedding profile
+        // (e.g. a backend switch whose full rebuild never ran): same
+        // content hash, wrong embed_dim.
+        let bumped: i64 = store
+            .conn()
+            .query_row("UPDATE rag_chunks SET embed_dim = ?1 RETURNING embed_dim", [1536], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bumped, 1536);
+
+        let mut second = CountingEmbedder::new(profile.dim as usize);
+        let modified = ChangeDelta {
+            modified: vec![PathBuf::from("m.py")],
+            ..ChangeDelta::default()
+        };
+        let report = refresh_incremental(
+            &store, root, &modified, &mut second, profile, Quantization::F32,
+            &ChunkOptions::default(), &RefreshBudgets::default(),
+        ).unwrap();
+        assert!(
+            !second.texts_seen.is_empty(),
+            "stale-dim chunk must be re-embedded, not skipped"
+        );
+        assert_eq!(report.chunks_skipped, 0);
+        let dim: i64 = store
+            .conn()
+            .query_row("SELECT embed_dim FROM rag_chunks LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dim, profile.dim as i64);
+    }
+
+    #[test]
+    fn matching_profile_chunk_is_still_skipped() {
+        let (tmp, store) = temp_store();
+        let root = tmp.path();
+        write(root, "m.py", "def a():\n    return 1\n");
+        let profile = crate::embed::profiles::default_profile();
+        let mut first = CountingEmbedder::new(profile.dim as usize);
+        let added = delta_added(&["m.py"]);
+        refresh_incremental(
+            &store, root, &added, &mut first, profile, Quantization::F32,
+            &ChunkOptions::default(), &RefreshBudgets::default(),
+        ).unwrap();
+
+        let mut second = CountingEmbedder::new(profile.dim as usize);
+        let modified = ChangeDelta {
+            modified: vec![PathBuf::from("m.py")],
+            ..ChangeDelta::default()
+        };
+        let report = refresh_incremental(
+            &store, root, &modified, &mut second, profile, Quantization::F32,
+            &ChunkOptions::default(), &RefreshBudgets::default(),
+        ).unwrap();
+        assert_eq!(report.chunks_skipped, 1);
+        assert!(second.texts_seen.is_empty());
     }
 }

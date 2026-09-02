@@ -353,7 +353,9 @@ impl<'a> ContextAssembler<'a> {
                 error_signature, resolution
             ));
             // Record that this warning was surfaced (FR-011 hit tracking).
-            let _ = self.graph.store().bump_anti_pattern_hit(*id);
+            if let Err(e) = self.graph.store().bump_anti_pattern_hit(*id) {
+                tracing::warn!("neurocode: failed to bump anti-pattern hit: {}", e);
+            }
         }
         out.push('\n');
         out

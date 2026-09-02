@@ -81,6 +81,7 @@ delegation:
   max_iterations: 50
   max_concurrent_children: auto
   max_spawn_depth: 1
+  subagent_recovery_attempts: 1
 code_execution:
   mode: "project"
 display:

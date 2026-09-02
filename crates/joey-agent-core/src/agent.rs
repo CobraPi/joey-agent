@@ -452,6 +452,13 @@ pub struct TurnResult {
     /// interrupt. Delegation consumers use this to report child failure
     /// instead of mistaking an empty fatal turn for success.
     pub fatal: bool,
+    /// True only when `fatal` was caused by a PROVIDER failure (unrecoverable
+    /// overflow, non-retryable API error, or retries exhausted with no
+    /// fallback) — as opposed to the behavioral fatal (3x invalid tool
+    /// calls). Recovery consumers use this to decide whether a bounded retry
+    /// with a clean context can meaningfully succeed: provider fatals may
+    /// clear on a fresh run; behavioral fatals will not.
+    pub fatal_provider_error: bool,
 }
 
 /// How a provider call block ended without a response.
@@ -770,6 +777,13 @@ impl Agent {
         engine: Option<Arc<dyn joey_neurocode::NeuroCodeEngine>>,
     ) {
         self.neurocode_engine = engine;
+    }
+
+    /// The installed NeuroCode engine, if any (Feature 015). Sharing this
+    /// Arc with orchestration children lets them reuse the SAME graph.db
+    /// (spec 015 FR-021) instead of re-indexing the project.
+    pub fn neurocode_engine(&self) -> Option<std::sync::Arc<dyn joey_neurocode::NeuroCodeEngine>> {
+        self.neurocode_engine.clone()
     }
 
     /// Set the dynamic LLM model allocator (feature 011). When set, the main
@@ -2622,7 +2636,7 @@ impl Agent {
                     usage: total_usage.clone(),
                     iterations: api_calls,
                 });
-                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false };
+                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false, fatal_provider_error: false };
             }
 
             // ── Pre-API /steer drain (conversation_loop.py:933-975) ────────
@@ -2715,7 +2729,7 @@ impl Agent {
                         usage: total_usage.clone(),
                     iterations: api_calls,
                     });
-                    return TurnResult { final_text: text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false };
+                    return TurnResult { final_text: text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false, fatal_provider_error: false };
                 }
                 Err(TurnAbort::Fatal(err)) => {
                     self.drop_trailing_synthetic_scaffolding();
@@ -2725,7 +2739,7 @@ impl Agent {
                     self.rag_auto_refresh();
                     self.neurocode_auto_reindex(&tx).await;
                     let _ = tx.send(AgentEvent::Failed(err));
-                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: true };
+                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: true, fatal_provider_error: true };
                 }
             };
             accumulate_usage(&mut total_usage, &self.usage_or_estimate(&resp));
@@ -2823,6 +2837,7 @@ impl Agent {
                             iterations: api_calls,
                             interrupted: false,
                             fatal: true,
+                            fatal_provider_error: false,
                         };
                     }
                     // Error-result every call so the model can self-correct
@@ -2899,7 +2914,7 @@ impl Agent {
                         usage: total_usage.clone(),
                     iterations: api_calls,
                     });
-                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false };
+                    return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false, fatal_provider_error: false };
                 }
 
                 // ── Post-tool-round compression check (conversation_loop.py:
@@ -2961,7 +2976,7 @@ impl Agent {
                     usage: total_usage.clone(),
                     iterations: api_calls,
                 });
-                return TurnResult { final_text: partial, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false };
+                return TurnResult { final_text: partial, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false, fatal_provider_error: false };
             }
 
             let content = resp.content.clone();
@@ -3027,7 +3042,7 @@ impl Agent {
                     usage: total_usage.clone(),
                     iterations: api_calls,
                 });
-                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false };
+                return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false, fatal_provider_error: false };
             }
 
             // Final response.
@@ -3044,7 +3059,7 @@ impl Agent {
                 usage: total_usage.clone(),
                     iterations: api_calls,
             });
-            return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false };
+            return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: false, fatal_provider_error: false };
         }
 
         // ── Iteration budget exhausted: one summary call with tools
@@ -3091,6 +3106,7 @@ impl Agent {
             iterations: api_calls,
             interrupted: false,
             fatal: false,
+            fatal_provider_error: false,
         }
     }
 
@@ -4040,6 +4056,7 @@ fn extract_diff_path(diff: &str) -> Option<String> {
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
+    use joey_providers::FunctionCall;
     use joey_tools::registry::{Tool, ToolResult};
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -5711,6 +5728,24 @@ mod tests {
         );
     }
 
+    /// Feature 015 (FR-021): the `neurocode_engine()` getter round-trips the
+    /// installed engine — None by default, Some(active) after installation —
+    /// so orchestration children can share the SAME graph.db handle.
+    #[test]
+    fn neurocode_engine_getter_round_trips_installed_engine() {
+        let mut fx = fixture(vec![Ok(text_resp("ok"))], 5, 3, None);
+        assert!(fx.agent.neurocode_engine().is_none());
+        let mut cfg = joey_neurocode::NeuroCodeConfig::default();
+        cfg.enabled = true;
+        let engine: std::sync::Arc<dyn joey_neurocode::NeuroCodeEngine> = std::sync::Arc::new(
+            joey_neurocode::DefaultEngine::new(cfg, std::path::PathBuf::from("/tmp")),
+        );
+        fx.agent.set_neurocode_engine(engine);
+        let got = fx.agent.neurocode_engine();
+        assert!(got.is_some());
+        assert!(got.unwrap().is_active());
+    }
+
     /// T067 / FR-020 / SC-008 case 2: an INSTALLED but INACTIVE engine is a
     /// complete no-op — no classify, no assemble_context, no injected context,
     /// system prompt bytes unchanged.
@@ -6801,5 +6836,66 @@ mod tests {
             assert!(m.contains("hello"));
             assert!(m.ends_with("[/OUT-OF-BAND USER MESSAGE]"));
         }
+    }
+
+    // ── fatal vs fatal_provider_error discrimination ────────────────────
+
+    /// A response whose only tool call targets a tool that does not exist —
+    /// drives the invalid-tool-call strike counter.
+    fn invalid_tool_resp() -> NormalizedResponse {
+        NormalizedResponse {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-bad".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "no_such_tool".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            reasoning: None,
+            usage: Usage::default(),
+            model: None,
+            reasoning_details: None,
+            anthropic_content_blocks: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fatal_provider_error_flagged_on_auth_failure() {
+        let home = std::env::temp_dir();
+        let (mut agent, _t) = rag_agent_at(
+            &home,
+            &home,
+            Config::defaults(),
+            vec![Err(ProviderError::Auth("bad key".to_string()))],
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = agent.run_turn("hello", tx).await;
+        assert!(r.fatal, "auth failure must be fatal");
+        assert!(r.fatal_provider_error, "auth failure is a provider fatal");
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_strikes_fatal_is_not_provider_error() {
+        let home = std::env::temp_dir();
+        let (mut agent, _t) = rag_agent_at(
+            &home,
+            &home,
+            Config::defaults(),
+            vec![
+                Ok(invalid_tool_resp()),
+                Ok(invalid_tool_resp()),
+                Ok(invalid_tool_resp()),
+            ],
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = agent.run_turn("hello", tx).await;
+        assert!(r.fatal, "3 strikes must be fatal");
+        assert!(
+            !r.fatal_provider_error,
+            "behavioral fatal must not trigger provider recovery"
+        );
     }
 }

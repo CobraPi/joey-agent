@@ -1278,6 +1278,15 @@ mod tests {
     /// Non-copilot providers never trip the guard.
     #[test]
     fn model_override_flags_unservable_copilot_wire_models() {
+        // Order-dependence guard: drain the process-global copilot catalog
+        // cache (other tests warm it via real HTTP) and SEED it with a catalog
+        // that contains "gpt-5.4", so copilot_servable is deterministic here.
+        let saved_catalog = joey_providers::copilot::take_catalog_cache_for_tests();
+        joey_providers::copilot::restore_catalog_cache_for_tests(Some((
+            vec![serde_json::json!({ "id": "gpt-5.4" })],
+            std::time::Instant::now(),
+        )));
+        assert!(joey_providers::profile::copilot_servable("gpt-5.4"));
         let rc = RoleConfig::default(); // empty → inherit parent model
 
         // copilot-wire + unservable inherited model: still returned as-is.
@@ -1297,6 +1306,7 @@ mod tests {
             model_override(&rc, "glm-5.2", "zai").as_deref(),
             Some("glm-5.2")
         );
+        joey_providers::copilot::restore_catalog_cache_for_tests(saved_catalog);
     }
 
     #[test]

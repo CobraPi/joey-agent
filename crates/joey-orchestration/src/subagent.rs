@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use joey_agent_core::{Agent, AgentConfig, TurnResult};
 use joey_core::Config;
-use joey_providers::ProviderError;
+use joey_providers::{ProviderError, Usage};
 use joey_tools::toolsets as ts;
 use joey_tools::{ToolContext, ToolRegistry};
 
@@ -27,6 +27,18 @@ pub(crate) fn resolve_model(
         .or_else(|| req_model.map(String::from))
         .or_else(|| default_model.map(String::from))
         .unwrap_or_else(|| parent_model.to_string())
+}
+
+/// Field-wise usage addition across recovery attempts (`Usage` implements no
+/// `Add`). Only used by the subagent recovery loop to keep token accounting
+/// honest when a turn is re-run after a fatal provider error.
+fn add_usage(acc: &mut Usage, other: &Usage) {
+    acc.prompt_tokens += other.prompt_tokens;
+    acc.completion_tokens += other.completion_tokens;
+    acc.total_tokens += other.total_tokens;
+    acc.cache_read_tokens += other.cache_read_tokens;
+    acc.cache_write_tokens += other.cache_write_tokens;
+    acc.reasoning_tokens += other.reasoning_tokens;
 }
 
 /// Build a toolset summary string for events (e.g. "file, web").
@@ -280,7 +292,7 @@ impl Subagent {
         self,
         event_tx: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
     ) -> DelegationResult {
-        self.run_with_tap(0, event_tx, None, None).await
+        self.run_with_tap(0, event_tx, None, None, 0).await
     }
 
     /// Run the subagent's turn loop, forwarding every child event to the
@@ -292,12 +304,23 @@ impl Subagent {
     /// cannot shadow the external tap.
     ///
     /// Id `0` + no tap is byte-identical to the pre-feature `run`.
+    ///
+    /// Self-recovery (feature 020 addendum): when the turn ends in a fatal
+    /// PROVIDER error (`TurnResult::fatal_provider_error` — not the
+    /// behavioral invalid-tool-call fatal) and `recovery_attempts` remains,
+    /// the child's poisoned history is cleared and the turn re-runs from the
+    /// initial prompt on the SAME Agent object (in-place reset keeps the
+    /// manager's interrupt/steer bridges and semaphore wired). Each retry
+    /// surfaces `AgentEvent::RetryAttempt` (wrapped to tap/recorder exactly
+    /// like in-turn events, raw on the legacy channel); usage and iteration
+    /// counts accumulate across attempts. Interrupts always win over retry.
     pub(crate) async fn run_with_tap(
         mut self,
         id: u64,
         event_tx: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
         tap: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
         recorder: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
+        recovery_attempts: usize,
     ) -> DelegationResult {
         let start = Instant::now();
         let goal = self.goal.clone();
@@ -350,35 +373,76 @@ impl Subagent {
         // forwarded raw to the legacy per-dispatch channel so existing
         // consumers are unaffected. Implementation: wrap the sender with a
         // fan-out via an mpsc channel + forwarding task.
-        let result: TurnResult = if tap.is_some() || recorder.is_some() {
-            let (child_tx, mut child_rx) =
-                tokio::sync::mpsc::unbounded_channel::<joey_agent_core::AgentEvent>();
-            let tap_tx = tap.cloned();
-            let recorder_tx = recorder.cloned();
-            let legacy_tx = tx_for_run.clone();
-            let fanout = tokio::spawn(async move {
-                while let Some(ev) = child_rx.recv().await {
-                    if id != 0 {
-                        let wrapped = joey_agent_core::AgentEvent::SubagentEvent {
-                            id,
-                            event: Box::new(ev.clone()),
-                        };
-                        if let Some(tx) = tap_tx.as_ref() {
-                            let _ = tx.send(wrapped.clone());
+        // Self-recovery loop (feature 020 addendum): a fatal PROVIDER error
+        // is retried with a clean history on the same Agent (interrupt and
+        // steer bridges stay wired — they hold this Agent's Arc handles).
+        // `recovery_attempts` bounds EXTRA runs after the initial one; 0
+        // preserves the pre-feature single-shot behavior exactly.
+        let mut extra_usage = Usage::default();
+        let mut extra_iterations = 0usize;
+        let mut attempts_used = 0usize;
+        let result: TurnResult = loop {
+            let r: TurnResult = if tap.is_some() || recorder.is_some() {
+                let (child_tx, mut child_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<joey_agent_core::AgentEvent>();
+                let tap_tx = tap.cloned();
+                let recorder_tx = recorder.cloned();
+                let legacy_tx = tx_for_run.clone();
+                let fanout = tokio::spawn(async move {
+                    while let Some(ev) = child_rx.recv().await {
+                        if id != 0 {
+                            let wrapped = joey_agent_core::AgentEvent::SubagentEvent {
+                                id,
+                                event: Box::new(ev.clone()),
+                            };
+                            if let Some(tx) = tap_tx.as_ref() {
+                                let _ = tx.send(wrapped.clone());
+                            }
+                            if let Some(tx) = recorder_tx.as_ref() {
+                                let _ = tx.send(wrapped);
+                            }
                         }
-                        if let Some(tx) = recorder_tx.as_ref() {
-                            let _ = tx.send(wrapped);
-                        }
+                        let _ = legacy_tx.send(ev);
                     }
-                    let _ = legacy_tx.send(ev);
+                });
+                let r = self.agent.run_turn(&initial_prompt, child_tx).await;
+                // child_tx drops here → fanout drains → task ends.
+                let _ = fanout.await;
+                r
+            } else {
+                self.agent.run_turn(&initial_prompt, tx_for_run.clone()).await
+            };
+            let interrupted = r.interrupted || batch_interrupt.load(Ordering::SeqCst);
+            if interrupted || !r.fatal_provider_error || attempts_used >= recovery_attempts {
+                break r;
+            }
+            attempts_used += 1;
+            add_usage(&mut extra_usage, &r.usage);
+            extra_iterations += r.iterations;
+            // Poisoned history out: the fatal turn appended an assistant
+            // error message; a clean re-run starts from the initial prompt.
+            self.agent.set_history(Vec::new());
+            let retry_ev = joey_agent_core::AgentEvent::RetryAttempt {
+                attempt: attempts_used,
+                max_retries: recovery_attempts,
+                error: "fatal provider error — retrying with a clean context".to_string(),
+                wait_secs: 0.0,
+            };
+            if id != 0 {
+                if let Some(t) = tap {
+                    let _ = t.send(joey_agent_core::AgentEvent::SubagentEvent {
+                        id,
+                        event: Box::new(retry_ev.clone()),
+                    });
                 }
-            });
-            let r = self.agent.run_turn(&initial_prompt, child_tx).await;
-            // child_tx drops here → fanout drains → task ends.
-            let _ = fanout.await;
-            r
-        } else {
-            self.agent.run_turn(&initial_prompt, tx_for_run).await
+                if let Some(rec) = recorder {
+                    let _ = rec.send(joey_agent_core::AgentEvent::SubagentEvent {
+                        id,
+                        event: Box::new(retry_ev.clone()),
+                    });
+                }
+            }
+            let _ = tx_for_run.send(retry_ev);
         };
 
         // Stop the forwarder.
@@ -405,6 +469,10 @@ impl Subagent {
         let was_interrupted = result.interrupted || batch_interrupt.load(Ordering::SeqCst);
         let fatal = result.fatal && !was_interrupted;
 
+        let mut token_usage = result.usage;
+        add_usage(&mut token_usage, &extra_usage);
+        let iterations = result.iterations + extra_iterations;
+
         DelegationResult {
             goal,
             summary,
@@ -416,10 +484,10 @@ impl Subagent {
             } else {
                 None
             },
-            token_usage: result.usage,
+            token_usage,
             wall_clock: elapsed,
             model,
-            iterations: result.iterations,
+            iterations,
             persisted_session_id: session_id,
             stop_reason: None,
         }

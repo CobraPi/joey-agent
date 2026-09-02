@@ -902,16 +902,37 @@ mod tests {
 
     #[test]
     fn resolve_constructs_gated_copilot_backend() {
+        // Pin the endpoint env: a pinned custom endpoint (proxy) resolves
+        // the default Metis model to the CAPI-served text-embedding-3-small
+        // (see copilot::resolve_model_for_endpoint) — this test pins the
+        // NO-proxy default, so detach from the ambient env for its duration.
+        // Serialized on copilot::TEST_ENV_LOCK against sibling tests that
+        // set/remove these env vars (e.g. copilot::tests::
+        // effective_model_tracks_pinned_proxy) — a concurrent set_var must
+        // not land inside this test's scrubbed-env window. The lock is
+        // taken BEFORE the save so a foreign value can't be captured.
+        let _lock = crate::embed::copilot::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = (
+            std::env::var("COPILOT_API_BASE_URL").ok(),
+            std::env::var("AI_USAGE_HUD_BASE_URL").ok(),
+        );
+        std::env::remove_var("COPILOT_API_BASE_URL");
+        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
         let mut cfg = crate::config::RagConfig::default();
         cfg.backend = crate::config::RagBackend::Copilot;
-        cfg.copilot_model = "text-embedding-3-small".into();
         cfg.enabled = true;
         let (decision, backend) = resolve(&cfg, None).unwrap();
         assert_eq!(decision.kind, BackendKind::Copilot);
         let info = backend.expect("constructed").describe_embedder();
         assert_eq!(info.backend_kind, BackendKind::Copilot);
-        assert_eq!(info.model, "text-embedding-3-small");
-        assert_eq!(info.dim, 1536);
+        assert_eq!(info.model, "metis-1024-I16-Binary");
+        assert_eq!(info.dim, 1024);
+        if let Some(v) = saved.0 {
+            std::env::set_var("COPILOT_API_BASE_URL", v);
+        }
+        if let Some(v) = saved.1 {
+            std::env::set_var("AI_USAGE_HUD_BASE_URL", v);
+        }
     }
 
     /// FR-008/auto's structural no-network guarantee: the resolution path
