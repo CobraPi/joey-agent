@@ -221,7 +221,7 @@ impl VerifyLoop {
                     handle.spawn(async move {
                         let joined = tokio::task::spawn_blocking(move || {
                             let verify = VerifyLoop::from_graph(config, graph);
-                            verify.run_with_fixes(&project_root, |_| false)
+                            verify.run_with_fixes(&project_root, informational_fix_log)
                         })
                         .await;
                         match joined {
@@ -259,7 +259,7 @@ impl VerifyLoop {
                     // through the oneshot channel (FR-017 — non-blocking).
                     std::thread::spawn(move || {
                         let verify = VerifyLoop::from_graph(config, graph);
-                        let outcome = verify.run_with_fixes(&project_root, |_| false);
+                        let outcome = verify.run_with_fixes(&project_root, informational_fix_log);
                         let _ = tx.send(outcome);
                     });
                 }
@@ -303,6 +303,18 @@ impl VerifyLoop {
     pub fn graph(&self) -> &DependencyGraph {
         &self.graph
     }
+}
+
+/// Informational fix callback for detached verification (spec 023 T023):
+/// detached verification records failures but never mutates code or gates
+/// completion; the awaited gate adapter (joey-cli `hypercode_gate`) owns
+/// DefectBundle-driven repair dispatch. Always returns `false` (no fix
+/// iteration) so the detached run is purely observational.
+fn informational_fix_log(results: &[VerifyResult]) -> bool {
+    for r in results.iter().filter(|r| !r.passed && !r.skipped) {
+        tracing::warn!(step = %r.step_name, "detached verification step failed (informational only, FR-019)");
+    }
+    false
 }
 
 #[cfg(test)]

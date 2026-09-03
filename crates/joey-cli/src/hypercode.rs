@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use joey_agent_core::AgentConfig;
 use joey_orchestration::evaluator::{
-    GateOutcome, VerificationGate as GateTrait, VerificationPlanView,
+    DefectBundle, GateOutcome, VerificationGate as GateTrait, VerificationPlanView,
 };
 use joey_orchestration::evidence::{run_root, RunHandle};
 use joey_orchestration::scheduler::{
@@ -1120,11 +1120,48 @@ struct HypercodeDispatcher<'a> {
     /// Root of the current evidence run (`<…>/runs/<run-id>`); isolated
     /// worktrees live under `<run_root>/worktree/<task-id>`.
     run_root: std::path::PathBuf,
+    /// Shared with the VerifyLoopGate (T023): the gate pushes a
+    /// DefectBundle per failed verification; dispatch pops the most
+    /// recent bundle (if any) and prefixes the repair context onto the
+    /// child's goal (FR-020 repair re-dispatch).
+    repair_queue: Arc<std::sync::Mutex<Vec<DefectBundle>>>,
+}
+
+/// Goal prefix built from a popped DefectBundle (T023, FR-020): tells the
+/// repair child what failed on the previous attempt. Extracted as a pure
+/// function for testability.
+fn repair_prefixed_goal(defect: &DefectBundle, base: &str) -> String {
+    format!(
+        "Previous attempt failed verification. Defects to repair:\n{}\n\n{}",
+        defect
+            .failed_commands
+            .iter()
+            .map(|c| format!("- `{}` exited {}: {}", c.command, c.exit, c.errors.join("; ")))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        base
+    )
 }
 
 #[async_trait::async_trait]
 impl TaskDispatcher for HypercodeDispatcher<'_> {
     async fn dispatch(&self, task: &TaskNode, workdir: &std::path::Path) -> bool {
+        // T023 (FR-020): pop the most recent pending repair bundle (if any)
+        // and prefix its defects onto the goal so the repair child knows
+        // what failed. The scheduler's Repair directive owns re-execution.
+        let mut repair = self
+            .repair_queue
+            .lock()
+            .expect("repair queue")
+            .pop();
+        if let Some(defect) = repair.as_mut() {
+            defect.task_id = task.id.as_str().to_string();
+            eprintln!(
+                "hypercode: repair re-dispatch for {} carrying {} defect-command(s)",
+                task.id.as_str(),
+                defect.failed_commands.len()
+            );
+        }
         // FR-015: route isolated writers to their own workspace. Prepare
         // is idempotent, so re-preparing post-run (joiner collection)
         // reuses the same path. Readers share the checkout untouched.
@@ -1153,13 +1190,18 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
         };
         let parent_model = parent_model_for(self.ctx);
         let rc = cfg.get_implementor_config(&opts.provider);
+        let req_goal_base = format!(
+            "Implement HyperCode task {}:\n{}\n(Project root: {})",
+            task.id.as_str(),
+            task.objective,
+            workdir.display()
+        );
+        let goal = match repair.as_ref() {
+            Some(defect) => repair_prefixed_goal(defect, &req_goal_base),
+            None => req_goal_base,
+        };
         let req = DelegationRequest {
-            goal: format!(
-                "Implement HyperCode task {}:\n{}\n(Project root: {})",
-                task.id.as_str(),
-                task.objective,
-                workdir.display()
-            ),
+            goal,
             context: None,
             tasks: Vec::new(),
             model: model_override(&rc, &parent_model, &opts.provider),
@@ -1255,12 +1297,17 @@ async fn execute_graph_run(ctx: &HypercodeContext, report: &mut HypercodeReport)
             .get_i64("hypercode.execution_graph.max_repair_attempts", 3)
             .max(0) as u32,
     };
+    // T023: the real VerifyLoop-backed gate (replaces the T016
+    // AlwaysPassGate placeholder at this call site; the placeholder type
+    // stays for its unit test).
+    let gate = crate::hypercode_gate::VerifyLoopGate::new(ctx.cwd.clone());
     let dispatcher = HypercodeDispatcher {
         ctx,
         run_root: root.clone(),
+        repair_queue: gate.repair_queue(),
     };
     stats = GraphScheduler::new(config)
-        .run_to_completion(&mut graph, &mut run, &dispatcher, &AlwaysPassGate, &ctx.cwd)
+        .run_to_completion(&mut graph, &mut run, &dispatcher, &gate, &ctx.cwd)
         .await;
 
     // ── Integration phase (Spec 023 T020 / US4, FR-016…FR-018) ─────────
@@ -1412,12 +1459,14 @@ pub async fn resume_execution_run(ctx: &HypercodeContext, run_id: &str) -> Optio
             .get_i64("hypercode.execution_graph.max_repair_attempts", 3)
             .max(0) as u32,
     };
+    let gate = crate::hypercode_gate::VerifyLoopGate::new(ctx.cwd.clone());
     let dispatcher = HypercodeDispatcher {
         ctx,
         run_root: root.clone(),
+        repair_queue: gate.repair_queue(),
     };
     let stats = GraphScheduler::new(config)
-        .run_to_completion(&mut graph, &mut run, &dispatcher, &AlwaysPassGate, &ctx.cwd)
+        .run_to_completion(&mut graph, &mut run, &dispatcher, &gate, &ctx.cwd)
         .await;
     eprintln!(
         "hypercode: resumed run {run_id} — {} completed, {} failed, {} degraded, {} blocked",
@@ -2280,6 +2329,32 @@ mod tests {
         let gate = AlwaysPassGate;
         let outcome = GateTrait::run(&gate, &VerificationPlanView::default(), std::path::Path::new("/tmp")).await;
         assert_eq!(outcome, GateOutcome::Passed);
+    }
+
+    /// T023 (FR-020): the dispatcher's repair goal prefix carries the
+    /// failed command and its exit code so the repair child knows what
+    /// to fix.
+    #[test]
+    fn repair_queue_context_injects_defect() {
+        let defect = DefectBundle {
+            task_id: String::new(),
+            failed_commands: vec![joey_orchestration::evaluator::CommandFailure {
+                command: "cargo test -p x".to_string(),
+                exit: 101,
+                errors: vec!["test foo failed".to_string()],
+            }],
+            policy_violations: vec![],
+            reviewer_findings: vec![],
+            changed_paths: vec![],
+        };
+        let goal = repair_prefixed_goal(&defect, "Implement HyperCode task t-1");
+        assert!(goal.contains("cargo test -p x"), "command present: {goal}");
+        assert!(goal.contains("101"), "exit code present: {goal}");
+        assert!(goal.contains("test foo failed"), "error line present: {goal}");
+        assert!(
+            goal.ends_with("Implement HyperCode task t-1"),
+            "original goal preserved as suffix: {goal}"
+        );
     }
 
     /// Run directories live under hypercode/projects/<hash>/runs/<run_id>
