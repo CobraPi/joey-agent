@@ -765,6 +765,23 @@ feedback loop for enterprise Java and Pega Platform codebases. It consumes
 narrow `NeuroCodeEngine` trait (Constitution VI) and by `joey-cli` for the
 `/neurocode` command.
 
+**2026-09-03 — Tier-model routing gated on the HyperCode orchestrator-active state.** NeuroCode's
+per-turn tier-model override (`DefaultEngine::resolve_tier_model` →
+`Agent::resolve_main_turn_model`) now returns `None` unless HyperCode is
+orchestrator-active (`hypercode.enabled` && `hypercode.orchestrator_mode`,
+matching joey-cli's `orchestrator_active` predicate), so toggling HyperCode
+off restores the
+user-configured main model (`model.default`) instead of silently routing to
+the frontier/economical tier model. The engine snapshots the
+orchestrator-active state into the new `NeuroCodeConfig::hypercode_enabled`
+field at build time, and
+`/hypercode toggle` rebuilds the live engine so the gate applies
+mid-session. RAG, indexing and context enrichment remain independent of
+HyperCode. Regression tests: `tier_model_routing_requires_hypercode_enabled`,
+`tier_model_routing_applies_when_hypercode_enabled`,
+`hypercode_gate_snapshots_orchestrator_active_state`
+(crates/joey-neurocode/tests/regression_disabled.rs).
+
 **Deliberate deviation — no Qdrant; SQLite + FTS5 instead.** The source plan
 proposed Qdrant (a separate vector database server). This is rejected for this
 workspace: Qdrant adds a second storage engine, a runtime server/dependency,
@@ -1501,3 +1518,89 @@ enterprise analysis plane). Two entries:
 No new deliberate divergences beyond that gating: the SC-001 parity
 evidence collection and the final flag flip remain pending as tasks
 T032/T033 in `specs/023-enterprise-orchestration-runtime/tasks.md`.
+
+## OMO↔HyperCode orchestration integration (feature 025, 2026-09-03)
+
+**Status**: Complete (Joey-native integration per
+`specs/025-please-integrate-omo/`; no upstream Hermes counterpart — the
+persona text is newly authored, NOT an upstream port).
+
+- **Delegation-first Conductor persona**
+  (`crates/joey-omo/src/agents/prompts/conductor.rs`): atlas-inherited
+  conductor identity with an embedded orchestration hard-rules core (no
+  direct writes; single final gate), a full-roster delegation briefing,
+  and the spec-kit lifecycle doctrine (read-only research/review during
+  specify/clarify/plan; parallel implementation during implement; one
+  final acceptance run). Ships `default`, `gpt`, and `gpt_5_6` variants
+  with a `for_model(model: &str) -> &'static str` two-level dispatch
+  (model-family prefix match; the GPT arm sub-checks `5.6`/`5-6`).
+  Exported unregistered — no AgentRegistry entry, no tab. GPT-5.6
+  variants were likewise added for the switchable primaries sisyphus,
+  atlas, and prometheus (hephaestus already had one; delegation-only
+  agents fall back without error).
+- **Persona-aware orchestrator overlay** (`crates/joey-cli` —
+  `hypercode.rs`, wired in `engine.rs`/`repl.rs`):
+  `orchestrator_persona_overlay[_for_profile]` swaps the orchestrator's
+  governing instructions for the Conductor persona (or the named agent's
+  persona via the existing dispatch) iff orchestration is enabled AND
+  the OMO registry has ≥1 resolved agent. Inactive integration or empty
+  registry degrades byte-identically to the fixed `ORCHESTRATOR_PROMPT`
+  (FR-012). Switching OMO agents mid-session swaps only the persona
+  (hard-rules core + full-roster briefing stay appended); `/model`
+  re-selects the variant without losing the persona.
+- **Full 11-agent roster delegation** (`joey-orchestration`
+  `delegation_tool.rs`): all 11 registered OMO agents (sisyphus,
+  hephaestus, prometheus, atlas, oracle, librarian, explore,
+  multimodal-looker, metis, momus, sisyphus-junior) are valid
+  `subagent_type` targets on `delegate_task` and on the `call_omo_agent`
+  enum (schema enum advisory; runtime resolver authoritative). Unknown
+  names error with the valid-name list; `load_skills` constructs the
+  skill overlay on the named-agent path exactly as the category path
+  does (FR-004); `category`/`subagent_type` stay mutually exclusive
+  (BC-011).
+- **OMO-chain role model defaults** (mirrored in `joey-cli`
+  `hypercode.rs` role resolution and `joey-orchestration`'s
+  `HyperRoleSettings` gap-fill; config keys unchanged — derivation is
+  read-time): explorer ← explore→librarian; implementor ← momus;
+  orchestrator session model ← sisyphus→hephaestus→metis, applied only
+  when the model is neither pinned (`--model`, `/model`,
+  `model_pinned`) nor configured (`model.default`). An unresolvable
+  chain inherits the existing default with a user-visible FR-006
+  warn-and-inherit notice through the agent-notice channel — never a
+  failure. **2026-09-03:** the `hypercode.omo_specialists.enabled`
+  toggle (default on) now swaps the chain derivation for a direct 1:1
+  mapping — explorer→explore, implementor→hephaestus, orchestrator→
+  atlas; the chains are preserved behind
+  `hypercode.omo_specialists.enabled=false`.
+
+## TUI feature indicators + task graph visualization (2026-09-03, TUI-only)
+
+Joey-native TUI feature (no upstream equivalent): ambient
+orchestration/systems indicators plus a live task-DAG view. Backing
+surfaces: new additive `EngineEvent::TaskGraphSnapshot` — the
+orchestration scheduler serializes the typed execution graph (spec 023)
+as JSON on every persisted transition, plus an initial snapshot when the
+graph is built/resumed — and agent-core now emits real
+`CompressionStart`/`CompressionEnd` around post-tool-round compaction
+(previously TUI-inferred). Neither alters any on-disk format, config
+key, or wire protocol.
+
+- **Status-bar chips** (`draw_status`): `↻{n}` retries this turn,
+  `⟳{n}` session compactions, `◐ web` browser-session connected,
+  `⚙{n}` configured MCP servers. Backed by the additive `state.rs`
+  "Feature indicators" fields (`retries_this_turn`, `compression_count`,
+  `browser_connected`, `mcp_servers`).
+- **Header task badge** `⚑{done}/{total}` while an execution graph is
+  live (green at completion), from the same snapshot stream.
+- **OMO goal line** `◎ {objective}` + age (`omo_goal` / `goal_set_at`;
+  `GoalSet`/`GoalCleared` events).
+- **Stats page (Ctrl+A) `systems` section**: browser state, MCP server
+  list, cron jobs (name/schedule/next/enabled — read from
+  `~/.joey/cron/jobs.json` via `CronStore`, display-only), compaction +
+  retry counters, task-graph progress line.
+- **Neuro explorer `tasks` tab** (key 3; feed → key 4): the hypercode
+  task DAG — boxes layered by dependency depth, status glyphs
+  (`○ ◉ ► ? ✓ ✗ ⚠ ⛔ ⤳`), dependency arrows, selected-task detail pane
+  (objective/status/attempts/deps/read-write sets), counts line. Renders
+  without a NeuroCode snapshot; the tab bar is always visible. Gated by
+  `hypercode.execution_graph.enabled`.

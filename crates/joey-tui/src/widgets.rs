@@ -279,7 +279,45 @@ pub fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinner: 
         ));
         left_end_x = badge_start_x + UnicodeWidthStr::width(badge) as u16;
     }
-    
+
+    // Task-graph badge (orchestration indicator): `⚑{done}/{total}` while a
+    // plan is live. Accent while work remains, success-green when the whole
+    // graph is finished. Direct-written like the HyperCode badge above and
+    // accounted into `left_end_x` so the right-aligned status drops its
+    // leading columns after (never over) it.
+    if let Some(graph) = &app.task_graph {
+        let total = graph.nodes.len();
+        let done = graph
+            .nodes
+            .values()
+            .filter(|n| {
+                matches!(
+                    n.status,
+                    joey_orchestration::task_graph::TaskStatus::Completed
+                        | joey_orchestration::task_graph::TaskStatus::Degraded
+                        | joey_orchestration::task_graph::TaskStatus::Skipped
+                )
+            })
+            .count();
+        let col = if total > 0 && done == total {
+            theme.success
+        } else {
+            theme.accent
+        };
+        let badge = format!(" ⚑{}/{} ", done, total);
+        let badge_start_x = left_end_x + 1;
+        for (i, ch) in badge.chars().enumerate() {
+            let cx = badge_start_x + i as u16;
+            if cx >= inner.x + inner.width {
+                break;
+            }
+            let cell = &mut buf[(cx, inner.y)];
+            cell.set_char(ch)
+                .set_style(Style::default().fg(col.to_color()).add_modifier(Modifier::BOLD));
+        }
+        left_end_x = badge_start_x + UnicodeWidthStr::width(badge.as_str()) as u16;
+    }
+
     // Render right portion, right-aligned into the region right of the
     // logo/badge. When the status is wider than that region, drop its
     // LEADING columns (the tail — session id + activity count — is the
@@ -2491,6 +2529,11 @@ struct StatsPageData<'a> {
     /// page (no per-call series; the row is orchestrator-only, exactly as
     /// before T035).
     usage_series: Option<&'a [(u64, u64)]>,
+    /// Feature indicators — pre-rendered "systems" section lines (browser /
+    /// mcp / cron / compactions / task graph). Appended below the dashboard
+    /// rows; the pane page passes an empty vec (child panes have no
+    /// system-level indicators).
+    systems_rows: Vec<Line<'static>>,
     /// Context-window entries for the stream (main vs pane snapshot).
     entries: &'a [joey_agent_core::events::ContextEntry],
     /// Which entry indices are expanded (click/Space affordance).
@@ -2570,6 +2613,13 @@ fn render_stats_page_composed(
         lines.push(usage_sparkline_row(series, spark_w, live, theme));
     }
 
+    // ── "systems" section (feature indicators) ─────────────────────────
+    // Pre-rendered by the orchestrator adapter only; empty on the pane page.
+    if !data.systems_rows.is_empty() {
+        lines.push(Line::from(vec![Span::raw("")]));
+        lines.extend(data.systems_rows);
+    }
+
     lines.push(Line::from(vec![Span::raw("")]));
 
     // ── Context stream (windowed, auto-follow/freeze, EXPANDABLE) ─────
@@ -2643,6 +2693,121 @@ fn render_stats_page_composed(
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
+/// Feature indicators — build the "systems" section lines for the
+/// orchestrator stats page: browser / MCP / cron / compactions+retries /
+/// live task graph. Section header mirrors the job-board's `┌─ jobs ─`
+/// style from `draw_omo_panel`. `cw` is the inner content width (used for
+/// truncation); long lines would otherwise be clipped mid-glyph.
+fn build_systems_rows(app: &App, theme: Theme, cw: usize) -> Vec<Line<'static>> {
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let dim = Style::default().fg(theme.fg_most_subtle.to_color());
+    let plain = Style::default().fg(theme.fg_subtle.to_color());
+    let label = Style::default()
+        .fg(theme.accent.to_color())
+        .add_modifier(Modifier::BOLD);
+
+    rows.push(Line::from(vec![Span::styled(
+        "┌─ systems ─────────────────".to_string(),
+        label,
+    )]));
+
+    // Browser.
+    rows.push(Line::from(vec![Span::styled(
+        format!(
+            "◐ browser {}",
+            if app.browser_connected { "connected" } else { "offline" }
+        ),
+        if app.browser_connected { label } else { dim },
+    )]));
+
+    // MCP servers: count + indented comma-joined name line.
+    rows.push(Line::from(vec![Span::styled(
+        format!("⚙ mcp {} servers", app.mcp_servers.len()),
+        label,
+    )]));
+    if !app.mcp_servers.is_empty() {
+        let names = app.mcp_servers.join(", ");
+        rows.push(Line::from(vec![Span::styled(
+            truncate_width(&format!("  {}", names), cw),
+            dim,
+        )]));
+    }
+
+    // Cron jobs: count + up to 4 detail lines (dim disabled), then +k more.
+    let enabled = app.cron_jobs.iter().filter(|j| j.enabled).count();
+    rows.push(Line::from(vec![Span::styled(
+        format!("⏰ cron {} jobs ({} enabled)", app.cron_jobs.len(), enabled),
+        label,
+    )]));
+    const MAX_CRON_ROWS: usize = 4;
+    for job in app.cron_jobs.iter().take(MAX_CRON_ROWS) {
+        // Disabled jobs render dimmer than enabled ones.
+        let style = if job.enabled { plain } else { dim };
+        rows.push(Line::from(vec![Span::styled(
+            truncate_width(
+                &format!(
+                    "  {} · {} · next {} · {}",
+                    job.name,
+                    job.schedule_display,
+                    job.next_run_at.as_deref().unwrap_or("-"),
+                    if job.enabled { "enabled" } else { "disabled" }
+                ),
+                cw,
+            ),
+            style,
+        )]));
+    }
+    if app.cron_jobs.len() > MAX_CRON_ROWS {
+        rows.push(Line::from(vec![Span::styled(
+            format!("  +{} more", app.cron_jobs.len() - MAX_CRON_ROWS),
+            dim,
+        )]));
+    }
+
+    // Compactions / retries this turn.
+    rows.push(Line::from(vec![Span::styled(
+        format!(
+            "⟳ {} compactions · ↻ {} retries (this turn)",
+            app.compression_count, app.retries_this_turn
+        ),
+        label,
+    )]));
+
+    // Live task graph (done/total mirrors the header badge logic).
+    if let Some(graph) = &app.task_graph {
+        let total = graph.nodes.len();
+        let done = graph
+            .nodes
+            .values()
+            .filter(|n| {
+                matches!(
+                    n.status,
+                    joey_orchestration::task_graph::TaskStatus::Completed
+                        | joey_orchestration::task_graph::TaskStatus::Degraded
+                        | joey_orchestration::task_graph::TaskStatus::Skipped
+                )
+            })
+            .count();
+        let mut line = format!("⚑ tasks {}/{}", done, total);
+        if let Some(at) = app.task_graph_updated_at {
+            let secs = at.elapsed().as_secs();
+            let ago = if secs < 60 {
+                format!("{}s", secs)
+            } else {
+                format!("{}m", secs / 60)
+            };
+            line.push_str(&format!(" · updated {}", ago));
+        }
+        rows.push(Line::from(vec![Span::styled(line, label)]));
+    }
+
+    rows.push(Line::from(vec![Span::styled(
+        "└─────────────────────────".to_string(),
+        dim,
+    )]));
+    rows
+}
+
 /// The maximized agent-stats page: a live dashboard (context window usage,
 /// token accounting, model/session, compression, per-call usage sparkline)
 /// on top and the full context-window stream below — one line per history
@@ -2671,6 +2836,9 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
     } else {
         "compress@?".to_string()
     };
+    // Inner width of the bordered stats block (Borders::ALL ⇒ −2) — drives
+    // the systems section's line truncation.
+    let cw = area.width.saturating_sub(2).max(1) as usize;
     render_stats_page_composed(
         f,
         area,
@@ -2680,6 +2848,7 @@ pub fn draw_stats_page(f: &mut Frame, area: Rect, app: &App, theme: Theme, spinn
             used,
             window: app.context_window,
             pct: app.context_usage_pct(),
+            systems_rows: build_systems_rows(app, theme, cw),
             breakdown_value: subtle_span(
                 format!(
                     "system {} · history {} · msgs {} · {} · compacted {}x",
@@ -2750,6 +2919,33 @@ pub fn draw_omo_panel(
 
     let cw = inner.width.max(1) as usize;
     let mut lines: Vec<Line> = Vec::new();
+
+    // ── Section −1: pinned OMO goal (feature indicators) ──
+    // The active goal rides above the active-agent pin so it stays visible
+    // regardless of roster state. `set {ago} ago` mirrors the neurocode
+    // feed's refresh-stamp wording ("now" / "Ns ago" / "Nm ago").
+    if let Some(goal) = &app.omo_goal {
+        let goal_line = format!("  ◎ {}", goal);
+        lines.push(Line::from(vec![Span::styled(
+            truncate_width(&goal_line, cw),
+            Style::default().fg(theme.accent.to_color()).add_modifier(Modifier::BOLD),
+        )]));
+        if let Some(at) = app.goal_set_at {
+            let secs = at.elapsed().as_secs();
+            // Mirror the neurocode feed's unit style (s / m), plugged into
+            // the `set {ago} ago` template.
+            let ago = if secs < 60 {
+                format!("{}s", secs)
+            } else {
+                format!("{}m", secs / 60)
+            };
+            lines.push(Line::from(vec![Span::styled(
+                format!("    set {} ago", ago),
+                Style::default().fg(theme.fg_more_subtle.to_color()),
+            )]));
+        }
+        lines.push(Line::from(vec![Span::raw("")]));
+    }
 
     // ── Section 0: pinned active agent + concurrency indicator (T066) ──
     if let Some(active) = app.agent_roster.get(app.active_agent_index) {
@@ -3247,6 +3443,36 @@ pub fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: Theme, elapsed: 
         ));
     }
 
+    // Feature-indicator chips (orchestration / omo / systems): appended
+    // LAST so the width-drop loop below pops them before any core span
+    // when the bar is crowded (the right-aligned hint lives in its own
+    // reserved region and never drops). Each chip renders only when
+    // relevant; error detail for retries lives in the transcript.
+    if app.retries_this_turn > 0 {
+        content.push(Span::styled(
+            format!("↻{}", app.retries_this_turn),
+            Style::default().fg(theme.warning.to_color()),
+        ));
+    }
+    if app.compression_count > 0 {
+        content.push(Span::styled(
+            format!("⟳{}", app.compression_count),
+            Style::default().fg(theme.accent.to_color()),
+        ));
+    }
+    if app.browser_connected {
+        content.push(Span::styled(
+            "◐ web".to_string(),
+            Style::default().fg(theme.accent.to_color()),
+        ));
+    }
+    if !app.mcp_servers.is_empty() {
+        content.push(Span::styled(
+            format!("⚙{}", app.mcp_servers.len()),
+            Style::default().fg(theme.fg_subtle.to_color()),
+        ));
+    }
+
     // Reserve the right-aligned keymap hint's region first so the left
     // content is never rendered under it: trailing (lowest-priority)
     // content spans are dropped until the remainder fits the left region.
@@ -3325,7 +3551,10 @@ fn shorten_path(p: &str, max: usize) -> String {
 pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
     // Centered modal.
     let w = 56.min(area.width);
-    let h = 26.min(area.height);
+    // 44 rows covers the 41-entry keymap below (2 border rows + margin) on
+    // tall terminals; shorter terminals clip the tail via `min(area.height)`
+    // exactly as before.
+    let h = 44.min(area.height);
     if w < 20 || h < 5 {
         return;
     }
@@ -3364,6 +3593,7 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("  viewer: ↑↓/PgUp·PgDn", "scroll output (g/G top/bottom) · auto-follows tail"),
         ("Ctrl+A / click header ▸", "agent stats page · live context window stream"),
         ("  stats: ↑↓/PgUp·PgDn", "scroll context (g/G top/bottom) · auto-follows tail"),
+        ("status chips", "↻ retries · ⟳ compactions · ◐ web · ⚙ mcp"),
         ("Alt+↑ / Alt+↓", "scroll NeuroCode context feed (when active)"),
         ("click feed panel", "open the fullscreen NeuroCode graph explorer"),
         ("  explorer: ←→↑↓/hjkl", "select nodes on the graph canvas"),
@@ -3371,6 +3601,7 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("  explorer: +/−/wheel/0", "zoom in/out · reset view"),
         ("  explorer: Tab / ⏎", "cycle graph · nodes · feed panes"),
         ("  explorer: Esc / click title", "dock the explorer back"),
+        ("  explorer: 3", "tasks tab — live hypercode task DAG"),
         ("Ctrl+L", "clear transcript view"),
         ("Ctrl+P", "back to the orchestrator tab (from a subagent pane)"),
         ("Ctrl+N", "expand / collapse the subagent rail (or click its title)"),
@@ -6279,6 +6510,7 @@ pub fn draw_pane_stats_page(
                 theme,
             ),
             usage_series: None,
+            systems_rows: Vec::new(),
             entries: &pane.context_entries,
             expanded: &pane.expanded_context,
             empty_note: "(no context yet — the child is waiting for its first response)",

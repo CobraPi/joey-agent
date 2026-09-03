@@ -47,13 +47,16 @@ impl CategoryResolver for OmoCategoryResolver {
         })
     }
 
+    /// Feature 025 T030 (US2/AC1): named delegations run under the agent's
+    /// identity prompt + resolved model. The identity rides `prompt_append`
+    /// through the existing child-overlay machinery in joey-orchestration.
     fn resolve_subagent_type(&self, name: &str) -> Option<ResolvedDelegation> {
         let guard = self.registry.lock().unwrap();
         let registry = guard.as_ref()?;
         let agent = registry.all().iter().find(|a| a.name == name)?;
         agent.resolved_model.as_ref().map(|model| ResolvedDelegation {
             model: model.clone(),
-            prompt_append: None,
+            prompt_append: Some(joey_omo::dispatch_system_prompt(&agent.name, model)),
         })
     }
 }

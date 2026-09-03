@@ -8,4 +8,4 @@
 - (optional) SubagentBudgetBreach { id, limit, observed } — emitted at breach detection before stop — DEFERRED: not scheduled in tasks.md v1 (plan scopes it out of the initial milestones); revisit after MVP.
 Existing variants unchanged; consumers with wildcard arms unaffected (verified pattern in joey-tui/joey-cli).
 ## Completion notice wire format (into existing pending-completions queue)
-`[SUBAGENT <COMPLETE|FAILED|STOPPED>] id=<id> goal=<goal> outcome=<...> tokens=<n> duration=<secs>s\n<summary ≤500 tokens>` — delivered at next turn boundary mid-turn, or via engine idle-wake (FR-003); queue cap 64 (existing), oldest dropped.
+`[SUBAGENT <COMPLETE|FAILED|STOPPED>] id=<id> goal=<goal> outcome=<...> tokens=<n> duration=<secs>s\n<summary ≤1000 tokens>` — delivered at next turn boundary mid-turn, or via engine idle-wake (FR-003); queue cap 64 (existing), oldest dropped.

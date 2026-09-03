@@ -367,7 +367,7 @@ server.
   execution).
 - **SC-002**: A subagent's intermediate tool calls and reasoning consume
   zero tokens from the parent agent's context window — only the final
-  summary (target: under 500 tokens) crosses the boundary.
+  summary (target: under 1000 tokens) crosses the boundary.
 - **SC-003**: When one subagent in a 3-member batch fails, the remaining
   two subagents' results are delivered to the parent without delay or
   loss.

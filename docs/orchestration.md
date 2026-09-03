@@ -55,7 +55,7 @@ pending-completions queue (cap 64, drop-oldest; failures are never
 silently dropped):
 
     [SUBAGENT COMPLETE|FAILED|STOPPED] id=<id> goal=<goal> outcome=<...> tokens=<n> duration=<secs>s
-    <summary — capped ~2000 chars (~500 tokens)>
+    <summary — capped ~2000 chars (~1000 tokens)>
 
 `outcome` is `success`, `failure`, or the snake_case stop reason
 (`orchestrator_requested`, `operator_requested`, `budget_exceeded`,
@@ -247,7 +247,14 @@ byte-identically to plain subagent delegation.
 the team — that child is the LEAD: an Orchestrator-role child with the
 team-lead directive (decompose the objective → `team_tasks add` with
 dependencies → spawn teammates with explorer/implementor role profiles →
-synthesize) and the `delegation` + `team` toolsets. Later references spawn
+synthesize) and the `delegation` + `team` toolsets. The lead's model:
+an explicit `hypercode.team.lead_model` always wins; otherwise it
+defaults to the orchestrator tier's mapping — `atlas` under specialists
+ON (`hypercode.omo_specialists.enabled`, default), the legacy chain
+head otherwise. The lead directive additionally carries a SPECIALISTS
+paragraph permitting teammates to be spawned via `subagent_type`; a
+teammate spawned that way uses the agent name as its role label.
+Later references spawn
 TEAMMATES: Leaf children keeping their role toolset plus `team` — they never
 receive `delegate_task` (no nested teams, no background subagents from
 mates). At most one team is active per session. Spawning errors
@@ -281,3 +288,69 @@ lead runs on `hypercode.team.lead_model` (empty = inherit the
 orchestrator's effective model). Each run records its decision in
 `HypercodeReport.mode_decisions` as `mode=<subagent|team> task=<summary>
 rationale=<text>`.
+
+## 4. OMO Integration (feature 025)
+
+Ties the OMO agent roster into HyperCode orchestrator mode. Everything
+here is additive: with the integration inactive, behavior is
+byte-identical to pre-feature. Design trail:
+`specs/025-please-integrate-omo/`.
+
+### Persona-aware orchestrator overlay
+
+When orchestration is enabled AND the OMO registry has ≥1 resolved agent,
+the orchestrator's governing instructions (`extra_instructions`) become
+the delegation-first **Conductor persona**
+(`crates/joey-omo/src/agents/prompts/conductor.rs` — exported
+unregistered, so it has no tab/registry entry), selected by model
+family: GPT-5.6 → `gpt_5_6`, other GPT → `gpt`, else `default`
+(`conductor::for_model`). Switching OMO agents mid-session swaps only
+the persona — the hard-rules core (no direct writes; single final gate)
+and the full-roster briefing are appended under any named persona;
+`/model` re-selects the variant without losing the persona. Inactive
+integration or an empty registry → the fixed `ORCHESTRATOR_PROMPT`,
+byte-identical to pre-feature. Entry point:
+`hypercode::orchestrator_persona_overlay[_for_profile]`, wired at
+session start / `SetOrchestratorMode` / agent- and model-switch reapply
+in `engine.rs` and `repl.rs`.
+
+### Full-roster delegation
+
+All 11 registered OMO agents (sisyphus, hephaestus, prometheus, atlas,
+oracle, librarian, explore, multimodal-looker, metis, momus,
+sisyphus-junior) are valid `subagent_type` targets on `delegate_task`
+and valid values on the `call_omo_agent` enum — the schema enum is
+advisory; the runtime resolver is authoritative. Unknown names error
+with the valid-name list. `load_skills` works on named routing too: the
+skill overlay (`prompt_append`) is synthesized from `load_skills`
+entries exactly as on the category path. `category` and `subagent_type`
+remain mutually exclusive (BC-011). In batch mode (`tasks[]`), each
+task may carry its own `subagent_type` (any of the 11 agents): the
+resolved model + identity prompt are applied per task, and the resolved
+model wins over both the per-task and batch-level `model`; per-task
+`role` composes with it — the role still gap-fills toolsets/turns and
+appends its directive. The orchestrator prompt/roster advertises
+`subagent_type` dispatch of any OMO specialist.
+
+### Role model defaults from OMO agents
+
+HyperCode role models derive from OMO agents — explicit overrides
+always win; derivation is read-time and keyed on
+`hypercode.omo_specialists.enabled` (bool, default **true**):
+
+- Specialists ON (default): direct 1:1 mapping, strict — no chain
+  fallback. explorer ← explore; implementor ← hephaestus; orchestrator
+  session model ← atlas, applied ONLY when the model is neither pinned
+  (`--model`, `/model`) nor configured (`model.default`). An unresolved
+  agent inherits the existing default with a user-visible warning —
+  never a failure.
+- Specialists OFF (`hypercode.omo_specialists.enabled: false`): legacy
+  feature-025 chains — explorer ← explore→librarian; implementor ←
+  momus; orchestrator session model ← sisyphus→hephaestus→metis (first
+  resolvable), same pinned/configured guard.
+
+Both modes derive identically on both sides: `joey-cli` role resolution
+(`hypercode.rs`) and the mirrored gap-fill in `joey-orchestration`
+(`HyperRoleSettings` in `delegation_tool.rs`). An unresolvable mapping
+inherits the existing default with a user-visible warning (FR-006,
+agent-notice channel) — never a failure.

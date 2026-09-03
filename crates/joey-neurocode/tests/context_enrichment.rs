@@ -224,6 +224,7 @@ fn tier_routing_follows_classification() {
 
     let mut cfg = NeuroCodeConfig::default();
     cfg.enabled = true;
+    cfg.hypercode_enabled = true;
     cfg.tier.economical_model = "eco-model".into();
     cfg.tier.frontier_model = "frontier-model".into();
 

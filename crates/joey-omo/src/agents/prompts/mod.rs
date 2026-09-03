@@ -17,6 +17,7 @@ use crate::models::ModelFamily;
 // ── Agent prompt modules ────────────────────────────────────────────
 
 pub mod atlas;
+pub mod conductor;
 pub mod explore;
 pub mod hephaestus;
 pub mod junior;
@@ -73,6 +74,19 @@ pub fn dispatch_system_prompt(agent_name: &str, model: &str) -> String {
 /// not its own agent identity.
 pub fn ultrawork_prompt(model: &str) -> String {
     ultrawork::for_model(model).to_string()
+}
+
+/// Return the delegation-first Conductor persona prompt variant for the
+/// given model (feature 025).
+///
+/// Separate from `dispatch_system_prompt` because the Conductor is NOT a
+/// registered OMO agent — no AgentRegistry entry, no tab, no model
+/// fallback chain (research D2, FR-013). It is the default orchestrator
+/// persona applied by the orchestration layer's overlay when OMO
+/// integration is active; named-agent delegation goes through
+/// `dispatch_system_prompt` as usual.
+pub fn conductor_prompt(model: &str) -> String {
+    conductor::for_model(model).to_string()
 }
 
 #[cfg(test)]

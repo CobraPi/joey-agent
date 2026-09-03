@@ -4,7 +4,7 @@
 //!   (a) successful background child -> a completion notice is queued whose
 //!       text starts with
 //!       `[SUBAGENT COMPLETE] id=<id> goal=<goal> outcome=success tokens=<n> duration=<n>s`
-//!       followed by a distilled summary of <=500 tokens (~2000 chars cap);
+//!       followed by a distilled summary of <=1000 tokens (~2000 chars cap);
 //!   (b) failing child -> `[SUBAGENT FAILED] ... outcome=failure ...` is
 //!       PUSHED (failures are never silently dropped, US2-2/SC-002 at the
 //!       delegation level: every finished failure produces a notice);
@@ -347,7 +347,7 @@ async fn t011_notice_bounded_for_huge_child_summary() {
         )),
         "unexpected header: {header:?}"
     );
-    // The summary is hard-capped (~2000 chars ~ 500 tokens) regardless of
+    // The summary is hard-capped (~2000 chars ~ 1000 tokens) regardless of
     // the child's 100_000-char transcript, and is marked truncated.
     assert!(
         body.chars().count() <= 2001,

@@ -133,3 +133,50 @@ fn resolve_tier_model_none_when_unconfigured() {
     // No tier models configured → None.
     assert_eq!(engine.resolve_tier_model(), None);
 }
+
+/// Tier-model routing is gated on HyperCode: with `hypercode.enabled`
+/// false, `resolve_tier_model` must return None so the agent falls back to
+/// the user-configured main model even when NeuroCode itself is enabled
+/// and tier models are configured.
+#[test]
+fn tier_model_routing_requires_hypercode_enabled() {
+    let mut cfg = NeuroCodeConfig::default();
+    cfg.enabled = true;
+    cfg.hypercode_enabled = false;
+    cfg.tier.frontier_model = "frontier-model".into();
+    cfg.tier.economical_model = "economical-model".into();
+    let engine = DefaultEngine::new(cfg, PathBuf::from("/tmp/test-project"));
+    assert_eq!(engine.resolve_tier_model(), None);
+}
+
+/// Regression guard for the gate: with HyperCode enabled, routing applies
+/// (unclassified + no pinned tier → ambiguous default tier = economical).
+#[test]
+fn tier_model_routing_applies_when_hypercode_enabled() {
+    let mut cfg = NeuroCodeConfig::default();
+    cfg.enabled = true;
+    cfg.hypercode_enabled = true;
+    cfg.tier.frontier_model = "frontier-model".into();
+    cfg.tier.economical_model = "economical-model".into();
+    let engine = DefaultEngine::new(cfg, PathBuf::from("/tmp/test-project"));
+    assert_eq!(
+        engine.resolve_tier_model().as_deref(),
+        Some("economical-model")
+    );
+}
+
+/// The gate snapshots the orchestrator-active state: HyperCode enabled AND
+/// orchestrator mode on (mode defaults to true when absent from config).
+#[test]
+fn hypercode_gate_snapshots_orchestrator_active_state() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), "hypercode:\n  enabled: true\n  orchestrator_mode: false\n").unwrap();
+    let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+    assert!(!NeuroCodeConfig::from_config(&cfg).hypercode_enabled);
+    std::fs::write(tmp.path(), "hypercode:\n  enabled: true\n").unwrap();
+    let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+    assert!(NeuroCodeConfig::from_config(&cfg).hypercode_enabled);
+    std::fs::write(tmp.path(), "hypercode:\n  enabled: false\n  orchestrator_mode: true\n").unwrap();
+    let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+    assert!(!NeuroCodeConfig::from_config(&cfg).hypercode_enabled);
+}

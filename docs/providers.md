@@ -208,7 +208,10 @@ Dynamic model routing never rewrites an explicitly chosen model.
 `/model` + `switch_model` at runtime, agent-picker switches, and
 delegation child configs (the delegation layer's resolution is
 authoritative). When pinned, NeuroCode tier routing (Mode 2) is skipped —
-it only applies to implicit/config-default models. The llm-selector
+it only applies to implicit/config-default models. Tier routing additionally
+requires the HyperCode orchestrator-active state (`hypercode.enabled` and
+`hypercode.orchestrator_mode` both true); without it the agent always uses
+the configured main model. The llm-selector
 (feature 011) is unaffected (it only engages on `model = "auto"`, which
 explicit flags replace).
 
@@ -259,6 +262,9 @@ NeuroCode (`joey-neurocode`, wired via `joey-cli`): separate subsystem, off
 by default (`neurocode.enabled`); has its own frontier/economical tier
 models (`neurocode.tier.providers.<id>`), resolved through the same
 provider profile machinery — not part of llm-selector's allocation map.
+Its tier-model routing only applies while HyperCode is orchestrator-active
+(`hypercode.enabled` and `hypercode.orchestrator_mode` both true;
+RAG/indexing are not gated on HyperCode).
 
 ## Image-model routing (feature 016)
 

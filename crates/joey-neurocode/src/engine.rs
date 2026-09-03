@@ -920,6 +920,15 @@ impl NeuroCodeEngine for DefaultEngine {
         // classified yet — e.g. a command-surface engine that never saw a
         // turn. Mode 2: NeuroCode resolves the tier model from its own
         // config, scoped to the active provider.
+        // Tier-model routing is part of the HyperCode orchestration
+        // experience. With HyperCode disabled (`hypercode.enabled:
+        // false`) the main agent must run on the user-configured model
+        // (model.default) — return None so Agent's model resolution falls
+        // back to config.model. RAG/indexing/context enrichment are NOT
+        // gated here; they stay independent of HyperCode.
+        if !self.config.hypercode_enabled {
+            return None;
+        }
         let tier = self
             .last_tier
             .lock()

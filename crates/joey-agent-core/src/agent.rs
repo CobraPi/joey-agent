@@ -2936,7 +2936,19 @@ impl Agent {
                 if self.compression_enabled && self.compressor.should_compress(Some(real_tokens)) {
                     let _ = tx.send(AgentEvent::Notice("  ⟳ compacting context…".to_string()));
                     let approx = self.compressor.last_prompt_tokens;
+                    let _ = tx.send(AgentEvent::CompressionStart {
+                        reason: format!(
+                            "context at ~{} tokens ≥ {} threshold after tool round",
+                            real_tokens, self.compressor.threshold_tokens
+                        ),
+                        approx_tokens: real_tokens,
+                    });
+                    let original_msgs = self.history.len();
                     self.compress_context(Some(approx), None, false, Some(&tx)).await;
+                    let _ = tx.send(AgentEvent::CompressionEnd {
+                        original_msgs,
+                        new_msgs: self.history.len(),
+                    });
                     // Live context view: the history just shrank — refresh.
                     self.emit_context_snapshot(&tx);
                 }

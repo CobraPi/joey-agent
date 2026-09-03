@@ -1115,6 +1115,7 @@ impl SubagentManager {
                     model: req.model.clone(),
                     toolsets: req.toolsets.clone(),
                     role: None,
+                    subagent_type: None,
                     background: false,
                     budgets: None, // req does not carry budgets (watcher is later wave)
                 };
@@ -1617,6 +1618,7 @@ mod tests {
             model: None,
             toolsets: vec![],
             role: None,
+            subagent_type: None,
             background: false,
             budgets: None,
         };

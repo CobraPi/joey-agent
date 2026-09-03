@@ -75,10 +75,10 @@ Reuse computed KV cache for common prompt prefixes.
 
 **Example savings**:
 ```
-Prompt: [System: 500 tokens] + [User: 100 tokens]
+Prompt: [System: 1000 tokens] + [User: 100 tokens]
 
 Without caching: Compute 600 tokens every request
-With caching: Compute 500 tokens once, then 100 tokens/request
+With caching: Compute 1000 tokens once, then 100 tokens/request
 = 83% faster TTFT
 ```
 

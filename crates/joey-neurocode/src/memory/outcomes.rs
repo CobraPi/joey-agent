@@ -288,6 +288,71 @@ impl OutcomeStore {
         let rows = stmt.query_map([], |row| row_to_memory(row))?;
         rows.collect()
     }
+
+    /// T035 (FR-026): all NON-expired rows — the enumeration the
+    /// material-change sweep iterates (`OutcomeMemory` deliberately does
+    /// not carry the `expired` flag, so callers cannot filter
+    /// [`OutcomeStore::all_rows`] themselves).
+    pub fn active_rows(&self) -> rusqlite::Result<Vec<OutcomeMemory>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {LESSON_COLS} FROM outcome_memory WHERE expired = 0"
+        ))?;
+        let rows = stmt.query_map([], |row| row_to_memory(row))?;
+        rows.collect()
+    }
+}
+
+/// T035 (FR-026): did the artifact at `path` change since the lesson was
+/// confirmed? The graph store carries no content hash for code artifacts
+/// (only `status` + `indexed_at`), so the material-change signal is the
+/// filesystem: a file modification strictly newer than the lesson's
+/// `last_confirmed_at`, or a file that no longer exists. An unparseable
+/// timestamp conservatively keeps the lesson.
+pub fn artifact_changed_since(path: &std::path::Path, last_confirmed_at: &str) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true; // referenced file gone ⇒ materially changed
+    };
+    let Ok(confirmed) = chrono::DateTime::parse_from_rfc3339(last_confirmed_at) else {
+        return false;
+    };
+    match meta.modified() {
+        Ok(m) => m > confirmed.into(),
+        Err(_) => false,
+    }
+}
+
+/// T035 (FR-026 / SC-008): expire every non-expired lesson whose
+/// referenced artifact changed materially. `resolve` maps an artifact id
+/// to its source path (production: the dependency-graph store; tests: a
+/// map). Returns the number of lessons expired. Unknown artifact ids keep
+/// their lessons (change cannot be proven).
+pub fn expire_stale_lessons<P, F>(store: &OutcomeStore, resolve: F) -> usize
+where
+    F: FnMut(u64) -> Option<P>,
+    P: AsRef<std::path::Path>,
+{
+    let rows = match store.active_rows() {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let mut resolve = resolve;
+    let mut expired = 0usize;
+    for lesson in rows {
+        let mut changed = false;
+        for aid in &lesson.artifact_ids {
+            if let Some(p) = resolve(*aid) {
+                if artifact_changed_since(p.as_ref(), &lesson.last_confirmed_at) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if changed {
+            let ids = lesson.artifact_ids.clone();
+            expired += store.mark_expired_where_artifacts(&ids, true).unwrap_or(0);
+        }
+    }
+    expired
 }
 
 /// Map a row selected with [`LESSON_COLS`] (id at index 0) to an
@@ -488,5 +553,90 @@ mod tests {
         let hits = reopened.consult_by_signature("sig").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].artifact_ids, vec![7]);
+    }
+
+    /// T035 (FR-026): active_rows enumerates only non-expired rows.
+    #[test]
+    fn active_rows_excludes_expired() {
+        let store = OutcomeStore::open_in_memory().unwrap();
+        store.record(&store_outcome("sigA", vec![7])).unwrap();
+        store.record(&store_outcome("sigB", vec![9])).unwrap();
+        assert_eq!(store.mark_expired_where_artifacts(&[7], true).unwrap(), 1);
+        let active = store.active_rows().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].task_signature, "sigB");
+        assert_eq!(store.all_rows().unwrap().len(), 2); // expired row still present
+    }
+
+    /// T035 (FR-026): mtime-based material-change detection — future
+    /// mtime and missing files count as changed; past mtime and
+    /// unparseable timestamps do not.
+    #[test]
+    fn artifact_changed_since_detects_newer_and_missing() {
+        use std::fs::File;
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("src.rs");
+        let mut f = File::options().write(true).create(true).open(&p).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // (i) mtime in the past vs a now timestamp → not changed.
+        f.set_modified(SystemTime::now() - Duration::from_secs(3600)).unwrap();
+        assert!(!artifact_changed_since(&p, &now));
+
+        // (ii) mtime in the future → changed.
+        f.set_modified(SystemTime::now() + Duration::from_secs(3600)).unwrap();
+        assert!(artifact_changed_since(&p, &now));
+
+        // (iii) nonexistent path → changed.
+        assert!(artifact_changed_since(&dir.path().join("gone.rs"), &now));
+
+        // (iv) garbage timestamp with existing file → conservatively not changed.
+        assert!(!artifact_changed_since(&p, "not-a-date"));
+    }
+
+    /// T035 (FR-026 / SC-008): the sweep expires only lessons whose
+    /// referenced artifact changed materially (future mtime), keeping
+    /// unchanged ones consultable.
+    #[test]
+    fn expire_stale_lessons_expires_only_changed() {
+        use std::collections::HashMap;
+        use std::fs::File;
+        use std::path::PathBuf;
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.rs");
+        let path_b = dir.path().join("b.rs");
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        for (path, mtime) in [(path_a.clone(), future), (path_b.clone(), past)] {
+            let mut f = File::options().write(true).create(true).open(&path).unwrap();
+            f.set_modified(mtime).unwrap();
+        }
+
+        let store = OutcomeStore::open_in_memory().unwrap();
+        store.record(&store_outcome("sigA", vec![1])).unwrap();
+        store.record(&store_outcome("sigB", vec![2])).unwrap();
+
+        let mut map: HashMap<u64, PathBuf> = HashMap::new();
+        map.insert(1, path_a);
+        map.insert(2, path_b);
+        let expired = expire_stale_lessons(&store, |id| map.get(&id).cloned());
+        assert_eq!(expired, 1);
+        assert_eq!(store.consult_by_signature("sigA").unwrap().len(), 0);
+        assert_eq!(store.consult_by_signature("sigB").unwrap().len(), 1);
+    }
+
+    /// T035 (FR-026): lessons referencing unknown artifact ids (resolve
+    /// returns None) are kept — change cannot be proven.
+    #[test]
+    fn expire_stale_lessons_keeps_unknown_artifacts() {
+        let store = OutcomeStore::open_in_memory().unwrap();
+        store.record(&store_outcome("sig", vec![9])).unwrap();
+        let expired = expire_stale_lessons(&store, |_id| Option::<&std::path::Path>::None);
+        assert_eq!(expired, 0);
+        assert_eq!(store.consult_by_signature("sig").unwrap().len(), 1);
     }
 }

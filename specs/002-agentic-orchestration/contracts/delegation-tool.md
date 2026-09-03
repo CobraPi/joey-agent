@@ -111,5 +111,5 @@ Returns a structured text block:
 
 - Leaf subagents (default) cannot call delegate_task.
 - Orchestrator subagents require `max_spawn_depth > 1`.
-- Subagent summary target: <500 tokens.
+- Subagent summary target: <1000 tokens.
 - The concurrency limiter queues excess tasks (does not reject).

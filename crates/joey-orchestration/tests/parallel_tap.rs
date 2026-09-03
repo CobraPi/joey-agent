@@ -55,6 +55,7 @@ async fn tap_receives_lifecycle_and_wrapped_child_events() {
             model: None,
             toolsets: vec![],
             role: None,
+            subagent_type: None,
             background: false,
             budgets: None,
         })
@@ -120,6 +121,7 @@ async fn ids_are_unique_and_monotonic() {
             model: None,
             toolsets: vec![],
             role: None,
+            subagent_type: None,
             background: false,
             budgets: None,
         })
@@ -172,6 +174,7 @@ async fn child_ids_disjoint_across_concurrent_managers() {
             model: None,
             toolsets: vec![],
             role: None,
+            subagent_type: None,
             background: false,
             budgets: None,
         })

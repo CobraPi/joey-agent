@@ -305,7 +305,7 @@ mod tests {
 
 use std::collections::HashMap;
 
-use crate::task_graph::{ModelTier, TaskNode};
+use crate::task_graph::{ModelTier, RiskLevel, TaskNode};
 
 /// Per-task repair bookkeeping kept in the [`RepairLedger`].
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -394,7 +394,17 @@ impl Evaluator {
         workdir: &Path,
         ledger: &mut RepairLedger,
     ) -> EvaluationOutcome {
-        let outcome = gate.run(&task.verification, workdir).await;
+        // T029 (FR-022): High-risk tasks MUST undergo independent specialist
+        // review before approval. The gate contract (contracts/public-api.md)
+        // is pinned to (plan, workdir), so the risk signal rides the plan
+        // view: force `risk_triggered_review` on for High-risk tasks. The
+        // gate (joey-cli VerifyLoopGate) runs the reviewer when the flag is
+        // set. Strict-JSON plans may also set the flag directly.
+        let mut plan_view = task.verification.clone();
+        if task.risk == RiskLevel::High {
+            plan_view.risk_triggered_review = true;
+        }
+        let outcome = gate.run(&plan_view, workdir).await;
         match outcome {
             GateOutcome::Passed => EvaluationOutcome {
                 directive: EvaluationDirective::Complete,
@@ -629,6 +639,59 @@ mod t021_tests {
             }
             other => panic!("expected Repair, got {:?}", other),
         }
+    }
+
+    /// T029 (FR-022): High-risk tasks force the review flag on the plan
+    /// view handed to the gate; Low-risk plans pass through unchanged.
+    #[tokio::test]
+    async fn high_risk_forces_review_flag_on_plan_view() {
+        use std::sync::Mutex;
+
+        struct CaptureGate(Mutex<Option<VerificationPlanView>>);
+
+        #[async_trait::async_trait]
+        impl VerificationGate for CaptureGate {
+            async fn run(&self, plan: &VerificationPlanView, _workdir: &Path) -> GateOutcome {
+                *self.0.lock().unwrap() = Some(plan.clone());
+                GateOutcome::Passed
+            }
+        }
+
+        let ev = Evaluator::new(2);
+        let mut ledger = RepairLedger::default();
+
+        // (i) High risk with risk_triggered_review: false on the task's own
+        // plan — the gate must receive it forced to true.
+        let mut high = node(ModelTier::Economical);
+        high.risk = RiskLevel::High;
+        high.verification = VerificationPlanView {
+            steps: vec![],
+            risk_triggered_review: false,
+        };
+        let gate = CaptureGate(Mutex::new(None));
+        let out = ev.evaluate(&high, &gate, Path::new("."), &mut ledger).await;
+        assert_eq!(out.directive, EvaluationDirective::Complete);
+        let received = gate.0.lock().unwrap().take().expect("gate saw a plan");
+        assert!(
+            received.risk_triggered_review,
+            "High-risk task must force risk_triggered_review on the plan view"
+        );
+
+        // (ii) Low risk — the view arrives unchanged (false).
+        let mut low = node(ModelTier::Economical);
+        low.risk = RiskLevel::Low;
+        low.verification = VerificationPlanView {
+            steps: vec![],
+            risk_triggered_review: false,
+        };
+        let gate = CaptureGate(Mutex::new(None));
+        let out = ev.evaluate(&low, &gate, Path::new("."), &mut ledger).await;
+        assert_eq!(out.directive, EvaluationDirective::Complete);
+        let received = gate.0.lock().unwrap().take().expect("gate saw a plan");
+        assert!(
+            !received.risk_triggered_review,
+            "Low-risk task's plan view must arrive unchanged"
+        );
     }
 
     #[test]

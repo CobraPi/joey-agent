@@ -731,6 +731,7 @@ mod tests {
                 model: None,
                 toolsets: vec![],
                 role: None,
+                subagent_type: None,
                 background: false,
                 budgets: None,
             },

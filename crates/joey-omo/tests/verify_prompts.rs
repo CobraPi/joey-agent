@@ -297,3 +297,216 @@ fn non_kimi_model_id_unchanged() {
         "non-Kimi model must not resolve to kimi_k3()"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GPT-5.6 variant tests (T020-T023) + conductor persona tests (T004).
+// Pointer-equality asserts variant identity: for_model must resolve to the
+// exact same 'static str the module exposes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gpt_5_6_ids_select_gpt_5_6_variants() {
+    use joey_omo::agents::prompts::{atlas, conductor, prometheus, sisyphus};
+    for id in ["gpt-5.6-sol", "GPT-5-6-high", "gpt-5.6"] {
+        let p = sisyphus::for_model(id);
+        assert!(
+            std::ptr::eq(p, sisyphus::gpt_5_6()),
+            "sisyphus + {id} must resolve to gpt_5_6()"
+        );
+        let p = atlas::for_model(id);
+        assert!(
+            std::ptr::eq(p, atlas::gpt_5_6()),
+            "atlas + {id} must resolve to gpt_5_6()"
+        );
+        let p = prometheus::for_model(id);
+        assert!(
+            std::ptr::eq(p, prometheus::gpt_5_6()),
+            "prometheus + {id} must resolve to gpt_5_6()"
+        );
+        let p = conductor::for_model(id);
+        assert!(
+            std::ptr::eq(p, conductor::gpt_5_6()),
+            "conductor + {id} must resolve to gpt_5_6()"
+        );
+    }
+}
+
+#[test]
+fn generic_gpt_ids_still_select_generic_variants() {
+    use joey_omo::agents::prompts::{atlas, conductor, prometheus, sisyphus};
+    assert!(
+        std::ptr::eq(sisyphus::for_model("gpt-5.4"), sisyphus::gpt()),
+        "sisyphus + gpt-5.4 must resolve to gpt()"
+    );
+    assert!(
+        std::ptr::eq(atlas::for_model("gpt-5.4"), atlas::gpt()),
+        "atlas + gpt-5.4 must resolve to gpt()"
+    );
+    assert!(
+        std::ptr::eq(prometheus::for_model("gpt-5.4"), prometheus::gpt()),
+        "prometheus + gpt-5.4 must resolve to gpt()"
+    );
+    assert!(
+        std::ptr::eq(conductor::for_model("gpt-5.4"), conductor::gpt()),
+        "conductor + gpt-5.4 must resolve to gpt()"
+    );
+}
+
+#[test]
+fn hephaestus_gpt_5_6_dispatch_unchanged() {
+    use joey_omo::agents::prompts::hephaestus;
+    assert!(
+        std::ptr::eq(hephaestus::for_model("gpt-5.6-sol"), hephaestus::gpt_5_6()),
+        "hephaestus + gpt-5.6-sol must resolve to gpt_5_6()"
+    );
+    assert!(
+        std::ptr::eq(hephaestus::for_model("gpt-5.5"), hephaestus::gpt_5_5()),
+        "hephaestus + gpt-5.5 must resolve to gpt_5_5()"
+    );
+}
+
+#[test]
+fn non_gpt_families_keep_existing_variants() {
+    use joey_omo::agents::prompts::{atlas, conductor, prometheus, sisyphus};
+    assert!(
+        std::ptr::eq(sisyphus::for_model("glm-5.2"), sisyphus::glm()),
+        "sisyphus + glm-5.2 must resolve to glm()"
+    );
+    assert!(
+        std::ptr::eq(atlas::for_model("kimi-k3"), atlas::kimi_k3()),
+        "atlas + kimi-k3 must resolve to kimi_k3()"
+    );
+    assert!(
+        std::ptr::eq(prometheus::for_model("claude-opus-4-8"), prometheus::default()),
+        "prometheus + claude-opus-4-8 must resolve to default()"
+    );
+    assert!(
+        std::ptr::eq(conductor::for_model("claude-opus-4-8"), conductor::default()),
+        "conductor + claude-opus-4-8 must resolve to default()"
+    );
+}
+
+#[test]
+fn delegation_only_agents_fall_back_without_error() {
+    // FR-009: agents without a dedicated GPT-5.6 variant fall back to the
+    // nearest existing variant without error.
+    use joey_omo::agents::prompts::{explore, junior, librarian};
+    assert!(
+        std::ptr::eq(junior::for_model("gpt-5.6-sol"), junior::gpt_5_5()),
+        "junior + gpt-5.6-sol must fold to the existing gpt_5_5() variant"
+    );
+    assert!(
+        std::ptr::eq(librarian::for_model("gpt-5.6-sol"), librarian::default()),
+        "librarian + gpt-5.6-sol must resolve to default()"
+    );
+    assert!(
+        std::ptr::eq(explore::for_model("gpt-5.6-sol"), explore::default()),
+        "explore + gpt-5.6-sol must resolve to default()"
+    );
+}
+
+#[test]
+fn sisyphus_gpt_5_6_keeps_hard_invariants() {
+    use joey_omo::agents::prompts::sisyphus;
+    let prompt = sisyphus::gpt_5_6();
+    assert!(prompt.contains("Never use `as any`"));
+    assert!(prompt.contains("Never delete a failing test"));
+    assert!(prompt.contains("Never use destructive git commands"));
+    assert!(prompt.contains("Never deliver the final answer while a consulted Oracle is still running"));
+}
+
+#[test]
+fn atlas_gpt_5_6_keeps_critical_rules() {
+    use joey_omo::agents::prompts::atlas;
+    let prompt = atlas::gpt_5_6();
+    assert!(prompt.contains("NEVER: Write/edit code yourself"));
+    assert!(prompt.contains("ALWAYS: Default to PARALLEL fan-out"));
+}
+
+#[test]
+fn prometheus_gpt_variants_still_load_ulw_plan() {
+    use joey_omo::agents::prompts::prometheus;
+    for prompt in [prometheus::gpt(), prometheus::gpt_5_6(), prometheus::default()] {
+        assert!(prompt.contains("ulw-plan"), "prometheus variant must reference ulw-plan");
+        assert!(prompt.contains("You are a PLANNER"), "prometheus variant must declare planner identity");
+    }
+    for prompt in [prometheus::gpt(), prometheus::gpt_5_6()] {
+        assert!(prompt.contains("never implement"), "GPT prometheus variant must keep the planner paragraph");
+    }
+}
+
+#[test]
+fn conductor_variants_carry_hard_rules_and_doctrine() {
+    use joey_omo::agents::prompts::conductor;
+    for (name, prompt) in [
+        ("default", conductor::default()),
+        ("gpt", conductor::gpt()),
+        ("gpt_5_6", conductor::gpt_5_6()),
+    ] {
+        assert!(
+            prompt.contains("NEVER write, patch, or delete files yourself"),
+            "{name} conductor variant must embed the no-direct-writes hard rule"
+        );
+        assert!(
+            prompt.contains("FINAL") && prompt.contains("GATE"),
+            "{name} conductor variant must embed the final gate rule"
+        );
+        assert!(
+            prompt.contains("SPEC-KIT LIFECYCLE DOCTRINE"),
+            "{name} conductor variant must carry spec-kit doctrine"
+        );
+        assert!(
+            prompt.contains(".specify/feature.json"),
+            "{name} conductor variant must carry step-detection procedure"
+        );
+        for agent in [
+            "sisyphus", "hephaestus", "prometheus", "atlas", "oracle",
+            "librarian", "explore", "multimodal-looker", "metis", "momus",
+            "sisyphus-junior",
+        ] {
+            assert!(
+                prompt.contains(agent),
+                "{name} conductor variant must brief roster agent {agent}"
+            );
+        }
+    }
+}
+
+#[test]
+fn conductor_dispatch_selection() {
+    use joey_omo::agents::prompts::conductor;
+    assert!(std::ptr::eq(conductor::for_model("gpt-5.6-sol"), conductor::gpt_5_6()));
+    assert!(std::ptr::eq(conductor::for_model("gpt-5-6"), conductor::gpt_5_6()));
+    assert!(std::ptr::eq(conductor::for_model("gpt-5.4"), conductor::gpt()));
+    assert!(std::ptr::eq(conductor::for_model("glm-5.2"), conductor::default()));
+    assert!(std::ptr::eq(conductor::for_model("claude-opus-4-8"), conductor::default()));
+}
+
+#[test]
+fn conductor_is_not_a_registered_agent() {
+    let available = joey_omo::AvailableModelSet::from_models(vec!["gpt-5.6-sol".to_string()]);
+    let overrides = joey_omo::agents::registry::ModelOverrides::new();
+    let registry = joey_omo::AgentRegistry::build(available, &overrides);
+    assert!(registry.get("conductor").is_none(), "conductor must not be a registered OMO agent");
+    assert_eq!(registry.all().len(), 11, "registry must still have exactly the 11 built-in agents");
+    // Unknown-name dispatch falls back to the sisyphus default, which must not
+    // carry the conductor persona.
+    let prompt = joey_omo::dispatch_system_prompt("conductor", "gpt-5.6-sol");
+    assert!(
+        !prompt.contains("Conductor"),
+        "unknown-name dispatch must fall back to sisyphus default, not the conductor persona"
+    );
+}
+
+/// Feature 025 T034: `conductor_prompt` is the module's dispatch surface and
+/// must stay byte-identical to `conductor::for_model` for every family.
+#[test]
+fn conductor_prompt_dispatch_surface() {
+    for model in ["gpt-5.6-sol", "glm-5.2"] {
+        assert_eq!(
+            joey_omo::agents::prompts::conductor_prompt(model),
+            joey_omo::agents::prompts::conductor::for_model(model).to_string(),
+            "conductor_prompt must dispatch to the same variant as conductor::for_model for {model}"
+        );
+    }
+}

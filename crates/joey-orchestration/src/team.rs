@@ -115,6 +115,26 @@ pub fn teammate_directive(poll_interval_ms: u64) -> String {
     format!("{TEAMMATE_DIRECTIVE}\n\nCadence: poll team_status/team_message about every {poll_interval_ms}ms of work.")
 }
 
+/// Appended to the lead directive when hypercode.omo_specialists.enabled
+/// (default true): the lead may spawn teammates as ANY registered OMO
+/// specialist via delegate_task `subagent_type`.
+pub const LEAD_SPECIALISTS_ADDENDUM: &str = "\n\nSPECIALISTS: besides role=explorer / role=implementor, you may spawn any registered OMO specialist as a teammate by passing subagent_type (e.g. \"oracle\", \"librarian\", \"metis\", \"momus\", \"hephaestus\") with team + name — the teammate runs under that agent's identity prompt and resolved model.";
+
+/// Variant of [`team_lead_directive`] that appends the OMO-specialists
+/// addendum when `specialists` is true.
+pub fn team_lead_directive_with_specialists(
+    max_members: usize,
+    max_parallel_members: usize,
+    specialists: bool,
+) -> String {
+    let base = team_lead_directive(max_members, max_parallel_members);
+    if specialists {
+        format!("{base}{LEAD_SPECIALISTS_ADDENDUM}")
+    } else {
+        base
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Persistence helpers (all take an explicit home so tests avoid env races)
 // ---------------------------------------------------------------------------
@@ -1406,6 +1426,15 @@ mod tests {
         assert!(lead.contains("hard member maximum"));
         let mate = teammate_directive(500);
         assert!(mate.contains("every 500ms"));
+    }
+
+    #[test]
+    fn lead_directive_specialists_variant() {
+        let with = team_lead_directive_with_specialists(8, 4, true);
+        assert!(with.contains("SPECIALISTS:"));
+        assert!(with.starts_with(&team_lead_directive(8, 4)));
+        let without = team_lead_directive_with_specialists(8, 4, false);
+        assert_eq!(without, team_lead_directive(8, 4));
     }
 
     #[test]

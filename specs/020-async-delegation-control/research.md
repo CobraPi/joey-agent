@@ -13,7 +13,7 @@ Each decision is recorded as: **Dn: Title** / Decision / Rationale / Alternative
 - **Alternatives considered:** Bare `tokio::spawn` per child (loses centralized limits/lifecycle); engine-owned job list (couples engine to delegation internals). Both rejected.
 
 **D2: Completion notice delivery**
-- **Decision:** Reuse `ToolContext::push_background_completion` (`joey-tools/src/context.rs:434`; queue cap 64, oldest dropped), drained at `run_turn` start (`agent.rs:2188`). Notices are formatted as distilled one-block strings: `[SUBAGENT COMPLETE|FAILED|STOPPED] <id> <goal> <outcome> <summary <=500 tokens> <tokens> <duration>`.
+- **Decision:** Reuse `ToolContext::push_background_completion` (`joey-tools/src/context.rs:434`; queue cap 64, oldest dropped), drained at `run_turn` start (`agent.rs:2188`). Notices are formatted as distilled one-block strings: `[SUBAGENT COMPLETE|FAILED|STOPPED] <id> <goal> <outcome> <summary <=1000 tokens> <tokens> <duration>`.
 - **Rationale:** Identical mechanism to background terminal processes; zero new agent-core plumbing; FR-004 (distilled-only) satisfied by formatting at push time.
 - **Alternatives considered:** A new dedicated mpsc channel into the agent (new plumbing, ordering risks); injecting `AgentEvent`s (events are observer-only, never model-visible). Both rejected.
 

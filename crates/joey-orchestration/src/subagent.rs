@@ -229,7 +229,8 @@ impl Subagent {
         // into child agents, so capacity_requests() never throttled.
         agent.set_provider_semaphore(semaphore);
 
-        // T060/T149: Inject category prompt_append as extra instructions.
+        // T060/T149: Delegation directive (category prompt_append, named-agent
+        // identity, or skills directive) injected as extra instructions.
         // This is prepended to the system prompt alongside any loaded skills.
         if let Some(ref append) = req.prompt_append {
             if !append.is_empty() {
@@ -240,9 +241,9 @@ impl Subagent {
                         skill
                     ));
                 }
-                overlay.push_str("--- Category Directive ---\n");
+                overlay.push_str("--- Delegation Directive ---\n");
                 overlay.push_str(append);
-                overlay.push_str("\n--- End Category Directive ---\n");
+                overlay.push_str("\n--- End Delegation Directive ---\n");
                 agent.set_extra_instructions(Some(overlay));
             }
         }
@@ -363,12 +364,12 @@ impl Subagent {
                      {ctx}\n\n\
                      --- End Context ---\n\
                      \n\
-                     Work on the goal above. Keep your final summary under 500 tokens."
+                     Work on the goal above. Keep your final summary under 1000 tokens."
                 )
             }
             _ => format!(
                 "{goal}\n\n\
-                 Keep your final summary under 500 tokens."
+                 Keep your final summary under 1000 tokens."
             ),
         };
 
@@ -544,7 +545,7 @@ pub(crate) fn specs_to_requests(
         role,
         workdir: None,
         category: None,
-        subagent_type: None,
+        subagent_type: spec.subagent_type.clone(),
         load_skills: Vec::new(),
         prompt_append: None,
         team: None,
@@ -570,7 +571,9 @@ pub(crate) fn apply_batch_hyper_roles(
                     spec.goal
                 ));
             };
-            crate::delegation_tool::apply_hyper_role(req, role, tree, provider);
+            // Batch path carries no resolver: no OMO-chain default, no FR-006
+            // warning (chain_applicable=false — byte-identical to pre-feature-025).
+            crate::delegation_tool::apply_hyper_role(req, role, tree, provider, None, false);
         }
     }
     Ok(())

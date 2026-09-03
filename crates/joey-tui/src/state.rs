@@ -808,6 +808,15 @@ impl TokenStats {
     }
 }
 
+/// Cheap display copy of a cron job (from ~/.joey/cron/jobs.json).
+#[derive(Clone, Debug)]
+pub struct CronJobInfo {
+    pub name: String,
+    pub enabled: bool,
+    pub schedule_display: String,
+    pub next_run_at: Option<String>,
+}
+
 /// The complete TUI state, rendered by borrowed widgets each frame.
 pub struct App {
     pub mode: RunMode,
@@ -1082,6 +1091,29 @@ pub struct App {
     /// T114: OMO context injection set by `/start-work`, consumed (and cleared)
     /// on the next submitted turn. Mirrors ReplState.pending_context_injection.
     pub pending_context_injection: Option<String>,
+    // --- Feature indicators (orchestration / omo / systems) ---
+    /// Current OMO goal objective (AgentEvent::GoalSet / GoalCleared).
+    pub omo_goal: Option<String>,
+    /// When the goal was last set.
+    pub goal_set_at: Option<Instant>,
+    /// Retries seen in the CURRENT turn (reset on TurnStart).
+    pub retries_this_turn: u32,
+    /// Most recent retry error text.
+    pub last_retry_error: Option<String>,
+    /// Completed context compressions this session.
+    pub compression_count: u64,
+    /// When the last compression finished.
+    pub last_compression_at: Option<Instant>,
+    /// Latest orchestration task graph (set from planner JSON).
+    pub task_graph: Option<joey_orchestration::task_graph::TaskGraph>,
+    /// When the task graph was last replaced.
+    pub task_graph_updated_at: Option<Instant>,
+    /// Display copies of cron jobs (refreshed from the default store).
+    pub cron_jobs: Vec<CronJobInfo>,
+    /// Connected MCP server names.
+    pub mcp_servers: Vec<String>,
+    /// Whether the headless browser is connected.
+    pub browser_connected: bool,
     // ── Search-in-history ──
     /// Search overlay is open.
     pub search_open: bool,
@@ -1487,6 +1519,17 @@ impl App {
             last_hypercode_rect: Cell::new((0, 0, 0, 0)),
             job_board_visible: false,
             pending_context_injection: None,
+            omo_goal: None,
+            goal_set_at: None,
+            retries_this_turn: 0,
+            last_retry_error: None,
+            compression_count: 0,
+            last_compression_at: None,
+            task_graph: None,
+            task_graph_updated_at: None,
+            cron_jobs: Vec::new(),
+            mcp_servers: Vec::new(),
+            browser_connected: false,
             search_open: false,
             search_query: String::new(),
             search_has_match: false,
@@ -1654,6 +1697,8 @@ impl App {
                 self.mode = RunMode::Busy;
                 self.turns += 1;
                 self.turn_started = Some(Instant::now());
+                self.retries_this_turn = 0;
+                self.last_retry_error = None;
                 self.streaming_assistant.clear();
                 self.streaming_reasoning.clear();
                 self.reasoning_open = false;
@@ -1889,22 +1934,20 @@ impl App {
                 });
             }
             AgentEvent::RetryAttempt { attempt, max_retries, error, .. } => {
+                self.retries_this_turn += 1;
+                self.last_retry_error = Some(error.clone());
                 self.push_item(TranscriptItem::Notice {
                     text: format!("Retry {}/{}: {}", attempt, max_retries, error),
                     kind: NoticeKind::Warning,
                 });
             }
-            AgentEvent::CompressionStart { reason, approx_tokens } => {
-                self.push_item(TranscriptItem::Notice {
-                    text: format!("Compressing ~{} tokens: {}", approx_tokens, reason),
-                    kind: NoticeKind::Busy,
-                });
-            }
-            AgentEvent::CompressionEnd { original_msgs, new_msgs } => {
-                self.push_item(TranscriptItem::Notice {
-                    text: format!("Compressed {} → {} messages", original_msgs, new_msgs),
-                    kind: NoticeKind::Success,
-                });
+            // No TUI-side compression Notices: the agent-core turn loop
+            // already emits a "⟳ compacting context…" Notice before
+            // compressing — pushing another here would double-report (T3).
+            AgentEvent::CompressionStart { .. } => {}
+            AgentEvent::CompressionEnd { .. } => {
+                self.compression_count += 1;
+                self.last_compression_at = Some(Instant::now());
             }
             AgentEvent::FallbackActivated { from_model, to_model } => {
                 self.push_item(TranscriptItem::Notice {
@@ -2254,12 +2297,16 @@ impl App {
                 });
             }
             AgentEvent::GoalSet { objective } => {
+                self.omo_goal = Some(objective.clone());
+                self.goal_set_at = Some(Instant::now());
                 self.push_item(TranscriptItem::Notice {
                     text: format!("Goal set: {}", objective),
                     kind: NoticeKind::Success,
                 });
             }
             AgentEvent::GoalCleared => {
+                self.omo_goal = None;
+                self.goal_set_at = None;
                 self.push_item(TranscriptItem::Notice {
                     text: "Goal cleared".into(),
                     kind: NoticeKind::Info,
@@ -2597,7 +2644,59 @@ impl App {
         if self.stats_open {
             self.close_stats();
         } else {
+            self.refresh_cron_jobs();
             self.open_stats();
+        }
+    }
+
+    // ── Feature indicators (orchestration / omo / systems) ───────────
+
+    /// Replace the task graph from a planner JSON value. A malformed
+    /// payload is ignored — the previous graph stays (never blank a good
+    /// graph on one bad plan).
+    pub fn set_task_graph(&mut self, value: serde_json::Value) {
+        match serde_json::from_value::<joey_orchestration::task_graph::TaskGraph>(value) {
+            Ok(g) => {
+                self.task_graph = Some(g);
+                self.task_graph_updated_at = Some(Instant::now());
+            }
+            Err(_) => { /* keep previous graph */ }
+        }
+    }
+
+    /// Drop the task graph (plan finished / cleared).
+    pub fn clear_task_graph(&mut self) {
+        self.task_graph = None;
+        self.task_graph_updated_at = None;
+    }
+
+    /// Replace the connected MCP server name list.
+    pub fn set_mcp_servers(&mut self, names: Vec<String>) {
+        self.mcp_servers = names;
+    }
+
+    /// Set whether the headless browser is connected.
+    pub fn set_browser_connected(&mut self, connected: bool) {
+        self.browser_connected = connected;
+    }
+
+    /// Reload cron jobs from the default store (~/.joey/cron/jobs.json).
+    /// On any load failure the current list is left as-is.
+    pub fn refresh_cron_jobs(&mut self) {
+        let store = joey_cron::CronStore::open_default();
+        match store.load() {
+            Ok(jobs) => {
+                self.cron_jobs = jobs
+                    .into_iter()
+                    .map(|j| CronJobInfo {
+                        name: j.name,
+                        enabled: j.enabled,
+                        schedule_display: j.schedule_display,
+                        next_run_at: j.next_run_at,
+                    })
+                    .collect();
+            }
+            Err(_) => { /* leave as-is */ }
         }
     }
 

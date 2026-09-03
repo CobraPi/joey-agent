@@ -122,6 +122,13 @@ pub struct TaskSpec {
     /// role directive. Optional.
     #[serde(default)]
     pub role: Option<String>,
+    /// OMO subagent type for this task (e.g. "oracle", "hephaestus").
+    /// When set, the task dispatches under that named agent's resolved
+    /// model + identity prompt (same semantics as single-mode
+    /// `subagent_type`). Mutually compositional with `role` (role still
+    /// gap-fills toolsets/turns/tokens and appends its directive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
     /// Background delegation (feature 020, FR-001): when true the dispatch
     /// returns a handle immediately instead of blocking for the result.
     /// Default `false` preserves blocking behavior byte-for-byte (FR-002).
@@ -212,7 +219,7 @@ impl DelegationRequest {
 pub struct DelegationResult {
     /// The original goal (for correlation).
     pub goal: String,
-    /// Concise result summary (<500 tokens target).
+    /// Concise result summary (<1000 tokens target).
     pub summary: String,
     /// Whether the subagent completed without fatal error.
     pub success: bool,
@@ -451,6 +458,7 @@ mod tests {
             model: None,
             toolsets: vec![],
             role: None,
+            subagent_type: None,
             background: false,
             budgets: None,
         };
@@ -469,6 +477,7 @@ mod tests {
             model: None,
             toolsets: vec![],
             role: None,
+            subagent_type: None,
             background: true,
             budgets: Some(Budgets {
                 max_turns: Some(2),
@@ -498,6 +507,16 @@ mod tests {
     }
 
     #[test]
+    fn taskspec_parses_subagent_type() {
+        // Present key → Some(name); absent key → None (serde default).
+        let with: TaskSpec =
+            serde_json::from_str(r#"{"goal":"g","subagent_type":"metis"}"#).unwrap();
+        assert_eq!(with.subagent_type.as_deref(), Some("metis"));
+        let without: TaskSpec = serde_json::from_str(r#"{"goal":"g"}"#).unwrap();
+        assert_eq!(without.subagent_type, None);
+    }
+
+    #[test]
     fn stop_reason_serde_round_trip() {
         for (reason, name) in [
             (StopReason::OrchestratorRequested, "orchestrator_requested"),
@@ -520,6 +539,7 @@ mod tests {
             model: None,
             toolsets: vec![],
             role: None,
+            subagent_type: None,
             background: true,
             budgets: Some(Budgets {
                 max_turns: Some(3),

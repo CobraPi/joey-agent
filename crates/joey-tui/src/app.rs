@@ -6145,11 +6145,22 @@ mod pane_viewer_key_tests {
 
         assert_eq!(pane_buf.area(), main_buf.area(), "same TestBackend geometry");
 
-        // The overlay modal rect, mirroring `draw_help_overlay`'s geometry:
-        // w = 56.min(width), h = 26.min(height), centered — (22, 2, 56, 26)
-        // on the 100×30 test terminal. Under it the two views legitimately
-        // differ (pane vs main transcript); INSIDE it they must not.
-        let rect = Rect::new(22, 2, 56, 26);
+        // The overlay modal rect, derived from the buffer's area mirroring
+        // `draw_help_overlay`'s geometry exactly (w = 56.min(width),
+        // h = 44.min(height), centered) so this can never drift from the
+        // widget's formula — (22, 0, 56, 30) on the 100×30 test terminal.
+        // The pane/main identity check below runs over the FULL modal rect.
+        // Outside it the two views legitimately differ (pane vs main
+        // transcript); INSIDE it they must not.
+        let area = pane_buf.area();
+        let w = 56.min(area.width);
+        let h = 44.min(area.height);
+        let rect = Rect::new(
+            area.x + (area.width - w) / 2,
+            area.y + (area.height - h) / 2,
+            w,
+            h,
+        );
         let pane_text: String = (rect.y..rect.bottom())
             .flat_map(|y| (rect.x..rect.right()).map(move |x| (x, y)))
             .map(|(x, y)| pane_buf[(x, y)].symbol().to_string())

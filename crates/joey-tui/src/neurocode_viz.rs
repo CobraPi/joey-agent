@@ -11,6 +11,10 @@
 //!   - a **node browser** — the inclusion list (reason, depth, fan-in),
 //!     synced with the canvas selection;
 //!   - a **detail pane** — the selected node's full snapshot record;
+//!   - a **tasks tab** — the live orchestration task DAG (hypercode):
+//!     mini-boxes per task on topological-depth rows with dependency
+//!     connectors + a detail pane; reads `App::task_graph`, so it works
+//!     without a NeuroCode snapshot;
 //!   - a **raw-feed tab** — the exact text NeuroCode fed the model.
 //!
 //! Everything is deterministic and pure with respect to the snapshot:
@@ -18,6 +22,7 @@
 //! renderer paints and the mouse hit-tests against.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -29,6 +34,7 @@ use crate::state::App;
 use crate::theme::Theme;
 
 use joey_neurocode::context::snapshot::{ContextGraphSnapshot, NodeSnapshot};
+use joey_orchestration::task_graph::{TaskGraph, TaskId, TaskNode, TaskStatus};
 
 // ── Model ───────────────────────────────────────────────────────────────────
 
@@ -40,6 +46,8 @@ pub enum VizTab {
     Graph,
     /// Inclusion list browser.
     Nodes,
+    /// Live orchestration task DAG (hypercode execution graph).
+    Tasks,
     /// Raw assembled-context feed.
     Feed,
 }
@@ -67,6 +75,10 @@ pub struct VizState {
     /// (absolute screen cells, same order as `snapshot.nodes`). Interior
     /// mutability so the renderer can record from `&App`.
     pub node_cells: RefCell<Vec<(u16, u16)>>,
+    /// Task-DAG box center cells as drawn by the LAST frame on the Tasks
+    /// tab (same order as the deterministic `(depth, id)` task ordering).
+    /// Separate from `node_cells` so the two hit-tests never mix indices.
+    pub task_cells: RefCell<Vec<(u16, u16)>>,
 }
 
 impl Default for VizState {
@@ -83,6 +95,7 @@ impl Default for VizState {
             detail_scroll: 0,
             show_neighbors: true,
             node_cells: RefCell::new(Vec::new()),
+            task_cells: RefCell::new(Vec::new()),
         }
     }
 }
@@ -98,12 +111,14 @@ impl VizState {
         self.detail_scroll = 0;
         self.show_neighbors = true;
         self.node_cells.borrow_mut().clear();
+        self.task_cells.borrow_mut().clear();
     }
 
     pub fn cycle_tab(&mut self) {
         self.tab = match self.tab {
             VizTab::Graph => VizTab::Nodes,
-            VizTab::Nodes => VizTab::Feed,
+            VizTab::Nodes => VizTab::Tasks,
+            VizTab::Tasks => VizTab::Feed,
             VizTab::Feed => VizTab::Graph,
         };
         // Keep list cursor synced with the canvas selection when arriving.
@@ -362,6 +377,29 @@ impl VizState {
     }
 }
 
+/// Move the Tasks-tab selection by one slot in the deterministic
+/// `(depth, id)` ordering, clamped at both ends. No-op when `n == 0`
+/// (no task graph); resets the detail scroll like every other selection
+/// move. Takes the viz state + count (not `&mut App`) so `explorer_key`
+/// can call it while holding its `viz` field borrow.
+fn task_select_move(viz: &mut VizState, n: usize, up: bool) {
+    if n == 0 {
+        return;
+    }
+    viz.selected = if up {
+        viz.selected.saturating_sub(1)
+    } else {
+        (viz.selected + 1).min(n - 1)
+    };
+    viz.detail_scroll = 0;
+}
+
+/// `task_select_move` over `App` — resolves the task count, then delegates.
+fn app_task_select_move(app: &mut App, up: bool) {
+    let n = app.task_graph.as_ref().map_or(0, |g| g.nodes.len());
+    task_select_move(&mut app.neurocode_viz, n, up);
+}
+
 /// Handle a mouse click inside the explorer area. Returns true when the
 /// click docked the explorer (caller stops). `title_row` is the explorer's
 /// first screen row — the dock affordance.
@@ -370,6 +408,23 @@ pub fn explorer_click(app: &mut App, row: u16, col: u16, area: Rect) -> bool {
     if row <= area.y {
         app.toggle_neurocode_expanded();
         return true;
+    }
+    // Tasks tab: hit-test task boxes (works without a neurocode snapshot).
+    // Misses are ignored — same rule as the graph canvas: accidental docks
+    // are worse than no-ops.
+    if app.neurocode_viz.tab == VizTab::Tasks && app.task_graph.is_some() {
+        let cells = app.neurocode_viz.task_cells.borrow().clone();
+        let mut best: Option<(u32, usize)> = None;
+        for (idx, (nx, ny)) in cells.iter().enumerate() {
+            let d = nx.abs_diff(col).max(ny.abs_diff(row)) as u32;
+            if d <= 2 && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, idx));
+            }
+        }
+        if let Some((_, idx)) = best {
+            app.neurocode_viz.select(idx);
+        }
+        return false;
     }
     let Some(snapshot) = app.neurocode_snapshot.as_ref() else {
         // No graph — the whole area is the raw feed; dock on any click to
@@ -412,6 +467,11 @@ fn list_row_to_index(snapshot: &ContextGraphSnapshot, inner_row: usize) -> Optio
 
 /// Handle a mouse-wheel event inside the explorer area.
 pub fn explorer_scroll(app: &mut App, row: u16, col: u16, up: bool) {
+    // Tasks tab first: it is task-graph-driven, not snapshot-driven.
+    if app.neurocode_viz.tab == VizTab::Tasks {
+        app_task_select_move(app, up);
+        return;
+    }
     let Some(snapshot) = app.neurocode_snapshot.as_ref() else {
         // Raw-feed fallback: scroll the feed.
         if up {
@@ -446,6 +506,11 @@ pub fn explorer_scroll(app: &mut App, row: u16, col: u16, up: bool) {
             } else {
                 app.neurocode_scroll = app.neurocode_scroll.saturating_sub(3);
             }
+        }
+        // Tasks never reaches here (handled above), but keep the arm
+        // exhaustive if that early return ever moves.
+        VizTab::Tasks => {
+            app_task_select_move(app, up);
         }
     }
 }
@@ -494,9 +559,32 @@ pub fn explorer_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
         KeyCode::BackTab => {
             viz.cycle_tab();
             viz.cycle_tab();
+            viz.cycle_tab();
             true
         }
-        _ if !has_snapshot => {
+        // Digit shortcuts mirror the tab-strip labels ([1 graph] …
+        // [4 feed]). Work on every tab (tasks included — reachable even
+        // without a neurocode snapshot).
+        KeyCode::Char('1') => {
+            viz.tab = VizTab::Graph;
+            true
+        }
+        KeyCode::Char('2') => {
+            viz.tab = VizTab::Nodes;
+            if app.neurocode_snapshot.is_some() {
+                viz.list_cursor = viz.selected;
+            }
+            true
+        }
+        KeyCode::Char('3') => {
+            viz.tab = VizTab::Tasks;
+            true
+        }
+        KeyCode::Char('4') => {
+            viz.tab = VizTab::Feed;
+            true
+        }
+        _ if !has_snapshot && viz.tab != VizTab::Tasks => {
             // Raw-feed fallback: only scrolling keys are explorer-owned.
             match code {
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -529,7 +617,7 @@ pub fn explorer_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
         KeyCode::Enter => {
             // Graph → jump to the Nodes pane with this node under the
             // cursor; Nodes → jump back to the canvas re-centered on the
-            // selection; Feed → back to the graph.
+            // selection; Tasks → back to the graph; Feed → back to the graph.
             viz.tab = match viz.tab {
                 VizTab::Graph => VizTab::Nodes,
                 _ => VizTab::Graph,
@@ -565,6 +653,10 @@ pub fn explorer_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
                         viz.list_move(snap, true);
                     }
                 }
+                VizTab::Tasks => {
+                    let n = app.task_graph.as_ref().map_or(0, |g| g.nodes.len());
+                    task_select_move(viz, n, true);
+                }
                 VizTab::Feed => {
                     app.neurocode_scroll = app.neurocode_scroll.saturating_add(1);
                 }
@@ -583,6 +675,10 @@ pub fn explorer_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
                         viz.list_move(snap, false);
                     }
                 }
+                VizTab::Tasks => {
+                    let n = app.task_graph.as_ref().map_or(0, |g| g.nodes.len());
+                    task_select_move(viz, n, false);
+                }
                 VizTab::Feed => {
                     app.neurocode_scroll = app.neurocode_scroll.saturating_sub(1);
                 }
@@ -595,6 +691,10 @@ pub fn explorer_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
                     if let Some(snap) = app.neurocode_snapshot.as_ref() {
                         viz.select_directional(snap, -1, 0);
                     }
+                }
+                VizTab::Tasks => {
+                    let n = app.task_graph.as_ref().map_or(0, |g| g.nodes.len());
+                    task_select_move(viz, n, true);
                 }
                 VizTab::Feed => {
                     app.neurocode_scroll = app.neurocode_scroll.saturating_add(2);
@@ -609,6 +709,10 @@ pub fn explorer_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
                     if let Some(snap) = app.neurocode_snapshot.as_ref() {
                         viz.select_directional(snap, 1, 0);
                     }
+                }
+                VizTab::Tasks => {
+                    let n = app.task_graph.as_ref().map_or(0, |g| g.nodes.len());
+                    task_select_move(viz, n, false);
                 }
                 VizTab::Feed => {
                     app.neurocode_scroll = app.neurocode_scroll.saturating_sub(2);
@@ -641,6 +745,7 @@ pub fn draw_explorer(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         match app.neurocode_viz.tab {
             VizTab::Graph => "graph",
             VizTab::Nodes => "nodes",
+            VizTab::Tasks => "tasks",
             VizTab::Feed => "feed",
         }
     );
@@ -651,15 +756,11 @@ pub fn draw_explorer(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         return;
     }
 
-    // No snapshot → raw-feed fallback (identical content to the old
-    // expanded feed, so nothing regresses while cold/un-indexed).
-    let Some(snapshot) = snapshot else {
-        draw_fallback_feed(f, inner, app, theme);
-        return;
-    };
-
     // Chrome: stats/tab strip (top) + key-hint footer (bottom), content
-    // between them.
+    // between them. The chrome ALWAYS renders (the Tasks tab is task-graph
+    // driven and the Feed tab is raw text — neither needs a snapshot);
+    // only the Graph/Nodes content arms require one, falling back to the
+    // raw feed below when cold/un-indexed.
     let rows = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
@@ -670,7 +771,9 @@ pub fn draw_explorer(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         .split(inner);
 
     // Stats line + tab strip.
-    let expanded = snapshot.nodes.iter().filter(|n| !n.primary).count();
+    let expanded = snapshot
+        .map(|s| s.nodes.iter().filter(|n| !n.primary).count())
+        .unwrap_or(0);
     let tab_span = |label: &str, active: bool| {
         Span::styled(
             format!("[{}] ", label),
@@ -687,31 +790,54 @@ pub fn draw_explorer(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 }),
         )
     };
-    let dropped = if snapshot.budget.dropped_for_budget > 0 {
-        format!(" · {} dropped", snapshot.budget.dropped_for_budget)
+    let stats = if app.neurocode_viz.tab == VizTab::Tasks {
+        // Task-DAG stats replace the neurocode graph stats on this tab.
+        let (done, running, blocked, total) = task_counts(app.task_graph.as_ref());
+        let ago = app
+            .task_graph_updated_at
+            .map(fmt_ago)
+            .unwrap_or_else(|| "—".to_string());
+        format!(
+            "  tasks {}/{} · {} active · {} blocked · updated {}",
+            done, total, running, blocked, ago
+        )
     } else {
-        String::new()
+        match snapshot {
+            Some(snapshot) => {
+                let dropped = if snapshot.budget.dropped_for_budget > 0 {
+                    format!(" · {} dropped", snapshot.budget.dropped_for_budget)
+                } else {
+                    String::new()
+                };
+                let edge_word =
+                    if snapshot.edges.len() == 1 { "edge" } else { "edges" };
+                format!(
+                    "  {} tier {} · Σ{} tok · {} nodes ({} target + {} expanded) · {} {} · budget {}/{}{}",
+                    tab_dot(app.neurocode_viz.tab == VizTab::Graph),
+                    snapshot.tier,
+                    fmt_tokens(snapshot.token_estimate),
+                    snapshot.nodes.len(),
+                    snapshot.nodes.iter().filter(|n| n.primary).count(),
+                    expanded,
+                    snapshot.edges.len(),
+                    edge_word,
+                    expanded,
+                    snapshot.budget.max_expanded_nodes,
+                    dropped,
+                )
+            }
+            None => format!(
+                "  {} no graph snapshot — raw feed only · 3 tasks for the DAG",
+                tab_dot(app.neurocode_viz.tab == VizTab::Graph),
+            ),
+        }
     };
-    let edge_word = if snapshot.edges.len() == 1 { "edge" } else { "edges" };
-    let stats = format!(
-        "  {} tier {} · Σ{} tok · {} nodes ({} target + {} expanded) · {} {} · budget {}/{}{}",
-        tab_dot(app.neurocode_viz.tab == VizTab::Graph),
-        snapshot.tier,
-        fmt_tokens(snapshot.token_estimate),
-        snapshot.nodes.len(),
-        snapshot.nodes.iter().filter(|n| n.primary).count(),
-        expanded,
-        snapshot.edges.len(),
-        edge_word,
-        expanded,
-        snapshot.budget.max_expanded_nodes,
-        dropped,
-    );
     f.render_widget(
         Paragraph::new(Line::from(vec![
             tab_span("1 graph", app.neurocode_viz.tab == VizTab::Graph),
             tab_span("2 nodes", app.neurocode_viz.tab == VizTab::Nodes),
-            tab_span("3 feed", app.neurocode_viz.tab == VizTab::Feed),
+            tab_span("3 tasks", app.neurocode_viz.tab == VizTab::Tasks),
+            tab_span("4 feed", app.neurocode_viz.tab == VizTab::Feed),
             Span::styled(
                 stats,
                 Style::default().fg(theme.fg_more_subtle.to_color()),
@@ -724,45 +850,58 @@ pub fn draw_explorer(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     match app.neurocode_viz.tab {
         VizTab::Graph => {
             let content = rows[1];
-            if content.width >= 48 {
-                // Canvas (left) | right column (list + detail).
-                let right_w = 36u16.min(content.width / 2);
-                let cols = ratatui::layout::Layout::default()
-                    .direction(ratatui::layout::Direction::Horizontal)
-                    .constraints([
-                        ratatui::layout::Constraint::Min(20),
-                        ratatui::layout::Constraint::Length(right_w),
-                    ])
-                    .split(content);
-                draw_canvas(f, cols[0], app, theme, snapshot);
+            if let Some(snapshot) = snapshot {
+                if content.width >= 48 {
+                    // Canvas (left) | right column (list + detail).
+                    let right_w = 36u16.min(content.width / 2);
+                    let cols = ratatui::layout::Layout::default()
+                        .direction(ratatui::layout::Direction::Horizontal)
+                        .constraints([
+                            ratatui::layout::Constraint::Min(20),
+                            ratatui::layout::Constraint::Length(right_w),
+                        ])
+                        .split(content);
+                    draw_canvas(f, cols[0], app, theme, snapshot);
 
-                let detail_h = (cols[1].height / 2).clamp(4, 14).min(cols[1].height);
-                let right_rows = ratatui::layout::Layout::default()
+                    let detail_h = (cols[1].height / 2).clamp(4, 14).min(cols[1].height);
+                    let right_rows = ratatui::layout::Layout::default()
+                        .direction(ratatui::layout::Direction::Vertical)
+                        .constraints([
+                            ratatui::layout::Constraint::Min(3),
+                            ratatui::layout::Constraint::Length(detail_h),
+                        ])
+                        .split(cols[1]);
+                    draw_node_list(f, right_rows[0], app, theme, snapshot);
+                    draw_detail(f, right_rows[1], app, theme, snapshot);
+                } else {
+                    // Narrow: canvas only.
+                    draw_canvas(f, content, app, theme, snapshot);
+                }
+            } else {
+                // Cold/un-indexed: keep the old expanded-feed content
+                // (empty-state message handled by draw_fallback_feed).
+                draw_fallback_feed(f, content, app, theme);
+            }
+        }
+        VizTab::Nodes => {
+            let content = rows[1];
+            if let Some(snapshot) = snapshot {
+                let detail_h = (content.height / 3).clamp(4, 12).min(content.height);
+                let vrows = ratatui::layout::Layout::default()
                     .direction(ratatui::layout::Direction::Vertical)
                     .constraints([
                         ratatui::layout::Constraint::Min(3),
                         ratatui::layout::Constraint::Length(detail_h),
                     ])
-                    .split(cols[1]);
-                draw_node_list(f, right_rows[0], app, theme, snapshot);
-                draw_detail(f, right_rows[1], app, theme, snapshot);
+                    .split(content);
+                draw_node_list(f, vrows[0], app, theme, snapshot);
+                draw_detail(f, vrows[1], app, theme, snapshot);
             } else {
-                // Narrow: canvas only.
-                draw_canvas(f, content, app, theme, snapshot);
+                draw_fallback_feed(f, content, app, theme);
             }
         }
-        VizTab::Nodes => {
-            let content = rows[1];
-            let detail_h = (content.height / 3).clamp(4, 12).min(content.height);
-            let vrows = ratatui::layout::Layout::default()
-                .direction(ratatui::layout::Direction::Vertical)
-                .constraints([
-                    ratatui::layout::Constraint::Min(3),
-                    ratatui::layout::Constraint::Length(detail_h),
-                ])
-                .split(content);
-            draw_node_list(f, vrows[0], app, theme, snapshot);
-            draw_detail(f, vrows[1], app, theme, snapshot);
+        VizTab::Tasks => {
+            draw_tasks_tab(f, rows[1], app, theme);
         }
         VizTab::Feed => {
             draw_feed_pane(f, rows[1], app, theme);
@@ -775,6 +914,7 @@ pub fn draw_explorer(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
             " ←→↑↓ select · Shift+←→↑↓ pan · wheel/+- zoom · 0 reset · Tab pane · ⏎ nodes · Space neighbors "
         }
         VizTab::Nodes => " ↑↓/jk move · ⏎ back to graph · g/G ends · Tab pane ",
+        VizTab::Tasks => " enter detail · hjkl select · tab next ",
         VizTab::Feed => " ↑↓ scroll · Tab pane ",
     };
     f.render_widget(
@@ -830,6 +970,521 @@ fn draw_fallback_feed(f: &mut Frame, inner: Rect, app: &App, theme: Theme) {
 /// The feed tab: same content as the fallback but under the explorer chrome.
 fn draw_feed_pane(f: &mut Frame, inner: Rect, app: &App, theme: Theme) {
     draw_fallback_feed(f, inner, app, theme);
+}
+
+// ── Tasks tab (live orchestration task DAG) ─────────────────────────────────
+
+/// Row height per depth level: 4 = box (3) + gap (1).
+const TASK_ROW_H: u16 = 4;
+
+/// "`now`"/"`Ns ago`"/"`Nm ago`" — same shape the context panel's ↻ stamp uses.
+fn fmt_ago(at: std::time::Instant) -> String {
+    let secs = at.elapsed().as_secs();
+    if secs < 1 {
+        "now".to_string()
+    } else if secs < 60 {
+        format!("{}s ago", secs)
+    } else {
+        format!("{}m ago", secs / 60)
+    }
+}
+
+/// Status word (lowercase, matching `TaskStatus::Display`).
+fn task_status_word(s: TaskStatus) -> &'static str {
+    match s {
+        TaskStatus::Pending => "pending",
+        TaskStatus::Ready => "ready",
+        TaskStatus::Dispatched => "dispatched",
+        TaskStatus::Evaluating => "evaluating",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Degraded => "degraded",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Skipped => "skipped",
+    }
+}
+
+/// Status glyph → color. Closest existing roles: cyan=info (ready),
+/// yellow=busy (dispatched), magenta=secondary (evaluating), green=success,
+/// red=error, amber=warning (degraded), dim=fg_most_subtle (pending/
+/// blocked/ skipped).
+fn task_status_color(theme: Theme, s: TaskStatus) -> ratatui::style::Color {
+    match s {
+        TaskStatus::Pending => theme.fg_most_subtle.to_color(),
+        TaskStatus::Ready => theme.info.to_color(),
+        TaskStatus::Dispatched => theme.busy.to_color(),
+        TaskStatus::Evaluating => theme.secondary.to_color(),
+        TaskStatus::Completed => theme.success.to_color(),
+        TaskStatus::Failed => theme.error.to_color(),
+        TaskStatus::Degraded => theme.warning.to_color(),
+        TaskStatus::Blocked => theme.fg_more_subtle.to_color(),
+        TaskStatus::Skipped => theme.fg_most_subtle.to_color(),
+    }
+}
+
+/// `(done, running, blocked, total)` for the Tasks-tab stats line:
+/// done = Completed+Degraded+Skipped, running = Dispatched+Evaluating+Ready,
+/// blocked = Blocked.
+fn task_counts(graph: Option<&TaskGraph>) -> (usize, usize, usize, usize) {
+    let mut done = 0;
+    let mut running = 0;
+    let mut blocked = 0;
+    let total = graph.map_or(0, |g| g.nodes.len());
+    if let Some(g) = graph {
+        for t in g.nodes.values() {
+            match t.status {
+                TaskStatus::Completed
+                | TaskStatus::Degraded
+                | TaskStatus::Skipped => done += 1,
+                TaskStatus::Dispatched
+                | TaskStatus::Evaluating
+                | TaskStatus::Ready => running += 1,
+                TaskStatus::Blocked => blocked += 1,
+                TaskStatus::Pending | TaskStatus::Failed => {}
+            }
+        }
+    }
+    (done, running, blocked, total)
+}
+
+/// Topological depth per node: 0 for roots, else 1 + max(dep depths).
+/// Iterates to fixpoint over BTreeMap order, capped at `nodes.len()+1`
+/// passes so a cycle (invalid but possible at runtime) still terminates —
+/// the nodes on the cycle keep increasing depths and land on the deepest
+/// row, which renders without looping forever.
+fn task_depths(graph: &TaskGraph) -> HashMap<&TaskId, usize> {
+    let mut depth: HashMap<&TaskId, usize> =
+        graph.nodes.keys().map(|id| (id, 0usize)).collect();
+    let cap = graph.nodes.len() + 1;
+    for _ in 0..cap {
+        let mut changed = false;
+        for (id, node) in &graph.nodes {
+            let d = node
+                .dependencies
+                .iter()
+                .filter_map(|dep| depth.get(dep).copied())
+                .max()
+                .map_or(0, |m| m + 1);
+            if depth.get(id).copied() != Some(d) {
+                depth.insert(id, d);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    depth
+}
+
+/// Deterministic task ordering: sort by (topological depth, id).
+fn task_order(graph: &TaskGraph) -> Vec<&TaskNode> {
+    let depths = task_depths(graph);
+    let mut order: Vec<&TaskNode> = graph.nodes.values().collect();
+    order.sort_by(|a, b| {
+        depths
+            .get(&a.id)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&depths.get(&b.id).copied().unwrap_or(0))
+            .then(a.id.cmp(&b.id))
+    });
+    order
+}
+
+/// One laid-out task box: absolute screen rect + entry-gate connector cell
+/// (directly above the box top-center — where dependency edges arrive).
+#[derive(Debug, Clone, Copy)]
+struct TaskBox {
+    rect: Rect,
+}
+
+impl TaskBox {
+    fn top_center(&self) -> (i32, i32) {
+        (
+            self.rect.x as i32 + (self.rect.width as i32 / 2),
+            self.rect.y as i32 - 1,
+        )
+    }
+    fn bottom_center(&self) -> (i32, i32) {
+        (
+            self.rect.x as i32 + (self.rect.width as i32 / 2) - 1,
+            self.rect.y as i32 + self.rect.height as i32,
+        )
+    }
+}
+
+/// The Tasks tab: DAG canvas (left) + selected-task detail (right); stacked
+/// vertically when narrow. Reads `App::task_graph` — no neurocode snapshot
+/// required. Empty state when no graph has landed.
+fn draw_tasks_tab(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    let Some(graph) = app.task_graph.as_ref() else {
+        // Empty state: centered dim hint.
+        let msg = " no task graph — run ⚡ hypercode with execution graph enabled ";
+        let x = area.x + area.width.saturating_sub(msg.chars().count() as u16) / 2;
+        let y = area.y + area.height / 2;
+        for (i, ch) in msg.chars().enumerate() {
+            let cx = x + i as u16;
+            if cx >= area.x + area.width {
+                break;
+            }
+            let cell = &mut f.buffer_mut()[(cx, y)];
+            cell.set_char(ch).set_style(
+                Style::default()
+                    .fg(theme.fg_most_subtle.to_color())
+                    .bg(theme.bg_panel.to_color()),
+            );
+        }
+        app.neurocode_viz.task_cells.borrow_mut().clear();
+        return;
+    };
+    if graph.nodes.is_empty() {
+        let msg = " task graph is empty ";
+        let x = area.x + area.width.saturating_sub(msg.chars().count() as u16) / 2;
+        let y = area.y + area.height / 2;
+        for (i, ch) in msg.chars().enumerate() {
+            let cx = x + i as u16;
+            if cx >= area.x + area.width {
+                break;
+            }
+            let cell = &mut f.buffer_mut()[(cx, y)];
+            cell.set_char(ch).set_style(
+                Style::default()
+                    .fg(theme.fg_most_subtle.to_color())
+                    .bg(theme.bg_panel.to_color()),
+            );
+        }
+        app.neurocode_viz.task_cells.borrow_mut().clear();
+        return;
+    }
+
+    // Split: canvas | detail (stack vertically when narrow).
+    let (canvas_area, detail_area) = if area.width >= 48 {
+        let right_w = 36u16.min(area.width / 2);
+        let cols = ratatui::layout::Layout::default()
+            .direction(ratatui::layout::Direction::Horizontal)
+            .constraints([
+                ratatui::layout::Constraint::Min(20),
+                ratatui::layout::Constraint::Length(right_w),
+            ])
+            .split(area);
+        (cols[0], cols[1])
+    } else {
+        let detail_h = (area.height / 3).clamp(3, 10).min(area.height);
+        let vrows = ratatui::layout::Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints([
+                ratatui::layout::Constraint::Min(3),
+                ratatui::layout::Constraint::Length(detail_h),
+            ])
+            .split(area);
+        (vrows[0], vrows[1])
+    };
+
+    draw_task_dag(f, canvas_area, app, theme, graph);
+    draw_task_detail(f, detail_area, app, theme, graph);
+}
+
+/// The DAG canvas: mini-boxes grouped on topological-depth rows, dependency
+/// connectors between rows, accent border on the selection. Records box
+/// centers into `task_cells` for click hit-testing.
+fn draw_task_dag(f: &mut Frame, area: Rect, app: &App, theme: Theme, graph: &TaskGraph) {
+    if area.width < 8 || area.height < 4 {
+        app.neurocode_viz.task_cells.borrow_mut().clear();
+        return;
+    }
+    let buf = f.buffer_mut();
+    // Panel background (same clear rule as the graph canvas).
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            let cell = &mut buf[(x, y)];
+            cell.reset();
+            cell.set_style(Style::default().bg(theme.bg_panel.to_color()));
+        }
+    }
+
+    let order = task_order(graph);
+    let depths = task_depths(graph);
+    let selected = app.neurocode_viz.selected.min(order.len() - 1);
+
+    // Group by depth (rows) preserving the (depth, id) order.
+    let mut rows: Vec<(usize, Vec<usize>)> = Vec::new(); // (depth, indices into order)
+    for (idx, t) in order.iter().enumerate() {
+        let d = depths.get(&t.id).copied().unwrap_or(0);
+        match rows.last_mut() {
+            Some((last_d, members)) if *last_d == d => members.push(idx),
+            _ => rows.push((d, vec![idx])),
+        }
+    }
+
+    // Lay out boxes: row y = top + row_index * TASK_ROW_H; x spread evenly
+    // across the width; box width = min(24, inner/count - 2).
+    let inner_w = area.width.saturating_sub(2) as usize; // 1-cell margin each side
+    let mut boxes: Vec<Option<TaskBox>> = vec![None; order.len()];
+    for (row_index, (_d, members)) in rows.iter().enumerate() {
+        let y = area.y + 1 + (row_index as u16) * TASK_ROW_H;
+        let count = members.len();
+        let slot = inner_w / count.max(1);
+        let bw = 24.min(slot.saturating_sub(2)).max(6) as u16;
+        for (k, &idx) in members.iter().enumerate() {
+            let x = area.x + 1
+                + (k * inner_w / count.max(1)) as u16
+                + ((slot.saturating_sub(bw as usize)) / 2) as u16;
+            let h = 3u16.min(area.y + area.height - y);
+            if h == 0 {
+                continue;
+            }
+            boxes[idx] = Some(TaskBox {
+                rect: Rect::new(x, y, bw.min(area.x + area.width - x), h),
+            });
+        }
+    }
+
+    // Record centers for hit-testing (in `order` sequence).
+    let cells: Vec<(u16, u16)> = boxes
+        .iter()
+        .map(|b| {
+            b.map(|b| {
+                (
+                    b.rect.x + b.rect.width / 2,
+                    b.rect.y + b.rect.height / 2,
+                )
+            })
+            .unwrap_or((0, 0))
+        })
+        .collect();
+    *app.neurocode_viz.task_cells.borrow_mut() = cells;
+
+    // Dependency connectors: dep bottom-center → dependent top-center.
+    for (idx, t) in order.iter().enumerate() {
+        let Some(box_dst) = boxes[idx] else { continue };
+        for dep in &t.dependencies {
+            let Some(src_idx) = order
+                .iter()
+                .position(|n| n.id == *dep)
+            else {
+                continue;
+            };
+            let Some(box_src) = boxes[src_idx] else { continue };
+            let (x0, y0) = box_src.bottom_center();
+            let (x1, y1) = box_dst.top_center();
+            if y1 <= y0 {
+                continue; // same row or inverted (cycle) — skip rather than tangle
+            }
+            let active = src_idx == selected || idx == selected;
+            let style = Style::default()
+                .fg(if active {
+                    theme.accent.to_color()
+                } else {
+                    theme.fg_most_subtle.to_color()
+                })
+                .bg(theme.bg_panel.to_color());
+            for (lx, ly) in line_cells(x0, y0, x1, y1) {
+                if lx >= area.x as i32
+                    && lx < (area.x + area.width) as i32
+                    && ly >= area.y as i32
+                    && ly < (area.y + area.height) as i32
+                {
+                    let cell = &mut buf[(lx as u16, ly as u16)];
+                    if cell.symbol() == " " {
+                        cell.set_char(if active { edge_glyph(x1 - x0, y1 - y0) } else { '·' })
+                            .set_style(style);
+                    }
+                }
+            }
+        }
+    }
+
+    // Boxes: unicode border + status glyph/id line + objective line.
+    for (idx, t) in order.iter().enumerate() {
+        let Some(tb) = boxes[idx] else { continue };
+        let r = tb.rect;
+        if r.width < 4 || r.height < 2 {
+            continue;
+        }
+        let is_sel = idx == selected;
+        let border = Style::default()
+            .fg(if is_sel {
+                theme.accent.to_color()
+            } else {
+                task_status_color(theme, t.status)
+            })
+            .bg(theme.bg_panel.to_color());
+        // Border via set_char (per-cell rule — see the ghosting regression).
+        for x in r.x..r.x + r.width {
+            let c = &mut buf[(x, r.y)];
+            c.set_char('─').set_style(border);
+            let c = &mut buf[(x, r.y + r.height - 1)];
+            c.set_char('─').set_style(border);
+        }
+        for y in r.y..r.y + r.height {
+            let c = &mut buf[(r.x, y)];
+            c.set_char('│').set_style(border);
+            let c = &mut buf[(r.x + r.width - 1, y)];
+            c.set_char('│').set_style(border);
+        }
+        buf[(r.x, r.y)].set_char('┌').set_style(border);
+        buf[(r.x + r.width - 1, r.y)].set_char('┐').set_style(border);
+        buf[(r.x, r.y + r.height - 1)].set_char('└').set_style(border);
+        buf[(r.x + r.width - 1, r.y + r.height - 1)]
+            .set_char('┘')
+            .set_style(border);
+
+        // Line 1: status glyph + short id (truncate to inner width).
+        let inner_w = (r.width as usize).saturating_sub(2);
+        let glyph = task_status_glyph(t.status);
+        let id: String = t.id.as_str().chars().take(inner_w.saturating_sub(2)).collect();
+        let status_style = Style::default()
+            .fg(task_status_color(theme, t.status))
+            .bg(theme.bg_panel.to_color())
+            .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() });
+        let mut line1: Vec<char> = Vec::with_capacity(inner_w);
+        line1.push(glyph);
+        line1.push(' ');
+        line1.extend(id.chars());
+        for (i, ch) in line1.iter().enumerate() {
+            if i >= inner_w {
+                break;
+            }
+            buf[(r.x + 1 + i as u16, r.y + 1)].set_char(*ch).set_style(status_style);
+        }
+        // Line 2: objective first ~20 chars (fit to inner width).
+        let obj: String = t
+            .objective
+            .chars()
+            .take(inner_w.min(20))
+            .collect();
+        let obj_style = Style::default()
+            .fg(if is_sel {
+                theme.fg_base.to_color()
+            } else {
+                theme.fg_subtle.to_color()
+            })
+            .bg(theme.bg_panel.to_color());
+        for (i, ch) in obj.chars().enumerate() {
+            if i >= inner_w {
+                break;
+            }
+            buf[(r.x + 1 + i as u16, r.y + 2)].set_char(ch).set_style(obj_style);
+        }
+    }
+}
+
+/// Status glyph for the DAG boxes.
+fn task_status_glyph(s: TaskStatus) -> char {
+    match s {
+        TaskStatus::Pending => '○',
+        TaskStatus::Ready => '◉',
+        TaskStatus::Dispatched => '►',
+        TaskStatus::Evaluating => '?',
+        TaskStatus::Completed => '✓',
+        TaskStatus::Failed => '✗',
+        TaskStatus::Degraded => '⚠',
+        TaskStatus::Blocked => '⛔',
+        TaskStatus::Skipped => '⤳',
+    }
+}
+
+/// Selected-task detail pane (right column): objective, status, attempts,
+/// deps, role/tier/risk, read/write sets, updated stamp.
+fn draw_task_detail(f: &mut Frame, area: Rect, app: &App, theme: Theme, graph: &TaskGraph) {
+    if area.width < 8 || area.height < 2 || graph.nodes.is_empty() {
+        return;
+    }
+    let block = crate::widgets::gradient_block(" task detail ", theme);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 4 || inner.height < 1 {
+        return;
+    }
+    let order = task_order(graph);
+    let sel = app.neurocode_viz.selected.min(order.len() - 1);
+    let t = order[sel];
+    let cw = inner.width as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{} ", task_status_glyph(t.status)),
+            Style::default().fg(task_status_color(theme, t.status)),
+        ),
+        Span::styled(
+            t.id.as_str().to_string(),
+            Style::default()
+                .fg(theme.fg_base.to_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {}", task_status_word(t.status)),
+            Style::default().fg(task_status_color(theme, t.status)),
+        ),
+    ]));
+
+    let kv = |lines: &mut Vec<Line>, k: &str, v: String| {
+        for (i, chunk) in textwrap::wrap(&v, cw.saturating_sub(12).max(8))
+            .into_iter()
+            .enumerate()
+        {
+            let label = if i == 0 { format!("{:<10}", k) } else { format!("{:<10}", "") };
+            lines.push(Line::from(vec![
+                Span::styled(label, Style::default().fg(theme.fg_more_subtle.to_color())),
+                Span::styled(chunk.to_string(), Style::default().fg(theme.fg_subtle.to_color())),
+            ]));
+        }
+    };
+    kv(&mut lines, "objective", t.objective.clone());
+    kv(&mut lines, "status", task_status_word(t.status).to_string());
+    kv(&mut lines, "attempts", format!("{}", t.attempts));
+    if !t.dependencies.is_empty() {
+        kv(
+            &mut lines,
+            "deps",
+            t.dependencies
+                .iter()
+                .map(|d| d.as_str().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    kv(&mut lines, "role", format!("{:?}", t.role).to_lowercase());
+    kv(&mut lines, "tier", format!("{:?}", t.model_tier).to_lowercase());
+    kv(&mut lines, "risk", format!("{:?}", t.risk).to_lowercase());
+    for (label, set) in [("reads", &t.read_set), ("writes", &t.write_set)] {
+        if set.is_empty() {
+            continue;
+        }
+        let shown: Vec<String> = set
+            .iter()
+            .take(3)
+            .map(|p| p.display().to_string())
+            .collect();
+        let extra = set.len().saturating_sub(3);
+        let v = if extra > 0 {
+            format!("{} +{} more", shown.join(", "), extra)
+        } else {
+            shown.join(", ")
+        };
+        kv(&mut lines, label, v);
+    }
+    if let Some(at) = app.task_graph_updated_at {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("↻ {}", fmt_ago(at)),
+                Style::default().fg(theme.fg_more_subtle.to_color()),
+            ),
+        ]));
+    }
+
+    // Scroll window over the detail lines (detail_scroll, same as nodes).
+    let visible = inner.height as usize;
+    let total = lines.len();
+    let scroll = app.neurocode_viz.detail_scroll.min(total.saturating_sub(visible));
+    let start = if total > visible { total - visible - scroll } else { 0 };
+    let end = (start + visible).min(total);
+    f.render_widget(Paragraph::new(lines[start..end].to_vec()), inner);
 }
 
 /// The node browser list.
@@ -1332,11 +1987,13 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_graph_nodes_feed() {
+    fn tab_cycles_graph_nodes_tasks_feed() {
         let mut v = VizState::default();
         assert_eq!(v.tab, VizTab::Graph);
         v.cycle_tab();
         assert_eq!(v.tab, VizTab::Nodes);
+        v.cycle_tab();
+        assert_eq!(v.tab, VizTab::Tasks);
         v.cycle_tab();
         assert_eq!(v.tab, VizTab::Feed);
         v.cycle_tab();

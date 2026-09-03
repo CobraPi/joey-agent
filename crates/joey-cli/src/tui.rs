@@ -189,6 +189,15 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        // Feature indicators (Spec 023): seed the status bar's MCP roster
+        // and cron-job list once at startup (they change rarely; the cron
+        // list is re-refreshed on demand by the App itself).
+        {
+            let (enabled, _disabled) = crate::oneshot::mcp_server_names(&config);
+            tui.app_mut().set_mcp_servers(enabled);
+            tui.app_mut().refresh_cron_jobs();
+        }
+
         tui.app_mut().push_item(TranscriptItem::Notice {
             text: format!(
                 "✦ joey-agent — model {} · provider {} · session {}",
@@ -996,6 +1005,14 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
         }
         _ = tokio::time::sleep(session.tui.frame_budget()) => {
             // Frame tick: drain all pending terminal input (non-blocking).
+            // Feature indicator: refresh the browser-connection badge once
+            // per tick (cheap atomic load) — only writes on change.
+            {
+                let c = joey_tools::tools::browser_tools::shared_browser_handle().is_connected();
+                if session.tui.app_mut().browser_connected != c {
+                    session.tui.app_mut().set_browser_connected(c);
+                }
+            }
             while event::poll(Duration::from_millis(0)).unwrap_or(false) {
                 match event::read() {
                     Ok(Event::Key(k)) => {
@@ -1120,6 +1137,13 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
                 text: format!("⚡ hypercode: {phase} — {detail}"),
                 kind: NoticeKind::Busy,
             });
+            None
+        }
+        Some(crate::engine::EngineEvent::TaskGraphSnapshot { graph }) => {
+            // Spec 023: live task-graph snapshot from the running hypercode
+            // graph run — feeds the job board. The final state deliberately
+            // stays visible after HeavyJobFinished (nothing clears it).
+            session.tui.app_mut().set_task_graph(graph);
             None
         }
         Some(crate::engine::EngineEvent::HeavyJobFinished { label: _, text }) => {

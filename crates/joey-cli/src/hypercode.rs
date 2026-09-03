@@ -323,6 +323,71 @@ pub fn orchestrator_overlay() -> String {
     ORCHESTRATOR_PROMPT.to_string()
 }
 
+/// Persona-aware orchestrator overlay (feature 025, FR-001/FR-007/FR-012).
+///
+/// Activation gate (research D6): the persona applies iff orchestration mode
+/// is enabled AND the OMO registry has ≥1 resolved agent; otherwise this
+/// returns the existing fixed [`ORCHESTRATOR_PROMPT`] unchanged (and callers
+/// that know orchestration is off don't call it at all).
+///
+/// - `agent = None` (or `"default"`) → the delegation-first Conductor persona
+///   variant for `model`'s family (FR-001).
+/// - `agent = Some(name)` → that OMO agent's identity prompt for its resolved
+///   model, with the orchestration hard-rules core and roster briefing
+///   appended so every persona keeps the safety rails and the full bench
+///   (FR-002/FR-007/FR-010). Unknown names fall back to the Conductor persona.
+pub fn orchestrator_persona_overlay(
+    config: &joey_core::Config,
+    agent: Option<&str>,
+    model: &str,
+    available: &joey_omo::AvailableModelSet,
+    overrides: &joey_omo::agents::registry::ModelOverrides,
+) -> String {
+    if !orchestrator_active(config) {
+        return ORCHESTRATOR_PROMPT.to_string();
+    }
+    let registry = joey_omo::AgentRegistry::build(available.clone(), overrides);
+    let bench_empty = registry.all().iter().all(|a| a.resolved_model.is_none());
+    if bench_empty {
+        // Empty bench degrades to the fixed prompt (FR-012, spec edge case:
+        // the orchestrator still functions and reports the empty bench).
+        return ORCHESTRATOR_PROMPT.to_string();
+    }
+    match agent {
+        None | Some("default") => joey_omo::agents::prompts::conductor_prompt(model),
+        Some(name) => {
+            let persona = match registry.get(name) {
+                Some(a) if a.resolved_model.is_some() => joey_omo::dispatch_system_prompt(
+                    name,
+                    a.resolved_model.as_deref().unwrap_or(model),
+                )
+                .to_string(),
+                _ => joey_omo::agents::prompts::conductor_prompt(model),
+            };
+            format!(
+                "{}\n\n{}\n\n{}",
+                persona,
+                joey_omo::agents::prompts::conductor::hard_rules_core(),
+                joey_omo::agents::prompts::conductor::roster_briefing()
+            )
+        }
+    }
+}
+
+/// Convenience wrapper for call sites that have the live agent: builds the
+/// available-model set from the agent's provider profile + active model
+/// (the same construction `engine_switch_agent` uses to rebuild a registry).
+pub fn orchestrator_persona_overlay_for_profile(
+    config: &joey_core::Config,
+    agent: Option<&str>,
+    model: &str,
+    profile: &joey_providers::ProviderProfile,
+) -> String {
+    let available = joey_omo::AvailableModelSet::from_connected_with_catalog(profile, model);
+    let overrides = joey_omo::agents::registry::ModelOverrides::new();
+    orchestrator_persona_overlay(config, agent, model, &available, &overrides)
+}
+
 /// Read one RoleConfig from a YAML mapping (provider table row).
 fn role_config_from_mapping(map: &serde_yaml::Mapping) -> RoleConfig {
     let get_str = |key: &str| -> String {
@@ -455,6 +520,13 @@ impl std::fmt::Debug for HypercodeContext {
 /// human-readable detail line.
 pub type ProgressFn<'a> = dyn Fn(Phase, &str) + Send + Sync + 'a;
 
+/// Task-graph snapshot callback (Spec 023): invoked with the full TaskGraph
+/// JSON at the initial conversion (and resume load) and then on every
+/// scheduler transition, so live UIs can render the job board. Owned Arc
+/// (the scheduler's `with_snapshot_sink` requires a `'static` sink, so a
+/// borrowed closure cannot be threaded through).
+pub type SnapshotFn = joey_orchestration::scheduler::SnapshotSink;
+
 /// Outcome of a HyperCode run.
 #[derive(Debug, Clone, Default)]
 pub struct HypercodeReport {
@@ -525,17 +597,23 @@ pub fn format_mode_decision(mode: &str, task: &str, rationale: &str) -> String {
 }
 
 /// Feature 022 (FR-019 + lead shape): build the lead child's delegation
-/// request. `model` stays None when `hypercode.team.lead_model` is empty so
-/// the lead inherits the orchestrator's effective model at dispatch.
+/// request. Model precedence: explicit `hypercode.team.lead_model` (when
+/// non-empty) wins; else the OMO orchestrator default `omo.orchestrator`
+/// (atlas's resolved model under hypercode.omo_specialists.enabled, the
+/// legacy chain's head otherwise); else `model` stays None so the lead
+/// inherits the orchestrator's effective model at dispatch.
 pub(crate) fn lead_request(
     goal: &str,
     team_name: &str,
     member: &str,
     cfg: &TeamConfig,
+    omo: &OmoRoleDefaults,
 ) -> DelegationRequest {
     let mut lead_req = DelegationRequest::single(goal.to_string());
     if !cfg.lead_model.is_empty() {
         lead_req.model = Some(cfg.lead_model.clone());
+    } else if let Some(m) = omo.orchestrator.as_ref() {
+        lead_req.model = Some(m.clone());
     }
     lead_req.role = joey_orchestration::SubagentRole::Orchestrator;
     lead_req.toolsets = vec![
@@ -564,8 +642,20 @@ pub(crate) fn try_team_run(
     team_enabled: bool,
     explicit_workstreams: bool,
     workstream_count: usize,
+    graph_route: Option<ModeRoute>,
 ) -> Result<Option<(String, String)>, String> {
-    if route_mode(team_enabled, explicit_workstreams, workstream_count) != ModeRoute::Team {
+    // T026 (FR-023): when the flag-on graph router decided, the route
+    // IS the decision (count is never a proxy); eligibility gates still
+    // apply. None => legacy count heuristic (flag-off, SC-001 parity).
+    let team = match graph_route {
+        Some(route) => {
+            route == ModeRoute::Team && team_enabled && !explicit_workstreams
+        }
+        None => {
+            route_mode(team_enabled, explicit_workstreams, workstream_count) == ModeRoute::Team
+        }
+    };
+    if !team {
         return Ok(None);
     }
     let team_name = team_slug(goal);
@@ -609,7 +699,8 @@ pub fn route_mode(team_enabled: bool, explicit_workstreams: bool, workstream_cou
 /// 4. `independent_components >= 2` => `ParallelSubagents`
 /// 5. otherwise => `SingleWorker`
 ///
-/// Team pre-seeding from the graph lands with the wiring task.
+/// Team pre-seeding from the graph landed in T026
+/// (`plan_team_seed` / `seed_team_tasks_from_graph`, FR-024).
 pub fn route_mode_from_graph(hint: &joey_neurocode::ExecutionHint) -> ModeRoute {
     if hint.write_overlap {
         ModeRoute::SingleWorker
@@ -622,6 +713,229 @@ pub fn route_mode_from_graph(hint: &joey_neurocode::ExecutionHint) -> ModeRoute 
     } else {
         ModeRoute::SingleWorker
     }
+}
+
+/// T026 (FR-023): derive the routing hint from validated graph
+/// structure — never from workstream count. Pure, deterministic
+/// function of the graph.
+///
+/// - `write_overlap`: ANY two distinct tasks share a write-set path.
+///   Deliberately broader than the WRITE_OVERLAP validation rule
+///   (which exempts ancestor-sequenced writers): even sequenced
+///   overlap routes to a single worker — the safest executor when
+///   patches would touch the same files.
+/// - `strict_dependency_depth`: longest dependency chain counted in
+///   NODES (edges on the longest path + 1; 0 for an empty graph).
+/// - `independent_components`: weakly-connected components of the
+///   dependency graph (union-find over `id ↔ dep` edges).
+/// - `cross_component_coordination`: some task's write_set intersects
+///   a DIFFERENT component's task's read_set, or two components share
+///   an artifact id — independent work that still needs coordination.
+pub fn execution_hint_from_graph(
+    graph: &joey_orchestration::task_graph::TaskGraph,
+) -> joey_neurocode::ExecutionHint {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use joey_orchestration::task_graph::TaskId;
+
+    // write_overlap: unordered pair scan (BTreeMap order = deterministic).
+    let mut write_overlap = false;
+    'outer: for (ida, a) in graph.nodes.iter() {
+        for (idb, b) in graph.nodes.iter() {
+            if ida == idb {
+                continue;
+            }
+            if a.write_set.iter().any(|p| b.write_set.contains(p)) {
+                write_overlap = true;
+                break 'outer;
+            }
+        }
+    }
+
+    // strict_dependency_depth: memoized longest chain (in nodes) ending at
+    // each task; the max over all tasks.
+    fn chain_depth(
+        id: &TaskId,
+        nodes: &BTreeMap<TaskId, joey_orchestration::task_graph::TaskNode>,
+        memo: &mut BTreeMap<TaskId, u32>,
+    ) -> u32 {
+        if let Some(d) = memo.get(id) {
+            return *d;
+        }
+        let node = &nodes[id];
+        let depth = 1 + node
+            .dependencies
+            .iter()
+            .map(|d| chain_depth(d, nodes, memo))
+            .max()
+            .unwrap_or(0);
+        memo.insert(id.clone(), depth);
+        depth
+    }
+    let mut memo: BTreeMap<TaskId, u32> = BTreeMap::new();
+    let strict_dependency_depth = graph
+        .nodes
+        .keys()
+        .map(|id| chain_depth(id, &graph.nodes, &mut memo))
+        .max()
+        .unwrap_or(0);
+
+    // independent_components: union-find over dependency edges.
+    let mut parent: BTreeMap<String, String> = graph
+        .nodes
+        .keys()
+        .map(|id| (id.as_str().to_string(), id.as_str().to_string()))
+        .collect();
+    fn find(parent: &mut BTreeMap<String, String>, x: &str) -> String {
+        let root = parent[x].clone();
+        if root == x {
+            return root;
+        }
+        let r = find(parent, &root);
+        parent.insert(x.to_string(), r.clone());
+        r
+    }
+    for (id, node) in graph.nodes.iter() {
+        for dep in &node.dependencies {
+            let ra = find(&mut parent, id.as_str());
+            let rb = find(&mut parent, dep.as_str());
+            if ra != rb {
+                parent.insert(ra, rb);
+            }
+        }
+    }
+    let roots: BTreeSet<String> = graph
+        .nodes
+        .keys()
+        .map(|id| find(&mut parent, id.as_str()))
+        .collect();
+    let independent_components = roots.len() as u32;
+
+    // cross_component_coordination: write∩read across components, or a
+    // shared artifact id across components.
+    let mut component_of = |id: &str| find(&mut parent, id);
+    let mut cross_component_coordination = false;
+    'coord: for (ida, a) in graph.nodes.iter() {
+        for (idb, b) in graph.nodes.iter() {
+            if ida == idb || component_of(ida.as_str()) == component_of(idb.as_str()) {
+                continue;
+            }
+            if a.write_set.iter().any(|p| b.read_set.contains(p)) {
+                cross_component_coordination = true;
+                break 'coord;
+            }
+            if a.artifact_ids.iter().any(|aid| b.artifact_ids.contains(aid)) {
+                cross_component_coordination = true;
+                break 'coord;
+            }
+        }
+    }
+
+    joey_neurocode::ExecutionHint {
+        write_overlap,
+        strict_dependency_depth,
+        independent_components,
+        cross_component_coordination,
+    }
+}
+
+/// One team pre-seed entry derived from a validated graph node (T026,
+/// FR-024). `dependencies` are graph ids of items seeded EARLIER.
+pub(crate) struct TeamSeedItem {
+    pub graph_id: String,
+    pub title: String,
+    pub dependencies: Vec<String>,
+}
+
+/// Pure planner for FR-024: topo-ordered (Kahn's algorithm; BTreeMap
+/// order within a wave — deterministic) seed items for the team task
+/// list. The team lead coordinates these nodes instead of inventing a
+/// separate decomposition.
+pub(crate) fn plan_team_seed(
+    graph: &joey_orchestration::task_graph::TaskGraph,
+) -> Vec<TeamSeedItem> {
+    use std::collections::BTreeMap;
+
+    let mut indegree: BTreeMap<String, usize> = graph
+        .nodes
+        .iter()
+        .map(|(id, n)| (id.as_str().to_string(), n.dependencies.len()))
+        .collect();
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (id, n) in graph.nodes.iter() {
+        for dep in &n.dependencies {
+            dependents
+                .entry(dep.as_str())
+                .or_default()
+                .push(id.as_str());
+        }
+    }
+    let mut ready: Vec<String> = indegree
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(id, _)| id.clone())
+        .collect();
+    ready.sort();
+    let mut out = Vec::new();
+    while let Some(id) = ready.first().cloned() {
+        ready.remove(0);
+        if let Some(node) = graph.nodes.get(
+            &joey_orchestration::task_graph::TaskId::new(&id)
+                .expect("graph node ids are valid TaskIds"),
+        ) {
+            let deps: Vec<String> = node
+                .dependencies
+                .iter()
+                .map(|d| d.as_str().to_string())
+                .collect();
+            out.push(TeamSeedItem {
+                graph_id: id.clone(),
+                title: format!("{}: {}", id, node.objective),
+                dependencies: deps,
+            });
+            if let Some(children) = dependents.get(id.as_str()) {
+                for child in children {
+                    if let Some(d) = indegree.get_mut(*child) {
+                        *d -= 1;
+                        if *d == 0 {
+                            ready.push(child.to_string());
+                        }
+                    }
+                }
+                ready.sort();
+            }
+        }
+    }
+    out
+}
+
+/// Create the team's tasks from [`plan_team_seed`], translating graph
+/// ids to the generated team task ids (FR-024). Returns the number of
+/// tasks added. Missing team => 0.
+pub(crate) fn seed_team_tasks_from_graph(
+    graph: &joey_orchestration::task_graph::TaskGraph,
+    team_name: &str,
+) -> usize {
+    use std::collections::BTreeMap;
+
+    let Some(rec) = joey_orchestration::team::global_teams().get(team_name) else {
+        return 0;
+    };
+    let Ok(mut rec) = rec.lock() else {
+        return 0;
+    };
+    let plan = plan_team_seed(graph);
+    let mut id_map: BTreeMap<String, String> = BTreeMap::new();
+    for item in &plan {
+        let deps: Vec<String> = item
+            .dependencies
+            .iter()
+            .filter_map(|d| id_map.get(d).cloned())
+            .collect();
+        let new_id = rec.add_task(&item.title, deps);
+        id_map.insert(item.graph_id.clone(), new_id);
+    }
+    plan.len()
 }
 
 /// Deterministic team name for a /hypercode team run: `hc-<slug>` where
@@ -647,7 +961,7 @@ solutions, plans, or recommendations — the orchestrator does all\n\
 planning and interpretation. If a question cannot be answered from the\n\
 code, say so plainly and report the closest evidence you found.\n\
 \n\
-Keep your final summary under 500 tokens.";
+Keep your final summary under 1000 tokens.";
 
 /// Implementor system prompt (execution only — the orchestrator owns all
 /// planning and design decisions; the implementor applies fully-specified
@@ -672,7 +986,7 @@ that once, after all implementors finish.\n\
 4. Report exactly what you changed, file by file, and the real scoped\n\
 check output (command + outcome).\n\
 \n\
-Keep your final summary under 500 tokens.";
+Keep your final summary under 1000 tokens.";
 
 /// Orchestrator system prompt (delegation-first; no direct file writes or
 /// code-manipulation commands).
@@ -717,13 +1031,24 @@ YOUR SUBAGENTS (via delegate_task):\n\
   returns exact file paths, symbols, short quotes, and real command\n\
   output — facts only, never analysis, plans, or recommendations.\n\
   Interpreting its findings and deciding what to do is entirely your job.\n\
+  (with hypercode.omo_specialists on, its default model is the explore\n\
+  agent's)\n\
 - role:\"implementor\" — execution only. Give it a fully-specified brief:\n\
   exact file paths, the precise edits to make (down to function/line\n\
   level wherever you know them), the exact commands to run, and the\n\
   expected result. It applies the brief verbatim, runs only the TARGETED\n\
   checks you list (e.g. cargo build -p <crate>, cargo test -p <crate>\n\
   [filter]) — never the full test suite — and reports what changed plus\n\
-  the real check output.\n\
+  the real check output. (with hypercode.omo_specialists on, its default\n\
+  model is the hephaestus agent's)\n\
+- subagent_type:\"<agent>\" — ANY registered OMO specialist by name:\n\
+  sisyphus, hephaestus, prometheus, atlas, oracle, librarian, explore,\n\
+  multimodal-looker, metis, momus, sisyphus-junior. It runs under that\n\
+  agent's identity prompt and resolved model. Use it when a task fits a\n\
+  specialist better than explorer/implementor (e.g. oracle for\n\
+  architecture analysis, librarian for docs/OSS research, metis for gap\n\
+  analysis, momus for critique). Works in batch tasks[] too (per-task\n\
+  subagent_type).\n\
 \n\
 BRIEF QUALITY (execution orders, not problem statements):\n\
 - Every brief must be complete enough that the subagent never needs to\n\
@@ -902,6 +1227,7 @@ fn planner_request(
     goal: &str,
     cfg: &HyperCodeConfig,
     opts: &HypercodeOptions,
+    omo: &OmoRoleDefaults,
     parent_model: &str,
 ) -> DelegationRequest {
     // The planner uses the IMPLEMENTOR config (it needs to reason about the
@@ -915,7 +1241,7 @@ fn planner_request(
         ),
         context: None,
         tasks: Vec::new(),
-        model: model_override(&rc, parent_model, &opts.provider),
+        model: model_override(&rc, parent_model, &opts.provider, omo.implementor.as_deref()),
         toolsets: vec![
             "file-read".to_string(),
             "terminal".to_string(),
@@ -941,11 +1267,12 @@ fn planner_request(
 /// Explorer is the orchestrator's read-only proxy INCLUDING terminal access
 /// (diagnostic commands: grep, ls, git log, cargo check, --help probes) —
 /// the orchestrator itself never runs commands.
-fn explorer_request(
+pub(crate) fn explorer_request(
     ws: &Workstream,
     goal: &str,
     cfg: &HyperCodeConfig,
     opts: &HypercodeOptions,
+    omo: &OmoRoleDefaults,
     parent_model: &str,
     workdir: &std::path::Path,
 ) -> DelegationRequest {
@@ -957,7 +1284,7 @@ fn explorer_request(
         ),
         context: None,
         tasks: Vec::new(),
-        model: model_override(&rc, parent_model, &opts.provider),
+        model: model_override(&rc, parent_model, &opts.provider, omo.explorer.as_deref()),
         toolsets: vec![
             "file-read".to_string(),
             "terminal".to_string(),
@@ -982,12 +1309,13 @@ fn explorer_request(
 ///
 /// Implementor owns the write path: edits plus the targeted checks that
 /// verify them. The single full-suite run is the orchestrator's final gate.
-fn implementor_request(
+pub(crate) fn implementor_request(
     ws: &Workstream,
     goal: &str,
     explorer_summary: &str,
     cfg: &HyperCodeConfig,
     opts: &HypercodeOptions,
+    omo: &OmoRoleDefaults,
     parent_model: &str,
     workdir: &std::path::Path,
 ) -> DelegationRequest {
@@ -1002,7 +1330,7 @@ fn implementor_request(
             ws.id, explorer_summary
         )),
         tasks: Vec::new(),
-        model: model_override(&rc, parent_model, &opts.provider),
+        model: model_override(&rc, parent_model, &opts.provider, omo.implementor.as_deref()),
         toolsets: vec![
             "file".to_string(),
             "terminal".to_string(),
@@ -1040,20 +1368,34 @@ fn parent_model_for(ctx: &HypercodeContext) -> String {
         .unwrap_or_else(|| ctx.agent_config.model.clone())
 }
 
-/// Resolve a child's model: the role table's explicit model wins; an empty
-/// entry inherits the parent's (effective) model explicitly so the config
-/// `delegation.default_model` doesn't silently shadow the live agent.
+/// Resolve a child's model with three-level precedence (feature 025,
+/// FR-005):
+/// 1. the role table's explicit per-role model always wins;
+/// 2. otherwise the OMO default (specialists toggle ON: the direct
+///    counterpart agent's model; OFF: the legacy chain) for the role
+///    (when orchestration is active and it resolved against available
+///    providers);
+/// 3. otherwise inherit the parent's (effective) model explicitly so the
+///    config `delegation.default_model` doesn't silently shadow the live
+///    agent (legacy behavior).
 ///
 /// Copilot-wire visibility: when the FINAL model is one the copilot-wire
 /// provider cannot serve, the real Copilot backend 400s (ModelNotFound) and
 /// proxies like ai-usage-hud silently substitute their default via mapModel
 /// with HTTP 200. Warn so the substitution is visible in logs. Warn-only —
 /// the returned model is unchanged.
-fn model_override(rc: &RoleConfig, parent_model: &str, provider: &str) -> Option<String> {
-    let model = if rc.model.is_empty() {
-        parent_model.to_string()
+fn model_override(
+    rc: &RoleConfig,
+    parent_model: &str,
+    provider: &str,
+    omo_default: Option<&str>,
+) -> Option<String> {
+    let model = if !rc.model.is_empty() {
+        rc.model.clone() // 1. explicit per-role configuration always wins
+    } else if let Some(m) = omo_default {
+        m.to_string() // 2. OMO-chain default (feature 025, FR-005)
     } else {
-        rc.model.clone()
+        parent_model.to_string() // 3. inherit the parent (legacy behavior)
     };
     if copilot_wire_unservable(&model, provider) {
         tracing::warn!(
@@ -1063,6 +1405,248 @@ fn model_override(rc: &RoleConfig, parent_model: &str, provider: &str) -> Option
         );
     }
     Some(model)
+}
+
+/// Outcome of OMO-chain role-default derivation (feature 025, FR-005/FR-006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleDefaultOutcome {
+    /// First chain member's resolved model, when one resolved.
+    pub model: Option<String>,
+    /// True when a chain applied but NO member resolved (FR-006: the caller
+    /// inherits the existing default and warns — never a hard failure).
+    pub unresolvable: bool,
+}
+
+/// Per-role OMO agent chains (feature 025, FR-005, contracts/role-defaults.md):
+/// explorer: explore → librarian; implementor: momus; orchestrator:
+/// sisyphus → hephaestus → metis. The first member whose OMO model chain
+/// resolves against available providers (exact then family-fuzzy, provider
+/// gates honored — the standard AgentRegistry resolution) wins.
+fn omo_role_chain(role: &str) -> Option<&'static [&'static str]> {
+    match role {
+        "explorer" => Some(&["explore", "librarian"]),
+        "implementor" => Some(&["momus"]),
+        "orchestrator" => Some(&["sisyphus", "hephaestus", "metis"]),
+        _ => None,
+    }
+}
+
+/// hypercode.omo_specialists.enabled (default true): the three hypercode
+/// tiers map DIRECTLY 1:1 to OMO agents for model defaults —
+/// explorer→explore, implementor→hephaestus, orchestrator→atlas —
+/// replacing the feature-025 chains. Strict: no chain fallback.
+pub fn omo_specialists_enabled(config: &joey_core::Config) -> bool {
+    config.get_bool("hypercode.omo_specialists.enabled", true)
+}
+
+/// The direct tier→agent counterpart for the specialists toggle.
+pub fn omo_specialist_for(role: &str) -> Option<&'static str> {
+    match role {
+        "explorer" => Some("explore"),
+        "implementor" => Some("hephaestus"),
+        "orchestrator" => Some("atlas"),
+        _ => None,
+    }
+}
+
+/// Derive one role's default from its OMO chain against the given
+/// available-model set. Pure read-time derivation — config keys are
+/// unchanged and nothing is persisted (contracts/role-defaults.md).
+pub fn omo_role_default(
+    role: &str,
+    available: &joey_omo::AvailableModelSet,
+    overrides: &joey_omo::agents::registry::ModelOverrides,
+) -> RoleDefaultOutcome {
+    let Some(chain) = omo_role_chain(role) else {
+        return RoleDefaultOutcome { model: None, unresolvable: false };
+    };
+    let registry = joey_omo::AgentRegistry::build(available.clone(), overrides);
+    omo_role_default_from_registry(&registry, chain)
+}
+
+fn omo_role_default_from_registry(
+    registry: &joey_omo::AgentRegistry,
+    chain: &[&str],
+) -> RoleDefaultOutcome {
+    for name in chain {
+        if let Some(model) = registry.get(name).and_then(|a| a.resolved_model.clone()) {
+            return RoleDefaultOutcome { model: Some(model), unresolvable: false };
+        }
+    }
+    RoleDefaultOutcome { model: None, unresolvable: true }
+}
+
+/// OMO-chain defaults for one hypercode run's explorer + implementor roles.
+/// Derived only while orchestration is active with a non-empty bench
+/// (FR-012: otherwise resolution is identical to today — no derivation, no
+/// warnings). Warns once per unresolvable chain (FR-006) via tracing, the
+/// same channel as the copilot-wire guard in [`model_override`]; the same
+/// messages also land in `warnings` so the run path can surface them to the
+/// user (T031/T032).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OmoRoleDefaults {
+    pub explorer: Option<String>,
+    pub implementor: Option<String>,
+    /// Orchestrator-role default: the direct specialist (atlas) resolved
+    /// model when hypercode.omo_specialists.enabled, else the legacy
+    /// orchestrator chain's (sisyphus→hephaestus→metis) first resolved
+    /// model.
+    pub orchestrator: Option<String>,
+    /// FR-006 user-visible warnings (one per unresolvable chain), mirrored
+    /// from the tracing logs so the run path can push them through the
+    /// progress channel (T031). Empty when every chain resolved.
+    pub warnings: Vec<String>,
+}
+
+pub fn omo_role_defaults(
+    config: &joey_core::Config,
+    available: &joey_omo::AvailableModelSet,
+) -> OmoRoleDefaults {
+    if !orchestrator_active(config) {
+        return OmoRoleDefaults::default();
+    }
+    let overrides = joey_omo::agents::registry::ModelOverrides::new();
+    let registry = joey_omo::AgentRegistry::build(available.clone(), &overrides);
+    if registry.all().iter().all(|a| a.resolved_model.is_none()) {
+        // Empty bench (spec edge case): degrade to today's behavior silently.
+        return OmoRoleDefaults::default();
+    }
+    let mut out = OmoRoleDefaults::default();
+    if omo_specialists_enabled(config) {
+        // Direct 1:1 tier→agent mapping (strict — no chain fallback): an
+        // unresolved specialist warns (FR-006 shape) and the slot stays
+        // None so the child inherits the parent/role default.
+        for (role, slot) in [("explorer", &mut out.explorer), ("implementor", &mut out.implementor)] {
+            let agent = omo_specialist_for(role).unwrap();
+            match registry.get(agent).and_then(|a| a.resolved_model.clone()) {
+                Some(model) => *slot = Some(model),
+                None => {
+                    let warning = format!(
+                        "hypercode {role} role: OMO specialist agent '{agent}' unresolved against available providers; inheriting the parent/role default model (FR-006)."
+                    );
+                    tracing::warn!(
+                        role = role,
+                        agent = agent,
+                        "OMO specialist agent '{agent}' unresolved against available providers; inheriting the parent/role default model (FR-006)"
+                    );
+                    out.warnings.push(warning);
+                }
+            }
+        }
+        out.orchestrator = registry.get("atlas").and_then(|a| a.resolved_model.clone());
+    } else {
+        for (role, slot) in [("explorer", &mut out.explorer), ("implementor", &mut out.implementor)] {
+            let outcome = omo_role_default_from_registry(&registry, omo_role_chain(role).unwrap());
+            if outcome.unresolvable {
+                let warning = format!(
+                    "hypercode {role} role: no OMO chain member resolved against available providers; inheriting the parent/role default model (FR-006)."
+                );
+                tracing::warn!(
+                    role = role,
+                    "no OMO chain member resolved against available providers; inheriting the parent/role default model (FR-006)"
+                );
+                out.warnings.push(warning);
+            }
+            *slot = outcome.model;
+        }
+        out.orchestrator =
+            omo_role_default_from_registry(&registry, omo_role_chain("orchestrator").unwrap()).model;
+    }
+    out
+}
+
+/// Orchestrator-role session model, feature 025 T015 / FR-005. With
+/// hypercode.omo_specialists.enabled (default) this is atlas's resolved
+/// model directly; with the toggle off it falls back to the legacy OMO
+/// chain (sisyphus → hephaestus → metis). Callers gate this on the
+/// user having neither pinned (--model / /model switch) nor configured
+/// (model.default in the user layer) a session model; no hypercode
+/// configuration key exists for it (contracts/role-defaults.md).
+pub fn omo_orchestrator_session_model(
+    config: &joey_core::Config,
+    available: &joey_omo::AvailableModelSet,
+) -> Option<String> {
+    let overrides = joey_omo::agents::registry::ModelOverrides::new();
+    if omo_specialists_enabled(config) {
+        let registry = joey_omo::AgentRegistry::build(available.clone(), &overrides);
+        let model = registry.get("atlas").and_then(|a| a.resolved_model.clone());
+        if model.is_none() {
+            tracing::warn!(
+                role = "orchestrator",
+                "no OMO specialist agent 'atlas' resolved against available providers; keeping the configured session model (FR-006)"
+            );
+        }
+        return model;
+    }
+    let outcome = omo_role_default("orchestrator", available, &overrides);
+    if outcome.unresolvable {
+        tracing::warn!(
+            role = "orchestrator",
+            "no OMO chain member (sisyphus→hephaestus→metis) resolved against available providers; keeping the configured session model (FR-006)"
+        );
+    }
+    outcome.model
+}
+
+/// True when the OMO registry resolves zero agents against `available`
+/// (the persona integration's empty-bench degradation state, T031).
+pub fn omo_registry_empty(available: &joey_omo::AvailableModelSet) -> bool {
+    let overrides = joey_omo::agents::registry::ModelOverrides::new();
+    let registry = joey_omo::AgentRegistry::build(available.clone(), &overrides);
+    registry.all().iter().all(|a| a.resolved_model.is_none())
+}
+
+/// True when the T015 session-model gate applies: orchestration active and
+/// the user neither pinned (--model / /model) nor configured (model.default)
+/// a session model. Shared by repl's build_agent_config and the engine's
+/// startup notice so the two can never drift (T032).
+pub fn orchestrator_session_model_applies(config: &joey_core::Config, model_pinned: bool) -> bool {
+    if !orchestrator_active(config) {
+        return false;
+    }
+    let user_configured = joey_core::config::get_nested(config.user_doc(), "model.default")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    !user_configured && !model_pinned
+}
+
+/// One-time startup/toggle notice for the persona integration (T031/T032):
+/// None when healthy; the empty-bench text when the registry resolved zero
+/// agents; the FR-006 text when the orchestrator session-model chain
+/// (sisyphus→hephaestus→metis) cannot resolve against a non-empty bench.
+pub fn orchestrator_startup_notice(
+    config: &joey_core::Config,
+    model_pinned: bool,
+    available: &joey_omo::AvailableModelSet,
+) -> Option<String> {
+    if !orchestrator_active(config) {
+        return None;
+    }
+    if omo_registry_empty(available) {
+        return Some(
+            "⚠️ HyperCode orchestration is on but no OMO agents resolved against the current provider — the delegation-first persona is inactive; running with the fixed orchestrator prompt and plain HyperCode roles (empty bench).".to_string(),
+        );
+    }
+    if orchestrator_session_model_applies(config, model_pinned) {
+        if omo_specialists_enabled(config) {
+            let overrides = joey_omo::agents::registry::ModelOverrides::new();
+            let registry = joey_omo::AgentRegistry::build(available.clone(), &overrides);
+            if registry.get("atlas").and_then(|a| a.resolved_model.clone()).is_none() {
+                return Some(
+                    "⚠️ No OMO specialist agent 'atlas' resolved against available providers; keeping the configured session model (FR-006).".to_string(),
+                );
+            }
+        } else {
+            let overrides = joey_omo::agents::registry::ModelOverrides::new();
+            if omo_role_default("orchestrator", available, &overrides).unresolvable {
+                return Some(
+                    "⚠️ No OMO orchestrator model chain member (sisyphus→hephaestus→metis) resolved against available providers; keeping the configured session model (FR-006).".to_string(),
+                );
+            }
+        }
+    }
+    None
 }
 
 /// True when `model` cannot be served by a copilot-wire `provider`
@@ -1157,22 +1741,214 @@ struct HypercodeDispatcher<'a> {
     /// recent bundle (if any) and prefixes the repair context onto the
     /// child's goal (FR-020 repair re-dispatch).
     repair_queue: Arc<std::sync::Mutex<Vec<DefectBundle>>>,
+    /// T028 (US7): outcome-memory store shared with post-run recording;
+    /// None unless `neurocode.enterprise_context.enabled`.
+    outcome_store: Option<
+        Arc<std::sync::Mutex<joey_neurocode::memory::outcomes::OutcomeStore>>,
+    >,
+    /// T028: (task_id, failure_signature) for every repair re-dispatch.
+    repair_log: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 /// Goal prefix built from a popped DefectBundle (T023, FR-020): tells the
 /// repair child what failed on the previous attempt. Extracted as a pure
-/// function for testability.
+/// function for testability. T029 (FR-022): reviewer findings ride the
+/// same defects section as `- reviewer finding: <f>` lines.
 fn repair_prefixed_goal(defect: &DefectBundle, base: &str) -> String {
+    let mut defects: Vec<String> = defect
+        .failed_commands
+        .iter()
+        .map(|c| format!("- `{}` exited {}: {}", c.command, c.exit, c.errors.join("; ")))
+        .collect();
+    defects.extend(
+        defect
+            .reviewer_findings
+            .iter()
+            .map(|f| format!("- reviewer finding: {f}")),
+    );
     format!(
         "Previous attempt failed verification. Defects to repair:\n{}\n\n{}",
-        defect
-            .failed_commands
-            .iter()
-            .map(|c| format!("- `{}` exited {}: {}", c.command, c.exit, c.errors.join("; ")))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        defects.join("\n"),
         base
     )
+}
+
+/// T028 (US7): the task signature used for outcome-memory keys. MUST
+/// match `AnalysisEngine::task_signature` byte-for-byte (analysis.rs:
+/// `format!("{}|{}|{}", id, objective, writes)` with each write_set path
+/// `to_string_lossy().replace('\\', "/")` and joined by ",") so
+/// runtime-recorded lessons hit analyzer consults.
+fn task_signature_of(task: &TaskNode) -> String {
+    let writes = task
+        .write_set
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}|{}|{}", task.id, task.objective, writes)
+}
+
+/// T028 (FR-025): record verified-outcome lessons for gate-passed tasks
+/// ONLY — TaskStatus::Completed is reachable solely through the
+/// scheduler's `gate_passed` transition, so unverified tasks (Failed,
+/// Degraded, Skipped, Blocked, Pending) yield ZERO records. Repaired
+/// tasks carry their failure signature + resolution at a reduced
+/// confidence (v1 heuristic: 100 clean pass, 80 post-repair).
+pub(crate) fn record_verified_outcomes(
+    store: &joey_neurocode::memory::outcomes::OutcomeStore,
+    graph: &TaskGraph,
+    run_id: &str,
+    repair_log: &[(String, String)],
+) -> usize {
+    use joey_orchestration::task_graph::TaskStatus;
+
+    let mut recorded = 0usize;
+    for (id, node) in graph.nodes.iter() {
+        if node.status != TaskStatus::Completed {
+            continue;
+        }
+        let repaired = repair_log
+            .iter()
+            .find(|(tid, _)| tid == id.as_str())
+            .map(|(_, sig)| sig.clone());
+        let outcome = joey_neurocode::memory::outcomes::VerifiedOutcome {
+            task_signature: task_signature_of(node),
+            repository_revision: graph.baseline_revision.clone(),
+            artifact_ids: node.artifact_ids.clone(),
+            // Policies apply when the analysis plane supplies them; the
+            // runtime path has none (FR-025 "where applicable").
+            policy_ids: Vec::new(),
+            failure_signature: repaired.clone(),
+            resolution: repaired
+                .as_ref()
+                .map(|_| "repaired; verification gate passed on re-run".to_string()),
+            evidence_ids: vec![format!("runs/{}/nodes/{}.json", run_id, id.as_str())],
+            confidence: if repaired.is_some() { 80 } else { 100 },
+        };
+        if store.record(&outcome).is_ok() {
+            recorded += 1;
+        }
+    }
+    recorded
+}
+
+/// T036: flag-gated outcome-store open shared by `execute_graph_run` and
+/// `resume_execution_run` (US7/FR-025) — opens `outcomes.db` next to the
+/// neurocode graph DB; flag-off runs get `None` (SC-001 parity). Extracted
+/// verbatim from the execute path so the two cannot drift.
+fn open_outcome_store(
+    ctx: &HypercodeContext,
+) -> Option<Arc<std::sync::Mutex<joey_neurocode::memory::outcomes::OutcomeStore>>> {
+    if ctx
+        .config
+        .get_bool("neurocode.enterprise_context.enabled", false)
+    {
+        let db_dir = joey_neurocode::graph::store::project_graph_db_path(&ctx.cwd)
+            .parent()
+            .map(|p| p.to_path_buf());
+        match db_dir {
+            Some(dir) => {
+                let _ = std::fs::create_dir_all(&dir);
+                joey_neurocode::memory::outcomes::OutcomeStore::open(&dir.join("outcomes.db"))
+                    .ok()
+                    .map(|s| Arc::new(std::sync::Mutex::new(s)))
+            }
+            None => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// T036 (FR-026/SC-008): pre-run material-change sweep shared by both
+/// runtime paths — expire lessons whose referenced artifacts changed
+/// before any dispatch consults them. Extracted verbatim from the
+/// execute path (T035).
+fn sweep_stale_lessons(
+    store: &Option<Arc<std::sync::Mutex<joey_neurocode::memory::outcomes::OutcomeStore>>>,
+    cwd: &std::path::Path,
+) {
+    if let Some(store) = store.as_ref() {
+        if let Ok(guard) = store.lock() {
+            if let Ok(dg) = joey_neurocode::DependencyGraph::open_for_project(cwd) {
+                let cwd = cwd.to_path_buf();
+                let expired = joey_neurocode::memory::outcomes::expire_stale_lessons(&guard, |id| {
+                    dg.store()
+                        .get_node(id)
+                        .ok()
+                        .flatten()
+                        .map(|n| cwd.join(n.source_path))
+                });
+                if expired > 0 {
+                    eprintln!(
+                        "hypercode: expired {expired} outcome lesson(s) whose artifacts changed (FR-026)"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// T036: gate construction shared by both runtime paths — the real
+/// VerifyLoop-backed gate WITH the production momus reviewer attached
+/// (T029/US8, FR-022: High-risk resumed tasks get reviewed, not
+/// notice-and-proceed).
+fn graph_gate(ctx: &HypercodeContext) -> crate::hypercode_gate::VerifyLoopGate {
+    crate::hypercode_gate::VerifyLoopGate::new(ctx.cwd.clone()).with_reviewer(
+        std::sync::Arc::new(crate::hypercode_gate::MomusReviewer::new(ctx.clone())),
+    )
+}
+
+/// T036: post-run finalization shared by both runtime paths — record
+/// verified-outcome lessons (T028/FR-025) and drain the review audit
+/// trail into ReviewOutcome evidence (T029/US8). Extracted verbatim
+/// from the execute path.
+fn finalize_graph_run(
+    outcome_store: &Option<Arc<std::sync::Mutex<joey_neurocode::memory::outcomes::OutcomeStore>>>,
+    review_events: &std::sync::Arc<
+        std::sync::Mutex<Vec<crate::hypercode_gate::ReviewEvent>>,
+    >,
+    graph: &TaskGraph,
+    run: &mut joey_orchestration::evidence::RunHandle,
+    repair_log: &std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+) {
+    // T028 (FR-025): record verified-outcome lessons from gate-passed
+    // (Completed) tasks into the outcome store — unverified tasks yield
+    // zero records. Runs before the graph is put back / the fn returns.
+    if let Some(store) = outcome_store.as_ref() {
+        if let Ok(guard) = store.lock() {
+            let recorded = record_verified_outcomes(
+                &guard,
+                graph,
+                run.run_id(),
+                &repair_log.lock().expect("repair log"),
+            );
+            eprintln!(
+                "hypercode: recorded {recorded} verified-outcome lesson(s) (FR-025; unverified tasks yield none)"
+            );
+        }
+    }
+
+    // T029 (US8): persist the review audit trail as ReviewOutcome
+    // evidence (notice-and-proceed included — FR-022's graceful skip is
+    // recorded, never silent).
+    let events: Vec<_> = review_events
+        .lock()
+        .expect("review events")
+        .drain(..)
+        .collect();
+    for ev in events {
+        let _ = run.record_evidence(
+            "risk-review",
+            joey_orchestration::evidence::EvidenceKind::ReviewOutcome,
+            serde_json::json!({
+                "workdir": ev.workdir,
+                "verdict": ev.verdict,
+                "findings": ev.findings,
+                "detail": ev.detail,
+            }),
+        );
+    }
 }
 
 #[async_trait::async_trait]
@@ -1188,6 +1964,15 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
             .pop();
         if let Some(defect) = repair.as_mut() {
             defect.task_id = task.id.as_str().to_string();
+            let sig = defect
+                .failed_commands
+                .first()
+                .map(|c| format!("{}:{}", c.command, c.exit))
+                .unwrap_or_else(|| "verification-failure".to_string());
+            self.repair_log
+                .lock()
+                .expect("repair log")
+                .push((task.id.as_str().to_string(), sig));
             eprintln!(
                 "hypercode: repair re-dispatch for {} carrying {} defect-command(s)",
                 task.id.as_str(),
@@ -1221,9 +2006,51 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
             ..Default::default()
         };
         let parent_model = parent_model_for(self.ctx);
+        // Feature 025 (FR-005): OMO-chain role model defaults for this run.
+        let omo_profile = joey_providers::profile::resolve_profile(
+            &self.ctx.agent_config.provider,
+            &self.ctx.agent_config.base_url,
+            &parent_model,
+        );
+        let omo_available =
+            joey_omo::AvailableModelSet::from_connected_with_catalog(&omo_profile, &parent_model);
+        let omo = omo_role_defaults(&self.ctx.config, &omo_available);
         let rc = cfg.get_implementor_config(&opts.provider);
+        // T028 (US7): structured lessons replace free-text wisdom as
+        // execution guidance on the flag-on path (FR-025/SC-008). Consult
+        // by exact task signature; only verified-outcome lessons live in
+        // the store, and consult bumps hit_count (T035: expiry re-check
+        // runs at run start (pre-run sweep) and in the analysis plane —
+        // no per-dispatch re-check needed since the store no longer
+        // returns expired rows).
+        let mut lesson_prefix = String::new();
+        if let Some(store) = self.outcome_store.as_ref() {
+            if let Ok(guard) = store.lock() {
+                if let Ok(lessons) = guard.consult_by_signature(&task_signature_of(task)) {
+                    if !lessons.is_empty() {
+                        let lines: Vec<String> = lessons
+                            .iter()
+                            .take(3)
+                            .map(|l| {
+                                format!(
+                                    "- {} (confidence {}, hits {})",
+                                    l.resolution.clone().unwrap_or_else(|| l.task_signature.clone()),
+                                    l.confidence,
+                                    l.hit_count
+                                )
+                            })
+                            .collect();
+                        lesson_prefix = format!(
+                            "Verified lessons for this exact task signature (outcome memory):\n{}\n\n",
+                            lines.join("\n")
+                        );
+                    }
+                }
+            }
+        }
         let req_goal_base = format!(
-            "Implement HyperCode task {}:\n{}\n(Project root: {})",
+            "{}Implement HyperCode task {}:\n{}\n(Project root: {})",
+            lesson_prefix,
             task.id.as_str(),
             task.objective,
             workdir.display()
@@ -1236,7 +2063,7 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
             goal,
             context: None,
             tasks: Vec::new(),
-            model: model_override(&rc, &parent_model, &opts.provider),
+            model: model_override(&rc, &parent_model, &opts.provider, omo.implementor.as_deref()),
             toolsets: vec![
                 "file".to_string(),
                 "terminal".to_string(),
@@ -1289,7 +2116,11 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
 /// directory, puts the mutated graph BACK (terminal statuses visible to
 /// callers/tests), and folds a summary into `report`. Returns the
 /// scheduler's counters.
-async fn execute_graph_run(ctx: &HypercodeContext, report: &mut HypercodeReport) -> RunStats {
+async fn execute_graph_run(
+    ctx: &HypercodeContext,
+    report: &mut HypercodeReport,
+    snapshots: Option<SnapshotFn>,
+) -> RunStats {
     let mut stats = RunStats::default();
     // Take the graph out of the slot (clone — graph is Clone).
     let graph = match ctx.execution_graph.lock() {
@@ -1329,18 +2160,48 @@ async fn execute_graph_run(ctx: &HypercodeContext, report: &mut HypercodeReport)
             .get_i64("hypercode.execution_graph.max_repair_attempts", 3)
             .max(0) as u32,
     };
-    // T023: the real VerifyLoop-backed gate (replaces the T016
+    // T036: shared helpers (gate + reviewer, outcome store, lesson sweep)
+    // — extracted from the inlined blocks so execute and resume cannot
+    // drift. T023: the real VerifyLoop-backed gate (replaces the T016
     // AlwaysPassGate placeholder at this call site; the placeholder type
-    // stays for its unit test).
-    let gate = crate::hypercode_gate::VerifyLoopGate::new(ctx.cwd.clone());
+    // stays for its unit test). T029 (US8, FR-022): attach the production
+    // momus reviewer — the gate invokes it when a plan view carries
+    // `risk_triggered_review` (forced on for High-risk tasks by the
+    // Evaluator). T029: clone the audit-trail Arc BEFORE the scheduler
+    // borrows `gate` so events can be drained after the run regardless of
+    // borrows. T028 (US7): open the outcome-memory store next to the
+    // neurocode graph DB — only when the enterprise-context flag is on;
+    // flag-off runs touch nothing (SC-001).
+    let gate = graph_gate(ctx);
+    let review_events = gate.review_events();
+    // T035 (FR-026/SC-008): pre-run material-change sweep — expire
+    // lessons whose referenced artifacts changed before any dispatch
+    // consults them, so the run that consults a changed lesson never
+    // surfaces it.
+    let outcome_store = open_outcome_store(ctx);
+    sweep_stale_lessons(&outcome_store, &ctx.cwd);
+    let repair_log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let dispatcher = HypercodeDispatcher {
         ctx,
         run_root: root.clone(),
         repair_queue: gate.repair_queue(),
+        outcome_store: outcome_store.clone(),
+        repair_log: repair_log.clone(),
     };
-    stats = GraphScheduler::new(config)
-        .run_to_completion(&mut graph, &mut run, &dispatcher, &gate, &ctx.cwd)
-        .await;
+    stats = {
+        let sched = match snapshots {
+            Some(f) => GraphScheduler::new(config).with_snapshot_sink(f),
+            None => GraphScheduler::new(config),
+        };
+        sched
+            .run_to_completion(&mut graph, &mut run, &dispatcher, &gate, &ctx.cwd)
+            .await
+    };
+
+    // T036: shared post-run finalization — record verified-outcome
+    // lessons (FR-025) and drain the review audit trail into
+    // ReviewOutcome evidence (US8), identical to the resume path.
+    finalize_graph_run(&outcome_store, &review_events, &graph, &mut run, &repair_log);
 
     // ── Integration phase (Spec 023 T020 / US4, FR-016…FR-018) ─────────
     // Collect a ChangeBundle from every Completed isolated-worktree task
@@ -1449,7 +2310,11 @@ async fn execute_graph_run(ctx: &HypercodeContext, report: &mut HypercodeReport)
 // Not yet reachable from the CLI tree (subcommand wiring is a later
 // spec-023 task); the tests exercise it via the free functions above.
 #[allow(dead_code)]
-pub async fn resume_execution_run(ctx: &HypercodeContext, run_id: &str) -> Option<RunStats> {
+pub async fn resume_execution_run(
+    ctx: &HypercodeContext,
+    run_id: &str,
+    snapshots: Option<SnapshotFn>,
+) -> Option<RunStats> {
     let root = run_root(&ctx.cwd, run_id);
     let current = baseline_revision(&ctx.cwd).unwrap_or_default();
     let mut run = match RunHandle::resume_at(&root, run_id, &current) {
@@ -1481,6 +2346,11 @@ pub async fn resume_execution_run(ctx: &HypercodeContext, run_id: &str) -> Optio
         eprintln!("hypercode: run {run_id} has no pending tasks — nothing to resume");
         return None;
     }
+    // Spec 023: fire the resumed graph's initial snapshot so live UIs see
+    // the loaded state before the first scheduler transition.
+    if let Some(f) = snapshots.as_ref() {
+        f(graph.snapshot());
+    }
     let config = GraphSchedulerConfig {
         max_concurrent_workers: ctx
             .config
@@ -1491,15 +2361,32 @@ pub async fn resume_execution_run(ctx: &HypercodeContext, run_id: &str) -> Optio
             .get_i64("hypercode.execution_graph.max_repair_attempts", 3)
             .max(0) as u32,
     };
-    let gate = crate::hypercode_gate::VerifyLoopGate::new(ctx.cwd.clone());
+    let gate = graph_gate(ctx);
+    let review_events = gate.review_events();
+    // T036: the resume path mirrors the execute path's US7/US8 wiring —
+    // reviewer on the gate (FR-022), outcome store + lesson sweep
+    // (FR-025/FR-026), post-run recording and review-evidence drain via
+    // the shared finalize helper.
+    let outcome_store = open_outcome_store(ctx);
+    sweep_stale_lessons(&outcome_store, &ctx.cwd);
+    let repair_log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let dispatcher = HypercodeDispatcher {
         ctx,
         run_root: root.clone(),
         repair_queue: gate.repair_queue(),
+        outcome_store: outcome_store.clone(),
+        repair_log: repair_log.clone(),
     };
-    let stats = GraphScheduler::new(config)
-        .run_to_completion(&mut graph, &mut run, &dispatcher, &gate, &ctx.cwd)
-        .await;
+    let stats = {
+        let sched = match snapshots {
+            Some(f) => GraphScheduler::new(config).with_snapshot_sink(f),
+            None => GraphScheduler::new(config),
+        };
+        sched
+            .run_to_completion(&mut graph, &mut run, &dispatcher, &gate, &ctx.cwd)
+            .await
+    };
+    finalize_graph_run(&outcome_store, &review_events, &graph, &mut run, &repair_log);
     eprintln!(
         "hypercode: resumed run {run_id} — {} completed, {} failed, {} degraded, {} blocked",
         stats.completed, stats.failed, stats.degraded, stats.blocked_remaining
@@ -1512,12 +2399,15 @@ pub async fn resume_execution_run(ctx: &HypercodeContext, run_id: &str) -> Optio
 /// global tap → TUI panes + rail + job board natively).
 ///
 /// `progress` is invoked at each phase transition (thread-safe, may send
-/// engine events). Returns the final report.
+/// engine events). `snapshots` (Spec 023) is invoked with the full
+/// TaskGraph JSON at the initial conversion (and resume load) plus every
+/// scheduler transition. Returns the final report.
 pub async fn run_hypercode(
     ctx: &HypercodeContext,
     goal: &str,
     opts: &HypercodeOptions,
     progress: Option<&ProgressFn<'_>>,
+    snapshots: Option<SnapshotFn>,
 ) -> HypercodeReport {
     let started = std::time::Instant::now();
     let cfg = HyperCodeConfig::from_config(&ctx.config);
@@ -1536,6 +2426,22 @@ pub async fn run_hypercode(
     // actually dispatches with) when available, falling back to the raw
     // config default (legacy behavior) when the caller didn't capture it.
     let parent_model = parent_model_for(ctx);
+    // Feature 025 (FR-005): OMO-chain role model defaults for this run.
+    let omo_profile = joey_providers::profile::resolve_profile(
+        &ctx.agent_config.provider,
+        &ctx.agent_config.base_url,
+        &parent_model,
+    );
+    let omo_available =
+        joey_omo::AvailableModelSet::from_connected_with_catalog(&omo_profile, &parent_model);
+    let omo = omo_role_defaults(&ctx.config, &omo_available);
+    // FR-006 user-visible warnings ride the progress channel (engine forwards
+    // them as HypercodeProgress events); tracing remains the log mirror.
+    for warning in &omo.warnings {
+        if let Some(cb) = progress {
+            cb(Phase::Planning, warning);
+        }
+    }
     let cap = effective_cap(&cfg, opts);
 
     // Time-to-completion: children skip the parent's inter-tool pacing
@@ -1563,7 +2469,7 @@ pub async fn run_hypercode(
         if let Some(cb) = progress {
             cb(Phase::Planning, "decomposing the goal into workstreams");
         }
-        let req = planner_request(goal, &cfg, opts, &parent_model);
+        let req = planner_request(goal, &cfg, opts, &omo, &parent_model);
         let results = ctx
             .manager
             .dispatch_requests(
@@ -1590,6 +2496,12 @@ pub async fn run_hypercode(
         }
     };
     report.workstreams = workstreams.clone();
+
+    // T026 (FR-023): graph-derived route on the flag-on path. None on
+    // the flag-off path — legacy count-based routing stays untouched
+    // (SC-001).
+    let mut graph_route: Option<ModeRoute> = None;
+    let mut routed_graph: Option<TaskGraph> = None;
 
     // Spec 023 (US2/T013, FR-007): convert the legacy `<workstreams>`
     // decomposition into a typed TaskGraph behind the
@@ -1620,9 +2532,30 @@ pub async fn run_hypercode(
         let graph = TaskGraph::from_workstreams(&legacy, &baseline);
         match graph.validate() {
             Ok(()) => {
-                if let Ok(mut slot) = ctx.execution_graph.lock() {
+                // T026 (FR-023): route from graph properties — never
+                // workstream count.
+                let hint = execution_hint_from_graph(&graph);
+                let route = route_mode_from_graph(&hint);
+                if matches!(route, ModeRoute::Team)
+                    && cfg.team.enabled
+                    && !explicit_workstreams
+                {
+                    // FR-024: the graph feeds the team task list; the
+                    // scheduler slot stays empty so the wave scheduler
+                    // never runs for this shape.
+                    routed_graph = Some(graph);
+                } else if let Ok(mut slot) = ctx.execution_graph.lock() {
+                    // Team shape but team unavailable (disabled or
+                    // pinned): the scheduler's bounded-parallel dispatch
+                    // is the fallback; every other route runs the graph.
+                    // Spec 023: fire the INITIAL snapshot before the graph
+                    // lands in the slot so live UIs see the plan instantly.
+                    if let Some(f) = snapshots.as_ref() {
+                        f(graph.snapshot());
+                    }
                     *slot = Some(graph);
                 }
+                graph_route = Some(route);
             }
             Err(errors) => {
                 let report: Vec<String> = errors
@@ -1649,7 +2582,7 @@ pub async fn run_hypercode(
         .expect("execution graph mutex")
         .is_some()
     {
-        let stats = execute_graph_run(ctx, &mut report).await;
+        let stats = execute_graph_run(ctx, &mut report, snapshots).await;
         eprintln!(
             "hypercode: graph run complete — {} completed, {} failed, {} degraded, {} blocked",
             stats.completed, stats.failed, stats.degraded, stats.blocked_remaining
@@ -1677,6 +2610,7 @@ pub async fn run_hypercode(
         cfg.team.enabled,
         explicit_workstreams,
         workstreams.len(),
+        graph_route,
     ) {
         Ok(Some(run)) => team_run = Some(run),
         Ok(None) => {}
@@ -1693,7 +2627,27 @@ pub async fn run_hypercode(
         )),
     }
     if let Some((team_name, member)) = team_run {
-        let lead_req = lead_request(goal, &team_name, &member, &cfg.team);
+        // T026 (FR-024): pre-seed the team task list from the validated
+        // graph — the lead coordinates existing nodes rather than
+        // inventing a separate decomposition.
+        if let Some(graph) = routed_graph.as_ref() {
+            let seeded = seed_team_tasks_from_graph(graph, &team_name);
+            report.mode_decisions.push(format_mode_decision(
+                "team",
+                goal.lines()
+                    .next()
+                    .unwrap_or(goal)
+                    .chars()
+                    .take(60)
+                    .collect::<String>()
+                    .trim(),
+                &format!(
+                    "graph-routed: seeded {} task(s) from the validated graph (FR-023/FR-024)",
+                    seeded
+                ),
+            ));
+        }
+        let lead_req = lead_request(goal, &team_name, &member, &cfg.team, &omo);
         let results = ctx
             .manager
             .dispatch_requests(&[lead_req], &ctx.agent_config, &ctx.config, &ctx.base_registry, None)
@@ -1726,7 +2680,7 @@ pub async fn run_hypercode(
     }
     let explorer_requests: Vec<DelegationRequest> = workstreams
         .iter()
-        .map(|ws| explorer_request(ws, goal, &cfg, opts, &parent_model, &ctx.cwd))
+        .map(|ws| explorer_request(ws, goal, &cfg, opts, &omo, &parent_model, &ctx.cwd))
         .collect();
     let explorer_results = ctx
         .manager
@@ -1769,7 +2723,7 @@ pub async fn run_hypercode(
         .iter()
         .zip(explorer_summaries.iter())
         .map(|(ws, brief)| {
-            implementor_request(ws, goal, brief, &cfg, opts, &parent_model, &ctx.cwd)
+            implementor_request(ws, goal, brief, &cfg, opts, &omo, &parent_model, &ctx.cwd)
         })
         .collect();
     let build_results = ctx
@@ -1990,7 +2944,7 @@ mod tests {
             id: 0,
             focus: "do things".into(),
         };
-        let req = explorer_request(&ws, "goal", &cfg, &opts, "parent-model", std::path::Path::new("/tmp"));
+        let req = explorer_request(&ws, "goal", &cfg, &opts, &OmoRoleDefaults::default(), "parent-model", std::path::Path::new("/tmp"));
         assert_eq!(req.model.as_deref(), Some("explorer-model"));
         assert_eq!(req.max_turns, Some(6));
         assert_eq!(req.max_tokens, Some(4000));
@@ -2010,7 +2964,7 @@ mod tests {
             id: 1,
             focus: "f".into(),
         };
-        let req = explorer_request(&ws, "g", &cfg, &opts, "live-model", std::path::Path::new("/tmp"));
+        let req = explorer_request(&ws, "g", &cfg, &opts, &OmoRoleDefaults::default(), "live-model", std::path::Path::new("/tmp"));
         // Empty role model → inherit the live parent model (not delegation.default_model).
         assert_eq!(req.model.as_deref(), Some("live-model"));
         assert_eq!(req.max_tokens, None);
@@ -2077,7 +3031,7 @@ mod tests {
         let parent_model = parent_model_for(&ctx);
         assert_eq!(parent_model, "gpt-5.6-sol");
         assert_eq!(
-            model_override(&rc, &parent_model, &opts.provider).as_deref(),
+            model_override(&rc, &parent_model, &opts.provider, None).as_deref(),
             Some("gpt-5.6-sol"),
             "children must inherit the parent's EFFECTIVE model when no role entry exists"
         );
@@ -2093,7 +3047,7 @@ mod tests {
         );
         let rc = cfg.get_explorer_config(&opts.provider);
         assert_eq!(
-            model_override(&rc, &parent_model, &opts.provider).as_deref(),
+            model_override(&rc, &parent_model, &opts.provider, None).as_deref(),
             Some("role-table-model")
         );
     }
@@ -2116,7 +3070,7 @@ mod tests {
 
         // copilot-wire + unservable inherited model: still returned as-is.
         assert_eq!(
-            model_override(&rc, "glm-5.2", "github-copilot").as_deref(),
+            model_override(&rc, "glm-5.2", "github-copilot", None).as_deref(),
             Some("glm-5.2")
         );
         assert!(copilot_wire_unservable("glm-5.2", "github-copilot"));
@@ -2128,7 +3082,7 @@ mod tests {
         // Non-copilot provider: never guarded, whatever the model.
         assert!(!copilot_wire_unservable("glm-5.2", "zai"));
         assert_eq!(
-            model_override(&rc, "glm-5.2", "zai").as_deref(),
+            model_override(&rc, "glm-5.2", "zai", None).as_deref(),
             Some("glm-5.2")
         );
         joey_providers::copilot::restore_catalog_cache_for_tests(saved_catalog);
@@ -2141,7 +3095,7 @@ mod tests {
             provider: "p".into(),
             ..Default::default()
         };
-        let req = planner_request("my goal", &cfg, &opts, "m");
+        let req = planner_request("my goal", &cfg, &opts, &OmoRoleDefaults::default(), "m");
         assert!(req.goal.starts_with("You are the Planner agent"));
         assert!(req.goal.contains("my goal"));
         assert!(req.goal.contains(&format!("Max workstreams: {}", DEFAULT_MAX_WORKSTREAMS)));
@@ -2250,7 +3204,7 @@ mod tests {
         let ws = Workstream { id: 0, focus: "f".into() };
 
         // Explorer: READ-ONLY files + terminal + web.
-        let ex = explorer_request(&ws, "g", &cfg, &opts, "m", std::path::Path::new("/tmp"));
+        let ex = explorer_request(&ws, "g", &cfg, &opts, &OmoRoleDefaults::default(), "m", std::path::Path::new("/tmp"));
         assert!(ex.toolsets.contains(&"file-read".to_string()));
         assert!(!ex.toolsets.contains(&"file".to_string()), "explorer must NOT have write access");
         assert!(ex.toolsets.contains(&"terminal".to_string()), "explorer runs diagnostic commands");
@@ -2259,7 +3213,7 @@ mod tests {
         assert!(ex.prompt_append.as_deref().unwrap_or("").contains("READ-ONLY"));
 
         // Implementor: write access + terminal + web.
-        let im = implementor_request(&ws, "g", "brief", &cfg, &opts, "m", std::path::Path::new("/tmp"));
+        let im = implementor_request(&ws, "g", "brief", &cfg, &opts, &OmoRoleDefaults::default(), "m", std::path::Path::new("/tmp"));
         assert!(im.toolsets.contains(&"file".to_string()), "implementor owns the write path");
         assert!(im.toolsets.contains(&"terminal".to_string()));
         assert!(im.prompt_append.as_deref().unwrap_or("").contains("Implementor agent"));
@@ -2267,16 +3221,16 @@ mod tests {
 
     // ── Spec 023 T013: execution_graph conversion wiring ──────────────
 
-    /// SC-001 parity: the flag defaults OFF and a freshly built context
-    /// carries no execution graph — with the flag off the conversion
-    /// block in run_hypercode is a pure no-op (same gate expression the
-    /// block uses: `config.get_bool("hypercode.execution_graph.enabled", false)`).
+    /// SC-001 parity: the flag-off path leaves a freshly built context
+    /// with no execution graph — with the flag explicitly off the
+    /// conversion block in run_hypercode is a pure no-op (same gate
+    /// expression the block uses:
+    /// `config.get_bool("hypercode.execution_graph.enabled", false)`).
+    /// FR-028 flipped the CONFIG default to true, so the flag-off leg is
+    /// exercised via an explicit `enabled: false` (call-site fallback
+    /// stays `false` and is unchanged).
     #[test]
     fn execution_graph_flag_gating_defaults_off_and_slot_empty() {
-        // Default config: flag off.
-        let defaults = joey_core::Config::defaults();
-        assert!(!defaults.get_bool("hypercode.execution_graph.enabled", false));
-
         // Explicit on/off round-trips through the same accessor the
         // run_hypercode block uses.
         let on = config_with_yaml("hypercode:\n  execution_graph:\n    enabled: true\n");
@@ -2383,6 +3337,47 @@ mod tests {
         assert!(goal.contains("cargo test -p x"), "command present: {goal}");
         assert!(goal.contains("101"), "exit code present: {goal}");
         assert!(goal.contains("test foo failed"), "error line present: {goal}");
+        assert!(
+            goal.ends_with("Implement HyperCode task t-1"),
+            "original goal preserved as suffix: {goal}"
+        );
+    }
+
+    /// T029 (FR-022): reviewer findings reach the repair child as
+    /// `- reviewer finding:` lines inside the same defects section.
+    #[test]
+    fn repair_queue_context_carries_reviewer_findings() {
+        let defect = DefectBundle {
+            task_id: String::new(),
+            failed_commands: vec![joey_orchestration::evaluator::CommandFailure {
+                command: "cargo test -p x".to_string(),
+                exit: 101,
+                errors: vec!["test foo failed".to_string()],
+            }],
+            policy_violations: vec![],
+            reviewer_findings: vec![
+                "race in cache eviction".to_string(),
+                "unhandled None in parser".to_string(),
+            ],
+            changed_paths: vec![],
+        };
+        let goal = repair_prefixed_goal(&defect, "Implement HyperCode task t-1");
+        assert!(
+            goal.contains("- reviewer finding: race in cache eviction"),
+            "first finding present: {goal}"
+        );
+        assert!(
+            goal.contains("- reviewer finding: unhandled None in parser"),
+            "second finding present: {goal}"
+        );
+        // Both finding lines come after the failed-command line (same
+        // defects section).
+        let cmd_pos = goal.find("- `cargo test -p x` exited 101").unwrap();
+        let f1 = goal.find("- reviewer finding: race in cache eviction").unwrap();
+        let f2 = goal
+            .find("- reviewer finding: unhandled None in parser")
+            .unwrap();
+        assert!(cmd_pos < f1 && f1 < f2, "ordering: command then findings: {goal}");
         assert!(
             goal.ends_with("Implement HyperCode task t-1"),
             "original goal preserved as suffix: {goal}"
@@ -2554,5 +3549,152 @@ mod tests {
         assert_eq!(route_mode(true, false, 1), ModeRoute::Subagent);
         assert_eq!(route_mode(false, false, 5), ModeRoute::Subagent);
         assert_eq!(route_mode(true, true, 5), ModeRoute::Subagent);
+    }
+
+    // ── Spec 023 T028: outcome memory (FR-025/FR-026) ─────────────────
+
+    /// Minimal TaskNode with a settable runtime status (T028 fixtures).
+    fn status_node(id: &str, status: TaskStatus, artifact_ids: Vec<u64>) -> TaskNode {
+        TaskNode {
+            id: TaskId::new(id).unwrap(),
+            objective: format!("objective for {id}"),
+            dependencies: vec![],
+            read_set: vec![],
+            write_set: vec![std::path::PathBuf::from("src/a.rs")],
+            artifact_ids,
+            role: joey_orchestration::task_graph::WorkerRole::Implementor,
+            model_tier: joey_orchestration::task_graph::ModelTier::Economical,
+            risk: joey_orchestration::task_graph::RiskLevel::Low,
+            acceptance: vec![joey_orchestration::task_graph::AcceptanceCriterion {
+                criterion: "it works".to_string(),
+                kind: "manual".to_string(),
+            }],
+            verification: VerificationPlanView::default(),
+            isolation: IsolationMode::SharedCheckout,
+            status,
+            attempts: 0,
+        }
+    }
+
+    /// T028 (FR-025): unverified tasks (Pending/Failed/Degraded) yield
+    /// ZERO outcome-memory records — Completed is the only record trigger.
+    #[test]
+    fn outcome_memory_records_zero_lessons_from_unverified_tasks() {
+        let store = joey_neurocode::memory::outcomes::OutcomeStore::open_in_memory().unwrap();
+        let mut graph = TaskGraph::default();
+        graph.nodes.insert(
+            TaskId::new("task-pending").unwrap(),
+            status_node("task-pending", TaskStatus::Pending, vec![]),
+        );
+        graph.nodes.insert(
+            TaskId::new("task-failed").unwrap(),
+            status_node("task-failed", TaskStatus::Failed, vec![]),
+        );
+        graph.nodes.insert(
+            TaskId::new("task-degraded").unwrap(),
+            status_node("task-degraded", TaskStatus::Degraded, vec![]),
+        );
+        assert_eq!(record_verified_outcomes(&store, &graph, "run-1", &[]), 0);
+        assert!(store.all_rows().unwrap().is_empty());
+    }
+
+    /// T028 (FR-025): a Completed task records exactly one
+    /// provenance-complete lesson (signature, revision, evidence, conf).
+    #[test]
+    fn outcome_memory_records_verified_outcome_with_provenance() {
+        let store = joey_neurocode::memory::outcomes::OutcomeStore::open_in_memory().unwrap();
+        let mut graph = TaskGraph::default();
+        graph.baseline_revision = "deadbeef".to_string();
+        let node = status_node("task-done", TaskStatus::Completed, vec![7, 9]);
+        graph.nodes.insert(TaskId::new("task-done").unwrap(), node.clone());
+        assert_eq!(record_verified_outcomes(&store, &graph, "run-1", &[]), 1);
+        let rows = store.all_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_signature, task_signature_of(&node));
+        assert_eq!(rows[0].repository_revision, "deadbeef");
+        assert_eq!(rows[0].evidence_ids, vec!["runs/run-1/nodes/task-done.json".to_string()]);
+        assert_eq!(rows[0].confidence, 100);
+        assert!(rows[0].failure_signature.is_none());
+    }
+
+    /// T028 (FR-025): a Completed task that appears in the repair log
+    /// carries its failure signature + resolution at reduced confidence.
+    #[test]
+    fn outcome_memory_repaired_task_carries_failure_signature() {
+        let store = joey_neurocode::memory::outcomes::OutcomeStore::open_in_memory().unwrap();
+        let mut graph = TaskGraph::default();
+        graph.nodes.insert(
+            TaskId::new("id-1").unwrap(),
+            status_node("id-1", TaskStatus::Completed, vec![]),
+        );
+        let repair_log = vec![("id-1".to_string(), "cargo test:101".to_string())];
+        assert_eq!(record_verified_outcomes(&store, &graph, "run-1", &repair_log), 1);
+        let rows = store.all_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].failure_signature.as_deref(), Some("cargo test:101"));
+        assert!(rows[0].resolution.is_some());
+        assert_eq!(rows[0].confidence, 80);
+    }
+
+    // ── Spec 023 T036: shared execute/resume helpers (US7/US8) ────────
+
+    /// T036: finalize_graph_run records verified outcomes for Completed
+    /// tasks AND drains review events into ReviewOutcome evidence
+    /// (evidence/risk-review.json) — the exact post-run wiring both
+    /// runtime paths now share.
+    #[test]
+    fn finalize_graph_run_records_outcomes_and_drains_review_evidence() {
+        let td = tempfile::tempdir().unwrap();
+        let mut run =
+            joey_orchestration::evidence::RunHandle::create_at(td.path(), "run-fx", "deadbeef")
+                .unwrap();
+        let mut graph = TaskGraph::default();
+        let node = status_node("task-fx", TaskStatus::Completed, vec![]);
+        graph.nodes.insert(TaskId::new("task-fx").unwrap(), node.clone());
+        let store =
+            joey_neurocode::memory::outcomes::OutcomeStore::open_in_memory().unwrap();
+        let outcome_store = Some(std::sync::Arc::new(std::sync::Mutex::new(store)));
+        let repair_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let review_events = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            crate::hypercode_gate::ReviewEvent {
+                workdir: "/tmp/x".into(),
+                verdict: "approve".into(),
+                findings: vec![],
+                detail: "d".into(),
+            },
+        ]));
+        finalize_graph_run(&outcome_store, &review_events, &graph, &mut run, &repair_log);
+        // (i) exactly one recorded lesson, keyed by the node's task signature
+        let rows = outcome_store
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .all_rows()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_signature, task_signature_of(&node));
+        // (ii) the drained ReviewOutcome evidence landed under the run dir
+        let evidence_path = td.path().join("evidence").join("risk-review.json");
+        let raw = std::fs::read_to_string(&evidence_path)
+            .expect("evidence/risk-review.json must exist after finalize");
+        assert!(
+            raw.contains("\"verdict\":\"approve\""),
+            "evidence must carry the approve verdict: {raw}"
+        );
+        // The drain emptied the shared audit-trail Arc.
+        assert!(review_events.lock().unwrap().is_empty());
+    }
+
+    /// T036: graph_gate attaches the production reviewer — the shared
+    /// constructor both runtime paths use (FR-022 on the resume path
+    /// too). Reuses the cheap model_ctx fixture (full construction is
+    /// heavy); a fresh gate starts with an empty audit trail.
+    #[test]
+    fn graph_gate_paths_attach_reviewer() {
+        let ctx = model_ctx("zai", None);
+        let gate = graph_gate(&ctx);
+        assert!(gate.has_reviewer());
+        assert!(gate.review_events().lock().unwrap().is_empty());
     }
 }

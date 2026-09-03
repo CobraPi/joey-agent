@@ -329,6 +329,51 @@ async fn e2e_preflight_pressure_triggers_compression() {
     assert!(history_has_summary(&fx.agent));
 }
 
+// ── (c2) post-tool-round compaction emits CompressionStart/End events ───
+
+#[tokio::test(start_paused = true)]
+async fn e2e_post_tool_compaction_emits_compression_events() {
+    let _l = lock();
+    let mut fx = fixture(vec![
+        // Tool round reporting REAL usage far above the threshold: the
+        // post-tool-round gate (conversation_loop.py:5106-5151) fires on the
+        // provider-reported prompt_tokens. The threshold sits ABOVE the rough
+        // preflight estimate (system + 30 msgs ≈ 10k tokens) so the pre-API
+        // site stays quiet and only the post-tool site fires.
+        Ok(tool_resp_with_usage(
+            vec![ToolCall::new("call_1", "echo", r#"{ "text": "hi" }"#)],
+            500_000,
+        )),
+        Ok(text_resp_with_usage("done", 120)),
+    ]);
+    seed_history(&mut fx.agent, 30);
+    fx.agent.compressor_mut().threshold_tokens = 400_000;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let result = fx.agent.run_turn("go", tx).await;
+    assert_eq!(result.final_text, "done");
+
+    let events = drain(&mut rx);
+    let start = events.iter().position(|e| {
+        matches!(
+            e,
+            AgentEvent::CompressionStart { approx_tokens, .. } if *approx_tokens >= 500_000
+        )
+    });
+    let end = events.iter().position(|e| {
+        matches!(e, AgentEvent::CompressionEnd { original_msgs, new_msgs } if *new_msgs < *original_msgs)
+    });
+    assert!(start.is_some(), "CompressionStart missing: {events:?}");
+    assert!(end.is_some(), "CompressionEnd missing: {events:?}");
+    assert!(
+        start.unwrap() < end.unwrap(),
+        "CompressionStart must precede CompressionEnd"
+    );
+    // The compacting Notice is still emitted alongside the structured events.
+    assert!(notices(&events).iter().any(|n| n == "  ⟳ compacting context…"));
+    assert!(history_has_summary(&fx.agent));
+}
+
 // ── (d) 3-attempt cap ───────────────────────────────────────────────────
 
 #[tokio::test(start_paused = true)]

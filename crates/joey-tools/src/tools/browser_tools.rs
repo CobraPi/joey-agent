@@ -34,6 +34,7 @@ impl BrowserHandle {
         Self::default()
     }
 
+    /// True when the shared browser session is connected (cheap atomic load; safe to poll per frame).
     pub fn is_connected(&self) -> bool {
         self.connected.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -848,5 +849,15 @@ impl Tool for BrowserClickCoords {
             Ok(r) => ok_json(json!({ "ok": r.ok, "detail": r.detail })),
             Err(e) => err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Fresh process: the process-global shared handle starts disconnected
+    /// (T6: `BrowserHandle::is_connected` accessor for UI indicators).
+    #[test]
+    fn browser_shared_handle_starts_disconnected() {
+        assert!(!crate::tools::browser_tools::shared_browser_handle().is_connected());
     }
 }

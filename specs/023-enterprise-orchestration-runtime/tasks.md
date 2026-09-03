@@ -130,7 +130,7 @@
 ### Implementation for User Story 6
 
 - [X] T025 [P] [US6] Add `ModeRoute::{SingleWorker, DagSubagents, ParallelSubagents}` variants and `route_mode_from_graph(hint: &ExecutionHint) -> ModeRoute` in crates/joey-cli/src/hypercode.rs implementing the FR-023 decision table (overlap→SingleWorker; strict depth>2→DagSubagents; independent≥2+coordination→Team; independent≥2→ParallelSubagents; else SingleWorker); route_mode and its existing variants remain unchanged; unit tests cover all five branches
-- [ ] T026 [US6] Switch flag-on call sites in crates/joey-cli/src/hypercode.rs (replacing the workstream_count>=2 heuristic at the route decision) and pre-seed team_tasks from the validated graph in team runs (FR-024); extend crates/joey-cli/src/tests/hypercode_team.rs with graph-seeded team assertions
+- [X] T026 [US6] Switch flag-on call sites in crates/joey-cli/src/hypercode.rs (replacing the workstream_count>=2 heuristic at the route decision) and pre-seed team_tasks from the validated graph in team runs (FR-024); extend crates/joey-cli/src/tests/hypercode_team.rs with graph-seeded team assertions
 
 **Checkpoint**: Team mode is graph-driven, not count-driven.
 
@@ -145,7 +145,7 @@
 ### Implementation for User Story 7
 
 - [X] T027 [P] [US7] Implement crates/joey-neurocode/src/memory/outcomes.rs: additive `CREATE TABLE IF NOT EXISTS outcome_memory` store (NEUROCODE_SCHEMA_VERSION stays 3), OutcomeMemory per data-model.md, record only from VerifiedOutcome, consult-by-signature/artifact with artifact-hash re-check → expire/down-rank (FR-025/FR-026, SC-008); unit tests with an in-memory DB
-- [ ] T028 [US7] Wire record_outcome from evaluator completions and consult in the analysis plane when `neurocode.enterprise_context.enabled` is on, in crates/joey-cli/src/hypercode.rs plus the analyzer call path; OMO notepad text (extract_wisdom/accumulate_wisdom) is no longer used as execution guidance on the flag-on path; unit test asserting zero records from unverified tasks
+- [X] T028 [US7] Wire record_outcome from evaluator completions and consult in the analysis plane when `neurocode.enterprise_context.enabled` is on, in crates/joey-cli/src/hypercode.rs plus the analyzer call path; OMO notepad text (extract_wisdom/accumulate_wisdom) is no longer used as execution guidance on the flag-on path; unit test asserting zero records from unverified tasks
 - [X] T034 [P] [US7] Add the SC-009 failure-recurrence A/B integration test crates/joey-neurocode/tests/outcome_memory_recurrence.rs: deterministic fake-repair harness where a worker with a known failure signature fails unless its consulted guidance contains a verified lesson matching that signature; run the fixture cycle 8 times with consultation off (unmatched baseline — count recurrences) and 8 times with one recorded verified lesson and consultation on; assert the lesson-matched recurrence count is at least 50% lower than the baseline count (SC-009)
 
 **Checkpoint**: Memory is structured, provenance-aware and self-expiring.
@@ -158,7 +158,7 @@
 
 **Independent Test**: quickstart §7/§8 review clauses — high-risk task reviewed with findings blocking approval; low-risk task unreviewed; missing reviewer records a notice.
 
-- [ ] T029 [US8] Implement risk-triggered review in the evaluation path (crates/joey-cli/src/hypercode.rs + evaluator wiring): invoke the existing oracle/momus personas as reviewers (not team members — team.rs:220 rejects them there) when RiskAssessment is High per FR-022, feed Findings into DefectBundle, record a notice-and-proceed when no reviewer is configured; unit tests for trigger/no-trigger/notice paths
+- [X] T029 [US8] Implement risk-triggered review in the evaluation path (crates/joey-cli/src/hypercode.rs + evaluator wiring): invoke the existing oracle/momus personas as reviewers (not team members — team.rs:220 rejects them there) when RiskAssessment is High per FR-022, feed Findings into DefectBundle, record a notice-and-proceed when no reviewer is configured; unit tests for trigger/no-trigger/notice paths
 
 **Checkpoint**: Risky changes get independent eyes before approval.
 
@@ -167,9 +167,9 @@
 ## Phase 11: Polish & Cross-Cutting Concerns
 
 - [X] T030 [P] Update docs/ (architecture/orchestration sections) and PORTING.md with the new subsystem parity status (dates, Complete/Partial/Deliberate-deviation entries per repo convention)
-- [ ] T031 [P] Execute quickstart.md scenarios §1–§9 end-to-end on a scratch repository with JOEY_HOME isolation; record results (pass/fail per scenario) in specs/023-enterprise-orchestration-runtime/quickstart.md as an appended validation log
-- [ ] T032 Verify SC-001 flag-off parity: full `cargo build --workspace` + `cargo test --workspace` green with both flags defaulted false, no `~/.joey/hypercode/` tree created on legacy runs; collect the parity evidence summary in the feature directory
-- [ ] T033 Execute FR-028: flip both flag defaults to true in crates/joey-core/src/config.rs once T032's parity evidence is recorded, update the default-config unit tests, and re-run the full workspace suite
+- [X] T031 [P] Execute quickstart.md scenarios §1–§9 end-to-end on a scratch repository with JOEY_HOME isolation; record results (pass/fail per scenario) in specs/023-enterprise-orchestration-runtime/quickstart.md as an appended validation log
+- [X] T032 Verify SC-001 flag-off parity: full `cargo build --workspace` + `cargo test --workspace` green with both flags defaulted false, no `~/.joey/hypercode/` tree created on legacy runs; collect the parity evidence summary in the feature directory
+- [X] T033 Execute FR-028: flip both flag defaults to true in crates/joey-core/src/config.rs once T032's parity evidence is recorded, update the default-config unit tests, and re-run the full workspace suite
 
 ---
 
@@ -240,3 +240,9 @@ Each subsequent story adds one independently testable capability: typed plans (U
 - Story labels map tasks to spec.md user stories for traceability.
 - Every task's verification is `cargo build -p <crate>` + `cargo test -p <crate>` [filter] (targeted), with the full workspace suite run at phase checkpoints and before T033.
 - Commit after each task or logical group; keep `cargo build --workspace` and `cargo test --workspace` green on every increment.
+
+## Phase 12: Convergence
+
+- [X] T035 Wire the FR-026/SC-008 artifact-hash expiry into a production consult path: on flag-on lesson consult (crates/joey-cli/src/hypercode.rs dispatch-time consult ~1543-1577 and/or the analysis plane `context_for` in crates/joey-neurocode/src/analysis.rs ~356-371), re-check the referenced artifacts' current state via the dependency-graph store and expire/down-rank materially-changed lessons using `OutcomeStore::consult_by_artifacts` + `mark_expired_where_artifacts` (both currently production-dead at crates/joey-neurocode/src/memory/outcomes.rs:227/:248), so every materially-changed lesson is expired or down-ranked within the next run that consults it; unit tests covering changed-artifact expiry and unchanged-artifact survival per FR-026/SC-008 (partial)
+
+- [X] T036 Mirror the execute-path US7/US8 wiring into the resume path in crates/joey-cli/src/hypercode.rs `resume_execution_run` (~1872-1933): attach `MomusReviewer` via `.with_reviewer` to the gate at ~1914 so resumed High-risk tasks undergo FR-022 review instead of notice-and-proceed, open/attach the outcomes.db store when `neurocode.enterprise_context.enabled` and call `record_verified_outcomes` after `run_to_completion` per FR-025 (currently `outcome_store: None` at ~1922 with no post-run recording), and drain `gate.review_events()` into the run evidence as `EvidenceKind::ReviewOutcome` records; extend scheduler_resume/evaluator tests to cover a resumed high-risk review and post-resume lesson recording (partial)

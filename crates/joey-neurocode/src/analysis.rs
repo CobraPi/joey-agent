@@ -114,6 +114,11 @@ pub struct AnalysisEngine {
     project_root: PathBuf,
     base_verification: VerificationPlan,
     outcomes: Mutex<OutcomeMemoryBuffer>,
+    /// T028 (US7): optional SQLite outcome store attached by the runtime
+    /// — `record_outcome` writes through to it and `context_for` consults
+    /// it in addition to the in-memory buffer. `None` keeps the engine
+    /// behaving exactly as before (additive).
+    attached_store: Option<Arc<Mutex<crate::memory::outcomes::OutcomeStore>>>,
 }
 
 impl AnalysisEngine {
@@ -148,7 +153,19 @@ impl AnalysisEngine {
             project_root,
             base_verification,
             outcomes: Mutex::new(OutcomeMemoryBuffer::default()),
+            attached_store: None,
         }
+    }
+
+    /// T028 (US7): attach the SQLite outcome store. record_outcome then
+    /// writes through to it, and consults read from it in addition to the
+    /// in-memory buffer. Additive: engines without a store behave exactly
+    /// as before.
+    pub fn attach_outcome_store(
+        &mut self,
+        store: std::sync::Arc<std::sync::Mutex<crate::memory::outcomes::OutcomeStore>>,
+    ) {
+        self.attached_store = Some(store);
     }
 }
 
@@ -337,11 +354,44 @@ impl EnterpriseTaskAnalyzer for AnalysisEngine {
         }
 
         // Lessons: consult outcome memory by task signature.
-        let lessons = self
+        let mut lessons = self
             .outcomes
             .lock()
             .expect("outcome memory buffer poisoned")
             .consult_by_signature(&task_signature(task));
+        // T028 (US7): also consult the attached SQLite store by the SAME
+        // signature, surfacing store lessons exactly like buffer lessons
+        // (buffer lessons first, store lessons after).
+        if let Some(store) = &self.attached_store {
+            if let Ok(guard) = store.lock() {
+                // T035 (FR-026/SC-008): before surfacing store lessons,
+                // expire those whose referenced artifacts changed
+                // materially since confirmation — the re-check runs on
+                // every consult, so a changed lesson can never surface
+                // as guidance.
+                if let Some(graph) = self.graph.as_ref() {
+                    if let Ok(g) = graph.lock() {
+                        let root = &self.project_root;
+                        let expired =
+                            crate::memory::outcomes::expire_stale_lessons(&guard, |id| {
+                                g.store()
+                                    .get_node(id)
+                                    .ok()
+                                    .flatten()
+                                    .map(|n| root.join(n.source_path))
+                            });
+                        if expired > 0 {
+                            eprintln!(
+                                "neurocode: expired {expired} outcome lesson(s) whose artifacts changed (FR-026)"
+                            );
+                        }
+                    }
+                }
+                if let Ok(store_lessons) = guard.consult_by_signature(&task_signature(task)) {
+                    lessons.extend(store_lessons);
+                }
+            }
+        }
 
         TaskContext {
             task_id: task.id.clone(),
@@ -371,6 +421,13 @@ impl EnterpriseTaskAnalyzer for AnalysisEngine {
             .lock()
             .expect("outcome memory buffer poisoned")
             .record(outcome);
+        // T028 (US7): write through to the attached SQLite store when one
+        // is present (best-effort — store errors degrade to buffer-only).
+        if let Some(store) = &self.attached_store {
+            if let Ok(guard) = store.lock() {
+                let _ = guard.record(outcome);
+            }
+        }
     }
 }
 
@@ -764,6 +821,160 @@ mod tests {
         assert_eq!(lesson.confidence, 90);
         assert_eq!(lesson.hit_count, 0);
         assert!(!lesson.last_confirmed_at.is_empty());
+    }
+
+    /// T028 (US7): record_outcome writes through to an attached SQLite
+    /// outcome store (exactly one row carrying the outcome's signature).
+    #[test]
+    fn attached_store_receives_record_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _shared) = make_engine(dir.path());
+        let store = Arc::new(Mutex::new(
+            crate::memory::outcomes::OutcomeStore::open_in_memory().unwrap(),
+        ));
+        engine.attach_outcome_store(store.clone());
+        let outcome = VerifiedOutcome {
+            task_signature: "t1|fix the NPE|src/hub.rs".to_string(),
+            repository_revision: "rev1".to_string(),
+            artifact_ids: vec![5],
+            policy_ids: vec!["p".to_string()],
+            failure_signature: Some("NPE at Hub".to_string()),
+            resolution: Some("guard the lookup".to_string()),
+            evidence_ids: vec!["e1".to_string()],
+            confidence: 90,
+        };
+        engine.record_outcome(&outcome);
+        let rows = store.lock().unwrap().all_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_signature, "t1|fix the NPE|src/hub.rs");
+    }
+
+    /// T028 (US7): context_for surfaces lessons recorded in an attached
+    /// store whose signature matches the task (TaskContext's lesson-bearing
+    /// field is `lessons: Vec<OutcomeMemory>`).
+    #[test]
+    fn context_for_surfaces_store_lesson() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _shared) = make_engine(dir.path());
+        let store = Arc::new(Mutex::new(
+            crate::memory::outcomes::OutcomeStore::open_in_memory().unwrap(),
+        ));
+        let task = AnalysisTask {
+            id: "t1".to_string(),
+            objective: "migrate the schema".to_string(),
+            dependencies: vec![],
+            read_set: vec![],
+            write_set: vec![PathBuf::from("sub/x.rs")],
+            risk: RiskLevel::Low,
+            verification: VerificationPlan::default(),
+        };
+        // Record a lesson into the attached store with the task's signature.
+        store
+            .lock()
+            .unwrap()
+            .record(&VerifiedOutcome {
+                task_signature: task_signature(&task),
+                repository_revision: "rev1".to_string(),
+                artifact_ids: vec![5],
+                policy_ids: vec![],
+                failure_signature: Some("NPE at Hub".to_string()),
+                resolution: Some("guard the lookup".to_string()),
+                evidence_ids: vec!["e1".to_string()],
+                confidence: 90,
+            })
+            .unwrap();
+        engine.attach_outcome_store(store);
+        let context = engine.context_for(&task);
+        assert!(context.lessons.len() >= 1);
+        assert!(
+            context
+                .lessons
+                .iter()
+                .any(|l| l.resolution.as_deref() == Some("guard the lookup"))
+        );
+    }
+
+    /// T035 (FR-026/SC-008): context_for expires attached-store lessons
+    /// whose referenced graph artifact changed materially (future-mtime
+    /// file) before the consult, while unchanged lessons still surface.
+    /// Uses the real path: a seeded in-memory graph (`upsert_node`) whose
+    /// `source_path` is project-relative, joined with project_root.
+    #[test]
+    fn context_for_expires_changed_artifact_lessons() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        // One materially-changed file (future mtime), one unchanged (past).
+        let set_mtime = |rel: &str, mtime: std::time::SystemTime| {
+            let p = root.join(rel);
+            fs::write(&p, "x\n").unwrap();
+            let mut f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(mtime).unwrap();
+        };
+        let now = std::time::SystemTime::now();
+        set_mtime("src/Changed.java", now + std::time::Duration::from_secs(3600));
+        set_mtime("src/Stable.java", now - std::time::Duration::from_secs(3600));
+
+        let (mut engine, shared) = make_engine(root);
+        let (changed_id, stable_id) = {
+            let graph = shared.lock().unwrap();
+            let changed_id = graph
+                .upsert_node(&CodeArtifactNode::new(
+                    ArtifactKind::Class,
+                    "com.ex.Changed".into(),
+                    "com.ex".into(),
+                    "src/Changed.java".into(),
+                ))
+                .unwrap();
+            let stable_id = graph
+                .upsert_node(&CodeArtifactNode::new(
+                    ArtifactKind::Class,
+                    "com.ex.Stable".into(),
+                    "com.ex".into(),
+                    "src/Stable.java".into(),
+                ))
+                .unwrap();
+            (changed_id, stable_id)
+        };
+
+        let store = Arc::new(Mutex::new(
+            crate::memory::outcomes::OutcomeStore::open_in_memory().unwrap(),
+        ));
+        let task = AnalysisTask {
+            id: "t1".to_string(),
+            objective: "migrate the schema".to_string(),
+            dependencies: vec![],
+            read_set: vec![],
+            write_set: vec![PathBuf::from("sub/x.rs")],
+            risk: RiskLevel::Low,
+            verification: VerificationPlan::default(),
+        };
+        let lesson = |artifact: u64| VerifiedOutcome {
+            task_signature: task_signature(&task),
+            repository_revision: "rev1".to_string(),
+            artifact_ids: vec![artifact],
+            policy_ids: vec![],
+            failure_signature: None,
+            resolution: Some(format!("lesson for artifact {artifact}")),
+            evidence_ids: vec![],
+            confidence: 90,
+        };
+        {
+            let mut guard = store.lock().unwrap();
+            guard.record(&lesson(changed_id)).unwrap();
+            guard.record(&lesson(stable_id)).unwrap();
+        }
+        engine.attach_outcome_store(store);
+
+        let context = engine.context_for(&task);
+        // The changed artifact's lesson is expired pre-consult; the stable
+        // artifact's lesson surfaces.
+        assert_eq!(context.lessons.len(), 1);
+        assert_eq!(
+            context.lessons[0].resolution.as_deref(),
+            Some(&*format!("lesson for artifact {stable_id}"))
+        );
     }
 
     #[test]

@@ -176,14 +176,30 @@ pub fn needs_replan(graph: &TaskGraph) -> bool {
     })
 }
 
+/// Optional observer for graph transitions: invoked with the full graph
+/// snapshot JSON (`TaskGraph::snapshot()`) immediately after it is
+/// persisted, so UIs can watch task-graph progress live.
+pub type SnapshotSink = std::sync::Arc<dyn Fn(serde_json::Value) + Send + Sync>;
+
 /// The deterministic wave scheduler (FR-011).
 pub struct Scheduler {
     config: SchedulerConfig,
+    snapshot_sink: Option<SnapshotSink>,
 }
 
 impl Scheduler {
     pub fn new(config: SchedulerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            snapshot_sink: None,
+        }
+    }
+
+    /// Builder-style: attach a [`SnapshotSink`], fired with the graph
+    /// snapshot JSON right after every persisted transition.
+    pub fn with_snapshot_sink(mut self, sink: SnapshotSink) -> Self {
+        self.snapshot_sink = Some(sink);
+        self
     }
 
     /// Runs the graph to completion in deterministic waves.
@@ -274,6 +290,7 @@ impl Scheduler {
                     group,
                     &graph_m,
                     &run_m,
+                    &self.snapshot_sink,
                     &ledger_m,
                     &stats_m,
                     &semaphore,
@@ -315,6 +332,7 @@ fn with_stats<R>(m: &Mutex<&mut RunStats>, f: impl FnOnce(&mut RunStats) -> R) -
 fn transition_and_persist(
     graph_m: &Mutex<&mut TaskGraph>,
     run_m: &Mutex<&mut RunHandle>,
+    sink: &Option<SnapshotSink>,
     id: &TaskId,
     to: TaskStatus,
     cause: &str,
@@ -359,6 +377,11 @@ fn transition_and_persist(
                 eprintln!("joey-orchestration: failed to write graph snapshot: {e}");
             }
         });
+        // Fire the snapshot sink (if attached) with the same JSON value
+        // that was just persisted.
+        if let Some(sink) = sink {
+            sink(graph_json.clone());
+        }
     }
 }
 
@@ -369,6 +392,7 @@ async fn process_group(
     group: Vec<TaskId>,
     graph_m: &Mutex<&mut TaskGraph>,
     run_m: &Mutex<&mut RunHandle>,
+    sink: &Option<SnapshotSink>,
     ledger_m: &tokio::sync::Mutex<&mut RepairLedger>,
     stats_m: &Mutex<&mut RunStats>,
     semaphore: &Arc<tokio::sync::Semaphore>,
@@ -382,6 +406,7 @@ async fn process_group(
             id,
             graph_m,
             run_m,
+            sink,
             ledger_m,
             stats_m,
             semaphore,
@@ -401,6 +426,7 @@ async fn process_task(
     id: TaskId,
     graph_m: &Mutex<&mut TaskGraph>,
     run_m: &Mutex<&mut RunHandle>,
+    sink: &Option<SnapshotSink>,
     ledger_m: &tokio::sync::Mutex<&mut RepairLedger>,
     stats_m: &Mutex<&mut RunStats>,
     semaphore: &Arc<tokio::sync::Semaphore>,
@@ -439,6 +465,7 @@ async fn process_task(
     transition_and_persist(
         graph_m,
         run_m,
+        sink,
         &id,
         TaskStatus::Ready,
         "dependency_completed",
@@ -447,6 +474,7 @@ async fn process_task(
     transition_and_persist(
         graph_m,
         run_m,
+        sink,
         &id,
         TaskStatus::Dispatched,
         "dependency_completed",
@@ -467,6 +495,7 @@ async fn process_task(
         transition_and_persist(
             graph_m,
             run_m,
+            sink,
             &id,
             TaskStatus::Evaluating,
             "worker_completed",
@@ -478,6 +507,7 @@ async fn process_task(
             transition_and_persist(
                 graph_m,
                 run_m,
+                sink,
                 &id,
                 TaskStatus::Failed,
                 "worker_completed",
@@ -506,6 +536,7 @@ async fn process_task(
                 transition_and_persist(
                     graph_m,
                     run_m,
+                    sink,
                     &id,
                     TaskStatus::Completed,
                     "gate_passed",
@@ -518,6 +549,7 @@ async fn process_task(
                 transition_and_persist(
                     graph_m,
                     run_m,
+                    sink,
                     &id,
                     TaskStatus::Degraded,
                     "degraded",
@@ -535,6 +567,7 @@ async fn process_task(
                 transition_and_persist(
                     graph_m,
                     run_m,
+                    sink,
                     &id,
                     TaskStatus::Dispatched,
                     "repair_scheduled",
@@ -552,6 +585,7 @@ async fn process_task(
                 transition_and_persist(
                     graph_m,
                     run_m,
+                    sink,
                     &id,
                     TaskStatus::Dispatched,
                     "escalated",
@@ -563,6 +597,7 @@ async fn process_task(
                 transition_and_persist(
                     graph_m,
                     run_m,
+                    sink,
                     &id,
                     TaskStatus::Failed,
                     "gate_failed",
@@ -811,6 +846,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_sink_observes_transitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = node("a", &["src/a.rs"]);
+        let mut b = node("b", &["src/b.rs"]);
+        b.dependencies = ids(&["a"]);
+        let mut graph = graph_of(vec![a, b]);
+        let mut run = run_handle(tmp.path());
+
+        let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_capture = captured.clone();
+        let scheduler = Scheduler::new(SchedulerConfig::default()).with_snapshot_sink(Arc::new(
+            move |v: serde_json::Value| {
+                sink_capture.lock().unwrap().push(v);
+            },
+        ));
+        let stats = scheduler
+            .run_to_completion(&mut graph, &mut run, &OkDispatcher::new(), &PassGate, tmp.path())
+            .await;
+
+        assert_eq!(stats.completed, 2);
+
+        let snapshots = captured.lock().unwrap();
+        assert!(
+            !snapshots.is_empty(),
+            "sink must receive at least one snapshot"
+        );
+        let last = snapshots.last().unwrap().clone();
+        let final_graph: TaskGraph = serde_json::from_value(last)
+            .expect("last snapshot deserializes back into a TaskGraph");
+        assert!(
+            final_graph.nodes.values().all(|n| n.status.is_terminal()),
+            "all nodes must be terminal (Completed/Failed/Skipped) in the last snapshot"
+        );
+        assert_eq!(final_graph.nodes.len(), 2);
     }
 
     #[tokio::test]

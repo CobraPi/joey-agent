@@ -248,7 +248,7 @@ async fn budget_watcher(
 ///
 /// ```text
 /// [SUBAGENT COMPLETE|FAILED|STOPPED] id=<id> goal=<goal> outcome=<...> tokens=<n> duration=<secs>s
-/// <summary ≤500 tokens>
+/// <summary ≤1000 tokens>
 /// ```
 ///
 /// COMPLETE for natural success (`outcome=success`), FAILED for failure
@@ -541,6 +541,7 @@ where
             model: req.model.clone(),
             toolsets: req.toolsets.clone(),
             role: None,
+            subagent_type: None,
             background: true,
             // T021: per-child budgets ride the registry record so
             // status/overview can show caps vs consumption (FR-012) and the

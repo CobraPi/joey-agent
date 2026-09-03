@@ -811,7 +811,10 @@ fn explorer_still_owns_keys_without_pane_and_on_mode_pane() {
     explorer_key_routed(&mut m, KeyCode::Tab);
     assert_eq!(m.neurocode_viz.tab, VizTab::Nodes, "no pane: explorer ate Tab");
     explorer_key_routed(&mut m, KeyCode::Tab);
-    assert_eq!(m.neurocode_viz.tab, VizTab::Feed, "no pane: explorer cycles again");
+    // 4-tab cycle since the tasks-DAG feature: Graph → Nodes → Tasks → Feed.
+    assert_eq!(m.neurocode_viz.tab, VizTab::Tasks, "no pane: explorer cycles again");
+    explorer_key_routed(&mut m, KeyCode::Tab);
+    assert_eq!(m.neurocode_viz.tab, VizTab::Feed, "no pane: explorer cycles to Feed");
     assert!(!m.agent_picker_open, "the global Tab arm never ran");
 
     // Case 2: mode-spawned pane focused → explorer still gets keys.

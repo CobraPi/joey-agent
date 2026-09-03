@@ -50,11 +50,40 @@ model-label updates via events.
 
 ## Views and panels (widgets.rs)
 
-Particle background, header (spinner + pulse), transcript with scrollbar
-and streaming assistant/reasoning text ("Thought for Ns" footer), reasoning
-panel, OMO agent panel, multi-line input editor, status bar (token
-accounting, elapsed), help overlay, search bar, agent picker, and a
-slash-command popup.
+Particle background, header (spinner + pulse, task badge while a hypercode
+execution graph is live), transcript with scrollbar and streaming
+assistant/reasoning text ("Thought for Ns" footer), reasoning panel, OMO
+agent panel (with goal line), multi-line input editor, status bar (token
+accounting, elapsed, feature indicator chips), agent-stats page (with a
+systems section), help overlay, search bar, agent picker, a slash-command
+popup, and the NeuroCode explorer's hypercode tasks tab.
+
+## Feature indicators
+
+Lightweight chips and badges that surface orchestration/systems state at
+a glance (see `state.rs` "Feature indicators" fields):
+
+- **Status-bar chips** (`draw_status`):
+  - `↻{n}` — provider retries seen this turn (reset on each new turn;
+    fed by `RetryAttempt` events).
+  - `⟳{n}` — context compactions this session; agent-core emits real
+    `CompressionStart`/`CompressionEnd` events around post-tool-round
+    compaction and the TUI counts them.
+  - `◐ web` — a headless browser session is connected (shared browser
+    handle).
+  - `⚙{n}` — configured MCP servers (connected server names from the
+    `mcp_servers` config).
+- **Header task badge** — `⚑{done}/{total}` renders while a hypercode
+  execution graph is live (green once every task has completed). Data
+  comes from `EngineEvent::TaskGraphSnapshot`: the orchestration
+  scheduler streams the graph JSON on every persisted transition, plus an
+  initial snapshot when the graph is built or resumed.
+- **OMO goal line** — the OMO panel shows `◎ {objective}` plus the goal's
+  age while a goal is set (`GoalSet` / `GoalCleared` events).
+- **Stats-page systems section** (Ctrl+A) — browser connected/offline,
+  the MCP server list, cron jobs (name / schedule / next run / enabled,
+  read from `~/.joey/cron/jobs.json`), compaction + retry counters, and a
+  task-graph progress line.
 
 ## Animated header gradient bar (agent-active indicator)
 
@@ -437,6 +466,29 @@ When the NeuroCode engine is active (`neurocode.enabled: true` in config):
   keep flowing live in both.
 - The panel yields entirely on narrow/short terminals or when NeuroCode is
   off — the layout is byte-identical to pre-feature when inactive.
+
+### NeuroCode explorer — hypercode tasks tab
+
+The fullscreen explorer (click the docked feed to expand it) now has a
+`tasks` tab (**key 3**; the raw context feed moved to **key 4**, graph
+canvas 1, node list 2 — Tab still cycles). It renders the live hypercode
+task DAG:
+
+- Task boxes are layered by dependency depth, with arrows drawn along
+  dependency edges.
+- Status glyphs: `○` Pending, `◉` Ready, `►` Dispatched, `?` Evaluating,
+  `✓` Completed, `✗` Failed, `⚠` Degraded, `⛔` Blocked, `⤳` Skipped.
+- Selecting a task opens a detail pane: objective, status, attempt count,
+  dependencies, and read/write sets.
+- A counts line (`tasks {done}/{total} · …`) tracks overall progress.
+- The tab works even without a NeuroCode snapshot, and the tab bar is
+  always visible now (it used to hide without a snapshot).
+
+The DAG data rides `EngineEvent::TaskGraphSnapshot` — the same scheduler
+stream that drives the header's `⚑` badge — so transitions appear live
+as the orchestration scheduler persists them. The tab requires
+`hypercode.execution_graph.enabled` (on by default) — with the graph
+disabled there is no task DAG to render.
 
 ## Mid-turn messaging (Hermes parity)
 

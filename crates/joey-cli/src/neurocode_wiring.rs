@@ -344,7 +344,7 @@ mod tests {
         // resolve_tier_model consult the frontier tier.
         let model_yaml = "model:\n  provider: zai\n  default: glm-5.2\n";
         let config = config_with_yaml(&format!(
-            "{}neurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    frontier:\n      model: legacy-frontier\n    providers:\n      zai:\n        frontier: glm-5.2\n",
+            "{}hypercode:\n  enabled: true\nneurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    frontier:\n      model: legacy-frontier\n    providers:\n      zai:\n        frontier: glm-5.2\n",
             model_yaml
         ));
         let engine = try_build_engine(&config).unwrap();
@@ -412,7 +412,7 @@ mod tests {
         // model → resolve_profile magnetizes onto ai-usage-hud.
         let engine = try_build_engine_for_agent_inputs(
             &config_with_yaml(
-                "neurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    frontier:\n      model: legacy-frontier\n    providers:\n      ai-usage-hud:\n        frontier: gpt-5.4\n        economical: gpt-4.1-mini\n",
+                "hypercode:\n  enabled: true\nneurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    frontier:\n      model: legacy-frontier\n    providers:\n      ai-usage-hud:\n        frontier: gpt-5.4\n        economical: gpt-4.1-mini\n",
             ),
             "auto",
             "",
@@ -425,7 +425,7 @@ mod tests {
         // (e.g. glm-5.2 → zai) — proving the agent-triple scope is what
         // pins the engine to ai-usage-hud here.
         let config = config_with_yaml(
-            "model:\n  provider: auto\n  default: glm-5.2\nneurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    frontier:\n      model: legacy-frontier\n    providers:\n      ai-usage-hud:\n        frontier: gpt-5.4\n        economical: gpt-4.1-mini\n",
+            "model:\n  provider: auto\n  default: glm-5.2\nhypercode:\n  enabled: true\nneurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    frontier:\n      model: legacy-frontier\n    providers:\n      ai-usage-hud:\n        frontier: gpt-5.4\n        economical: gpt-4.1-mini\n",
         );
         let engine = try_build_engine_for_agent_inputs(&config, "auto", "", "glm-5.2").unwrap();
         // glm is NOT copilot-servable → agent runs on zai → the HUD keys are
@@ -449,7 +449,7 @@ mod tests {
         // runs with a session model override of glm-5.2 (auto-detected zai).
         // The agent-triple scope must resolve zai and read zai's keys.
         let config = config_with_yaml(
-            "model:\n  provider: auto\n  default: gpt-5.4\nneurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    providers:\n      ai-usage-hud:\n        frontier: gpt-5.4\n        economical: gpt-4.1-mini\n      zai:\n        frontier: glm-5.2\n        economical: glm-4.5-flash\n",
+            "model:\n  provider: auto\n  default: gpt-5.4\nhypercode:\n  enabled: true\nneurocode:\n  enabled: true\n  tier:\n    ambiguous_default: frontier\n    providers:\n      ai-usage-hud:\n        frontier: gpt-5.4\n        economical: gpt-4.1-mini\n      zai:\n        frontier: glm-5.2\n        economical: glm-4.5-flash\n",
         );
         let engine = try_build_engine_for_agent_inputs(&config, "auto", "", "glm-5.2").unwrap();
         assert_eq!(engine.resolve_tier_model().as_deref(), Some("glm-5.2"));

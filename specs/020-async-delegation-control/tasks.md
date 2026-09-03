@@ -69,7 +69,7 @@
 
 ## Phase 4: User Story 2 - Completion Notifications (Priority: P1)
 
-**Goal**: Distilled completion notices ("[SUBAGENT COMPLETE|FAILED|STOPPED] id= goal= outcome= tokens= duration=s" + summary ≤500 tokens) delivered at the next turn boundary; failures never dropped; idle wake
+**Goal**: Distilled completion notices ("[SUBAGENT COMPLETE|FAILED|STOPPED] id= goal= outcome= tokens= duration=s" + summary ≤1000 tokens) delivered at the next turn boundary; failures never dropped; idle wake
 
 **Independent Test**: run a background child to completion while idle and observe the distilled notice arrive via idle wake (TUI) or next interaction (line REPL)
 
@@ -77,7 +77,7 @@
 
 > **NOTE: Write these tests FIRST, ensure they FAIL before implementation**
 
-- [x] T011 [P] [US2] Write notice tests in crates/joey-orchestration/tests/notices.rs: distilled "[SUBAGENT COMPLETE|FAILED|STOPPED] id= goal= outcome= tokens= duration=s" format with summary ≤500 tokens (FR-003/004/016), failure completions never dropped (SC-002), and notice size stays bounded regardless of child transcript length — context grows with subagent count, not activity volume (SC-006)
+- [x] T011 [P] [US2] Write notice tests in crates/joey-orchestration/tests/notices.rs: distilled "[SUBAGENT COMPLETE|FAILED|STOPPED] id= goal= outcome= tokens= duration=s" format with summary ≤1000 tokens (FR-003/004/016), failure completions never dropped (SC-002), and notice size stays bounded regardless of child transcript length — context grows with subagent count, not activity volume (SC-006)
 
 ### Implementation for User Story 2
 

@@ -29,7 +29,7 @@ All entities below are **in-memory, session lifetime**; this feature introduces 
   - Existing fields unchanged, plus: `stop_reason: Option<StopReason>` (`None` for natural completion/failure).
 
 - **CompletionNotice** *(formatted string, pushed via the existing background-completion queue)*
-  - Grammar: `[SUBAGENT <COMPLETE|FAILED|STOPPED>] id=<id> goal=<goal> outcome=<success|failure|stop_reason> tokens=<total> duration=<secs>s` + newline + distilled summary (≤500 tokens).
+  - Grammar: `[SUBAGENT <COMPLETE|FAILED|STOPPED>] id=<id> goal=<goal> outcome=<success|failure|stop_reason> tokens=<total> duration=<secs>s` + newline + distilled summary (≤1000 tokens).
   - States are distinguishable per FR-016.
 
 - **SteeringMessage**

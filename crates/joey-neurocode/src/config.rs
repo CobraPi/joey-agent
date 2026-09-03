@@ -43,6 +43,14 @@ use crate::classifier::ComplexityTier;
 pub struct NeuroCodeConfig {
     /// Whether NeuroCode is enabled (default-off, FR-003).
     pub enabled: bool,
+    /// Snapshot of the HyperCode orchestrator-active state
+    /// (`hypercode.enabled && hypercode.orchestrator_mode`; the mode flag
+    /// defaults to true, matching `orchestrator_active` in joey-cli).
+    /// Tier-model routing is part of the HyperCode experience: when not
+    /// orchestrator-active the agent must stay on the user-configured main
+    /// model (`model.default`), so `resolve_tier_model` returns None. RAG,
+    /// indexing and context enrichment are NOT gated on this.
+    pub hypercode_enabled: bool,
     pub tier: TierConfig,
     pub verify: VerifyConfig,
     pub classifier: ClassifierConfig,
@@ -56,6 +64,7 @@ impl Default for NeuroCodeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            hypercode_enabled: false,
             tier: TierConfig::default(),
             verify: VerifyConfig::default(),
             classifier: ClassifierConfig::default(),
@@ -109,6 +118,8 @@ impl NeuroCodeConfig {
     pub fn from_config(cfg: &joey_core::Config) -> Self {
         Self {
             enabled: cfg.get_bool("neurocode.enabled", false),
+            hypercode_enabled: cfg.get_bool("hypercode.enabled", false)
+                && cfg.get_bool("hypercode.orchestrator_mode", true),
             tier: TierConfig::from_config(cfg),
             verify: VerifyConfig::from_config(cfg),
             classifier: ClassifierConfig::from_config(cfg),

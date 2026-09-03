@@ -120,7 +120,7 @@ The CLI prints compact inline summaries as events arrive:
 ```text
 [explore] spawned → running (model: glm-5)
 [librarian] spawned → running (model: gpt-5.4-mini)
-[explore] done (4.2s, 1500 tokens)
+[explore] done (4.2s, 11000 tokens)
 [oracle] spawned → running (model: gpt-5.6-sol)
 [junior:quick] spawned → running (model: gpt-5.4-mini)
 ```

@@ -62,7 +62,9 @@ subsystem you're working on:
 10. [`orchestration.md`](orchestration.md) — subagent delegation
     (`delegate_task`, SubagentManager) and OMO multi-agent orchestration
     (11 agents, 11 categories, intent gating, goals/boulder/notepads,
-    team mode). Subagents inherit the parent's NeuroCode engine (same
+    team mode), plus the OMO integration (feature 025): persona-aware
+    orchestrator overlay, full-roster delegation, OMO-chain role model
+    defaults. Subagents inherit the parent's NeuroCode engine (same
     graph.db; task-targeted context).
 11. [`cron.md`](cron.md) — the built-in scheduler: schedule kinds, job
     store format, delivery targets, script jobs, and the `joey cron` CLI.
@@ -93,6 +95,9 @@ subsystem you're working on:
     integration: copilot-instructions.md / instructions / prompts / skills
     parsing, the `joey copilot` plugin installer, `/copilot` + `/<prompt>`
     slash commands, and `.github/mcp.json` merge semantics.
+21. [`features/README.md`](features/README.md) — per-crate feature
+    reference — one deep-dive page per workspace crate (APIs, behaviors,
+    configuration, defaults, testing).
 
 All pages were verified against workspace source in August 2026. If code
 and docs disagree, the code wins — and please fix the doc.
@@ -101,9 +106,10 @@ and docs disagree, the code wins — and please fix the doc.
 
 ```
 joey-agent/
-├── Cargo.toml                 workspace manifest (13 member crates)
+├── Cargo.toml                 workspace manifest (17 member crates)
 ├── crates/
 │   ├── joey-core/             branding, config, SQLite state store, logging, redaction
+│   ├── joey-browser/          browser automation over CDP (attach or managed launch)
 │   ├── joey-providers/        LLM provider wire protocols + client
 │   ├── joey-tools/            Tool trait, registry, toolsets, built-in tools
 │   ├── joey-agent-core/       the turn loop, system prompt, context compression
@@ -115,6 +121,9 @@ joey-agent/
 │   ├── joey-llm-selector/     dynamic model allocator (model.default = auto)
 │   ├── joey-orchestration/    subagent manager + delegate_task tool
 │   ├── joey-omo/              multi-agent personas, routing, Atlas plan execution
+│   ├── joey-neurocode/        NeuroCode code-graph intelligence (ingest, tiers, context assembly)
+│   ├── joey-neurocode-rag/    NeuroCode RAG: embedding backends, hybrid search, consent
+│   ├── joey-copilot/          GitHub Copilot `.github/` bundle discovery & plugin manifest
 │   └── joey-speckit-ui/       standalone backend for the SpecKit Visual UI
 ├── docs/                      you are here
 ├── skills/                    Agent Skills bundled with the project

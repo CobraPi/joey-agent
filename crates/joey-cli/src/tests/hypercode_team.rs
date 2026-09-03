@@ -1,4 +1,7 @@
-use crate::hypercode::{format_mode_decision, route_mode, ModeRoute, TeamConfig};
+use crate::hypercode::{
+    execution_hint_from_graph, format_mode_decision, plan_team_seed, route_mode, try_team_run,
+    ModeRoute, OmoRoleDefaults, TeamConfig,
+};
 
 use std::sync::Mutex;
 
@@ -120,7 +123,7 @@ fn lead_request_inherits_orchestrator_model_when_unset_per_fr019() {
     // carries no model override and inherits the orchestrator's effective
     // model at dispatch; a pinned lead_model is forwarded verbatim.
     let cfg = TeamConfig::default();
-    let req = crate::hypercode::lead_request("objective text", "team-a", "lead", &cfg);
+    let req = crate::hypercode::lead_request("objective text", "team-a", "lead", &cfg, &OmoRoleDefaults::default());
     assert!(req.model.is_none(), "empty lead_model must leave model unset (inherit)");
     assert_eq!(req.team.as_deref(), Some("team-a"));
     assert_eq!(req.name.as_deref(), Some("lead"));
@@ -129,7 +132,7 @@ fn lead_request_inherits_orchestrator_model_when_unset_per_fr019() {
 
     let mut pinned = cfg.clone();
     pinned.lead_model = "glm-4.7".to_string();
-    let req = crate::hypercode::lead_request("objective text", "team-a", "lead", &pinned);
+    let req = crate::hypercode::lead_request("objective text", "team-a", "lead", &pinned, &OmoRoleDefaults::default());
     assert_eq!(req.model.as_deref(), Some("glm-4.7"));
 }
 
@@ -145,11 +148,11 @@ fn refused_second_team_records_subagent_decision_per_fr018() {
     std::env::set_var("JOEY_HOME", &home);
     let cfg = config_from_yaml("hypercode:\n  team:\n    enabled: true\n");
     // First team starts fine (2 independent workstreams).
-    let first = crate::hypercode::try_team_run(&cfg, "refusal fixture one", true, false, 2);
+    let first = crate::hypercode::try_team_run(&cfg, "refusal fixture one", true, false, 2, None);
     assert!(matches!(first, Ok(Some(_))), "first team must start: {first:?}");
     let (team_name, _member) = first.unwrap().unwrap();
     // Second team (different objective) is refused while the first is active.
-    let second = crate::hypercode::try_team_run(&cfg, "refusal fixture two", true, false, 3);
+    let second = crate::hypercode::try_team_run(&cfg, "refusal fixture two", true, false, 3, None);
     match second {
         Err(e) => {
             assert!(e.contains("one active team per session"), "refusal reason: {e}");
@@ -165,13 +168,202 @@ fn refused_second_team_records_subagent_decision_per_fr018() {
     }
     // Non-team routing never touches the registry (Ok(None)).
     assert!(matches!(
-        crate::hypercode::try_team_run(&cfg, "single stream", true, false, 1),
+        crate::hypercode::try_team_run(&cfg, "single stream", true, false, 1, None),
         Ok(None)
     ));
     // Cleanup: close the record, restore env, remove temp home.
     if let Some(rec) = joey_orchestration::team::global_teams().get(&team_name) {
         rec.lock().unwrap().close();
     }
+    match prev {
+        Some(v) => std::env::set_var("JOEY_HOME", v),
+        None => std::env::remove_var("JOEY_HOME"),
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---- T026: graph-derived routing + team pre-seeding (FR-023/FR-024) ----
+
+use joey_orchestration::evaluator::VerificationPlanView;
+use joey_orchestration::task_graph::{
+    default_isolation, AcceptanceCriterion, LegacyWorkstream, ModelTier, RiskLevel, TaskGraph,
+    TaskId, TaskNode, TaskStatus, WorkerRole,
+};
+
+fn tid(s: &str) -> TaskId {
+    TaskId::new(s).unwrap()
+}
+
+/// Mirror of `TaskGraph::from_workstreams` node construction (task_graph.rs
+/// ~872-920) for direct struct fixtures.
+fn gnode(id_str: &str, deps: &[&str], read: &[&str], write: &[&str]) -> TaskNode {
+    TaskNode {
+        id: tid(id_str),
+        objective: format!("do {}", id_str),
+        dependencies: deps.iter().map(|d| tid(d)).collect(),
+        read_set: read.iter().map(std::path::PathBuf::from).collect(),
+        write_set: write.iter().map(std::path::PathBuf::from).collect(),
+        artifact_ids: vec![],
+        role: WorkerRole::Implementor,
+        model_tier: ModelTier::Economical,
+        risk: RiskLevel::Low,
+        acceptance: vec![AcceptanceCriterion {
+            criterion: format!("Workstream delivered: {}", id_str),
+            kind: "manual".to_string(),
+        }],
+        verification: VerificationPlanView::default(),
+        isolation: default_isolation(&write.iter().map(std::path::PathBuf::from).collect::<Vec<_>>()),
+        status: TaskStatus::Pending,
+        attempts: 0,
+    }
+}
+
+fn graph_of(nodes: Vec<TaskNode>) -> TaskGraph {
+    TaskGraph {
+        nodes: nodes.into_iter().map(|n| (n.id.clone(), n)).collect(),
+        baseline_revision: "x".into(),
+        run_id: String::new(),
+    }
+}
+
+#[test]
+fn hint_flags_write_overlap_even_when_sequenced() {
+    // a writes src/one.rs; b writes src/one.rs and depends on a — valid
+    // under WRITE_OVERLAP (ancestor-sequenced) but the routing hint is
+    // deliberately broader: any overlap => single worker.
+    let g = graph_of(vec![
+        gnode("a", &[], &[], &["src/one.rs"]),
+        gnode("b", &["a"], &[], &["src/one.rs"]),
+    ]);
+    assert!(execution_hint_from_graph(&g).write_overlap);
+}
+
+#[test]
+fn hint_depth_counts_chain_in_nodes() {
+    // Chain a→b→c (c dep b, b dep a): longest chain is 3 NODES.
+    let g = graph_of(vec![
+        gnode("a", &[], &[], &[]),
+        gnode("b", &["a"], &[], &[]),
+        gnode("c", &["b"], &[], &[]),
+    ]);
+    let hint = execution_hint_from_graph(&g);
+    assert_eq!(hint.strict_dependency_depth, 3);
+    assert_eq!(hint.independent_components, 1);
+}
+
+#[test]
+fn hint_counts_independent_components() {
+    // Three tasks, no deps, empty sets: three independent components.
+    let g = TaskGraph::from_workstreams(
+        &[
+            LegacyWorkstream { id: "1".into(), focus: "one".into() },
+            LegacyWorkstream { id: "2".into(), focus: "two".into() },
+            LegacyWorkstream { id: "3".into(), focus: "three".into() },
+        ],
+        "deadbeef",
+    );
+    let hint = execution_hint_from_graph(&g);
+    assert_eq!(hint.independent_components, 3);
+    assert!(!hint.write_overlap);
+    assert!(!hint.cross_component_coordination);
+}
+
+#[test]
+fn hint_detects_cross_component_coordination() {
+    // a (component 1) writes src/lib.rs; b (component 2, no dep on a)
+    // reads src/lib.rs — independent but needs coordination.
+    let g = graph_of(vec![
+        gnode("a", &[], &[], &["src/lib.rs"]),
+        gnode("b", &[], &["src/lib.rs"], &["src/other.rs"]),
+    ]);
+    let hint = execution_hint_from_graph(&g);
+    assert!(hint.cross_component_coordination);
+    assert_eq!(hint.independent_components, 2);
+}
+
+#[test]
+fn hint_empty_graph_is_all_zero() {
+    let g = TaskGraph {
+        nodes: std::collections::BTreeMap::new(),
+        baseline_revision: "x".into(),
+        run_id: String::new(),
+    };
+    let hint = execution_hint_from_graph(&g);
+    assert_eq!(hint.write_overlap, false);
+    assert_eq!(hint.strict_dependency_depth, 0);
+    assert_eq!(hint.independent_components, 0);
+    assert_eq!(hint.cross_component_coordination, false);
+}
+
+#[test]
+fn plan_team_seed_orders_topologically_and_translates_deps() {
+    // Diamond: a; b dep a; c dep a; d dep b,c.
+    let g = graph_of(vec![
+        gnode("a", &[], &[], &[]),
+        gnode("b", &["a"], &[], &[]),
+        gnode("c", &["a"], &[], &[]),
+        gnode("d", &["b", "c"], &[], &[]),
+    ]);
+    let plan = plan_team_seed(&g);
+    assert_eq!(plan.len(), 4);
+    assert_eq!(plan[0].graph_id, "a");
+    assert_eq!(plan[1].graph_id, "b");
+    assert_eq!(plan[2].graph_id, "c");
+    assert_eq!(plan[3].graph_id, "d");
+    assert_eq!(plan[3].dependencies, vec!["b".to_string(), "c".to_string()]);
+    // Every dependency references an EARLIER item's graph_id.
+    for (i, item) in plan.iter().enumerate() {
+        for dep in &item.dependencies {
+            assert!(
+                plan[..i].iter().any(|p| &p.graph_id == dep),
+                "dep {dep} of item {i} must reference an earlier item"
+            );
+        }
+    }
+}
+
+#[test]
+fn try_team_run_honors_graph_route() {
+    let _g = TEAM_ENV_LOCK.lock().unwrap();
+    let home = std::env::temp_dir().join(format!(
+        "joey-t026-graph-route-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    let prev = std::env::var("JOEY_HOME").ok();
+    std::env::set_var("JOEY_HOME", &home);
+    let cfg = config_from_yaml("hypercode:\n  team:\n    enabled: true\n");
+
+    // Unique goal per run so the team name never collides.
+    let goal = format!("graph route fixture {}", std::process::id());
+
+    // (i) graph-routed Team with count 0 still starts a team.
+    let first = try_team_run(&cfg, &goal, true, false, 0, Some(ModeRoute::Team));
+    let (team_name, _member) = first.unwrap().unwrap();
+    // Cleanup (existing pattern): close the record in the same test.
+    joey_orchestration::team::global_teams()
+        .get(&team_name)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .close();
+
+    // (ii) non-Team graph route => Ok(None) even when eligible by count.
+    assert!(matches!(
+        try_team_run(&cfg, &goal, true, false, 5, Some(ModeRoute::ParallelSubagents)),
+        Ok(None)
+    ));
+    // (iii) Team graph route but explicit workstreams => Ok(None).
+    assert!(matches!(
+        try_team_run(&cfg, &goal, true, true, 5, Some(ModeRoute::Team)),
+        Ok(None)
+    ));
+    // (iv) legacy path (None) with team disabled => Ok(None).
+    assert!(matches!(
+        try_team_run(&cfg, &goal, false, false, 5, None),
+        Ok(None)
+    ));
+
     match prev {
         Some(v) => std::env::set_var("JOEY_HOME", v),
         None => std::env::remove_var("JOEY_HOME"),

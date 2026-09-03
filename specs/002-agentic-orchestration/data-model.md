@@ -46,7 +46,7 @@ The outcome of a completed subagent execution.
 | Field | Type | Description |
 |-------|------|-------------|
 | goal | String | The original goal (for correlation) |
-| summary | String | Concise result summary (<500 tokens target) |
+| summary | String | Concise result summary (<1000 tokens target) |
 | success | bool | Whether the subagent completed without fatal error |
 | error | Option<String> | Error detail if success=false |
 | token_usage | Usage | Total tokens consumed by this subagent |
@@ -210,5 +210,5 @@ ProcessSession registered in ProcessRegistry
 - **Toolset restriction**: If `toolsets` is empty, the subagent gets all
   enabled tools. If specified, only those toolsets' tools are registered.
   delegate_task is always excluded for Leaf role subagents.
-- **Summary token budget**: Target <500 tokens. The summary prompt includes
-  an explicit "Keep your summary under 500 tokens" instruction.
+- **Summary token budget**: Target <1000 tokens. The summary prompt includes
+  an explicit "Keep your summary under 1000 tokens" instruction.

@@ -19,6 +19,36 @@ use crate::manager::SubagentManager;
 use crate::types::{DelegationRequest, SubagentRole, TaskSpec};
 use crate::CategoryResolver;
 
+/// The full OMO agent roster valid as `subagent_type` values (feature 025,
+/// FR-003/FR-010). Kept in one place so the schema enum, the parameter
+/// descriptions, and the unknown-type error can never drift apart. The
+/// runtime resolver stays authoritative — this list is advisory guidance.
+pub(crate) const OMO_ROSTER: &[&str] = &[
+    "sisyphus",
+    "hephaestus",
+    "prometheus",
+    "atlas",
+    "oracle",
+    "librarian",
+    "explore",
+    "multimodal-looker",
+    "metis",
+    "momus",
+    "sisyphus-junior",
+];
+
+/// Directive synthesized as the `prompt_append` for named-agent (subagent_type)
+/// delegations that carry `load_skills` (feature 025, FR-004). Without a
+/// prompt_append the child's skill overlay is silently dropped (subagent.rs
+/// gates the overlay on a non-empty append), so named dispatches synthesize
+/// one that instructs the child to apply its loaded skills under its agent
+/// identity — the same overlay machinery the category path uses.
+pub(crate) fn named_agent_skill_directive(sat: &str) -> String {
+    format!(
+        "You are dispatched as the OMO agent '{sat}'. Load and follow each skill listed above within that agent's identity and constraints."
+    )
+}
+
 // ---------------------------------------------------------------------------
 // HyperCode role routing (explorer / implementor)
 // ---------------------------------------------------------------------------
@@ -101,6 +131,92 @@ impl HyperRole {
     }
 }
 
+/// OMO agent chains for role model defaults (feature 025, FR-005,
+/// contracts/role-defaults.md). Mirrors joey-cli's hypercode derivation —
+/// the config keys are the contract; both sides derive identically. The
+/// orchestration crate cannot depend on joey-omo, so chain members resolve
+/// through the injected CategoryResolver (the same bridge the CLI's
+/// OmoCategoryResolver provides): the first member the resolver can serve
+/// supplies the role's default model.
+pub(crate) fn omo_role_chain_default(
+    role: HyperRole,
+    resolver: &dyn CategoryResolver,
+) -> Option<String> {
+    let chain: &[&str] = match role {
+        HyperRole::Explorer => &["explore", "librarian"],
+        HyperRole::Implementor => &["momus"],
+    };
+    for name in chain {
+        if let Some(r) = resolver.resolve_subagent_type(name) {
+            if !r.model.is_empty() {
+                return Some(r.model);
+            }
+        }
+    }
+    None
+}
+
+/// Direct 1:1 tier→agent mapping (hypercode.omo_specialists.enabled,
+/// default true): Explorer → "explore", Implementor → "hephaestus".
+/// Strict: no chain fallback — an unresolvable agent yields None (the
+/// caller warns and inherits, FR-006 precedence 3 shape).
+pub(crate) fn omo_specialist_agent(role: HyperRole) -> &'static str {
+    match role {
+        HyperRole::Explorer => "explore",
+        HyperRole::Implementor => "hephaestus",
+    }
+}
+
+/// Read the specialists toggle (default true).
+pub(crate) fn omo_specialists_enabled(tree: &Config) -> bool {
+    tree.get_bool("hypercode.omo_specialists.enabled", true)
+}
+
+/// Resolve per-task `subagent_type` for a batch (mirrors single-mode
+/// precedence: the resolved agent model WINS over spec/batch model;
+/// identity prompt rides prompt_append). Unknown name or missing
+/// resolver is a hard error naming the roster.
+pub(crate) fn resolve_batch_subagent_types(
+    requests: &mut [DelegationRequest],
+    resolver: Option<&Arc<dyn CategoryResolver>>,
+) -> Result<(), String> {
+    for req in requests.iter_mut() {
+        let Some(name) = req.subagent_type.clone() else {
+            continue;
+        };
+        let Some(resolver) = resolver else {
+            return Err(
+                "Subagent type delegation requires an OMO category resolver, but none is configured. Use 'model' directly instead."
+                    .to_string(),
+            );
+        };
+        let Some(r) = resolver.resolve_subagent_type(&name) else {
+            return Err(format!(
+                "Subagent type '{}' is unknown or unavailable. Valid OMO agent names: {}.",
+                name,
+                OMO_ROSTER.join(", ")
+            ));
+        };
+        // Resolved agent model wins over spec/batch model (single-mode
+        // parity: resolution first, args model only as fallback).
+        req.model = Some(r.model);
+        // Identity prompt rides prompt_append (prepended before any
+        // existing append); skip when the resolved append is empty.
+        match r.prompt_append {
+            Some(append) if !append.is_empty() => {
+                req.prompt_append = Some(match req.prompt_append.take() {
+                    Some(existing) if !existing.is_empty() => {
+                        format!("{existing}\n\n{append}")
+                    }
+                    _ => append,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Role directives injected as the child's extra instructions. Wording kept
 /// in joey-orchestration (not joey-cli) so the tool is self-contained.
 pub(crate) const EXPLORER_DIRECTIVE: &str = "You are the EXPLORER agent: read-only, facts only.\n\
@@ -112,7 +228,7 @@ beyond the questions asked and do not propose solutions, plans, or\n\
 recommendations — the orchestrator does all planning and interpretation.\n\
 If a question cannot be answered from the code, say so plainly and\n\
 report the closest evidence you found. Keep your final summary under\n\
-500 tokens.";
+1000 tokens.";
 
 pub(crate) const IMPLEMENTOR_DIRECTIVE: &str = "You are the IMPLEMENTOR agent: execution only.\n\
 Follow the brief EXACTLY. It specifies the file paths, the precise\n\
@@ -128,7 +244,7 @@ only the scoped tests that cover your changes (cargo test -p <crate>\n\
 [filter]). NEVER run the full test suite (cargo test --workspace) or\n\
 any broad test run: the orchestrator runs that once, after all\n\
 implementors finish. Report exactly what you changed, file by file, and\n\
-the real scoped check output. Keep your final summary under 500 tokens.";
+the real scoped check output. Keep your final summary under 1000 tokens.";
 
 /// Resolve a DelegationRequest patch for a HyperCode role: toolsets, role
 /// config (model/turns/tokens/reasoning) unless the caller set explicit
@@ -137,18 +253,35 @@ the real scoped check output. Keep your final summary under 500 tokens.";
 ///
 /// `explicit_toolsets` = the tool call included its own `toolsets` array
 /// (keeps user control; role defaults only fill gaps).
+///
+/// Returns whether the FR-006 warning condition hit: the request's model was
+/// left to the existing inherit default despite an applicable OMO chain
+/// (feature 025, FR-005 precedence 3).
+///
+/// OMO specialists toggle: when hypercode.omo_specialists.enabled (default
+/// true) the call site swaps the chain default for the direct tier→agent
+/// mapping (Explorer→explore, Implementor→hephaestus).
 pub(crate) fn apply_hyper_role(
     req: &mut DelegationRequest,
     role: HyperRole,
     tree: &Config,
     provider: &str,
-) {
+    omo_default: Option<String>,
+    chain_applicable: bool,
+) -> bool {
     let settings = HyperRoleSettings::from_config_tree(tree, role.table(), provider);
     if req.toolsets.is_empty() {
         req.toolsets = role.toolsets().iter().map(|s| s.to_string()).collect();
     }
-    if req.model.is_none() && !settings.model.is_empty() {
-        req.model = Some(settings.model.clone());
+    let mut warned = false;
+    if req.model.is_none() {
+        if !settings.model.is_empty() {
+            req.model = Some(settings.model.clone()); // explicit config wins (FR-005 precedence 1)
+        } else if let Some(m) = omo_default {
+            req.model = Some(m); // OMO-chain default (precedence 2)
+        } else if chain_applicable {
+            warned = true; // unresolvable chain → inherit existing default + warn (precedence 3, FR-006)
+        }
     }
     if req.max_turns.is_none() && settings.max_turns > 0 {
         req.max_turns = Some(settings.max_turns as usize);
@@ -166,6 +299,7 @@ pub(crate) fn apply_hyper_role(
         Some(existing) if !existing.is_empty() => format!("{existing}\n\n{directive}"),
         _ => directive,
     });
+    warned
 }
 
 /// Parse a HyperCode role name (shared by single + batch paths).
@@ -291,7 +425,7 @@ impl Tool for DelegateTask {
                 "role": {
                     "type": "string",
                     "enum": ["explorer", "implementor"],
-                    "description": "HyperCode role routing. 'explorer' = read-only investigation (file-read + terminal + web; runs diagnostic commands on your behalf; NEVER writes). 'implementor' = writes files and runs ONLY the targeted checks specified in its brief (scoped builds/tests); the single full-suite run belongs to the orchestrator after all implementors finish. When set, the role's configured model/turns/tokens/reasoning (hypercode.explorer / hypercode.implementor in config) apply unless explicitly overridden here."
+                    "description": "HyperCode role routing. 'explorer' = read-only investigation (file-read + terminal + web; runs diagnostic commands on your behalf; NEVER writes). 'implementor' = writes files and runs ONLY the targeted checks specified in its brief (scoped builds/tests); the single full-suite run belongs to the orchestrator after all implementors finish. When set, the role's configured model/turns/tokens/reasoning (hypercode.explorer / hypercode.implementor in config) apply unless explicitly overridden here. When hypercode.omo_specialists.enabled (default true), the role's default model maps directly to its OMO counterpart agent (explorer→explore, implementor→hephaestus)."
                 },
                 "context": {
                     "type": "string",
@@ -306,7 +440,8 @@ impl Tool for DelegateTask {
                             "context": {"type": "string"},
                             "model": {"type": "string"},
                             "toolsets": {"type": "array", "items": {"type": "string"}},
-                            "role": {"type": "string", "enum": ["explorer", "implementor"], "description": "HyperCode role routing for this task: 'explorer' (read-only + diagnostic commands) or 'implementor' (writes + targeted checks only). Applies the role's config and directive unless overridden per-task."}
+                            "role": {"type": "string", "enum": ["explorer", "implementor"], "description": "HyperCode role routing for this task: 'explorer' (read-only + diagnostic commands) or 'implementor' (writes + targeted checks only). Applies the role's config and directive unless overridden per-task."},
+                            "subagent_type": {"type": "string", "description": "OMO agent name for this task (e.g. 'oracle', 'hephaestus', 'momus'). Resolved model + identity prompt apply; the resolved model wins over per-task/batch model. Composes with 'role' (role still fills toolsets/turns and appends its directive)."}
                         },
                         "required": ["goal"]
                     },
@@ -347,12 +482,12 @@ impl Tool for DelegateTask {
                 },
                 "subagent_type": {
                     "type": "string",
-                    "description": "OMO subagent type (e.g. 'oracle', 'explore', 'librarian'). When set, spawns the named agent with its resolved model. Mutually exclusive with 'category'."
+                    "description": "OMO subagent type — any registered OMO agent by name (sisyphus, hephaestus, prometheus, atlas, oracle, librarian, explore, multimodal-looker, metis, momus, sisyphus-junior). When set, spawns the named agent with its resolved model and identity prompt. Mutually exclusive with 'category'."
                 },
                 "load_skills": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Skill names to load and prepend to the subagent's system prompt. Only effective when 'category' is also specified."
+                    "description": "Skill names to load and prepend to the subagent's system prompt. Effective with 'category' or 'subagent_type' routing."
                 },
                 "team": {
                     "type": "string",
@@ -449,11 +584,15 @@ impl Tool for DelegateTask {
                     Some(r) => {
                         resolved_model = Some(r.model);
                         prompt_append = r.prompt_append;
+                        if !load_skills.is_empty() && prompt_append.is_none() {
+                            prompt_append = Some(named_agent_skill_directive(sat));
+                        }
                     }
                     None => {
                         return ToolResult::Error(format!(
-                            "Subagent type '{}' is unknown or unavailable.",
-                            sat
+                            "Subagent type '{}' is unknown or unavailable. Valid OMO agent names: {}.",
+                            sat,
+                            OMO_ROSTER.join(", ")
                         ));
                     }
                 }
@@ -539,7 +678,51 @@ impl Tool for DelegateTask {
             match HyperRole::parse(role_str) {
                 Some(role) => {
                     hyper_role = Some(role);
-                    apply_hyper_role(&mut req, role, &self.parent_config_tree, &self.parent_config.provider);
+                    // Feature 025 (FR-005/FR-006): role model default. With
+                    // OMO specialists enabled (default true) the tier maps
+                    // DIRECTLY to its counterpart agent (Explorer→explore,
+                    // Implementor→hephaestus); toggle OFF keeps the legacy
+                    // chain default byte-identically.
+                    let specialists = omo_specialists_enabled(&self.parent_config_tree);
+                    let chain_default = if specialists {
+                        self.resolver
+                            .as_ref()
+                            .and_then(|r| r.resolve_subagent_type(omo_specialist_agent(role)))
+                            .filter(|r| !r.model.is_empty())
+                            .map(|r| r.model)
+                    } else {
+                        self.resolver
+                            .as_ref()
+                            .and_then(|r| omo_role_chain_default(role, r.as_ref()))
+                    };
+                    let chain_applicable = self.resolver.is_some();
+                    let warned = apply_hyper_role(
+                        &mut req,
+                        role,
+                        &self.parent_config_tree,
+                        &self.parent_config.provider,
+                        chain_default,
+                        chain_applicable,
+                    );
+                    if warned {
+                        // FR-006: user-visible warning through the agent-notice channel —
+                        // the same mechanism other delegation notices use.
+                        if let Some(tx) = &self.event_tx {
+                            let notice = if specialists {
+                                format!(
+                                    "hypercode {} role: OMO specialist agent '{}' unresolved against available providers; inheriting the default model (FR-006).",
+                                    role.table(),
+                                    omo_specialist_agent(role)
+                                )
+                            } else {
+                                format!(
+                                    "hypercode {} role: no OMO chain member resolved against available providers; inheriting the default model (FR-006).",
+                                    if matches!(role, HyperRole::Explorer) { "explorer" } else { "implementor" }
+                                )
+                            };
+                            let _ = tx.send(AgentEvent::Notice(notice));
+                        }
+                    }
                 }
                 None => {
                     return ToolResult::Error(format!(
@@ -552,13 +735,18 @@ impl Tool for DelegateTask {
         // Feature 022 (agent teams): gate + lazy-create / member-register
         // BEFORE dispatch so failures reject the call outright (FR-009/FR-010).
         if let Some(team_name) = team_arg {
-            let role_str = hyper_role.map(|r| r.table()).unwrap_or("explorer");
+            // Prefer the named agent (subagent_type) as the member role
+            // label; fall back to the hypercode role table, then explorer.
+            let role_str = hyper_role
+                .map(|r| r.table().to_string())
+                .or_else(|| req.subagent_type.clone())
+                .unwrap_or_else(|| "explorer".to_string());
             match crate::team::register_spawn(
                 &self.parent_config_tree,
                 &team_name,
                 name_arg.as_deref(),
                 &req.goal,
-                role_str,
+                &role_str,
             ) {
                 Ok(spawn) => {
                     req.team = Some(team_name.clone());
@@ -579,7 +767,11 @@ impl Tool for DelegateTask {
                             "web".to_string(),
                             "team".to_string(),
                         ];
-                        crate::team::team_lead_directive(max_members, max_parallel)
+                        crate::team::team_lead_directive_with_specialists(
+                            max_members,
+                            max_parallel,
+                            omo_specialists_enabled(tree),
+                        )
                     } else {
                         if !req.toolsets.iter().any(|t| t == "team") {
                             req.toolsets.push("team".to_string());
@@ -724,6 +916,12 @@ impl DelegateTask {
                 self.manager.config().default_persist,
                 SubagentRole::Leaf,
             );
+            if let Err(e) = crate::delegation_tool::resolve_batch_subagent_types(
+                &mut requests,
+                self.resolver.as_ref(),
+            ) {
+                return ToolResult::Error(e);
+            }
             if let Err(e) = crate::subagent::apply_batch_hyper_roles(
                 &mut requests,
                 &task_specs,
@@ -780,6 +978,48 @@ impl DelegateTask {
                 self.manager.config().default_persist,
                 SubagentRole::Leaf,
             );
+            if let Err(e) = crate::delegation_tool::resolve_batch_subagent_types(
+                &mut requests,
+                self.resolver.as_ref(),
+            ) {
+                return ToolResult::Error(e);
+            }
+            if let Err(e) = crate::subagent::apply_batch_hyper_roles(
+                &mut requests,
+                &task_specs,
+                &self.parent_config_tree,
+                &self.parent_config.provider,
+            ) {
+                tracing::warn!("hypercode role routing failed: {e}");
+            }
+            self.manager
+                .dispatch_requests(
+                    &requests,
+                    &self.parent_config,
+                    &self.parent_config_tree,
+                    &self.base_registry,
+                    self.event_tx.as_ref(),
+                )
+                .await
+        } else if task_specs.iter().any(|s| s.subagent_type.is_some()) {
+            // Per-task subagent_type present but no budget cap: the manager's
+            // dispatch_batch_with_roles builds requests without a resolver, so
+            // build them here (same construction, default turn cap, no budget)
+            // to run named-agent resolution first.
+            let mut requests = crate::subagent::specs_to_requests(
+                &task_specs,
+                batch_model.as_deref(),
+                &batch_toolsets,
+                Some(self.manager.config().default_max_turns),
+                self.manager.config().default_persist,
+                SubagentRole::Leaf,
+            );
+            if let Err(e) = crate::delegation_tool::resolve_batch_subagent_types(
+                &mut requests,
+                self.resolver.as_ref(),
+            ) {
+                return ToolResult::Error(e);
+            }
             if let Err(e) = crate::subagent::apply_batch_hyper_roles(
                 &mut requests,
                 &task_specs,
@@ -894,7 +1134,7 @@ impl Tool for CallOmoAgent {
     }
 
     fn description(&self) -> &str {
-        "Delegate a research task to another OMO agent (explore, librarian, oracle) \
+        "Delegate a research task to another OMO agent (any registered OMO agent by name) \
          for read-only consultation. Use this when you need research, codebase \
          exploration, or architectural guidance — NOT for implementation delegation. \
          The called agent returns a concise summary."
@@ -914,8 +1154,8 @@ impl Tool for CallOmoAgent {
                 },
                 "subagent_type": {
                     "type": "string",
-                    "description": "The agent to consult: 'explore' (codebase search), 'librarian' (documentation), or 'oracle' (architecture). Required.",
-                    "enum": ["explore", "librarian", "oracle"]
+                    "description": "The OMO agent to consult, by name — any registered agent: sisyphus, hephaestus, prometheus, atlas, oracle, librarian, explore, multimodal-looker, metis, momus, sisyphus-junior. Required.",
+                    "enum": OMO_ROSTER.to_vec()
                 }
             },
             "required": ["goal", "subagent_type"]
@@ -926,7 +1166,7 @@ impl Tool for CallOmoAgent {
         // Force subagent_type to be present (BC-012).
         if args.get("subagent_type").and_then(|v| v.as_str()).is_none() {
             return ToolResult::Error(
-                "call_omo_agent requires 'subagent_type' (explore, librarian, or oracle)".to_string(),
+                "call_omo_agent requires 'subagent_type' (any registered OMO agent name)".to_string(),
             );
         }
         // Delegate to the inner DelegateTask which handles resolution + dispatch.
@@ -980,7 +1220,7 @@ mod role_tests {
     fn explorer_role_gives_readonly_files_plus_terminal() {
         let tree = tree_with("");
         let mut req = base_req();
-        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "prov");
+        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "prov", None, false);
         assert!(req.toolsets.contains(&"file-read".to_string()));
         assert!(!req.toolsets.contains(&"file".to_string()));
         assert!(req.toolsets.contains(&"terminal".to_string()));
@@ -992,7 +1232,7 @@ mod role_tests {
     fn implementor_role_gives_write_access() {
         let tree = tree_with("");
         let mut req = base_req();
-        apply_hyper_role(&mut req, HyperRole::Implementor, &tree, "prov");
+        apply_hyper_role(&mut req, HyperRole::Implementor, &tree, "prov", None, false);
         assert!(req.toolsets.contains(&"file".to_string()));
         assert!(req.toolsets.contains(&"terminal".to_string()));
         assert!(req.prompt_append.as_deref().unwrap_or("").contains("IMPLEMENTOR"));
@@ -1005,7 +1245,7 @@ mod role_tests {
         );
         // Gaps filled from config.
         let mut req = base_req();
-        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "prov");
+        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "prov", None, false);
         assert_eq!(req.model.as_deref(), Some("cheap-model"));
         assert_eq!(req.max_turns, Some(7));
         assert_eq!(req.max_tokens, Some(9000));
@@ -1015,7 +1255,7 @@ mod role_tests {
         let mut req = base_req();
         req.model = Some("explicit".into());
         req.max_turns = Some(3);
-        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "prov");
+        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "prov", None, false);
         assert_eq!(req.model.as_deref(), Some("explicit"));
         assert_eq!(req.max_turns, Some(3));
     }
@@ -1025,7 +1265,7 @@ mod role_tests {
         let tree = tree_with("");
         let mut req = base_req();
         req.prompt_append = Some("caller content".into());
-        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "p");
+        apply_hyper_role(&mut req, HyperRole::Explorer, &tree, "p", None, false);
         let append = req.prompt_append.unwrap();
         assert!(append.starts_with("caller content"));
         assert!(append.contains("EXPLORER"));
@@ -1035,9 +1275,9 @@ mod role_tests {
     fn batch_role_routing_applies_per_task() {
         let tree = tree_with("");
         let tasks = vec![
-            TaskSpec { goal: "read thing".into(), context: None, model: None, toolsets: Vec::new(), role: Some("explorer".into()), background: false, budgets: None },
-            TaskSpec { goal: "build thing".into(), context: None, model: None, toolsets: Vec::new(), role: Some("implementor".into()), background: false, budgets: None },
-            TaskSpec { goal: "plain".into(), context: None, model: None, toolsets: Vec::new(), role: None, background: false, budgets: None },
+            TaskSpec { goal: "read thing".into(), context: None, model: None, toolsets: Vec::new(), role: Some("explorer".into()), background: false, subagent_type: None, budgets: None },
+            TaskSpec { goal: "build thing".into(), context: None, model: None, toolsets: Vec::new(), role: Some("implementor".into()), background: false, subagent_type: None, budgets: None },
+            TaskSpec { goal: "plain".into(), context: None, model: None, toolsets: Vec::new(), role: None, background: false, subagent_type: None, budgets: None },
         ];
         let mut reqs: Vec<DelegationRequest> = tasks.iter().map(|_| base_req()).collect();
         crate::subagent::apply_batch_hyper_roles(&mut reqs, &tasks, &tree, "p").unwrap();
@@ -1049,7 +1289,7 @@ mod role_tests {
     #[test]
     fn batch_role_routing_rejects_unknown_role() {
         let tree = tree_with("");
-        let tasks = vec![TaskSpec { goal: "x".into(), context: None, model: None, toolsets: Vec::new(), role: Some("wat".into()), background: false, budgets: None }];
+        let tasks = vec![TaskSpec { goal: "x".into(), context: None, model: None, toolsets: Vec::new(), role: Some("wat".into()), background: false, subagent_type: None, budgets: None }];
         let mut reqs: Vec<DelegationRequest> = vec![base_req()];
         assert!(crate::subagent::apply_batch_hyper_roles(&mut reqs, &tasks, &tree, "p").is_err());
     }
@@ -1096,5 +1336,151 @@ mod role_tests {
             .as_str()
             .unwrap()
             .contains("unique"));
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+
+    fn tree_with(yaml: &str) -> Config {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), yaml).unwrap();
+        Config::load_from(tmp.path().to_path_buf()).unwrap()
+    }
+
+    fn base_req() -> DelegationRequest {
+        DelegationRequest::single("g")
+    }
+
+    /// FR-004: the named-agent skill directive names the agent and instructs
+    /// skill application.
+    #[test]
+    fn named_agent_skill_directive_names_agent_and_skills() {
+        let d = named_agent_skill_directive("oracle");
+        assert!(d.contains("oracle"));
+        assert!(d.contains("skill"));
+    }
+
+    /// T014 / FR-005: the OMO-chain role default picks the FIRST chain member
+    /// the resolver can serve, per role.
+    struct ChainMockResolver {
+        explore: bool,
+    }
+
+    impl crate::CategoryResolver for ChainMockResolver {
+        fn resolve_category(&self, _name: &str) -> Option<crate::ResolvedDelegation> {
+            None
+        }
+        fn resolve_subagent_type(&self, name: &str) -> Option<crate::ResolvedDelegation> {
+            match name {
+                "explore" if self.explore => Some(crate::ResolvedDelegation {
+                    model: "explore-model".to_string(),
+                    prompt_append: None,
+                }),
+                "librarian" => Some(crate::ResolvedDelegation {
+                    model: "lib-model".to_string(),
+                    prompt_append: None,
+                }),
+                "momus" => Some(crate::ResolvedDelegation {
+                    model: "momus-model".to_string(),
+                    prompt_append: None,
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn omo_role_chain_default_prefers_first_member() {
+        // Full mock: first member of each chain wins.
+        let mock = ChainMockResolver { explore: true };
+        assert_eq!(
+            omo_role_chain_default(HyperRole::Explorer, &mock),
+            Some("explore-model".to_string())
+        );
+        assert_eq!(
+            omo_role_chain_default(HyperRole::Implementor, &mock),
+            Some("momus-model".to_string())
+        );
+        // First member unresolvable → falls to the next chain member.
+        let mock_no_explore = ChainMockResolver { explore: false };
+        assert_eq!(
+            omo_role_chain_default(HyperRole::Explorer, &mock_no_explore),
+            Some("lib-model".to_string())
+        );
+    }
+
+    #[test]
+    fn omo_specialist_agent_maps_directly() {
+        assert_eq!(omo_specialist_agent(HyperRole::Explorer), "explore");
+        assert_eq!(omo_specialist_agent(HyperRole::Implementor), "hephaestus");
+    }
+
+    #[test]
+    fn omo_specialists_enabled_default_true_and_off() {
+        let tree = tree_with("");
+        assert!(omo_specialists_enabled(&tree), "default is true");
+        let tree_off = tree_with("hypercode:\n  omo_specialists:\n    enabled: false\n");
+        assert!(!omo_specialists_enabled(&tree_off));
+    }
+
+    /// Mock resolver for batch subagent_type resolution tests (mirrors
+    /// ChainMockResolver's style).
+    struct OracleMockResolver;
+
+    impl crate::CategoryResolver for OracleMockResolver {
+        fn resolve_category(&self, _name: &str) -> Option<crate::ResolvedDelegation> {
+            None
+        }
+        fn resolve_subagent_type(&self, name: &str) -> Option<crate::ResolvedDelegation> {
+            match name {
+                "oracle" => Some(crate::ResolvedDelegation {
+                    model: "oracle-model".to_string(),
+                    prompt_append: Some("You are Oracle.".to_string()),
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_batch_subagent_types_precedence_and_errors() {
+        // Resolver None → hard error.
+        let mut reqs = vec![{
+            let mut r = base_req();
+            r.subagent_type = Some("oracle".into());
+            r
+        }];
+        let err = resolve_batch_subagent_types(&mut reqs, None).unwrap_err();
+        assert!(err.contains("requires an OMO category resolver"), "err: {err}");
+
+        // Unknown name → hard error listing the roster.
+        let resolver: Arc<dyn CategoryResolver> = Arc::new(OracleMockResolver);
+        let mut reqs = vec![{
+            let mut r = base_req();
+            r.subagent_type = Some("nope".into());
+            r
+        }];
+        let err =
+            resolve_batch_subagent_types(&mut reqs, Some(&resolver)).unwrap_err();
+        assert!(err.contains("'nope' is unknown"), "err: {err}");
+        assert!(err.contains("sisyphus, hephaestus"), "err: {err}");
+
+        // Success: resolved model WINS over spec model; prompt_appends
+        // combine; requests without subagent_type untouched.
+        let mut r0 = base_req();
+        r0.subagent_type = Some("oracle".into());
+        r0.model = Some("spec-model".into());
+        r0.prompt_append = Some("existing content".into());
+        let r1 = base_req();
+        let mut reqs = vec![r0, r1];
+        resolve_batch_subagent_types(&mut reqs, Some(&resolver)).unwrap();
+        assert_eq!(reqs[0].model.as_deref(), Some("oracle-model"));
+        let append = reqs[0].prompt_append.as_deref().unwrap();
+        assert!(append.contains("existing content"), "append: {append}");
+        assert!(append.contains("You are Oracle."), "append: {append}");
+        assert_eq!(reqs[1].model, None);
+        assert_eq!(reqs[1].prompt_append, None);
     }
 }
