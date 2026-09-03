@@ -582,6 +582,11 @@ pub(crate) fn try_team_run(
 pub enum ModeRoute {
     Subagent,
     Team,
+    /// Graph-derived routes (spec 023 FR-023); legacy count-based routes
+    /// remain for the flag-off path.
+    SingleWorker,
+    DagSubagents,
+    ParallelSubagents,
 }
 
 pub fn route_mode(team_enabled: bool, explicit_workstreams: bool, workstream_count: usize) -> ModeRoute {
@@ -589,6 +594,33 @@ pub fn route_mode(team_enabled: bool, explicit_workstreams: bool, workstream_cou
         ModeRoute::Team
     } else {
         ModeRoute::Subagent
+    }
+}
+
+/// Spec 023 FR-023: execution mode derived from execution-graph
+/// properties — the workstream count is NOT a proxy for parallelism.
+/// Decision table, in order:
+///
+/// 1. `write_overlap` => `SingleWorker` (overlapping writers must be
+///    sequenced in one worker)
+/// 2. `strict_dependency_depth > 2` => `DagSubagents`
+/// 3. `independent_components >= 2 && cross_component_coordination` =>
+///    `Team` (lead coordinates graph-seeded members)
+/// 4. `independent_components >= 2` => `ParallelSubagents`
+/// 5. otherwise => `SingleWorker`
+///
+/// Team pre-seeding from the graph lands with the wiring task.
+pub fn route_mode_from_graph(hint: &joey_neurocode::ExecutionHint) -> ModeRoute {
+    if hint.write_overlap {
+        ModeRoute::SingleWorker
+    } else if hint.strict_dependency_depth > 2 {
+        ModeRoute::DagSubagents
+    } else if hint.independent_components >= 2 && hint.cross_component_coordination {
+        ModeRoute::Team
+    } else if hint.independent_components >= 2 {
+        ModeRoute::ParallelSubagents
+    } else {
+        ModeRoute::SingleWorker
     }
 }
 
@@ -2433,5 +2465,94 @@ mod tests {
             "task-r",
             joey_orchestration::task_graph::default_isolation(&[])
         )));
+    }
+
+    // ── Spec 023 T025: graph-derived mode routing (FR-023) ────────────
+
+    /// Positional helper mirroring the FR-023 decision-table inputs.
+    fn hint(
+        write_overlap: bool,
+        strict_dependency_depth: u32,
+        independent_components: u32,
+        cross_component_coordination: bool,
+    ) -> joey_neurocode::ExecutionHint {
+        joey_neurocode::ExecutionHint {
+            write_overlap,
+            strict_dependency_depth,
+            independent_components,
+            cross_component_coordination,
+        }
+    }
+
+    /// Rule 1 dominates everything: overlapping writers are sequenced in
+    /// one worker even when the hint otherwise screams parallelism.
+    #[test]
+    fn route_from_graph_overlapping_writes_single_worker() {
+        assert_eq!(
+            route_mode_from_graph(&hint(true, 5, 4, true)),
+            ModeRoute::SingleWorker,
+            "overlapping writers must be sequenced in one worker (FR-023 rule 1)"
+        );
+    }
+
+    /// Rule 2 is strictly `depth > 2`: depth 3 routes DagSubagents, depth 2
+    /// falls through the table (and, with nothing else set, lands on
+    /// SingleWorker via the final else).
+    #[test]
+    fn route_from_graph_deep_dag_dag_subagents() {
+        assert_eq!(
+            route_mode_from_graph(&hint(false, 3, 0, false)),
+            ModeRoute::DagSubagents,
+            "depth 3 => DagSubagents"
+        );
+        assert_ne!(
+            route_mode_from_graph(&hint(false, 2, 0, false)),
+            ModeRoute::DagSubagents,
+            "depth 2 is not > 2 — falls through per the FR-023 table"
+        );
+        assert_eq!(
+            route_mode_from_graph(&hint(false, 2, 0, false)),
+            ModeRoute::SingleWorker
+        );
+    }
+
+    /// Rule 3: >=2 independent components that still need cross-component
+    /// coordination go to Team (lead coordinates graph-seeded members).
+    #[test]
+    fn route_from_graph_independent_with_coordination_team() {
+        assert_eq!(
+            route_mode_from_graph(&hint(false, 1, 2, true)),
+            ModeRoute::Team
+        );
+    }
+
+    /// Rule 4: >=2 independent components without coordination fan out as
+    /// plain parallel subagents.
+    #[test]
+    fn route_from_graph_independent_parallel() {
+        assert_eq!(
+            route_mode_from_graph(&hint(false, 1, 2, false)),
+            ModeRoute::ParallelSubagents
+        );
+    }
+
+    /// Rule 5: an all-clear hint is single-worker work.
+    #[test]
+    fn route_from_graph_default_single_worker() {
+        assert_eq!(
+            route_mode_from_graph(&hint(false, 0, 0, false)),
+            ModeRoute::SingleWorker
+        );
+    }
+
+    /// The legacy count-based router keeps returning only its two legacy
+    /// variants (Subagent/Team) — the flag-off path is unchanged.
+    #[test]
+    fn legacy_route_mode_uses_only_legacy_variants() {
+        assert_eq!(route_mode(true, false, 2), ModeRoute::Team);
+        assert_eq!(route_mode(true, false, 5), ModeRoute::Team);
+        assert_eq!(route_mode(true, false, 1), ModeRoute::Subagent);
+        assert_eq!(route_mode(false, false, 5), ModeRoute::Subagent);
+        assert_eq!(route_mode(true, true, 5), ModeRoute::Subagent);
     }
 }
