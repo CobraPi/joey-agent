@@ -31,8 +31,11 @@ use joey_orchestration::evidence::{run_root, RunHandle};
 use joey_orchestration::scheduler::{
     RunStats, Scheduler as GraphScheduler, SchedulerConfig as GraphSchedulerConfig, TaskDispatcher,
 };
-use joey_orchestration::task_graph::{LegacyWorkstream, TaskGraph, TaskNode, TaskStatus};
-use joey_orchestration::workspace::baseline_revision;
+use joey_orchestration::joiner::{ChangeBundle, Joiner};
+use joey_orchestration::task_graph::{
+    IsolationMode, LegacyWorkstream, TaskGraph, TaskId, TaskNode, TaskStatus,
+};
+use joey_orchestration::workspace::{baseline_revision, WorkspaceIsolation};
 use joey_orchestration::{DelegationRequest, SubagentManager, SubagentRole};
 use joey_providers::ReasoningEffort;
 use joey_tools::ToolRegistry;
@@ -1092,19 +1095,56 @@ impl GateTrait for AlwaysPassGate {
     }
 }
 
+/// Routing predicate for FR-015: only `IsolatedWorktree` tasks get an
+/// isolated workspace; `SharedCheckout` (readers) keep the caller's
+/// workdir. Extracted as a tiny pure function for testability.
+fn is_isolated(task: &TaskNode) -> bool {
+    task.isolation == IsolationMode::IsolatedWorktree
+}
+
 /// [`TaskDispatcher`] adapter (Spec 023 T016): hands one graph task to an
 /// Implementor Leaf child through the SAME `SubagentManager` the legacy
 /// phases (and `delegate_task`) use — one `DelegationRequest` per task,
 /// mirroring [`implementor_request`]'s construction (model resolution via
 /// the role table + `parent_model_for` inheritance, `file`/`terminal`/
 /// `web` toolsets, `max_turns.max(4)`, `IMPLEMENTOR_PROMPT`).
+///
+/// FR-015 (T020): tasks marked `IsolatedWorktree` are dispatched against
+/// a prepared isolated workspace (`<run_root>/worktree/<task-id>` — see
+/// [`WorkspaceIsolation`]) — both the goal text's project-root reference
+/// and the delegation `workdir` point at the workspace. Readers
+/// (`SharedCheckout`) keep `ctx.cwd` (current behavior). Isolation is the
+/// dispatcher's concern, not the scheduler's (TaskDispatcher contract).
 struct HypercodeDispatcher<'a> {
     ctx: &'a HypercodeContext,
+    /// Root of the current evidence run (`<…>/runs/<run-id>`); isolated
+    /// worktrees live under `<run_root>/worktree/<task-id>`.
+    run_root: std::path::PathBuf,
 }
 
 #[async_trait::async_trait]
 impl TaskDispatcher for HypercodeDispatcher<'_> {
     async fn dispatch(&self, task: &TaskNode, workdir: &std::path::Path) -> bool {
+        // FR-015: route isolated writers to their own workspace. Prepare
+        // is idempotent, so re-preparing post-run (joiner collection)
+        // reuses the same path. Readers share the checkout untouched.
+        let effective_workdir: std::path::PathBuf = if is_isolated(task) {
+            let iso = WorkspaceIsolation::new(self.ctx.cwd.clone(), self.run_root.clone());
+            match iso.prepare(task) {
+                Ok(ws) => ws.path().to_path_buf(),
+                Err(e) => {
+                    eprintln!(
+                        "hypercode: isolation prepare failed for {}: {}",
+                        task.id.as_str(),
+                        e
+                    );
+                    return false;
+                }
+            }
+        } else {
+            workdir.to_path_buf()
+        };
+        let workdir = effective_workdir.as_path();
         let cfg = HyperCodeConfig::from_config(&self.ctx.config);
         let provider = self.ctx.agent_config.provider.clone();
         let opts = HypercodeOptions {
@@ -1215,10 +1255,75 @@ async fn execute_graph_run(ctx: &HypercodeContext, report: &mut HypercodeReport)
             .get_i64("hypercode.execution_graph.max_repair_attempts", 3)
             .max(0) as u32,
     };
-    let dispatcher = HypercodeDispatcher { ctx };
+    let dispatcher = HypercodeDispatcher {
+        ctx,
+        run_root: root.clone(),
+    };
     stats = GraphScheduler::new(config)
         .run_to_completion(&mut graph, &mut run, &dispatcher, &AlwaysPassGate, &ctx.cwd)
         .await;
+
+    // ── Integration phase (Spec 023 T020 / US4, FR-016…FR-018) ─────────
+    // Collect a ChangeBundle from every Completed isolated-worktree task
+    // (prepare is idempotent — the dispatch-time worktree is reused) and
+    // three-way-apply the patches into the shared checkout. PARITY
+    // (SC-001): this whole phase lives inside the flag-on early-return
+    // path — flag-off cost is unchanged (one Mutex lock + is_some).
+    // FR-018: integrate applies patches but NEVER commits.
+    let joiner = Joiner::new(&ctx.cwd);
+    let mut bundles: Vec<ChangeBundle> = Vec::new();
+    let iso = WorkspaceIsolation::new(ctx.cwd.clone(), root.clone());
+    let ids: Vec<TaskId> = graph
+        .nodes
+        .values()
+        .filter(|n| n.status == TaskStatus::Completed && n.isolation == IsolationMode::IsolatedWorktree)
+        .map(|n| n.id.clone())
+        .collect();
+    for id in &ids {
+        let node = graph.nodes.get(id).expect("collected id");
+        match iso.prepare(node) {
+            Ok(ws) => match joiner.collect(&ws, node, &mut run) {
+                Ok(b) => bundles.push(b),
+                Err(e) => eprintln!(
+                    "hypercode: bundle collection failed for {}: {}",
+                    id.as_str(),
+                    e
+                ),
+            },
+            Err(e) => eprintln!(
+                "hypercode: worktree re-prepare failed for {}: {}",
+                id.as_str(),
+                e
+            ),
+        }
+    }
+    if !bundles.is_empty() {
+        match joiner.integrate(&bundles, |b| {
+            eprintln!("hypercode: integrated patch for {}", b.task_id);
+            Ok(())
+        }) {
+            Ok(report) => eprintln!(
+                "hypercode: integrated {} patch(es)",
+                report.applied_task_ids.len()
+            ),
+            Err(conflict) => eprintln!(
+                "hypercode: integration conflict for task {} — {} (patch left unapplied: {})",
+                conflict.task_id,
+                conflict.reason,
+                conflict.patch_path.display()
+            ),
+        }
+        // Best-effort worktree cleanup; errors ignored.
+        for b in &bundles {
+            if let Some(tid) = TaskId::new(&b.task_id) {
+                if let Some(node) = graph.nodes.get(&tid) {
+                    if let Ok(ws) = iso.prepare(node) {
+                        let _ = iso.cleanup(&ws);
+                    }
+                }
+            }
+        }
+    }
 
     let graph_for_report = graph.clone();
     // Put the mutated graph back (terminal statuses + attempts persist).
@@ -1307,7 +1412,10 @@ pub async fn resume_execution_run(ctx: &HypercodeContext, run_id: &str) -> Optio
             .get_i64("hypercode.execution_graph.max_repair_attempts", 3)
             .max(0) as u32,
     };
-    let dispatcher = HypercodeDispatcher { ctx };
+    let dispatcher = HypercodeDispatcher {
+        ctx,
+        run_root: root.clone(),
+    };
     let stats = GraphScheduler::new(config)
         .run_to_completion(&mut graph, &mut run, &dispatcher, &AlwaysPassGate, &ctx.cwd)
         .await;
@@ -2184,5 +2292,71 @@ mod tests {
         assert!(s.contains("projects"), "root must sit under projects/: {s}");
         assert!(s.contains("runs"), "root must sit under runs/: {s}");
         assert!(s.ends_with("run-20990101-000000"), "root must end with the run id: {s}");
+    }
+
+    // ── Spec 023 T020: isolation routing (FR-015) ─────────────────────
+
+    /// Minimal TaskNode with the given isolation mode (14 fields).
+    fn isolation_node(id: &str, isolation: IsolationMode) -> TaskNode {
+        TaskNode {
+            id: TaskId::new(id).unwrap(),
+            objective: format!("objective for {id}"),
+            dependencies: vec![],
+            read_set: vec![],
+            write_set: vec![std::path::PathBuf::from("src/a.rs")],
+            artifact_ids: vec![],
+            role: joey_orchestration::task_graph::WorkerRole::Implementor,
+            model_tier: joey_orchestration::task_graph::ModelTier::Economical,
+            risk: joey_orchestration::task_graph::RiskLevel::Low,
+            acceptance: vec![joey_orchestration::task_graph::AcceptanceCriterion {
+                criterion: "it works".to_string(),
+                kind: "manual".to_string(),
+            }],
+            verification: VerificationPlanView::default(),
+            isolation,
+            status: TaskStatus::Pending,
+            attempts: 0,
+        }
+    }
+
+    /// FR-015 routing predicate: a SharedCheckout (reader) task must NOT
+    /// be routed to an isolated workspace — the dispatcher keeps the
+    /// caller's workdir (ctx.cwd). IsolatedWorktree tasks are routed.
+    #[test]
+    fn reader_task_uses_shared_checkout() {
+        let reader = isolation_node("task-read", IsolationMode::SharedCheckout);
+        assert!(
+            !is_isolated(&reader),
+            "SharedCheckout readers keep the shared checkout workdir"
+        );
+        let writer = isolation_node("task-write", IsolationMode::IsolatedWorktree);
+        assert!(
+            is_isolated(&writer),
+            "IsolatedWorktree writers are routed to a prepared workspace"
+        );
+    }
+
+    /// The routing predicate agrees with the plan-side default: a task
+    /// with a declared write set defaults to IsolatedWorktree, an
+    /// undeclared (reader-shaped) one to SharedCheckout.
+    #[test]
+    fn routing_predicate_matches_default_isolation() {
+        let writes = vec![std::path::PathBuf::from("src/a.rs")];
+        assert_eq!(
+            joey_orchestration::task_graph::default_isolation(&writes),
+            IsolationMode::IsolatedWorktree
+        );
+        assert_eq!(
+            joey_orchestration::task_graph::default_isolation(&[]),
+            IsolationMode::SharedCheckout
+        );
+        assert!(is_isolated(&isolation_node(
+            "task-w",
+            joey_orchestration::task_graph::default_isolation(&writes)
+        )));
+        assert!(!is_isolated(&isolation_node(
+            "task-r",
+            joey_orchestration::task_graph::default_isolation(&[])
+        )));
     }
 }
