@@ -129,7 +129,7 @@
 
 ### Implementation for User Story 6
 
-- [ ] T025 [P] [US6] Add `ModeRoute::{SingleWorker, DagSubagents, ParallelSubagents}` variants and `route_mode_from_graph(hint: &ExecutionHint) -> ModeRoute` in crates/joey-cli/src/hypercode.rs implementing the FR-023 decision table (overlap→SingleWorker; strict depth>2→DagSubagents; independent≥2+coordination→Team; independent≥2→ParallelSubagents; else SingleWorker); route_mode and its existing variants remain unchanged; unit tests cover all five branches
+- [X] T025 [P] [US6] Add `ModeRoute::{SingleWorker, DagSubagents, ParallelSubagents}` variants and `route_mode_from_graph(hint: &ExecutionHint) -> ModeRoute` in crates/joey-cli/src/hypercode.rs implementing the FR-023 decision table (overlap→SingleWorker; strict depth>2→DagSubagents; independent≥2+coordination→Team; independent≥2→ParallelSubagents; else SingleWorker); route_mode and its existing variants remain unchanged; unit tests cover all five branches
 - [ ] T026 [US6] Switch flag-on call sites in crates/joey-cli/src/hypercode.rs (replacing the workstream_count>=2 heuristic at the route decision) and pre-seed team_tasks from the validated graph in team runs (FR-024); extend crates/joey-cli/src/tests/hypercode_team.rs with graph-seeded team assertions
 
 **Checkpoint**: Team mode is graph-driven, not count-driven.
@@ -166,7 +166,7 @@
 
 ## Phase 11: Polish & Cross-Cutting Concerns
 
-- [ ] T030 [P] Update docs/ (architecture/orchestration sections) and PORTING.md with the new subsystem parity status (dates, Complete/Partial/Deliberate-deviation entries per repo convention)
+- [X] T030 [P] Update docs/ (architecture/orchestration sections) and PORTING.md with the new subsystem parity status (dates, Complete/Partial/Deliberate-deviation entries per repo convention)
 - [ ] T031 [P] Execute quickstart.md scenarios §1–§9 end-to-end on a scratch repository with JOEY_HOME isolation; record results (pass/fail per scenario) in specs/023-enterprise-orchestration-runtime/quickstart.md as an appended validation log
 - [ ] T032 Verify SC-001 flag-off parity: full `cargo build --workspace` + `cargo test --workspace` green with both flags defaulted false, no `~/.joey/hypercode/` tree created on legacy runs; collect the parity evidence summary in the feature directory
 - [ ] T033 Execute FR-028: flip both flag defaults to true in crates/joey-core/src/config.rs once T032's parity evidence is recorded, update the default-config unit tests, and re-run the full workspace suite
