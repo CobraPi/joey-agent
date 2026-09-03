@@ -24,7 +24,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use joey_agent_core::AgentConfig;
-use joey_orchestration::task_graph::{LegacyWorkstream, TaskGraph};
+use joey_orchestration::evaluator::{
+    GateOutcome, VerificationGate as GateTrait, VerificationPlanView,
+};
+use joey_orchestration::evidence::{run_root, RunHandle};
+use joey_orchestration::scheduler::{
+    RunStats, Scheduler as GraphScheduler, SchedulerConfig as GraphSchedulerConfig, TaskDispatcher,
+};
+use joey_orchestration::task_graph::{LegacyWorkstream, TaskGraph, TaskNode, TaskStatus};
+use joey_orchestration::workspace::baseline_revision;
 use joey_orchestration::{DelegationRequest, SubagentManager, SubagentRole};
 use joey_providers::ReasoningEffort;
 use joey_tools::ToolRegistry;
@@ -1056,6 +1064,260 @@ fn child_agent_config(ctx: &HypercodeContext) -> AgentConfig {
     cfg
 }
 
+// ---------------------------------------------------------------------------
+// Spec 023 (US3/T016): scheduler-driven execution of the typed graph
+// ---------------------------------------------------------------------------
+
+/// Single source of truth for mapping a worker's [`DelegationResult`] to
+/// the boolean the scheduler's [`TaskDispatcher`] contract expects: the
+/// SAME `success` field the legacy path treats as "worker did its job"
+/// (see the build-results mapping in [`run_hypercode`]: `report.successes
+/// = build_results.iter().map(|r| r.success)`) and the team path before
+/// it (`report.successes.push(r.success)`). Extracted so the scheduler
+/// adapter can never drift from the legacy semantics. Unit-testable.
+pub(crate) fn delegation_succeeded(result: &joey_orchestration::DelegationResult) -> bool {
+    result.success
+}
+
+/// PLACEHOLDER verification gate (Spec 023 T016): unconditionally passes.
+/// Keeps US3 (scheduler-driven execution) runnable end-to-end without
+/// US5 — the real VerifyLoop adapter lands in T023 and replaces this type
+/// at the [`execute_graph_run`] / [`resume_execution_run`] call sites.
+struct AlwaysPassGate;
+
+#[async_trait::async_trait]
+impl GateTrait for AlwaysPassGate {
+    async fn run(&self, _plan: &VerificationPlanView, _workdir: &std::path::Path) -> GateOutcome {
+        GateOutcome::Passed
+    }
+}
+
+/// [`TaskDispatcher`] adapter (Spec 023 T016): hands one graph task to an
+/// Implementor Leaf child through the SAME `SubagentManager` the legacy
+/// phases (and `delegate_task`) use — one `DelegationRequest` per task,
+/// mirroring [`implementor_request`]'s construction (model resolution via
+/// the role table + `parent_model_for` inheritance, `file`/`terminal`/
+/// `web` toolsets, `max_turns.max(4)`, `IMPLEMENTOR_PROMPT`).
+struct HypercodeDispatcher<'a> {
+    ctx: &'a HypercodeContext,
+}
+
+#[async_trait::async_trait]
+impl TaskDispatcher for HypercodeDispatcher<'_> {
+    async fn dispatch(&self, task: &TaskNode, workdir: &std::path::Path) -> bool {
+        let cfg = HyperCodeConfig::from_config(&self.ctx.config);
+        let provider = self.ctx.agent_config.provider.clone();
+        let opts = HypercodeOptions {
+            provider,
+            ..Default::default()
+        };
+        let parent_model = parent_model_for(self.ctx);
+        let rc = cfg.get_implementor_config(&opts.provider);
+        let req = DelegationRequest {
+            goal: format!(
+                "Implement HyperCode task {}:\n{}\n(Project root: {})",
+                task.id.as_str(),
+                task.objective,
+                workdir.display()
+            ),
+            context: None,
+            tasks: Vec::new(),
+            model: model_override(&rc, &parent_model, &opts.provider),
+            toolsets: vec![
+                "file".to_string(),
+                "terminal".to_string(),
+                "web".to_string(),
+            ],
+            max_turns: Some(rc.max_turns.max(4)),
+            reasoning: parse_reasoning_level(&rc.reasoning_level),
+            max_tokens: nonzero(rc.max_tokens),
+            persist: false,
+            role: SubagentRole::Leaf,
+            workdir: Some(workdir.to_path_buf()),
+            category: None,
+            subagent_type: None,
+            load_skills: Vec::new(),
+            prompt_append: Some(IMPLEMENTOR_PROMPT.to_string()),
+            team: None,
+            name: None,
+        };
+        eprintln!(
+            "hypercode: graph dispatching task {} ({} worker)",
+            task.id.as_str(),
+            match task.role {
+                joey_orchestration::task_graph::WorkerRole::Explorer => "explorer",
+                joey_orchestration::task_graph::WorkerRole::Implementor => "implementor",
+                joey_orchestration::task_graph::WorkerRole::Orchestrator => "orchestrator",
+            }
+        );
+        let child_agent_cfg = child_agent_config(self.ctx);
+        let results = self
+            .ctx
+            .manager
+            .dispatch_requests(
+                &[req],
+                &child_agent_cfg,
+                &self.ctx.config,
+                &self.ctx.base_registry,
+                None,
+            )
+            .await;
+        match results.first() {
+            Some(r) => delegation_succeeded(r),
+            None => false,
+        }
+    }
+}
+
+/// Execute the converted graph (T013's `ctx.execution_graph` slot) with
+/// the deterministic wave scheduler (Spec 023 US3): takes the graph OUT of
+/// the slot, runs `run_to_completion` against a fresh evidence run
+/// directory, puts the mutated graph BACK (terminal statuses visible to
+/// callers/tests), and folds a summary into `report`. Returns the
+/// scheduler's counters.
+async fn execute_graph_run(ctx: &HypercodeContext, report: &mut HypercodeReport) -> RunStats {
+    let mut stats = RunStats::default();
+    // Take the graph out of the slot (clone — graph is Clone).
+    let graph = match ctx.execution_graph.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => {
+            eprintln!("hypercode: execution graph mutex poisoned");
+            return stats;
+        }
+    };
+    let mut graph = match graph {
+        Some(g) => g,
+        None => return stats,
+    };
+
+    let baseline = baseline_revision(&ctx.cwd).unwrap_or_default();
+    let run_id = format!("run-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    let root = run_root(&ctx.cwd, &run_id);
+    let mut run = match RunHandle::create_at(&root, &run_id, &baseline) {
+        Ok(run) => run,
+        Err(e) => {
+            eprintln!("hypercode: failed to create run dir {}: {e}", root.display());
+            // Put the untouched graph back before bailing.
+            if let Ok(mut slot) = ctx.execution_graph.lock() {
+                *slot = Some(graph);
+            }
+            return stats;
+        }
+    };
+
+    let config = GraphSchedulerConfig {
+        max_concurrent_workers: ctx
+            .config
+            .get_i64("hypercode.execution_graph.max_concurrent_workers", 16)
+            .max(0) as usize,
+        max_repair_attempts: ctx
+            .config
+            .get_i64("hypercode.execution_graph.max_repair_attempts", 3)
+            .max(0) as u32,
+    };
+    let dispatcher = HypercodeDispatcher { ctx };
+    stats = GraphScheduler::new(config)
+        .run_to_completion(&mut graph, &mut run, &dispatcher, &AlwaysPassGate, &ctx.cwd)
+        .await;
+
+    let graph_for_report = graph.clone();
+    // Put the mutated graph back (terminal statuses + attempts persist).
+    if let Ok(mut slot) = ctx.execution_graph.lock() {
+        *slot = Some(graph);
+    }
+
+    // Fold a summary into the report, mirroring the legacy fill shape
+    // (successes/build_summaries aligned with the already-populated
+    // workstreams — the conversion filled report.workstreams 1:1 with
+    // graph nodes). Defensive: only align when the counts match.
+    if report.workstreams.len() == graph_for_report.nodes.len() {
+        for (_id, node) in &graph_for_report.nodes {
+            let ok = matches!(node.status, TaskStatus::Completed);
+            report.successes.push(ok);
+            report.build_summaries.push(format!(
+                "task {} → {:?}",
+                node.id.as_str(),
+                node.status
+            ));
+        }
+    }
+    report.mode_decisions.push(format_mode_decision(
+        "execution-graph",
+        "scheduler wave run",
+        &format!(
+            "{} completed, {} failed, {} degraded, {} blocked",
+            stats.completed, stats.failed, stats.degraded, stats.blocked_remaining
+        ),
+    ));
+    eprintln!(
+        "hypercode: graph run {} — {} completed, {} failed, {} degraded, {} blocked",
+        run_id, stats.completed, stats.failed, stats.degraded, stats.blocked_remaining
+    );
+    stats
+}
+
+/// Spec 023 (FR-013/FR-030) resume entry point: re-open a persisted run
+/// directory, re-load its `graph.json`, refuse on baseline mismatch (via
+/// [`RunHandle::resume_at`]), and drive the remaining `Pending` tasks to
+/// completion with the same scheduler/dispatcher/gate wiring as
+/// [`execute_graph_run`]. Returns `None` (with a stderr reason) when the
+/// run cannot be resumed, and `Some(stats)` after the resumed wave run.
+// Not yet reachable from the CLI tree (subcommand wiring is a later
+// spec-023 task); the tests exercise it via the free functions above.
+#[allow(dead_code)]
+pub async fn resume_execution_run(ctx: &HypercodeContext, run_id: &str) -> Option<RunStats> {
+    let root = run_root(&ctx.cwd, run_id);
+    let current = baseline_revision(&ctx.cwd).unwrap_or_default();
+    let mut run = match RunHandle::resume_at(&root, run_id, &current) {
+        Err(e) => {
+            eprintln!("hypercode: refusing to resume run {run_id} — {e}");
+            return None;
+        }
+        Ok(run) => run,
+    };
+    let graph_raw = match std::fs::read_to_string(root.join("graph.json")) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("hypercode: cannot read {} — {e}", root.join("graph.json").display());
+            return None;
+        }
+    };
+    let mut graph = match serde_json::from_str::<TaskGraph>(&graph_raw) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("hypercode: failed to parse graph.json for run {run_id} — {e}");
+            return None;
+        }
+    };
+    if !graph
+        .nodes
+        .values()
+        .any(|n| n.status == TaskStatus::Pending)
+    {
+        eprintln!("hypercode: run {run_id} has no pending tasks — nothing to resume");
+        return None;
+    }
+    let config = GraphSchedulerConfig {
+        max_concurrent_workers: ctx
+            .config
+            .get_i64("hypercode.execution_graph.max_concurrent_workers", 16)
+            .max(0) as usize,
+        max_repair_attempts: ctx
+            .config
+            .get_i64("hypercode.execution_graph.max_repair_attempts", 3)
+            .max(0) as u32,
+    };
+    let dispatcher = HypercodeDispatcher { ctx };
+    let stats = GraphScheduler::new(config)
+        .run_to_completion(&mut graph, &mut run, &dispatcher, &AlwaysPassGate, &ctx.cwd)
+        .await;
+    eprintln!(
+        "hypercode: resumed run {run_id} — {} completed, {} failed, {} degraded, {} blocked",
+        stats.completed, stats.failed, stats.degraded, stats.blocked_remaining
+    );
+    Some(stats)
+}
+
 /// Run the full HyperCode pipeline. Every child dispatch flows through the
 /// manager (SubagentSpawn/SubagentEvent/SubagentComplete events hit the
 /// global tap → TUI panes + rail + job board natively).
@@ -1184,6 +1446,27 @@ pub async fn run_hypercode(
                 );
             }
         }
+    }
+
+    // Spec 023 (US3/T016): when the flag produced a validated graph, hand
+    // the WHOLE run to the deterministic wave scheduler and return — the
+    // legacy explorer/implementor phases never fire. Flag off (default)
+    // ⇒ slot is None ⇒ this early return never taken (SC-001: the legacy
+    // path below is byte-identical; the only flag-off cost is one mutex
+    // lock + is_some check).
+    if ctx
+        .execution_graph
+        .lock()
+        .expect("execution graph mutex")
+        .is_some()
+    {
+        let stats = execute_graph_run(ctx, &mut report).await;
+        eprintln!(
+            "hypercode: graph run complete — {} completed, {} failed, {} degraded, {} blocked",
+            stats.completed, stats.failed, stats.degraded, stats.blocked_remaining
+        );
+        report.total_secs = started.elapsed().as_secs_f64();
+        return report;
     }
 
     if ctx.manager.is_interrupted() {
@@ -1853,5 +2136,53 @@ mod tests {
         }
         assert_eq!(graph.baseline_revision, "deadbeef");
         assert_eq!(graph.validate(), Ok(()), "converted plan must validate");
+    }
+
+    // ── Spec 023 T016: scheduler wiring ───────────────────────────────
+
+    /// Minimal DelegationResult literal for the success-mapping test.
+    fn del_result(success: bool) -> joey_orchestration::DelegationResult {
+        joey_orchestration::DelegationResult {
+            goal: "g".to_string(),
+            summary: "s".to_string(),
+            success,
+            error: if success { None } else { Some("boom".to_string()) },
+            token_usage: Default::default(),
+            wall_clock: std::time::Duration::from_secs(1),
+            model: "m".to_string(),
+            iterations: 1,
+            persisted_session_id: None,
+            stop_reason: None,
+        }
+    }
+
+    /// delegation_succeeded mirrors the legacy predicate exactly: the
+    /// `success` field the build/team paths already map into
+    /// report.successes.
+    #[test]
+    fn delegation_succeeded_maps_both_outcomes() {
+        assert!(delegation_succeeded(&del_result(true)));
+        assert!(!delegation_succeeded(&del_result(false)));
+    }
+
+    /// The placeholder gate passes unconditionally (keeps US3 runnable
+    /// end-to-end until T023's VerifyLoop adapter replaces it).
+    #[tokio::test]
+    async fn always_pass_gate_returns_passed() {
+        let gate = AlwaysPassGate;
+        let outcome = GateTrait::run(&gate, &VerificationPlanView::default(), std::path::Path::new("/tmp")).await;
+        assert_eq!(outcome, GateOutcome::Passed);
+    }
+
+    /// Run directories live under hypercode/projects/<hash>/runs/<run_id>
+    /// (evidence.rs run_root shape).
+    #[test]
+    fn run_id_and_root_shape() {
+        let root = run_root(std::path::Path::new("/tmp/proj"), "run-20990101-000000");
+        let s = root.display().to_string();
+        assert!(s.contains("hypercode"), "root must sit under hypercode/: {s}");
+        assert!(s.contains("projects"), "root must sit under projects/: {s}");
+        assert!(s.contains("runs"), "root must sit under runs/: {s}");
+        assert!(s.ends_with("run-20990101-000000"), "root must end with the run id: {s}");
     }
 }
