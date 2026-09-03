@@ -134,3 +134,62 @@ the same specs/<feature>/*.md files joey-cli's speckit skills operate on.
   (`SCHEMA_VERSION = 22`), cron `jobs.json` envelope, and skill format are
   intentionally identical to upstream so a `~/.hermes` home can be renamed
   to `~/.joey` and just work.
+
+## Enterprise Orchestration Runtime (spec 023)
+
+A typed, evidence-producing execution plane for hypercode runs, built to
+`specs/023-enterprise-orchestration-runtime/` (net-new Joey capability; no
+upstream Hermes counterpart). It spans two crates plus CLI wiring and is
+gated by two independent feature flags, **both default OFF until the final
+flip**: `hypercode.execution_graph.enabled` (the typed TaskGraph runtime)
+and `neurocode.enterprise_context.enabled` (the enterprise analysis plane),
+with knobs `hypercode.execution_graph.max_concurrent_workers` (16) and
+`max_repair_attempts` (3). Flag-off means byte-identical legacy behavior
+(SC-001); the flag flip itself is tracked as pending task T033, gated on
+T032's parity evidence.
+
+### Analysis plane (`joey-neurocode`, additive — `NeuroCodeEngine` untouched)
+
+- `policy/{sources,resolver}` — instruction-file parsing (FR-003) and
+  hierarchical policy combine (FR-002).
+- `risk.rs` — task risk scoring (FR-022).
+- `verification_plan.rs` — verification-plan derivation (FR-001).
+- Classifier graph signals: `SignalKind::GraphHub` activation (FR-004) via
+  a shared `Arc<Mutex<DependencyGraph>>`.
+- `analysis.rs` — `EnterpriseTaskAnalyzer` trait / `AnalysisEngine`
+  (FR-001/FR-005).
+- `memory/outcomes.rs` — outcome memory backed by the `outcome_memory`
+  SQLite table (FR-025/FR-026); the graph schema stays at v3.
+
+### Execution runtime (`joey-orchestration`)
+
+- `task_graph.rs` — `TaskNode`/`TaskGraph`, six validation invariants
+  (FR-009), strict planner JSON `joey-taskgraph/1` (FR-008), legacy-plan
+  conversion (FR-007).
+- `evidence.rs` — run state under
+  `~/.joey/hypercode/projects/<hash>/runs/<run-id>/`, append-only
+  `decisions.jsonl` with a 13-cause vocabulary (FR-012/FR-014), resume
+  baseline check (FR-030).
+- `scheduler.rs` — deterministic wave scheduling, `ConflictAnalyzer`
+  partitioning, semaphore concurrency cap (FR-011/FR-029).
+- `workspace.rs` — git-worktree isolation with full-copy fallback
+  (FR-015).
+- `joiner.rs` — `ChangeBundle`, `git apply --3way` with pre-apply conflict
+  surfacing (FR-017); no commits are made (FR-018).
+- `evaluator.rs` — the `VerificationGate` trait, awaited gates (FR-019),
+  repair ledger + exhaustion ladder (FR-021), Degraded outcome (FR-031).
+
+### CLI wiring (`joey-cli`)
+
+- `hypercode.rs` — the execution-graph path (conversion → scheduler →
+  isolation → joiner → gates) early-returns behind the flag.
+- `hypercode_gate.rs` — `VerifyLoop`→`VerificationGate` adapter with a
+  `DefectBundle` repair queue.
+- Graph-derived routing (FR-023): `route_mode_from_graph`; the legacy
+  `route_mode` is preserved.
+
+### Crate-boundary rule
+
+`joey-orchestration` does **not** import `joey-neurocode` types for the
+gate/graph; the CLI adapts between them (`AnalysisTask` stand-in,
+`VerificationPlanView` mirror) — the workspace DAG is preserved.

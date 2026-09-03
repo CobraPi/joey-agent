@@ -1455,3 +1455,49 @@ as methods on `TeamRecord` / `TeamRegistry` in
 complete/release/list, send/receive/poll), different receiver shapes;
 `data-model.md` pins the entities, JSON layouts, and status enums (which
 match exactly), not Rust receiver shapes.
+
+## Spec 023 — Enterprise Orchestration Runtime (2026-09-02)
+
+**Status**: Deliberate-deviation subsystem (Joey-original, no upstream
+counterpart — this is net-new capability built to
+`specs/023-enterprise-orchestration-runtime/`, **not** upstream parity
+work; upstream Hermes has no typed execution-graph runtime and no
+enterprise analysis plane). Two entries:
+
+- **Enterprise analysis plane (US1)** — additive modules in
+  `joey-neurocode` (the existing `NeuroCodeEngine` is untouched):
+  `policy/{sources,resolver}` (instruction-file parsing FR-003,
+  hierarchical combine FR-002), `risk.rs` (FR-022), `verification_plan.rs`
+  (FR-001), classifier graph signals (`SignalKind::GraphHub` activation
+  FR-004 via a shared `Arc<Mutex<DependencyGraph>>`), `analysis.rs`
+  (`EnterpriseTaskAnalyzer`/`AnalysisEngine` FR-001/FR-005), and
+  `memory/outcomes.rs` (outcome memory in the `outcome_memory` SQLite
+  table FR-025/FR-026; the neurocode graph schema stays at v3).
+- **Execution runtime (US2–US6)** — new modules in `joey-orchestration`:
+  `task_graph.rs` (`TaskNode`/`TaskGraph`, six validation invariants
+  FR-009, strict planner JSON `joey-taskgraph/1` FR-008, legacy conversion
+  FR-007), `evidence.rs` (run state under
+  `~/.joey/hypercode/projects/<hash>/runs/<run-id>/`, append-only
+  `decisions.jsonl` with a 13-cause vocabulary FR-012/FR-014, resume
+  baseline check FR-030), `scheduler.rs` (deterministic waves,
+  `ConflictAnalyzer` partitioning, semaphore cap FR-011/FR-029),
+  `workspace.rs` (git worktree isolation + full-copy fallback FR-015),
+  `joiner.rs` (`ChangeBundle`, `git apply --3way` with pre-apply conflict
+  surfacing FR-017, no commits FR-018), `evaluator.rs` (`VerificationGate`
+  trait, awaited gates FR-019, repair ledger + exhaustion ladder FR-021,
+  Degraded FR-031); plus `joey-cli` wiring (`hypercode.rs` execution-graph
+  path, `hypercode_gate.rs` `VerifyLoop`→`VerificationGate` adapter with
+  `DefectBundle` repair queue, graph-derived routing FR-023 via
+  `route_mode_from_graph` with legacy `route_mode` preserved). Crate
+  boundary: `joey-orchestration` imports no `joey-neurocode` types for the
+  gate/graph — the CLI adapts (`AnalysisTask` stand-in,
+  `VerificationPlanView` mirror), preserving the workspace DAG.
+
+**Flag gating (SC-001)**: two independent flags, both default **false** —
+`hypercode.execution_graph.enabled` and
+`neurocode.enterprise_context.enabled`; with knobs
+`hypercode.execution_graph.max_concurrent_workers` (16) and
+`max_repair_attempts` (3). Flag-off is byte-identical legacy behavior.
+No new deliberate divergences beyond that gating: the SC-001 parity
+evidence collection and the final flag flip remain pending as tasks
+T032/T033 in `specs/023-enterprise-orchestration-runtime/tasks.md`.
