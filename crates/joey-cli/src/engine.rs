@@ -623,6 +623,8 @@ async fn engine_task(
                 let _ = event_tx.send(EngineEvent::HeavyJobFinished { label: out_label, text: res });
             }
             EngineCommand::Hypercode { goal } => {
+                // clear stale interrupt poison (T: self-interrupt fix)
+                interrupt.store(false, Ordering::SeqCst);
                 // HyperCode runs the multi-phase parallel pipeline directly
                 // on the engine's async task (children are network-bound —
                 // the blocking pool would be wrong). The pipeline shares

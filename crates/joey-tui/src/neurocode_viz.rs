@@ -21,7 +21,7 @@
 //! `layout_nodes` maps (snapshot, camera) → cell positions, which the
 //! renderer paints and the mouse hit-tests against.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use ratatui::layout::Rect;
@@ -72,15 +72,23 @@ pub struct VizState {
     /// Highlight the selected node's direct neighbors on the canvas.
     pub show_neighbors: bool,
     /// Canvas cell position of each node as drawn by the LAST frame
-    /// (absolute screen cells, same order as `snapshot.nodes`). Interior
-    /// mutability so the renderer can record from `&App`.
-    pub node_cells: RefCell<Vec<(u16, u16)>>,
+    /// (absolute screen cells, same order as `snapshot.nodes`); `None`
+    /// marks a node the canvas clipped — no hit-cell for invisible
+    /// nodes (same rule as `task_cells`). Interior mutability so the
+    /// renderer can record from `&App`.
+    pub node_cells: RefCell<Vec<Option<(u16, u16)>>>,
     /// Task-DAG box center cells as drawn by the LAST frame on the Tasks
     /// tab (same order as the deterministic `(depth, id)` task ordering);
     /// `None` marks a box the canvas clipped — no hit-cell for invisible
     /// tasks. Separate from `node_cells` so the two hit-tests never mix
     /// indices.
     pub task_cells: RefCell<Vec<Option<(u16, u16)>>>,
+    /// Node-list scroll window start as drawn by the LAST frame: the
+    /// list-line index of the first visible row (header included).
+    /// `explorer_click` adds this to the clicked row so hit-tests map
+    /// through the scrolled window instead of always assuming row 0.
+    /// Interior mutability so the renderer can record from `&App`.
+    pub list_window_start: Cell<usize>,
 }
 
 impl Default for VizState {
@@ -98,6 +106,7 @@ impl Default for VizState {
             show_neighbors: true,
             node_cells: RefCell::new(Vec::new()),
             task_cells: RefCell::new(Vec::new()),
+            list_window_start: Cell::new(0),
         }
     }
 }
@@ -114,6 +123,7 @@ impl VizState {
         self.show_neighbors = true;
         self.node_cells.borrow_mut().clear();
         self.task_cells.borrow_mut().clear();
+        self.list_window_start.set(0);
     }
 
     pub fn cycle_tab(&mut self) {
@@ -333,13 +343,16 @@ impl VizState {
         if cells.is_empty() || self.selected >= cells.len() {
             return;
         }
-        let (sx, sy) = cells[self.selected];
+        let Some((sx, sy)) = cells[self.selected] else {
+            return; // selected node is off-canvas — no anchor to steer from
+        };
         let (sx, sy) = (sx as i32, sy as i32);
         let mut best: Option<(f32, usize)> = None;
-        for (idx, (nx, ny)) in cells.iter().enumerate() {
+        for (idx, cell) in cells.iter().enumerate() {
             if idx == self.selected {
                 continue;
             }
+            let Some((nx, ny)) = cell else { continue }; // clipped — skip
             let (nx, ny) = (*nx as i32, *ny as i32);
             let (vx, vy) = (nx - sx, ny - sy);
             // Must make progress in the requested direction.
@@ -445,7 +458,10 @@ pub fn explorer_click(app: &mut App, row: u16, col: u16, area: Rect) -> bool {
     let (lx, ly, lw, lh) = app.last_viz_nodes_rect.get();
     if lw > 0 && row >= ly && row < ly + lh && col >= lx && col < lx + lw {
         let inner_y = row.saturating_sub(ly).saturating_sub(1); // -1 border
-        if let Some(idx) = list_row_to_index(snapshot, inner_y as usize) {
+        // Add the list's scroll-window start: row 0 of the pane shows
+        // list line `list_window_start`, not line 0.
+        let inner_y = inner_y as usize + viz.list_window_start.get();
+        if let Some(idx) = list_row_to_index(snapshot, inner_y) {
             viz.select(idx);
         }
         return false;
@@ -454,7 +470,8 @@ pub fn explorer_click(app: &mut App, row: u16, col: u16, area: Rect) -> bool {
     // keyboard-driven; accidental docks are worse than no-ops).
     let cells = viz.node_cells.borrow().clone();
     let mut best: Option<(u32, usize)> = None;
-    for (idx, (nx, ny)) in cells.iter().enumerate() {
+    for (idx, cell) in cells.iter().enumerate() {
+        let Some((nx, ny)) = cell else { continue }; // clipped — no hit-cell
         let d = nx.abs_diff(col).max(ny.abs_diff(row)) as u32;
         if d <= 2 && best.map(|(bd, _)| d < bd).unwrap_or(true) {
             best = Some((d, idx));
@@ -1602,6 +1619,9 @@ fn draw_node_list(f: &mut Frame, area: Rect, app: &App, theme: Theme, snapshot: 
     } else {
         0
     };
+    // Record the window start so mouse hit-tests map through the scroll
+    // (the first visible row is list line `start`, not line 0).
+    app.neurocode_viz.list_window_start.set(start);
     let end = (start + visible).min(total);
     f.render_widget(Paragraph::new(lines[start..end].to_vec()), inner);
 }
@@ -1764,14 +1784,22 @@ fn draw_canvas(f: &mut Frame, area: Rect, app: &App, theme: Theme, snapshot: &Co
         Vec::new()
     };
 
-    // Record absolute cells for hit-testing.
-    let cells: Vec<(u16, u16)> = positions
+    // Record absolute cells for hit-testing. Nodes outside the render
+    // bounds record None — a clamped off-canvas cell put a phantom node
+    // at the canvas edge that caught clicks and skewed spatial nav
+    // (same fix pattern as `task_cells`).
+    let cells: Vec<Option<(u16, u16)>> = positions
         .iter()
         .map(|p| {
-            (
-                p.x.clamp(0, u16::MAX as i32) as u16,
-                p.y.clamp(0, u16::MAX as i32) as u16,
-            )
+            if p.x < area.x as i32
+                || p.x >= (area.x + area.width) as i32
+                || p.y < area.y as i32
+                || p.y >= (area.y + area.height) as i32
+            {
+                None
+            } else {
+                Some((p.x as u16, p.y as u16))
+            }
         })
         .collect();
     *viz.node_cells.borrow_mut() = cells;
@@ -1964,7 +1992,7 @@ mod tests {
         let mut v = VizState::default();
         v.reset();
         // Fake recorded cells: primary center, one node to the right, one up.
-        *v.node_cells.borrow_mut() = vec![(40, 12), (50, 12), (40, 4)];
+        *v.node_cells.borrow_mut() = vec![Some((40, 12)), Some((50, 12)), Some((40, 4))];
         v.select_directional(&s, 1, 0);
         assert_eq!(v.selected, 1, "right selects the right-hand node");
         v.select_directional(&s, 0, -1);
@@ -2029,6 +2057,132 @@ mod tests {
         assert_eq!(list_row_to_index(&s, 1), Some(0));
         assert_eq!(list_row_to_index(&s, 3), Some(2));
         assert_eq!(list_row_to_index(&s, 4), None, "past the end");
+    }
+
+    /// Regression (bug 1): nodes laid out outside the canvas bounds used to
+    /// record a hit-cell clamped into u16 range, so phantom nodes at the
+    /// canvas edge caught clicks and skewed `select_directional`. Off-canvas
+    /// nodes must now record `None` and be skipped by both hit-tests.
+    #[test]
+    fn off_canvas_nodes_are_not_hit_testable() {
+        use ratatui::backend::TestBackend;
+        let mut s = snap(9);
+        // Spread nodes so several fall far outside a small canvas.
+        for (i, nd) in s.nodes.iter_mut().enumerate().skip(1) {
+            nd.depth = 3.min(1 + i);
+        }
+        let mut app = App::new("s", "m");
+        app.neurocode_snapshot = Some(s);
+        app.neurocode_active = true;
+        app.neurocode_expanded = true;
+        app.neurocode_viz.zoom = 3.0; // max zoom-out radius — pushes rings off
+
+        let area = Rect::new(0, 0, 40, 12);
+        let mut term = ratatui::Terminal::new(TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| draw_explorer(f, area, &app, Theme::aurora()))
+            .unwrap();
+
+        let cells = app.neurocode_viz.node_cells.borrow().clone();
+        assert_eq!(cells.len(), 9, "every node records a slot");
+        // Every recorded Some(..) cell must lie INSIDE the canvas area…
+        for cell in cells.iter().flatten() {
+            assert!(
+                cell.0 >= area.x
+                    && cell.0 < area.x + area.width
+                    && cell.1 >= area.y
+                    && cell.1 < area.y + area.height,
+                "recorded cell {cell:?} outside canvas {area:?}"
+            );
+        }
+        // …and at this zoom at least one node must have been clipped.
+        assert!(
+            cells.iter().any(|c| c.is_none()),
+            "expected at least one off-canvas node to record None"
+        );
+        let vis: Vec<usize> = cells
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.map(|_| i))
+            .collect();
+        let invis: Vec<usize> = cells
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.is_none().then_some(i))
+            .collect();
+        assert!(!vis.is_empty() && !invis.is_empty());
+
+        // Click everywhere except the title row (which docks): a phantom
+        // clamped cell used to sit at a canvas edge and catch clicks. The
+        // selection must never land on a clipped (invisible) node.
+        app.neurocode_viz.selected = vis[0];
+        for row in (area.y + 1)..(area.y + area.height) {
+            for col in area.x..(area.x + area.width) {
+                explorer_click(&mut app, row, col, area);
+                assert!(
+                    vis.contains(&app.neurocode_viz.selected),
+                    "click at ({row},{col}) selected clipped node {}",
+                    app.neurocode_viz.selected
+                );
+            }
+        }
+    }
+
+    /// Regression (bug 1, spatial nav): `select_directional` must skip
+    /// `None` (off-canvas) cells — a phantom clamped cell used to win
+    /// direction queries it had no business competing in.
+    #[test]
+    fn directional_selection_skips_off_canvas_nodes() {
+        let s = snap(4);
+        let mut v = VizState::default();
+        // Primary on screen; node 1 recorded None (clipped); node 2 right.
+        *v.node_cells.borrow_mut() = vec![Some((40, 12)), None, Some((52, 12))];
+        v.selected = 0;
+        v.select_directional(&s, 1, 0);
+        assert_eq!(v.selected, 2, "right skips the clipped node");
+        // Anchor itself clipped → no-op rather than a phantom steer.
+        let mut v2 = VizState::default();
+        *v2.node_cells.borrow_mut() = vec![None, Some((52, 12)), Some((40, 4))];
+        v2.selected = 0;
+        v2.select_directional(&s, 1, 0);
+        assert_eq!(v2.selected, 0, "clipped anchor means no move");
+    }
+
+    /// Regression (bug 2): when the node list is scrolled (cursor past the
+    /// visible window), pane row 0 shows list line `start` — clicks must
+    /// map through the scroll, not assume line 0.
+    #[test]
+    fn node_list_click_maps_through_scroll_window() {
+        use ratatui::backend::TestBackend;
+        let s = snap(40); // far more nodes than the pane shows
+        let mut app = App::new("s", "m");
+        app.neurocode_snapshot = Some(s);
+        app.neurocode_active = true;
+        app.neurocode_expanded = true;
+        app.neurocode_viz.tab = VizTab::Nodes;
+        // Scroll deep into the list so the window start is well past 0.
+        app.neurocode_viz.list_cursor = 30;
+        app.neurocode_viz.selected = 30;
+
+        let area = Rect::new(0, 0, 100, 36);
+        let mut term = ratatui::Terminal::new(TestBackend::new(100, 36)).unwrap();
+        term.draw(|f| draw_explorer(f, area, &app, Theme::aurora()))
+            .unwrap();
+
+        let start = app.neurocode_viz.list_window_start.get();
+        assert!(start > 0, "list is scrolled: window start {start} > 0");
+
+        // Click the first node row under the header: it must select node
+        // index `start` (the first visible node), NOT node 0/1 as the
+        // unscrolled mapping did.
+        let (lx, ly, lw, lh) = app.last_viz_nodes_rect.get();
+        assert!(lw > 0 && lh > 0, "node-list rect recorded");
+        let click_row = ly + 2; // border + header row
+        explorer_click(&mut app, click_row, lx + 2, area);
+        assert_eq!(
+            app.neurocode_viz.selected, start,
+            "clicked first visible row; expected node {start} (window start), got {}",
+            app.neurocode_viz.selected
+        );
     }
 
     /// Visual smoke (run with JOEY_TUI_VISUAL=1 --nocapture to eyeball):

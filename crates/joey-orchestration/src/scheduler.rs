@@ -277,7 +277,7 @@ impl Scheduler {
                             ),
                         );
                         if let Err(e) = r.append_decision(&entry) {
-                            eprintln!("joey-orchestration: failed to append decision: {e}");
+                            tracing::warn!("joey-orchestration: failed to append decision: {e}");
                         }
                     }
                 }
@@ -344,7 +344,7 @@ fn transition_and_persist(
             let from = match g.node(id) {
                 Some(n) => n.status,
                 None => {
-                    eprintln!("joey-orchestration: scheduler referenced unknown task {id}");
+                    tracing::warn!("joey-orchestration: scheduler referenced unknown task {id}");
                     return None;
                 }
             };
@@ -357,7 +357,7 @@ fn transition_and_persist(
                     g.snapshot(),
                 )),
                 Err(e) => {
-                    eprintln!("joey-orchestration: {e}");
+                    tracing::warn!("joey-orchestration: {e}");
                     None
                 }
             }
@@ -368,13 +368,13 @@ fn transition_and_persist(
             let entry =
                 DecisionEntry::new(id.as_str(), from, to, cause, vec![], detail.to_string());
             if let Err(e) = r.append_decision(&entry) {
-                eprintln!("joey-orchestration: failed to append decision: {e}");
+                tracing::warn!("joey-orchestration: failed to append decision: {e}");
             }
             if let Err(e) = r.write_node(id.as_str(), &node_json) {
-                eprintln!("joey-orchestration: failed to write node snapshot: {e}");
+                tracing::warn!("joey-orchestration: failed to write node snapshot: {e}");
             }
             if let Err(e) = r.write_graph(&graph_json) {
-                eprintln!("joey-orchestration: failed to write graph snapshot: {e}");
+                tracing::warn!("joey-orchestration: failed to write graph snapshot: {e}");
             }
         });
         // Fire the snapshot sink (if attached) with the same JSON value
@@ -450,7 +450,7 @@ async fn process_task(
                     "queued beyond concurrency cap",
                 );
                 if let Err(e) = r.append_decision(&entry) {
-                    eprintln!("joey-orchestration: failed to append decision: {e}");
+                    tracing::warn!("joey-orchestration: failed to append decision: {e}");
                 }
             });
             semaphore
@@ -486,7 +486,7 @@ async fn process_task(
         let snapshot = match with_graph(graph_m, |g| g.node(&id).map(|n| n.clone())) {
             Some(node) => node,
             None => {
-                eprintln!("joey-orchestration: task {id} vanished mid-run");
+                tracing::warn!("joey-orchestration: task {id} vanished mid-run");
                 return;
             }
         };
@@ -521,7 +521,7 @@ async fn process_task(
             let task = match with_graph(graph_m, |g| g.node(&id).map(|n| n.clone())) {
                 Some(node) => node,
                 None => {
-                    eprintln!("joey-orchestration: task {id} vanished mid-run");
+                    tracing::warn!("joey-orchestration: task {id} vanished mid-run");
                     return;
                 }
             };

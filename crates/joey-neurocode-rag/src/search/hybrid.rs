@@ -698,8 +698,11 @@ fn keyword_leg_candidates(
 /// Dense-leg candidates with the file-scope filter applied INSIDE the leg
 /// — BEFORE fusion (T019). Dense ranks are positions in the cosine-ordered
 /// candidate list (assigned pre-filter, like the keyword ordinals); a
-/// filtered-out path NEVER appears here. Embedder failure propagates as
-/// [`DenseLegError`] (the T020 degradation signal).
+/// filtered-out path NEVER appears here. Each survivor carries the rank it
+/// earned in the FULL candidate list — filtering drops entries, it never
+/// renumbers the survivors (the keyword leg's documented contract, ~line
+/// 686). Embedder failure propagates as [`DenseLegError`] (the T020
+/// degradation signal).
 fn dense_leg_candidates<E: fmt::Display, F>(
     store: &GraphStore,
     profile: &EmbedProfile,
@@ -708,7 +711,7 @@ fn dense_leg_candidates<E: fmt::Display, F>(
     file_filter: Option<&str>,
     include_fallback_chunks: bool,
     embed: F,
-) -> Result<Vec<(ChunkRow, f32)>, DenseLegError>
+) -> Result<Vec<(ChunkRow, f32, u32)>, DenseLegError>
 where
     F: FnOnce(&[String]) -> Result<Vec<Vec<f32>>, E>,
 {
@@ -720,10 +723,14 @@ where
         include_fallback_chunks,
         embed,
     )?;
-    let mut pairs: Vec<(ChunkRow, f32)> = Vec::with_capacity(candidates.len());
-    for c in &candidates {
+    // Rank (1-based position in the cosine-ordered candidate list) is
+    // assigned from the candidate position BEFORE the retain below — a
+    // filtered-out rank-1 hit must leave the rank-2 survivor at 2, not
+    // compact it to 1.
+    let mut triples: Vec<(ChunkRow, f32, u32)> = Vec::with_capacity(candidates.len());
+    for (position, c) in candidates.iter().enumerate() {
         match fetch_chunk_row(store, &c.chunk_id) {
-            Ok(row) => pairs.push((row, c.score)),
+            Ok(row) => triples.push((row, c.score, position as u32 + 1)),
             // The candidate's row vanished between the scan and this
             // fetch (a refresh committed a purge in between — WAL gives
             // per-statement snapshots, not cross-statement ones).
@@ -738,9 +745,9 @@ where
         }
     }
     if let Some(pattern) = file_filter {
-        pairs.retain(|(row, _)| glob_match(pattern, &row.source_path));
+        triples.retain(|(row, _, _)| glob_match(pattern, &row.source_path));
     }
-    Ok(pairs)
+    Ok(triples)
 }
 
 /// `/neurocode search` orchestration, keyword-only posture: the injected
@@ -851,7 +858,7 @@ where
             })
             .keyword_rank = Some(*keyword_rank);
     }
-    for (rank, (row, _score)) in dense_pairs.iter().enumerate() {
+    for (row, _score, dense_rank) in dense_pairs.iter() {
         by_id
             .entry(row.chunk_id.clone())
             .or_insert_with(|| crate::search::rrf::RrfEntry {
@@ -859,12 +866,12 @@ where
                 keyword_rank: None,
                 dense_rank: None,
             })
-            .dense_rank = Some(rank as u32 + 1);
+            .dense_rank = Some(*dense_rank);
     }
     let rows_by_id: std::collections::HashMap<&String, &ChunkRow> = keyword_leg
         .iter()
         .map(|(row, _)| (&row.chunk_id, row))
-        .chain(dense_pairs.iter().map(|(row, _)| (&row.chunk_id, row)))
+        .chain(dense_pairs.iter().map(|(row, _, _)| (&row.chunk_id, row)))
         .collect();
     let fused = crate::search::rrf::rrf_fuse(by_id.into_values().collect());
     let mut merged: Vec<RankedResult> = fused
@@ -1949,9 +1956,9 @@ mod tests {
             .unwrap();
             assert!(!leg.is_empty(), "in-scope dense hits present");
             assert!(
-                leg.iter().all(|(r, _)| r.source_path.starts_with("src/")),
+                leg.iter().all(|(r, _, _)| r.source_path.starts_with("src/")),
                 "no lib/ path in the dense candidate list: {:?}",
-                leg.iter().map(|(r, _)| r.source_path.clone()).collect::<Vec<_>>()
+                leg.iter().map(|(r, _, _)| r.source_path.clone()).collect::<Vec<_>>()
             );
             // Unfiltered: both files reachable (query aligned with src/ but
             // exhaustive scan returns lib/ too).
@@ -1966,6 +1973,66 @@ mod tests {
             )
             .unwrap();
             assert!(unfiltered.len() >= 2);
+        }
+
+        /// The rank-carry pin: ranks are positions in the FULL cosine-
+        /// ordered candidate list, assigned BEFORE the file filter —
+        /// filtering out the rank-1 hit must leave the rank-2 survivor at
+        /// dense rank 2, never compacted to 1 (the documented leg contract
+        /// mirrored from the keyword leg).
+        #[test]
+        fn t019_dense_leg_filter_keeps_full_list_ranks() {
+            let (tmp, store) = temp_store();
+            index_two_files(&tmp, &store);
+            let dim = NOMIC_EMBED_TEXT_V1_5.dim as usize;
+            // Query aligned with the lib/ unit vector (index 1): lib/ is
+            // the cosine rank-1 hit, src/ ranks 2 in the FULL list.
+            let lib_query = || {
+                let mut v = vec![0.0f32; dim];
+                v[1] = 1.0;
+                move |_texts: &[String]| Ok::<_, std::convert::Infallible>(vec![v.clone()])
+            };
+
+            // Fixture sanity: lib/ leads the FULL (unfiltered) list.
+            let full = dense_leg_candidates(
+                &store,
+                &NOMIC_EMBED_TEXT_V1_5,
+                "value",
+                10,
+                None,
+                true,
+                lib_query(),
+            )
+            .unwrap();
+            assert!(
+                full.first().is_some_and(|(r, _, _)| r.source_path.starts_with("lib/")),
+                "fixture sanity: lib/ must lead the full list: {:?}",
+                full.iter().map(|(r, _, rk)| (r.source_path.clone(), rk)).collect::<Vec<_>>()
+            );
+
+            // The glob `src/*` filters out the lib/ rank-1 hit; the src/
+            // survivor keeps the rank it earned in the FULL list (2), not
+            // the compacted position 1.
+            let scoped = dense_leg_candidates(
+                &store,
+                &NOMIC_EMBED_TEXT_V1_5,
+                "value",
+                10,
+                Some("src/*"),
+                true,
+                lib_query(),
+            )
+            .unwrap();
+            let survivor_rank = scoped
+                .iter()
+                .find(|(r, _, _)| r.source_path.starts_with("src/"))
+                .map(|(_, _, rank)| *rank);
+            assert_eq!(
+                survivor_rank,
+                Some(2),
+                "filtered dense survivors keep full-list ordinals (2), not compacted ranks: {:?}",
+                scoped.iter().map(|(r, _, rk)| (r.source_path.clone(), rk)).collect::<Vec<_>>()
+            );
         }
 
         /// End-to-end through the fused outcome with a working embedder:

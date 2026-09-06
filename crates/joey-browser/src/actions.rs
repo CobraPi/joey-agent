@@ -8,6 +8,118 @@ use crate::cdp::BrowserError;
 use crate::refs::{ElementRefRegistry, ResolvedBy, TargetDescriptor};
 use crate::session::BrowserManager;
 
+/// JSON-encode a string for interpolation into a JS string literal.
+/// Rust `{:?}` Debug escaping emits sequences like `\u{1}` that are
+/// INVALID JavaScript; serde_json emits `\u0001`, which is valid.
+pub(crate) fn js_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Walk the DOM exactly like the scanner (same-origin iframe documents +
+/// shadow roots) and run `op` — a comma expression over `el` evaluating to
+/// a string — on the first element matching by locator (exact → suffix) or
+/// normalized text (mirroring the resolver cascade). Returns 'nope' when
+/// not found.
+///
+/// Bug fix: locators SCAN_JS builds for elements inside iframes/shadow
+/// roots cannot be resolved by `document.querySelector` on the top
+/// document — they must be re-resolved through the owning frame/shadow
+/// root at action time.
+const FIND_AND_OP_JS: &str = r#"
+(function(){
+  const LOC = %LOCATOR%;
+  const TXT = %TEXT%;
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  function locatorFor(el) {
+    if (el.id) return '#' + CSS.escape(el.id);
+    const parts = [];
+    let node = el;
+    while (node && node !== document && parts.length < 8) {
+      const parent = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
+      const tag = node.tagName ? node.tagName.toLowerCase() : 'unknown';
+      if (parent) {
+        const sibs = Array.from(parent.children || []).filter((c) => c.tagName === node.tagName);
+        const idx = sibs.indexOf(node) + 1;
+        parts.unshift(sibs.length > 1 ? tag + ':nth-of-type(' + idx + ')' : tag);
+      } else {
+        parts.unshift(tag);
+      }
+      node = parent;
+    }
+    return parts.join(' > ') || el.tagName.toLowerCase();
+  }
+  let exact = null, suffix = null, byText = null;
+  function consider(el) {
+    if (el.nodeType !== 1) return;
+    let loc = null;
+    try { loc = locatorFor(el); } catch (e) { return; }
+    if (LOC && loc === LOC && exact === null) exact = el;
+    else if (LOC && typeof loc === 'string' && loc.endsWith(LOC) && suffix === null) suffix = el;
+    else if (TXT && byText === null) {
+      const txt = norm(el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder || '');
+      if (txt === TXT) byText = el;
+    }
+  }
+  function walk(root) {
+    if (!root) return;
+    let nodes;
+    try { nodes = root.querySelectorAll('*'); } catch (e) { return; }
+    for (const el of nodes) consider(el);
+    try {
+      for (const f of root.querySelectorAll('iframe')) {
+        if (f.contentDocument) walk(f.contentDocument);
+      }
+    } catch (e) { /* skip */ }
+    for (const host of nodes) {
+      if (host.shadowRoot) walk(host.shadowRoot);
+    }
+  }
+  walk(document);
+  const el = exact || suffix || byText;
+  if (!el) return 'nope';
+  return %OP%;
+})()
+"#;
+
+fn find_and_op_js(locator: &str, text: &str, op: &str) -> String {
+    FIND_AND_OP_JS
+        .replace("%LOCATOR%", &js_str(locator))
+        .replace("%TEXT%", &js_str(text))
+        .replace("%OP%", op)
+}
+
+/// op: focus the element.
+const FOCUS_OP: &str = "(el.focus(), 'ok')";
+/// op: focus + clear a form control's value.
+const FOCUS_CLEAR_OP: &str = "(el.focus(), el.value = '', 'ok')";
+
+/// op: set a form control's value (JSON-escaped — never Rust `{:?}`) and
+/// fire `change`.
+fn select_op(value: &str) -> String {
+    format!(
+        "(el.value = {}, el.dispatchEvent(new Event('change', {{bubbles:true}})), String(el.value))",
+        js_str(value)
+    )
+}
+
+/// op: scroll a container by `delta` px.
+fn scroll_op(delta: f64) -> String {
+    format!("(el.scrollTop += {delta}, String(el.scrollTop))")
+}
+
+/// True when `key` denotes a single printable character typed without
+/// ctrl/alt/meta (shift is allowed: shift+a still types). Such keys must
+/// be dispatched as `keyDown` WITH `text` — rawKeyDown with text omitted
+/// types nothing.
+fn is_printable_key(key: &str, ctrl: bool, alt: bool, meta: bool) -> bool {
+    if ctrl || alt || meta {
+        return false;
+    }
+    let mut chars = key.chars();
+    let Some(c) = chars.next() else { return false };
+    chars.next().is_none() && !c.is_control()
+}
+
 /// Result of one action.
 #[derive(Debug, Clone)]
 pub struct ActionResult {
@@ -111,18 +223,15 @@ impl BrowserManager {
         let (_, el, by) = self.resolve_fresh(target).await?;
         let page = self.ensure_page().await?;
         let s = &page.session_id;
-        // Focus + optional clear via JS (non-mutating beyond the input's own value).
-        let clear_js = if clear {
-            format!(
-                "(function(){{ var e=document.querySelector('{}'); if(!e) return 'nope'; e.focus(); e.value=''; return 'ok'; }})()",
-                el.locator.replace('\'', "\\'")
-            )
-        } else {
-            format!(
-                "(function(){{ var e=document.querySelector('{}'); if(!e) return 'nope'; e.focus(); return 'ok'; }})()",
-                el.locator.replace('\'', "\\'")
-            )
-        };
+        // Focus + optional clear via JS (non-mutating beyond the input's own
+        // value). find_and_op_js resolves the element ONCE through the same
+        // frame/shadow-root cascade the scanner uses — document.querySelector
+        // cannot reach elements inside iframes/shadow roots.
+        let clear_js = find_and_op_js(
+            &el.locator,
+            &el.text,
+            if clear { FOCUS_CLEAR_OP } else { FOCUS_OP },
+        );
         let fr = self.evaluate(&clear_js).await?;
         if fr.as_str() == Some("nope") {
             return Err(BrowserError::target_not_found(&[format!(
@@ -194,11 +303,7 @@ impl BrowserManager {
             Some(t) => {
                 // Container scroll: resolve the container, scroll it via JS.
                 let (_, el, by) = self.resolve_fresh(t).await?;
-                let js = format!(
-                    "(function(){{ var e=document.querySelector('{}'); if(!e) return 'nope'; e.scrollTop += {}; return String(e.scrollTop); }})()",
-                    el.locator.replace('\'', "\\'"),
-                    sign * amount_px
-                );
+                let js = find_and_op_js(&el.locator, &el.text, &scroll_op(sign * amount_px));
                 let r = self.evaluate(&js).await?;
                 if r.as_str() == Some("nope") {
                     return Err(BrowserError::target_not_found(&[format!(
@@ -249,11 +354,7 @@ impl BrowserManager {
         value: &str,
     ) -> Result<ActionResult, BrowserError> {
         let (_, el, by) = self.resolve_fresh(target).await?;
-        let js = format!(
-            "(function(){{ var e=document.querySelector('{}'); if(!e) return 'nope'; e.value={:?}; e.dispatchEvent(new Event('change', {{bubbles:true}})); return String(e.value); }})()",
-            el.locator.replace('\'', "\\'"),
-            value
-        );
+        let js = find_and_op_js(&el.locator, &el.text, &select_op(value));
         let r = self.evaluate(&js).await?;
         match r.as_str() {
             Some("nope") => Err(BrowserError::target_not_found(&[format!(
@@ -281,14 +382,29 @@ impl BrowserManager {
         let page = self.ensure_page().await?;
         let modifiers = modifier_bitmask(ctrl, alt, shift, meta);
         let code = key.to_string();
-        for kind in ["rawKeyDown", "keyUp"] {
-            self.conn()?
-                .send(
-                    "Input.dispatchKeyEvent",
-                    key_event(kind, key, Some(&code), modifiers, None),
-                    Some(&page.session_id),
-                )
-                .await?;
+        if is_printable_key(key, ctrl, alt, meta) {
+            // Printable keys must be dispatched as keyDown WITH `text` —
+            // rawKeyDown with text omitted types nothing.
+            let ch = key.to_string();
+            for kind in ["keyDown", "keyUp"] {
+                self.conn()?
+                    .send(
+                        "Input.dispatchKeyEvent",
+                        key_event(kind, key, Some(&code), modifiers, Some(&ch)),
+                        Some(&page.session_id),
+                    )
+                    .await?;
+            }
+        } else {
+            for kind in ["rawKeyDown", "keyUp"] {
+                self.conn()?
+                    .send(
+                        "Input.dispatchKeyEvent",
+                        key_event(kind, key, Some(&code), modifiers, None),
+                        Some(&page.session_id),
+                    )
+                    .await?;
+            }
         }
         Ok(ActionResult { ok: true, resolved_by: ResolvedBy::Geometry, detail: format!("pressed {key}") })
     }

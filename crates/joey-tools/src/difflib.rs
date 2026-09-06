@@ -24,7 +24,6 @@ pub struct SequenceMatcher<'a, T: Eq + Hash> {
     a: &'a [T],
     b: &'a [T],
     b2j: HashMap<&'a T, Vec<usize>>,
-    bpopular: std::collections::HashSet<&'a T>,
 }
 
 impl<'a, T: Eq + Hash> SequenceMatcher<'a, T> {
@@ -49,11 +48,17 @@ impl<'a, T: Eq + Hash> SequenceMatcher<'a, T> {
                 b2j.remove(elt);
             }
         }
-        Self { a, b, b2j, bpopular }
+        Self { a, b, b2j }
     }
 
-    fn is_bjunk(&self, elt: &T) -> bool {
-        self.bpopular.contains(elt)
+    fn is_bjunk(&self, _elt: &T) -> bool {
+        // CPython divergence note: with isjunk=None, `bjunk` is never
+        // populated — popular elements (autojunk) are removed from b2j but
+        // are NOT junk for the extension loops in find_longest_match.
+        // This port has no junk phase (no isjunk input), so is_bjunk is
+        // always false; the junk-extension loops below are dead code kept
+        // for structural parity with CPython's difflib.
+        false
     }
 
     /// Port of `find_longest_match`.
@@ -393,5 +398,28 @@ mod tests {
         assert_eq!(split_lines_keepends("a\nb"), vec!["a\n", "b"]);
         assert_eq!(split_lines_keepends("a\r\nb\n"), vec!["a\r\n", "b\n"]);
         assert_eq!(split_lines_keepends(""), Vec::<&str>::new());
+    }
+
+    /// Pinned CPython-divergence case: with isjunk=None, autojunk-popular
+    /// elements are removed from `b2j` but are NOT junk — CPython's non-junk
+    /// extension loops in `find_longest_match` extend across them (bjunk is
+    /// empty). If `is_bjunk` consults `bpopular` (the old bug), the loops
+    /// refuse to extend over the popular `1`s and a non-maximal
+    /// `(0, 30, 1)` comes back instead of CPython's `(0, 30, 4)`.
+    #[test]
+    fn find_longest_match_popular_elements_are_not_junk() {
+        let a: Vec<i32> = vec![75, 1, 52, 1, 89, 1];
+        let mut b: Vec<i32> = (0..220).map(|i| 1000 + i as i32).collect();
+        b[30] = 75;
+        b[31] = 1;
+        b[32] = 52;
+        b[33] = 1;
+        // Make `1` popular: n=220 → ntest = 220/100+1 = 3, and `1` occurs at
+        // 31, 33, 100, 150, 200 → 5 > 3 → dropped from b2j by autojunk.
+        b[100] = 1;
+        b[150] = 1;
+        b[200] = 1;
+        let sm = SequenceMatcher::new(&a, &b);
+        assert_eq!(sm.find_longest_match(0, a.len(), 0, b.len()), (0, 30, 4));
     }
 }

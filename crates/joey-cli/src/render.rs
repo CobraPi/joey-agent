@@ -506,6 +506,45 @@ fn current_term_height() -> u16 {
     crossterm::terminal::size().map(|(_, h)| h).unwrap_or(0)
 }
 
+/// US2/T040 (spinner-residue fix): erase transient cursor-line artifacts —
+/// a still-running thinking-spinner frame and/or the streaming caret — so
+/// the physical cursor row is clean before the next println/print. Used by
+/// the terminal arms (Done/Failed) that previously never finalized the
+/// spinner: any turn ending without streamed content or a tool call (empty
+/// response, iterations == 0, immediate error, reasoning-only) used to leave
+/// the last spinner frame (`⠸ querying model... · 12k in`) on the cursor
+/// row, where reedline then drew its `❯` prompt and echoed keystrokes.
+/// Prints NO newline; its only job is to clear the current row. A spinner
+/// that is `Some` but NOT running was already finalized (ContentDelta) and
+/// its row terminated by the newline prints there — leave it alone.
+fn finalize_live_rendering(
+    spinner_state: &mut Option<crate::animation::AnimationState>,
+    caret_visible: &mut bool,
+) {
+    // US2: finalize a still-running spinner (mirrors the ContentDelta arm).
+    if let Some(s) = spinner_state.as_mut() {
+        if s.running {
+            s.finalize();
+            use crossterm::{cursor, execute, terminal};
+            let _ = execute!(
+                std::io::stdout(),
+                cursor::MoveToColumn(0),
+                terminal::Clear(terminal::ClearType::CurrentLine)
+            );
+        }
+    }
+    // T040: erase the streaming caret if it's visible.
+    if *caret_visible {
+        use crossterm::{cursor, execute, terminal};
+        let _ = execute!(
+            std::io::stdout(),
+            cursor::MoveLeft(1),
+            terminal::Clear(terminal::ClearType::FromCursorDown),
+        );
+        *caret_visible = false;
+    }
+}
+
 /// Consume agent events and render them live. Returns the final text.
 #[allow(unused_assignments)] // row/interleave accounting locals are written via `println_counted!` in every loop arm; exit arms (Done/Failed) never read the last write
 pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: RenderOptions) -> String {
@@ -1318,15 +1357,11 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     pending_separator = true;
                 }
 
-                // T040: erase the streaming caret if visible.
-                if caret_visible {
-                    use crossterm::{cursor, execute, terminal};
-                    let _ = execute!(
-                        std::io::stdout(),
-                        cursor::MoveLeft(1),
-                        terminal::Clear(terminal::ClearType::FromCursorDown),
-                    );
-                }
+                // US2/T040 (spinner-residue fix): finalize any still-running
+                // spinner and erase the streaming caret — Done previously
+                // never finalized the spinner, leaving the last frame on the
+                // cursor row for turns that ended without content or tools.
+                finalize_live_rendering(&mut spinner_state, &mut caret_visible);
 
                 // US3: markdown reflow. If we streamed raw text and the final
                 // text contains markdown, clear the streamed region and re-print
@@ -1413,6 +1448,11 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                     if streamed_any { interleaved_output = true; }
                     pending_separator = true;
                 }
+                // US2/T040 (spinner-residue fix): Failed previously never
+                // finalized the spinner nor erased the streaming caret — an
+                // immediate error left the last spinner frame on the cursor
+                // row, contaminating the reedline prompt/input line below.
+                finalize_live_rendering(&mut spinner_state, &mut caret_visible);
                 // Feature 013 (T025/T031): drain before the error line. The
                 // old `if streamed_any { println!() }` ad-hoc blank is subsumed
                 // by the flag (INV-1 dedup). NO set after — turn end.

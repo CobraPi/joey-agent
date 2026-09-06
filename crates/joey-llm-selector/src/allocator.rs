@@ -676,22 +676,10 @@ impl ModelAllocator for SelectorEngine {
             };
         }
 
-        // Check the per-turn cache first (FR-007). Pool guard: a cached id
-        // whose model has since left the pool is stale — fall through to the
-        // map path so the FR-014 staleness check re-resolves it. (The cache
-        // lock is dropped before touching the pool to keep lock ordering
-        // strictly cache → pool.)
-        let cached = {
-            let cache = self.cache.lock().unwrap();
-            cache.allocations.get(&module).cloned()
-        };
-        if let Some(alloc) = cached {
-            if self.is_in_pool(&alloc.model_id) {
-                return alloc;
-            }
-        }
-
-        // Cache miss: resolve from the map.
+        // Per-turn requirements (FR-005) — computed BEFORE the cache/map hit
+        // paths so a cached or map-allocated model can be re-checked against
+        // THIS turn's capability needs (images, token budget). A hit from an
+        // earlier image-less turn must not serve a turn that now has images.
         let reqs = match &module {
             ModuleId::MainTurn => ModuleRequirements::main_turn(turn_has_images, token_budget_hint),
             ModuleId::Compression => ModuleRequirements::compression(token_budget_hint),
@@ -703,6 +691,29 @@ impl ModelAllocator for SelectorEngine {
             },
         };
 
+        // Check the per-turn cache first (FR-007). Pool guard: a cached id
+        // whose model has since left the pool is stale — fall through to the
+        // map path so the FR-014 staleness check re-resolves it. Capability
+        // guard: even a live cached model must still satisfy this turn's
+        // requirements. (The cache lock is dropped before touching the pool
+        // to keep lock ordering strictly cache → pool.)
+        let cached = {
+            let cache = self.cache.lock().unwrap();
+            cache.allocations.get(&module).cloned()
+        };
+        if let Some(alloc) = cached {
+            let pool = self.pool.read().unwrap();
+            let usable = pool
+                .get(&alloc.model_id)
+                .map(|m| ColdStartScorer::satisfies(m, &reqs))
+                .unwrap_or(false);
+            drop(pool);
+            if usable {
+                return alloc;
+            }
+        }
+
+        // Cache miss: resolve from the map.
         let map = self.map.read().unwrap();
         if let Some(entry) = map.get(&module) {
             // Honor pinned entries verbatim (FR-012).
@@ -714,7 +725,16 @@ impl ModelAllocator for SelectorEngine {
                 return alloc;
             }
             // FR-014: if the cached model id is stale (not in pool), re-resolve.
-            if !self.is_in_pool(&entry.model_id) {
+            // FR-005: if the model is live but incapable of THIS turn's
+            // requirements (e.g. no vision while the turn has images),
+            // re-resolve via cold-start rather than serving it.
+            let entry_usable = {
+                let pool = self.pool.read().unwrap();
+                pool.get(&entry.model_id)
+                    .map(|m| ColdStartScorer::satisfies(m, &reqs))
+                    .unwrap_or(false)
+            };
+            if !entry_usable {
                 drop(map);
                 if let Some((id, _reason)) = self.cold_start_resolve(&module, &reqs) {
                     let alloc = Allocation {
@@ -1141,6 +1161,106 @@ mod tests {
     }
 
     // ── Phase 11 Convergence: pool population + fallback (T070/T072/T073) ──
+
+    /// Regression (FR-005 per-turn capability gate on hit paths): turn 1
+    /// without images cold-starts the cheapest capable model (non-vision
+    /// model-a). Turn 2 WITH images must NOT serve model-a — neither from
+    /// the per-turn cache nor from the map — because it fails this turn's
+    /// vision requirement; it must re-resolve to a vision-capable model.
+    #[test]
+    fn test_turn2_with_images_does_not_return_nonvision_model() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: "auto".to_string(),
+            ..Default::default()
+        };
+        // Pool: model-a is cheaper (Flash) but lacks vision; model-v is
+        // vision-capable. Turn 1 (no images) → model-a.
+        let mut map = AllocationMap::default();
+        map.enabled = true;
+        let (engine, _dir) = make_engine_with_pool(
+            cfg,
+            map,
+            vec![
+                test_model("model-a", true, false, 128_000), // cheap, NO vision
+                test_model("model-v", true, true, 128_000),  // vision-capable
+            ],
+        );
+        {
+            let mut pool = engine.pool.write().unwrap();
+            pool.models[0].tier = crate::candidate::CapabilityTier::Flash;
+            pool.models[1].tier = crate::candidate::CapabilityTier::Versatile;
+        }
+
+        // Turn 1: no images → cold-start picks model-a (cheapest capable).
+        let t1 = engine.resolve(ModuleId::MainTurn, false, true, 1000);
+        assert_eq!(t1.model_id, "model-a");
+        assert_eq!(t1.source, AllocationSource::ColdStartReresolve);
+        // The map now holds the model-a allocation.
+        assert_eq!(
+            engine
+                .map_snapshot()
+                .get(&ModuleId::MainTurn)
+                .unwrap()
+                .model_id,
+            "model-a"
+        );
+
+        // Turn 2 refresh rebuilds the per-turn cache from the map (cache-hit
+        // path now holds model-a). Turn 2 has images → model-a is incapable.
+        engine.refresh_at_turn_start();
+        let t2 = engine.resolve(ModuleId::MainTurn, true, true, 1000);
+        assert_ne!(
+            t2.model_id, "model-a",
+            "a non-vision model must not serve a turn with images (cache-hit path)"
+        );
+        assert_eq!(t2.model_id, "model-v");
+        assert_eq!(t2.source, AllocationSource::ColdStartReresolve);
+
+        // Turn 3: same map now holds model-v; a fresh turn with images must
+        // keep serving the vision-capable model (map-hit path re-checked).
+        engine.refresh_at_turn_start();
+        let t3 = engine.resolve(ModuleId::MainTurn, true, true, 1000);
+        assert_eq!(t3.model_id, "model-v");
+    }
+
+    /// Same gate via the map-hit path with no per-turn cache: a map entry
+    /// pointing at a non-vision model must not serve an image turn.
+    #[test]
+    fn test_map_entry_nonvision_model_not_served_for_image_turn() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: "auto".to_string(),
+            ..Default::default()
+        };
+        let mut map = AllocationMap::default();
+        map.enabled = true;
+        map.entries.push(AllocationEntry {
+            module: ModuleId::MainTurn,
+            model_id: "model-a".to_string(),
+            pinned: false,
+            implicit_pin: false,
+            reason: "cold-start from an earlier image-less turn".to_string(),
+            estimated_performance: None,
+            updated_at: None,
+        });
+        let (engine, _dir) = make_engine_with_pool(
+            cfg,
+            map,
+            vec![
+                test_model("model-a", true, false, 128_000), // NO vision
+                test_model("model-v", true, true, 128_000),
+            ],
+        );
+        // No refresh_at_turn_start → per-turn cache empty → map-hit path.
+        let alloc = engine.resolve(ModuleId::MainTurn, true, true, 1000);
+        assert_ne!(
+            alloc.model_id, "model-a",
+            "map-hit path must re-check per-turn vision requirement"
+        );
+        assert_eq!(alloc.model_id, "model-v");
+        assert_eq!(alloc.source, AllocationSource::ColdStartReresolve);
+    }
 
     /// T070: `is_active()` is false when the pool is empty, even when enabled
     /// and `auto` is the configured model. This is the gating invariant that

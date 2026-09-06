@@ -1440,7 +1440,12 @@ async fn stream_output(
                                     }
                                     Err(_) => {
                                         // Can't create temp file — keep in memory.
-                                        mem_buf.extend_from_slice(chunk);
+                                        // `existing` holds everything that was just
+                                        // taken out of mem_buf above: fold the new
+                                        // chunk into it and hand it back, or all
+                                        // output captured so far is silently dropped.
+                                        existing.extend_from_slice(chunk);
+                                        mem_buf = existing;
                                     }
                                 }
                             } else if let Some(ref mut f) = temp_file {

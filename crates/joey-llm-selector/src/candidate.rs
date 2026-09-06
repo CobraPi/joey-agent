@@ -189,14 +189,15 @@ fn copilot_supports_tools(entry: &Value) -> bool {
 }
 
 fn copilot_supports_vision(id: &str, entry: &Value) -> bool {
-    // Provider hint overrides table.
-    if let Some(true) = entry
+    // Explicit provider hint wins in BOTH directions: an explicit
+    // vision:false must not be overridden by the id-prefix table.
+    if let Some(v) = entry
         .get("capabilities")
         .and_then(|c| c.get("supports"))
         .and_then(|s| s.get("vision"))
         .and_then(|v| v.as_bool())
     {
-        return true;
+        return v;
     }
     supports_vision_by_id(id)
 }
@@ -407,9 +408,13 @@ fn classify_tier(id: &str) -> CapabilityTier {
         return CapabilityTier::Frontier;
     }
 
-    // Flash: cheap/fast suffixes.
+    // Flash: cheap/fast suffix tokens. Match by equality on hyphen-split
+    // segments AFTER the vendor prefix — a plain `contains` would match
+    // "mini" inside "gemini" itself, misclassifying every non-flash Gemini
+    // (e.g. gemini-2.0-pro, gemini-2.5) as the cheapest tier.
+    let segments: Vec<&str> = l.split('-').collect();
     let flash = ["haiku", "flash", "mini", "nano", "micro"];
-    if flash.iter().any(|p| l.contains(p)) {
+    if segments[1..].iter().any(|s| flash.contains(s)) {
         return CapabilityTier::Flash;
     }
 
@@ -460,6 +465,75 @@ mod tests {
         assert_eq!(
             classify_tier("some-unknown-model"),
             CapabilityTier::Standard
+        );
+    }
+
+    /// Regression: "mini" is a substring of the vendor name "gemini" — a
+    /// plain contains() match classified every non-flash Gemini as Flash.
+    /// Flash tokens must match hyphen segments AFTER the vendor prefix only.
+    #[test]
+    fn test_classify_tier_gemini_not_misclassified_as_flash() {
+        // Non-flash Gemini models must never land in the cheapest tier.
+        assert_ne!(classify_tier("gemini-2.0-pro"), CapabilityTier::Flash);
+        assert_ne!(classify_tier("gemini-3-pro"), CapabilityTier::Flash);
+        // "gemini-2.0-pro" matches no versatile prefix (only "gemini-2.5" is
+        // listed) → Standard, same decision path as gemini-3-pro.
+        assert_eq!(classify_tier("gemini-2.0-pro"), CapabilityTier::Standard);
+        assert_eq!(classify_tier("gemini-3-pro"), CapabilityTier::Standard);
+        // The versatile gemini-2.5 entry is reachable again.
+        assert_eq!(classify_tier("gemini-2.5"), CapabilityTier::Versatile);
+        assert_eq!(classify_tier("gemini-2.5-pro"), CapabilityTier::Frontier);
+        // Genuine flash-token models still classify as Flash.
+        assert_eq!(classify_tier("gemini-2.5-flash"), CapabilityTier::Flash);
+    }
+
+    /// Regression: frontier prefixes win over flash tokens — gpt-5-mini and
+    /// grok-4-mini are Frontier, not Flash.
+    #[test]
+    fn test_classify_tier_frontier_beats_flash_tokens() {
+        assert_eq!(classify_tier("gpt-5-mini"), CapabilityTier::Frontier);
+        assert_eq!(classify_tier("grok-4-mini"), CapabilityTier::Frontier);
+        // ...while non-frontier "-mini" models are Flash.
+        assert_eq!(classify_tier("gpt-4o-mini"), CapabilityTier::Flash);
+    }
+
+    /// Regression: an explicit capabilities.supports.vision=false must NOT be
+    /// overridden by the id-prefix table (gpt-4o-audio-preview is text/audio
+    /// only despite the "gpt-4o" prefix).
+    #[test]
+    fn test_copilot_explicit_vision_false_wins_over_prefix_table() {
+        let raw = serde_json::json!([
+            {
+                "id": "gpt-4o-audio-preview",
+                "capabilities": {
+                    "type": "chat",
+                    "supports": {"vision": false},
+                    "supported_endpoints": ["chat/completions"]
+                }
+            },
+            {
+                "id": "gpt-4o-audio-preview",
+                "capabilities": {
+                    "type": "chat",
+                    "supports": {"vision": true},
+                    "supported_endpoints": ["chat/completions"]
+                }
+            },
+            {
+                "id": "gpt-4o-audio-preview",
+                "capabilities": {
+                    "type": "chat",
+                    "supported_endpoints": ["chat/completions"]
+                }
+            }
+        ]);
+        let (models, _) = consolidate_copilot(raw.as_array().unwrap());
+        assert_eq!(models.len(), 3);
+        assert!(!models[0].supports_vision, "explicit vision:false must win");
+        assert!(models[1].supports_vision, "explicit vision:true must win");
+        assert!(
+            models[2].supports_vision,
+            "absent hint falls back to the id-prefix table (gpt-4o → true)"
         );
     }
 

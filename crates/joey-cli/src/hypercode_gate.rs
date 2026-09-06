@@ -135,7 +135,7 @@ impl VerificationGate for VerifyLoopGate {
             let orchestrator = VerifyLoop::new(config, graph);
             let outcome = orchestrator.run_with_fixes(workdir, |results| {
                 for r in results.iter().filter(|r| !r.passed && !r.skipped) {
-                    eprintln!(
+                    tracing::warn!(
                         "hypercode-gate: step '{}' failed — queued for repair dispatch",
                         r.step_name
                     );

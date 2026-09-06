@@ -4004,7 +4004,9 @@ mod neurocode_expand_tests {
 
         // Click the second node's cell.
         let cells = tui.app.neurocode_viz.node_cells.borrow().clone();
-        let (cx, cy) = cells[2];
+        let Some((cx, cy)) = cells[2] else {
+            panic!("node 2 should be on the canvas");
+        };
         tui.handle_mouse_click(cy, cx);
         assert_eq!(tui.app.neurocode_viz.selected, 2, "canvas click selected node 2");
         assert!(tui.app.neurocode_expanded, "still expanded");

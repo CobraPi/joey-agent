@@ -379,6 +379,21 @@ pub fn new_job_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
 }
 
+/// Deterministic fallback id for records that arrive without one: a stable
+/// hash of (name + created_at) rendered as 12 hex chars. Unlike a fresh
+/// uuid4, it is identical on every load, so an unrepaired jobs.json doesn't
+/// get a different id per load. Ids are opaque strings, so std's DefaultHasher
+/// stability within this format is sufficient.
+fn synthesized_job_id(name: &str, created_at: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    created_at.hash(&mut hasher);
+    let hash = hasher.finish();
+    // Low 48 bits as 12 hex chars — same length as new_job_id().
+    format!("{:012x}", hash & 0xFFFF_FFFF_FFFF)
+}
+
 // =============================================================================
 // Schedule parsing
 // =============================================================================
@@ -398,6 +413,12 @@ static ISO_DATE_RE: Lazy<Regex> = Lazy::new(|| {
     // if it were invalid, compilation would fail (not runtime).
     Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap()
 });
+
+/// Conservative upper bound (in minutes) on durations accepted by
+/// [`parse_duration`]. chrono `TimeDelta` maxes out at `i64::MAX`
+/// milliseconds (~153.7e12 minutes); this bound sits well below it so
+/// downstream `Duration::minutes`/`try_minutes` calls can never overflow.
+const MAX_SCHEDULE_MINUTES: i64 = 8_210_000_000_000;
 
 /// Parse a duration string into minutes (`"30m"` → 30, `"2h"` → 120,
 /// `"1d"` → 1440). Case-insensitive, optional whitespace before the unit.
@@ -419,7 +440,16 @@ pub fn parse_duration(s: &str) -> Result<i64> {
         'd' => 1440,
         _ => return Err(duration_error(&s)),
     };
-    Ok(value * multiplier)
+    // value*multiplier can overflow i64, and even an in-range minute
+    // count can exceed chrono's TimeDelta bound — reject both with the
+    // standard error instead of panicking later in Duration::minutes.
+    let minutes = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| duration_error(&s))?;
+    if minutes > MAX_SCHEDULE_MINUTES {
+        return Err(duration_error(&s));
+    }
+    Ok(minutes)
 }
 
 fn duration_error(s: &str) -> anyhow::Error {
@@ -489,7 +519,8 @@ pub fn parse_schedule(schedule: &str) -> Result<Schedule> {
 
     // Duration like "30m", "2h", "1d" → one-shot from now.
     if let Ok(minutes) = parse_duration(schedule) {
-        let run_at = time_now() + Duration::minutes(minutes);
+        let delta = Duration::try_minutes(minutes).ok_or_else(|| duration_error(original))?;
+        let run_at = time_now() + delta;
         return Ok(Schedule::once(
             fmt_isoformat(&run_at),
             format!("once in {}", original),
@@ -534,13 +565,16 @@ pub fn compute_next_run(schedule: &Schedule, last_run_at: Option<&str>) -> Optio
         "once" => recoverable_oneshot_run_at(schedule, now, last_run_at),
         "interval" => {
             let minutes = schedule.minutes?;
+            // Hand-edited stores can carry minutes beyond chrono's
+            // TimeDelta bound — no next run instead of a panic.
+            let delta = Duration::try_minutes(minutes)?;
             let next_run = match last_run_at {
                 Some(last) => match ensure_aware_str(last) {
-                    Ok(dt) => dt + Duration::minutes(minutes),
-                    Err(_) => now + Duration::minutes(minutes),
+                    Ok(dt) => dt + delta,
+                    Err(_) => now + delta,
                 },
                 // First run is now + interval.
-                None => now + Duration::minutes(minutes),
+                None => now + delta,
             };
             Some(fmt_isoformat(&next_run))
         }
@@ -1636,11 +1670,24 @@ fn repair_record(value: Value) -> Option<(Job, bool)> {
         if let Some(text) = numeric_id {
             map.insert("id".into(), Value::String(text));
         } else {
+            // Deterministic fallback: hash the record's own (name,
+            // created_at) so repeated loads of an unrepaired file
+            // synthesize the SAME id instead of a fresh uuid4 each time.
+            let name = map
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let created_at = map
+                .get("created_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             let recovered = map
                 .remove("job_id")
                 .and_then(|v| v.as_str().map(str::to_string))
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(new_job_id);
+                .unwrap_or_else(|| synthesized_job_id(&name, &created_at));
             map.insert("id".into(), Value::String(recovered));
             repaired = true;
         }
@@ -1915,15 +1962,21 @@ fn repair_record(value: Value) -> Option<(Job, bool)> {
                 sched.insert(key.into(), new);
             }
         }
-        // Truncate float minutes to an int (hand-edited files).
+        // Truncate float minutes to an int (hand-edited files). Minutes
+        // <= 0 are invalid intervals (a negative/zero period re-fires
+        // forever) — null them like other unparseable values.
         let coerced = match sched.get("minutes") {
-            Some(Value::Number(n)) if n.as_i64().is_none() => {
-                Some(Value::Number((n.as_f64().unwrap_or(0.0) as i64).into()))
-            }
+            Some(Value::Number(n)) => match n.as_i64() {
+                Some(m) if m > 0 => None, // already a valid int
+                Some(_) => Some(Value::Null), // <= 0: invalid interval
+                None => Some(minutes_value_or_null(
+                    n.as_f64().unwrap_or(0.0) as i64,
+                )),
+            },
             Some(Value::String(s)) => Some(
                 s.trim()
                     .parse::<i64>()
-                    .map(|i| Value::Number(i.into()))
+                    .map(minutes_value_or_null)
                     .unwrap_or(Value::Null),
             ),
             Some(v) if !matches!(v, Value::Number(_) | Value::Null) => Some(Value::Null),
@@ -1948,6 +2001,16 @@ fn scalar_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+/// Valid interval minutes (positive) keep their number; anything else
+/// becomes null (no schedule) during repair.
+fn minutes_value_or_null(minutes: i64) -> Value {
+    if minutes > 0 {
+        Value::Number(minutes.into())
+    } else {
+        Value::Null
     }
 }
 
@@ -3113,5 +3176,92 @@ mod tests {
         assert!(parse_schedule("").is_err());
         assert!(parse_schedule("every").is_err());
         assert!(parse_schedule("every abc").is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Overflow / hand-edited-store regressions.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_duration_huge_values_return_error_not_panic() {
+        // i64::MAX minutes: passes the regex, must be rejected by the
+        // bound/overflow guard before Duration::minutes could panic.
+        for bad in [
+            "9223372036854775807m",
+            "2562047788015216h",
+            "6399581432000d",
+            "9999999999999999999m", // value itself overflows i64 parse
+        ] {
+            let err = parse_duration(bad).unwrap_err().to_string();
+            assert!(err.starts_with("Invalid duration: '"), "{bad:?}: {err}");
+        }
+        // The same values through parse_schedule (one-shot and every paths).
+        assert!(parse_schedule("9223372036854775807m").is_err());
+        assert!(parse_schedule("2562047788015216h").is_err());
+        assert!(parse_schedule("every 9223372036854775807m").is_err());
+        assert!(parse_schedule("every 2562047788015216h").is_err());
+        // Just under the bound still parses.
+        assert_eq!(parse_duration("8210000000000m").unwrap(), 8_210_000_000_000);
+    }
+
+    #[test]
+    fn compute_next_run_huge_interval_minutes_is_none_not_panic() {
+        // A hand-edited store can carry minutes beyond chrono's TimeDelta
+        // bound without going through parse_duration at all.
+        let sched = Schedule::interval(i64::MAX, "every huge");
+        assert!(compute_next_run(&sched, None).is_none());
+        let last = fmt_isoformat(&(time_now() - Duration::minutes(10)));
+        assert!(compute_next_run(&sched, Some(&last)).is_none());
+    }
+
+    #[test]
+    fn missing_id_regeneration_is_deterministic_across_loads() {
+        let (_tmp, store) = store();
+        write_raw(
+            &store,
+            r#"{"jobs": [
+                {"name": "noid-a", "prompt": "p", "created_at": "2026-01-01T00:00:00+00:00",
+                 "schedule": {"kind": "interval", "minutes": 5}},
+                {"name": "noid-b", "prompt": "p", "created_at": "2026-01-01T00:00:00+00:00",
+                 "schedule": {"kind": "interval", "minutes": 5}}
+            ], "updated_at": "x"}"#,
+        );
+        let first = store.load().unwrap();
+        let second = store.load().unwrap();
+        // Same synthesized id on every load of the same record.
+        assert_eq!(first[0].id, second[0].id);
+        assert_eq!(first[1].id, second[1].id);
+        assert_eq!(first[0].id.len(), 12);
+        // Distinct records get distinct ids.
+        assert_ne!(first[0].id, first[1].id);
+    }
+
+    #[test]
+    fn repair_nulls_non_positive_interval_minutes() {
+        let (_tmp, store) = store();
+        write_raw(
+            &store,
+            r#"{"jobs": [
+                {"id": "negmin000001", "name": "neg", "prompt": "p",
+                 "schedule": {"kind": "interval", "minutes": -5, "display": "every -5m"}},
+                {"id": "zeromin00001", "name": "zero", "prompt": "p",
+                 "schedule": {"kind": "interval", "minutes": 0}},
+                {"id": "strneg000001", "name": "strneg", "prompt": "p",
+                 "schedule": {"kind": "interval", "minutes": "-5"}},
+                {"id": "posmin0000001", "name": "pos", "prompt": "p",
+                 "schedule": {"kind": "interval", "minutes": 5}}
+            ], "updated_at": "x"}"#,
+        );
+        let jobs = store.load().unwrap();
+        assert_eq!(jobs.len(), 4);
+        // Negative / zero / negative-string minutes are nulled → no interval
+        // schedule left, so compute_next_run yields None (no re-fire loop).
+        for job in &jobs[..3] {
+            assert_eq!(job.schedule.minutes, None, "job {}", job.id);
+            assert!(compute_next_run(&job.schedule, None).is_none());
+        }
+        // A positive interval is untouched.
+        assert_eq!(jobs[3].schedule.minutes, Some(5));
+        assert!(compute_next_run(&jobs[3].schedule, None).is_some());
     }
 }

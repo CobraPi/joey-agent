@@ -412,7 +412,13 @@ impl CheckpointManager {
     /// stat or unstage a given path is skipped rather than aborting the
     /// whole checkpoint.
     fn unstage_oversized_files(&self) -> Result<()> {
-        let staged = self.run_git_capture(&["diff", "--cached", "--name-only"], &[0])?;
+        // core.quotepath=false: git C-quotes non-ASCII paths by default
+        // ("\303\274..." octal escapes), which `work_tree.join` would treat
+        // as a literal (non-existent) filename.
+        let staged = self.run_git_capture(
+            &["-c", "core.quotepath=false", "diff", "--cached", "--name-only"],
+            &[0],
+        )?;
         let mut oversized: Vec<String> = Vec::new();
         for rel_path in staged.lines() {
             if rel_path.is_empty() {
@@ -531,8 +537,12 @@ impl CheckpointManager {
         let hash = &target.commit_hash;
         self.run_git(&["checkout", hash, "--", "."])?;
 
+        // core.quotepath=false: keep non-ASCII paths raw so the
+        // work_tree.join/remove_file below resolves the real file.
         let files_to_remove = self.run_git_capture(
             &[
+                "-c",
+                "core.quotepath=false",
                 "diff",
                 "--name-only",
                 "--diff-filter=A",
@@ -1553,6 +1563,74 @@ mod tests {
         assert!(
             !legacy_dir.exists(),
             "legacy per-session shadow repo should be discarded"
+        );
+    }
+
+    /// Regression (core.quotepath): `diff --cached --name-only` and revert's
+    /// `diff --name-only --diff-filter=A` C-quote non-ASCII paths by default
+    /// (e.g. `"sch\303\266n.txt"`), which `work_tree.join` treats as literal
+    /// non-existent filenames — oversized non-ASCII files were never
+    /// unstaged and non-ASCII files added after a checkpoint were never
+    /// removed on revert. Both invocations now pass
+    /// `-c core.quotepath=false` so paths come back raw.
+    #[test]
+    fn non_ascii_paths_survive_unstage_and_revert() {
+        let _lock = crate::test_env_lock();
+        if !git_available() {
+            return;
+        }
+        let (_home, dir, _guard) = test_setup();
+        let work_tree = dir.path();
+
+        // Force a tiny size cap so the non-ASCII file counts as oversized.
+        std::env::set_var("JOEY_TEST_MAX_FILE_SIZE_BYTES", "10");
+        // A committable file so checkpoint 1 isn't a no-op (the oversized file is unstaged by design).
+        std::fs::write(work_tree.join("keep.txt"), "ok").unwrap();
+        std::fs::write(work_tree.join("sch\u{f6}n_gro\u{df}.txt"), "x".repeat(50)).unwrap();
+
+        let mut mgr = CheckpointManager::new("quotepath-test", work_tree);
+        mgr.checkpoint("with non-ascii oversized file").unwrap();
+
+        // The oversized non-ASCII file must have been unstaged: it appears
+        // in no checkpoint commit. NOTE: checkpoints are plumbing-only
+        // (write-tree/commit-tree/update-ref) against refs/joey/<hash> and
+        // the shared store's HEAD is deliberately never written, so `git
+        // show` must target the project ref — a bare `git show` would hit
+        // the always-unborn HEAD and exit 128.
+        let project_ref = mgr.ref_name();
+        let committed = mgr
+            .run_git_capture(
+                &[
+                    "-c",
+                    "core.quotepath=false",
+                    "show",
+                    "--name-only",
+                    "--pretty=format:",
+                    &project_ref,
+                ],
+                &[0],
+            )
+            .unwrap();
+        std::env::remove_var("JOEY_TEST_MAX_FILE_SIZE_BYTES");
+
+        assert!(
+            !committed.contains("sch\u{f6}n_gro\u{df}.txt"),
+            "oversized non-ASCII file must be unstaged (raw path, not C-quoted), committed: {committed}"
+        );
+        assert!(
+            !committed.contains("\\303"),
+            "path must not come back C-quoted (core.quotepath=false), committed: {committed}"
+        );
+
+        // Revert path: a non-ASCII file added after a checkpoint must be
+        // removed by revert (raw path resolves via work_tree.join).
+        std::fs::write(work_tree.join("d\u{e9}j\u{e0}_vu.txt"), "added later").unwrap();
+        mgr.checkpoint("with non-ascii added file").unwrap();
+        let before = mgr.list().unwrap().len();
+        mgr.revert(before - 1).unwrap();
+        assert!(
+            !work_tree.join("d\u{e9}j\u{e0}_vu.txt").exists(),
+            "non-ASCII file added after the target checkpoint must be removed on revert"
         );
     }
 }

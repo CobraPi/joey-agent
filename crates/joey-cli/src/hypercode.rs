@@ -2014,7 +2014,7 @@ fn sweep_stale_lessons(
                         .map(|n| cwd.join(n.source_path))
                 });
                 if expired > 0 {
-                    eprintln!(
+                    tracing::warn!(
                         "hypercode: expired {expired} outcome lesson(s) whose artifacts changed (FR-026)"
                     );
                 }
@@ -2064,7 +2064,7 @@ fn finalize_graph_run(
                 run.run_id(),
                 &repair_log.lock().expect("repair log"),
             );
-            eprintln!(
+            tracing::info!(
                 "hypercode: recorded {recorded} verified-outcome lesson(s) (FR-025; unverified tasks yield none)"
             );
         }
@@ -2114,7 +2114,7 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
                 .lock()
                 .expect("repair log")
                 .push((task.id.as_str().to_string(), sig));
-            eprintln!(
+            tracing::info!(
                 "hypercode: repair re-dispatch for {} carrying {} defect-command(s)",
                 task.id.as_str(),
                 defect.failed_commands.len()
@@ -2128,7 +2128,7 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
             match iso.prepare(task) {
                 Ok(ws) => ws.path().to_path_buf(),
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "hypercode: isolation prepare failed for {}: {}",
                         task.id.as_str(),
                         e
@@ -2223,7 +2223,7 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
             team: None,
             name: None,
         };
-        eprintln!(
+        tracing::info!(
             "hypercode: graph dispatching task {} ({} worker)",
             task.id.as_str(),
             match task.role {
@@ -2267,7 +2267,7 @@ async fn execute_graph_run(
     let graph = match ctx.execution_graph.lock() {
         Ok(mut slot) => slot.take(),
         Err(_) => {
-            eprintln!("hypercode: execution graph mutex poisoned");
+            tracing::warn!("hypercode: execution graph mutex poisoned");
             return stats;
         }
     };
@@ -2282,7 +2282,7 @@ async fn execute_graph_run(
     let mut run = match RunHandle::create_at(&root, &run_id, &baseline) {
         Ok(run) => run,
         Err(e) => {
-            eprintln!("hypercode: failed to create run dir {}: {e}", root.display());
+            tracing::warn!("hypercode: failed to create run dir {}: {e}", root.display());
             // Put the untouched graph back before bailing.
             if let Ok(mut slot) = ctx.execution_graph.lock() {
                 *slot = Some(graph);
@@ -2365,13 +2365,13 @@ async fn execute_graph_run(
         match iso.prepare(node) {
             Ok(ws) => match joiner.collect(&ws, node, &mut run) {
                 Ok(b) => bundles.push(b),
-                Err(e) => eprintln!(
+                Err(e) => tracing::warn!(
                     "hypercode: bundle collection failed for {}: {}",
                     id.as_str(),
                     e
                 ),
             },
-            Err(e) => eprintln!(
+            Err(e) => tracing::warn!(
                 "hypercode: worktree re-prepare failed for {}: {}",
                 id.as_str(),
                 e
@@ -2380,14 +2380,14 @@ async fn execute_graph_run(
     }
     if !bundles.is_empty() {
         match joiner.integrate(&bundles, |b| {
-            eprintln!("hypercode: integrated patch for {}", b.task_id);
+            tracing::info!("hypercode: integrated patch for {}", b.task_id);
             Ok(())
         }) {
-            Ok(report) => eprintln!(
+            Ok(report) => tracing::info!(
                 "hypercode: integrated {} patch(es)",
                 report.applied_task_ids.len()
             ),
-            Err(conflict) => eprintln!(
+            Err(conflict) => tracing::warn!(
                 "hypercode: integration conflict for task {} — {} (patch left unapplied: {})",
                 conflict.task_id,
                 conflict.reason,
@@ -2435,7 +2435,7 @@ async fn execute_graph_run(
             stats.completed, stats.failed, stats.degraded, stats.blocked_remaining
         ),
     ));
-    eprintln!(
+    tracing::info!(
         "hypercode: graph run {} — {} completed, {} failed, {} degraded, {} blocked",
         run_id, stats.completed, stats.failed, stats.degraded, stats.blocked_remaining
     );
@@ -2460,7 +2460,7 @@ pub async fn resume_execution_run(
     let current = baseline_revision(&ctx.cwd).unwrap_or_default();
     let mut run = match RunHandle::resume_at(&root, run_id, &current) {
         Err(e) => {
-            eprintln!("hypercode: refusing to resume run {run_id} — {e}");
+            tracing::warn!("hypercode: refusing to resume run {run_id} — {e}");
             return None;
         }
         Ok(run) => run,
@@ -2468,14 +2468,14 @@ pub async fn resume_execution_run(
     let graph_raw = match std::fs::read_to_string(root.join("graph.json")) {
         Ok(raw) => raw,
         Err(e) => {
-            eprintln!("hypercode: cannot read {} — {e}", root.join("graph.json").display());
+            tracing::warn!("hypercode: cannot read {} — {e}", root.join("graph.json").display());
             return None;
         }
     };
     let mut graph = match serde_json::from_str::<TaskGraph>(&graph_raw) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("hypercode: failed to parse graph.json for run {run_id} — {e}");
+            tracing::warn!("hypercode: failed to parse graph.json for run {run_id} — {e}");
             return None;
         }
     };
@@ -2484,7 +2484,7 @@ pub async fn resume_execution_run(
         .values()
         .any(|n| n.status == TaskStatus::Pending)
     {
-        eprintln!("hypercode: run {run_id} has no pending tasks — nothing to resume");
+        tracing::warn!("hypercode: run {run_id} has no pending tasks — nothing to resume");
         return None;
     }
     // Spec 023: fire the resumed graph's initial snapshot so live UIs see
@@ -2528,7 +2528,7 @@ pub async fn resume_execution_run(
             .await
     };
     finalize_graph_run(&outcome_store, &review_events, &graph, &mut run, &repair_log);
-    eprintln!(
+    tracing::info!(
         "hypercode: resumed run {run_id} — {} completed, {} failed, {} degraded, {} blocked",
         stats.completed, stats.failed, stats.degraded, stats.blocked_remaining
     );
@@ -2703,7 +2703,7 @@ pub async fn run_hypercode(
                     .iter()
                     .map(|e| format!("  {:?}: {} ({})", e.task_ids, e.rule, e.detail))
                     .collect();
-                eprintln!(
+                tracing::warn!(
                     "hypercode: converted workstream plan failed validation (FR-009):\n{}",
                     report.join("\n")
                 );
@@ -2724,7 +2724,7 @@ pub async fn run_hypercode(
         .is_some()
     {
         let stats = execute_graph_run(ctx, &mut report, snapshots).await;
-        eprintln!(
+        tracing::info!(
             "hypercode: graph run complete — {} completed, {} failed, {} degraded, {} blocked",
             stats.completed, stats.failed, stats.degraded, stats.blocked_remaining
         );

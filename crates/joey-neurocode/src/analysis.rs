@@ -123,6 +123,11 @@ pub struct AnalysisEngine {
     /// (additive, deduped) to every verification plan this engine builds.
     /// Default empty — an empty store leaves plans unchanged.
     acceptance_criteria: Vec<String>,
+    /// The tier AmbiguousDefault resolves to, captured from
+    /// `config.ambiguous_default_tier()` at construction so `analyze`
+    /// honors the configured default (like `engine.rs`) instead of
+    /// hardcoding Economical.
+    ambiguous_default_tier: ComplexityTier,
 }
 
 impl AnalysisEngine {
@@ -160,6 +165,7 @@ impl AnalysisEngine {
             outcomes: Mutex::new(OutcomeMemoryBuffer::default()),
             attached_store: None,
             acceptance_criteria: Vec::new(),
+            ambiguous_default_tier: config.ambiguous_default_tier(),
         }
     }
 
@@ -290,8 +296,9 @@ impl EnterpriseTaskAnalyzer for AnalysisEngine {
         // (vi) Assess the accumulated risk factors.
         let risk = assess(factors);
 
-        // (vii) Model tier: resolve AmbiguousDefault → Economical.
-        let model_tier = complexity.tier.resolve_ambiguous(ComplexityTier::Economical);
+        // (vii) Model tier: resolve AmbiguousDefault → the configured
+        // default tier (captured at construction from config).
+        let model_tier = complexity.tier.resolve_ambiguous(self.ambiguous_default_tier);
 
         // (viii) Modules: distinct first path components of impacted +
         // target source_paths (non-empty, forward slashes). Provisional
@@ -768,6 +775,49 @@ mod tests {
             == SignalKind::Keyword
             || s.kind == SignalKind::ScopeFanOut));
         assert_eq!(analysis.model_tier, ComplexityTier::Frontier);
+    }
+
+    /// Bug: `analyze` hardcoded `resolve_ambiguous(Economical)` while
+    /// `engine.rs` honored `config.ambiguous_default_tier()`. The analysis
+    /// plane must resolve AmbiguousDefault to the CONFIGURED default tier.
+    #[test]
+    fn analyze_resolves_ambiguous_default_to_configured_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Neutral request text → AmbiguousDefault classification.
+        let mut cfg = NeuroCodeConfig::default();
+        cfg.tier.ambiguous_default = "frontier".to_string();
+        let engine = AnalysisEngine::new(
+            ComplexityClassifier::default(),
+            None,
+            root.to_path_buf(),
+            &cfg,
+        );
+        let analysis = engine.analyze(&make_request(root, "help me with this code", None));
+        assert_eq!(
+            analysis.complexity.tier,
+            ComplexityTier::AmbiguousDefault,
+            "neutral request must classify as AmbiguousDefault"
+        );
+        assert_eq!(
+            analysis.model_tier, ComplexityTier::Frontier,
+            "AmbiguousDefault must resolve to the configured frontier default"
+        );
+
+        // Default config still resolves to Economical.
+        let engine_eco = AnalysisEngine::new(
+            ComplexityClassifier::default(),
+            None,
+            root.to_path_buf(),
+            &NeuroCodeConfig::default(),
+        );
+        let analysis_eco =
+            engine_eco.analyze(&make_request(root, "help me with this code", None));
+        assert_eq!(
+            analysis_eco.model_tier, ComplexityTier::Economical,
+            "default config resolves AmbiguousDefault to Economical"
+        );
     }
 
     #[test]

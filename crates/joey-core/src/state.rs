@@ -514,19 +514,32 @@ impl SessionDb {
                     );
                 }
                 if needs_backfill {
-                    let _ = self.conn.execute(
-                        "INSERT INTO messages_fts(rowid, content) \
-                         SELECT id, COALESCE(content, '') || ' ' || COALESCE(tool_name, '') \
-                                || ' ' || COALESCE(tool_calls, '') FROM messages",
-                        [],
-                    );
-                    if self.trigram_available {
-                        let _ = self.conn.execute(
-                            "INSERT INTO messages_fts_trigram(rowid, content) \
+                    if let Err(e) = self.execute_write(|conn| {
+                        conn.execute(
+                            "INSERT INTO messages_fts(rowid, content) \
                              SELECT id, COALESCE(content, '') || ' ' || COALESCE(tool_name, '') \
                                     || ' ' || COALESCE(tool_calls, '') FROM messages",
                             [],
-                        );
+                        )?;
+                        Ok(())
+                    }) {
+                        tracing::warn!("legacy FTS backfill for messages_fts failed: {}", e);
+                    }
+                    if self.trigram_available {
+                        if let Err(e) = self.execute_write(|conn| {
+                            conn.execute(
+                                "INSERT INTO messages_fts_trigram(rowid, content) \
+                                 SELECT id, COALESCE(content, '') || ' ' || COALESCE(tool_name, '') \
+                                        || ' ' || COALESCE(tool_calls, '') FROM messages",
+                                [],
+                            )?;
+                            Ok(())
+                        }) {
+                            tracing::warn!(
+                                "legacy FTS backfill for messages_fts_trigram failed: {}",
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -866,12 +879,17 @@ impl SessionDb {
                 "UPDATE messages SET active = 0 WHERE session_id = ?1 AND active = 1 AND id >= ?2",
                 params![session_id, from_id],
             )?;
-            // Refresh the session counters to the active totals.
+            // Refresh the session counters to the active totals. tool_call_count
+            // must recount the SAME unit add_message increments: the number of
+            // entries in each tool_calls JSON array (hermes_state.py:4221-4268),
+            // not the number of rows carrying a tool_calls value.
             conn.execute(
                 "UPDATE sessions SET message_count = \
                     (SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND active = 1), \
                     tool_call_count = \
-                    (SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND active = 1 AND tool_calls IS NOT NULL) \
+                    (SELECT COALESCE(SUM(json_array_length(tool_calls)), 0) FROM messages \
+                     WHERE session_id = ?1 AND active = 1 \
+                       AND tool_calls IS NOT NULL AND tool_calls != '') \
                  WHERE id = ?1",
                 params![session_id],
             )?;
@@ -1350,6 +1368,12 @@ pub fn sanitize_fts5_query(query: &str) -> String {
     // Cap user-controlled input before any regex processing.
     let query: String = query.chars().take(MAX_FTS5_QUERY_CHARS).collect();
 
+    // Strip literal NUL bytes before anything else: a \u{0} surviving into
+    // the FTS5 MATCH expression is a syntax error ("fts5: syntax error
+    // near ..."), and Step 1 below deliberately USES \u{0} as an internal
+    // placeholder marker, so an input NUL could also collide with one.
+    let query = query.replace('\u{0}', "");
+
     // Step 1: extract balanced double-quoted phrases via a linear scan and
     // protect them with numbered placeholders.
     let mut quoted_parts: Vec<String> = Vec::new();
@@ -1666,6 +1690,24 @@ INSERT INTO messages (session_id, role, content, timestamp) VALUES ('old_joey_se
         assert_eq!(sanitize_fts5_query("foo\"bar"), "foo bar");
     }
 
+    /// Regression: literal NUL bytes in user input must be stripped before
+    /// the string reaches an FTS5 MATCH expression, where they are a syntax
+    /// error. A NUL-only (or NUL-stripped-empty) query yields Ok(empty).
+    #[test]
+    fn fts_sanitization_strips_nul_bytes() {
+        assert_eq!(sanitize_fts5_query("a\u{0}b"), "ab");
+        assert_eq!(sanitize_fts5_query("\u{0}\u{0}"), "");
+        // End-to-end: search must return Ok(vec![]), not an FTS5 syntax Err.
+        let db = SessionDb::open_in_memory().unwrap();
+        let sid = db.create_session("cli", None, None).unwrap();
+        db.add_message(&StoredMessage::new(&sid, Role::User, "needle here")).unwrap();
+        let hits = db.search("needle\u{0}", 5).unwrap();
+        // "needle\u{0}" → "needle" still matches; the NUL itself never errors.
+        assert_eq!(hits.len(), 1);
+        let hits = db.search("\u{0}", 5).unwrap();
+        assert!(hits.is_empty(), "NUL-only query is empty, not an error");
+    }
+
     #[test]
     fn fts_search_survives_hostile_query() {
         let db = SessionDb::open_in_memory().unwrap();
@@ -1769,6 +1811,42 @@ INSERT INTO messages (session_id, role, content, timestamp) VALUES ('old_joey_se
         // Counters refreshed.
         let s = db.get_session(&sid).unwrap().unwrap();
         assert_eq!(s.message_count, 0);
+    }
+
+    /// Regression: rewind recounts tool_call_count using the SAME unit
+    /// add_message increments — the number of entries in each tool_calls
+    /// JSON array — not the number of rows carrying a tool_calls value.
+    #[test]
+    fn rewind_recounts_tool_call_count_by_array_length() {
+        let db = SessionDb::open_in_memory().unwrap();
+        let sid = db.create_session("cli", None, None).unwrap();
+
+        // Two exchanges; each assistant row carries a 2-element tool_calls
+        // array → session total 4.
+        let two_calls = r#"[{"id":"a","function":{"name":"x"}},{"id":"b","function":{"name":"y"}}]"#;
+        db.add_message(&StoredMessage::new(&sid, Role::User, "u0")).unwrap();
+        let mut a0 = StoredMessage::new(&sid, Role::Assistant, "");
+        a0.tool_calls = Some(two_calls.into());
+        db.add_message(&a0).unwrap();
+        db.add_message(&StoredMessage::new(&sid, Role::User, "u1")).unwrap();
+        let mut a1 = StoredMessage::new(&sid, Role::Assistant, "");
+        a1.tool_calls = Some(two_calls.into());
+        db.add_message(&a1).unwrap();
+
+        let s = db.get_session(&sid).unwrap().unwrap();
+        assert_eq!(s.tool_call_count, 4, "add_message counts array entries");
+
+        // Rewind 1 exchange: drops u1 + a1; the remaining active rows hold
+        // ONE 2-element array → recount must be 2 (SUM of json_array_length),
+        // not 1 (COUNT of rows with tool_calls).
+        let removed = db.rewind_last_user_exchanges(&sid, 1).unwrap();
+        assert_eq!(removed, 2);
+        let s = db.get_session(&sid).unwrap().unwrap();
+        assert_eq!(
+            s.tool_call_count, 2,
+            "recount must SUM json_array_length(tool_calls), not COUNT rows"
+        );
+        assert_eq!(s.message_count, 2);
     }
 
     #[test]

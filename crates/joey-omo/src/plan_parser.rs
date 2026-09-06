@@ -58,6 +58,35 @@ impl ParsedPlan {
     }
 }
 
+/// Parse a single `> Depends on:` token strictly.
+///
+/// Accepted forms:
+///   - `N`  → implementation task N
+///   - `FN` → final-verification task N (mapped into the F-number range
+///     via `F_TASK_NUMBER_OFFSET`, matching how task rows store F-numbers)
+///
+/// Anything else is invalid and is dropped with a recorded warning —
+/// previously unparseable tokens were silently discarded by a
+/// `filter_map`, hiding plan-authoring mistakes like `F1x` or `banana`.
+fn parse_dep_token(token: &str) -> Option<usize> {
+    let token = token.trim();
+    let parsed = if let Some(num_part) = token.strip_prefix('F') {
+        num_part
+            .parse::<usize>()
+            .ok()
+            .map(|n| F_TASK_NUMBER_OFFSET + n)
+    } else {
+        token.parse::<usize>().ok()
+    };
+    match parsed {
+        Some(dep) => Some(dep),
+        None => {
+            tracing::warn!(token = token, "invalid plan dependency token dropped");
+            None
+        }
+    }
+}
+
 /// Parse a plan markdown document into a structured plan (T102, BC-031).
 ///
 /// Recognizes:
@@ -75,10 +104,7 @@ pub fn parse_plan(markdown: &str) -> ParsedPlan {
 
         // Check for dependency annotation
         if let Some(rest) = trimmed.strip_prefix("> Depends on:") {
-            last_task_deps = rest
-                .split(',')
-                .filter_map(|s| s.trim().parse::<usize>().ok())
-                .collect();
+            last_task_deps = rest.split(',').filter_map(parse_dep_token).collect();
             // Attach to the last task. A dependency line BEFORE the first
             // task row has nothing to attach to — skip it with a recorded
             // warning instead of silently dropping the constraint.
@@ -143,6 +169,27 @@ pub fn parse_plan(markdown: &str) -> ParsedPlan {
             dependencies: Vec::new(),
             completed: checked,
         });
+    }
+
+    // Validate dependencies: every dep must refer to an existing task
+    // number. A dangling dep (typo, removed task) would otherwise stall the
+    // task forever in `ready_tasks` (its blocker never completes), so drop
+    // it with a recorded warning instead.
+    let known_numbers: std::collections::HashSet<usize> =
+        tasks.iter().map(|t| t.number).collect();
+    for task in tasks.iter_mut() {
+        let (valid, invalid): (Vec<usize>, Vec<usize>) = task
+            .dependencies
+            .iter()
+            .partition(|dep| known_numbers.contains(dep));
+        if !invalid.is_empty() {
+            tracing::warn!(
+                task = task.number,
+                invalid_deps = ?invalid,
+                "plan dependencies referencing unknown tasks dropped"
+            );
+            task.dependencies = valid;
+        }
     }
 
     ParsedPlan { tasks }
@@ -214,6 +261,59 @@ mod tests {
             plan.tasks[0].dependencies.is_empty(),
             "stray pre-task annotation must not leak into the first task"
         );
+    }
+
+    #[test]
+    fn f_prefixed_dependency_token_is_parsed() {
+        // `Depends on: F1` must wire the final-verification task's offset
+        // number, not be silently dropped (the old filter_map only parsed
+        // plain integers). The dep line attaches to the preceding task row.
+        let markdown =
+            "- [ ] 1. Build feature\n> Depends on: F1\n- [ ] F1. Final verification\n";
+        let plan = parse_plan(markdown);
+        let t1 = plan.tasks.iter().find(|t| t.number == 1).unwrap();
+        assert_eq!(
+            t1.dependencies,
+            vec![F_TASK_NUMBER_OFFSET + 1],
+            "`F1` dep must map to the F-number range"
+        );
+    }
+
+    #[test]
+    fn invalid_dependency_token_is_dropped() {
+        // Unparseable tokens are dropped (with a logged warning) rather
+        // than silently filter-mapped away — behavior is the same drop,
+        // but strict parsing means tokens like `banana` can never pass.
+        let markdown = "- [ ] 1. Build\n> Depends on: banana\n- [ ] 2. Test\n";
+        let plan = parse_plan(markdown);
+        assert!(plan.tasks[0].dependencies.is_empty());
+    }
+
+    #[test]
+    fn dependency_on_unknown_task_is_dropped_no_stall() {
+        // `Depends on: 99` with no task 99 must be dropped so the task
+        // does not stall forever waiting for a blocker that can never
+        // complete.
+        let markdown = "- [ ] 1. Build\n> Depends on: 99\n";
+        let plan = parse_plan(markdown);
+        assert!(
+            plan.tasks[0].dependencies.is_empty(),
+            "dangling dep must be dropped, not kept"
+        );
+        // And the task is ready immediately (no stall).
+        let completed = std::collections::HashSet::new();
+        let ready = plan.ready_tasks(&completed);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].number, 1);
+    }
+
+    #[test]
+    fn valid_dependencies_are_kept_after_validation() {
+        // Validation must only drop invalid deps; valid ones survive.
+        let markdown = "- [ ] 1. Build\n- [ ] 2. Test\n> Depends on: 1, 99, banana\n";
+        let plan = parse_plan(markdown);
+        let t2 = plan.tasks.iter().find(|t| t.number == 2).unwrap();
+        assert_eq!(t2.dependencies, vec![1], "only the valid dep `1` survives");
     }
 
     #[test]

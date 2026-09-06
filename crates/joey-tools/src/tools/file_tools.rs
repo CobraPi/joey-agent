@@ -1236,7 +1236,9 @@ count for multi-spot edits."
         let original_content = raw_bomless.to_string();
         let original_ending = detect_line_ending(&original_content);
 
-        // Apply edits sequentially, collecting failures.
+        // Validate ALL edits against the evolving content BEFORE writing
+        // anything (atomicity — the description promises validates-all-
+        // before-applying). If any edit fails, nothing is written.
         let mut current_content = original_content.clone();
         let mut failed: Vec<Value> = Vec::new();
         let mut applied = 0usize;
@@ -1263,20 +1265,27 @@ count for multi-spot edits."
             }
         }
 
+        // Any failed edit aborts the whole call — the file is NOT written,
+        // so no partial results ever land on disk.
+        if !failed.is_empty() {
+            result.insert("success".into(), json!(false));
+            result.insert(
+                "error".into(),
+                json!(format!(
+                    "validation failed for {} of {} edit(s); no changes were written",
+                    failed.len(),
+                    edits.len()
+                )),
+            );
+            result.insert("edits_failed".into(), json!(failed));
+            return ToolResult::Text(dumps(&Value::Object(result)));
+        }
+
         // Check if any changes were made.
         let changed = current_content != original_content;
         if !changed {
-            if failed.is_empty() {
-                result.insert("success".into(), json!(false));
-                result.insert("error".into(), json!("no changes made - all edits resulted in identical content"));
-            } else {
-                result.insert("success".into(), json!(false));
-                result.insert(
-                    "error".into(),
-                    json!(format!("no changes made - all {} edit(s) failed", failed.len())),
-                );
-                result.insert("edits_failed".into(), json!(failed));
-            }
+            result.insert("success".into(), json!(false));
+            result.insert("error".into(), json!("no changes made - all edits resulted in identical content"));
             return ToolResult::Text(dumps(&Value::Object(result)));
         }
 
@@ -1289,9 +1298,6 @@ count for multi-spot edits."
         if let Err(e) = write_with_preservation(&resolved, &current_content) {
             result.insert("success".into(), json!(false));
             result.insert("error".into(), json!(format!("Failed to write changes: {}", e)));
-            if !failed.is_empty() {
-                result.insert("edits_failed".into(), json!(failed));
-            }
             return ToolResult::Text(dumps(&Value::Object(result)));
         }
 
@@ -1305,9 +1311,6 @@ count for multi-spot edits."
 
         result.insert("success".into(), json!(true));
         result.insert("edits_applied".into(), json!(applied));
-        if !failed.is_empty() {
-            result.insert("edits_failed".into(), json!(failed));
-        }
         if !diff.is_empty() {
             result.insert("diff".into(), json!(diff));
         }
@@ -1635,7 +1638,10 @@ async fn run_search_command(script: &str, cwd: &Path) -> (String, i32) {
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // On timeout the future is dropped mid-`wait_with_output`; without
+        // this the leaked child (and its bash pipeline) would survive.
+        .kill_on_drop(true);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (format!("Search error: {}", e), 2),
@@ -2450,5 +2456,188 @@ mod tests {
         // Multiple number patterns (should take last).
         let r = parse_search_context_line("path-1-foo-2-bar");
         assert!(r.is_some());
+    }
+
+    // ── multi_edit atomicity tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn multi_edit_all_valid_applies_all() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let ctx = ctx_in(dir.path());
+        let v = parse(
+            &MultiEdit
+                .execute(
+                    json!({
+                        "file_path": "f.txt",
+                        "edits": [
+                            {"old_string": "alpha", "new_string": "ALPHA"},
+                            {"old_string": "gamma", "new_string": "GAMMA"}
+                        ]
+                    }),
+                    &ctx,
+                )
+                .await,
+        );
+        assert_eq!(v["success"], true);
+        assert_eq!(v["edits_applied"], 2);
+        assert!(v.get("edits_failed").is_none());
+        let on_disk = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
+        assert_eq!(on_disk, "ALPHA\nbeta\nGAMMA\n");
+    }
+
+    /// Atomicity: when ANY edit fails validation, NOTHING is written — the
+    /// first edit's change must not partially land on disk.
+    #[tokio::test]
+    async fn multi_edit_failure_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "alpha\nbeta\ngamma\n";
+        std::fs::write(dir.path().join("f.txt"), original).unwrap();
+        let ctx = ctx_in(dir.path());
+        let v = parse(
+            &MultiEdit
+                .execute(
+                    json!({
+                        "file_path": "f.txt",
+                        "edits": [
+                            {"old_string": "alpha", "new_string": "ALPHA"},
+                            {"old_string": "NO_SUCH_TOKEN", "new_string": "X"}
+                        ]
+                    }),
+                    &ctx,
+                )
+                .await,
+        );
+        assert_eq!(v["success"], false);
+        let err = v["error"].as_str().unwrap();
+        assert!(
+            err.contains("no changes were written"),
+            "error must state nothing was written, got: {err}"
+        );
+        let failed = v["edits_failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["index"], 2);
+        // The file on disk must be byte-identical to the original.
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), original);
+    }
+
+    /// Per-edit validation runs against the EVOLVING content: edit #2 may
+    /// target text introduced by edit #1, and a later-failing edit still
+    /// blocks the write.
+    #[tokio::test]
+    async fn multi_edit_validates_against_evolving_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "one\n").unwrap();
+        let ctx = ctx_in(dir.path());
+        // Edit #1 succeeds, edit #2 targets edit #1's output (valid),
+        // edit #3 fails → nothing written.
+        let v = parse(
+            &MultiEdit
+                .execute(
+                    json!({
+                        "file_path": "f.txt",
+                        "edits": [
+                            {"old_string": "one", "new_string": "two"},
+                            {"old_string": "two", "new_string": "three"},
+                            {"old_string": "missing", "new_string": "X"}
+                        ]
+                    }),
+                    &ctx,
+                )
+                .await,
+        );
+        assert_eq!(v["success"], false);
+        assert_eq!(v["edits_failed"].as_array().unwrap().len(), 1);
+        assert_eq!(v["edits_failed"][0]["index"], 3);
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "one\n");
+
+        // Without the failing edit, the chained edits all apply.
+        let v2 = parse(
+            &MultiEdit
+                .execute(
+                    json!({
+                        "file_path": "f.txt",
+                        "edits": [
+                            {"old_string": "one", "new_string": "two"},
+                            {"old_string": "two", "new_string": "three"}
+                        ]
+                    }),
+                    &ctx,
+                )
+                .await,
+        );
+        assert_eq!(v2["success"], true);
+        assert_eq!(v2["edits_applied"], 2);
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "three\n");
+    }
+
+    /// All edits fail → edits_failed error, no write.
+    #[tokio::test]
+    async fn multi_edit_all_fail_no_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "keep\n").unwrap();
+        let ctx = ctx_in(dir.path());
+        let v = parse(
+            &MultiEdit
+                .execute(
+                    json!({
+                        "file_path": "f.txt",
+                        "edits": [
+                            {"old_string": "nope1", "new_string": "X"},
+                            {"old_string": "nope2", "new_string": "Y"}
+                        ]
+                    }),
+                    &ctx,
+                )
+                .await,
+        );
+        assert_eq!(v["success"], false);
+        assert_eq!(v["edits_failed"].as_array().unwrap().len(), 2);
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "keep\n");
+    }
+
+    /// Identical-content edits (old == new) still count as validation
+    /// failures and must not write.
+    #[tokio::test]
+    async fn multi_edit_identical_edit_is_failure_no_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "alpha\nbeta\n").unwrap();
+        let ctx = ctx_in(dir.path());
+        let v = parse(
+            &MultiEdit
+                .execute(
+                    json!({
+                        "file_path": "f.txt",
+                        "edits": [
+                            {"old_string": "alpha", "new_string": "ALPHA"},
+                            {"old_string": "beta", "new_string": "beta"}
+                        ]
+                    }),
+                    &ctx,
+                )
+                .await,
+        );
+        assert_eq!(v["success"], false);
+        assert_eq!(v["edits_failed"].as_array().unwrap().len(), 1);
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "alpha\nbeta\n");
+    }
+
+    #[tokio::test]
+    async fn multi_edit_creation_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        let v = parse(
+            &MultiEdit
+                .execute(
+                    json!({
+                        "file_path": "new.txt",
+                        "edits": [{"old_string": "", "new_string": "fresh\n"}]
+                    }),
+                    &ctx,
+                )
+                .await,
+        );
+        assert_eq!(v["success"], true);
+        assert_eq!(std::fs::read_to_string(dir.path().join("new.txt")).unwrap(), "fresh\n");
     }
 }

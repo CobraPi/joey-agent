@@ -330,6 +330,7 @@ impl GraphStore {
                  status, indexed_at, signature)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(fqcn, kind, source_path) DO UPDATE SET
+                package=excluded.package,
                 enclosing_type=excluded.enclosing_type,
                 implemented_interfaces=excluded.implemented_interfaces,
                 annotations=excluded.annotations,
@@ -1206,5 +1207,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION.to_string());
+    }
+
+    /// Bug: the ON CONFLICT DO UPDATE clause omitted `package`, so
+    /// re-upserting a node whose package changed never updated it.
+    #[test]
+    fn upsert_node_updates_package_on_conflict() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let mut node = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "com.ex.Svc".into(),
+            "com.ex".into(),
+            "src/Svc.java".into(),
+        );
+        store.upsert_node(&node).unwrap();
+
+        // Same unique key (fqcn, kind, source_path) — new package.
+        node.package = "com.ex.moved".into();
+        let id = store.upsert_node(&node).unwrap();
+
+        let reloaded = store.get_node(id).unwrap().expect("node must exist");
+        assert_eq!(
+            reloaded.package, "com.ex.moved",
+            "ON CONFLICT DO UPDATE must refresh the package column"
+        );
     }
 }

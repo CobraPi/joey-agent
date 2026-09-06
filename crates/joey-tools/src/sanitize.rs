@@ -40,22 +40,24 @@ fn sanitize_parameters_named(params: Value, name: &str) -> Value {
     if !params.is_object() && !params.is_string() {
         return json!({"type": "object", "properties": {}});
     }
-    let mut top = sanitize_node(params, name);
-    // After recursion, guarantee the top-level is an object with properties.
-    match top.as_object_mut() {
-        Some(map) => {
-            if map.get("type").and_then(|t| t.as_str()) != Some("object") {
-                map.insert("type".to_string(), json!("object"));
-            }
-            if !map.get("properties").map(|p| p.is_object()).unwrap_or(false) {
-                map.insert("properties".to_string(), json!({}));
-            }
-        }
-        None => return json!({"type": "object", "properties": {}}),
-    }
+    let top = sanitize_node(params, name);
     let top = strip_nullable_unions(top, true);
     let top = strip_top_level_combinators(top);
-    strip_ref_siblings(top)
+    // AFTER union collapsing / combinator stripping: guarantee the top level
+    // is an object with properties. Doing it earlier meant a top-level
+    // nullable anyOf union collapsed to its non-null branch afterwards,
+    // discarding the just-inserted object/properties guarantee.
+    let mut top = match top {
+        Value::Object(map) => map,
+        _ => return json!({"type": "object", "properties": {}}),
+    };
+    if top.get("type").and_then(|t| t.as_str()) != Some("object") {
+        top.insert("type".to_string(), json!("object"));
+    }
+    if !top.get("properties").map(|p| p.is_object()).unwrap_or(false) {
+        top.insert("properties".to_string(), json!({}));
+    }
+    strip_ref_siblings(Value::Object(top))
 }
 
 /// Sibling keywords strict JSON Schema validators reject alongside `$ref`.
@@ -475,6 +477,19 @@ mod tests {
         }));
         assert!(out.get("allOf").is_none());
         assert!(out["properties"]["a"].get("anyOf").is_some());
+    }
+
+    /// Regression: the top-level object/properties guarantee used to run
+    /// BEFORE strip_nullable_unions, so a top-level nullable anyOf union
+    /// collapsed to its non-null branch afterwards and discarded the
+    /// guarantee — leaving a non-object-shaped parameters schema.
+    #[test]
+    fn top_level_nullable_union_sanitizes_to_object_shape() {
+        let out = sanitize_parameters(json!({"anyOf": [{"type": "string"}, {"type": "null"}]}));
+        assert_eq!(out["type"], "object");
+        assert!(out["properties"].is_object());
+        assert!(out.get("anyOf").is_none());
+        assert_eq!(out["nullable"], true, "nullable hint must survive the collapse");
     }
 
     #[test]

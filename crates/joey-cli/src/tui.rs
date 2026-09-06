@@ -884,7 +884,20 @@ impl TuiSession {
             return;
         }
         self.last_ctrlc = Some(now);
-        self.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Route through the engine's command queue (the serialization
+        // point), never the shared flag directly: a direct store landing
+        // in the window after the engine's Submit-arm clear but before the
+        // next turn starts polling makes the new turn "born interrupted"
+        // (the agent appears to interrupt itself). Mid-turn the engine's
+        // select signals the live turn; idle it acknowledges and drops
+        // the request (engine::interrupt_action_for — self-interrupt fix).
+        if let Some(engine) = &self.engine {
+            engine.send(crate::engine::EngineCommand::Interrupt);
+        } else {
+            // No engine (restart failed): the flag still belongs to the
+            // dead engine's unwinding agent — store directly so it stops.
+            self.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         self.tui.app_mut().push_item(TranscriptItem::Notice {
             text: "⚡ Interrupting… (press Ctrl-C again to KILL & restart the engine)".into(),
             kind: NoticeKind::Warning,

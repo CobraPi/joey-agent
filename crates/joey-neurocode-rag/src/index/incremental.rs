@@ -196,8 +196,10 @@ fn walk_relative(root: &Path, filter: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
 /// * `renamed` is left empty here — the git rename assist (T022) fills it;
 ///   unassisted renames surface as remove+add, an equivalent end state.
 ///
-/// Unreadable files (permissions, races) are skipped entirely — a transient
-/// stat/read failure must never purge a file's chunks.
+/// Unreadable files (permissions, races) are treated as PRESENT with an
+/// unknown mtime/size — a transient stat/read failure must never purge a
+/// file's chunks (the hash-confirm path then decides, no-oping safely
+/// when the read fails too).
 pub fn detect_changes(
     root: &Path,
     previous: &[FileFingerprint],
@@ -212,19 +214,33 @@ pub fn detect_changes(
 
     for rel in walk_relative(root, filter) {
         let source_path = normalize_source_path(&rel);
-        let Ok(meta) = std::fs::metadata(root.join(&rel)) else {
-            continue; // raced away — neither added nor removed
+        // Metadata failure (permissions, transient race): the walk DID see
+        // the entry, so the file is PRESENT with an unknown mtime/size.
+        // Skipping it classified it as removed at the bottom of this
+        // function and purged its chunks — contradicting the module
+        // guarantee that "a transient stat/read failure must never purge a
+        // file's chunks". Sentinel mtime/size differ from any stored
+        // fingerprint, forcing the hash-confirm path for tracked files —
+        // which itself no-ops safely when the read fails too.
+        let (mtime, size, meta_failed) = match std::fs::metadata(root.join(&rel)) {
+            Ok(meta) => (
+                meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                meta.len(),
+                false,
+            ),
+            Err(_) => (SystemTime::UNIX_EPOCH, u64::MAX, true),
         };
-        on_disk.insert(
-            source_path.clone(),
-            (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len()),
-        );
+        on_disk.insert(source_path.clone(), (mtime, size));
 
         match prev.get(source_path.as_str()) {
+            None if meta_failed => {
+                // Present but unreadable, never seen before: nothing to
+                // index from and not removed — leave to the next refresh.
+            }
             None => delta.added.push(rel),
             Some(fp) => {
                 let (mtime, size) = on_disk.get(&source_path).copied().unwrap();
-                let mtime_candidate = mtime != fp.mtime || size != fp.size;
+                let mtime_candidate = meta_failed || mtime != fp.mtime || size != fp.size;
                 if mtime_candidate || !options.trust_mtime {
                     // Confirm via content hash — the authority.
                     if let Ok(current) = fingerprint_file(root, &rel) {
@@ -941,6 +957,16 @@ pub fn refresh_incremental(
         rusqlite::params![chrono::Utc::now().to_rfc3339()],
     )?;
 
+    // Derived chunk-level edges (T028, data-model.md §7): rewrite from
+    // scratch inside the SAME transaction — mirrors the full-write path
+    // (vector/store.rs write_index). Without this, new/renamed files had
+    // ZERO projected edges until the next full `write_index`, because the
+    // incremental path only SWEPT dangling edges and never (re)projectd.
+    // Fully derived, so the rewrite rebuilds every edge from the typed
+    // graph + the chunk rows just staged (and drops rows referencing
+    // purged chunks).
+    crate::index::chunker::rewrite_chunk_edges(&tx)?;
+
     tx.commit()?;
     Ok(outcome)
 }
@@ -1593,6 +1619,111 @@ mod tests {
             .query_row("SELECT embed_dim FROM rag_chunks LIMIT 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(dim, profile.dim as i64);
+    }
+
+    /// Refresh must PROJECT derived chunk edges, not just sweep dangling
+    /// ones: a typed-graph edge between two indexed files' artifacts
+    /// appears in `rag_chunk_edges` after an incremental refresh — without
+    /// calling `rewrite_chunk_edges`, new files had zero projected edges
+    /// until a full `write_index`.
+    #[test]
+    fn refresh_projects_derived_chunk_edges() {
+        use joey_neurocode::graph::{ArtifactKind, CodeArtifactNode, EdgeKind};
+
+        let (tmp, store) = temp_store();
+        let root = tmp.path();
+        write(root, "a.py", "class Alpha:\n    def one(self):\n        return 1\n");
+        write(root, "b.py", "class Beta:\n    def two(self):\n        return 2\n");
+
+        // Typed-graph nodes + edge (the authoritative layer edges are
+        // projected FROM — normally built by the ingestion pipeline).
+        let alpha = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "Alpha".to_string(),
+            String::new(),
+            "a.py".to_string(),
+        );
+        let beta = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "Beta".to_string(),
+            String::new(),
+            "b.py".to_string(),
+        );
+        let alpha_id = store.upsert_node(&alpha).unwrap();
+        let beta_id = store.upsert_node(&beta).unwrap();
+        store.upsert_edge(alpha_id, beta_id, EdgeKind::ReferencesRule).unwrap();
+
+        let profile = default_profile();
+        let mut embedder = CountingEmbedder::new(profile.dim as usize);
+        refresh_incremental(
+            &store, root, &delta_added(&["a.py", "b.py"]), &mut embedder, profile,
+            Quantization::F32, &ChunkOptions::default(), &RefreshBudgets::default(),
+        )
+        .unwrap();
+
+        // The typed edge is projected down to the endpoints' symbol chunks.
+        let a_chunk: String = store
+            .conn()
+            .query_row(
+                "SELECT chunk_id FROM rag_chunks WHERE source_path = 'a.py' AND chunk_kind = 'symbol' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let b_chunk: String = store
+            .conn()
+            .query_row(
+                "SELECT chunk_id FROM rag_chunks WHERE source_path = 'b.py' AND chunk_kind = 'symbol' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let projected: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM rag_chunk_edges WHERE from_chunk_id = ?1 AND to_chunk_id = ?2 AND edge_kind = 'ReferencesRule'",
+                rusqlite::params![a_chunk, b_chunk],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(projected, 1, "incremental refresh projects derived chunk edges");
+    }
+
+    /// Metadata failure on a TRACKED file must classify it as present, not
+    /// removed — the module guarantee "a transient stat/read failure must
+    /// never purge a file's chunks". The stat race is simulated
+    /// deterministically: the filter deletes the file MID-WALK, after
+    /// walkdir's `is_file` check yielded it but before `detect_changes`
+    /// stats it (exactly the TOCTOU window the fix guards).
+    #[test]
+    fn metadata_failure_file_is_not_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "m.py", "x = 1\n");
+        let previous = snapshot_tree(root, &default_indexable_filter);
+        assert_eq!(previous.len(), 1);
+
+        // The walk still lists m.py (a regular file at walk time); the
+        // metadata call then fails because the file raced away.
+        let race_root = root.to_path_buf();
+        let racing_filter = |rel: &Path| {
+            if rel == Path::new("m.py") {
+                std::fs::remove_file(race_root.join(rel)).unwrap();
+            }
+            default_indexable_filter(rel)
+        };
+
+        let delta = detect_changes(
+            root,
+            &previous,
+            &racing_filter,
+            &DetectionOptions::default(),
+        );
+        assert!(
+            delta.removed.is_empty(),
+            "metadata failure must not classify the file as removed (would purge chunks): {delta:?}"
+        );
+        assert!(delta.is_empty(), "unreadable file contributes no change: {delta:?}");
     }
 
     #[test]

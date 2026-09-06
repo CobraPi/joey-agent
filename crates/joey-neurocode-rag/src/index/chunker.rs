@@ -307,19 +307,36 @@ fn contextual_prefix(source_path: &str, extraction: &SourceExtraction, max_impor
 /// found (parse-only chunk) — acceptable: the DDL leaves the FK nullable.
 /// `ORDER BY id` keeps the LIMIT 1 deterministic (an unspecified row
 /// choice would make chunk FKs nondeterministic across runs when multiple
-/// rows match the LIKE form).
+/// rows match the LIKE form). The LIKE pattern escapes `\`, `%` and `_`
+/// (with `ESCAPE '\'`) so symbol names containing them match LITERALLY —
+/// an unescaped `_` acted as a single-char wildcard and bound wrong
+/// artifact ids (e.g. symbol `foo_bar` matching `fooXbar`).
 fn find_artifact_id(store: &GraphStore, source_path: &str, symbol: &str) -> Option<u64> {
     store
         .conn()
         .query_row(
             "SELECT id FROM code_artifacts
-             WHERE source_path = ?1 AND (fqcn = ?2 OR fqcn LIKE ?3)
+             WHERE source_path = ?1 AND (fqcn = ?2 OR fqcn LIKE ?3 ESCAPE '\\')
              ORDER BY id LIMIT 1",
-            rusqlite::params![source_path, symbol, format!("%.{}", symbol)],
+            rusqlite::params![
+                source_path,
+                symbol,
+                format!("%.{}", like_escape_symbol(symbol))
+            ],
             |row| row.get::<_, i64>(0),
         )
         .ok()
         .map(|id| id as u64)
+}
+
+/// Escape SQL LIKE wildcards (`%`, `_`, `\`) so a symbol name matches
+/// literally in [`find_artifact_id`]'s `ESCAPE '\'` LIKE form (same rule
+/// as the keyword leg's `like_escape` in `search/hybrid.rs`).
+fn like_escape_symbol(token: &str) -> String {
+    token
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Push one symbol-aligned chunk, split into ≤ `max_chunk_lines` pieces.
@@ -627,5 +644,54 @@ mod tests {
         assert!(matches!(sym.kind, ChunkKind::Symbol { ref symbol_name, .. } if symbol_name == "a"));
         let fb = records.iter().find(|r| r.kind == ChunkKind::Fallback).unwrap();
         assert!(fb.embed_text.contains("x = 2"));
+    }
+
+    /// LIKE wildcard escape pin: `find_artifact_id`'s qualified form must
+    /// match symbol names LITERALLY — an unescaped `_` acted as a
+    /// single-char wildcard, so symbol `foo_bar` wrongly matched an
+    /// artifact `mod.fooXbar` (and bound its id). With `ESCAPE '\'`
+    /// escaping, `foo_bar` matches only the exact `mod.foo_bar` form.
+    #[test]
+    fn find_artifact_id_like_wildcards_match_literally() {
+        use joey_neurocode::graph::{ArtifactKind, CodeArtifactNode};
+
+        let store = joey_neurocode::graph::GraphStore::open_in_memory().unwrap();
+        let path = "src/m.py";
+        let decoy = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "mod.fooXbar".to_string(),
+            String::new(),
+            path.to_string(),
+        );
+        let target = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "mod.foo_bar".to_string(),
+            String::new(),
+            path.to_string(),
+        );
+        let decoy_id = store.upsert_node(&decoy).unwrap();
+        let target_id = store.upsert_node(&target).unwrap();
+        assert_ne!(decoy_id, target_id);
+
+        // The wildcard bug: LIKE '%.foo_bar' (unescaped `_`) matched
+        // `mod.fooXbar` too, and with ORDER BY id LIMIT 1 could bind the
+        // decoy. Escaped, only the literal `mod.foo_bar` matches.
+        assert_eq!(find_artifact_id(&store, path, "foo_bar"), Some(target_id));
+        // The decoy is reachable by its own literal name only.
+        assert_eq!(find_artifact_id(&store, path, "fooXbar"), Some(decoy_id));
+        // No `%` wildcard either: a symbol containing `%` matches nothing
+        // except its literal form.
+        let pct = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "mod.foo%bar".to_string(),
+            String::new(),
+            path.to_string(),
+        );
+        let pct_id = store.upsert_node(&pct).unwrap();
+        assert_eq!(find_artifact_id(&store, path, "foo%bar"), Some(pct_id));
+        // And `fooXbar` must NOT match the `%.foo_bar` form any more than
+        // `foo_bar` matches `%.fooXbar` — cross-check via a name that would
+        // be produced by wildcard expansion of the OTHER symbol.
+        assert_eq!(find_artifact_id(&store, path, "foo_bar"), Some(target_id));
     }
 }

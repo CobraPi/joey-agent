@@ -391,7 +391,9 @@ fn ignore_user_config() -> bool {
 }
 
 /// Read the raw user document. `Ok` for every readable state (missing,
-/// empty, non-mapping → `{}`), `Err(parse error)` only for broken YAML.
+/// empty → `{}`), `Err` for broken YAML OR a non-mapping document
+/// (list/scalar at the top level cannot be merged as config — the caller
+/// routes it through the same warn + `.corrupt.<ts>.bak` path).
 fn read_user_doc(path: &Path) -> std::result::Result<Value, String> {
     if ignore_user_config() || !path.exists() {
         return Ok(Value::Mapping(Mapping::new()));
@@ -405,7 +407,10 @@ fn read_user_doc(path: &Path) -> std::result::Result<Value, String> {
     }
     match serde_yaml::from_str::<Value>(&text) {
         Ok(v @ Value::Mapping(_)) => Ok(v),
-        Ok(_) => Ok(Value::Mapping(Mapping::new())),
+        Ok(other) => Err(format!(
+            "top-level document must be a mapping, found {}",
+            value_type_name(&other)
+        )),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -1368,10 +1373,12 @@ pub fn save_env_value(key: &str, value: &str) -> Result<()> {
     let new_line = format!("{}={}\n", key, serialized);
     let mut found = false;
     for line in lines.iter_mut() {
+        // Replace EVERY matching line, not just the first: load_dotenv_file
+        // applies all lines last-wins, so a stale duplicate left in place
+        // would win over the freshly saved value on next load.
         if env_line_defines_key(line, key) {
             *line = new_line.clone();
             found = true;
-            break;
         }
     }
     if !found {
@@ -1966,5 +1973,72 @@ mod tests {
         // Setting a nested key that doesn't exist yet must create the path.
         cfg.set_and_save("a.b.c", "hello").unwrap();
         assert_eq!(cfg.get_str("a.b.c", ""), "hello");
+    }
+
+    /// Regression: save_env_value must replace EVERY line defining the key,
+    /// not just the first. load_dotenv_file applies all lines last-wins, so
+    /// a stale later duplicate previously beat the freshly saved value.
+    #[test]
+    fn save_env_value_replaces_all_duplicate_key_lines() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home_lock = crate::constants::TEST_HOME_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::constants::HomeOverrideGuard::new(dir.path().to_path_buf());
+        let envfile = crate::constants::env_path();
+        std::fs::create_dir_all(envfile.parent().unwrap()).unwrap();
+        // K defined twice: line 1 (current) and line 5 (stale duplicate that
+        // last-wins under dotenv semantics).
+        std::fs::write(
+            &envfile,
+            "JOEY_TEST_DUP_KEY=old\nOTHER_A=1\nOTHER_B=2\n# comment\nJOEY_TEST_DUP_KEY=stale\n",
+        )
+        .unwrap();
+
+        save_env_value("JOEY_TEST_DUP_KEY", "new").unwrap();
+
+        // On disk: no stale/old definitions survive; other lines untouched.
+        let text = std::fs::read_to_string(&envfile).unwrap();
+        assert!(!text.contains("=old"), "first definition replaced: {}", text);
+        assert!(!text.contains("=stale"), "stale duplicate replaced: {}", text);
+        assert_eq!(text.matches("JOEY_TEST_DUP_KEY=new\n").count(), 2, "{}", text);
+        assert!(text.contains("OTHER_A=1") && text.contains("OTHER_B=2"), "{}", text);
+
+        // Reload applies last-wins → the saved value, on every line.
+        std::env::remove_var("JOEY_TEST_DUP_KEY");
+        load_dotenv_file(&envfile, true);
+        assert_eq!(std::env::var("JOEY_TEST_DUP_KEY").unwrap(), "new");
+        std::env::remove_var("JOEY_TEST_DUP_KEY");
+        let _ = std::fs::remove_file(&envfile);
+    }
+
+    /// Regression: a non-mapping config.yaml (top-level list/scalar) is a
+    /// corrupt config, not a silent {}: it must route through
+    /// warn_config_parse_failure and produce a `.corrupt.<ts>.bak` backup
+    /// while the load still succeeds on defaults.
+    #[test]
+    fn non_mapping_config_yaml_backed_up_and_serves_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "- a\n- b\n").unwrap();
+
+        let cfg = Config::load_from(path.clone()).unwrap();
+
+        // Defaults served (upstream pin: terminal.max_concurrent = "auto").
+        assert_eq!(cfg.get_str("terminal.max_concurrent", ""), "auto");
+        // The corrupt file was preserved as config.yaml.corrupt.<ts>.bak.
+        let backed = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .find(|n| n.starts_with("config.yaml.corrupt.") && n.ends_with(".bak"));
+        assert!(backed.is_some(), "corrupt backup missing in {:?}", dir.path());
+        // The backup holds the original content.
+        let bak = std::fs::read_to_string(
+            dir.path().join(backed.unwrap()),
+        )
+        .unwrap();
+        assert_eq!(bak, "- a\n- b\n");
     }
 }

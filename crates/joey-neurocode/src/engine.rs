@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use crate::classifier::{ComplexityClassifier, ComplexityRoute, ComplexityTier};
 use crate::config::NeuroCodeConfig;
 use crate::context::{AssembledContext, ContextAssembler};
-use crate::graph::DependencyGraph;
+use crate::graph::{DependencyGraph, EdgeKind};
 use crate::parse;
 
 /// The input to classification and context assembly (data-model.md Entity 10).
@@ -495,6 +495,13 @@ impl NeuroCodeCommands for DefaultEngine {
                         return format!("No artifact matching '{}' for dependency lookup.", symbol);
                     };
                     let edges = graph.traverse_to(node.id, None).unwrap_or_default();
+                    // Membership is not a dependency: a type's members point
+                    // at it via MemberOf, which must never read as a
+                    // "dependent" in this listing.
+                    let edges: Vec<_> = edges
+                        .into_iter()
+                        .filter(|(_, kind)| *kind != EdgeKind::MemberOf)
+                        .collect();
                     if edges.is_empty() {
                         return format!("No dependents for '{}'.", node.fqcn);
                     }
@@ -520,6 +527,13 @@ impl NeuroCodeCommands for DefaultEngine {
                         return format!("No artifact matching '{}' for dependency lookup.", symbol);
                     };
                     let edges = graph.traverse_edges(node.id, None).unwrap_or_default();
+                    // Membership is not a dependency: the type points at its
+                    // members via MemberOf, which must never read as an
+                    // outgoing "dependency" in this listing.
+                    let edges: Vec<_> = edges
+                        .into_iter()
+                        .filter(|(_, kind)| *kind != EdgeKind::MemberOf)
+                        .collect();
                     if edges.is_empty() {
                         return format!("No outgoing dependencies from '{}'.", node.fqcn);
                     }
@@ -802,6 +816,7 @@ fn resolve_query_node(
         })
         .or_else(|| results.iter().find(|n| n.simple_name() == symbol))
         .or_else(|| results.iter().find(|n| is_type_level(n)))
+        .or_else(|| results.first())
         .cloned()
 }
 
@@ -1366,6 +1381,132 @@ neurocode:
         assert!(
             status.contains("economical=flat-economical"),
             "Expected flat-key fallback for unconfigured economical tier"
+        );
+    }
+
+    // ── Dependency listing must exclude MemberOf (membership ≠ dependency) ──
+
+    /// Seed helper: a class with one method (MemberOf edge) plus one real
+    /// dependent (Injects) and one real dependency (Implements).
+    fn seed_member_graph(root: &std::path::Path) -> DefaultEngine {
+        use crate::graph::{CodeArtifactNode, DependencyGraph};
+        use crate::graph::node::ArtifactKind;
+
+        let graph = DependencyGraph::open_for_project(root).unwrap();
+        let svc = graph
+            .upsert_node(&CodeArtifactNode::new(
+                ArtifactKind::Class,
+                "com.ex.Svc".into(),
+                "com.ex".into(),
+                "src/Svc.java".into(),
+            ))
+            .unwrap();
+        let client = graph
+            .upsert_node(&CodeArtifactNode::new(
+                ArtifactKind::Class,
+                "com.ex.Client".into(),
+                "com.ex".into(),
+                "src/Client.java".into(),
+            ))
+            .unwrap();
+        let iface = graph
+            .upsert_node(&CodeArtifactNode::new(
+                ArtifactKind::Interface,
+                "com.ex.Iface".into(),
+                "com.ex".into(),
+                "src/Iface.java".into(),
+            ))
+            .unwrap();
+        let method = graph
+            .upsert_node(&CodeArtifactNode::new(
+                ArtifactKind::Method,
+                "com.ex.Svc.run()".into(),
+                "com.ex".into(),
+                "src/Svc.java".into(),
+            ))
+            .unwrap();
+        graph.upsert_edge(method, svc, EdgeKind::MemberOf).unwrap();
+        graph.upsert_edge(client, svc, EdgeKind::Injects).unwrap();
+        graph.upsert_edge(svc, iface, EdgeKind::Implements).unwrap();
+        drop(graph);
+
+        let mut cfg = NeuroCodeConfig::default();
+        cfg.enabled = true;
+        DefaultEngine::new(cfg, root.to_path_buf())
+    }
+
+    /// Bug: `dependents` listed MemberOf edges — a type's own methods read
+    /// as its "dependents". Membership must never read as dependency.
+    #[test]
+    fn dependents_listing_excludes_member_of_edges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = seed_member_graph(tmp.path());
+
+        let out = engine.query_text("dependents", "Svc");
+        assert!(
+            out.contains("Client"),
+            "the real dependent (Client --[Injects]--> Svc) must be listed: {out}"
+        );
+        assert!(
+            !out.contains("MemberOf"),
+            "MemberOf edges must not appear in dependents: {out}"
+        );
+        assert!(
+            !out.contains("Svc.run()"),
+            "the type's own method is not a dependent: {out}"
+        );
+    }
+
+    /// Bug: `dependencies` listed MemberOf edges — a type's own members
+    /// read as its outgoing "dependencies". Membership must never read as
+    /// dependency.
+    #[test]
+    fn dependencies_listing_excludes_member_of_edges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = seed_member_graph(tmp.path());
+
+        let out = engine.query_text("dependencies", "Svc");
+        assert!(
+            out.contains("Iface"),
+            "the real dependency (Svc --[Implements]--> Iface) must be listed: {out}"
+        );
+        assert!(
+            !out.contains("MemberOf"),
+            "MemberOf edges must not appear in dependencies: {out}"
+        );
+        assert!(
+            !out.contains("Svc.run()"),
+            "the type's own member is not a dependency: {out}"
+        );
+    }
+
+    // ── resolve_query_node first-hit fallback ──────────────────────────
+
+    #[test]
+    fn resolve_query_node_falls_back_to_first_hit() {
+        use crate::graph::node::{ArtifactKind, CodeArtifactNode};
+
+        // Only member nodes match (no type-level hit at all): the documented
+        // first-hit fallback must resolve instead of returning None.
+        let nodes = vec![
+            CodeArtifactNode::new(
+                ArtifactKind::Method,
+                "com.ex.Svc.run()".into(),
+                "com.ex".into(),
+                "src/Svc.java".into(),
+            ),
+            CodeArtifactNode::new(
+                ArtifactKind::Field,
+                "com.ex.Svc.count".into(),
+                "com.ex".into(),
+                "src/Svc.java".into(),
+            ),
+        ];
+        let resolved = resolve_query_node("Svc", nodes.clone());
+        assert_eq!(
+            resolved.as_ref().map(|n| n.fqcn.clone()),
+            Some("com.ex.Svc.run()".to_string()),
+            "member-only results must fall back to the first hit"
         );
     }
 }

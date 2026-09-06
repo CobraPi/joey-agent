@@ -313,9 +313,13 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
                 continue;
             };
             for iface in &type_node.implemented_interfaces {
+                // Exact same-file match only: a suffix match
+                // (`AuditService`.ends_with(`Service`) for an `implements
+                // Service` clause) mis-wires the edge onto an unrelated
+                // local type. Everything else resolves cross-file post-walk.
                 if let Some(to_id) = node_ids
                     .iter()
-                    .find(|(name, _, _)| name == iface || name.ends_with(iface.as_str()))
+                    .find(|(name, _, _)| name == iface)
                     .map(|(_, _, id)| *id)
                 {
                     if graph.upsert_edge(from_id, to_id, EdgeKind::Implements).is_ok() {
@@ -340,9 +344,13 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
             }
             for dep in &type_node.declared_dependencies {
                 let dep_base = dep.rsplit('.').next().unwrap_or(dep).to_string();
+                // Exact same-file match on the base name only: a suffix
+                // match (`MyService`.ends_with(`Service`)) mis-wires the
+                // Injects edge onto an unrelated local type. Everything
+                // else resolves cross-file post-walk.
                 if let Some(to_id) = node_ids
                     .iter()
-                    .find(|(name, _, _)| name == dep || name.ends_with(&dep_base))
+                    .find(|(name, _, _)| *name == dep_base)
                     .map(|(_, _, id)| *id)
                 {
                     if graph.upsert_edge(from_id, to_id, EdgeKind::Injects).is_ok() {
@@ -427,23 +435,30 @@ fn member_fqcn(language: &str, type_fqcn: &str, member: &str, is_method: bool) -
 }
 
 /// Resolve a reference (FQCN, dotted name, or simple name) to an ingested
-/// node id — via the in-memory simple-name index first, then FTS with an
-/// exact-match check.
+/// node id — via exact FQCN/reference matching (FTS) first, then the
+/// in-memory simple-name index as a fallback.
+///
+/// Exact-match first matters: the simple-name index is first-wins across
+/// files, so consulting it before the exact path would let an unrelated
+/// same-named type from another file hijack a fully-qualified reference.
 fn resolve_reference(
     graph: &DependencyGraph,
     name_index: &HashMap<String, NodeId>,
     reference: &str,
 ) -> Option<NodeId> {
-    let simple = reference.rsplit('.').next().unwrap_or(reference);
-    let simple = simple.rsplit("::").next().unwrap_or(simple);
-    if let Some(id) = name_index.get(simple) {
-        return Some(*id);
-    }
+    // Exact FQCN / reference match first (node_matches_reference accepts
+    // the full FQCN, the simple tail, and Pega rule-name variants).
     let results = graph.query_fts(reference, 10).ok()?;
-    results
+    if let Some(node) = results
         .iter()
         .find(|n| pega::node_matches_reference(&n.fqcn, reference))
-        .map(|n| n.id)
+    {
+        return Some(node.id);
+    }
+    // Fallback: simple-name index (cross-file resolution by simple name).
+    let simple = reference.rsplit('.').next().unwrap_or(reference);
+    let simple = simple.rsplit("::").next().unwrap_or(simple);
+    name_index.get(simple).copied()
 }
 
 /// Whether the target project contains source artifacts NeuroCode can
@@ -504,4 +519,152 @@ pub fn project_has_source(project_root: &Path) -> bool {
 /// answers "does this project have ingestible source of any language".
 pub fn project_has_java(project_root: &Path) -> bool {
     project_has_source(project_root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::node::{ArtifactKind, CodeArtifactNode};
+
+    fn node_by_fqcn(graph: &DependencyGraph, fqcn: &str) -> CodeArtifactNode {
+        graph
+            .query_fts(fqcn, 10)
+            .unwrap()
+            .into_iter()
+            .find(|n| n.fqcn == fqcn)
+            .unwrap_or_else(|| panic!("node {fqcn} should be ingested"))
+    }
+
+    fn has_edge(graph: &DependencyGraph, from: NodeId, to: NodeId, kind: EdgeKind) -> bool {
+        graph
+            .traverse_edges(from, Some(kind))
+            .map(|edges| edges.iter().any(|(t, _)| *t == to))
+            .unwrap_or(false)
+    }
+
+    /// Bug: `name.ends_with(iface)` mis-wired Implements onto an unrelated
+    /// local type (`Client implements Service` in a file also declaring
+    /// `PaymentService`). Exact match only; everything else resolves
+    /// cross-file post-walk.
+    #[test]
+    fn implements_suffix_does_not_miswire_to_unrelated_local_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("Local.java"),
+            "package com.example;\npublic class PaymentService {}\npublic class Client implements Service {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("Service.java"),
+            "package com.example;\npublic interface Service {}\n",
+        )
+        .unwrap();
+
+        let graph = DependencyGraph::open_in_memory().unwrap();
+        let result = ingest_project(&graph, tmp.path());
+        assert!(result.errors.is_empty(), "ingestion errors: {:?}", result.errors);
+
+        let client = node_by_fqcn(&graph, "com.example.Client");
+        let service = node_by_fqcn(&graph, "com.example.Service");
+        let payment = node_by_fqcn(&graph, "com.example.PaymentService");
+
+        assert!(
+            has_edge(&graph, client.id, service.id, EdgeKind::Implements),
+            "implements must resolve to the real Service interface (cross-file)"
+        );
+        assert!(
+            !has_edge(&graph, client.id, payment.id, EdgeKind::Implements),
+            "suffix match must not mis-wire Implements onto PaymentService"
+        );
+    }
+
+    /// Same suffix bug on the Injects path: `@Autowired Service` in a class
+    /// named `OrderService` created a self-edge via
+    /// `OrderService`.ends_with(`Service`). The field is named
+    /// `paymentService` (not `service`) so the field node's own tokens can't
+    /// hijack the cross-file resolution.
+    #[test]
+    fn injects_suffix_does_not_miswire_to_unrelated_local_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("Order.java"),
+            "package com.example;\nimport org.springframework.beans.factory.annotation.Autowired;\npublic class OrderService {\n    @Autowired\n    private Service paymentService;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("Service.java"),
+            "package com.example;\npublic interface Service {}\n",
+        )
+        .unwrap();
+
+        let graph = DependencyGraph::open_in_memory().unwrap();
+        let result = ingest_project(&graph, tmp.path());
+        assert!(result.errors.is_empty(), "ingestion errors: {:?}", result.errors);
+
+        let order = node_by_fqcn(&graph, "com.example.OrderService");
+        let service = node_by_fqcn(&graph, "com.example.Service");
+
+        assert!(
+            has_edge(&graph, order.id, service.id, EdgeKind::Injects),
+            "injects must resolve to the real Service interface (cross-file)"
+        );
+        assert!(
+            !has_edge(&graph, order.id, order.id, EdgeKind::Injects),
+            "suffix match must not create an OrderService→OrderService self-edge"
+        );
+    }
+
+    /// Bug: the simple-name index (first-wins across files) was consulted
+    /// BEFORE exact-FQCN matching, so a fully-qualified reference could be
+    /// hijacked by an unrelated same-named type. Exact match must win.
+    #[test]
+    fn resolve_reference_prefers_exact_fqcn_over_simple_name_index() {
+        let graph = DependencyGraph::open_in_memory().unwrap();
+        let a = graph
+            .upsert_node(&CodeArtifactNode::new(
+                ArtifactKind::Class,
+                "com.ex.Service".into(),
+                "com.ex".into(),
+                "src/a/Service.java".into(),
+            ))
+            .unwrap();
+        let b = graph
+            .upsert_node(&CodeArtifactNode::new(
+                ArtifactKind::Class,
+                "org.other.Service".into(),
+                "org.other".into(),
+                "src/b/Service.java".into(),
+            ))
+            .unwrap();
+        // Simulate the first-wins simple-name index landing on the WRONG one.
+        let mut name_index: HashMap<String, NodeId> = HashMap::new();
+        name_index.insert("Service".to_string(), b);
+
+        assert_eq!(
+            resolve_reference(&graph, &name_index, "com.ex.Service"),
+            Some(a),
+            "exact FQCN must beat the simple-name index"
+        );
+
+        // The simple-name fallback still applies when nothing matches exactly.
+        let c = graph
+            .upsert_node(&CodeArtifactNode::new(
+                ArtifactKind::Class,
+                "Widget".into(),
+                String::new(),
+                "src/w.rs".into(),
+            ))
+            .unwrap();
+        let mut idx: HashMap<String, NodeId> = HashMap::new();
+        idx.insert("Widget".to_string(), c);
+        assert_eq!(
+            resolve_reference(&graph, &idx, "some.pkg.Widget"),
+            Some(c),
+            "simple-name fallback must still resolve cross-file references"
+        );
+    }
 }

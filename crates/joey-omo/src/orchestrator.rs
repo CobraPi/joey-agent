@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::agents::registry::AgentRegistry;
-use crate::boulder::{BoulderState, BoulderWork, BoulderWorkStatus};
+use crate::boulder::{BoulderState, BoulderWorkStatus};
 use crate::notepad::{NotepadFile, NotepadStore};
 use crate::plan_parser::ParsedTask;
 
@@ -58,6 +58,10 @@ pub struct DelegationRoute {
     pub agent_name: String,
     /// The model to use (resolved from category or agent fallback chain).
     pub model: Option<String>,
+    /// Tool allow-list from the agent's ToolPermissions (empty = allow all
+    /// non-denied). Previously only the deny list was propagated and the
+    /// allow-list was lost, over-granting tools to allow-listed agents.
+    pub allowed_tools: Vec<String>,
     /// Tool restrictions to apply (from the agent's ToolPermissions).
     pub denied_tools: Vec<String>,
     /// Prompt append from category (if category-routed).
@@ -122,10 +126,14 @@ pub fn route_delegation(
         let denied_tools: Vec<String> = junior
             .tool_permissions
             .denied().to_vec();
+        let allowed_tools: Vec<String> = junior
+            .tool_permissions
+            .allowed().to_vec();
 
         return Ok(DelegationRoute {
             agent_name: "sisyphus-junior".to_string(),
             model,
+            allowed_tools,
             denied_tools,
             prompt_append: category.prompt_append.clone(),
             temperature: Some(category.temperature.unwrap_or(0.5)),
@@ -142,10 +150,14 @@ pub fn route_delegation(
         let denied_tools: Vec<String> = agent
             .tool_permissions
             .denied().to_vec();
+        let allowed_tools: Vec<String> = agent
+            .tool_permissions
+            .allowed().to_vec();
 
         return Ok(DelegationRoute {
             agent_name: agent_name.clone(),
             model: agent.resolved_model.clone(),
+            allowed_tools,
             denied_tools,
             prompt_append: None,
             temperature: Some(agent.temperature),
@@ -470,16 +482,37 @@ pub fn start_work(
         let existing = BoulderState::read(omo_dir);
         // Only resume if there are works.
         if !existing.works.is_empty() {
-            // Find active work for this session or the most recent active work.
-            let active_work = existing
+            // An explicit `/start-work <name>` naming a DIFFERENT plan
+            // takes precedence over silently resuming the active work:
+            // fall through to init mode and create new work for the
+            // named plan instead of resuming the old one.
+            let explicit_slug = explicit_plan_name.map(|n| n.trim().replace(' ', "-"));
+
+            // Find active work for this session or the most recent active
+            // work — but when a plan was explicitly named, only an active
+            // work on THAT plan is resumable.
+            let active_works: Vec<_> = existing
                 .works
                 .iter()
-                .find(|w| w.session_id == session_id && w.status == BoulderWorkStatus::Active)
-                .or_else(|| {
-                    existing
-                        .works
-                        .iter().rfind(|w| w.status == BoulderWorkStatus::Active)
-                });
+                .filter(|w| w.status == BoulderWorkStatus::Active)
+                .collect();
+            let active_work = match explicit_slug.as_deref() {
+                Some(slug) => active_works
+                    .iter()
+                    .copied()
+                    .find(|w| w.session_id == session_id && w.plan_name == slug)
+                    .or_else(|| {
+                        active_works
+                            .iter()
+                            .copied()
+                            .find(|w| w.plan_name == slug)
+                    }),
+                None => active_works
+                    .iter()
+                    .copied()
+                    .find(|w| w.session_id == session_id)
+                    .or_else(|| active_works.last().copied()),
+            };
 
             if let Some(work) = active_work {
                 let plan_path = PathBuf::from(&work.plan_path);
@@ -534,20 +567,15 @@ pub fn start_work(
         .unwrap_or("unnamed")
         .to_string();
 
-    // Create boulder state.
-    let work = BoulderWork {
-        id: format!("work_{}", chrono::Utc::now().timestamp()),
-        plan_path: plan_path.to_string_lossy().to_string(),
-        plan_name: plan_name.clone(),
-        session_id: session_id.to_string(),
-        agent: "atlas".to_string(),
-        worktree_path: None,
-        status: BoulderWorkStatus::Active,
-        started_at: chrono::Utc::now().to_rfc3339(),
-    };
-
+    // Create boulder state. `create_work` generates a uuid-based work id —
+    // the previous epoch-seconds id collided for works started within the
+    // same second.
     let mut boulder = BoulderState::read(omo_dir);
-    boulder.works.push(work);
+    boulder.create_work(
+        plan_path.to_string_lossy().to_string(),
+        plan_name.clone(),
+        session_id.to_string(),
+    );
     let _ = boulder.write(omo_dir);
 
     let context = format!(
@@ -585,15 +613,19 @@ pub struct PlanProgress {
     pub total: usize,
 }
 
-/// Calculate progress from a plan file by counting checked vs unchecked boxes.
+/// Calculate progress from a plan file by parsing real task rows.
+///
+/// The previous raw line scan counted ANY `- [` line — including
+/// non-task checklist items — and missed indented task rows. Parsing via
+/// `parse_plan` counts only actual `N.`/`FN.` task rows (indented or
+/// not) and uses each task's completed flag.
 fn calculate_plan_progress(plan_path: &Path) -> PlanProgress {
     let content = std::fs::read_to_string(plan_path).unwrap_or_default();
-    let total = content.lines().filter(|l| l.starts_with("- [")).count();
-    let completed = content
-        .lines()
-        .filter(|l| l.starts_with("- [x]") || l.starts_with("- [X]"))
-        .count();
-    PlanProgress { completed, total }
+    let plan = crate::plan_parser::parse_plan(&content);
+    PlanProgress {
+        completed: plan.tasks.iter().filter(|t| t.completed).count(),
+        total: plan.tasks.len(),
+    }
 }
 
 /// Find the most recently modified .md file in .omo/plans/.
@@ -628,12 +660,76 @@ fn find_latest_plan(plans_dir: &Path) -> Result<PathBuf, String> {
 
 // ─── Prometheus Write Restriction ────────────────────────────────────
 
+/// Lexically normalize a path without touching the filesystem: resolve
+/// `.` components and collapse `a/../b` → `b`. Symlinks are NOT resolved
+/// (that requires the paths to exist); this only makes the component
+/// structure comparable.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        use std::path::Component;
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `..` at the root cannot be popped — keep it so the path
+                // remains visibly "escaping" (callers reject `..` anyway).
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Canonicalize for containment checks: `fs::canonicalize` (which also
+/// resolves symlinks) when the path exists. For not-yet-existing write
+/// targets, canonicalize the longest existing ancestor and append the
+/// non-existing tail — a plain lexical fallback would disagree with
+/// `fs::canonicalize` on symlinked prefixes (e.g. `/var` vs
+/// `/private/var` on macOS) and break containment.
+fn canonicalize_for_check(path: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    // Find the deepest existing ancestor.
+    let mut prefix = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !prefix.exists() {
+        match (prefix.parent(), prefix.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                prefix = parent.to_path_buf();
+            }
+            _ => return lexical_normalize(path),
+        }
+    }
+    match std::fs::canonicalize(&prefix) {
+        Ok(mut c) => {
+            for seg in tail.iter().rev() {
+                c.push(seg);
+            }
+            c
+        }
+        Err(_) => lexical_normalize(path),
+    }
+}
+
 /// Check if a path is within the `.omo/` directory (Prometheus constraint).
 ///
 /// Prometheus is restricted to writing markdown files under `.omo/`.
 /// This function validates that a write target is within that scope.
 pub fn is_prometheus_write_allowed(path: &str, omo_dir: &Path) -> bool {
     let resolved = std::path::PathBuf::from(path);
+
+    // Reject any `..` component outright: `Path::starts_with` is a lexical
+    // prefix check, so `.omo/../src/evil.md` would otherwise pass the
+    // containment test below.
+    if resolved.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return false;
+    }
+
     let abs = if resolved.is_absolute() {
         resolved
     } else {
@@ -642,8 +738,13 @@ pub fn is_prometheus_write_allowed(path: &str, omo_dir: &Path) -> bool {
             .join(resolved)
     };
 
+    // Compare canonical forms so symlinks and residual `.` components
+    // can't smuggle a target outside `.omo/`.
+    let abs = canonicalize_for_check(&abs);
+    let omo = canonicalize_for_check(omo_dir);
+
     // Must be inside .omo/
-    if !abs.starts_with(omo_dir) {
+    if !abs.starts_with(omo) {
         return false;
     }
 
@@ -848,6 +949,172 @@ mod tests {
         assert!(!is_prometheus_write_allowed("/project/src/main.rs", &omo_dir));
         assert!(!is_prometheus_write_allowed("/project/.omo/config.json", &omo_dir));
         assert!(!is_prometheus_write_allowed("/project/.omo/plans/test.txt", &omo_dir));
+    }
+
+    #[test]
+    fn prometheus_write_rejects_parent_dir_traversal() {
+        // `starts_with` is a lexical prefix check: `.omo/../src/evil.md`
+        // used to pass it. Any `..` component must be rejected outright.
+        let omo_dir = std::path::PathBuf::from("/project/.omo");
+        assert!(!is_prometheus_write_allowed("/project/.omo/../src/evil.md", &omo_dir));
+        assert!(!is_prometheus_write_allowed(".omo/../src/evil.md", &omo_dir));
+        assert!(!is_prometheus_write_allowed(
+            "/project/.omo/plans/../../src/evil.md",
+            &omo_dir
+        ));
+        // Sanity: a plain in-scope path still passes.
+        assert!(is_prometheus_write_allowed("/project/.omo/plans/x.md", &omo_dir));
+    }
+
+    #[test]
+    fn prometheus_write_relative_path_resolved_against_omo_dir() {
+        // omo_dir given as absolute; the write target as relative. The
+        // relative path is resolved against the CWD, so it must NOT be
+        // considered inside the (absolute) omo_dir unless the CWD really
+        // is its parent — use a tempdir to pin the CWD.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let omo_dir = project.join(".omo");
+        std::fs::create_dir_all(omo_dir.join("plans")).unwrap();
+
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&project).unwrap();
+
+        // Relative in-scope target (resolved against CWD = project).
+        assert!(is_prometheus_write_allowed(".omo/plans/x.md", &omo_dir));
+        // Relative escaping target — `..` rejected outright.
+        assert!(!is_prometheus_write_allowed(".omo/../src/evil.md", &omo_dir));
+        // Absolute in-scope target.
+        assert!(is_prometheus_write_allowed(
+            omo_dir.join("plans").join("x.md").to_str().unwrap(),
+            &omo_dir
+        ));
+
+        std::env::set_current_dir(orig_cwd).unwrap();
+    }
+
+    #[test]
+    fn route_propagates_allowed_tools() {
+        // Junior's allow-list (call_omo_agent, read_file, ...) must be
+        // propagated alongside the deny list — previously it was lost.
+        let registry = test_registry();
+
+        let req = OmoDelegationRequest {
+            prompt: "test".into(),
+            description: None,
+            category: Some("deep".into()),
+            subagent_type: None,
+            load_skills: vec![],
+            run_in_background: false,
+        };
+        let route = route_delegation(&req, &registry).unwrap();
+        assert!(route.allowed_tools.contains(&"call_omo_agent".to_string()));
+        assert!(route.allowed_tools.contains(&"read_file".to_string()));
+        assert!(route.denied_tools.contains(&"task".to_string()));
+
+        // Subagent routing propagates its allow-list too. Oracle's
+        // allow-list is intentionally empty (allow-all non-denied, deny
+        // write/patch/delegate), so it must propagate as empty — while
+        // oracle's deny list is preserved.
+        let req = OmoDelegationRequest {
+            prompt: "test".into(),
+            description: None,
+            category: None,
+            subagent_type: Some("oracle".into()),
+            load_skills: vec![],
+            run_in_background: false,
+        };
+        let route = route_delegation(&req, &registry).unwrap();
+        assert!(
+            route.allowed_tools.is_empty(),
+            "oracle's (empty, allow-all) allow-list must propagate as empty"
+        );
+        assert!(route.denied_tools.contains(&"write_file".to_string()));
+        assert!(route.denied_tools.contains(&"delegate_task".to_string()));
+    }
+
+    #[test]
+    fn start_work_uses_uuid_work_ids() {
+        // Two works created in the same second must have distinct ids
+        // (the old epoch-seconds ids collided). Complete the first work
+        // so the second start_work creates fresh work instead of resuming.
+        let dir = tempfile::tempdir().unwrap();
+        let omo_dir = dir.path().join(".omo");
+        let plans = omo_dir.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join("alpha.md"), "# Plan\n\n- [ ] 1. Do a thing\n").unwrap();
+
+        let _ = start_work(&omo_dir, "s1", None).unwrap();
+        let mut boulder = BoulderState::read(&omo_dir);
+        assert_eq!(boulder.works.len(), 1);
+        let first_id = boulder.works[0].id.clone();
+        boulder.complete_work(&first_id);
+        let _ = boulder.write(&omo_dir);
+
+        let _ = start_work(&omo_dir, "s1", None).unwrap();
+
+        let boulder = BoulderState::read(&omo_dir);
+        assert_eq!(boulder.works.len(), 2);
+        assert_ne!(
+            boulder.works[1].id, first_id,
+            "work ids must be unique even within the same second"
+        );
+        assert!(boulder.works[1].id.starts_with("work_"));
+    }
+
+    #[test]
+    fn start_work_explicit_plan_differs_from_active_creates_new_work() {
+        // With an active boulder on plan A, `/start-work b` must create
+        // new work for plan B instead of silently resuming plan A.
+        let dir = tempfile::tempdir().unwrap();
+        let omo_dir = dir.path().join(".omo");
+        let plans = omo_dir.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join("alpha.md"), "# A\n\n- [ ] 1. A task\n").unwrap();
+        std::fs::write(plans.join("beta.md"), "# B\n\n- [ ] 1. B task\n").unwrap();
+
+        // Start plan alpha.
+        let r1 = start_work(&omo_dir, "s1", Some("alpha")).unwrap();
+        assert!(!r1.is_resume);
+
+        // Explicitly start beta while alpha is active.
+        let r2 = start_work(&omo_dir, "s1", Some("beta")).unwrap();
+        assert!(!r2.is_resume, "explicit different plan must not silently resume");
+        assert!(r2.plan_path.unwrap().ends_with("beta.md"));
+
+        // Both works exist; beta is the latest.
+        let boulder = BoulderState::read(&omo_dir);
+        assert_eq!(boulder.works.len(), 2);
+        assert_eq!(boulder.works[1].plan_name, "beta");
+
+        // Naming the SAME plan still resumes.
+        let r3 = start_work(&omo_dir, "s1", Some("beta")).unwrap();
+        assert!(r3.is_resume, "explicit name matching the active work resumes");
+    }
+
+    #[test]
+    fn plan_progress_counts_only_real_tasks() {
+        use std::io::Write;
+        // Progress must count parsed task rows, not arbitrary `- [` lines,
+        // and must include indented task rows.
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("plan.md");
+        let content = "# Plan\n\
+            \n\
+            - [x] 1. Done task\n\
+            - [ ] 2. Pending task\n\
+              - [ ] 2a. Indented subtask-ish line (not a numbered task row)\n\
+            - [ ] F1. Final verification\n\
+            \n\
+            ## Notes checklist (not tasks)\n\
+            - [ ] shopping list item\n\
+            - [x] another non-task item\n";
+        let mut f = std::fs::File::create(&plan_path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+
+        let progress = calculate_plan_progress(&plan_path);
+        assert_eq!(progress.total, 3, "only numbered task rows count (1, 2, F1)");
+        assert_eq!(progress.completed, 1, "only task 1 is completed");
     }
 
     #[test]

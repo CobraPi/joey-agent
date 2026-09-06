@@ -198,8 +198,13 @@ pub(crate) fn resolve_batch_subagent_types(
             ));
         };
         // Resolved agent model wins over spec/batch model (single-mode
-        // parity: resolution first, args model only as fallback).
-        req.model = Some(r.model);
+        // parity: resolution first, args model only as fallback). An empty
+        // resolved model resolves nothing — keep the spec/batch model so the
+        // normal fallback chain (spec > batch > delegation default > parent)
+        // stays intact, same guard as the chain-default path.
+        if !r.model.is_empty() {
+            req.model = Some(r.model);
+        }
         // Identity prompt rides prompt_append (prepended before any
         // existing append); skip when the resolved append is empty.
         match r.prompt_append {
@@ -458,7 +463,7 @@ impl Tool for DelegateTask {
                 },
                 "persist": {
                     "type": "boolean",
-                    "description": "If true, persist the subagent's full session trace to the session store for later session_search recall. Default: false (ephemeral).",
+                    "description": "If true, persist the subagent's full session trace to the session store for later session_search recall. Default: false (ephemeral). Single-task mode only: not supported with batch 'tasks'.",
                     "default": false
                 },
                 "background": {
@@ -478,16 +483,16 @@ impl Tool for DelegateTask {
                 },
                 "category": {
                     "type": "string",
-                    "description": "OMO category name (e.g. 'quick', 'visual-engineering', 'deep'). When set, routes through Sisyphus-Junior with the category's resolved model and prompt_append. Mutually exclusive with 'subagent_type'."
+                    "description": "OMO category name (e.g. 'quick', 'visual-engineering', 'deep'). When set, routes through Sisyphus-Junior with the category's resolved model and prompt_append. Mutually exclusive with 'subagent_type'. Single-task mode only: ignored-with-error in batch 'tasks' mode."
                 },
                 "subagent_type": {
                     "type": "string",
-                    "description": "OMO subagent type — any registered OMO agent by name (sisyphus, hephaestus, prometheus, atlas, oracle, librarian, explore, multimodal-looker, metis, momus, sisyphus-junior). When set, spawns the named agent with its resolved model and identity prompt. Mutually exclusive with 'category'."
+                    "description": "OMO subagent type — any registered OMO agent by name (sisyphus, hephaestus, prometheus, atlas, oracle, librarian, explore, multimodal-looker, metis, momus, sisyphus-junior). When set, spawns the named agent with its resolved model and identity prompt. Mutually exclusive with 'category'. Single-task mode only at top level; in batch mode set subagent_type per task inside the tasks array instead."
                 },
                 "load_skills": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Skill names to load and prepend to the subagent's system prompt. Effective with 'category' or 'subagent_type' routing."
+                    "description": "Skill names to load and prepend to the subagent's system prompt. Effective with 'category' or 'subagent_type' routing. Single-task mode only: not supported with batch 'tasks'."
                 },
                 "team": {
                     "type": "string",
@@ -521,6 +526,17 @@ impl Tool for DelegateTask {
         if is_batch {
             if team_arg.is_some() {
                 return ToolResult::Error("team spawns do not support batch tasks".to_string());
+            }
+            // Batch mode only honors model/toolsets/role/background/budgets at
+            // the top level; these single-task fields have no batch meaning
+            // and would otherwise be silently dropped (same shape as the team
+            // rejection above).
+            for field in ["category", "subagent_type", "load_skills", "persist"] {
+                if args.get(field).is_some_and(|v| !v.is_null()) {
+                    return ToolResult::Error(format!(
+                        "'{field}' is single-task mode only and is not supported with batch 'tasks' (batch mode honors only model/toolsets/role/background/budgets); drop it or use single-task mode"
+                    ));
+                }
             }
             return self.execute_batch(tasks_value.unwrap(), &args, budgets).await;
         }
@@ -582,7 +598,13 @@ impl Tool for DelegateTask {
             if let Some(ref resolver) = self.resolver {
                 match resolver.resolve_subagent_type(sat) {
                     Some(r) => {
-                        resolved_model = Some(r.model);
+                        // Empty resolved model resolves nothing — leave
+                        // resolved_model None so the args `model` and the
+                        // normal fallback chain apply (same guard as the
+                        // chain-default path and batch resolution).
+                        if !r.model.is_empty() {
+                            resolved_model = Some(r.model);
+                        }
                         prompt_append = r.prompt_append;
                         if !load_skills.is_empty() && prompt_append.is_none() {
                             prompt_append = Some(named_agent_skill_directive(sat));
@@ -1586,5 +1608,146 @@ mod roster_tests {
         assert!(append.contains("You are Oracle."), "append: {append}");
         assert_eq!(reqs[1].model, None);
         assert_eq!(reqs[1].prompt_append, None);
+    }
+
+    /// Bug fix: an EMPTY resolved model must not clobber the spec/batch
+    /// model — the guard mirrors the chain-default path (!r.model.is_empty()).
+    struct EmptyModelResolver;
+
+    impl crate::CategoryResolver for EmptyModelResolver {
+        fn resolve_category(&self, _name: &str) -> Option<crate::ResolvedDelegation> {
+            None
+        }
+        fn resolve_subagent_type(&self, name: &str) -> Option<crate::ResolvedDelegation> {
+            match name {
+                "oracle" => Some(crate::ResolvedDelegation {
+                    model: String::new(),
+                    prompt_append: Some("You are Oracle.".to_string()),
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_batch_subagent_types_empty_model_keeps_spec_model() {
+        let resolver: Arc<dyn CategoryResolver> = Arc::new(EmptyModelResolver);
+        let mut r = base_req();
+        r.subagent_type = Some("oracle".into());
+        r.model = Some("spec-model".into());
+        let mut reqs = vec![r];
+        resolve_batch_subagent_types(&mut reqs, Some(&resolver)).unwrap();
+        assert_eq!(
+            reqs[0].model.as_deref(),
+            Some("spec-model"),
+            "empty resolved model must not overwrite the spec model"
+        );
+        // The identity prompt still applies even when the model does not.
+        assert_eq!(reqs[0].prompt_append.as_deref(), Some("You are Oracle."));
+    }
+
+    fn test_agent_config() -> joey_agent_core::AgentConfig {
+        joey_agent_core::AgentConfig {
+            model: "parent-model".into(),
+            provider: "openai".into(),
+            // Unroutable port: connection refused immediately, so the
+            // dispatch fails fast without real network access.
+            base_url: "http://127.0.0.1:9/v1".into(),
+            api_key: None,
+            max_turns: 2,
+            api_max_retries: 1,
+            tool_delay: 0.0,
+            reasoning: None,
+            enabled_tools: Vec::new(),
+            max_tokens: None,
+            stream: false,
+            pass_session_id: false,
+            model_pinned: false,
+        }
+    }
+
+    fn make_delegate_tool(
+        resolver: Option<Arc<dyn CategoryResolver>>,
+        event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> DelegateTask {
+        DelegateTask::new(
+            std::sync::Arc::new(crate::manager::SubagentManager::new(
+                crate::manager::ManagerConfig::default(),
+            )),
+            test_agent_config(),
+            Config::defaults(),
+            ToolRegistry::new(),
+            event_tx,
+            resolver,
+        )
+    }
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(std::env::temp_dir(), Config::defaults(), "delegation-tool-test")
+    }
+
+    /// Bug fix: batch mode must REJECT (not silently drop) the single-task
+    /// fields category/subagent_type/load_skills/persist at the top level.
+    #[tokio::test]
+    async fn batch_mode_rejects_single_task_only_fields() {
+        let (tool, ctx) = (make_delegate_tool(None, None), test_ctx());
+        for field in ["category", "subagent_type", "load_skills", "persist"] {
+            let value = if field == "load_skills" {
+                json!(["some-skill"])
+            } else if field == "persist" {
+                json!(true)
+            } else {
+                json!("quick")
+            };
+            let args = json!({ "tasks": [ { "goal": "a" } ], field: value });
+            let result = tool.execute(args, &ctx).await;
+            match result {
+                ToolResult::Error(ref e) => {
+                    assert!(
+                        e.contains("single-task mode only"),
+                        "field '{field}' error mentions single-task mode: {e}"
+                    );
+                    assert!(e.contains(field), "error names '{field}': {e}");
+                }
+                other => panic!("field '{field}' must be rejected, got: {other:?}"),
+            }
+        }
+    }
+
+    /// Control: batch mode WITHOUT the single-task fields still dispatches
+    /// (no false-positive rejection); the unroutable base_url fails the
+    /// child fast, but the call must not error with the mode rejection.
+    #[tokio::test]
+    async fn batch_mode_without_single_task_fields_is_not_rejected() {
+        let (tool, ctx) = (make_delegate_tool(None, None), test_ctx());
+        let args = json!({ "tasks": [ { "goal": "a" } ], "model": "m", "toolsets": ["file-read"] });
+        let result = tool.execute(args, &ctx).await;
+        assert!(
+            !matches!(result, ToolResult::Error(ref e) if e.contains("single-task mode only")),
+            "plain batch must not hit the single-task rejection: {result:?}"
+        );
+    }
+
+    /// Bug fix (single-mode): an EMPTY resolved model must not shadow the
+    /// caller's `model` arg — the spawn falls back to the args model.
+    #[tokio::test]
+    async fn single_mode_empty_resolved_model_falls_back_to_args_model() {
+        let resolver: Arc<dyn CategoryResolver> = Arc::new(EmptyModelResolver);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let tool = make_delegate_tool(Some(resolver), Some(tx));
+        let ctx = test_ctx();
+        let args = json!({ "goal": "g", "subagent_type": "oracle", "model": "args-model" });
+        let _ = tool.execute(args, &ctx).await; // dispatch fails fast (no network)
+        let mut spawned_model = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::SubagentSpawn { model, .. } = ev {
+                spawned_model = Some(model);
+            }
+        }
+        assert_eq!(
+            spawned_model.as_deref(),
+            Some("args-model"),
+            "empty resolved model must not shadow the args model (spawned: {spawned_model:?})"
+        );
     }
 }

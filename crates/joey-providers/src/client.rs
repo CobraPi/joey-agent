@@ -18,8 +18,6 @@ use crate::profile::{ApiMode, ProviderProfile};
 use crate::request::ProviderRequest;
 use crate::types::{FinishReason, FunctionCall, NormalizedResponse, StreamEvent, ToolCall, Usage};
 
-/// Default overall request timeout (upstream `HERMES_API_TIMEOUT=1800s`).
-const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 /// Default per-read stall timeout for streaming (upstream
 /// `HERMES_STREAM_READ_TIMEOUT`, chat_completion_helpers.py:2640-2657).
 const DEFAULT_STREAM_READ_TIMEOUT_SECS: u64 = 120;
@@ -53,8 +51,12 @@ impl ProviderClient {
             )));
         }
 
+        // No total .timeout() on the shared client: reqwest applies it to
+        // the WHOLE request including the response body, which kills healthy
+        // long streams. Upstream uses read-timeout semantics — the per-read
+        // stall timeout in each stream parser already enforces that; only
+        // the connect phase is bounded here.
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs()))
             .connect_timeout(Duration::from_secs(10))
             .user_agent(format!(
                 "{}/{}",
@@ -344,7 +346,11 @@ impl ProviderClient {
         let mut last_id_at_idx: std::collections::HashMap<u64, String> = Default::default();
         let mut active_slot_by_idx: std::collections::HashMap<u64, usize> = Default::default();
 
-        let mut buf = String::new();
+        // Raw-byte buffer: network chunks split at arbitrary byte
+        // boundaries, so a multibyte UTF-8 char split across chunks must
+        // stay undecoded until its line completes (decoding per chunk would
+        // corrupt it to U+FFFD).
+        let mut buf: Vec<u8> = Vec::new();
         let mut sse = SseDataBuffer::default();
         let mut stream = resp.bytes_stream();
         let read_timeout = Duration::from_secs(stream_read_timeout_secs());
@@ -354,11 +360,11 @@ impl ProviderClient {
                 // Flush any final event that lacked a trailing blank line
                 // through the normal parser (so its deltas emit StreamEvents
                 // like the in-loop path), then exit.
-                if !buf.trim().is_empty() && !buf.ends_with('\n') {
-                    buf.push('\n');
+                if !sse_buf_blank(&buf) && !buf.ends_with(b"\n") {
+                    buf.push(b'\n');
                 }
                 if !sse.is_empty() {
-                    buf.push('\n');
+                    buf.push(b'\n');
                 }
             } else {
                 let next = tokio::time::timeout(read_timeout, stream.next()).await;
@@ -375,12 +381,10 @@ impl ProviderClient {
                     }
                     Ok(Some(c)) => c.map_err(|e| ProviderError::Connection(e.to_string()))?,
                 };
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                buf.extend_from_slice(&chunk);
             }
 
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].trim().to_string();
-                buf.drain(..=nl);
+            for line in take_sse_lines(&mut buf) {
                 if let Some(data) = line.strip_prefix("data:") {
                     // Consecutive data lines are ONE event (SSE spec joins
                     // them with '\n'); accumulate until the boundary.
@@ -471,7 +475,7 @@ impl ProviderClient {
             }
             // Stream exhausted and buffer drained — done (the flush above
             // already ran the final unterminated event through the parser).
-            if stream_done && buf.trim().is_empty() && sse.is_empty() {
+            if stream_done && sse_buf_blank(&buf) && sse.is_empty() {
                 break;
             }
         }
@@ -708,7 +712,9 @@ impl ProviderClient {
         // slot = output_index -> (wire call_id, function name, accumulated args, authoritative?)
         let mut calls: Vec<(Option<u64>, String, String, String, bool)> = Vec::new();
         let mut completed: Option<Value> = None;
-        let mut buffer = String::new();
+        // Raw-byte buffer (see parse_openai_stream): multibyte chars split
+        // across chunks must not be decoded until their line completes.
+        let mut buffer: Vec<u8> = Vec::new();
         let mut sse = SseDataBuffer::default();
         let mut stream = response.bytes_stream();
         let read_timeout = Duration::from_secs(stream_read_timeout_secs());
@@ -718,11 +724,11 @@ impl ProviderClient {
                 // Flush any final event that lacked its trailing blank line
                 // through the normal parser (so its deltas emit StreamEvents
                 // like the in-loop path), then exit below.
-                if !buffer.trim().is_empty() && !buffer.ends_with('\n') {
-                    buffer.push('\n');
+                if !sse_buf_blank(&buffer) && !buffer.ends_with(b"\n") {
+                    buffer.push(b'\n');
                 }
                 if !sse.is_empty() {
-                    buffer.push('\n');
+                    buffer.push(b'\n');
                 }
             } else {
                 let chunk = match tokio::time::timeout(read_timeout, stream.next())
@@ -735,11 +741,9 @@ impl ProviderClient {
                         continue;
                     }
                 };
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                buffer.extend_from_slice(&chunk);
             }
-            while let Some(newline) = buffer.find('\n') {
-                let line = buffer[..newline].trim().to_string();
-                buffer.drain(..=newline);
+            for line in take_sse_lines(&mut buffer) {
                 if let Some(raw) = line.strip_prefix("data:") {
                     // Consecutive data lines are ONE event (SSE spec joins
                     // them with '\n'); accumulate until the boundary.
@@ -879,14 +883,18 @@ impl ProviderClient {
             }
             // Stream exhausted and buffer drained — done (the flush above
             // already ran the final unterminated event through the parser).
-            if stream_done && buffer.trim().is_empty() && sse.is_empty() {
+            if stream_done && sse_buf_blank(&buffer) && sse.is_empty() {
                 break;
             }
         }
+        // `response.completed` is authoritative ONLY when it parses into a
+        // usable payload; a completed event with no/empty `output` must not
+        // fail the (already successful) delta-assembled stream.
         if let Some(value) = completed {
-            let parsed = parse_responses_response(&value)?;
-            if !parsed.content.is_empty() || !parsed.tool_calls.is_empty() {
-                return Ok(parsed);
+            if let Ok(parsed) = parse_responses_response(&value) {
+                if !parsed.content.is_empty() || !parsed.tool_calls.is_empty() {
+                    return Ok(parsed);
+                }
             }
         }
         // Slots: drop empty-name/empty-arg fragments (deltas that never joined
@@ -1017,7 +1025,9 @@ impl ProviderClient {
         let mut blocks: Vec<AnthropicBlockAccum> = Vec::new();
         let mut model: Option<String> = None;
 
-        let mut buf = String::new();
+        // Raw-byte buffer (see parse_openai_stream): multibyte chars split
+        // across chunks must not be decoded until their line completes.
+        let mut buf: Vec<u8> = Vec::new();
         let mut sse = SseDataBuffer::default();
         let mut stream = resp.bytes_stream();
         let read_timeout = Duration::from_secs(stream_read_timeout_secs());
@@ -1027,11 +1037,11 @@ impl ProviderClient {
                 // Flush any final event that lacked its trailing blank line
                 // (message_delta/usage) through the normal parser — including
                 // its StreamEvent deltas — then exit.
-                if !buf.trim().is_empty() && !buf.ends_with('\n') {
-                    buf.push('\n');
+                if !sse_buf_blank(&buf) && !buf.ends_with(b"\n") {
+                    buf.push(b'\n');
                 }
                 if !sse.is_empty() {
-                    buf.push('\n');
+                    buf.push(b'\n');
                 }
             } else {
                 let next = tokio::time::timeout(read_timeout, stream.next()).await;
@@ -1049,13 +1059,11 @@ impl ProviderClient {
                     Ok(Some(c)) => {
                         let chunk =
                             c.map_err(|e| ProviderError::Connection(e.to_string()))?;
-                        buf.push_str(&String::from_utf8_lossy(&chunk));
+                        buf.extend_from_slice(&chunk);
                     }
                 }
             }
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].trim().to_string();
-                buf.drain(..=nl);
+            for line in take_sse_lines(&mut buf) {
                 if let Some(data) = line.strip_prefix("data:") {
                     // Consecutive data lines are ONE event (SSE spec joins
                     // them with '\n'); accumulate until the boundary.
@@ -1188,7 +1196,7 @@ impl ProviderClient {
             }
             // Stream exhausted and buffer drained — done (the flush above
             // already ran the final unterminated line through the parser).
-            if stream_done && buf.trim().is_empty() && sse.is_empty() {
+            if stream_done && sse_buf_blank(&buf) && sse.is_empty() {
                 break;
             }
         }
@@ -1246,13 +1254,6 @@ impl ProviderClient {
             model,
         ))
     }
-}
-
-fn timeout_secs() -> u64 {
-    std::env::var("JOEY_API_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
 }
 
 fn stream_read_timeout_secs() -> u64 {
@@ -1358,6 +1359,27 @@ impl SseDataBuffer {
         self.lines.clear();
         Some(joined)
     }
+}
+
+/// Raw-byte SSE line scanner: pull every complete `\n`-terminated line out of
+/// `buf`, decoding each FULL line lossily. Network chunks split at arbitrary
+/// byte boundaries, so a multibyte UTF-8 char split across chunks (e.g. 你 =
+/// E4 BD A0 arriving as E4 BD | A0) must stay undecoded in the buffer until
+/// its line completes — decoding per chunk would corrupt it to U+FFFD.
+/// Trailing bytes without a newline remain in the buffer.
+fn take_sse_lines(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        let line = String::from_utf8_lossy(&buf[..nl]).trim().to_string();
+        buf.drain(..=nl);
+        lines.push(line);
+    }
+    lines
+}
+
+/// True when the raw SSE byte buffer holds only whitespace (no payload left).
+fn sse_buf_blank(buf: &[u8]) -> bool {
+    String::from_utf8_lossy(buf).trim().is_empty()
 }
 
 /// Get-or-create the accumulator slot for output item index `idx` in a
@@ -2269,6 +2291,139 @@ mod tests {
             "flush path must emit the final unterminated delta as a StreamEvent"
         );
         assert_eq!(resp.content, "tailfinal");
+    }
+
+    /// Byte-scanner unit test for the multibyte-chunk-split fix: a UTF-8
+    /// char (你 = E4 BD A0) split 2/1 across chunks must stay undecoded in
+    /// the raw buffer until its line completes, then decode intact — never
+    /// corrupt to U+FFFD.
+    #[test]
+    fn sse_byte_scanner_reassembles_split_multibyte_char() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"data: {\"t\":\"");
+        assert!(
+            take_sse_lines(&mut buf).is_empty(),
+            "incomplete line stays buffered"
+        );
+        buf.extend_from_slice(&[0xE4, 0xBD]); // first 2/3 bytes of 你
+        assert!(take_sse_lines(&mut buf).is_empty());
+        buf.extend_from_slice(&[0xA0]); // final byte of 你
+        buf.extend_from_slice(b"\"}\n\n");
+        let lines = take_sse_lines(&mut buf);
+        assert_eq!(lines, vec!["data: {\"t\":\"你\"}".to_string(), String::new()]);
+        assert!(sse_buf_blank(&buf));
+        assert!(!lines[0].contains('\u{FFFD}'));
+    }
+
+    /// Regression (multibyte chunk split): a chat-completions SSE stream
+    /// whose data line splits a multibyte char across TCP chunks (E4 BD |
+    /// A0) must deliver the intact char in the parsed events and assembled
+    /// content — decoding per chunk would corrupt it to two U+FFFD.
+    #[test]
+    fn chat_stream_multibyte_char_split_across_chunks() {
+        // Hand-built byte body so the split lands INSIDE 你 (E4 BD A0).
+        let mut head = Vec::new();
+        head.extend_from_slice(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        head.extend_from_slice(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"");
+        head.extend_from_slice(&[0xE4, 0xBD]); // first 2/3 of 你
+        let mut tail = vec![0xA0]; // last 1/3 of 你
+        tail.extend_from_slice(
+            b"\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf); // drain the request
+            sock.write_all(&head).unwrap();
+            sock.flush().unwrap();
+            // Force the client to observe `head` as its own chunk, splitting
+            // the multibyte char mid-stream.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            sock.write_all(&tail).unwrap();
+            sock.flush().unwrap();
+        });
+        let profile = crate::profile::get_profile("copilot").unwrap();
+        let base = format!("http://{}", addr);
+        let client = ProviderClient::new(profile, Some(base), Some("ghu_test".into())).unwrap();
+        let req = ProviderRequest::new(
+            "claude-opus-5",
+            vec![crate::types::Message::user("hi")],
+        )
+        .streaming(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let resp = rt.block_on(client.stream(&req, tx)).expect("stream ok");
+        let mut content_deltas = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::ContentDelta(s) = ev {
+                content_deltas.push(s);
+            }
+        }
+        assert_eq!(
+            content_deltas,
+            vec!["你".to_string()],
+            "split multibyte char must arrive intact, not as U+FFFD fragments"
+        );
+        assert_eq!(resp.content, "你");
+        assert!(!resp.content.contains('\u{FFFD}'));
+    }
+
+    /// Regression (completed-without-output): a `response.completed` event
+    /// whose response object carries no `output` field must not fail the
+    /// already-successful stream — parse_responses_response errors are
+    /// swallowed and the delta-assembled result is returned.
+    #[test]
+    fn copilot_responses_completed_without_output_falls_back_to_deltas() {
+        let sse = [
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"hel"}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"lo"}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":3,"output_tokens":2}}}"#,
+            "[DONE]",
+        ];
+        let body = {
+            let mut b = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            for line in &sse {
+                b.push_str("data: ");
+                b.push_str(line);
+                b.push_str("\n\n");
+            }
+            b
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            sock.write_all(body.as_bytes()).unwrap();
+            sock.flush().unwrap();
+        });
+        let profile = crate::profile::get_profile("copilot").unwrap();
+        let base = format!("http://{}", addr);
+        let client = ProviderClient::new(profile, Some(base), Some("ghu_test".into())).unwrap();
+        let req = ProviderRequest::new(
+            "gpt-5.4",
+            vec![crate::types::Message::user("say hello")],
+        )
+        .streaming(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let resp = rt.block_on(client.stream(&req, tx)).expect("stream ok");
+        assert_eq!(resp.content, "hello");
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+        assert!(resp.tool_calls.is_empty());
     }
 
     /// Regression (2026-08-18): a copilot-wire client built for a chat-wire
