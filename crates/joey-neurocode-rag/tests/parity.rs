@@ -196,6 +196,7 @@ fn request(text: &str, root: std::path::PathBuf) -> CodingRequest {
         active_symbols: vec![],
         project_root: root,
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     }
 }
 

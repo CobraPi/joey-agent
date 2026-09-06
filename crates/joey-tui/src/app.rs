@@ -257,7 +257,7 @@ fn render_body(
             widgets::draw_pane_transcript(f, convo_split[0], app, pane, theme, focused, glow);
             widgets::draw_reasoning(f, convo_split[1], app, theme, spinner);
         } else if app.neurocode_expanded
-            && app.neurocode_active
+            && (app.neurocode_active || app.task_graph.is_some())
             && pane.spawned_by_neurocode
             && body[0].height >= 12
         {
@@ -309,7 +309,10 @@ fn render_body(
             .split(body[0]);
         widgets::draw_transcript(f, main[0], app, theme, focused, glow);
         widgets::draw_output_viewer(f, main[1], app, theme, spinner);
-    } else if app.neurocode_expanded && app.neurocode_active && body[0].height >= 12 {
+    } else if app.neurocode_expanded
+        && (app.neurocode_active || app.task_graph.is_some())
+        && body[0].height >= 12
+    {
         let (transcript_h, feed_h) = split_expanded_feed(body[0].height);
         let main = Layout::default()
             .direction(Direction::Vertical)
@@ -353,8 +356,13 @@ fn render_body(
         // gets up to 40% of the sidebar (min 6 rows) and yields
         // entirely when the sidebar is too short. While the feed is
         // EXPANDED onto the main screen, the docked copy is hidden
-        // (one live view at a time).
-        if app.neurocode_active && !app.neurocode_expanded && body[1].height >= 16 {
+        // (one live view at a time). A published task graph alone also
+        // docks the panel (explorer-without-indexer): the user needs
+        // the click target to expand the Tasks view.
+        if (app.neurocode_active || app.task_graph.is_some())
+            && !app.neurocode_expanded
+            && body[1].height >= 16
+        {
             let feed_h =
                 ((body[1].height as f32 * 0.4).round() as u16).clamp(6, body[1].height - 8);
             let side = Layout::default()
@@ -507,7 +515,7 @@ enum TranscriptTarget {
 /// matching the draw branch's `if let Some(pane) = app.focused_pane()`.
 pub fn neurocode_explorer_owns_keys(app: &App) -> bool {
     app.neurocode_expanded
-        && app.neurocode_active
+        && (app.neurocode_active || app.task_graph.is_some())
         && app
             .focused_pane()
             .map_or(true, |pane| pane.spawned_by_neurocode)
@@ -2387,7 +2395,9 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// True when `(row, col)` falls inside the NeuroCode context panel as
     /// drawn by the last frame (docked bottom-right or expanded main view).
     fn neurocode_panel_hit(&self, row: u16, col: u16) -> bool {
-        if !self.app.neurocode_active {
+        // A published task graph alone keeps the panel clickable (the
+        // docked panel is the expand affordance for the Tasks view).
+        if !self.app.neurocode_active && self.app.task_graph.is_none() {
             return false;
         }
         let (x, y, w, h) = self.app.last_neurocode_rect.get();
@@ -2397,7 +2407,9 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// The rect of the expanded NeuroCode explorer as drawn by the last
     /// frame (the lower pane of the main split), when active + expanded.
     fn expanded_neurocode_area(&self) -> Option<Rect> {
-        if !self.app.neurocode_active || !self.app.neurocode_expanded {
+        if (!self.app.neurocode_active && self.app.task_graph.is_none())
+            || !self.app.neurocode_expanded
+        {
             return None;
         }
         let (x, y, w, h) = self.app.last_neurocode_rect.get();

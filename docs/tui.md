@@ -73,11 +73,14 @@ a glance (see `state.rs` "Feature indicators" fields):
     handle).
   - `⚙{n}` — configured MCP servers (connected server names from the
     `mcp_servers` config).
-- **Header task badge** — `⚑{done}/{total}` renders while a hypercode
-  execution graph is live (green once every task has completed). Data
-  comes from `EngineEvent::TaskGraphSnapshot`: the orchestration
-  scheduler streams the graph JSON on every persisted transition, plus an
-  initial snapshot when the graph is built or resumed.
+- **Header task badge** — `⚑{done}/{total}` renders while a task graph
+  is live (green once every task has completed). Two sources feed it:
+  `EngineEvent::TaskGraphSnapshot` (the orchestration scheduler streams
+  the graph JSON on every persisted transition, plus an initial
+  snapshot when the graph is built or resumed) and — from the live
+  orchestrator, no `/hypercode run` needed —
+  `AgentEvent::TaskGraphPublished` emitted by every successful
+  `task_graph` plan/update.
 - **OMO goal line** — the OMO panel shows `◎ {objective}` plus the goal's
   age while a goal is set (`GoalSet` / `GoalCleared` events).
 - **Stats-page systems section** (Ctrl+A) — browser connected/offline,
@@ -486,7 +489,13 @@ task DAG:
 
 The DAG data rides `EngineEvent::TaskGraphSnapshot` — the same scheduler
 stream that drives the header's `⚑` badge — so transitions appear live
-as the orchestration scheduler persists them. The tab requires
+as the orchestration scheduler persists them. The tab also renders
+graphs published live by the orchestrator itself via the `task_graph`
+tool (`AgentEvent::TaskGraphPublished`): in that case no
+`/hypercode run` is needed, and the explorer's docked panel becomes
+reachable (click/Esc expand work as usual) even when the NeuroCode
+indexer is inactive — with the Tasks tab selected by default. For the
+`/hypercode run` path the tab requires
 `hypercode.execution_graph.enabled` (on by default) — with the graph
 disabled there is no task DAG to render.
 

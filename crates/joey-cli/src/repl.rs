@@ -287,6 +287,20 @@ pub(crate) fn build_agent_parts(
     if orchestrator_on {
         agent.set_extra_instructions(Some(crate::hypercode::orchestrator_persona_overlay_for_profile(config, None, agent.model(), agent.client().profile())));
     }
+    // Feature 026 (T023): session-start lifecycle context — ONE-TIME
+    // injection through the extra_instructions slot (cache-friendly, never
+    // per-turn). Appended to any existing overlay via the read accessor so
+    // nothing is clobbered; gated by speckit.enabled * speckit.lifecycle_context.
+    if let Some(block) = crate::speckit_lifecycle::session_context_block(
+        &std::env::current_dir().unwrap_or_default(),
+        config,
+    ) {
+        let merged = match agent.extra_instructions() {
+            Some(existing) => format!("{existing}\n\n{block}"),
+            None => block,
+        };
+        agent.set_extra_instructions(Some(merged));
+    }
     // Inject the shared concurrency limiter into the agent's transport path.
     agent.set_provider_semaphore(manager.semaphore());
 
@@ -351,16 +365,6 @@ pub(crate) fn build_agent_parts(
         agent_config: agent_cfg,
         base_registry,
     })
-}
-
-pub(crate) fn build_agent(
-    config: &Config,
-    cwd: &std::path::Path,
-    ov: &Overrides,
-    session_id: &str,
-    history: Vec<Message>,
-) -> Result<Agent> {
-    Ok(build_agent_parts(config, cwd, ov, session_id, history)?.agent)
 }
 
 pub(crate) fn restore_history(db: &SessionDb, session_id: &str) -> Vec<Message> {
@@ -781,8 +785,15 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         .with_menu(reedline::ReedlineMenu::EngineCompleter(menu))
         .with_hinter(Box::new(crate::slash_menu::SmartHinter))
         .with_edit_mode(Box::new(Emacs::new(keybindings)));
-    if let Ok(hist) = FileBackedHistory::with_file(10_000, history_path) {
-        editor = editor.with_history(Box::new(hist));
+    match FileBackedHistory::with_file(10_000, history_path) {
+        Ok(hist) => {
+            editor = editor.with_history(Box::new(hist));
+        }
+        Err(e) => {
+            // One-time warning: unwritable history file silently disabled
+            // persistence before; surface it instead.
+            render::warning(&format!("history persistence disabled: {e}"));
+        }
     }
     let prompt = JoeyPrompt;
 
@@ -923,6 +934,33 @@ async fn process_input(raw: &str, st: &mut ReplState) -> LoopOutcome {
         };
     }
 
+    // Feature 026 (T011): dotted `speckit.<name> [args]` intercept — the
+    // twin spelling of `/speckit-<name>` (contract invariant 1: one
+    // implementation, two spellings). Only when the speckit surface is
+    // enabled; disabled → the text flows to the model untouched (FR-013).
+    // Unknown dotted names error listing the surface; they NEVER shadow
+    // user input silently (invariant 3).
+    if input.starts_with("speckit.") && crate::speckit_slash::speckit_enabled(&st.config) {
+        match crate::speckit_slash::dotted_to_slash(&input) {
+            Some((canon, args)) => {
+                let slash = if args.is_empty() {
+                    format!("/{canon}")
+                } else {
+                    format!("/{canon} {args}")
+                };
+                return match handle_slash(&slash, st).await {
+                    SlashOutcome::Quit => LoopOutcome::Quit,
+                    SlashOutcome::Continue => LoopOutcome::Continue,
+                };
+            }
+            None => {
+                let (name, _) = crate::speckit_slash::dotted_parts(&input).unwrap_or((input.as_str(), ""));
+                println!("{}", crate::speckit_slash::unknown_command_error(&format!("speckit-{name}")));
+                return LoopOutcome::Continue;
+            }
+        }
+    }
+
     // T108/T142: @plan prefix detection — delegate to Prometheus for planning.
     // Equivalent to switching to Prometheus + describing the work, but does NOT
     // start execution (the plan is produced, then the user decides).
@@ -931,6 +969,9 @@ async fn process_input(raw: &str, st: &mut ReplState) -> LoopOutcome {
         st.active_agent = "prometheus".to_string();
         let overlay = joey_omo::agents::prompts::dispatch_system_prompt("prometheus", st.agent.model());
         st.agent.set_extra_instructions(Some(overlay));
+        // Overlay replaced extra_instructions wholesale — restore the
+        // spec-kit lifecycle context block if this session had one.
+        crate::engine::reapply_lifecycle(&mut st.agent, &st.config);
         render::info("📋 Switched to Prometheus (@plan) — create a plan, no execution.");
         // Strip the @plan prefix so the rest of the message is the planning goal.
         input = input.trim_start_matches("@plan").trim().to_string();
@@ -1063,6 +1104,9 @@ fn apply_intent_gate(st: &mut ReplState, message: &str) {
             if joey_omo::check_ultrawork_activation(keyword, &st.active_agent).is_some() {
                 let overlay = joey_omo::ultrawork_prompt(st.agent.model());
                 st.agent.set_extra_instructions(Some(overlay));
+                // Overlay replaced extra_instructions wholesale — restore
+                // the spec-kit lifecycle context block if present before.
+                crate::engine::reapply_lifecycle(&mut st.agent, &st.config);
                 render::success("⚡ ULTRAWORK MODE ENABLED!");
             } else {
                 render::info(&format!(
@@ -1412,6 +1456,9 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
             }
             if let Some(overlay) = overlay {
                 st.agent.set_extra_instructions(Some(overlay));
+                // Overlay replaced extra_instructions wholesale — restore
+                // the spec-kit lifecycle context block if present before.
+                crate::engine::reapply_lifecycle(&mut st.agent, &st.config);
                 render::info("personality overlay applied to this session");
             }
         }
@@ -1673,9 +1720,9 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
         "speckit-constitution" | "speckit-specify" | "speckit-clarify" | "speckit-plan"
         | "speckit-checklist" | "speckit-tasks" | "speckit-analyze" | "speckit-implement"
         | "speckit-converge" | "speckit-taskstoissues" => {
-            speckit_step_slash(st, name, args).await;
+            speckit_step_slash(st, name, args, 0).await;
         }
-        "speckit-status" => speckit_status_slash(),
+        "speckit-status" => speckit_status_slash(&st.config),
         "speckit-help" => println!("{}", crate::speckit_slash::render_help()),
         // ── HyperCode parallel optimization ──
         "hypercode" => {
@@ -1695,7 +1742,7 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
                         let tools = crate::hypercode::orchestrator_tool_names();
                         st.agent.set_enabled_tools(tools);
                         st.agent.rebuild_system_prompt();
-                        st.agent.set_extra_instructions(Some(crate::hypercode::orchestrator_overlay()));
+                        st.agent.set_extra_instructions(Some(crate::hypercode::orchestrator_persona_overlay_for_profile(&st.config, Some(st.active_agent.as_str()), st.agent.model(), st.agent.client().profile())));
                     } else {
                         let tools = crate::commands::platform_tools(&st.config, "cli");
                         st.agent.set_enabled_tools(tools);
@@ -1754,7 +1801,17 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
 /// (pre-flight script + skill workflow), then run it as one agent turn
 /// through the standard interactive turn path (streaming, tools,
 /// interrupts, auto-checkpoint).
-async fn speckit_step_slash(st: &mut ReplState, name: &str, args: &str) {
+///
+/// Feature 026: executes mandatory `before_/after_<step>` extension hooks
+/// (T018) and resolves the primary post-step handoff (T021) — `send: true`
+/// auto-sends the next command (chained auto-sends capped at
+/// [`SPECKIT_HANDOFF_MAX_DEPTH`]), otherwise the handoff is offered
+/// without starting it (US5 scenario 3).
+///
+/// Returns the main turn's final render; an empty String means the step
+/// was aborted (resolution error, mandatory-hook failure) so chained
+/// callers treat it as failure.
+async fn speckit_step_slash(st: &mut ReplState, name: &str, args: &str, depth: usize) -> String {
     use crate::speckit_slash;
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -1763,40 +1820,172 @@ async fn speckit_step_slash(st: &mut ReplState, name: &str, args: &str) {
             "not a spec-kit repository — no .specify/ directory found here or in any parent. \
              Initialize spec-kit first (github/spec-kit), then retry.",
         );
-        return;
+        return String::new();
     };
     let Some(step) = speckit_slash::step_by_name(name) else {
-        render::error(&format!("unknown spec-kit step: {name}"));
-        return;
+        render::error(&crate::speckit_slash::unknown_command_error(name));
+        return String::new();
     };
 
     println!();
     render::info(&format!("/{} — running pre-flight…", step.name));
-    let prep = match speckit_slash::prepare_step(step, &root, args, Some(step.skill)) {
+    // Feature 026 (T007): speckit.enabled=false → the exact pre-feature
+    // body/preflight path (FR-013); enabled (default) → native resolution.
+    let policy = if speckit_slash::speckit_enabled(&st.config) {
+        speckit_slash::PrepPolicy::Native
+    } else {
+        speckit_slash::PrepPolicy::Legacy
+    };
+    let prep = match speckit_slash::prepare_step_opts(step, &root, args, Some(step.skill), policy) {
         Ok(p) => p,
         Err(e) => {
             render::error(&e);
-            return;
+            return String::new();
         }
     };
+    let mut prep = prep;
+
+    // Feature 026 (T018): mandatory executable `before_<step>` hooks run as
+    // native command turns and are AWAITED before the main workflow turn;
+    // a failed mandatory hook aborts the step. Optional hooks are surfaced
+    // only (prep.hooks_note already carries their block). All hook
+    // discovery/execution is gated on BOTH speckit.enabled and
+    // speckit.hooks (T019/FR-013): false → zero discovery, zero notes
+    // (the resolved note section prepare baked in is stripped).
+    let short = step.name.strip_prefix("speckit-").unwrap_or(step.name);
+    let hooks_allowed =
+        policy == speckit_slash::PrepPolicy::Native && crate::speckit_hooks::config_allows(&st.config);
+    if !hooks_allowed && !prep.hooks_note.is_empty() {
+        if let Some(rest) = prep.prompt.strip_prefix(&prep.hooks_note) {
+            prep.prompt = rest.trim_start_matches('\n').to_string();
+        }
+        prep.hooks_note.clear();
+    }
+    if hooks_allowed {
+        for entry in crate::speckit_hooks::hooks_for(&root, &format!("before_{short}")) {
+            if entry.optional || !crate::speckit_hooks::is_executable(&entry) {
+                continue;
+            }
+            if !run_mandatory_hook(st, &entry, depth).await {
+                println!("mandatory hook '{}' failed — step aborted", entry.extension);
+                return String::new();
+            }
+        }
+    }
+
     render::info(&format!(
         "starting the {} workflow (the agent will author the artifacts)…",
         step.skill
     ));
     println!();
 
-    let _final = run_turn_interactive(st, &prep.prompt).await;
+    let final_text = run_turn_interactive(st, &prep.prompt).await;
+
+    // T018 after-hooks: same treatment AFTER the main turn; a mandatory
+    // failure prints the failure but the step result stands.
+    if hooks_allowed {
+        for entry in crate::speckit_hooks::hooks_for(&root, &format!("after_{short}")) {
+            if entry.optional || !crate::speckit_hooks::is_executable(&entry) {
+                continue;
+            }
+            if !run_mandatory_hook(st, &entry, depth).await {
+                println!("mandatory hook '{}' failed", entry.extension);
+            }
+        }
+    }
+
+    // Feature 026 (T021): primary handoff resolution. Gated on the native
+    // surface being enabled (speckit_enabled via policy), NOT the hooks
+    // toggle. send=true auto-sends (depth-capped); otherwise offer only.
+    if policy == speckit_slash::PrepPolicy::Native {
+        if let Some((label, prompt, send, target)) = speckit_slash::primary_handoff(step, &root) {
+            if send && depth < SPECKIT_HANDOFF_MAX_DEPTH {
+                println!("↪ handoff (auto-send): {label} → /{target}");
+                let base_prompt = handoff_prompt(&prompt, &final_text);
+                return Box::pin(speckit_step_slash(st, &target, &base_prompt, depth + 1)).await;
+            }
+            println!("Handoff available: {label}");
+            println!("  → run /{target}  (prompt: {prompt})");
+        }
+    }
+
+    final_text
+}
+
+/// Max chained auto-sent handoffs (T021 recursion guard).
+const SPECKIT_HANDOFF_MAX_DEPTH: usize = 3;
+
+/// Label the prior step's final output for the next step's base prompt,
+/// truncated to the last ~2000 chars (the handoff needs the tail —
+/// conclusions/verdicts — not the whole transcript).
+fn handoff_prompt(base_prompt: &str, prior_final_text: &str) -> String {
+    const MAX_PRIOR_CHARS: usize = 2000;
+    let prior = {
+        let chars: Vec<char> = prior_final_text.chars().collect();
+        if chars.len() > MAX_PRIOR_CHARS {
+            let start = chars.len() - MAX_PRIOR_CHARS;
+            chars[start..].iter().collect::<String>()
+        } else {
+            prior_final_text.to_string()
+        }
+    };
+    format!(
+        "Prior step output:\n{prior}\n\n---\n\n{base_prompt}"
+    )
+}
+
+/// Test-facing alias for the private [`handoff_prompt`] helper (asserted by
+/// the speckit_native suite).
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn handoff_prompt_for_test(base_prompt: &str, prior_final_text: &str) -> String {
+    handoff_prompt(base_prompt, prior_final_text)
+}
+
+/// Execute one mandatory extension hook (T018): print the upstream
+/// Automatic Pre-Hook block, then run it — a hook command normalizing to a
+/// known speckit command dispatches recursively through the same speckit
+/// path (awaited; status/help via their own handlers); anything else is
+/// submitted as an agent turn. Returns whether the hook succeeded (an
+/// empty agent result is failure).
+async fn run_mandatory_hook(st: &mut ReplState, entry: &crate::speckit_hooks::HookEntry, depth: usize) -> bool {
+    let canon = crate::speckit_hooks::slash_form(&entry.command);
+    println!("**Automatic Pre-Hook**: {}", entry.extension);
+    println!("Executing: `/{canon}");
+    println!("EXECUTE_COMMAND: {}", entry.command);
+
+    let known_speckit = crate::speckit_slash::step_by_name(&canon).is_some()
+        || canon == "speckit-status"
+        || canon == "speckit-help";
+    if known_speckit && depth < SPECKIT_HANDOFF_MAX_DEPTH {
+        match canon.as_str() {
+            "speckit-status" => speckit_status_slash(&st.config),
+            "speckit-help" => println!("{}", crate::speckit_slash::render_help()),
+            _ => {
+                let out = Box::pin(speckit_step_slash(st, &canon, &entry.prompt, depth + 1)).await;
+                return !out.is_empty();
+            }
+        }
+        true
+    } else {
+        let prompt = format!(
+            "Extension hook '{}' (from .specify/extensions.yml) instructs: command `{}` with prompt: {}",
+            entry.extension, entry.command, entry.prompt
+        );
+        let result = run_turn_interactive(st, &prompt).await;
+        !result.is_empty()
+    }
 }
 
 /// `/speckit-status` — artifact readiness, no agent turn.
-fn speckit_status_slash() {
+fn speckit_status_slash(config: &Config) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     match crate::speckit_slash::status(&cwd) {
         Ok(s) => {
             println!();
             println!("{}", Color::Cyan.bold().paint("Spec-Kit Status"));
             println!();
-            println!("{}", crate::speckit_slash::render_status(&s));
+            println!("{}", crate::speckit_slash::render_status_with_config(&s, config));
         }
         Err(e) => render::error(&e),
     }
@@ -1835,6 +2024,10 @@ fn omo_agents_slash(st: &mut ReplState, args: &str) {
             if crate::hypercode::orchestrator_active(&st.config) {
                 st.agent.set_extra_instructions(Some(crate::hypercode::orchestrator_overlay()));
             }
+            // The overlay set above (or a prior clear) may have dropped the
+            // spec-kit lifecycle context block — restore it (no-op when
+            // already present).
+            crate::engine::reapply_lifecycle(&mut st.agent, &st.config);
             render::success(&format!("Switched to {} [{}].", target.display_name, target.name));
             return;
         }
@@ -1849,6 +2042,8 @@ fn omo_agents_slash(st: &mut ReplState, args: &str) {
                 if crate::hypercode::orchestrator_active(&st.config) {
                     st.agent.set_extra_instructions(Some(crate::hypercode::orchestrator_overlay()));
                 }
+                // Same overlay-clobber hazard as the numeric branch above.
+                crate::engine::reapply_lifecycle(&mut st.agent, &st.config);
                 render::success(&format!("Switched to {} [{}].", agent.display_name, agent.name));
             } else {
                 render::error(&format!("Agent '{}' is not available (no model resolved).", agent.display_name));
@@ -2344,9 +2539,22 @@ fn resume_session(st: &mut ReplState, target: &str) {
     let history = restore_history(db, &id);
     let count = history.len();
     end_session(st, "switched_session");
-    match build_agent(&st.config, &st.cwd, &st.overrides, &id, history) {
-        Ok(agent) => {
-            st.agent = agent;
+    // Build via build_agent_parts so the resumed session's agent gets a FRESH
+    // SubagentManager AND st.hypercode is refreshed to hold that same Arc —
+    // otherwise the delegate_task tool's registry and the hypercode context's
+    // manager diverge (stop/steer would target a stale/empty registry).
+    match build_agent_parts(&st.config, &st.cwd, &st.overrides, &id, history) {
+        Ok(parts) => {
+            st.hypercode = Some(crate::hypercode::HypercodeContext {
+                agent_config: parts.agent_config.clone(),
+                config: st.config.clone(),
+                base_registry: parts.base_registry.clone(),
+                manager: parts.subagent_manager.clone(),
+                cwd: st.cwd.clone(),
+                parent_effective_model: Some(parts.agent.effective_main_turn_model()),
+                execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            });
+            st.agent = parts.agent;
             st.session_id = id.clone();
             joey_core::logging::set_session_context(Some(&id));
             render::success(&format!("Resumed session {} ({} messages).", id, count));
@@ -2798,7 +3006,18 @@ async fn maybe_auto_checkpoint(st: &mut ReplState) {
                 st.last_auto_checkpoint = Instant::now();
             }
             Ok((mgr, None)) => st.checkpoints = Some(mgr),
-            Err(e) => render::error(&format!("auto-checkpoint task failed: {e}")),
+            Err(e) => {
+                render::error(&format!("auto-checkpoint task failed: {e}"));
+                // The manager was moved into the failed blocking task and is
+                // gone. Rebuild a fresh one (same gate as initial
+                // construction) so auto + manual checkpointing survives
+                // transient spawn_blocking failures instead of being
+                // disabled for the rest of the session.
+                let cp = joey_tools::vcs::CheckpointManager::new(&st.session_id, &st.cwd);
+                if cp.is_enabled() {
+                    st.checkpoints = Some(cp);
+                }
+            }
         }
     }
 }
@@ -3020,6 +3239,8 @@ pub fn hypercode_slash_with_provider(provider: &str, args: &str) -> Result<Hyper
             "  Every subagent gets a live TUI pane on the right rail + job board".to_string(),
             "  (same machinery as delegate_task batches — full streaming).".to_string(),
             "  Toggle orchestrator-only delegation: /hypercode orchestrator on|off".to_string(),
+            "  The orchestrator inherits the main agent's workflow — skills index,".to_string(),
+            "  session todo list, and the task-graph planner stay on its tool surface.".to_string(),
         ]);
         
         if neurocode_active {

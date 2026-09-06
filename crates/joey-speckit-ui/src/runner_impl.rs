@@ -6,6 +6,7 @@
 //! into `RunnerEvent`s and forwards them over the event channel.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -72,8 +73,16 @@ impl WorkflowRunner for JoeyCliRunner {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .env("SPECIFY_FEATURE", feature_id)
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| RunnerError::Spawn(format!("failed to spawn {program}: {e}")))?;
+
+        // Share the child between the wait task (reaps the process) and the
+        // attempt handle (kills it on cancel). stdin/stdout/stderr are taken
+        // out for the reader/writer tasks first; only then does the child
+        // go into the slot.
+        let child_slot: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
 
         // Set up event streaming channels.
         let (event_tx, event_rx) = mpsc::channel::<RunnerEvent>(64);
@@ -137,12 +146,40 @@ impl WorkflowRunner for JoeyCliRunner {
             });
         }
 
-        // Spawn the child wait task: emit terminal status event.
+        // Spawn the child wait task: emit terminal status event. The child
+        // handle STAYS in the shared slot so `cancel()` can reach it at any
+        // time; this task reaps via non-blocking `try_wait` polls (holding
+        // the lock across `.await` would deadlock cancel()).
+        *child_slot.lock().await = Some(child);
         let tx = event_tx.clone();
         let aid = attempt_id.clone();
+        let wait_child_slot = child_slot.clone();
         tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let status = child.wait().await.ok();
+            let status = loop {
+                let exited = {
+                    let mut guard = wait_child_slot.lock().await;
+                    match guard.as_mut() {
+                        Some(c) => c
+                            .try_wait()
+                            .ok()
+                            .flatten(),
+                        None => None, // defensive: slot drained elsewhere
+                    }
+                };
+                match exited {
+                    Some(status) => break Some(status),
+                    None => {
+                        // Still running (or slot empty) — poll again shortly.
+                        // If the slot was drained, stop waiting so we don't
+                        // spin forever.
+                        if wait_child_slot.lock().await.is_none() {
+                            break None;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            };
             let terminal = exit_code_to_status(status.and_then(|s| s.code()));
             let duration_ms = start.elapsed().as_millis() as u64;
             let _ = tx
@@ -159,6 +196,7 @@ impl WorkflowRunner for JoeyCliRunner {
             staging_root: staging_root.worktree,
             events: event_rx,
             respond_tx,
+            child: child_slot,
         })
     }
 
@@ -174,10 +212,18 @@ impl WorkflowRunner for JoeyCliRunner {
             .map_err(|_| RunnerError::Other("attempt stdin closed".to_string()))
     }
 
-    async fn cancel(&self, _attempt: &mut AttemptHandle) -> Result<(), RunnerError> {
-        // The child wait task holds the Child handle; dropping the event receiver
-        // and stdin sender effectively cancels the run. In a fuller implementation,
-        // we'd send SIGTERM here via the child PID.
+    async fn cancel(&self, attempt: &mut AttemptHandle) -> Result<(), RunnerError> {
+        // Kill the subprocess via the shared child slot. `start_kill()` is
+        // async-signal-safe and non-blocking; the wait task's polling loop
+        // then observes the exit (signal → `None` exit code → Cancelled)
+        // and emits the terminal Status event. Killing the process also
+        // closes its stdio, ending the reader tasks and the worktree lease.
+        let mut guard = attempt.child.lock().await;
+        if let Some(child) = guard.as_mut() {
+            child
+                .start_kill()
+                .map_err(|e| RunnerError::Other(format!("failed to kill child: {e}")))?;
+        }
         Ok(())
     }
 }
@@ -230,5 +276,75 @@ mod tests {
         assert_eq!(exit_code_to_status(Some(0)), TerminalStatus::Succeeded);
         assert_eq!(exit_code_to_status(Some(1)), TerminalStatus::Failed);
         assert_eq!(exit_code_to_status(None), TerminalStatus::Cancelled);
+    }
+
+    /// cancel() actually kills the spawned child: a long-running subprocess
+    /// exits shortly after cancel(), the shared child slot shows it gone, and
+    /// the event stream delivers a terminal Status::Cancelled event.
+    #[tokio::test]
+    async fn cancel_kills_the_child() {
+        // Guard: this needs `bash` + `sleep`; skip gracefully if missing.
+        if which::which("bash").is_err() {
+            return;
+        }
+
+        let runner = JoeyCliRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfiguration {
+            change_mode: Some(crate::model::ChangeMode::Direct),
+            ..Default::default()
+        };
+
+        // Spawn a child that outlives the test unless cancelled: bash that
+        // sleeps for 30s. prepare_and_start prefers the `joey` CLI when on
+        // PATH, so craft the repo so it falls back to the bash script path…
+        // simpler: create the wrapper script it would run.
+        std::fs::create_dir_all(dir.path().join(".specify/scripts/bash")).unwrap();
+        std::fs::write(
+            dir.path().join(".specify/scripts/bash/implement.sh"),
+            "#!/usr/bin/env bash\nsleep 30\n",
+        )
+        .unwrap();
+
+        // Ensure the joey CLI is NOT picked (it would run a real command);
+        // prepare_and_start checks `which joey` first. If joey IS on PATH
+        // this test would spawn it — skip in that case to stay hermetic.
+        if which::which("joey").is_ok() {
+            return;
+        }
+
+        let mut handle = runner
+            .prepare_and_start(dir.path(), "feat-cancel", "implement", &config, &NoopStaging)
+            .await
+            .expect("spawn should succeed");
+
+        // Give the child a moment to be alive, then cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        runner
+            .cancel(&mut handle)
+            .await
+            .expect("cancel should succeed");
+
+        // Drain events until the terminal Status arrives (bounded wait).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut terminal = None;
+        while let Some(evt) = handle.events.recv().await {
+            if let RunnerEvent::Status { terminal: t, .. } = evt {
+                terminal = Some(t);
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+        }
+        assert_eq!(
+            terminal,
+            Some(TerminalStatus::Cancelled),
+            "cancelled child must produce a Cancelled terminal event"
+        );
+
+        // The child slot is now empty or the child is reaped — cancel is
+        // idempotent and safe to call again.
+        runner.cancel(&mut handle).await.expect("second cancel ok");
     }
 }

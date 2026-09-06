@@ -17,6 +17,7 @@ fn make_request(text: &str) -> CodingRequest {
         active_symbols: vec![],
         project_root: PathBuf::from("/tmp/test-project"),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     }
 }
 
@@ -72,6 +73,7 @@ fn disabled_engine_returns_cold_mode_context() {
         active_symbols: vec![],
         project_root: project.path().to_path_buf(),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     };
     let ctx = engine.assemble_context(&request, ComplexityTier::Frontier);
 
@@ -96,6 +98,7 @@ fn disabled_engine_cold_context_formatted_text_present() {
         active_symbols: vec![],
         project_root: PathBuf::from("/tmp/test-project-disabled2"),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     };
     let ctx = engine.assemble_context(&req, ComplexityTier::Economical);
 

@@ -471,6 +471,7 @@ mod tests {
             active_symbols: vec![],
             project_root: PathBuf::from("."),
             token_budget_hint: 0,
+            scope_files: vec![],
         }
     }
 
@@ -593,6 +594,7 @@ mod tests {
             active_symbols: vec![],
             project_root: PathBuf::from("."),
             token_budget_hint: 0,
+            scope_files: vec![],
         }
     }
 

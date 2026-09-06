@@ -2386,6 +2386,13 @@ impl App {
                 self.terminal_active = active;
                 self.terminal_queued = queued;
             }
+            // Orchestrator-published task graph (the `task_graph` tool or
+            // any orchestration surface): same deserialize-only path as
+            // `set_task_graph` — a malformed payload keeps the previous
+            // graph.
+            AgentEvent::TaskGraphPublished { graph } => {
+                self.set_task_graph(graph);
+            }
             // Additive events with no TUI state: ignored.
             _ => {}
         }
@@ -2469,10 +2476,11 @@ impl App {
 
     /// Toggle the NeuroCode context feed between its docked bottom-right
     /// panel and expanded main-screen mode (and back). Invoked by clicking
-    /// the panel or pressing Esc while expanded. No-op when NeuroCode is
-    /// inactive.
+    /// the panel or pressing Esc while expanded. No-op when BOTH the
+    /// NeuroCode indexer is inactive AND no task graph exists (a published
+    /// graph alone opens the explorer without the indexer).
     pub fn toggle_neurocode_expanded(&mut self) {
-        if !self.neurocode_active {
+        if !self.neurocode_active && self.task_graph.is_none() {
             return;
         }
         self.neurocode_expanded = !self.neurocode_expanded;
@@ -2659,6 +2667,12 @@ impl App {
             Ok(g) => {
                 self.task_graph = Some(g);
                 self.task_graph_updated_at = Some(Instant::now());
+                // With the NeuroCode indexer inactive the only meaningful
+                // explorer tab is Tasks — a graph arriving without the
+                // indexer selects it so the first expand shows the DAG.
+                if !self.neurocode_active {
+                    self.neurocode_viz.tab = crate::neurocode_viz::VizTab::Tasks;
+                }
             }
             Err(_) => { /* keep previous graph */ }
         }

@@ -16,6 +16,7 @@ fn make_request(text: &str) -> CodingRequest {
         active_symbols: vec![],
         project_root: PathBuf::from("."),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     }
 }
 
@@ -26,6 +27,7 @@ fn make_request_with_symbols(text: &str, symbols: &[&str]) -> CodingRequest {
         active_symbols: symbols.iter().map(|s| s.to_string()).collect(),
         project_root: PathBuf::from("."),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     }
 }
 

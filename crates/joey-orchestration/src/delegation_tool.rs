@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::manager::SubagentManager;
-use crate::types::{DelegationRequest, SubagentRole, TaskSpec};
+use crate::types::{DelegationRequest, DelegationResult, SubagentRole, TaskSpec};
 use crate::CategoryResolver;
 
 /// The full OMO agent roster valid as `subagent_type` values (feature 025,
@@ -895,21 +895,44 @@ impl DelegateTask {
         // Background mode (feature 020, FR-001 + contracts/delegation-tools.md):
         // a top-level background=true applies to EVERY task in the batch —
         // each dispatches as background and the tool returns one handle line
-        // per task, in order, immediately (SC-001). FR-013: nothing is
+        // per task, in order, immediately (SC-001). A PER-SPEC
+        // background=true applies to that task only: the batch is SPLIT so
+        // blocking siblings keep their blocking results (one background
+        // spec must not reflag the whole batch). FR-013: nothing is
         // rejected; permits are acquired inside the children under the same
         // limits. background=false / unset keeps the blocking path below
         // untouched (FR-002 byte parity — pinned by tests/background.rs T007).
-        let background = args
+        let top_background = args
             .get("background")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            || task_specs.iter().any(|s| s.background);
-        if background {
-            // Same request construction the blocking batch path uses
-            // (model/toolsets/turns/persist defaults + HyperCode role
-            // routing), so background children run with identical config.
+            .unwrap_or(false);
+        let is_background: Vec<bool> = task_specs
+            .iter()
+            .map(|s| top_background || s.background)
+            .collect();
+        if is_background.iter().any(|b| *b) {
+            // Split preserving original task order: background specs
+            // dispatch through the background wave (handles now), blocking
+            // specs through the blocking path (results below).
+            let bg_specs: Vec<TaskSpec> = task_specs
+                .iter()
+                .zip(is_background.iter())
+                .filter(|(_, b)| **b)
+                .map(|(s, _)| s.clone())
+                .collect();
+            let blocking_specs: Vec<TaskSpec> = task_specs
+                .iter()
+                .zip(is_background.iter())
+                .filter(|(_, b)| !**b)
+                .map(|(s, _)| s.clone())
+                .collect();
+
+            // Background subwave: same request construction the blocking
+            // batch path uses (model/toolsets/turns/persist defaults +
+            // HyperCode role routing), so background children run with
+            // identical config.
             let mut requests = crate::subagent::specs_to_requests(
-                &task_specs,
+                &bg_specs,
                 batch_model.as_deref(),
                 &batch_toolsets,
                 Some(self.manager.config().default_max_turns),
@@ -924,7 +947,7 @@ impl DelegateTask {
             }
             if let Err(e) = crate::subagent::apply_batch_hyper_roles(
                 &mut requests,
-                &task_specs,
+                &bg_specs,
                 &self.parent_config_tree,
                 &self.parent_config.provider,
             ) {
@@ -948,17 +971,71 @@ impl DelegateTask {
                 &self.base_registry,
                 self.event_tx.as_ref(),
             );
-            let mut output = String::new();
-            for (i, handle) in handles.iter().enumerate() {
-                if i > 0 {
-                    output.push('\n');
+
+            // Blocking subwave (empty when the whole batch is background):
+            // starts after the background handles exist but still blocks
+            // until every blocking child finishes.
+            let blocking_results: Vec<DelegationResult> = if blocking_specs.is_empty() {
+                Vec::new()
+            } else {
+                match self
+                    .dispatch_blocking_batch(
+                        &blocking_specs,
+                        batch_model.as_deref(),
+                        &batch_toolsets,
+                        budgets,
+                    )
+                    .await
+                {
+                    Ok(results) => results,
+                    // The background subwave is already dispatched; surface
+                    // the resolution failure per blocking spec instead of
+                    // dropping the already-returned handles.
+                    Err(e) => {
+                        tracing::warn!("blocking subwave resolution failed: {e}");
+                        blocking_specs
+                            .iter()
+                            .map(|spec| DelegationResult {
+                                goal: spec.goal.clone(),
+                                summary: String::new(),
+                                success: false,
+                                error: Some(e.clone()),
+                                token_usage: Default::default(),
+                                wall_clock: std::time::Duration::ZERO,
+                                model: String::new(),
+                                iterations: 0,
+                                persisted_session_id: None,
+                                stop_reason: None,
+                            })
+                            .collect()
+                    }
                 }
-                output.push_str(&format!(
-                    "[BACKGROUND] id={} goal={} started",
-                    handle.child_id, handle.goal
-                ));
+            };
+
+            // Merge the result lines in ORIGINAL task order: blocking
+            // entries keep their [i/total] report blocks, background
+            // entries are the immediate handle lines.
+            let total = task_specs.len();
+            let mut bg_handles = handles.into_iter();
+            let mut blocking_iter = blocking_results.into_iter();
+            let mut segments: Vec<String> = Vec::with_capacity(total);
+            for (position, background) in is_background.iter().enumerate() {
+                if *background {
+                    let handle = bg_handles
+                        .next()
+                        .expect("one handle per background spec");
+                    segments.push(format!(
+                        "[BACKGROUND] id={} goal={} started",
+                        handle.child_id, handle.goal
+                    ));
+                } else {
+                    let r = blocking_iter
+                        .next()
+                        .expect("one result per blocking spec");
+                    segments.push(format_result_block(position + 1, total, &r));
+                }
             }
-            return ToolResult::Text(output);
+            return ToolResult::Text(segments.join("\n"));
         }
 
         // Blocking batch (T021): when budgets.max_turns is set, build the
@@ -966,14 +1043,47 @@ impl DelegateTask {
         // dispatch_batch_with_roles, which is otherwise left untouched for
         // the no-budgets byte-parity path). tokens/wall-clock are deferred
         // on the blocking path (no watcher exists — see single path).
+        let results = match self
+            .dispatch_blocking_batch(&task_specs, batch_model.as_deref(), &batch_toolsets, budgets)
+            .await
+        {
+            Ok(results) => results,
+            Err(e) => return ToolResult::Error(e),
+        };
+
+        // Format results per the delegation-tool contract.
+        let total = results.len();
+        let blocks: Vec<String> = results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format_result_block(i + 1, total, r))
+            .collect();
+        if blocks.is_empty() {
+            return ToolResult::Text(String::new());
+        }
+        ToolResult::Text(format!("{}\n", blocks.join("\n\n")))
+    }
+
+    /// The blocking batch dispatch paths (T021), factored out so the mixed
+    /// background/blocking split can send the blocking subwave through the
+    /// SAME code: budgeted turn cap → named subagent types → default
+    /// role-routed batch. `Err` carries the resolver failure the inline
+    /// paths surfaced as `ToolResult::Error`.
+    async fn dispatch_blocking_batch(
+        &self,
+        task_specs: &[TaskSpec],
+        batch_model: Option<&str>,
+        batch_toolsets: &[String],
+        budgets: Option<crate::types::Budgets>,
+    ) -> Result<Vec<DelegationResult>, String> {
         let budgeted_turns = budgets
             .and_then(|b| b.max_turns)
             .map(|t| t as usize);
-        let results = if let Some(mt) = budgeted_turns {
+        if let Some(mt) = budgeted_turns {
             let mut requests = crate::subagent::specs_to_requests(
-                &task_specs,
-                batch_model.as_deref(),
-                &batch_toolsets,
+                task_specs,
+                batch_model,
+                batch_toolsets,
                 Some(mt),
                 self.manager.config().default_persist,
                 SubagentRole::Leaf,
@@ -982,17 +1092,18 @@ impl DelegateTask {
                 &mut requests,
                 self.resolver.as_ref(),
             ) {
-                return ToolResult::Error(e);
+                return Err(e);
             }
             if let Err(e) = crate::subagent::apply_batch_hyper_roles(
                 &mut requests,
-                &task_specs,
+                task_specs,
                 &self.parent_config_tree,
                 &self.parent_config.provider,
             ) {
                 tracing::warn!("hypercode role routing failed: {e}");
             }
-            self.manager
+            Ok(self
+                .manager
                 .dispatch_requests(
                     &requests,
                     &self.parent_config,
@@ -1000,16 +1111,16 @@ impl DelegateTask {
                     &self.base_registry,
                     self.event_tx.as_ref(),
                 )
-                .await
+                .await)
         } else if task_specs.iter().any(|s| s.subagent_type.is_some()) {
             // Per-task subagent_type present but no budget cap: the manager's
             // dispatch_batch_with_roles builds requests without a resolver, so
             // build them here (same construction, default turn cap, no budget)
             // to run named-agent resolution first.
             let mut requests = crate::subagent::specs_to_requests(
-                &task_specs,
-                batch_model.as_deref(),
-                &batch_toolsets,
+                task_specs,
+                batch_model,
+                batch_toolsets,
                 Some(self.manager.config().default_max_turns),
                 self.manager.config().default_persist,
                 SubagentRole::Leaf,
@@ -1018,17 +1129,18 @@ impl DelegateTask {
                 &mut requests,
                 self.resolver.as_ref(),
             ) {
-                return ToolResult::Error(e);
+                return Err(e);
             }
             if let Err(e) = crate::subagent::apply_batch_hyper_roles(
                 &mut requests,
-                &task_specs,
+                task_specs,
                 &self.parent_config_tree,
                 &self.parent_config.provider,
             ) {
                 tracing::warn!("hypercode role routing failed: {e}");
             }
-            self.manager
+            Ok(self
+                .manager
                 .dispatch_requests(
                     &requests,
                     &self.parent_config,
@@ -1036,53 +1148,45 @@ impl DelegateTask {
                     &self.base_registry,
                     self.event_tx.as_ref(),
                 )
-                .await
+                .await)
         } else {
-            self.manager
+            Ok(self
+                .manager
                 .dispatch_batch_with_roles(
-                    &task_specs,
-                    batch_model.as_deref(),
-                    &batch_toolsets,
+                    task_specs,
+                    batch_model,
+                    batch_toolsets,
                     &self.parent_config,
                     &self.parent_config_tree,
                     &self.base_registry,
                     self.event_tx.as_ref(),
                 )
-                .await
-        };
-
-        // Format results per the delegation-tool contract.
-        let total = results.len();
-        let mut output = String::new();
-        for (i, r) in results.iter().enumerate() {
-            output.push_str(&format!(
-                "[{}/{}] goal: {:?}\n",
-                i + 1,
-                total,
-                r.goal
-            ));
-            if r.success {
-                output.push_str("      status: success\n");
-                output.push_str(&format!("      summary: {}\n", r.summary));
-            } else {
-                output.push_str("      status: failed\n");
-                output.push_str(&format!(
-                    "      error: {}\n",
-                    r.error.as_deref().unwrap_or("unknown")
-                ));
-            }
-            output.push_str(&format!(
-                "      tokens: {} | duration: {:.1}s\n",
-                r.token_usage.total_tokens,
-                r.wall_clock.as_secs_f64()
-            ));
-            if i + 1 < total {
-                output.push('\n');
-            }
+                .await)
         }
-
-        ToolResult::Text(output)
     }
+}
+
+/// One `[i/total]` blocking-result report block (no trailing newline — the
+/// caller inserts separators). The block lines are byte-identical to the
+/// pinned contract format (tests/background.rs t007_blocking_batch_exact_format).
+fn format_result_block(index: usize, total: usize, r: &DelegationResult) -> String {
+    let mut block = format!("[{}/{}] goal: {:?}\n", index, total, r.goal);
+    if r.success {
+        block.push_str("      status: success\n");
+        block.push_str(&format!("      summary: {}\n", r.summary));
+    } else {
+        block.push_str("      status: failed\n");
+        block.push_str(&format!(
+            "      error: {}\n",
+            r.error.as_deref().unwrap_or("unknown")
+        ));
+    }
+    block.push_str(&format!(
+        "      tokens: {} | duration: {:.1}s",
+        r.token_usage.total_tokens,
+        r.wall_clock.as_secs_f64()
+    ));
+    block
 }
 
 /// The `call_omo_agent` tool — research-only delegation for Sisyphus-Junior.

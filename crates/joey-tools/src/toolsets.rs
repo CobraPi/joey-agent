@@ -168,6 +168,14 @@ static TOOLSETS: Lazy<HashMap<&'static str, Toolset>> = Lazy::new(|| {
         },
     );
     m.insert(
+        "task-graph",
+        Toolset {
+            description: "task graph planning for orchestration (task_graph tool)",
+            tools: &["task_graph"],
+            includes: &[],
+        },
+    );
+    m.insert(
         "memory",
         Toolset {
             description: "Persistent memory across sessions (personal notes + user profile)",
@@ -405,6 +413,11 @@ mod tests {
             resolve("team"),
             vec!["team_message", "team_status", "team_tasks"]
         );
+    }
+
+    #[test]
+    fn task_graph_toolset_resolves() {
+        assert_eq!(resolve("task-graph"), vec!["task_graph"]);
     }
 
     #[test]

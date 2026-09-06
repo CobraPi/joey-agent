@@ -621,3 +621,117 @@ fn lead_request_model_precedence() {
     let req = lead_request("goal", "team-a", "lead", &cfg, &none);
     assert!(req.model.is_none(), "both empty ⇒ inherit");
 }
+
+// ── Workflow inheritance: skills + todo + task-graph on the orchestrator ──
+
+/// The orchestrator toolset inherits the main agent's workflow toolsets:
+/// todo, skills, and task-graph (const-level; task-graph resolution to a
+/// `task_graph` tool name lands in a parallel change, so the resolved-name
+/// assertion here only covers the stable entries).
+#[test]
+fn orchestrator_toolset_inherits_workflow_tools() {
+    for ts in ["todo", "skills", "task-graph"] {
+        assert!(
+            crate::hypercode::ORCHESTRATOR_TOOLSET.iter().any(|t| *t == ts),
+            "ORCHESTRATOR_TOOLSET must contain {ts}"
+        );
+    }
+    let tools = crate::hypercode::orchestrator_tool_names();
+    assert!(tools.contains(&"todo".to_string()), "resolved: todo tool");
+    assert!(
+        tools.contains(&"skills_list".to_string()),
+        "resolved: skills_list tool"
+    );
+}
+
+/// Inheritance must not widen the surface: delegation stays, direct file
+/// mutation stays out.
+#[test]
+fn orchestrator_toolset_still_restricted() {
+    let tools = crate::hypercode::orchestrator_tool_names();
+    assert!(tools.contains(&"delegate_task".to_string()));
+    assert!(!tools.contains(&"write_file".to_string()));
+    assert!(!tools.iter().any(|t| t.contains("patch")));
+}
+
+/// The fixed orchestrator prompt carries the workflow-inheritance section.
+#[test]
+fn workflow_inheritance_guidance_in_fixed_prompt() {
+    let prompt = crate::hypercode::ORCHESTRATOR_PROMPT;
+    assert!(prompt.contains("## Workflow inheritance"));
+    assert!(prompt.contains("skill_view(name)"));
+    assert!(prompt.contains("task_graph"));
+    assert!(prompt.contains("todo tool"));
+}
+
+/// Every ACTIVE persona overlay carries the workflow-inheritance guidance
+/// (default conductor persona AND named-agent personas).
+#[test]
+fn workflow_inheritance_guidance_in_persona_overlays() {
+    let default = crate::hypercode::orchestrator_persona_overlay(
+        &hc_on(),
+        None,
+        "glm-5.2",
+        &avail(&["glm-5.2"]),
+        &overrides(),
+    );
+    assert!(
+        default.contains("## Workflow inheritance"),
+        "default (None) persona overlay must carry the workflow guidance"
+    );
+    let named = crate::hypercode::orchestrator_persona_overlay(
+        &hc_on(),
+        Some("sisyphus"),
+        "glm-5.2",
+        &avail(&["glm-5.2"]),
+        &overrides(),
+    );
+    assert!(
+        named.contains("## Workflow inheritance"),
+        "named-agent persona overlay must carry the workflow guidance"
+    );
+}
+
+/// FR-012 stays explicit next to the new section: with the integration
+/// inactive, the overlay remains byte-identical to the fixed prompt (which
+/// now embeds the workflow-inheritance section).
+#[test]
+fn inactive_integration_still_byte_identical() {
+    let overlay = crate::hypercode::orchestrator_persona_overlay(
+        &config_with(
+            "model:\n  provider: zai\n  default: glm-4.5-flash\nhypercode:\n  enabled: true\n  orchestrator_mode: false\n",
+        ),
+        None,
+        "glm-5.2",
+        &avail(&["glm-5.2"]),
+        &overrides(),
+    );
+    assert_eq!(
+        overlay,
+        crate::hypercode::ORCHESTRATOR_PROMPT.to_string(),
+        "inactive integration must keep the fixed prompt byte-identical"
+    );
+}
+
+// ── Workflow-inheritance sync guard + strict-schema content ─────────
+
+/// The Workflow-inheritance section embedded in ORCHESTRATOR_PROMPT must
+/// stay byte-identical to the WORKFLOW_INHERITANCE_GUIDANCE const (the
+/// duplication is deliberate — edit both together).
+#[test]
+fn workflow_inheritance_embedded_copy_matches_const() {
+    assert!(
+        crate::hypercode::ORCHESTRATOR_PROMPT.contains(crate::hypercode::WORKFLOW_INHERITANCE_GUIDANCE),
+        "the embedded Workflow-inheritance section in ORCHESTRATOR_PROMPT must stay byte-identical to the WORKFLOW_INHERITANCE_GUIDANCE const"
+    );
+}
+
+/// The TASK GRAPH bullet carries the strict task_graph wire schema so
+/// orchestrators get the graph right on the first call.
+#[test]
+fn task_graph_guidance_carries_strict_schema() {
+    let g = crate::hypercode::WORKFLOW_INHERITANCE_GUIDANCE;
+    for needle in ["STRICT SCHEMA", "joey-taskgraph/1", "artifact_ids", "\"economical\"|\"frontier\"", "risk_triggered_review"] {
+        assert!(g.contains(needle), "guidance must mention {needle}");
+    }
+}

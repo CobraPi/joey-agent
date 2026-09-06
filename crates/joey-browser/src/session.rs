@@ -57,6 +57,9 @@ pub struct BrowserManager {
     page: Mutex<Option<PageRef>>,
     pub config: BrowserConfig,
     managed_child: Mutex<Option<tokio::process::Child>>,
+    /// Ephemeral profile dir of the managed launch (None when attached);
+    /// removed on disconnect.
+    managed_user_data_dir: Option<std::path::PathBuf>,
 }
 
 impl BrowserManager {
@@ -74,6 +77,7 @@ impl BrowserManager {
                 page: Mutex::new(None),
                 config: cfg,
                 managed_child: Mutex::new(None),
+                managed_user_data_dir: None,
             };
             return Ok(Arc::new(mgr));
         }
@@ -91,6 +95,7 @@ impl BrowserManager {
             page: Mutex::new(None),
             config: cfg,
             managed_child: Mutex::new(Some(managed.child)),
+            managed_user_data_dir: Some(managed.user_data_dir),
         };
         // Managed hygiene: the freshly-launched browser opens an initial tab
         // of its own. Create OUR agent tab first (the browser must never
@@ -210,8 +215,16 @@ impl BrowserManager {
     /// History back in the agent tab.
     pub async fn back(&self) -> Result<Value, BrowserError> {
         let page = self.ensure_page().await?;
+        // CDP requires a real entry id from Page.getNavigationHistory —
+        // synthetic ids like -2 are protocol errors.
+        let hist = self
+            .conn()?
+            .send("Page.getNavigationHistory", json!({}), Some(&page.session_id))
+            .await?;
+        let entry_id = back_entry_id(&hist)
+            .ok_or_else(|| BrowserError::Protocol("no back entry".into()))?;
         self.conn()?
-            .send("Page.navigateToHistoryEntry", json!({ "entryId": -2 }), Some(&page.session_id))
+            .send("Page.navigateToHistoryEntry", json!({ "entryId": entry_id }), Some(&page.session_id))
             .await
     }
 
@@ -311,12 +324,19 @@ impl BrowserManager {
         Ok(())
     }
 
-    /// Disconnect: kill the child iff Managed (no orphans); leave an
-    /// attached browser running.
+    /// Disconnect: kill the child iff Managed (no orphans) and remove its
+    /// ephemeral profile dir (no temp leaks); leave an attached browser
+    /// running.
     pub async fn disconnect(self: Arc<Self>) -> Result<(), BrowserError> {
         let mut mode = self.mode.lock().await;
         if let Some(child) = self.managed_child.lock().await.as_mut() {
             let _ = child.kill().await;
+        }
+        if let Some(dir) = &self.managed_user_data_dir {
+            // Best-effort: never fail disconnect on cleanup.
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                tracing::debug!(dir = %dir.display(), error = %e, "profile dir cleanup");
+            }
         }
         *self.page.lock().await = None;
         *mode = Mode::Disconnected;
@@ -442,6 +462,46 @@ async fn probe_ws_url(cdp_url: &str) -> Option<String> {
     resp.get("webSocketDebuggerUrl")
         .and_then(|u| u.as_str())
         .map(str::to_string)
+}
+
+/// Pick the navigation-history entry one step back from a
+/// `Page.getNavigationHistory` result: `entries[currentIndex - 1].id`.
+/// None when the history is empty or the current entry is the first one.
+fn back_entry_id(hist: &Value) -> Option<i64> {
+    let index = hist.get("currentIndex")?.as_u64()? as usize;
+    let entries = hist.get("entries")?.as_array()?;
+    if index == 0 || entries.is_empty() {
+        return None;
+    }
+    entries.get(index - 1)?.get("id")?.as_i64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Canned `Page.getNavigationHistory` payloads pinning the two-step
+    /// back() selection (no live browser).
+    #[test]
+    fn back_entry_selection_from_canned_history() {
+        let hist: Value = serde_json::from_str(
+            r#"{"currentIndex":2,"entries":[
+                {"id":0,"url":"http://a/"},
+                {"id":3,"url":"http://b/"},
+                {"id":7,"url":"http://c/"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(back_entry_id(&hist), Some(3));
+
+        // At the first entry there is nothing before it.
+        let first: Value =
+            serde_json::from_str(r#"{"currentIndex":0,"entries":[{"id":0}]}"#).unwrap();
+        assert_eq!(back_entry_id(&first), None);
+
+        // Empty history.
+        let empty: Value = serde_json::from_str(r#"{"currentIndex":0,"entries":[]}"#).unwrap();
+        assert_eq!(back_entry_id(&empty), None);
+    }
 }
 
 // reqwest is not currently a joey-browser dependency — cfg-gate the probe to

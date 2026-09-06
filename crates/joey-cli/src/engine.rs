@@ -223,9 +223,24 @@ pub struct EngineSpec {
 impl EngineSpec {
     /// Rebuild a fresh agent from the spec (startup + restart-after-kill).
     /// History is restored from the session DB so the conversation survives.
-    pub fn build_agent(&self) -> anyhow::Result<Agent> {
+    ///
+    /// Takes `&mut self`: `build_agent_parts` constructs a FRESH
+    /// SubagentManager per call, and the spec must capture it — the agent's
+    /// delegate_task tool holds that exact Arc, and the engine routes
+    /// StopSubagent/SteerSubagent through `spec.subagent_manager`. Leaving
+    /// the startup manager in the spec after a rebuild would point stop/steer
+    /// at an EMPTY registry (the empty-registry hazard documented above).
+    pub fn build_agent(&mut self) -> anyhow::Result<Agent> {
         let history = crate::repl::restore_history_from_db(&self.session_id);
-        crate::repl::build_agent(&self.config, &self.cwd, &self.overrides, &self.session_id, history)
+        let parts = crate::repl::build_agent_parts(
+            &self.config,
+            &self.cwd,
+            &self.overrides,
+            &self.session_id,
+            history,
+        )?;
+        self.subagent_manager = parts.subagent_manager;
+        Ok(parts.agent)
     }
 
     /// Wind-down timeout (T025, FR-015) for the exit-path `shutdown` call:
@@ -797,7 +812,7 @@ async fn engine_task(
                     agent.rebuild_system_prompt();
                     agent.set_extra_instructions(Some(crate::hypercode::orchestrator_persona_overlay_for_profile(&spec_config, current_agent.as_deref(), agent.model(), agent.client().profile())));
                     let _ = event_tx.send(EngineEvent::Notice(
-                        "⚡ orchestrator mode ON — file writes/builds now go through explorer/implementor subagents (you keep process monitoring, read-only peeks, and web)".into(),
+                        "⚡ orchestrator mode ON — file writes/builds now go through explorer/implementor subagents (you keep process monitoring, read-only peeks, web, plus your inherited workflow: skills, todo list, task-graph planner)".into(),
                     ));
                     // T031/T032: re-check the persona-integration health on
                     // every toggle-ON (provider may have changed since startup).
@@ -1172,6 +1187,41 @@ fn reapply_orchestrator_overlay(
             agent.client().profile(),
         )));
     }
+    // The overlay set above REPLACED extra_instructions wholesale (and
+    // switch_model cleared it even when the orchestrator is off) — restore
+    // the spec-kit lifecycle context block if this session had one. No-op
+    // when the block is already present or not applicable.
+    reapply_lifecycle(agent, config);
+}
+
+/// Header of the session-start lifecycle context block (feature 026, T023).
+/// Its presence in `extra_instructions` means the block is already injected.
+const LIFECYCLE_BLOCK_HEADER: &str = "## Spec-Kit Lifecycle Context";
+
+/// Re-apply the spec-kit lifecycle context block after something REPLACED
+/// `extra_instructions` (persona/orchestrator/ultrawork overlays, model
+/// switches). Reads the current overlay; when the lifecycle block is ABSENT,
+/// re-derives it exactly like session start does and appends it, so persona
+/// text and lifecycle context coexist instead of clobbering each other.
+/// No-op when the block is already present or `session_context_block`
+/// returns None (not a spec-kit repo / disabled in config).
+pub(crate) fn reapply_lifecycle(agent: &mut Agent, config: &joey_core::Config) {
+    if agent
+        .extra_instructions()
+        .is_some_and(|e| e.contains(LIFECYCLE_BLOCK_HEADER))
+    {
+        return;
+    }
+    if let Some(block) = crate::speckit_lifecycle::session_context_block(
+        &std::env::current_dir().unwrap_or_default(),
+        config,
+    ) {
+        let merged = match agent.extra_instructions() {
+            Some(existing) => format!("{existing}\n\n{block}"),
+            None => block,
+        };
+        agent.set_extra_instructions(Some(merged));
+    }
 }
 
 /// `/model <name>` on the engine side: swap the live agent's main model,
@@ -1405,7 +1455,7 @@ pub(crate) mod actor_tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "model:\n  provider: openai-api\n  default: gpt-4o-mini\n").unwrap();
         let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
-        let spec = EngineSpec {
+        let mut spec = EngineSpec {
             config,
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
@@ -1451,7 +1501,7 @@ pub(crate) mod actor_tests {
         )
         .unwrap();
         let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
-        let spec = EngineSpec {
+        let mut spec = EngineSpec {
             config,
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
@@ -1498,6 +1548,50 @@ pub(crate) mod actor_tests {
         );
     }
 
+    /// Fix 11 (overlay preservation): a persona overlay must not clobber the
+    /// spec-kit lifecycle context block — `reapply_lifecycle` re-appends the
+    /// block when its header is absent, and no-ops when already present.
+    /// Uses a tempdir spec-kit fixture as CWD (`.specify/` alone suffices:
+    /// no feature pointer renders the "(none)" block with the same header).
+    #[test]
+    fn reapply_lifecycle_preserves_persona_overlay() {
+        struct CwdGuard(Option<std::path::PathBuf>);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                if let Some(p) = self.0.take() {
+                    let _ = std::env::set_current_dir(p);
+                }
+            }
+        }
+        let _env_guard = TestEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".specify")).unwrap();
+        let _cwd = CwdGuard(std::env::current_dir().ok());
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let mut spec = unauth_spec("englife1");
+        let mut agent = spec.build_agent().expect("agent builds");
+        // Simulate a persona overlay clobbering any lifecycle block.
+        agent.set_extra_instructions(Some("PERSONA: Conductor".into()));
+        reapply_lifecycle(&mut agent, &spec.config);
+        let merged = agent.extra_instructions().expect("overlay present").to_string();
+        assert!(
+            merged.contains("PERSONA: Conductor"),
+            "persona text kept: {merged}"
+        );
+        assert!(
+            merged.contains("## Spec-Kit Lifecycle Context"),
+            "lifecycle block appended: {merged}"
+        );
+        // Idempotence: a second reapply must not duplicate the block.
+        reapply_lifecycle(&mut agent, &spec.config);
+        assert_eq!(
+            merged,
+            agent.extra_instructions().unwrap(),
+            "already-present block is a no-op"
+        );
+    }
+
     /// Regression (orchestrator persona swap, feature 025): `/agents <name>`
     /// swaps in the named OMO agent's persona as the orchestrator overlay
     /// (hard rules + roster briefing appended). The OMO identity goes into
@@ -1515,7 +1609,7 @@ pub(crate) mod actor_tests {
         )
         .unwrap();
         let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
-        let spec = EngineSpec {
+        let mut spec = EngineSpec {
             config,
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
@@ -1555,7 +1649,7 @@ pub(crate) mod actor_tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "model:\n  provider: openai-api\n  default: gpt-4o-mini\n").unwrap();
         let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
-        let spec = EngineSpec {
+        let mut spec = EngineSpec {
             config,
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
@@ -1602,7 +1696,7 @@ pub(crate) mod actor_tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "model:\n  provider: openai-api\n  default: gpt-4o-mini\n").unwrap();
         let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
-        let spec = EngineSpec {
+        let mut spec = EngineSpec {
             config,
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
@@ -1756,7 +1850,7 @@ pub(crate) mod actor_tests {
         )
         .unwrap();
         let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
-        let spec = EngineSpec {
+        let mut spec = EngineSpec {
             config,
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
@@ -1891,7 +1985,7 @@ pub(crate) mod actor_tests {
         )
         .unwrap();
         let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
-        let spec = EngineSpec {
+        let mut spec = EngineSpec {
             config,
             cwd: std::env::temp_dir(),
             overrides: crate::repl::Overrides::default(),
@@ -1973,6 +2067,32 @@ pub(crate) mod actor_tests {
         }
     }
 
+    /// Regression (manager staleness on rebuild, fix 8): `build_agent`
+    /// constructs a FRESH SubagentManager inside `build_agent_parts`; the
+    /// spec must capture it so the engine's StopSubagent/SteerSubagent
+    /// routing targets the registry the rebuilt agent's delegate_task tool
+    /// actually populates. Cheapest honest assertion: Arc pointer identity
+    /// between `spec.subagent_manager` before vs after the rebuild — the
+    /// OLD behavior left the startup Arc in place (pointers equal only if
+    /// the spec captured nothing new); the fixed behavior stores the
+    /// freshly-built Arc (pointers differ). We also pin the exact Arc the
+    /// agent's tools hold is unreachable from here (Agent keeps it private),
+    /// so pointer-refresh of the spec field is the observable contract.
+    #[test]
+    fn build_agent_refreshes_spec_manager() {
+        let _env_guard = TestEnvGuard::new();
+        let mut spec = unauth_spec("engmgr1");
+        let before: *const joey_orchestration::SubagentManager =
+            std::sync::Arc::as_ptr(&spec.subagent_manager);
+        let _agent = spec.build_agent().expect("agent builds");
+        let after: *const joey_orchestration::SubagentManager =
+            std::sync::Arc::as_ptr(&spec.subagent_manager);
+        assert_ne!(
+            before, after,
+            "spec.subagent_manager must be refreshed to the rebuilt agent's manager"
+        );
+    }
+
     /// Regression (busy deadlock fix): early-exit submit paths (empty
     /// pre-turn text, missing credentials) must emit a synthetic
     /// AgentEvent::Done BEFORE EngineEvent::TurnFinished so the UI resets
@@ -1982,7 +2102,7 @@ pub(crate) mod actor_tests {
     async fn engine_early_exit_sends_done_before_turn_finished() {
         let _env_guard = TestEnvGuard::new();
         for (tag, prompt) in [("engdone1", "@plan"), ("engdone2", "hello")] {
-            let eng_spec = unauth_spec(tag);
+            let mut eng_spec = unauth_spec(tag);
             let agent = eng_spec.build_agent().expect("agent builds");
             let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
             let (handle, _int) = spawn_engine(agent, eng_spec, ev_tx);
@@ -2022,7 +2142,7 @@ pub(crate) mod actor_tests {
     #[tokio::test]
     async fn idle_interrupt_does_not_poison_next_turn() {
         let _env_guard = TestEnvGuard::new();
-        let spec = unauth_spec("engstale");
+        let mut spec = unauth_spec("engstale");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let (handle, interrupt) = spawn_engine(agent, spec, ev_tx);
@@ -2108,7 +2228,7 @@ pub(crate) mod actor_tests {
     #[tokio::test]
     async fn engine_survives_post_turn_submit() {
         let _env_guard = TestEnvGuard::new();
-        let spec = unauth_spec("engrace");
+        let mut spec = unauth_spec("engrace");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let (handle, _int) = spawn_engine(agent, spec, ev_tx);
@@ -2145,7 +2265,7 @@ pub(crate) mod actor_tests {
     #[tokio::test]
     async fn idle_steer_degrades_to_queued_submit() {
         let _env_guard = TestEnvGuard::new();
-        let spec = unauth_spec("engsteer1");
+        let mut spec = unauth_spec("engsteer1");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let (handle, _int) = spawn_engine(agent, spec, ev_tx);
@@ -2171,7 +2291,7 @@ pub(crate) mod actor_tests {
     #[tokio::test]
     async fn queued_submit_started_announces_only_marked_submits() {
         let _env_guard = TestEnvGuard::new();
-        let spec = unauth_spec("engqss1");
+        let mut spec = unauth_spec("engqss1");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let (handle, _int) = spawn_engine(agent, spec, ev_tx);
@@ -2216,7 +2336,7 @@ pub(crate) mod actor_tests {
     #[tokio::test]
     async fn engine_announces_idle_after_drain() {
         let _env_guard = TestEnvGuard::new();
-        let spec = unauth_spec("engidle1");
+        let mut spec = unauth_spec("engidle1");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let (handle, _int) = spawn_engine(agent, spec, ev_tx);
@@ -2246,7 +2366,7 @@ pub(crate) mod actor_tests {
     #[tokio::test]
     async fn hypercode_command_streams_progress_and_finishes() {
         let _env_guard = TestEnvGuard::new();
-        let spec = unauth_spec("enghc1");
+        let mut spec = unauth_spec("enghc1");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let (handle, _int) = spawn_engine(agent, spec, ev_tx);
@@ -2340,7 +2460,7 @@ mod subagent_control_tests {
     #[tokio::test]
     async fn engine_stop_subagent_unknown_id_yields_error_notice() {
         let _env_guard = actor_tests::TestEnvGuard::new();
-        let spec = actor_tests::unauth_spec("engstop1");
+        let mut spec = actor_tests::unauth_spec("engstop1");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let (handle, _int) = spawn_engine(agent, spec, ev_tx);
@@ -2374,7 +2494,7 @@ mod subagent_control_tests {
     #[tokio::test]
     async fn engine_steer_subagent_unknown_id_yields_error_notice() {
         let _env_guard = actor_tests::TestEnvGuard::new();
-        let spec = actor_tests::unauth_spec("engsteer1");
+        let mut spec = actor_tests::unauth_spec("engsteer1");
         let agent = spec.build_agent().expect("agent builds");
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let (handle, _int) = spawn_engine(agent, spec, ev_tx);

@@ -27,6 +27,9 @@ pub struct CodingRequest {
     pub project_root: PathBuf,
     /// The available context budget for the resolved tier.
     pub token_budget_hint: u64,
+    /// Feature-scoped file list (spec-kit plan/tasks read+write sets);
+    /// empty = unscoped, behavior unchanged.
+    pub scope_files: Vec<String>,
 }
 
 /// Narrow interface the agent turn loop consumes to classify a coding
@@ -130,6 +133,10 @@ pub struct DefaultEngine {
     /// Mutex-wrapped: the engine is shared (`Arc<dyn NeuroCodeEngine>`)
     /// while the tracker is inherently mutable.
     auto_index: std::sync::Mutex<crate::auto_index::AutoIndexState>,
+    /// Feature scope (T028, US7): the spec-kit plan/tasks read+write file
+    /// set. Empty = unscoped. When set, auto-reindex work is ordered
+    /// scope-first; thresholds and trigger conditions are unchanged.
+    feature_scope: std::sync::Mutex<Vec<String>>,
 }
 
 impl DefaultEngine {
@@ -145,6 +152,7 @@ impl DefaultEngine {
             provider: String::new(),
             last_tier: Mutex::new(None),
             auto_index: Mutex::new(auto_index),
+            feature_scope: Mutex::new(Vec::new()),
         }
     }
 
@@ -152,6 +160,23 @@ impl DefaultEngine {
     /// Mirrors how the agent snapshots its resolved provider at construction.
     pub fn set_provider(&mut self, provider: &str) {
         self.provider = provider.trim().to_string();
+    }
+
+    /// Set the feature scope (T028, US7): the spec-kit plan/tasks
+    /// read+write file set. Empty clears it. Strictly additive — an
+    /// unset/empty scope leaves all pre-scope behavior unchanged.
+    pub fn set_feature_scope(&self, files: Vec<String>) {
+        if let Ok(mut guard) = self.feature_scope.lock() {
+            *guard = files;
+        }
+    }
+
+    /// The current feature scope (empty when unscoped).
+    pub fn feature_scope(&self) -> Vec<String> {
+        self.feature_scope
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Open the graph for the project (or reuse the cached one).
@@ -964,6 +989,20 @@ impl NeuroCodeEngine for DefaultEngine {
         // path `/neurocode index` takes (index_project), wrapped with the
         // auto-index bookkeeping: trackers cleared + debounce window
         // restarted on completion.
+        // Feature scope (T028): `index_project` takes no file list (it
+        // re-ingests the whole tree), so the scope-first ordering of the
+        // pending work is recorded via tracing only — thresholds and
+        // trigger conditions are untouched.
+        let scope = self.feature_scope();
+        if !scope.is_empty() {
+            if let Ok(tracker) = self.auto_index.lock() {
+                tracing::debug!(
+                    target: "neurocode",
+                    ordered = ?tracker.pending_prioritized(&scope),
+                    "auto-reindex work ordered scope-first"
+                );
+            }
+        }
         let result = self.index_project();
         if result.errors.is_empty() || result.files_scanned > 0 {
             if let Ok(mut tracker) = self.auto_index.lock() {
@@ -1000,6 +1039,7 @@ mod tests {
             active_symbols: vec![],
             project_root: PathBuf::from("/tmp/test-project"),
             token_budget_hint: 0,
+            scope_files: vec![],
         };
         let route = engine.classify(&req);
         assert_eq!(route.tier, ComplexityTier::Economical);
@@ -1067,6 +1107,7 @@ mod tests {
             active_symbols: vec!["UserService".into()],
             project_root: dir.path().to_path_buf(),
             token_budget_hint: 0,
+            scope_files: vec![],
         };
         let ctx = engine.assemble_context(&req, ComplexityTier::Economical);
         assert!(!ctx.cold_mode, "graph populated by the auto re-index");

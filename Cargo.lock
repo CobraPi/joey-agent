@@ -2729,6 +2729,7 @@ dependencies = [
  "joey-omo",
  "joey-orchestration",
  "joey-providers",
+ "joey-speckit-ui",
  "joey-tools",
  "joey-tui",
  "libc",

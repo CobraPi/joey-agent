@@ -11,10 +11,33 @@ use crate::model::{Task, TaskStatus};
 
 pub fn parse_tasks(content: &str) -> Vec<Task> {
     let mut tasks = Vec::new();
+    let mut in_fence = false;
     for line in content.lines() {
+
+        // Skip code fences — a checkbox inside ``` is content, not a task.
         let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        let indent = line.len() - line.trim_start().len();
         if let Some(task) = parse_task_line(trimmed) {
-            tasks.push(task);
+            if indent == 0 {
+                // Top-level task: only unindented checkbox lines qualify.
+                tasks.push(task);
+            } else if let Some(parent) = tasks.last_mut() {
+                // Indented sub-task checkbox: attach to the previous
+                // top-level task (extend its description) instead of
+                // surfacing as a top-level Task.
+                if !parent.description.is_empty() {
+                    parent.description.push(' ');
+                }
+                parent.description.push_str(trimmed);
+            }
         }
     }
     tasks
@@ -151,5 +174,38 @@ mod tests {
         let line = "- [ ] T016 [P] [US1] Contract test for PATCH";
         let tasks = parse_tasks(line);
         assert_eq!(tasks[0].user_story_ref.as_deref(), Some("US1"));
+    }
+
+    #[test]
+    fn indented_subtask_is_not_top_level() {
+        let content = "- [ ] T005 [P] Define core model types\n  - [ ] T005a Sub-task detail\n";
+        let tasks = parse_tasks(content);
+        assert_eq!(tasks.len(), 1, "indented checkbox must not be a top-level task");
+        assert_eq!(tasks[0].id, "T005");
+        assert!(tasks[0].description.contains("T005a"));
+        assert!(tasks[0].description.contains("Sub-task detail"));
+    }
+
+    #[test]
+    fn fenced_checkbox_is_ignored() {
+        let content = "# Tasks\n\n```markdown\n- [ ] T900 Fenced phantom task\n```\n\n- [ ] T001 Real task\n";
+        let tasks = parse_tasks(content);
+        assert_eq!(tasks.len(), 1, "checkbox inside a code fence is not a task");
+        assert_eq!(tasks[0].id, "T001");
+    }
+
+    #[test]
+    fn top_level_tasks_unchanged_without_indent_or_fences() {
+        // Compat: joey-cli's FeatureScope extraction consumes this parser —
+        // ids/descriptions stay byte-identical for plain input.
+        let content = "- [ ] T001 [P] Alpha\n- [X] T002 Beta\n- [ ] T003 [US1] Gamma\n";
+        let tasks = parse_tasks(content);
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].id, "T001");
+        assert_eq!(tasks[0].description, "[P] Alpha");
+        assert_eq!(tasks[1].id, "T002");
+        assert_eq!(tasks[1].description, "Beta");
+        assert_eq!(tasks[2].id, "T003");
+        assert_eq!(tasks[2].description, "[US1] Gamma");
     }
 }

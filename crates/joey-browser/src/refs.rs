@@ -214,7 +214,8 @@ impl ElementRefRegistry {
                             hits.iter().min_by(|a, b| {
                                 dist2(a.geometry.center(), g.center())
                                     .partial_cmp(&dist2(b.geometry.center(), g.center()))
-                                    .expect("finite f64")
+                                    // NaN geometry must not panic the resolver.
+                                    .unwrap_or(std::cmp::Ordering::Equal)
                             })
                         {
                             return Ok((nearest, ResolvedBy::Text));
@@ -230,7 +231,8 @@ impl ElementRefRegistry {
             if let Some(nearest) = self.elements.iter().min_by(|a, b| {
                 dist2(a.geometry.center(), (cx, cy))
                     .partial_cmp(&dist2(b.geometry.center(), (cx, cy)))
-                    .expect("finite f64")
+                    // NaN geometry must not panic the resolver.
+                    .unwrap_or(std::cmp::Ordering::Equal)
             }) {
                 // Guard: only accept when reasonably close (inside the rect
                 // or within half a rect's dimension).

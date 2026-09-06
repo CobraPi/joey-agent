@@ -37,6 +37,7 @@ fn make_request(root: &std::path::Path, text: &str) -> CodingRequest {
         active_symbols: vec!["UserServiceImpl".into()],
         project_root: root.to_path_buf(),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     }
 }
 

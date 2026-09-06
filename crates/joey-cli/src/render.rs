@@ -409,14 +409,35 @@ fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next(); // consume '['
-            // Consume the sequence up to and including the final byte
-            // (0x40..=0x7E per ECMA-48).
-            for c2 in chars.by_ref() {
-                if ('\x40'..='\x7e').contains(&c2) {
-                    break;
+        if c == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next(); // consume '['
+                    // Consume the sequence up to and including the final byte
+                    // (0x40..=0x7E per ECMA-48).
+                    for c2 in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c2) {
+                            break;
+                        }
+                    }
                 }
+                Some(']') => {
+                    // OSC (Operating System Command): ESC ] ... ST. Consume
+                    // through the string terminator — BEL (0x07) or ESC \
+                    // (ST). Without this, hyperlink/title OSC payloads
+                    // inflate visible-width math.
+                    chars.next(); // consume ']'
+                    while let Some(c2) = chars.next() {
+                        if c2 == '\x07' {
+                            break;
+                        }
+                        if c2 == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next(); // consume '\'
+                            break;
+                        }
+                    }
+                }
+                _ => out.push(c),
             }
         } else {
             out.push(c);

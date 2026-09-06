@@ -650,30 +650,36 @@ fn compute_file_work(
 
     // A brand-new file has no stored rows, so every chunk lands in
     // `changed` naturally; a tracked file skips exactly the chunks whose
-    // recomputed hash matches a stored one.
+    // recomputed identity AND hash match a stored row.
     let stored = stored_chunks_for_path(store.conn(), &source_path).unwrap_or_default();
-    let stored_hashes: std::collections::HashSet<&str> =
-        stored.iter().map(|c| c.content_hash.as_str()).collect();
+    // Skip set keyed by CHUNK IDENTITY, not content hash: a symbol that
+    // moved to new lines in a modified file rebuilds with a NEW chunk_id
+    // (line-range identity — chunker.rs `make_chunk_id`) even when its
+    // body, hence content_hash, is byte-identical. Keying the skip by
+    // content hash alone marked such a moved chunk unchanged (never
+    // written) while the stale purge below deleted the old chunk_id row —
+    // the chunk VANISHED from the index. Skip only when the stored row
+    // with the SAME chunk_id carries the same content_hash, and only when
+    // that row was embedded with the CURRENT profile's dimension (a chunk
+    // carried over from another embedding profile — backend switch
+    // without a full rebuild — must re-embed, never skip, or dense search
+    // keeps a stale dimension-mismatched vector).
+    let stored_by_id: HashMap<&str, (&str, Option<i64>)> = stored
+        .iter()
+        .map(|c| (c.chunk_id.as_str(), (c.content_hash.as_str(), c.embed_dim)))
+        .collect();
     let profile_dim = profile.dim as i64;
 
     let mut work =
         FileWork { source_path, records, unchanged: Vec::new(), changed: Vec::new() };
     for (i, rec) in work.records.iter().enumerate() {
-        if stored_hashes.contains(rec.content_hash.as_str()) {
-            // Hash matches a stored row — but only reuse it if that row was
-            // embedded with the CURRENT profile's dimension: a chunk carried
-            // over from another embedding profile (backend switch without a
-            // full rebuild) would otherwise skip re-embed and keep a stale,
-            // dimension-mismatched vector that breaks dense search.
-            let stored_dim = stored
-                .iter()
-                .find(|c| c.content_hash == rec.content_hash)
-                .and_then(|c| c.embed_dim);
-            if stored_dim == Some(profile_dim) {
-                work.unchanged.push(i);
-            } else {
-                work.changed.push(i);
-            }
+        let reusable = stored_by_id
+            .get(rec.chunk_id.as_str())
+            .is_some_and(|(hash, dim)| {
+                *hash == rec.content_hash.as_str() && *dim == Some(profile_dim)
+            });
+        if reusable {
+            work.unchanged.push(i);
         } else {
             work.changed.push(i);
         }
@@ -776,7 +782,11 @@ pub fn refresh_incremental(
             continue;
         };
 
-        // Embed ONLY the changed chunks (chunk-hash skip, FR-004/SC-004).
+        // Embed ONLY the changed chunks (chunk-hash skip, FR-004/SC-004),
+        // in bounded EMBED_BATCH_SIZE batches — the same bound index_file
+        // applies (chunker.rs; the backend contract's batch-64 default,
+        // research.md R2). One unbounded call embedded an entire changed
+        // file's chunks in a single request, defeating that bound.
         let mut texts: Vec<String> = Vec::with_capacity(work.changed.len());
         for &i in &work.changed {
             texts.push(profile.document_input(&work.records[i].embed_text));
@@ -784,9 +794,20 @@ pub fn refresh_incremental(
         let vectors = if texts.is_empty() {
             Vec::new()
         } else {
-            let embedded = embedder
-                .embed_texts(&texts)
-                .map_err(RefreshError::Embed)?;
+            let mut embedded: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+            for batch in texts.chunks(crate::index::chunker::EMBED_BATCH_SIZE) {
+                let part = embedder
+                    .embed_texts(batch)
+                    .map_err(RefreshError::Embed)?;
+                if part.len() != batch.len() {
+                    return Err(RefreshError::Embed(format!(
+                        "embedder returned {} vectors for {} texts",
+                        part.len(),
+                        batch.len()
+                    )));
+                }
+                embedded.extend(part);
+            }
             if embedded.len() != texts.len() {
                 return Err(RefreshError::Embed(format!(
                     "embedder returned {} vectors for {} texts",

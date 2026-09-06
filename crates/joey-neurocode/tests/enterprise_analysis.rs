@@ -83,6 +83,7 @@ fn hub_request(root: &Path) -> joey_neurocode::CodingRequest {
         active_symbols: vec![],
         project_root: root.to_path_buf(),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     }
 }
 

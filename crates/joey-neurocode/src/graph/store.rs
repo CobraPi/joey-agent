@@ -441,7 +441,7 @@ impl GraphStore {
         let sql = format!(
             "SELECT ca.* FROM code_artifacts_fts fts
              JOIN code_artifacts ca ON ca.id = fts.rowid
-             WHERE code_artifacts_fts MATCH ?1
+             WHERE code_artifacts_fts MATCH ?1 AND ca.status='Active'
              ORDER BY rank
              LIMIT {}",
             limit
@@ -460,9 +460,11 @@ impl GraphStore {
     ) -> rusqlite::Result<Vec<(NodeId, EdgeKind)>> {
         let mut rows = match kind_filter {
             Some(k) => {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT to_id, edge_kind FROM graph_edges WHERE from_id=?1 AND edge_kind=?2")?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT to_id, edge_kind FROM graph_edges
+                     WHERE from_id=?1 AND edge_kind=?2
+                       AND to_id IN (SELECT id FROM code_artifacts WHERE status='Active')",
+                )?;
                 let r = stmt.query_map(params![from as i64, k.as_str()], |row| {
                     let to: i64 = row.get(0)?;
                     let kind_str: String = row.get(1)?;
@@ -471,9 +473,11 @@ impl GraphStore {
                 r.filter_map(Result::ok).collect::<Vec<_>>()
             }
             None => {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT to_id, edge_kind FROM graph_edges WHERE from_id=?1")?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT to_id, edge_kind FROM graph_edges
+                     WHERE from_id=?1
+                       AND to_id IN (SELECT id FROM code_artifacts WHERE status='Active')",
+                )?;
                 let r = stmt.query_map(params![from as i64], |row| {
                     let to: i64 = row.get(0)?;
                     let kind_str: String = row.get(1)?;
@@ -495,9 +499,11 @@ impl GraphStore {
     ) -> rusqlite::Result<Vec<(NodeId, EdgeKind)>> {
         let rows = match kind_filter {
             Some(k) => {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT from_id, edge_kind FROM graph_edges WHERE to_id=?1 AND edge_kind=?2")?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT from_id, edge_kind FROM graph_edges
+                     WHERE to_id=?1 AND edge_kind=?2
+                       AND from_id IN (SELECT id FROM code_artifacts WHERE status='Active')",
+                )?;
                 let r = stmt.query_map(params![to as i64, k.as_str()], |row| {
                     let from: i64 = row.get(0)?;
                     let kind_str: String = row.get(1)?;
@@ -506,9 +512,11 @@ impl GraphStore {
                 r.filter_map(Result::ok).collect::<Vec<_>>()
             }
             None => {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT from_id, edge_kind FROM graph_edges WHERE to_id=?1")?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT from_id, edge_kind FROM graph_edges
+                     WHERE to_id=?1
+                       AND from_id IN (SELECT id FROM code_artifacts WHERE status='Active')",
+                )?;
                 let r = stmt.query_map(params![to as i64], |row| {
                     let from: i64 = row.get(0)?;
                     let kind_str: String = row.get(1)?;
@@ -544,10 +552,21 @@ impl GraphStore {
             return Ok(exact);
         }
         // Suffix match on path components, longest-path first for stability.
-        let like = format!("%{}", path.trim_start_matches("./"));
+        // Escape LIKE wildcards in the (user-influenced) path so `%` and `_`
+        // match literally instead of acting as wildcards; `ESCAPE '\'`
+        // activates the escapes. The LEADING `%` stays a wildcard by design
+        // (it IS the suffix match). Backslashes are escaped first so the
+        // escapes just inserted are not themselves escaped again.
+        let like = format!(
+            "%{}",
+            path.trim_start_matches("./")
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
         let mut stmt = self.conn.prepare(
             "SELECT * FROM code_artifacts
-             WHERE source_path LIKE ?1
+             WHERE source_path LIKE ?1 ESCAPE '\\'
                AND kind IN ('Class','Interface','Enum','PegaRule')
                AND status='Active'
              ORDER BY LENGTH(source_path) ASC LIMIT 20",
@@ -1011,6 +1030,104 @@ mod tests {
         let results = store.query_fts("UserRepository", 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].fqcn, "com.example.UserRepository");
+    }
+
+    #[test]
+    fn tombstoned_nodes_hidden_from_fts_and_traverse() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let hub = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "com.ex.Hub".into(),
+            "com.ex".into(),
+            "src/Hub.java".into(),
+        );
+        let client = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "com.ex.Client".into(),
+            "com.ex".into(),
+            "src/Client.java".into(),
+        );
+        let hub_id = store.upsert_node(&hub).unwrap();
+        let client_id = store.upsert_node(&client).unwrap();
+        store.upsert_edge(client_id, hub_id, EdgeKind::Injects).unwrap();
+
+        // Both visible while Active.
+        assert!(!store.query_fts("Hub", 10).unwrap().is_empty());
+        assert_eq!(store.traverse_from(client_id, None).unwrap().len(), 1);
+        assert_eq!(store.traverse_to(hub_id, None).unwrap().len(), 1);
+
+        // Tombstone the client (edges are NOT purged — minimal fix).
+        assert_eq!(store.set_status_for_path("src/Client.java", "Deleted").unwrap(), 1);
+
+        // Deleted node no longer FTS-matches...
+        assert!(
+            store.query_fts("Client", 10).unwrap().is_empty(),
+            "Deleted nodes must not match FTS"
+        );
+        // ...and traversal hides edges pointing at it in BOTH directions.
+        assert!(
+            store.traverse_to(hub_id, None).unwrap().is_empty(),
+            "edges from a Deleted node must not surface via traverse_to"
+        );
+        // Edges out of a still-Active node to a Deleted one are hidden too.
+        assert_eq!(store.set_status_for_path("src/Hub.java", "Deleted").unwrap(), 1);
+        assert!(
+            store.traverse_from(client_id, None).unwrap().is_empty(),
+            "edges into a Deleted node must not surface via traverse_from"
+        );
+        // Reactivation (re-ingest) restores visibility.
+        assert_eq!(store.set_status_for_path("src/Client.java", "Active").unwrap(), 1);
+        assert_eq!(store.set_status_for_path("src/Hub.java", "Active").unwrap(), 1);
+        assert_eq!(store.traverse_from(client_id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn nodes_by_source_path_escapes_like_wildcards() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let plain = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "com.ex.Plain".into(),
+            "com.ex".into(),
+            "src/Plain.java".into(),
+        );
+        // Paths whose names contain LIKE wildcard characters.
+        let percent = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "com.ex.Pct".into(),
+            "com.ex".into(),
+            "src/100%.java".into(),
+        );
+        let underscore = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "com.ex.Und".into(),
+            "com.ex".into(),
+            "src/my_file.java".into(),
+        );
+        store.upsert_node(&plain).unwrap();
+        store.upsert_node(&percent).unwrap();
+        store.upsert_node(&underscore).unwrap();
+
+        // A literal `%` in the query must match ONLY the literal path, not
+        // every path (unescaped, `%100%.java` matches everything).
+        let hits = store.nodes_by_source_path("100%.java").unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "literal % must not act as a wildcard: {:?}",
+            hits.iter().map(|n| n.source_path.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(hits[0].source_path, "src/100%.java");
+
+        // A literal `_` must match ONLY the literal path (unescaped, `_` is
+        // a single-char wildcard — `my_file.java` would also hit `myXfile.java`).
+        let hits = store.nodes_by_source_path("my_file.java").unwrap();
+        assert_eq!(hits.len(), 1, "literal _ must not act as a wildcard");
+        assert_eq!(hits[0].source_path, "src/my_file.java");
+
+        // Suffix matching still works for an escaped-free query.
+        let hits = store.nodes_by_source_path("Plain.java").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_path, "src/Plain.java");
     }
 
     #[test]

@@ -119,6 +119,10 @@ pub struct AnalysisEngine {
     /// it in addition to the in-memory buffer. `None` keeps the engine
     /// behaving exactly as before (additive).
     attached_store: Option<Arc<Mutex<crate::memory::outcomes::OutcomeStore>>>,
+    /// Engine-level acceptance criteria (feature-scope wiring): appended
+    /// (additive, deduped) to every verification plan this engine builds.
+    /// Default empty — an empty store leaves plans unchanged.
+    acceptance_criteria: Vec<String>,
 }
 
 impl AnalysisEngine {
@@ -146,6 +150,7 @@ impl AnalysisEngine {
                 })
                 .collect(),
             risk_triggered_review: false,
+            acceptance_criteria: Vec::new(),
         };
         Self {
             classifier,
@@ -154,7 +159,21 @@ impl AnalysisEngine {
             base_verification,
             outcomes: Mutex::new(OutcomeMemoryBuffer::default()),
             attached_store: None,
+            acceptance_criteria: Vec::new(),
         }
+    }
+
+    /// Set the engine-level acceptance criteria store (feature-scope
+    /// wiring): these are appended to every verification plan built by
+    /// [`Self::analyze`] / [`Self::verification_for`]. Replaces the
+    /// previous store contents.
+    pub fn set_acceptance_criteria(&mut self, criteria: Vec<String>) {
+        self.acceptance_criteria = criteria;
+    }
+
+    /// The stored engine-level acceptance criteria (empty by default).
+    pub fn acceptance_criteria(&self) -> &[String] {
+        &self.acceptance_criteria
     }
 
     /// T028 (US7): attach the SQLite outcome store. record_outcome then
@@ -287,8 +306,18 @@ impl EnterpriseTaskAnalyzer for AnalysisEngine {
         };
 
         // (ix) Scoped verification; the review flag follows the ASSESSED
-        // risk level, set explicitly after scoping.
-        let mut verification = self.base_verification.scoped(&modules);
+        // risk level, set explicitly after scoping. When target resolution
+        // produced NO modules (no active_file / nothing resolved — the
+        // common path), `scoped(&[])` would drop every step; distinguish
+        // that from a genuine narrow-to-none resolution by falling back to
+        // the unscoped base plan. Acceptance criteria from the engine-level
+        // store are appended (additive only, deduped).
+        let mut verification = if modules.is_empty() {
+            self.base_verification.clone()
+        } else {
+            self.base_verification.scoped(&modules)
+        };
+        verification = verification.with_acceptance_criteria(self.acceptance_criteria.clone());
         verification.risk_triggered_review = risk.level == RiskLevel::High;
 
         TaskAnalysis {
@@ -410,7 +439,14 @@ impl EnterpriseTaskAnalyzer for AnalysisEngine {
 
     fn verification_for(&self, task: &AnalysisTask) -> VerificationPlan {
         let modules = modules_of_paths(&task.write_set);
-        let mut plan = self.base_verification.scoped(&modules);
+        let mut plan = if modules.is_empty() {
+            // No resolvable modules (empty/unresolved write set): the
+            // unscoped base plan, not `scoped(&[])` which drops every step.
+            self.base_verification.clone()
+        } else {
+            self.base_verification.scoped(&modules)
+        };
+        plan = plan.with_acceptance_criteria(self.acceptance_criteria.clone());
         plan.risk_triggered_review = task.risk == RiskLevel::High;
         plan
     }
@@ -624,6 +660,7 @@ mod tests {
             active_symbols: vec![],
             project_root: root.to_path_buf(),
             token_budget_hint: 0,
+            scope_files: vec![],
         }
     }
 
@@ -783,6 +820,93 @@ mod tests {
         };
         assert!(engine.verification_for(&task(RiskLevel::High)).risk_triggered_review);
         assert!(!engine.verification_for(&task(RiskLevel::Low)).risk_triggered_review);
+    }
+
+    /// An engine with configured verify steps but NO resolvable modules
+    /// (no active_file, empty graph targets) must fall back to the
+    /// UNSCOPED base plan — `scoped(&[])` would drop every step.
+    #[test]
+    fn analyze_with_no_resolvable_modules_keeps_base_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut config = NeuroCodeConfig::default();
+        config.verify.steps = vec![crate::config::VerifyStepConfig {
+            name: "core-tests".to_string(),
+            command: "cargo test -p joey-core".to_string(),
+            parse: "plain".to_string(),
+            timeout_sec: 120,
+        }];
+        let (mut engine, _shared) = make_engine(root);
+        // Rebuild with the step config (make_engine uses Default config).
+        engine = AnalysisEngine::new(
+            ComplexityClassifier::default().with_graph(Arc::new(Mutex::new(
+                DependencyGraph::open_in_memory().unwrap(),
+            ))),
+            None,
+            root.to_path_buf(),
+            &config,
+        );
+
+        // No active_file and no graph → no modules resolvable.
+        let analysis = engine.analyze(&make_request(root, "refactor something", None));
+        assert_eq!(analysis.verification.steps.len(), 1, "unscoped base plan keeps its steps");
+        assert_eq!(analysis.verification.steps[0].name, "core-tests");
+    }
+
+    /// Engine-level criteria flow into built plans (analyze + verification_for),
+    /// appended additively; an empty store leaves plans unchanged.
+    #[test]
+    fn acceptance_criteria_store_flows_into_built_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut config = NeuroCodeConfig::default();
+        config.verify.steps = vec![crate::config::VerifyStepConfig {
+            name: "core-tests".to_string(),
+            command: "cargo test -p joey-core".to_string(),
+            parse: "plain".to_string(),
+            timeout_sec: 120,
+        }];
+        let graph = Arc::new(Mutex::new(DependencyGraph::open_in_memory().unwrap()));
+        let mut engine = AnalysisEngine::new(
+            ComplexityClassifier::default().with_graph(graph.clone()),
+            Some(graph),
+            root.to_path_buf(),
+            &config,
+        );
+
+        // Empty store (default): plan unchanged — no criteria, base steps.
+        assert!(engine.acceptance_criteria().is_empty());
+        let analysis = engine.analyze(&make_request(root, "refactor the hub service", None));
+        assert!(analysis.verification.acceptance_criteria.is_empty());
+        assert_eq!(analysis.verification.steps.len(), 1);
+
+        // Stored criteria flow into the analyzed plan.
+        engine.set_acceptance_criteria(vec![
+            "given a scoped change".to_string(),
+            "then criteria ride along".to_string(),
+        ]);
+        assert_eq!(engine.acceptance_criteria().len(), 2);
+        let analysis = engine.analyze(&make_request(root, "refactor the hub service", None));
+        assert_eq!(
+            analysis.verification.acceptance_criteria,
+            vec![
+                "given a scoped change".to_string(),
+                "then criteria ride along".to_string(),
+            ]
+        );
+
+        // ...and into verification_for plans as well.
+        let task = AnalysisTask {
+            id: "t1".to_string(),
+            objective: "o".to_string(),
+            dependencies: vec![],
+            read_set: vec![],
+            write_set: vec![PathBuf::from("src/a.rs")],
+            risk: RiskLevel::Low,
+            verification: VerificationPlan::default(),
+        };
+        let plan = engine.verification_for(&task);
+        assert_eq!(plan.acceptance_criteria.len(), 2);
     }
 
     #[test]
@@ -1033,6 +1157,7 @@ mod tests {
             verification: VerificationPlan {
                 steps: vec![],
                 risk_triggered_review: true,
+                acceptance_criteria: Vec::new(),
             },
         };
         let json = serde_json::to_string(&analysis).unwrap();

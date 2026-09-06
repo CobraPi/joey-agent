@@ -266,6 +266,8 @@ Every key in `DEFAULT_CONFIG_YAML` (the embedded defaults; user keys merge on to
 | `hypercode.max_workstreams` | `0` | Workstream cap |
 | `hypercode.child_tool_delay` | `0.0` | Delay between child tool calls |
 | `hypercode.explorer` / `hypercode.implementor` | `{}` | Role-specific overrides |
+| `hypercode.reviewer.enabled` | `false` | Risk-review subagent off by default; high-risk graphs record a notice-and-proceed instead |
+| `hypercode.reviewer` | `{}` | Reviewer per-provider overrides (model falls back to implementor → explorer → parent) |
 | `hypercode.team.enabled` | `false` | Team orchestration off |
 | `hypercode.team.lead_model` | `""` | Team lead model |
 | `hypercode.team.max_members` | `8` | Max team members |

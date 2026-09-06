@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use joey_agent_core::AgentConfig;
 use joey_core::Config;
-use joey_orchestration::{ManagerConfig, SubagentManager, TaskSpec};
+use joey_orchestration::{
+    DelegationRequest, ManagerConfig, SubagentManager, TaskSpec,
+};
 use joey_tools::ToolRegistry;
 use joey_tools::context::ToolContext;
 use joey_tools::registry::{Tool, ToolResult};
@@ -182,6 +184,9 @@ struct ServerProbe {
     /// Per-connection start time (millis since server bind), in
     /// completion order of the body read.
     starts_ms: Arc<Mutex<Vec<u64>>>,
+    /// Per-connection end time (millis since server bind), recorded after
+    /// the response is written — in completion order of the connection.
+    ends_ms: Arc<Mutex<Vec<u64>>>,
     in_flight: Arc<AtomicUsize>,
     max_in_flight: Arc<AtomicUsize>,
     epoch: Instant,
@@ -218,22 +223,25 @@ async fn serve_conn(mut stream: TcpStream, p: ServerProbe) {
     );
     let _ = stream.write_all(resp.as_bytes()).await;
     let _ = stream.shutdown().await;
+    p.ends_ms.lock().unwrap().push(p.epoch.elapsed().as_millis() as u64);
     p.in_flight.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// Bind a scripted mock provider; returns (base_url, start-time log,
-/// max observed in-flight requests).
+/// end-time log, max observed in-flight requests).
 async fn spawn_scripted_server(
     steps: Vec<ScriptedFinal>,
-) -> (String, Arc<Mutex<Vec<u64>>>, Arc<AtomicUsize>) {
+) -> (String, Arc<Mutex<Vec<u64>>>, Arc<Mutex<Vec<u64>>>, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let starts_ms: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let ends_ms: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
     let queue = Arc::new(Mutex::new(VecDeque::from(steps)));
     let epoch = Instant::now();
     let ret_starts = starts_ms.clone();
+    let ret_ends = ends_ms.clone();
     let ret_max = max_in_flight.clone();
     tokio::spawn(async move {
         loop {
@@ -243,6 +251,7 @@ async fn spawn_scripted_server(
             let probe = ServerProbe {
                 queue: queue.clone(),
                 starts_ms: starts_ms.clone(),
+                ends_ms: ends_ms.clone(),
                 in_flight: in_flight.clone(),
                 max_in_flight: max_in_flight.clone(),
                 epoch,
@@ -252,7 +261,7 @@ async fn spawn_scripted_server(
             });
         }
     });
-    (format!("http://{addr}"), ret_starts, ret_max)
+    (format!("http://{addr}"), ret_starts, ret_ends, ret_max)
 }
 
 // A trivial tool the scripted child can call (registered into the base
@@ -319,7 +328,7 @@ async fn no_chunk_barrier_slow_child_does_not_block_later_children() {
         ScriptedFinal { delay_ms: 80, text: "fast-b" },
         ScriptedFinal { delay_ms: 80, text: "fast-c" },
     ];
-    let (base_url, starts_ms, max_in_flight) = spawn_scripted_server(steps).await;
+    let (base_url, starts_ms, _ends_ms, max_in_flight) = spawn_scripted_server(steps).await;
 
     let mgr = SubagentManager::new(ManagerConfig {
         max_concurrent_children: 2,
@@ -392,5 +401,177 @@ async fn no_chunk_barrier_slow_child_does_not_block_later_children() {
     );
 
     // All provider-request permits return after the wave.
+    assert_eq!(mgr.semaphore().available_permits(), 8);
+}
+
+/// Manager-global child-slot pool across PATHS: a BACKGROUND child (spawned
+/// via the background wave) and a blocking batch draw from the SAME pool,
+/// so together they can never exceed `max_concurrent_children`. Before the
+/// fix, background children never acquired a child slot, so a background
+/// child + a blocking wave oversubscribed the cap.
+#[tokio::test]
+async fn child_slot_pool_caps_background_plus_blocking_batch() {
+    // cap 2: the background child holds one slot for 600ms; the blocking
+    // wave of 4 may run only ONE child alongside it until it finishes.
+    let steps = vec![
+        ScriptedFinal { delay_ms: 600, text: "bg-holds-slot" }, // background child (first connection)
+        ScriptedFinal { delay_ms: 80, text: "fast-1" },
+        ScriptedFinal { delay_ms: 80, text: "fast-2" },
+        ScriptedFinal { delay_ms: 80, text: "fast-3" },
+        ScriptedFinal { delay_ms: 80, text: "fast-4" },
+    ];
+    let (base_url, starts_ms, ends_ms, max_in_flight) = spawn_scripted_server(steps).await;
+
+    let mgr = SubagentManager::new(ManagerConfig {
+        max_concurrent_children: 2,
+        // Wide request pool so the child-slot semaphore is the ONLY
+        // binding constraint (mirrors the tests above).
+        max_concurrent_requests: 8,
+        ..Default::default()
+    });
+
+    let mut base = ToolRegistry::new();
+    base.register(Arc::new(EchoTool));
+
+    let cfg = agent_config(base_url);
+    let tree = Config::defaults();
+
+    // Dispatch ONE background child first.
+    let ctx = ToolContext::new(std::env::temp_dir(), Config::defaults(), "cap-test");
+    let req = DelegationRequest::single("bg-holds-slot");
+    let _handle = joey_orchestration::background::dispatch_background_with_notices(
+        &mgr, &req, &cfg, &tree, &base, None, &ctx,
+    );
+
+    // Wait until its provider call has STARTED — it holds a child slot
+    // from this point until its 600ms response lands.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while starts_ms.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "background child never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Now run a blocking batch of 4 through the SAME manager.
+    let tasks: Vec<TaskSpec> = (0..4)
+        .map(|i| TaskSpec {
+            goal: format!("Cap-task-{i}"),
+            context: None,
+            model: None,
+            toolsets: vec![],
+            role: None,
+            subagent_type: None,
+            background: false,
+            budgets: None,
+        })
+        .collect();
+    let results = mgr
+        .dispatch_batch(&tasks, None, &[], &cfg, &tree, &base, None)
+        .await;
+    assert_eq!(results.len(), 4);
+    for (i, r) in results.iter().enumerate() {
+        assert!(
+            r.success,
+            "batch child {i} must succeed against the mock provider, error: {:?}",
+            r.error
+        );
+    }
+
+    // The background child + the blocking wave never exceeded the cap of 2
+    // concurrently-running children...
+    let observed_max = max_in_flight.load(Ordering::SeqCst);
+    assert!(
+        observed_max <= 2,
+        "background + blocking must respect the cap of 2, observed {observed_max}"
+    );
+    // ...and the pool genuinely ran 2-wide (background child + one batch child).
+    assert!(
+        observed_max >= 2,
+        "expected genuine 2-wide overlap, observed {observed_max}"
+    );
+
+    // All provider-request permits return once every child (the background
+    // one included) has finished.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ends_ms.lock().unwrap().len() < 5 || mgr.semaphore().available_permits() != 8 {
+        assert!(
+            Instant::now() < deadline,
+            "permits never returned: ends={:?} available={}",
+            ends_ms.lock().unwrap().len(),
+            mgr.semaphore().available_permits()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Manager-global child-slot pool: with `max_concurrent_children: 1`, TWO
+/// concurrent `dispatch_requests` calls (one child each — the shape of
+/// multiple `delegate_task` tool calls in one assistant message) must
+/// serialize on the SAME slot pool: the second child's turn loop (observed
+/// as its mock provider request) starts only AFTER the first child's ends.
+/// A per-call local semaphore would give each call its own full pool and
+/// both children would start together — this pins the global pool.
+#[tokio::test]
+async fn child_slot_pool_is_global_across_concurrent_dispatch_calls() {
+    // Child A's provider request is slow; child B's is fast. Both calls
+    // are issued concurrently (tokio::join!).
+    let steps = vec![
+        ScriptedFinal { delay_ms: 400, text: "call-a" }, // first to arrive
+        ScriptedFinal { delay_ms: 50, text: "call-b" },  // second
+    ];
+    let (base_url, starts_ms, ends_ms, max_in_flight) = spawn_scripted_server(steps).await;
+
+    let mgr = SubagentManager::new(ManagerConfig {
+        max_concurrent_children: 1,
+        // Wide request pool so the child-slot semaphore is the ONLY
+        // binding constraint (mirrors no_chunk_barrier above).
+        max_concurrent_requests: 8,
+        ..Default::default()
+    });
+
+    let mut base = ToolRegistry::new();
+    base.register(Arc::new(EchoTool));
+
+    let cfg = agent_config(base_url);
+    let tree = Config::defaults();
+    let req = |goal: &'static str| DelegationRequest::single(goal);
+    let requests_a = [req("global-slot-a")];
+    let requests_b = [req("global-slot-b")];
+
+    let (results_a, results_b) = tokio::join!(
+        mgr.dispatch_requests(&requests_a, &cfg, &tree, &base, None),
+        mgr.dispatch_requests(&requests_b, &cfg, &tree, &base, None),
+    );
+
+    for (label, results) in [("A", &results_a), ("B", &results_b)] {
+        assert_eq!(results.len(), 1, "call {label} returns one result");
+        assert!(
+            results[0].success,
+            "call {label} child must succeed against the mock provider, error: {:?}",
+            results[0].error
+        );
+    }
+
+    // Global slot enforcement: exactly one child turn loop ran at a time.
+    let observed_max = max_in_flight.load(Ordering::SeqCst);
+    assert_eq!(
+        observed_max, 1,
+        "one child slot ⇒ the two dispatch calls must never overlap their turn loops"
+    );
+
+    // Relative timing: the second child's provider request starts only
+    // AFTER the first child's ends (both measured against the same server
+    // epoch). The queue order fixes which start pairs with which end.
+    let starts = starts_ms.lock().unwrap().clone();
+    let ends = ends_ms.lock().unwrap().clone();
+    assert_eq!(starts.len(), 2, "both children made their provider call: {starts:?}");
+    assert_eq!(ends.len(), 2, "both provider calls completed: {ends:?}");
+    // starts[0]/ends[0] = first-served connection (call-a, 400ms); the
+    // queued second connection (call-b) must start after it ENDED.
+    assert!(
+        starts[1] >= ends[0],
+        "second child must start only after the first ended: starts={starts:?} ends={ends:?}"
+    );
+
+    // All slots/permits return after both calls.
     assert_eq!(mgr.semaphore().available_permits(), 8);
 }

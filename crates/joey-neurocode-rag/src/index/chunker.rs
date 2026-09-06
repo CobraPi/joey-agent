@@ -305,13 +305,16 @@ fn contextual_prefix(source_path: &str, extraction: &SourceExtraction, max_impor
 /// graph is keyed `(fqcn, kind, source_path)`; match on exact fqcn or an
 /// ends-with-`.name` qualified form within the same file. `None` when not
 /// found (parse-only chunk) — acceptable: the DDL leaves the FK nullable.
+/// `ORDER BY id` keeps the LIMIT 1 deterministic (an unspecified row
+/// choice would make chunk FKs nondeterministic across runs when multiple
+/// rows match the LIKE form).
 fn find_artifact_id(store: &GraphStore, source_path: &str, symbol: &str) -> Option<u64> {
     store
         .conn()
         .query_row(
             "SELECT id FROM code_artifacts
              WHERE source_path = ?1 AND (fqcn = ?2 OR fqcn LIKE ?3)
-             LIMIT 1",
+             ORDER BY id LIMIT 1",
             rusqlite::params![source_path, symbol, format!("%.{}", symbol)],
             |row| row.get::<_, i64>(0),
         )

@@ -394,7 +394,10 @@ impl TaskGraph {
         }
     }
 
-    /// Tasks with status `Pending` whose dependencies are all `Completed`.
+    /// Tasks with status `Pending` whose dependencies are all `Completed`
+    /// or `Skipped` (a skipped dependency satisfies readiness exactly as
+    /// `is_blocked` treats it — otherwise dependents of skipped tasks are
+    /// permanently wedged).
     ///
     /// Deterministic order: topological (Kahn with alphabetical tie-break),
     /// then id ascending within the same depth; tasks with no dependencies
@@ -453,10 +456,10 @@ impl TaskGraph {
             .filter(|(_, node)| node.status == TaskStatus::Pending)
             .filter(|(_, node)| {
                 node.dependencies.iter().all(|d| {
-                    self.nodes
-                        .get(d)
-                        .map(|dn| dn.status == TaskStatus::Completed)
-                        .unwrap_or(false)
+                    matches!(
+                        self.nodes.get(d).map(|dn| dn.status),
+                        Some(TaskStatus::Completed) | Some(TaskStatus::Skipped)
+                    )
                 })
             })
             .map(|(id, _)| (*depth.get(id).unwrap_or(&0), id.clone()))
@@ -622,12 +625,19 @@ impl TaskGraph {
             .and_then(|b| b.as_str())
             .unwrap_or("")
             .to_string();
-        let empty_tasks: Vec<serde_json::Value> = Vec::new();
-        let tasks = obj
-            .get("tasks")
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or(empty_tasks);
+        // Strict means strict: `tasks` must be present AND an array — a
+        // document missing it (or carrying a non-array) is NOT an empty
+        // valid graph.
+        let tasks: Vec<serde_json::Value> = match obj.get("tasks") {
+            Some(serde_json::Value::Array(a)) => a.clone(),
+            _ => {
+                return Err(vec![ValidationError {
+                    task_ids: vec![],
+                    rule: rules::INVALID_FORMAT.to_string(),
+                    detail: "missing or non-array 'tasks'".to_string(),
+                }]);
+            }
+        };
 
         let mut errors: Vec<ValidationError> = Vec::new();
         let mut nodes: BTreeMap<TaskId, TaskNode> = BTreeMap::new();
@@ -693,6 +703,16 @@ impl TaskGraph {
                 }
             }
             if !path_ok {
+                continue;
+            }
+            // Duplicate task id: a silent overwrite would drop the first
+            // node's objective/deps entirely — reject instead.
+            if nodes.contains_key(&task_id) {
+                errors.push(ValidationError {
+                    task_ids: vec![task_id.to_string()],
+                    rule: rules::SCHEMA.to_string(),
+                    detail: format!("duplicate task id {task_id}"),
+                });
                 continue;
             }
             nodes.insert(task_id, node);
@@ -1173,6 +1193,28 @@ mod tests {
     }
 
     #[test]
+    fn ready_nodes_accepts_skipped_dependencies() {
+        // A Skipped dependency satisfies readiness exactly like Completed
+        // (mirrors is_blocked) — otherwise dependents of skipped tasks are
+        // permanently wedged.
+        let mut g = graph(vec![node("a", &[]), node("b", &["a"])]);
+        g.node_mut(&id("a")).unwrap().status = TaskStatus::Skipped;
+        assert!(!g.is_blocked(&id("b")), "skipped dep must not block");
+        assert_eq!(g.ready_nodes(), vec![id("b")]);
+
+        // Completed dep keeps its existing readiness.
+        let mut g = graph(vec![node("a", &[]), node("b", &["a"])]);
+        g.node_mut(&id("a")).unwrap().status = TaskStatus::Completed;
+        assert_eq!(g.ready_nodes(), vec![id("b")]);
+
+        // Failed dep still blocks.
+        let mut g = graph(vec![node("a", &[]), node("b", &["a"])]);
+        g.node_mut(&id("a")).unwrap().status = TaskStatus::Failed;
+        assert!(g.is_blocked(&id("b")));
+        assert_eq!(g.ready_nodes(), Vec::<TaskId>::new());
+    }
+
+    #[test]
     fn ready_nodes_diamond() {
         let mut g = graph(vec![
             node("a", &[]),
@@ -1474,6 +1516,49 @@ mod tests {
             g.node(&id("task-auth")).unwrap().isolation,
             IsolationMode::SharedCheckout
         );
+    }
+
+    #[test]
+    fn strict_json_rejects_missing_or_non_array_tasks() {
+        // Missing `tasks` key is NOT an empty valid graph (strict format).
+        let mut v: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        v.as_object_mut().unwrap().remove("tasks");
+        let json = serde_json::to_string(&v).unwrap();
+        let errs = TaskGraph::from_strict_json(&json, &plan_root()).unwrap_err();
+        assert_eq!(errs.len(), 1, "one error for missing tasks: {:?}", errs);
+        assert_eq!(errs[0].rule, rules::INVALID_FORMAT);
+        assert_eq!(errs[0].detail, "missing or non-array 'tasks'");
+
+        // Non-array `tasks` is rejected the same way.
+        let mut v: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        v["tasks"] = serde_json::json!({ "not": "an array" });
+        let json = serde_json::to_string(&v).unwrap();
+        let errs = TaskGraph::from_strict_json(&json, &plan_root()).unwrap_err();
+        assert_eq!(errs.len(), 1, "one error for non-array tasks: {:?}", errs);
+        assert_eq!(errs[0].rule, rules::INVALID_FORMAT);
+        assert_eq!(errs[0].detail, "missing or non-array 'tasks'");
+
+        // An EMPTY array remains a valid empty graph.
+        let mut v: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        v["tasks"] = serde_json::json!([]);
+        let json = serde_json::to_string(&v).unwrap();
+        let g = TaskGraph::from_strict_json(&json, &plan_root()).expect("empty tasks array is valid");
+        assert!(g.nodes.is_empty());
+    }
+
+    #[test]
+    fn strict_json_rejects_duplicate_task_id() {
+        // A second entry with the same id must be rejected, not silently
+        // overwrite the first node.
+        let mut v: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        let dup = v["tasks"][0].clone();
+        v["tasks"].as_array_mut().unwrap().push(dup);
+        let json = serde_json::to_string(&v).unwrap();
+        let errs = TaskGraph::from_strict_json(&json, &plan_root()).unwrap_err();
+        let schema = rule_errors(&errs, rules::SCHEMA);
+        assert_eq!(schema.len(), 1, "errors: {:?}", errs);
+        assert_eq!(schema[0].task_ids, vec!["task-auth".to_string()]);
+        assert_eq!(schema[0].detail, "duplicate task id task-auth");
     }
 
     #[test]

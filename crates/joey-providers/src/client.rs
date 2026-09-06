@@ -244,7 +244,20 @@ impl ProviderClient {
         let auth = self.copilot_auth.as_ref().expect("checked above");
         auth.invalidate();
         let credentials = auth.credentials(&self.http).await?;
-        Ok(retry.bearer_auth(credentials.token).send().await?)
+        // The cloned builder still carries the stale `Authorization: Bearer`
+        // header set in copilot_headers(); reqwest's bearer_auth() APPENDS a
+        // header instead of replacing, so a plain retry would go out with
+        // TWO Authorization headers and servers read the stale one — the
+        // refresh could never succeed. Build the request, strip the old
+        // header, attach the fresh token, then execute.
+        let mut req = retry.build()?;
+        req.headers_mut().remove(reqwest::header::AUTHORIZATION);
+        req.headers_mut().insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", credentials.token))
+                .map_err(|e| ProviderError::Other(e.to_string()))?,
+        );
+        Ok(self.http.execute(req).await?)
     }
 
     // ── OpenAI Chat Completions ──────────────────────────────────────────────
@@ -332,33 +345,60 @@ impl ProviderClient {
         let mut active_slot_by_idx: std::collections::HashMap<u64, usize> = Default::default();
 
         let mut buf = String::new();
+        let mut sse = SseDataBuffer::default();
         let mut stream = resp.bytes_stream();
         let read_timeout = Duration::from_secs(stream_read_timeout_secs());
+        let mut stream_done = false;
         loop {
-            let next = tokio::time::timeout(read_timeout, stream.next()).await;
-            let chunk = match next {
-                Err(_) => {
-                    return Err(ProviderError::Timeout(format!(
-                        "stream stalled: no chunk within {}s",
-                        read_timeout.as_secs()
-                    )))
+            if stream_done {
+                // Flush any final event that lacked a trailing blank line
+                // through the normal parser (so its deltas emit StreamEvents
+                // like the in-loop path), then exit.
+                if !buf.trim().is_empty() && !buf.ends_with('\n') {
+                    buf.push('\n');
                 }
-                Ok(None) => break,
-                Ok(Some(c)) => c.map_err(|e| ProviderError::Connection(e.to_string()))?,
-            };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+                if !sse.is_empty() {
+                    buf.push('\n');
+                }
+            } else {
+                let next = tokio::time::timeout(read_timeout, stream.next()).await;
+                let chunk = match next {
+                    Err(_) => {
+                        return Err(ProviderError::Timeout(format!(
+                            "stream stalled: no chunk within {}s",
+                            read_timeout.as_secs()
+                        )))
+                    }
+                    Ok(None) => {
+                        stream_done = true;
+                        continue;
+                    }
+                    Ok(Some(c)) => c.map_err(|e| ProviderError::Connection(e.to_string()))?,
+                };
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+            }
 
             while let Some(nl) = buf.find('\n') {
                 let line = buf[..nl].trim().to_string();
                 buf.drain(..=nl);
-                let Some(data) = line.strip_prefix("data:") else {
+                if let Some(data) = line.strip_prefix("data:") {
+                    // Consecutive data lines are ONE event (SSE spec joins
+                    // them with '\n'); accumulate until the boundary.
+                    sse.push(data.trim());
+                    continue;
+                }
+                if !line.is_empty() {
+                    // Other field lines (event:/id:/comments) don't end
+                    // data accumulation; only a blank line dispatches.
+                    continue;
+                }
+                let Some(data) = sse.take_joined() else {
                     continue;
                 };
-                let data = data.trim();
                 if data == "[DONE]" {
                     continue;
                 }
-                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                let Ok(v) = serde_json::from_str::<Value>(&data) else {
                     continue;
                 };
                 saw_event = true;
@@ -429,67 +469,10 @@ impl ProviderClient {
                     );
                 }
             }
-        }
-
-        // Final-line flush: a stream whose last event lacks a trailing
-        // newline leaves it in `buf` — usage/[DONE]/finish_reason would be
-        // silently dropped. Re-run the line parser over the remainder once.
-        if !buf.trim().is_empty() {
-            let line = buf.trim().to_string();
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-                if data != "[DONE]" {
-                    if let Ok(v) = serde_json::from_str::<Value>(data) {
-                        saw_event = true;
-                        if model.is_none() {
-                            model = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
-                        }
-                        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                            usage = parse_usage(u);
-                        }
-                        if let Some(choice) = v.get("choices").and_then(|c| c.get(0)) {
-                            if let Some(fr) = choice.get("finish_reason") {
-                                if let Some(s) = fr.as_str() {
-                                    finish = Some(FinishReason::from_wire(s));
-                                    saw_finish_string = true;
-                                } else if let Some(n) = fr.as_i64() {
-                                    finish = Some(FinishReason::from_wire(&n.to_string()));
-                                    saw_finish_string = true;
-                                }
-                            }
-                            if let Some(delta) = choice.get("delta") {
-                                if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
-                                    if !c.is_empty() {
-                                        content.push_str(c);
-                                    }
-                                }
-                                let r = delta
-                                    .get("reasoning_content")
-                                    .and_then(|r| r.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .or_else(|| {
-                                        delta
-                                            .get("reasoning")
-                                            .and_then(|r| r.as_str())
-                                            .filter(|s| !s.is_empty())
-                                    });
-                                if let Some(r) = r {
-                                    reasoning.push_str(r);
-                                }
-                                if let Some(tcs) =
-                                    delta.get("tool_calls").and_then(|t| t.as_array())
-                                {
-                                    accumulate_tool_calls(
-                                        &mut tool_accum,
-                                        tcs,
-                                        &mut last_id_at_idx,
-                                        &mut active_slot_by_idx,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+            // Stream exhausted and buffer drained — done (the flush above
+            // already ran the final unterminated event through the parser).
+            if stream_done && buf.trim().is_empty() && sse.is_empty() {
+                break;
             }
         }
 
@@ -726,24 +709,53 @@ impl ProviderClient {
         let mut calls: Vec<(Option<u64>, String, String, String, bool)> = Vec::new();
         let mut completed: Option<Value> = None;
         let mut buffer = String::new();
+        let mut sse = SseDataBuffer::default();
         let mut stream = response.bytes_stream();
         let read_timeout = Duration::from_secs(stream_read_timeout_secs());
-        while let Some(chunk) = tokio::time::timeout(read_timeout, stream.next())
-            .await
-            .map_err(|_| ProviderError::Timeout("Responses stream stalled".into()))?
-        {
-            let chunk = chunk.map_err(|e| ProviderError::Connection(e.to_string()))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+        let mut stream_done = false;
+        loop {
+            if stream_done {
+                // Flush any final event that lacked its trailing blank line
+                // through the normal parser (so its deltas emit StreamEvents
+                // like the in-loop path), then exit below.
+                if !buffer.trim().is_empty() && !buffer.ends_with('\n') {
+                    buffer.push('\n');
+                }
+                if !sse.is_empty() {
+                    buffer.push('\n');
+                }
+            } else {
+                let chunk = match tokio::time::timeout(read_timeout, stream.next())
+                    .await
+                    .map_err(|_| ProviderError::Timeout("Responses stream stalled".into()))?
+                {
+                    Some(chunk) => chunk.map_err(|e| ProviderError::Connection(e.to_string()))?,
+                    None => {
+                        stream_done = true;
+                        continue;
+                    }
+                };
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+            }
             while let Some(newline) = buffer.find('\n') {
                 let line = buffer[..newline].trim().to_string();
                 buffer.drain(..=newline);
-                let Some(raw) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                if raw.trim() == "[DONE]" {
+                if let Some(raw) = line.strip_prefix("data:") {
+                    // Consecutive data lines are ONE event (SSE spec joins
+                    // them with '\n'); accumulate until the boundary.
+                    sse.push(raw.trim());
                     continue;
                 }
-                let Ok(event) = serde_json::from_str::<Value>(raw.trim()) else {
+                if !line.is_empty() {
+                    continue;
+                }
+                let Some(raw) = sse.take_joined() else {
+                    continue;
+                };
+                if raw == "[DONE]" {
+                    continue;
+                }
+                let Ok(event) = serde_json::from_str::<Value>(&raw) else {
                     continue;
                 };
                 let output_index = event.get("output_index").and_then(Value::as_u64);
@@ -864,6 +876,11 @@ impl ProviderClient {
                     }
                     _ => {}
                 }
+            }
+            // Stream exhausted and buffer drained — done (the flush above
+            // already ran the final unterminated event through the parser).
+            if stream_done && buffer.trim().is_empty() && sse.is_empty() {
+                break;
             }
         }
         if let Some(value) = completed {
@@ -1001,14 +1018,19 @@ impl ProviderClient {
         let mut model: Option<String> = None;
 
         let mut buf = String::new();
+        let mut sse = SseDataBuffer::default();
         let mut stream = resp.bytes_stream();
         let read_timeout = Duration::from_secs(stream_read_timeout_secs());
         let mut stream_done = false;
         loop {
             if stream_done {
-                // Flush any final line that lacked a trailing newline
-                // (message_delta/usage) through the normal parser, then exit.
+                // Flush any final event that lacked its trailing blank line
+                // (message_delta/usage) through the normal parser — including
+                // its StreamEvent deltas — then exit.
                 if !buf.trim().is_empty() && !buf.ends_with('\n') {
+                    buf.push('\n');
+                }
+                if !sse.is_empty() {
                     buf.push('\n');
                 }
             } else {
@@ -1034,10 +1056,21 @@ impl ProviderClient {
             while let Some(nl) = buf.find('\n') {
                 let line = buf[..nl].trim().to_string();
                 buf.drain(..=nl);
-                let Some(data) = line.strip_prefix("data:") else {
+                if let Some(data) = line.strip_prefix("data:") {
+                    // Consecutive data lines are ONE event (SSE spec joins
+                    // them with '\n'); accumulate until the boundary.
+                    sse.push(data.trim());
+                    continue;
+                }
+                if !line.is_empty() {
+                    // Other field lines (event:/id:/comments) don't end
+                    // data accumulation; only a blank line dispatches.
+                    continue;
+                }
+                let Some(data) = sse.take_joined() else {
                     continue;
                 };
-                let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+                let Ok(v) = serde_json::from_str::<Value>(&data) else {
                     continue;
                 };
                 saw_event = true;
@@ -1155,7 +1188,7 @@ impl ProviderClient {
             }
             // Stream exhausted and buffer drained — done (the flush above
             // already ran the final unterminated line through the parser).
-            if stream_done && buf.trim().is_empty() {
+            if stream_done && buf.trim().is_empty() && sse.is_empty() {
                 break;
             }
         }
@@ -1295,6 +1328,36 @@ fn request_has_images(req: &ProviderRequest) -> bool {
             })
             .unwrap_or(false)
     })
+}
+
+/// Accumulator for one SSE event whose payload may span multiple `data:`
+/// lines (the SSE spec joins consecutive data lines of an event with
+/// `\n`). Payloads are stored pre-trim per line and joined at the event
+/// boundary (blank line) or at stream end, whichever comes first.
+#[derive(Default)]
+struct SseDataBuffer {
+    lines: Vec<String>,
+}
+
+impl SseDataBuffer {
+    fn push(&mut self, payload: &str) {
+        self.lines.push(payload.to_string());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Join the accumulated `data:` payloads with `\n` and clear the buffer.
+    /// Returns None when nothing was accumulated.
+    fn take_joined(&mut self) -> Option<String> {
+        if self.lines.is_empty() {
+            return None;
+        }
+        let joined = self.lines.join("\n");
+        self.lines.clear();
+        Some(joined)
+    }
 }
 
 /// Get-or-create the accumulator slot for output item index `idx` in a
@@ -2100,6 +2163,112 @@ mod tests {
             resp.reasoning.as_deref(),
             Some("upstream pair only ")
         );
+    }
+
+    /// SSE spec: an event's payload may be split across multiple `data:`
+    /// lines, joined with '\n' at the event boundary (blank line). Neither
+    /// line of the first event below parses as JSON alone — only the joined
+    /// payload does — and it must yield exactly ONE ContentDelta.
+    #[test]
+    fn chat_stream_multi_line_data_event_joins_into_one_delta() {
+        let body = concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\n",
+            "data: \"delta\":{\"content\":\"joined\"}}]}\n",
+            "\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" ok\"},\"finish_reason\":null}]}\n",
+            "\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "\n",
+            "data: [DONE]\n",
+            "\n",
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf); // drain the request
+            sock.write_all(body.as_bytes()).unwrap();
+            sock.flush().unwrap();
+        });
+        let profile = crate::profile::get_profile("copilot").unwrap();
+        let base = format!("http://{}", addr);
+        let client = ProviderClient::new(profile, Some(base), Some("ghu_test".into())).unwrap();
+        let req = ProviderRequest::new(
+            "claude-opus-5",
+            vec![crate::types::Message::user("hi")],
+        )
+        .streaming(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let resp = rt.block_on(client.stream(&req, tx)).expect("stream ok");
+        let mut content_deltas = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::ContentDelta(s) = ev {
+                content_deltas.push(s);
+            }
+        }
+        assert_eq!(
+            content_deltas,
+            vec!["joined".to_string(), " ok".to_string()],
+            "multi-line data event must join into exactly one delta"
+        );
+        assert_eq!(resp.content, "joined ok");
+    }
+
+    /// Flush path: a stream ending on a final `data:` line with no trailing
+    /// newline/blank line must still emit that delta as a StreamEvent — live
+    /// UI consumers must not lose the final chunk.
+    #[test]
+    fn chat_stream_flush_path_emits_final_delta_event() {
+        // Note: last line has NO trailing newline — it lives in the flush path.
+        let body = concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tail\"},\"finish_reason\":null}]}\n",
+            "\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final\"},\"finish_reason\":\"stop\"}]}",
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf); // drain the request
+            sock.write_all(body.as_bytes()).unwrap();
+            sock.flush().unwrap();
+        });
+        let profile = crate::profile::get_profile("copilot").unwrap();
+        let base = format!("http://{}", addr);
+        let client = ProviderClient::new(profile, Some(base), Some("ghu_test".into())).unwrap();
+        let req = ProviderRequest::new(
+            "claude-opus-5",
+            vec![crate::types::Message::user("hi")],
+        )
+        .streaming(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let resp = rt.block_on(client.stream(&req, tx)).expect("stream ok");
+        let mut content_deltas = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::ContentDelta(s) = ev {
+                content_deltas.push(s);
+            }
+        }
+        assert_eq!(
+            content_deltas,
+            vec!["tail".to_string(), "final".to_string()],
+            "flush path must emit the final unterminated delta as a StreamEvent"
+        );
+        assert_eq!(resp.content, "tailfinal");
     }
 
     /// Regression (2026-08-18): a copilot-wire client built for a chat-wire

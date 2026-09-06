@@ -434,9 +434,34 @@ pub fn load_hooks_from_config(
     let Some(raw) = config.get("hooks") else {
         return Vec::new();
     };
-    // The config value is a YAML sequence of hook objects.
+    // The config value is a YAML sequence of hook objects. Parse per
+    // element: one malformed entry must NOT discard the whole list — that
+    // would silently drop Deny/Halt policy hooks too. Skip (with a warning)
+    // only the offending entries.
     match serde_yaml::to_string(&raw) {
-        Ok(yaml_str) => serde_yaml::from_str::<Vec<HookConfig>>(&yaml_str).unwrap_or_default(),
+        Ok(yaml_str) => match serde_yaml::from_str::<Vec<serde_yaml::Value>>(&yaml_str) {
+            Ok(elements) => elements
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, element)| {
+                    match serde_yaml::from_value::<HookConfig>(element) {
+                        Ok(hook) => Some(hook),
+                        Err(err) => {
+                            tracing::warn!(
+                                index,
+                                error = %err,
+                                "skipping malformed hooks config entry"
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "hooks config is not a list; ignoring hooks");
+                Vec::new()
+            }
+        },
         Err(_) => Vec::new(),
     }
 }
@@ -594,5 +619,65 @@ mod tests {
         let agg = runner.run("terminal", &serde_json::json!({}), "s1").await;
         assert_eq!(agg.action, HookAction::Allow); // timeout → allow
         assert_eq!(agg.hooks_run, 1);
+    }
+
+    fn cfg_from(yaml: &str) -> joey_core::Config {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, yaml).expect("write yaml");
+        joey_core::Config::load_from(path).expect("config load")
+    }
+
+    /// Regression: one malformed hooks entry used to discard the ENTIRE
+    /// list (`from_str::<Vec<_>>().unwrap_or_default()`) — silently
+    /// dropping valid Deny/Halt policy hooks. Only the bad entry may be
+    /// skipped.
+    #[test]
+    fn load_hooks_mixed_valid_and_invalid_keeps_valid() {
+        let cfg = cfg_from(
+            "hooks:\n\
+             \x20 - name: good-allow\n\
+             \x20   event: PreToolUse\n\
+             \x20   matcher: \"\"\n\
+             \x20   command: \"exit 0\"\n\
+             \x20 - name: broken-no-command\n\
+             \x20   event: PreToolUse\n\
+             \x20 - name: good-deny\n\
+             \x20   event: PreToolUse\n\
+             \x20   matcher: \"write_file\"\n\
+             \x20   command: \"exit 2\"\n",
+        );
+        let hooks = load_hooks_from_config(&cfg);
+        assert_eq!(hooks.len(), 2, "valid entries must survive a bad one");
+        assert_eq!(hooks[0].name, "good-allow");
+        assert_eq!(hooks[0].command, "exit 0");
+        assert_eq!(hooks[1].name, "good-deny");
+        assert_eq!(hooks[1].matcher, "write_file");
+    }
+
+    /// All-valid list parses identically to the old whole-list path.
+    #[test]
+    fn load_hooks_all_valid() {
+        let cfg = cfg_from(
+            "hooks:\n\
+             \x20 - name: a\n\
+             \x20   command: \"exit 0\"\n\
+             \x20 - name: b\n\
+             \x20   matcher: \"terminal\"\n\
+             \x20   command: \"exit 2\"\n\
+             \x20   timeout_secs: 5\n",
+        );
+        let hooks = load_hooks_from_config(&cfg);
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0].name, "a");
+        assert_eq!(hooks[0].event, EVENT_PRE_TOOL_USE); // defaulted
+        assert_eq!(hooks[1].timeout_secs, Some(5));
+    }
+
+    /// A `hooks` value that is not a list at all still yields an empty vec.
+    #[test]
+    fn load_hooks_non_list_yields_empty() {
+        let cfg = cfg_from("hooks: 42\n");
+        assert!(load_hooks_from_config(&cfg).is_empty());
     }
 }

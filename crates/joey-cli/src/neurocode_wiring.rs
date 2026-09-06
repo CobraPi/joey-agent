@@ -38,7 +38,11 @@ pub fn try_build_engine(config: &joey_core::Config) -> Option<Arc<DefaultEngine>
     let model = config.model();
     let profile = joey_providers::resolve_profile(&provider, &base_url, &model);
     engine.set_provider(profile.name);
-    Some(Arc::new(engine))
+    let engine = Arc::new(engine);
+    // Feature 026 (T030/US7): scope the engine to the active spec-kit
+    // feature's write set (empty scope = unchanged behavior).
+    apply_feature_scope(&engine, config);
+    Some(engine)
 }
 
 /// Like [`try_build_engine`], but scopes the tier resolution to an EXPLICIT
@@ -55,7 +59,25 @@ pub fn try_build_engine_scoped(
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut engine = DefaultEngine::new(nc_cfg, project_root);
     engine.set_provider(provider);
-    Some(Arc::new(engine))
+    let engine = Arc::new(engine);
+    // Feature 026 (T030/US7): scope the engine to the active spec-kit
+    // feature's write set (empty scope = unchanged behavior). Also covers
+    // try_build_engine_for_agent_inputs, which delegates here.
+    apply_feature_scope(&engine, config);
+    Some(engine)
+}
+
+/// Feature 026 (T030/US7): apply the active spec-kit feature's scope files
+/// to the engine when the native surface is enabled and a feature is active
+/// (non-empty write set); no-op otherwise.
+fn apply_feature_scope(engine: &Arc<DefaultEngine>, config: &joey_core::Config) {
+    let files = crate::speckit_lifecycle::feature_scope_files(
+        &std::env::current_dir().unwrap_or_default(),
+        config,
+    );
+    if !files.is_empty() {
+        engine.set_feature_scope(files);
+    }
 }
 
 /// Like [`try_build_engine`], but scopes tier resolution to the provider an

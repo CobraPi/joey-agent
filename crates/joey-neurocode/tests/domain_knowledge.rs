@@ -39,6 +39,7 @@ fn make_request(symbol: &str, file: &str) -> CodingRequest {
         active_symbols: vec![symbol.to_string()],
         project_root: PathBuf::from("."),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     }
 }
 

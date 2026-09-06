@@ -368,22 +368,57 @@ fn load_fingerprint_sidecar(store: &GraphStore) -> Option<Vec<FileFingerprint>> 
 /// disk). Best-effort by design: failure costs only the healing ladder's
 /// re-detection next refresh, never correctness — so errors are logged,
 /// not propagated.
+///
+/// **Index truth, not disk truth**: the sidecar lists exactly the paths
+/// with committed `rag_chunks` rows, fingerprinted against the CURRENT
+/// disk state for those paths only. A disk-wide `snapshot_tree` here
+/// would fingerprint budget-deferred files (present on disk, never
+/// actually indexed because `max_files_per_turn` < backlog) as-if-indexed
+/// — and `detect_changes` trusts this sidecar as previous state, so they
+/// would be PERMANENTLY skipped. Files on disk but absent from
+/// `rag_chunks` stay OUT of the sidecar and re-detect next refresh,
+/// exactly as FR-004 requires.
 fn persist_fingerprints(store: &GraphStore, root: &Path) {
     let Some(sidecar_path) = fingerprint_sidecar_path(store) else { return };
-    let fps = incremental::snapshot_tree(root, &incremental::default_indexable_filter);
-    let map: std::collections::BTreeMap<String, FingerprintEntry> = fps
+
+    let indexed_paths: Vec<String> = {
+        let conn = store.conn();
+        let Ok(mut stmt) = conn.prepare("SELECT DISTINCT source_path FROM rag_chunks") else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+            return;
+        };
+        rows.flatten().collect()
+    };
+
+    let map: std::collections::BTreeMap<String, FingerprintEntry> = indexed_paths
         .into_iter()
-        .map(|fp| {
-            (
-                fp.source_path.clone(),
-                FingerprintEntry {
+        .map(|source_path| {
+            match incremental::fingerprint_file(root, Path::new(&source_path)) {
+                Ok(fp) => FingerprintEntry {
                     source_path: fp.source_path,
                     mtime: chrono::DateTime::<chrono::Utc>::from(fp.mtime).to_rfc3339(),
                     size: fp.size,
                     sha256: fp.sha256,
                 },
-            )
+                // Committed rows whose file vanished mid-refresh (between
+                // the data commit and this sidecar write) keep the same
+                // sentinel reconstruct_previous uses for gone files: the
+                // next refresh classifies them `removed` and purges,
+                // instead of silently leaking committed chunks forever.
+                Err(_) => FingerprintEntry {
+                    mtime: chrono::DateTime::<chrono::Utc>::from(
+                        std::time::SystemTime::UNIX_EPOCH,
+                    )
+                    .to_rfc3339(),
+                    size: 0,
+                    sha256: String::new(),
+                    source_path,
+                },
+            }
         })
+        .map(|e| (e.source_path.clone(), e))
         .collect();
     let json = serde_json::to_string_pretty(&map).unwrap_or_default();
     if let Err(e) = std::fs::write(&sidecar_path, json) {

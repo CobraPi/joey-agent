@@ -24,6 +24,7 @@ joey-llm-selector.workspace = true
 joey-neurocode.workspace = true
 joey-neurocode-rag.workspace = true
 joey-copilot.workspace = true
+joey-speckit-ui.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
 url.workspace = true

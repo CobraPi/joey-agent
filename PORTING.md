@@ -1573,6 +1573,32 @@ persona text is newly authored, NOT an upstream port).
   atlas; the chains are preserved behind
   `hypercode.omo_specialists.enabled=false`.
 
+## HyperCode workflow inheritance + task-graph planning (2026-09-03)
+
+**Status**: Complete (Joey-native extension; no upstream equivalent —
+upstream Hermes has no orchestrator task-graph publishing.)
+
+- Orchestrator toolset extended: `todo`, `skills`, `task-graph` join
+  `delegation`, `terminal`, `file-read`, `web` — the orchestrator
+  inherits the main agent's skill index, session TODO list, and gains
+  the task-graph planner (`ORCHESTRATOR_TOOLSET`,
+  `orchestrator_tool_names`).
+- New `task_graph` tool (joey-orchestration): plan/update/status over
+  the strict `joey-taskgraph/1` format (same validator as the
+  execution-graph pipeline); registered unconditionally, exposed via
+  the `task-graph` toolset only.
+- New `AgentEvent::TaskGraphPublished { graph }` (joey-agent-core,
+  additive/non_exhaustive) emitted through the SubagentManager event
+  tap; TUI feeds it into the existing Tasks tab + ⚑ badge (previously
+  only `EngineEvent::TaskGraphSnapshot` from the `/hypercode run`
+  pipeline reached those).
+- `## Workflow inheritance` guidance appended to ORCHESTRATOR_PROMPT
+  and to every persona-overlay branch (inactive integration stays
+  byte-identical to the const).
+- TUI: explorer reachable on task-graph-alone (NeuroCode indexer may
+  be off); Tasks tab default in that case.
+- 2026-09-03: `task_graph` tool description + `WORKFLOW_INHERITANCE_GUIDANCE` (and the embedded `ORCHESTRATOR_PROMPT` copy, byte-identical, now guarded by a test) document the full strict document schema — required keys incl. `artifact_ids` (integers) and `verification`, exact enum variants — after orchestrators hit serial `schema_violation` rejections guessing the format.
+
 ## TUI feature indicators + task graph visualization (2026-09-03, TUI-only)
 
 Joey-native TUI feature (no upstream equivalent): ambient
@@ -1604,3 +1630,78 @@ key, or wire protocol.
   (objective/status/attempts/deps/read-write sets), counts line. Renders
   without a NeuroCode snapshot; the tab bar is always visible. Gated by
   `hypercode.execution_graph.enabled`.
+
+## Parallel delegation dispatch + manager-global child slot pool (2026-09-04)
+
+**Status**: Deliberate deviation (joey-native; delegation/orchestration
+parity area). Two related deviations from upstream Hermes in one change:
+
+1. Multiple delegation tool calls (`delegate_task`) emitted within ONE
+   assistant message are dispatched concurrently by the agent turn
+   loop — upstream remains sequential per call.
+2. The child-slot admission semaphore is MANAGER-GLOBAL
+   (`SubagentManager::child_slots`, sized
+   `max(1, max_concurrent_children)` in `SubagentManager::new`) and is
+   shared across ALL dispatch paths (blocking singles, batches,
+   background waves) instead of being constructed per
+   `dispatch_requests` call — concurrent dispatches can never
+   oversubscribe the documented shared child cap. Regression-tested in
+   `crates/joey-orchestration/tests/concurrency_limiter.rs`
+   (`child_slot_pool_is_global_across_concurrent_dispatch_calls`) and
+   `tests/task_graph_tool.rs`
+   (`concurrent_updates_on_disjoint_nodes_both_apply_and_republish`).
+   Documented in `docs/orchestration.md` § "Parallel dispatch".
+   Related in spirit: the `todo_tool` description was reworded to match
+   (removed "Only ONE item in_progress at a time.", added the parallel
+   fan-out sentence) (2026-09-04).
+
+## Spec-Kit Integration (feature 026, 2026-09-03)
+
+**Status**: Complete (Joey-native integration per
+`specs/026-please-fully-integrate/`; upstream's spec-kit dispatch runs
+through the external Copilot binary — the native path is a deliberate
+deviation, see below).
+
+- **Command surface** — Complete: 10 lifecycle commands (specify,
+  clarify, plan, constitution, checklist, tasks, analyze, implement,
+  converge, taskstoissues) plus status/help, all native; dual-form
+  invocation (`/speckit-<name>` and `speckit.<name>`) dispatching
+  through one identical path.
+- **Bundled bodies** — Complete: workflow bodies vendored byte-verbatim
+  from upstream spec-kit @ `e3e6a3c`; refresh procedure in
+  `crates/joey-cli/src/speckit_bodies/PROVENANCE.md`.
+- **Hooks** — Complete: 20 hook points (before_/after_ × the ten
+  lifecycle steps) with `contracts/hooks.md` semantics (extensions.yml
+  discovery; mandatory executes and blocks, failure stops the step;
+  optional surfaces an invocation block; invalid YAML silently skipped;
+  non-empty conditions passed through unevaluated).
+- **Handoffs** — Complete: frontmatter handoff semantics
+  (label/agent/prompt/send; send=true auto-invokes the next step,
+  otherwise offered; prior outputs carried).
+- **Lifecycle injection** — Complete: session-start Spec-Kit Lifecycle
+  Context block (Feature/Step/Artifacts/Note) injected once per
+  session; `/speckit-status` renders the same derivation on demand.
+- **Orchestration adaptation** — Complete: conductor detects the
+  feature/step at session start and adapts dispatch (read-only
+  researchers during specify/clarify/plan; parallel implementors with
+  exclusive write sets during implement; one final verification at
+  acceptance).
+- **NeuroCode scoping** — Complete: the feature's plan/tasks file lists
+  prioritized for context + indexing; verification plans aligned with
+  spec acceptance criteria.
+- **Config keys** — Complete: `speckit.enabled` /
+  `speckit.lifecycle_context` / `speckit.hooks` (all default true;
+  enabled=false restores pre-feature behavior exactly; CONFIG_VERSION
+  35, additive-only).
+
+**Deliberate deviations (not oversights):**
+
+1. Dotted form dispatches natively — upstream dispatches via the
+   external Copilot binary; Joey never spawns external agent binaries.
+2. The project-local third-precedence body hop is
+   `.specify/commands/speckit-<name>.md` — upstream has no `.specify/`
+   body layout; this is a Joey extension documented in
+   `docs/speckit-workflow.md`.
+3. `__SPECKIT_COMMAND_*__` markers render to the slash form
+   `/speckit-<name>` (single canonical form per FR-003's
+   one-implementation rule).

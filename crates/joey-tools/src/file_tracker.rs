@@ -505,10 +505,26 @@ pub fn generate_diff(before: &str, after: &str, filename: &str) -> DiffResult {
         match current.as_mut() {
             None => {
                 if is_change {
+                    // Push up to `context` PRECEDING context lines first
+                    // (clamped to file start) so the hunk body matches the
+                    // header start (old_pos - context); without them every
+                    // hunk not at file start has header numbers `context`
+                    // ahead of its body and standard diff consumers
+                    // misapply it. Lines before a hunk-opening change are
+                    // context-equal in both files by construction (any
+                    // earlier change would have kept a hunk open), so
+                    // `before_lines` supplies them — including lines the
+                    // prefix-trim removed from `entries`.
+                    let ctx_from = old_pos.saturating_sub(context);
+                    let mut hunk_lines: Vec<(u8, String)> = before_lines[ctx_from..old_pos]
+                        .iter()
+                        .map(|l| (0u8, (*l).to_string()))
+                        .collect();
+                    hunk_lines.push((kind, line.clone()));
                     let h = HunkAcc {
-                        old_start: old_pos.saturating_sub(context),
+                        old_start: ctx_from,
                         new_start: new_pos.saturating_sub(context),
-                        lines: vec![(kind, line.clone())],
+                        lines: hunk_lines,
                     };
                     current = Some(h);
                     ctx_run = 0;
@@ -666,6 +682,58 @@ mod tests {
         let result = generate_diff(before, after, "add.txt");
         assert_eq!(result.added, 1);
         assert_eq!(result.removed, 0);
+    }
+
+    #[test]
+    fn diff_hunk_header_matches_body_start() {
+        // Regression: hunk headers advertised `context` (3) preceding
+        // context lines but never pushed them into the body, so any hunk
+        // not at file start had header numbers 3 ahead of its body. The
+        // header start must equal the first body line's 1-based position.
+        let before: Vec<String> = (1..=20).map(|i| format!("line {}", i)).collect();
+        let mut after = before.clone();
+        after[9] = "line 10 CHANGED".to_string(); // change at line 10 (1-based)
+        let d = generate_diff(&before.join("\n"), &after.join("\n"), "hdr.txt");
+
+        let hunk_line = d
+            .diff
+            .lines()
+            .find(|l| l.starts_with("@@"))
+            .expect("hunk header present");
+        // First body line is context `line 7` (3 preceding lines: 7,8,9).
+        // (Skip the `--- a/` / `+++ b/` file headers — `--- a/` starts with
+        // '-' and would otherwise match the change-line probe.)
+        let body_first = d
+            .diff
+            .lines()
+            .skip(2)
+            .find(|l| l.starts_with(' ') || l.starts_with('-') || l.starts_with('+'))
+            .expect("hunk body present");
+        assert_eq!(body_first, " line 7", "body opens with preceding context");
+
+        // old_start (1-based) from the header must equal the index of the
+        // first body line counted in the old file.
+        let nums: Vec<&str> = hunk_line
+            .split_whitespace()
+            .filter(|s| s.starts_with('-') || s.starts_with('+'))
+            .collect();
+        let old_start: usize = nums[0]
+            .trim_start_matches('-')
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let first_body_old_idx = before
+            .iter()
+            .position(|l| l == "line 7")
+            .unwrap()
+            + 1; // 1-based
+        assert_eq!(
+            old_start, first_body_old_idx,
+            "hunk header start == first body line's 1-based index ({hunk_line})"
+        );
+        assert!(d.diff.contains(" line 7\n line 8\n line 9\n-line 10\n+line 10 CHANGED\n line 11"));
     }
 
     #[test]
@@ -926,7 +994,8 @@ mod rayon_diff_tests {
             raw.push((E::Add, b[j].to_string()));
             j += 1;
         }
-        // Hunk grouping (3 context lines).
+        // Hunk grouping (3 context lines, with preceding context replayed
+        // into the hunk body so header start matches body start).
         let context = 3;
         let mut hunks: Vec<(usize, usize, Vec<(E, String)>)> = Vec::new();
         let mut cur: Option<(usize, usize, Vec<(E, String)>)> = None;
@@ -938,11 +1007,13 @@ mod rayon_diff_tests {
             match cur.as_mut() {
                 None => {
                     if is_change {
-                        cur = Some((
-                            old_pos.saturating_sub(context),
-                            new_pos.saturating_sub(context),
-                            vec![(e, line)],
-                        ));
+                        let ctx_from = old_pos.saturating_sub(context);
+                        let mut lines: Vec<(E, String)> = a[ctx_from..old_pos]
+                            .iter()
+                            .map(|l| (E::Ctx, (*l).to_string()))
+                            .collect();
+                        lines.push((e, line));
+                        cur = Some((ctx_from, new_pos.saturating_sub(context), lines));
                         ctx_run = 0;
                     }
                 }

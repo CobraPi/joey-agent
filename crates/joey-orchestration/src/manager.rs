@@ -417,6 +417,14 @@ pub struct SubagentManager {
     /// `parent_reserved_permits == 0` sizes it equal to the parent pool
     /// (pre-feature behavior).
     child_semaphore: Arc<Semaphore>,
+    /// CHILD-SLOT POOL (manager-global): admission slots gating entry
+    /// into a child's turn loop, sized `max(1, max_concurrent_children)`.
+    /// Lives on the manager — NOT constructed per dispatch call — so the
+    /// pool is shared across ALL dispatch calls (blocking singles,
+    /// batches, background waves): concurrent `delegate_task` calls from
+    /// one assistant message draw from ONE pool and can never
+    /// oversubscribe the documented child cap.
+    child_slots: Arc<Semaphore>,
     /// Grant-back watcher state (T005): how many parent-pool permits are
     /// currently lent to the child pool + the lock serializing
     /// lend/reclaim steps + the once-flag ensuring ONE watcher task for
@@ -503,6 +511,11 @@ impl SubagentManager {
             semaphore: Arc::new(Semaphore::new(permits)),
             child_semaphore: Arc::new(Semaphore::new(
                 permits.saturating_sub(reserve).max(1),
+            )),
+            // Manager-global child-slot pool: shared by every dispatch
+            // path (see the field docs) instead of a per-call local.
+            child_slots: Arc::new(Semaphore::new(
+                config.max_concurrent_children.max(1),
             )),
             grant_back: Arc::new(GrantBackState::default()),
             config,
@@ -659,6 +672,7 @@ impl SubagentManager {
             config: ManagerConfig::default(),
             semaphore: self.semaphore.clone(),
             child_semaphore: self.child_semaphore.clone(),
+            child_slots: self.child_slots.clone(),
             grant_back: self.grant_back.clone(),
             registry: self.registry.clone(),
             child_pool_owner: true,
@@ -966,6 +980,18 @@ impl SubagentManager {
         max_spawn_depth: usize,
         allocated_id: u64,
     ) -> DelegationResult {
+        // Manager-global child-slot admission (see `child_slots`): EVERY
+        // dispatch path funnels through this function — blocking singles,
+        // `dispatch_requests` batch waves, and background children — so
+        // all children draw from ONE pool and can never oversubscribe
+        // `max_concurrent_children`. The permit is held across the whole
+        // run and released on completion or panic (RAII), handing the
+        // slot straight to the next waiter — no chunk barrier.
+        let _child_slot = self
+            .child_slots
+            .acquire()
+            .await
+            .expect("child slot semaphore closed");
         let model = crate::subagent::resolve_model(
             None,
             req.model.as_deref(),
@@ -1339,9 +1365,14 @@ impl SubagentManager {
         let max_turns = self.config.default_max_turns;
         let max_spawn_depth = self.config.max_spawn_depth;
         let depth = self.depth;
-        let max_children = self.config.max_concurrent_children.max(1);
         let shared_semaphore = self.semaphore.clone();
         let shared_child_semaphore = self.child_semaphore.clone();
+        // Manager-global child-slot pool (see `child_slots`): ONE pool
+        // shared across ALL dispatch calls — blocking singles, batches,
+        // and background waves — so concurrent `delegate_task` calls
+        // (e.g. multiple tool calls in one assistant message) draw from
+        // the same slots and cannot oversubscribe `max_concurrent_children`.
+        let slots = Arc::clone(&self.child_slots);
         let shared_grant_back = self.grant_back.clone();
         let shared_registry = self.registry.clone();
         let tap = self.event_tap();
@@ -1361,12 +1392,14 @@ impl SubagentManager {
         let mut indexed_results: Vec<(usize, DelegationResult)> = Vec::with_capacity(total);
 
         // Admission slots: every child spawns immediately, but at most
-        // `max_children` may enter their turn loop at once. Unlike the old
+        // `max_children` may enter their turn loop at once — and the pool
+        // is MANAGER-GLOBAL, shared across ALL dispatch calls (blocking,
+        // batch, background), so concurrent delegate_task calls from one
+        // assistant message cannot oversubscribe the cap. Unlike the old
         // fixed chunking (a barrier per chunk — every chunk paid its
         // slowest member before the next chunk could start), a finishing
         // child hands its slot straight to the next waiter: no barrier,
         // same cap, same stable ordering.
-        let slots = Arc::new(Semaphore::new(max_children));
 
         let mut join_set: JoinSet<(usize, DelegationResult)> = JoinSet::new();
 
@@ -1393,14 +1426,12 @@ impl SubagentManager {
             let child_id = self.next_id();
 
             join_set.spawn(async move {
-                // Wait for a child slot BEFORE entering the turn loop. The
-                // permit is held for the child's whole execution and is
-                // released on completion or panic (RAII), handing the
-                // slot to the next waiter immediately — no chunk barrier.
-                let _slot = slots
-                    .acquire()
-                    .await
-                    .expect("child slot semaphore closed");
+                // Child-slot admission lives INSIDE
+                // `dispatch_single_with_overrides` (the single funnel every
+                // dispatch path — blocking singles, this batch path, and
+                // background waves — shares), so this body must NOT acquire
+                // a second permit: the RAII permit held across the child's
+                // whole run is acquired at the top of the dispatch call.
                 // Each child shares the PARENT's pools + registry
                 // (FR-018, T004): the transient manager points at the
                 // top manager's child pool, shared interrupt, tap, and
@@ -1410,6 +1441,7 @@ impl SubagentManager {
                     config: ManagerConfig::default(),
                     semaphore: sem.clone(),
                     child_semaphore: child_sem.clone(),
+                    child_slots: slots.clone(),
                     grant_back: grant_back.clone(),
                     registry: child_registry.clone(),
                     child_pool_owner: true,

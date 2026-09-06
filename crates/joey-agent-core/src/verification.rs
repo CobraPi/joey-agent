@@ -559,7 +559,14 @@ pub fn build_verify_on_stop_nudge(
 
     let status_detail = if let Some(ev) = &status.evidence {
         let summary = if ev.output_summary.len() > VERIFY_NUDGE_OUTPUT_LIMIT {
-            ev.output_summary[..VERIFY_NUDGE_OUTPUT_LIMIT].to_string()
+            // Snap the cut to a UTF-8 char boundary (same hardening as
+            // `summarize_output`): a multibyte char straddling the limit
+            // would panic on a raw byte slice.
+            let mut end = VERIFY_NUDGE_OUTPUT_LIMIT.min(ev.output_summary.len());
+            while end > 0 && !ev.output_summary.is_char_boundary(end) {
+                end -= 1;
+            }
+            ev.output_summary[..end].to_string()
         } else {
             ev.output_summary.clone()
         };
@@ -810,6 +817,36 @@ mod tests {
         let summary = summarize_output(&long);
         assert!(summary.contains("[output truncated"));
         assert!(summary.len() < 5000);
+    }
+
+    /// Regression: the verify-nudge truncation at VERIFY_NUDGE_OUTPUT_LIMIT
+    /// used a raw byte slice — a multibyte char straddling byte 1200
+    /// panicked. The cut must snap down to a char boundary.
+    #[test]
+    fn test_nudge_output_limit_multibyte_no_panic() {
+        let _g = lock();
+        clear_all();
+        // 1198 ASCII bytes + 34 three-byte CJK chars = 1300 bytes total.
+        // The first CJK char spans bytes 1198..1201, so byte 1200 (the
+        // limit) is mid-character — the old raw slice panicked there. The
+        // cut must snap down to 1198.
+        let output = format!("{}{}", "a".repeat(1198), "漢".repeat(34));
+        assert_eq!(output.len(), 1300);
+        assert!(!output.is_char_boundary(VERIFY_NUDGE_OUTPUT_LIMIT));
+        assert!(output.is_char_boundary(1198));
+
+        record_terminal_result("cargo test", "/tmp/proj", "s1", 1, &output);
+
+        // Must not panic; the embedded summary is the boundary-snapped prefix.
+        let nudge =
+            build_verify_on_stop_nudge("s1", "/tmp/proj", &["src/main.rs".to_string()], 0)
+                .expect("nudge expected for failed verification");
+        let prefix = "a".repeat(1198);
+        assert!(nudge.contains(&prefix));
+        // The char straddling the limit must NOT have leaked into the
+        // nudge right after the preserved prefix.
+        assert!(!nudge.contains(&format!("{}漢", prefix)));
+        clear_all();
     }
 
     // ── FR-006/SC-005 regression tests (hardened sites) ──────────────────

@@ -79,9 +79,15 @@ pub fn parse_plan(markdown: &str) -> ParsedPlan {
                 .split(',')
                 .filter_map(|s| s.trim().parse::<usize>().ok())
                 .collect();
-            // Attach to the last task
-            if let Some(task) = tasks.last_mut() {
-                task.dependencies = last_task_deps.clone();
+            // Attach to the last task. A dependency line BEFORE the first
+            // task row has nothing to attach to — skip it with a recorded
+            // warning instead of silently dropping the constraint.
+            match tasks.last_mut() {
+                Some(task) => task.dependencies = last_task_deps.clone(),
+                None => tracing::warn!(
+                    deps = ?last_task_deps,
+                    "plan dependency line before the first task ignored"
+                ),
             }
             continue;
         }
@@ -192,6 +198,22 @@ mod tests {
         // Task 0 is completed
         let t0 = plan.tasks.iter().find(|t| t.number == 0).unwrap();
         assert!(t0.completed);
+    }
+
+    #[test]
+    fn dependency_line_before_first_task_is_ignored() {
+        // A `> Depends on: N` line BEFORE the first task row has nothing
+        // to attach to: it is skipped with a recorded warning (not a
+        // panic, not a silent corruption of the following task).
+        let markdown = "# Plan\n\n> Depends on: 1\n\n- [ ] 1. First task\n";
+        let plan = parse_plan(markdown);
+        assert_eq!(plan.tasks.len(), 1, "the task row after the stray annotation must survive");
+        assert_eq!(plan.tasks[0].number, 1);
+        assert_eq!(plan.tasks[0].title, "First task");
+        assert!(
+            plan.tasks[0].dependencies.is_empty(),
+            "stray pre-task annotation must not leak into the first task"
+        );
     }
 
     #[test]

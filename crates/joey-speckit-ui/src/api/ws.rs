@@ -33,8 +33,21 @@ async fn watch_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, id))
+) -> axum::response::Response {
+    // Path-traversal guard (same check rest.rs applies): the id lands in
+    // `repo_root.join("specs").join(&id)` — a percent-encoded `..` id must
+    // not be upgraded into a watcher on a directory outside the repo.
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": "invalid_path",
+                "message": "feature id is not a safe path component",
+            })),
+        )
+            .into_response();
+    }
+    ws.on_upgrade(move |socket| handle_socket(socket, state, id)).into_response()
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState, feature_id: String) {
@@ -199,8 +212,21 @@ async fn meaning_stream_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    // Path-traversal guard (same check rest.rs applies): the id lands in
+    // `repo_root.join("specs").join(&id)` below.
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": "invalid_path",
+                "message": "feature id is not a safe path component",
+            })),
+        )
+            .into_response();
+    }
     ws.on_upgrade(move |socket| meaning_stream_loop(socket, state, id))
+        .into_response()
 }
 
 /// Send the current semantic graph on connection, then keep the connection

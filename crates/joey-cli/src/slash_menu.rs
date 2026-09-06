@@ -118,6 +118,15 @@ impl Completer for SmartCompleter {
                 .collect();
         }
 
+        // ── Dotted spec-kit stage (feature 026, T013) ──
+        // `speckit.<name>` — the twin of `/speckit-<name>` (contract
+        // invariant 5: completion offers both forms). Offered for the
+        // dotted prefix only when the whole head IS the dotted token (no
+        // args yet), after the normal stages found nothing.
+        if head.starts_with("speckit.") && !head.contains(' ') {
+            return dotted_suggestions(head, Span::new(0, head.len()));
+        }
+
         // ── Path stage ──
         if let Some(word) = engine::extract_path_word(head) {
             let span_start = head.len() - word.len();
@@ -154,6 +163,29 @@ fn slash_name_suggestions(typed: &str, span: Span) -> Vec<Suggestion> {
             if !typed.is_empty() && alias.starts_with(typed) {
                 out.push(suggest(def, span, format!("/{}", alias), format!("alias of /{}", def.name)));
             }
+        }
+    }
+    out
+}
+
+/// Dotted `speckit.<name>` completion candidates (feature 026, T013),
+/// derived from the slash registry's twelve speckit entries. Prefix-matches
+/// the typed dotted form (`speckit.pl` → `speckit.plan`); descriptions come
+/// from the registry. Bare `speckit.` offers all twelve.
+pub(crate) fn dotted_suggestions(typed: &str, span: Span) -> Vec<Suggestion> {
+    let mut out = Vec::new();
+    for def in slash::REGISTRY {
+        if !def.name.starts_with("speckit-") {
+            continue;
+        }
+        let dotted = format!("speckit.{}", &def.name["speckit-".len()..]);
+        if typed == "speckit." || dotted.starts_with(typed) {
+            let extra = format!(
+                "dotted form of /{} · args: {}",
+                def.name,
+                if def.args_hint.is_empty() { "—" } else { def.args_hint },
+            );
+            out.push(suggest(def, span, dotted, extra));
         }
     }
     out

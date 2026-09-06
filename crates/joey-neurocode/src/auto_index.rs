@@ -108,6 +108,27 @@ impl AutoIndexState {
     pub fn config(&self) -> &AutoIndexConfig {
         &self.config
     }
+
+    /// Pending (edited-since-last-index) files, ordered scope-first
+    /// (T028): entries whose path ends with any scope entry come first
+    /// (in scope-relative order), the rest follow in the existing
+    /// BTreeSet order. Thresholds and the `should_reindex` decision are
+    /// untouched — this only orders the work once a re-index runs.
+    pub fn pending_prioritized(&self, scope: &[String]) -> Vec<String> {
+        let mut prioritized: Vec<String> = Vec::with_capacity(self.edited_files.len());
+        let mut rest: Vec<String> = Vec::new();
+        for file in &self.edited_files {
+            if scope.iter().any(|s| {
+                !s.is_empty() && (file == s || file.ends_with(&format!("/{s}")))
+            }) {
+                prioritized.push(file.clone());
+            } else {
+                rest.push(file.clone());
+            }
+        }
+        prioritized.extend(rest);
+        prioritized
+    }
 }
 
 /// Snapshot of tracker progress toward the re-index thresholds.
@@ -202,5 +223,36 @@ mod tests {
         let p = s.progress();
         assert_eq!(p.file_threshold, 3);
         assert_eq!(p.line_threshold, 200);
+    }
+
+    #[test]
+    fn pending_prioritized_matches_whole_path_components() {
+        let mut s = state();
+        s.record_edit("src/a.rs", 1, 1);
+        s.record_edit("src/ba.rs", 1, 1);
+
+        // Scope `a.rs` must NOT prioritize `ba.rs` (bare suffix match did).
+        let ordered = s.pending_prioritized(&["a.rs".to_string()]);
+        assert_eq!(
+            ordered.first().map(String::as_str),
+            Some("src/a.rs"),
+            "exact component match prioritized, got: {:?}",
+            ordered
+        );
+        assert!(
+            !ordered.iter().take(1).any(|f| f == "src/ba.rs"),
+            "`ba.rs` must not be prioritized by a bare suffix: {:?}",
+            ordered
+        );
+
+        // A full-path scope entry still matches exactly.
+        let ordered = s.pending_prioritized(&["src/a.rs".to_string()]);
+        assert_eq!(ordered.first().map(String::as_str), Some("src/a.rs"));
+
+        // A directory-form scope entry matches as a path suffix component.
+        let mut s2 = state();
+        s2.record_edit("x/feat/mod.rs", 1, 1);
+        let ordered = s2.pending_prioritized(&["feat/mod.rs".to_string()]);
+        assert_eq!(ordered.first().map(String::as_str), Some("x/feat/mod.rs"));
     }
 }

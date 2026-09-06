@@ -51,24 +51,31 @@ pub fn get_tool_output_limits(config: &Config) -> ToolOutputLimits {
 }
 
 /// Head/tail truncation with the terminal tool's exact marker
-/// (terminal_tool.py:2818-2829): 40% head, 60% tail.
+/// (terminal_tool.py:2818-2829): 40% head, 60% tail. The budget and the
+/// omitted/total counts are in CHARS (Python str semantics), not bytes.
 pub fn truncate_terminal_output(output: &str, max_output_chars: usize) -> String {
-    if output.len() <= max_output_chars {
+    let total_chars = output.chars().count();
+    if total_chars <= max_output_chars {
         return output.to_string();
     }
     let head_chars = (max_output_chars as f64 * 0.4) as usize;
     let tail_chars = max_output_chars - head_chars;
-    let omitted = output.len() - head_chars - tail_chars;
+    let omitted = total_chars - head_chars - tail_chars;
     let truncated_notice = format!(
         "\n\n... [OUTPUT TRUNCATED - {} chars omitted out of {} total] ...\n\n",
         omitted,
-        output.len()
+        total_chars
     );
-    // Slice on char boundaries (Python slices on chars; byte offsets can land
-    // mid-UTF-8 in Rust, so snap inward to the nearest boundary).
-    let head_end = floor_char_boundary(output, head_chars);
-    let tail_start = ceil_char_boundary(output, output.len() - tail_chars);
+    // Find char-boundary split points for the head/tail char counts.
+    let head_end = char_index_to_byte(output, head_chars);
+    let tail_start = char_index_to_byte(output, total_chars - tail_chars);
     format!("{}{}{}", &output[..head_end], truncated_notice, &output[tail_start..])
+}
+
+/// Byte offset of the `n`-th char (chars before it) in `s`; the end of the
+/// string when `n` exceeds its char count.
+pub fn char_index_to_byte(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
 }
 
 pub fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
@@ -129,6 +136,24 @@ mod tests {
         ));
         assert!(out.starts_with(&"x".repeat(40)));
         assert!(out.ends_with(&"x".repeat(60)));
+    }
+
+    #[test]
+    fn terminal_truncation_counts_chars_not_bytes() {
+        // 100 chars of 3-byte UTF-8 = 300 bytes; a byte-based budget of 90
+        // would cut at 90 bytes (30 chars). Char semantics with budget 90:
+        // head 36, tail 54, omitted 10 — all in chars.
+        let text = "日".repeat(100);
+        assert_eq!(text.len(), 300);
+        let out = truncate_terminal_output(&text, 90);
+        assert!(out.contains(
+            "\n\n... [OUTPUT TRUNCATED - 10 chars omitted out of 100 total] ...\n\n"
+        ));
+        assert!(out.starts_with(&"日".repeat(36)));
+        assert!(out.ends_with(&"日".repeat(54)));
+        // A budget at/above the char count must not truncate despite the
+        // 300-byte length.
+        assert_eq!(truncate_terminal_output(&text, 100), text);
     }
 
     #[test]

@@ -243,6 +243,12 @@ const RETRY_AFTER_CAP: Duration = Duration::from_secs(600);
 /// block the turn indefinitely.
 const PARALLEL_TOOL_TIMEOUT_SECS: u64 = 300;
 
+/// Per-handle grace when an interrupted co-dispatched delegation run is
+/// drained: each still-running child gets this long to finish before its
+/// tool_call is answered with "<interrupted>" (children must not be
+/// detached mid-write, and every tool_call must get a tool_result).
+const DELEGATION_INTERRUPT_GRACE_SECS: u64 = 3;
+
 /// Read-only tools with no shared mutable session state — safe to run
 /// concurrently within a batch (tool_dispatch_helpers.py `_PARALLEL_SAFE_TOOLS`,
 /// restricted to tools the port ships).
@@ -255,6 +261,15 @@ const PARALLEL_SAFE_TOOLS: &[&str] = &[
     "web_extract",
     "web_search",
 ];
+
+/// Delegation tools whose calls are long-running but safe — and intended —
+/// to run concurrently when the model emits several in one assistant
+/// message (joey-native; upstream dispatches these sequentially). Unlike
+/// PARALLEL_SAFE_TOOLS these are NOT read-only: they keep the sequential
+/// path's post-processing (result append order, loop detection, interrupt
+/// checks) and are exempt from PARALLEL_TOOL_TIMEOUT_SECS — subagents
+/// legitimately run for minutes.
+const CONCURRENT_DELEGATION_TOOLS: &[&str] = &["delegate_task", "call_omo_agent"];
 
 /// Tools whose results carry attacker-controllable content
 /// (tool_dispatch_helpers.py `_UNTRUSTED_TOOL_NAMES` / `_UNTRUSTED_TOOL_PREFIXES`).
@@ -1811,6 +1826,7 @@ impl Agent {
             active_symbols: hints.identifiers,
             project_root: self.ctx.cwd().to_path_buf(),
             token_budget_hint: 0,
+            scope_files: Vec::new(),
         };
         let route = engine.classify(&request);
         // Tier transparency (FR-002/SC-002): the developer greps the log to see
@@ -2556,13 +2572,12 @@ impl Agent {
                     joey_llm_selector::ModuleId::MainTurn,
                 ) as i64;
                 if allocated_ctx > 0 && allocated_ctx != self.compressor.context_length {
-                    self.compressor.context_length = allocated_ctx;
-                    // Re-apply the small-context floor for the new window.
-                    self.compressor.threshold_percent =
-                        compression::ContextCompressor::effective_threshold_percent(
-                            allocated_ctx,
-                            self.compressor.configured_threshold_percent,
-                        );
+                    // Recompute ALL context-window-derived thresholds (percent
+                    // AND tokens) exactly like a model switch would — patching
+                    // only context_length + threshold_percent left
+                    // threshold_tokens derived from the OLD window, firing
+                    // should_compress at the wrong point.
+                    self.compressor.reallocate_context_window(allocated_ctx);
                 }
             }
         }
@@ -2742,10 +2757,10 @@ impl Agent {
                     return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: true, fatal_provider_error: true };
                 }
             };
-            accumulate_usage(&mut total_usage, &self.usage_or_estimate(&resp));
+            accumulate_usage(&mut total_usage, &self.usage_or_estimate(&tools, &resp));
 
             let _ = tx.send(AgentEvent::ApiCallEnd {
-                usage: self.usage_or_estimate(&resp),
+                usage: self.usage_or_estimate(&tools, &resp),
             });
 
             // ── Feed real usage to the compressor (conversation_loop.py:
@@ -3084,7 +3099,7 @@ impl Agent {
         self.push_message(Message::user(MAX_ITERATIONS_SUMMARY_REQUEST), None);
         let mut summary = match self.call_with_retries(false, &[], &tx, &mut compression_attempts).await {
             Ok(resp) => {
-                accumulate_usage(&mut total_usage, &self.usage_or_estimate(&resp));
+                accumulate_usage(&mut total_usage, &self.usage_or_estimate(&[], &resp));
                 strip_think_blocks(&resp.content).trim().to_string()
             }
             Err(_) => String::new(),
@@ -3093,7 +3108,7 @@ impl Agent {
             // One retry (handle_max_iterations "Retry summary generation").
             summary = match self.call_with_retries(false, &[], &tx, &mut compression_attempts).await {
                 Ok(resp) => {
-                    accumulate_usage(&mut total_usage, &self.usage_or_estimate(&resp));
+                    accumulate_usage(&mut total_usage, &self.usage_or_estimate(&[], &resp));
                     strip_think_blocks(&resp.content).trim().to_string()
                 }
                 Err(_) => String::new(),
@@ -3143,16 +3158,24 @@ impl Agent {
 
     /// Per-call usage, with the ~4-chars/token estimator when the provider
     /// omitted usage entirely (conversation_loop.py:5121-5140 fallback).
-    fn usage_or_estimate(&self, resp: &NormalizedResponse) -> Usage {
+    /// `tools` is the schema list sent on THIS request (empty for plain
+    /// text calls); when usage IS present the real numbers win unchanged.
+    fn usage_or_estimate(&self, tools: &[ToolSchema], resp: &NormalizedResponse) -> Usage {
         let u = &resp.usage;
         if u.prompt_tokens != 0 || u.completion_tokens != 0 || u.total_tokens != 0 {
             return u.clone();
         }
-        let mut prompt_text = self.system_prompt.clone();
+        // Estimate the prompt the provider actually saw: the EFFECTIVE
+        // system prompt (base + identity/ultrawork/neurocode overlays), the
+        // history, and — when tools were sent — the rough tool-schema
+        // tokens (estimator's `_estimate_tools_tokens_rough`). Stays an
+        // estimate; never consulted when real usage exists.
+        let mut prompt_text = self.effective_system_prompt();
         for m in &self.history {
             prompt_text.push_str(&m.text_content());
         }
-        let prompt_tokens = joey_core::utils::estimate_tokens(&prompt_text) as u64;
+        let mut prompt_tokens = joey_core::utils::estimate_tokens(&prompt_text) as u64;
+        prompt_tokens += compression::estimate_tools_tokens_rough(tools) as u64;
         let completion_tokens = joey_core::utils::estimate_tokens(&resp.content) as u64;
         Usage {
             prompt_tokens,
@@ -3394,87 +3417,119 @@ impl Agent {
                     executed += 1;
                 }
             } else {
-                for tc in &calls {
-                    let args = normalized_args(tc);
-                    let _ = tx.send(AgentEvent::ToolStart {
-                        name: tc.function.name.clone(),
-                        emoji: self.registry.get_emoji(&tc.function.name),
-                        summary: summarize_args(&tc.function.name, &args),
-                    });
-                    let call_start = std::time::Instant::now();
-                    let ctx = self.ctx_for_tool(&tc.function.name, tx.clone());
-                    let result = self
-                        .registry
-                        .dispatch_call(&tc.function.name, args, &ctx, &tc.id)
-                        .await;
-                    let duration = call_start.elapsed().as_secs_f64();
-                    let is_error = result.is_error();
-                    let content_raw = result.to_content_string();
-                    let preview = preview_result(&content_raw);
-                    // Feature 005 (T011): emit FileChange events before ToolEnd.
-                    emit_pending_file_changes(tx, &tc.function.name, &content_raw, self.neurocode_engine.as_ref());
-                    let _ = tx.send(AgentEvent::ToolEnd {
-                        name: tc.function.name.clone(),
-                        is_error,
-                        result_preview: preview,
-                        duration_secs: duration,
-                        exit_code: extract_exit_code(&tc.function.name, &content_raw),
-                        full_result: content_raw.clone(),
-                    });
-                    let wrapped = maybe_wrap_untrusted(&tc.function.name, &content_raw);
-                    self.push_message(
-                        Message::tool_result(&tc.id, &tc.function.name, wrapped.clone()),
-                        None,
-                    );
-                    executed += 1;
-
-                    // ── Loop detection (crush-style) ───────────────────────
-                    if self.loop_detector.record(
-                        &tc.function.name,
-                        &tc.function.arguments,
-                        &wrapped,
-                    ) {
-                        let _ = tx.send(AgentEvent::Notice(
-                            "🔁 Loop detected — injecting nudge to change approach".into()
-                        ));
-                        // Inject the nudge as a user-role message. It must NOT
-                        // be a tool result: its tool_call_id would be declared
-                        // by no assistant message, which strict providers
-                        // reject with a 400.
-                        self.push_message(
-                            Message::user(
-                                crate::loop_detection::LoopDetector::nudge_message().to_string(),
-                            ),
-                            None,
-                        );
-                    }
-
-                    // Interrupt between sequential calls: skip the rest
-                    if self.interrupted() && executed < total {
-                        let remaining: Vec<&ToolCall> = rewritten[executed..].iter().collect();
-                        let _ = tx.send(AgentEvent::Notice(format!(
-                            "⚡ Interrupt: skipping {} remaining tool call(s)",
-                            remaining.len()
-                        )));
-                        for skipped in remaining {
-                            let content = format!(
-                                "[Tool execution skipped — {} was not started. User sent a new message]",
-                                skipped.function.name
-                            );
-                            self.push_message(
-                                Message::tool_result(&skipped.id, &skipped.function.name, content),
-                                None,
-                            );
+                let mut i = 0usize;
+                while i < calls.len() {
+                    // Maximal contiguous run of delegation calls starting at
+                    // i (runs >= 2 are co-dispatched below; anything shorter
+                    // takes the plain single-call path).
+                    let run_len = delegation_run_len(&calls[i..]);
+                    if run_len >= 2 {
+                        let run = &calls[i..i + run_len];
+                        // Co-dispatch the whole delegation run concurrently —
+                        // same spawn shape as the parallel-read-only branch
+                        // (ToolStart → spawn, per call, in call order) — but
+                        // joined WITHOUT PARALLEL_TOOL_TIMEOUT_SECS:
+                        // subagents legitimately run for minutes.
+                        let mut handles = Vec::with_capacity(run.len());
+                        let mut start_times = Vec::with_capacity(run.len());
+                        for tc in run {
+                            let args = normalized_args(tc);
+                            let _ = tx.send(AgentEvent::ToolStart {
+                                name: tc.function.name.clone(),
+                                emoji: self.registry.get_emoji(&tc.function.name),
+                                summary: summarize_args(&tc.function.name, &args),
+                            });
+                            start_times.push(std::time::Instant::now());
+                            let registry = self.registry.clone();
+                            let ctx = self.ctx_for_tool(&tc.function.name, tx.clone());
+                            let name = tc.function.name.clone();
+                            let id = tc.id.clone();
+                            handles.push(tokio::spawn(async move {
+                                registry.dispatch_call(&name, args, &ctx, &id).await
+                            }));
                         }
-                        return true;
-                    }
-                    if self.config.tool_delay > 0.0
-                        && executed < total
-                        && self
-                            .sleep_with_interrupt(Duration::from_secs_f64(self.config.tool_delay))
-                            .await
-                    {
+                        // Join in call order (no timeout wrapper), then run
+                        // the sequential path's per-result post-processing.
+                        // `pre_run_executed` is passed where the single-call
+                        // path passes `total`: it suppresses finish's
+                        // in-call skip branch (which answers remaining calls
+                        // as "not started") while co-dispatched siblings are
+                        // still in flight and merely AWAITING their join —
+                        // the drain below answers every call of the run
+                        // itself, started or not. Interrupt detection mirrors
+                        // that branch's condition (`interrupted && work
+                        // remains`), extended to in-flight run siblings.
+                        let pre_run_executed = executed;
+                        let mut pending: std::collections::VecDeque<_> = handles.into();
+                        let mut interrupted_at: Option<usize> = None;
+                        for (idx, tc) in run.iter().enumerate() {
+                            let handle = pending
+                                .pop_front()
+                                .expect("one spawned handle per run call");
+                            let joined = handle.await;
+                            let (content_raw, is_error) = match joined {
+                                Ok(result) => (result.to_content_string(), result.is_error()),
+                                Err(e) => (
+                                    format!("Error executing tool '{}': {}", tc.function.name, e),
+                                    true,
+                                ),
+                            };
+                            let duration = start_times[idx].elapsed().as_secs_f64();
+                            self.finish_sequential_result(
+                                tc,
+                                &content_raw,
+                                is_error,
+                                duration,
+                                tx,
+                                &rewritten,
+                                pre_run_executed,
+                                &mut executed,
+                            );
+                            if self.interrupted() && (idx + 1 < run.len() || executed < total) {
+                                interrupted_at = Some(idx);
+                                break;
+                            }
+                        }
+                        if let Some(idx) = interrupted_at {
+                            // Grace-drain the still-running co-dispatched
+                            // handles (small per-handle timeout): children
+                            // must not keep running detached after the
+                            // interrupt, and every tool_call of the run must
+                            // receive a tool_result — a dangling tool_use is
+                            // a hard request error on Anthropic. A call that
+                            // finishes within the grace keeps its real
+                            // (wrapped) result; one that does not is answered
+                            // with "<interrupted>".
+                            for (tc, handle) in run[idx + 1..].iter().zip(pending) {
+                                let bounded = tokio::time::timeout(
+                                    std::time::Duration::from_secs(DELEGATION_INTERRUPT_GRACE_SECS),
+                                    handle,
+                                )
+                                .await;
+                                let content = match bounded {
+                                    Ok(Ok(result)) => maybe_wrap_untrusted(
+                                        &tc.function.name,
+                                        &result.to_content_string(),
+                                    ),
+                                    Ok(Err(_)) | Err(_) => "<interrupted>".to_string(),
+                                };
+                                self.push_message(
+                                    Message::tool_result(&tc.id, &tc.function.name, content),
+                                    None,
+                                );
+                                executed += 1;
+                            }
+                            // Any batch calls past this run were never
+                            // started; answer them with the standard skip
+                            // result (same shape finish_sequential_result's
+                            // suppressed branch uses).
                             let remaining: Vec<&ToolCall> = rewritten[executed..].iter().collect();
+                            if !remaining.is_empty() {
+                                let _ = tx.send(AgentEvent::Notice(format!(
+                                    "⚡ Interrupt: skipping {} remaining tool call(s)",
+                                    remaining.len()
+                                )));
+                            }
                             for skipped in remaining {
                                 let content = format!(
                                     "[Tool execution skipped — {} was not started. User sent a new message]",
@@ -3487,8 +3542,158 @@ impl Agent {
                             }
                             return true;
                         }
+                        // tool_delay applies between tools/segments — never
+                        // between co-dispatched delegation calls (they are
+                        // intended to start simultaneously), only once after
+                        // the finished run.
+                        if self.tool_delay_or_interrupt(executed, total, &rewritten).await {
+                            return true;
+                        }
+                        i += run_len;
+                    } else {
+                        let tc = &calls[i];
+                        let args = normalized_args(tc);
+                        let _ = tx.send(AgentEvent::ToolStart {
+                            name: tc.function.name.clone(),
+                            emoji: self.registry.get_emoji(&tc.function.name),
+                            summary: summarize_args(&tc.function.name, &args),
+                        });
+                        let call_start = std::time::Instant::now();
+                        let ctx = self.ctx_for_tool(&tc.function.name, tx.clone());
+                        let result = self
+                            .registry
+                            .dispatch_call(&tc.function.name, args, &ctx, &tc.id)
+                            .await;
+                        let duration = call_start.elapsed().as_secs_f64();
+                        let is_error = result.is_error();
+                        let content_raw = result.to_content_string();
+                        if self.finish_sequential_result(
+                            tc,
+                            &content_raw,
+                            is_error,
+                            duration,
+                            tx,
+                            &rewritten,
+                            total,
+                            &mut executed,
+                        ) {
+                            return true;
+                        }
+                        if self.tool_delay_or_interrupt(executed, total, &rewritten).await {
+                            return true;
+                        }
+                        i += 1;
+                    }
                 }
             }
+        }
+        false
+    }
+
+    /// Shared per-result post-processing for the sequential dispatch path
+    /// (plain single calls and co-dispatched delegation runs alike):
+    /// FileChange emission, ToolEnd event, history append, loop detection,
+    /// and the between-calls interrupt check — byte-identical to the
+    /// pre-refactor inline block. Returns true when the batch was
+    /// interrupted (the caller stops and reports interruption).
+    fn finish_sequential_result(
+        &mut self,
+        tc: &ToolCall,
+        content_raw: &str,
+        is_error: bool,
+        duration: f64,
+        tx: &mpsc::UnboundedSender<AgentEvent>,
+        rewritten: &[ToolCall],
+        total: usize,
+        executed: &mut usize,
+    ) -> bool {
+        let preview = preview_result(content_raw);
+        // Feature 005 (T011): emit FileChange events before ToolEnd.
+        emit_pending_file_changes(tx, &tc.function.name, content_raw, self.neurocode_engine.as_ref());
+        let _ = tx.send(AgentEvent::ToolEnd {
+            name: tc.function.name.clone(),
+            is_error,
+            result_preview: preview,
+            duration_secs: duration,
+            exit_code: extract_exit_code(&tc.function.name, content_raw),
+            full_result: content_raw.to_string(),
+        });
+        let wrapped = maybe_wrap_untrusted(&tc.function.name, content_raw);
+        self.push_message(
+            Message::tool_result(&tc.id, &tc.function.name, wrapped.clone()),
+            None,
+        );
+        *executed += 1;
+
+        // ── Loop detection (crush-style) ───────────────────────
+        if self
+            .loop_detector
+            .record(&tc.function.name, &tc.function.arguments, &wrapped)
+        {
+            let _ = tx.send(AgentEvent::Notice(
+                "🔁 Loop detected — injecting nudge to change approach".into(),
+            ));
+            // Inject the nudge as a user-role message. It must NOT
+            // be a tool result: its tool_call_id would be declared
+            // by no assistant message, which strict providers
+            // reject with a 400.
+            self.push_message(
+                Message::user(crate::loop_detection::LoopDetector::nudge_message().to_string()),
+                None,
+            );
+        }
+
+        // Interrupt between sequential calls: skip the rest
+        if self.interrupted() && *executed < total {
+            let remaining: Vec<&ToolCall> = rewritten[*executed..].iter().collect();
+            let _ = tx.send(AgentEvent::Notice(format!(
+                "⚡ Interrupt: skipping {} remaining tool call(s)",
+                remaining.len()
+            )));
+            for skipped in remaining {
+                let content = format!(
+                    "[Tool execution skipped — {} was not started. User sent a new message]",
+                    skipped.function.name
+                );
+                self.push_message(
+                    Message::tool_result(&skipped.id, &skipped.function.name, content),
+                    None,
+                );
+            }
+            return true;
+        }
+        false
+    }
+
+    /// `tool_delay` spacing between sequential calls. Callers invoke this
+    /// once per single call or per FINISHED delegation run — never between
+    /// co-dispatched delegation calls (they are intended to start
+    /// simultaneously). Returns true when the sleep was interrupted (the
+    /// caller skips the remaining calls).
+    async fn tool_delay_or_interrupt(
+        &mut self,
+        executed: usize,
+        total: usize,
+        rewritten: &[ToolCall],
+    ) -> bool {
+        if self.config.tool_delay > 0.0
+            && executed < total
+            && self
+                .sleep_with_interrupt(Duration::from_secs_f64(self.config.tool_delay))
+                .await
+        {
+            let remaining: Vec<&ToolCall> = rewritten[executed..].iter().collect();
+            for skipped in remaining {
+                let content = format!(
+                    "[Tool execution skipped — {} was not started. User sent a new message]",
+                    skipped.function.name
+                );
+                self.push_message(
+                    Message::tool_result(&skipped.id, &skipped.function.name, content),
+                    None,
+                );
+            }
+            return true;
         }
         false
     }
@@ -3774,6 +3979,19 @@ fn plan_tool_segments(tool_calls: &[ToolCall]) -> Vec<(bool, Vec<ToolCall>)> {
         }
     }
     normalized
+}
+
+/// Length of the maximal contiguous run of concurrent-delegation calls
+/// starting at `calls[0]`. Runs of length >= 2 are co-dispatched by the
+/// sequential segment path (see `execute_tool_calls`); runs of length 1
+/// keep the plain single-call sequential behavior.
+fn delegation_run_len(calls: &[ToolCall]) -> usize {
+    calls
+        .iter()
+        .take_while(|tc| {
+            CONCURRENT_DELEGATION_TOOLS.contains(&tc.function.name.as_str())
+        })
+        .count()
 }
 
 fn normalized_args(tc: &ToolCall) -> Value {
@@ -4233,6 +4451,44 @@ mod tests {
             ctx.emit_output("chunk-a\n");
             ctx.emit_output("chunk-b\n");
             ToolResult::Text("ok".to_string())
+        }
+    }
+
+    /// Mock delegation tool (classification is NAME-based): records a
+    /// (start, end) execution interval into a shared vector, sleeping
+    /// `delay_ms` in between so tests can assert concurrent overlap.
+    /// The registry keys tools by name, so ONE instance serves every
+    /// `delegate_task` call in a batch — each dispatch records its own
+    /// interval, which is exactly what the overlap assertion needs.
+    struct DelegateMock {
+        intervals: Arc<Mutex<Vec<(std::time::Instant, std::time::Instant)>>>,
+        delay_ms: u64,
+    }
+    #[async_trait]
+    impl Tool for DelegateMock {
+        fn name(&self) -> &str {
+            "delegate_task"
+        }
+        fn toolset(&self) -> &str {
+            "test"
+        }
+        fn description(&self) -> &str {
+            "mock delegation tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {"label": {"type": "string"}}})
+        }
+        async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
+            let start = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            self.intervals
+                .lock()
+                .unwrap()
+                .push((start, std::time::Instant::now()));
+            ToolResult::Text(format!(
+                "delegated:{}",
+                args.get("label").and_then(|l| l.as_str()).unwrap_or("")
+            ))
         }
     }
 
@@ -5340,6 +5596,175 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn delegation_run_len_reports_contiguous_run_boundaries() {
+        let tc = |name: &str| ToolCall::new(format!("id_{}{}", name, name.len()), name, "{}");
+        let batch = vec![
+            tc("delegate_task"), // 0
+            tc("delegate_task"), // 1
+            tc("read_file"),     // 2
+            tc("delegate_task"), // 3
+            tc("call_omo_agent"), // 4
+        ];
+        // Run of 2 at 0.
+        assert_eq!(delegation_run_len(&batch[0..]), 2);
+        // Inside the run (index 1): run of 1 remains.
+        assert_eq!(delegation_run_len(&batch[1..]), 1);
+        // Not a delegation tool at 2: run length 0 (plain sequential path).
+        assert_eq!(delegation_run_len(&batch[2..]), 0);
+        // Mixed delegation names still form one contiguous run: 2 at 3.
+        assert_eq!(delegation_run_len(&batch[3..]), 2);
+        // Trailing boundary inside the run at 4.
+        assert_eq!(delegation_run_len(&batch[4..]), 1);
+        // Empty slice: no run.
+        assert_eq!(delegation_run_len(&batch[5..]), 0);
+    }
+
+    /// Multiple `delegate_task` calls in one assistant message must execute
+    /// CONCURRENTLY (interval overlap) while their tool results are appended
+    /// in call order. Drives the real `run_turn` dispatch entry point with a
+    /// mock tool NAMED `delegate_task` (classification is name-based).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delegation_runs_execute_concurrently_and_append_in_order() {
+        let _l = lock();
+        let intervals: Arc<Mutex<Vec<(std::time::Instant, std::time::Instant)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let tool = DelegateMock { intervals: intervals.clone(), delay_ms: 200 };
+        let mut fx = fixture(
+            vec![
+                Ok(tool_resp(
+                    vec![
+                        ToolCall::new("d1", "delegate_task", r#"{ "label": "one" }"#),
+                        ToolCall::new("d2", "delegate_task", r#"{ "label": "two" }"#),
+                    ],
+                    FinishReason::ToolCalls,
+                )),
+                Ok(text_resp("done")),
+            ],
+            10,
+            3,
+            Some(Arc::new(tool)),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        let result = fx.agent.run_turn("go", tx).await;
+        let elapsed = started.elapsed();
+        assert_eq!(result.final_text, "done");
+        assert!(!result.interrupted);
+
+        // Serialized execution would take >= 400ms; concurrent should be
+        // comfortably under that (2 × 200ms sleeps overlapping).
+        assert!(
+            elapsed < std::time::Duration::from_millis(400),
+            "delegation calls executed serially: {:?}",
+            elapsed
+        );
+
+        // The two intervals must overlap (true concurrency).
+        {
+            let ivs = intervals.lock().unwrap();
+            assert_eq!(ivs.len(), 2, "both mock delegations ran");
+            let (s1, e1) = ivs[0];
+            let (s2, e2) = ivs[1];
+            assert!(
+                s2 < e1 && s1 < e2,
+                "execution intervals did not overlap: ({:?}..{:?}) vs ({:?}..{:?})",
+                s1, e1, s2, e2
+            );
+        }
+
+        // Tool results appended in call order (d1 before d2).
+        let tool_msgs: Vec<&Message> = fx
+            .agent
+            .history()
+            .iter()
+            .filter(|m| m.role == "tool")
+            .collect();
+        assert_eq!(tool_msgs.len(), 2);
+        assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("d1"));
+        assert_eq!(tool_msgs[0].content.as_deref(), Some("delegated:one"));
+        assert_eq!(tool_msgs[1].tool_call_id.as_deref(), Some("d2"));
+        assert_eq!(tool_msgs[1].content.as_deref(), Some("delegated:two"));
+
+        // Events show both delegations started before either ended.
+        let events = drain(&mut rx);
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolStart { name, .. } if name == "delegate_task" => Some(()),
+                _ => None,
+            })
+            .collect();
+        let ends: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolEnd { name, .. } if name == "delegate_task" => Some(()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(ends.len(), 2);
+        let first_end = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolEnd { name, .. } if name == "delegate_task"))
+            .unwrap();
+        let last_start = events
+            .iter()
+            .rposition(|e| matches!(e, AgentEvent::ToolStart { name, .. } if name == "delegate_task"))
+            .unwrap();
+        assert!(
+            last_start < first_end,
+            "both ToolStart events must precede the first ToolEnd (simultaneous launch)"
+        );
+
+        assert_eq!(fx.transport.request_count(), 2);
+    }
+
+    /// Regression: a SINGLE `delegate_task` call (run of 1) stays on the
+    /// plain sequential path — dispatched, post-processed, and appended
+    /// with unchanged behavior (no concurrency machinery involved).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_delegation_call_stays_sequential() {
+        let _l = lock();
+        let intervals: Arc<Mutex<Vec<(std::time::Instant, std::time::Instant)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let tool = DelegateMock { intervals: intervals.clone(), delay_ms: 10 };
+        let mut fx = fixture(
+            vec![
+                Ok(tool_resp(
+                    vec![ToolCall::new("solo", "delegate_task", r#"{ "label": "only" }"#)],
+                    FinishReason::ToolCalls,
+                )),
+                Ok(text_resp("done")),
+            ],
+            10,
+            3,
+            Some(Arc::new(tool)),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert_eq!(result.final_text, "done");
+        assert!(!result.interrupted);
+        assert_eq!(intervals.lock().unwrap().len(), 1);
+        let tool_msgs: Vec<&Message> = fx
+            .agent
+            .history()
+            .iter()
+            .filter(|m| m.role == "tool")
+            .collect();
+        assert_eq!(tool_msgs.len(), 1);
+        assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("solo"));
+        assert_eq!(tool_msgs[0].content.as_deref(), Some("delegated:only"));
+        let events = drain(&mut rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolStart { name, .. } if name == "delegate_task")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolEnd { name, .. } if name == "delegate_task")));
+        assert_eq!(fx.transport.request_count(), 2);
     }
 
     #[test]

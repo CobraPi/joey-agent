@@ -20,6 +20,29 @@ child. Model resolution chain: per-TaskSpec model > request model >
 `delegation.default_model` > parent model. `model: "auto"` consults the
 llm-selector's ModelAllocator.
 
+### Parallel dispatch
+
+(a) Multiple `delegate_task` calls emitted in one assistant message are
+dispatched concurrently by the agent turn loop (a joey-native
+enhancement; upstream Hermes dispatches tool calls sequentially). There
+is deliberately no per-call timeout on this concurrent dispatch —
+subagents run long by design.
+
+(b) The child-slot semaphore pool is GLOBAL to the `SubagentManager`
+and shared across all dispatch paths — blocking singles, batches, and
+background waves all draw admission slots from ONE pool sized by
+`delegation.max_concurrent_children`. Concurrent `delegate_task` calls
+therefore cannot oversubscribe the documented child cap: every child
+still spawns immediately, but at most `max_concurrent_children` may
+enter their turn loop at any moment, process-wide per manager.
+
+(c) `task_graph` `action=update` accepts a batched `transitions` array
+and is safe under concurrent callers: mutations are Mutex-serialized
+and a fresh graph snapshot is re-published via
+`AgentEvent::TaskGraphPublished` after each batch of transitions, so
+disjoint concurrent updates both land and observers see a consistent
+graph after each.
+
 ### Async delegation — `background=true` (feature 020)
 
 `delegate_task` accepts two additive parameters (default behavior stays
@@ -354,3 +377,72 @@ Both modes derive identically on both sides: `joey-cli` role resolution
 (`HyperRoleSettings` in `delegation_tool.rs`). An unresolvable mapping
 inherits the existing default with a user-visible warning (FR-006,
 agent-notice channel) — never a failure.
+
+### Workflow inheritance: orchestrator toolset
+
+In orchestrator mode (`/hypercode orchestrator on`) the main agent is a
+delegation-first conductor. Its toolset used to be `delegation`,
+`terminal`, `file-read`, `web`; it now also inherits the main agent's
+workflow surfaces:
+
+- `todo` — the session TODO list tool: the orchestrator decomposes its
+  plan into a trackable checklist and maintains it as work progresses.
+- `skills` — skills_list / skill_view / skill_manage: the
+  `<available_skills>` index is injected into the orchestrator's system
+  prompt again, so it can load matching skills (`skill_view`) BEFORE
+  planning and pass `load_skills` in delegation requests.
+- `task-graph` — the new `task_graph` tool (below): the graph planner.
+
+Every orchestrator prompt — the fixed `ORCHESTRATOR_PROMPT` and every
+persona-overlay variant — carries a `## Workflow inheritance` section
+instructing exactly that: load matching skills before planning and pass
+`load_skills` on delegation; build and maintain the session todo list
+from the plan; publish and maintain the task graph and re-plan instead
+of drifting. (With the OMO integration inactive the prompt stays
+byte-identical to the const plus this section.)
+
+### `task_graph` tool (toolset: task-graph)
+
+New tool in `joey-orchestration`, registered globally but exposed only
+through the `task-graph` toolset, so normal sessions never see it —
+only the orchestrator does. Actions:
+
+- `plan` — replace the current graph with a validated strict
+  `joey-taskgraph/1` document (the same validator the execution-graph
+  pipeline uses).
+- `update` — apply TaskStatus transitions only: an array of
+  `{id, status}` entries, enforcing the legal transition edges.
+  Unknown task ids and illegal edges are rejected ("unknown task ..."
+  / "illegal transition ...").
+- `status` — render the current graph.
+
+Every successful `plan`/`update` emits the additive
+`AgentEvent::TaskGraphPublished { graph }` through the SubagentManager
+event tap. The TUI feeds that event into the Tasks tab and the
+`⚑{done}/{total}` header badge, so live-published orchestrator graphs
+render exactly like `/hypercode` execution graphs.
+
+### Strict document schema
+
+The `plan` action's document is validated strictly; violations come
+back as `schema_violation` errors. Shape:
+
+- Document: `{"format":"joey-taskgraph/1","tasks":[...]}` —
+  `baseline_revision` optional.
+- Every task REQUIRES: `id` (lowercase `[a-z0-9-]`), `objective`,
+  `dependencies`, `read_set`, `write_set` (relative paths),
+  `artifact_ids` (array of integers), `role`
+  (`"explorer"|"implementor"|"orchestrator"`), `model_tier`
+  (`"economical"|"frontier"`), `risk` (`"low"|"medium"|"high"`),
+  `acceptance` (non-empty array of `{criterion, kind}`), and
+  `verification`
+  (`{steps:[{name, command, parse, timeout_sec, required}], risk_triggered_review}` —
+  required key, may be `{"steps":[],"risk_triggered_review":false}`;
+  risk `"high"` needs a `required:true` step or
+  `risk_triggered_review:true`).
+- Optional: `isolation` (auto-injected per `write_set`), `status` /
+  `attempts` (defaulted).
+- Common rejections: missing `artifact_ids`/`verification` keys,
+  string `artifact_ids`, unknown enum variants (e.g. `"light"`,
+  `"conductor"`), absolute paths, empty `acceptance`,
+  dependency-unrelated tasks sharing a write path.

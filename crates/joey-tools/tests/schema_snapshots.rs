@@ -163,7 +163,7 @@ fn todo_schema() {
     let t = tool("todo");
     assert_eq!(
         t.description(),
-        "Manage your task list for the current session. Use for complex tasks with 3+ steps or when the user provides multiple tasks. Call with no parameters to read the current list.\n\nWriting:\n- Provide 'todos' array to create/update items\n- merge=false (default): replace the entire list with a fresh plan\n- merge=true: update existing items by id, add any new ones\n\nEach item: {id: string, content: string, status: pending|in_progress|completed|cancelled}\nList order is priority. Only ONE item in_progress at a time.\nMark items completed immediately when done. If something fails, cancel it and add a revised item.\n\nAlways returns the full current list."
+        "Manage your task list for the current session. Use for complex tasks with 3+ steps or when the user provides multiple tasks. Call with no parameters to read the current list.\n\nWriting:\n- Provide 'todos' array to create/update items\n- merge=false (default): replace the entire list with a fresh plan\n- merge=true: update existing items by id, add any new ones\n\nEach item: {id: string, content: string, status: pending|in_progress|completed|cancelled}\nList order is priority. Mark an item in_progress when its work starts and completed the moment it is verified. During a parallel fan-out wave (multiple subagents dispatched at once), every dispatched item may be in_progress simultaneously.\nMark items completed immediately when done. If something fails, cancel it and add a revised item.\n\nAlways returns the full current list."
     );
     assert_eq!(
         t.parameters(),

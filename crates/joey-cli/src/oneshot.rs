@@ -309,6 +309,12 @@ async fn run_agent(
 
     let mut agent = Agent::new(agent_cfg.clone(), registry, ctx)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Feature 026 (T023): session-start lifecycle context — ONE-TIME
+    // injection through the extra_instructions slot (cache-friendly, never
+    // per-turn); gated by speckit.enabled * speckit.lifecycle_context.
+    if let Some(block) = crate::speckit_lifecycle::session_context_block(&cwd, config) {
+        agent.set_extra_instructions(Some(block));
+    }
     agent.set_provider_semaphore(manager.semaphore());
 
     // Feature 011: install the allocator on the parent agent (main turn +

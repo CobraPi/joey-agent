@@ -27,6 +27,13 @@ pub struct VerificationStep {
 pub struct VerificationPlan {
     pub steps: Vec<VerificationStep>,
     pub risk_triggered_review: bool,
+    /// Acceptance criteria (T029, feature 026 US7): the spec's
+    /// Given/When/Then list carried alongside the steps so downstream
+    /// consumers can check the change against what the spec required.
+    /// Serialized with a default so planner JSON predating the field
+    /// deserializes cleanly.
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
 }
 
 impl VerificationPlan {
@@ -38,8 +45,8 @@ impl VerificationPlan {
     /// Derive a module-scoped plan (FR-001): keep only the steps whose
     /// `command` contains any of `impacted_modules` as a substring, mark
     /// every kept step `required = true`, and drop the rest.
-    /// `risk_triggered_review` is carried over unchanged. An empty
-    /// `impacted_modules` yields a plan with no steps.
+    /// `risk_triggered_review` and `acceptance_criteria` are carried over
+    /// unchanged. An empty `impacted_modules` yields a plan with no steps.
     pub fn scoped(&self, impacted_modules: &[String]) -> VerificationPlan {
         VerificationPlan {
             steps: self
@@ -56,6 +63,7 @@ impl VerificationPlan {
                 })
                 .collect(),
             risk_triggered_review: self.risk_triggered_review,
+            acceptance_criteria: self.acceptance_criteria.clone(),
         }
     }
 
@@ -63,6 +71,19 @@ impl VerificationPlan {
     /// least one required step, or risk-triggered review was requested.
     pub fn is_satisfied_for_high_risk(&self) -> bool {
         self.has_required_step() || self.risk_triggered_review
+    }
+
+    /// Builder (T029): attach acceptance criteria. Consuming builder —
+    /// `plan.with_acceptance_criteria(vec![...])`. APPENDS to any
+    /// existing criteria, deduplicating while preserving first-seen
+    /// order (additive only — never replaces).
+    pub fn with_acceptance_criteria(mut self, criteria: Vec<String>) -> Self {
+        for criterion in criteria {
+            if !self.acceptance_criteria.contains(&criterion) {
+                self.acceptance_criteria.push(criterion);
+            }
+        }
+        self
     }
 }
 
@@ -91,6 +112,7 @@ mod tests {
                 required: true,
             }],
             risk_triggered_review: false,
+            acceptance_criteria: vec![],
         };
 
         let json = serde_json::to_value(&plan).unwrap();
@@ -106,12 +128,26 @@ mod tests {
                         "required": true
                     }
                 ],
-                "risk_triggered_review": false
+                "risk_triggered_review": false,
+                "acceptance_criteria": []
             })
         );
 
         let round_trip: VerificationPlan = serde_json::from_value(json).unwrap();
         assert_eq!(round_trip, plan);
+    }
+
+    #[test]
+    fn serde_deserializes_json_without_acceptance_criteria_key() {
+        // Planner JSON predating T029 has no `acceptance_criteria` key —
+        // `#[serde(default)]` must absorb that.
+        let json = serde_json::json!({
+            "steps": [],
+            "risk_triggered_review": true
+        });
+        let plan: VerificationPlan = serde_json::from_value(json).unwrap();
+        assert!(plan.risk_triggered_review);
+        assert!(plan.acceptance_criteria.is_empty());
     }
 
     #[test]
@@ -123,6 +159,7 @@ mod tests {
                 step("c", "echo hi", false),
             ],
             risk_triggered_review: false,
+            acceptance_criteria: vec![],
         };
 
         let scoped = plan.scoped(&["joey-core".to_string()]);
@@ -137,6 +174,7 @@ mod tests {
         let plan = VerificationPlan {
             steps: vec![step("a", "cargo test -p joey-core", false)],
             risk_triggered_review: true,
+            acceptance_criteria: vec![],
         };
 
         let scoped = plan.scoped(&[]);
@@ -149,6 +187,7 @@ mod tests {
         let plan = VerificationPlan {
             steps: vec![step("a", "cargo test -p joey-core", false)],
             risk_triggered_review: true,
+            acceptance_criteria: vec![],
         };
 
         let scoped = plan.scoped(&["joey-core".to_string()]);
@@ -159,16 +198,57 @@ mod tests {
     }
 
     #[test]
+    fn scoped_preserves_acceptance_criteria() {
+        let plan = VerificationPlan {
+            steps: vec![step("a", "cargo test -p joey-core", false)],
+            risk_triggered_review: false,
+            acceptance_criteria: vec!["given a scoped change".to_string()],
+        }
+        .with_acceptance_criteria(vec!["given a scoped change".to_string()]);
+
+        let scoped = plan.scoped(&["joey-core".to_string()]);
+        assert_eq!(
+            scoped.acceptance_criteria,
+            vec!["given a scoped change".to_string()]
+        );
+
+        let scoped_none = plan.scoped(&[]);
+        assert_eq!(
+            scoped_none.acceptance_criteria,
+            vec!["given a scoped change".to_string()]
+        );
+    }
+
+    #[test]
+    fn with_acceptance_criteria_sets_field() {
+        let plan = VerificationPlan::default()
+            .with_acceptance_criteria(vec!["c1".to_string(), "c2".to_string()]);
+        assert_eq!(plan.acceptance_criteria, vec!["c1".to_string(), "c2".to_string()]);
+    }
+
+    #[test]
+    fn with_acceptance_criteria_appends_and_dedups_preserving_order() {
+        // Appends to existing criteria instead of replacing them, dedups
+        // preserving first-seen order.
+        let plan = VerificationPlan::default()
+            .with_acceptance_criteria(vec!["a".to_string(), "b".to_string()])
+            .with_acceptance_criteria(vec!["b".to_string(), "c".to_string(), "a".to_string()]);
+        assert_eq!(plan.acceptance_criteria, vec!["a", "b", "c"]);
+    }
+
+    #[test]
     fn has_required_step_true_and_false() {
         let with_required = VerificationPlan {
             steps: vec![step("a", "cargo test -p joey-core", true)],
             risk_triggered_review: false,
+            acceptance_criteria: vec![],
         };
         assert!(with_required.has_required_step());
 
         let without_required = VerificationPlan {
             steps: vec![step("a", "cargo test -p joey-core", false)],
             risk_triggered_review: false,
+            acceptance_criteria: vec![],
         };
         assert!(!without_required.has_required_step());
     }
@@ -183,6 +263,7 @@ mod tests {
         let review_only = VerificationPlan {
             steps: vec![],
             risk_triggered_review: true,
+            acceptance_criteria: vec![],
         };
         assert!(review_only.is_satisfied_for_high_risk());
 
@@ -190,6 +271,7 @@ mod tests {
         let required_step = VerificationPlan {
             steps: vec![step("a", "cargo test -p joey-core", true)],
             risk_triggered_review: false,
+            acceptance_criteria: vec![],
         };
         assert!(required_step.is_satisfied_for_high_risk());
 
@@ -197,6 +279,7 @@ mod tests {
         let non_required = VerificationPlan {
             steps: vec![step("a", "cargo test -p joey-core", false)],
             risk_triggered_review: false,
+            acceptance_criteria: vec![],
         };
         assert!(!non_required.is_satisfied_for_high_risk());
     }

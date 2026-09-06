@@ -89,6 +89,17 @@ pub fn conductor_prompt(model: &str) -> String {
     conductor::for_model(model).to_string()
 }
 
+/// Return the Conductor persona prompt with the runtime lifecycle snapshot
+/// (feature 026 T024/FR-008): the dynamic CURRENT LIFECYCLE STATE block is
+/// appended after the static spec-kit doctrine. `None` yields output
+/// byte-identical to [`conductor_prompt`].
+pub fn conductor_prompt_with_lifecycle(
+    model: &str,
+    snap: Option<&conductor::LifecycleSnapshot>,
+) -> String {
+    conductor::for_model_with_lifecycle(model, snap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

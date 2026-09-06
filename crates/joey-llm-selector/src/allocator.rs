@@ -306,9 +306,32 @@ impl SelectorEngine {
         // implicated one. A strictly-higher tier is preferred; if same tier,
         // prefer a different model only if the implicated one is Flash
         // (the weakest tier — worth diversifying away from).
+        //
+        // Capability gate (FR-005): the diagnoser runs detached from any
+        // turn, so per-turn flags (images, token budget) are unknowable here.
+        // We gate on the module's static needs: MainTurn/Subagent require
+        // tool support; vision and context-window minimums are per-turn and
+        // cannot be checked in this context.
+        let reqs = match module {
+            ModuleId::MainTurn | ModuleId::Subagent => ModuleRequirements {
+                needs_tools: true,
+                needs_vision: false,
+                min_context_window: 0,
+            },
+            ModuleId::Compression | ModuleId::Custom(_) => ModuleRequirements {
+                needs_tools: false,
+                needs_vision: false,
+                min_context_window: 0,
+            },
+        };
         let mut best: Option<&crate::candidate::CandidateModel> = None;
         for m in &pool.models {
             if m.id == implicated_model.id {
+                continue;
+            }
+            // FR-005: never reallocate to an incapable model just because it
+            // is higher-tier.
+            if !ColdStartScorer::satisfies(m, &reqs) {
                 continue;
             }
             let rank = match m.tier {
@@ -595,6 +618,16 @@ impl SelectorEngine {
                 source: AllocationSource::DegradedFallback,
             };
         }
+        // Empty pool AND cfg is "auto"/empty: still never the literal "auto"
+        // sentinel (FR-020). Substitute the first provider-curated fallback.
+        if cfg_model == "auto" || cfg_model.is_empty() {
+            if let Some(fb) = fallbacks.first() {
+                return Allocation {
+                    model_id: fb.clone(),
+                    source: AllocationSource::DegradedFallback,
+                };
+            }
+        }
         Allocation {
             model_id: cfg_model,
             source: AllocationSource::DegradedFallback,
@@ -620,17 +653,41 @@ impl ModelAllocator for SelectorEngine {
         // FR-002 disable path: when inactive, return the literal configured model.
         if !self.compute_active() {
             let cfg = self.config.read().unwrap();
+            let cfg_model = cfg.configured_model.clone();
+            drop(cfg);
+            // FR-020: never return the literal "auto" sentinel — it is not a
+            // routable model id. Substitute the first provider-curated
+            // fallback when the configured model is "auto" or empty.
+            if cfg_model != "auto" && !cfg_model.is_empty() {
+                return Allocation {
+                    model_id: cfg_model,
+                    source: AllocationSource::DisabledFallback,
+                };
+            }
+            if let Some(fb) = self.fallback_models.read().unwrap().first() {
+                return Allocation {
+                    model_id: fb.clone(),
+                    source: AllocationSource::DisabledFallback,
+                };
+            }
             return Allocation {
-                model_id: cfg.configured_model.clone(),
+                model_id: cfg_model,
                 source: AllocationSource::DisabledFallback,
             };
         }
 
-        // Check the per-turn cache first (FR-007).
-        {
+        // Check the per-turn cache first (FR-007). Pool guard: a cached id
+        // whose model has since left the pool is stale — fall through to the
+        // map path so the FR-014 staleness check re-resolves it. (The cache
+        // lock is dropped before touching the pool to keep lock ordering
+        // strictly cache → pool.)
+        let cached = {
             let cache = self.cache.lock().unwrap();
-            if let Some(alloc) = cache.allocations.get(&module) {
-                return alloc.clone();
+            cache.allocations.get(&module).cloned()
+        };
+        if let Some(alloc) = cached {
+            if self.is_in_pool(&alloc.model_id) {
+                return alloc;
             }
         }
 
@@ -724,6 +781,14 @@ impl ModelAllocator for SelectorEngine {
         cache.context_windows.clear();
 
         for entry in &map.entries {
+            // Pool guard (FR-014): never cache an allocation whose model is
+            // no longer in the pool — a cached dead id would short-circuit
+            // `resolve` all turn (the cache is consulted before the staleness
+            // check). Skipping here lets the first `resolve` for the module
+            // re-resolve naturally from the map path.
+            if !pool.get(&entry.model_id).is_some() {
+                continue;
+            }
             cache.allocations.insert(
                 entry.module.clone(),
                 Allocation {
@@ -1280,6 +1345,115 @@ mod tests {
         assert_ne!(alloc.model_id, "removed-from-catalog");
         assert_eq!(alloc.model_id, "live-model");
         assert_eq!(alloc.source, AllocationSource::ColdStartReresolve);
+    }
+
+    // ── Stale-cache short-circuit + 'auto' sentinel leak (FR-014/FR-020) ────
+
+    /// (a) Stale entry not served from the per-turn cache: an entry whose
+    /// model left the pool must not be cached at turn start, and a cached id
+    /// that goes stale mid-turn (pool shrank after refresh) must fall through
+    /// to the map path instead of being returned verbatim.
+    #[test]
+    fn test_stale_entry_not_served_from_turn_cache() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: "auto".to_string(),
+            ..Default::default()
+        };
+        let mut map = AllocationMap::default();
+        map.enabled = true;
+        map.entries.push(AllocationEntry {
+            module: ModuleId::MainTurn,
+            model_id: "removed-model".to_string(), // NOT in pool
+            pinned: false,
+            implicit_pin: false,
+            reason: "old".to_string(),
+            estimated_performance: None,
+            updated_at: None,
+        });
+        let (engine, _dir) = make_engine_with_pool(
+            cfg,
+            map,
+            vec![test_model("live-model", true, false, 32_000)],
+        );
+        // Turn start refresh — must NOT cache the stale entry (pool guard).
+        engine.refresh_at_turn_start();
+        let alloc = engine.resolve(ModuleId::MainTurn, false, true, 1000);
+        assert_ne!(alloc.model_id, "removed-model", "stale id must not be served from cache");
+        assert_eq!(alloc.model_id, "live-model");
+        assert_eq!(alloc.source, AllocationSource::ColdStartReresolve);
+    }
+
+    /// (a, complement) cache-hit pool guard: an id cached while in the pool
+    /// becomes stale when the pool shrinks — resolve must fall through to the
+    /// map/stale path rather than returning the dead cached id.
+    #[test]
+    fn test_cache_hit_pool_guard_falls_through_when_model_leaves_pool() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: "auto".to_string(),
+            ..Default::default()
+        };
+        let mut map = AllocationMap::default();
+        map.enabled = true;
+        map.entries.push(AllocationEntry {
+            module: ModuleId::MainTurn,
+            model_id: "model-a".to_string(),
+            pinned: false,
+            implicit_pin: false,
+            reason: "cold-start".to_string(),
+            estimated_performance: None,
+            updated_at: None,
+        });
+        let (engine, _dir) =
+            make_engine_with_pool(cfg, map, vec![test_model("model-a", true, false, 32_000)]);
+        // Refresh caches model-a (it IS in the pool at this point).
+        engine.refresh_at_turn_start();
+        // The catalog changes: model-a leaves, model-b joins.
+        engine.set_pool(CandidateModelPool::from_consolidated(
+            vec![test_model("model-b", true, false, 32_000)],
+            CatalogSource::Copilot,
+        ));
+        let alloc = engine.resolve(ModuleId::MainTurn, false, true, 1000);
+        assert_ne!(alloc.model_id, "model-a", "cached id gone from pool must not be returned");
+        assert_eq!(alloc.model_id, "model-b");
+        assert_eq!(alloc.source, AllocationSource::ColdStartReresolve);
+    }
+
+    /// (b) inactive + configured 'auto': resolve must never return the literal
+    /// 'auto' sentinel (FR-020) — the first provider-curated fallback is used.
+    #[test]
+    fn test_inactive_configured_auto_never_returns_auto() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: "auto".to_string(), // active sentinel, but pool empty → inactive
+            ..Default::default()
+        };
+        let (engine, _dir) = make_engine(cfg, AllocationMap::default());
+        engine.set_fallback_models(vec!["glm-5.2".to_string()]);
+        let alloc = engine.resolve(ModuleId::MainTurn, false, true, 1000);
+        assert_ne!(alloc.model_id, "auto", "FR-020: 'auto' must never leak from resolve");
+        assert_eq!(alloc.model_id, "glm-5.2");
+        assert_eq!(alloc.source, AllocationSource::DisabledFallback);
+    }
+
+    /// (c) empty pool + configured 'auto': degraded_fallback must never return
+    /// the literal 'auto' sentinel (FR-020).
+    #[test]
+    fn test_degraded_fallback_empty_pool_never_returns_auto() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: "auto".to_string(),
+            ..Default::default()
+        };
+        let (engine, _dir) = make_engine(cfg, AllocationMap::default());
+        // Pool empty; fallback ids are not in the pool → walk fails → cfg is
+        // 'auto' → must substitute the first curated fallback, never 'auto'.
+        engine.set_fallback_models(vec!["glm-5.2".to_string(), "glm-5".to_string()]);
+        let alloc = engine.degraded_fallback();
+        assert_ne!(alloc.model_id, "auto", "FR-020: 'auto' must never leak from degraded_fallback");
+        assert_eq!(alloc.model_id, "glm-5.2");
+        assert_eq!(alloc.source, AllocationSource::DegradedFallback);
     }
 
     // ── Phase 7 / T048: model-removed substitution (FR-015 acceptance 2) ────

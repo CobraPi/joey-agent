@@ -109,6 +109,17 @@ fn error_body(code: &str, message: impl Into<String>) -> Json<serde_json::Value>
     Json(json!({ "error": code, "message": message.into() }))
 }
 
+/// Path-traversal guard rejection (same shape `post_patch` already uses):
+/// request-controlled feature ids land in `repo_root.join("specs").join(&id)`
+/// paths, and a percent-encoded `..`/absolute id escapes the repo root.
+fn invalid_feature_id() -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        error_body("invalid_path", "feature id is not a safe path component"),
+    )
+        .into_response()
+}
+
 /// Whole-token containment: true when `needle` appears in `haystack` bounded
 /// by non-alphanumeric characters (or string edges). Plain `contains` made
 /// "FR-01" match "FR-011"'s line and "T001" match "T0010" — editing the wrong
@@ -266,6 +277,9 @@ async fn get_feature(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     match load_feature(&state.repo_root, &id) {
         Ok(feature) => (StatusCode::OK, Json(json!(feature))).into_response(),
         Err(e) => {
@@ -304,6 +318,9 @@ async fn patch_spec(
     AxPath(id): AxPath<String>,
     Json(body): Json<PatchSpecRequest>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let spec_path = state.repo_root.join("specs").join(&id).join("spec.md");
     if !spec_path.exists() {
         return (
@@ -379,6 +396,9 @@ async fn patch_task(
     AxPath((id, task_id)): AxPath<(String, String)>,
     Json(body): Json<PatchTaskRequest>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let tasks_path = state.repo_root.join("specs").join(&id).join("tasks.md");
     if !tasks_path.exists() {
         return (
@@ -442,6 +462,9 @@ async fn post_clarify(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let session_id = uuid::Uuid::new_v4().to_string();
     let repo_root = state.repo_root.clone();
     let feature_id = id.clone();
@@ -485,27 +508,26 @@ struct ClarifyAnswerRequest {
     answer: String,
 }
 
-#[tracing::instrument(skip(state, _body))]
+#[tracing::instrument(skip_all)]
 async fn post_clarify_answer(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     AxPath((id, _session_id)): AxPath<(String, String)>,
     Json(_body): Json<ClarifyAnswerRequest>,
 ) -> impl IntoResponse {
-    let spec_path = state.repo_root.join("specs").join(&id).join("spec.md");
-    let hash = if spec_path.exists() {
-        std::fs::read_to_string(&spec_path)
-            .ok()
-            .map(|c| conflict::content_hash(&c))
-    } else {
-        None
-    };
+    // Path-traversal guard (see post_patch).
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
 
+    // This endpoint previously discarded the answer body and returned 200
+    // with an empty `updated_line` — silent data loss. Until persistence is
+    // implemented, tell callers the truth instead of a fake success.
     (
-        StatusCode::OK,
-        Json(json!({
-            "updated_line": "",
-            "spec_content_hash": hash,
-        })),
+        StatusCode::NOT_IMPLEMENTED,
+        error_body(
+            "not_implemented",
+            "clarify answers are not persisted by this API yet",
+        ),
     )
         .into_response()
 }
@@ -519,6 +541,9 @@ async fn post_analyze(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     match commands::run_analyze(&state.repo_root, &id).await {
         Ok(result) => {
             let findings: Vec<crate::model::AnalysisFinding> = Vec::new();
@@ -558,6 +583,9 @@ async fn post_task_execute(
     State(state): State<AppState>,
     AxPath((id, task_id)): AxPath<(String, String)>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let run_id = uuid::Uuid::new_v4().to_string();
     let repo_root = state.repo_root.clone();
     let feature_id = id.clone();
@@ -654,6 +682,9 @@ async fn get_artifacts(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let feature_dir = state.repo_root.join("specs").join(&id);
     if !feature_dir.exists() {
         return (
@@ -696,6 +727,9 @@ async fn get_artifact(
     State(state): State<AppState>,
     AxPath((id, path)): AxPath<(String, String)>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let abs_path = match crate::parser::discovery::resolve_artifact_path(&state.repo_root, &path) {
         Some(p) => p,
         None => {
@@ -774,6 +808,9 @@ async fn patch_artifact(
     AxPath((id, path)): AxPath<(String, String)>,
     Json(body): Json<PatchArtifactRequest>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let abs_path = match crate::parser::discovery::resolve_artifact_path(&state.repo_root, &path) {
         Some(p) => p,
         None => {
@@ -902,6 +939,9 @@ async fn get_workflow(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let feature_dir = state.repo_root.join("specs").join(&id);
     if !feature_dir.exists() {
         return (
@@ -931,6 +971,9 @@ async fn get_step_config(
     State(state): State<AppState>,
     AxPath((id, step)): AxPath<(String, String)>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let installed = format!("Installed defaults for {step}");
     let override_data = state.get_override(&id, &step).await;
 
@@ -966,6 +1009,9 @@ async fn put_step_override(
     AxPath((id, step)): AxPath<(String, String)>,
     Json(body): Json<OverrideRequest>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let override_id = state
         .set_override(&id, &step, body.instructions.clone())
         .await;
@@ -978,6 +1024,9 @@ async fn delete_step_override(
     State(state): State<AppState>,
     AxPath((id, step)): AxPath<(String, String)>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     state.remove_override(&id, &step).await;
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1010,6 +1059,9 @@ async fn post_workflow_run(
     AxPath((id, step)): AxPath<(String, String)>,
     Json(body): Json<RunRequest>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let catalog = state.options_catalog();
 
     // FR-010: change_mode is mandatory (validate request body first).
@@ -1100,7 +1152,6 @@ async fn post_workflow_run(
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let cleanup_state = state.clone();
     let cleanup_attempt_id = attempt_id.clone();
-    let cleanup_token = cancel_token.clone();
 
     // Register the attempt for interaction/cancel endpoints.
     let (respond_tx, respond_rx) = tokio::sync::mpsc::channel::<runner::InteractionPayload>(16);
@@ -1140,22 +1191,44 @@ async fn post_workflow_run(
                     }
                 });
 
-                // Stream events from the runner to the WS broadcast channel.
-                while let Some(evt) = handle.events.recv().await {
-                    let json = serde_json::to_string(&evt).unwrap_or_default();
-                    let _ = tx.send(json);
+                // Stream events from the runner to the WS broadcast channel,
+                // selecting on the cancellation token so POST /cancel actually
+                // stops event processing (FR-014). The runner exposes no kill
+                // handle for the child, so cancellation here means: stop
+                // consuming events, mark the attempt Cancelled, update history,
+                // and emit the terminal Status event.
+                loop {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => {
+                            attempt.status = crate::model::AttemptStatus::Cancelled;
+                            attempt.ended_at = Some(chrono::Utc::now().to_rfc3339());
+                            let _ = crate::history::update_in_place(&joey_home, &attempt);
+                            let evt = runner::RunnerEvent::Status {
+                                attempt_id: ws_attempt_id.clone(),
+                                terminal: runner::TerminalStatus::Cancelled,
+                                duration_ms: 0,
+                            };
+                            let _ = tx.send(serde_json::to_string(&evt).unwrap_or_default());
+                            break;
+                        }
+                        maybe_evt = handle.events.recv() => {
+                            let Some(evt) = maybe_evt else { break };
+                            let json = serde_json::to_string(&evt).unwrap_or_default();
+                            let _ = tx.send(json);
 
-                    // Handle terminal status.
-                    if let runner::RunnerEvent::Status { ref terminal, .. } = evt {
-                        let final_status = match terminal {
-                            runner::TerminalStatus::Succeeded => crate::model::AttemptStatus::Succeeded,
-                            runner::TerminalStatus::Failed => crate::model::AttemptStatus::Failed,
-                            runner::TerminalStatus::Cancelled => crate::model::AttemptStatus::Cancelled,
-                        };
-                        attempt.status = final_status;
-                        attempt.ended_at = Some(chrono::Utc::now().to_rfc3339());
-                        let _ = crate::history::update_in_place(&joey_home, &attempt);
-                        break;
+                            // Handle terminal status.
+                            if let runner::RunnerEvent::Status { ref terminal, .. } = evt {
+                                let final_status = match terminal {
+                                    runner::TerminalStatus::Succeeded => crate::model::AttemptStatus::Succeeded,
+                                    runner::TerminalStatus::Failed => crate::model::AttemptStatus::Failed,
+                                    runner::TerminalStatus::Cancelled => crate::model::AttemptStatus::Cancelled,
+                                };
+                                attempt.status = final_status;
+                                attempt.ended_at = Some(chrono::Utc::now().to_rfc3339());
+                                let _ = crate::history::update_in_place(&joey_home, &attempt);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -1178,9 +1251,6 @@ async fn post_workflow_run(
         cleanup_state.remove_channel(&cleanup_attempt_id).await;
         cleanup_state.remove_attempt(&cleanup_attempt_id).await;
     });
-
-    // Select on cancel_token for safe cancellation (FR-014).
-    let _ = cleanup_token;
 
     (
         StatusCode::ACCEPTED,
@@ -1482,8 +1552,11 @@ async fn get_history(
     AxPath(id): AxPath<String>,
     axum::extract::Query(params): axum::extract::Query<HistoryQuery>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let path = crate::history::history_file(&state.joey_home(), &id);
-    let limit = params.limit.unwrap_or(50).min(200);
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let (attempts, next_cursor) =
         match crate::history::read_paginated(&path, limit, params.before.as_deref()) {
             Ok(result) => result,
@@ -1539,6 +1612,9 @@ async fn get_preferences(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let prefs = state.get_preferences(&id);
     (StatusCode::OK, Json(serde_json::to_value(&prefs).unwrap_or_default())).into_response()
 }
@@ -1550,6 +1626,9 @@ async fn put_preferences(
     AxPath(id): AxPath<String>,
     Json(body): Json<crate::model::WorkspacePreference>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     // Constitution III: reject embedded artifact content.
     if let Some(ref layout) = body.pane_layout {
         if let Some(content) = layout.as_str() {
@@ -1800,6 +1879,9 @@ async fn get_atlas(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let feature = match load_feature(&state.repo_root, &id) {
         Ok(f) => f,
         Err(e) => {
@@ -1924,6 +2006,9 @@ async fn get_stage_bar(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let _feature = match load_feature(&state.repo_root, &id) {
         Ok(f) => f,
         Err(e) => {
@@ -2000,6 +2085,9 @@ async fn get_recovery_states(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let feature_dir = state.repo_root.join("specs").join(&id);
 
     let mut states = Vec::new();
@@ -2069,6 +2157,16 @@ async fn get_cst(
     State(state): State<AppState>,
     AxPath((id, artifact)): AxPath<(String, String)>,
 ) -> impl IntoResponse {
+    // Path-traversal guard: both segments land in a filesystem path.
+    if !crate::parser::discovery::is_safe_feature_id(&id)
+        || !crate::parser::discovery::is_safe_artifact_name(&artifact)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            error_body("invalid_path", "feature id or artifact name is not a safe path component"),
+        )
+            .into_response();
+    }
     let path = state.repo_root.join("specs").join(&id).join(&artifact);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -2092,6 +2190,9 @@ async fn get_meaning_graph(
     AxPath(id): AxPath<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let feature_dir = state.repo_root.join("specs").join(&id);
     if !feature_dir.exists() {
         return (
@@ -2137,6 +2238,9 @@ async fn get_tree_diff(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let feature_dir = state.repo_root.join("specs").join(&id);
     let plan_path = feature_dir.join("plan.md");
 
@@ -2267,6 +2371,9 @@ async fn get_board(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let feature = match load_feature(&state.repo_root, &id) {
         Ok(f) => f,
         Err(e) => {
@@ -2533,6 +2640,9 @@ async fn get_coverage(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let feature_dir = state.repo_root.join("specs").join(&id);
     let mut docs = Vec::new();
     for name in &["spec.md", "plan.md", "tasks.md"] {
@@ -2602,6 +2712,9 @@ async fn get_defects(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let feature_dir = state.repo_root.join("specs").join(&id);
     let mut docs = Vec::new();
     for name in &["spec.md", "plan.md", "tasks.md"] {
@@ -2629,6 +2742,9 @@ async fn post_defect_fix(
     State(state): State<AppState>,
     AxPath((id, defect_id)): AxPath<(String, String)>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let feature_dir = state.repo_root.join("specs").join(&id);
     let mut docs = Vec::new();
     for name in &["spec.md", "plan.md", "tasks.md"] {
@@ -2641,21 +2757,19 @@ async fn post_defect_fix(
 
     let defect = graph.defects.iter().find(|d| d.id == defect_id);
     match defect {
-        Some(d) => (
-            StatusCode::OK,
-            Json(json!({
-                "feature_id": id,
-                "defect_id": defect_id,
-                "applied": true,
-                "scaffold": {
-                    "target_artifact": d.scaffold.target_artifact,
-                    "stub_bytes": d.scaffold.stub_bytes,
-                    "insertion_mode": format!("{:?}", d.scaffold.insertion_mode),
-                },
-                "generative_followon": d.generative_followon.is_some(),
-            })),
-        )
-            .into_response(),
+        Some(_) => {
+            // The defect exists, but this endpoint previously reported
+            // `applied: true` without writing anything — a silent no-op lie.
+            // Until a real (safe) apply path exists, be truthful (FR-023).
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                error_body(
+                    "not_implemented",
+                    "defect fixes are not applied by this API yet",
+                ),
+            )
+                .into_response()
+        }
         None => (
             StatusCode::NOT_FOUND,
             error_body("not_found", format!("defect {defect_id} not found")),
@@ -2670,6 +2784,9 @@ async fn get_clarify(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let feature_dir = state.repo_root.join("specs").join(&id);
     let mut docs = Vec::new();
     for name in &["spec.md", "plan.md", "tasks.md"] {
@@ -2722,6 +2839,9 @@ async fn post_clarify_answer_012(
     AxPath((id, marker_id)): AxPath<(String, String)>,
     Json(req): Json<ClarifyAnswerRequest012>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     let record = crate::ui_state::AcceptedClarifyRecord::new(
         chrono::Utc::now().to_rfc3339(),
         marker_id.clone(),
@@ -2761,60 +2881,36 @@ async fn post_clarify_answer_012(
 #[derive(Debug, Deserialize)]
 struct HunkAcceptRequest {
     /// If this hunk resolves a clarify marker, its marker_id.
+    #[allow(dead_code)]
     resolves_marker: Option<String>,
     /// The artifact this hunk belongs to.
+    #[allow(dead_code)]
     artifact: String,
 }
 
-#[tracing::instrument(skip(state))]
+#[tracing::instrument(skip_all)]
 async fn post_hunk_accept(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     AxPath((id, hunk_id)): AxPath<(String, String)>,
     Json(req): Json<HunkAcceptRequest>,
 ) -> impl IntoResponse {
-    let mut cleared_marker = false;
-    let coverage_recomputed;
-
-    // If the hunk resolves a clarify marker, record the accepted answer and
-    // clear the marker from the active queue (FR-029 — "accepting a hunk that
-    // resolves a clarify question clears the matching clarify card").
-    if let Some(marker_id) = &req.resolves_marker {
-        let record = crate::ui_state::AcceptedClarifyRecord::new(
-            chrono::Utc::now().to_rfc3339(),
-            marker_id.clone(),
-            format!("Resolved by accepting hunk {hunk_id}"),
-            "accepted".to_string(),
-            "sha256:accepted".to_string(),
-        );
-        let _ = crate::history::append_accepted_clarify(&state.joey_home(), &id, record);
-        cleared_marker = true;
+    // Path-traversal guard (see post_patch).
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
     }
 
-    // Recompute the coverage matrix after the accept (FR-029 — "updates the
-    // coverage matrix in one consistent action").
-    let feature_dir = state.repo_root.join("specs").join(&id);
-    let mut docs = Vec::new();
-    for name in &["spec.md", "plan.md", "tasks.md"] {
-        let p = feature_dir.join(name);
-        if let Ok(bytes) = std::fs::read(&p) {
-            docs.push(parse_bytes(name, &bytes));
-        }
-    }
-    let graph = build_graph(&id, &docs);
-    let defect_count = graph.defects.len();
-    coverage_recomputed = true;
-
+    // This endpoint previously returned `accepted: true` (and claimed
+    // coverage recomputation) without writing anything to the working tree —
+    // a silent no-op. Until a real, safe apply path exists, be truthful
+    // (FR-029). The request body is still parsed so the route contract is
+    // unchanged.
+    let _ = (hunk_id, req);
     (
-        StatusCode::OK,
-        Json(json!({
-            "feature_id": id,
-            "hunk_id": hunk_id,
-            "accepted": true,
-            "artifact": req.artifact,
-            "cleared_marker": cleared_marker,
-            "coverage_recomputed": coverage_recomputed,
-            "current_defect_count": defect_count,
-        })),
+        StatusCode::NOT_IMPLEMENTED,
+        error_body(
+            "not_implemented",
+            "hunk acceptance is not applied by this API yet",
+        ),
     )
         .into_response()
 }
@@ -2832,6 +2928,9 @@ async fn get_branch_drift(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     // Check the current git branch.
     let repo_root = &state.repo_root;
     let current_branch = std::process::Command::new("git")
@@ -2903,6 +3002,9 @@ async fn get_recovery_surface(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
+    if !crate::parser::discovery::is_safe_feature_id(&id) {
+        return invalid_feature_id();
+    }
     // Read history for this feature and find interrupted/recoverable attempts.
     let history_path = crate::history::history_file(&state.joey_home(), &id);
     let records = crate::history::read_overlay_records(&history_path).unwrap_or_default();

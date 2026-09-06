@@ -76,9 +76,11 @@ pub struct VizState {
     /// mutability so the renderer can record from `&App`.
     pub node_cells: RefCell<Vec<(u16, u16)>>,
     /// Task-DAG box center cells as drawn by the LAST frame on the Tasks
-    /// tab (same order as the deterministic `(depth, id)` task ordering).
-    /// Separate from `node_cells` so the two hit-tests never mix indices.
-    pub task_cells: RefCell<Vec<(u16, u16)>>,
+    /// tab (same order as the deterministic `(depth, id)` task ordering);
+    /// `None` marks a box the canvas clipped — no hit-cell for invisible
+    /// tasks. Separate from `node_cells` so the two hit-tests never mix
+    /// indices.
+    pub task_cells: RefCell<Vec<Option<(u16, u16)>>>,
 }
 
 impl Default for VizState {
@@ -125,6 +127,11 @@ impl VizState {
         if self.tab == VizTab::Nodes {
             self.list_cursor = self.selected;
         }
+    }
+
+    /// The currently active explorer tab.
+    pub fn current_tab(&self) -> VizTab {
+        self.tab
     }
 
     pub fn zoom_in(&mut self) {
@@ -415,7 +422,8 @@ pub fn explorer_click(app: &mut App, row: u16, col: u16, area: Rect) -> bool {
     if app.neurocode_viz.tab == VizTab::Tasks && app.task_graph.is_some() {
         let cells = app.neurocode_viz.task_cells.borrow().clone();
         let mut best: Option<(u32, usize)> = None;
-        for (idx, (nx, ny)) in cells.iter().enumerate() {
+        for (idx, cell) in cells.iter().enumerate() {
+            let Some((nx, ny)) = cell else { continue }; // clipped — no hit-cell
             let d = nx.abs_diff(col).max(ny.abs_diff(row)) as u32;
             if d <= 2 && best.map(|(bd, _)| d < bd).unwrap_or(true) {
                 best = Some((d, idx));
@@ -1123,7 +1131,7 @@ fn draw_tasks_tab(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     }
     let Some(graph) = app.task_graph.as_ref() else {
         // Empty state: centered dim hint.
-        let msg = " no task graph — run ⚡ hypercode with execution graph enabled ";
+        let msg = " no task graph yet — the orchestrator publishes plans with the task_graph tool ";
         let x = area.x + area.width.saturating_sub(msg.chars().count() as u16) / 2;
         let y = area.y + area.height / 2;
         for (i, ch) in msg.chars().enumerate() {
@@ -1225,7 +1233,20 @@ fn draw_task_dag(f: &mut Frame, area: Rect, app: &App, theme: Theme, graph: &Tas
     let inner_w = area.width.saturating_sub(2) as usize; // 1-cell margin each side
     let mut boxes: Vec<Option<TaskBox>> = vec![None; order.len()];
     for (row_index, (_d, members)) in rows.iter().enumerate() {
-        let y = area.y + 1 + (row_index as u16) * TASK_ROW_H;
+        // Saturating row geometry (regression: deep DAGs put row tops
+        // below the panel bottom — `area.y + area.height - y` underflowed
+        // in debug and wrapped to h=3 in release, pushing boxes past the
+        // buffer). Rows that don't fit are clipped, never wrapped.
+        let y_off = (row_index as u32) * (TASK_ROW_H as u32);
+        if y_off > u16::MAX as u32 {
+            continue;
+        }
+        let y = area.y.saturating_add(1).saturating_add(y_off as u16);
+        let rem = (area.y + area.height).saturating_sub(y);
+        let h = 3u16.min(rem);
+        if h == 0 {
+            continue;
+        }
         let count = members.len();
         let slot = inner_w / count.max(1);
         let bw = 24.min(slot.saturating_sub(2)).max(6) as u16;
@@ -1233,18 +1254,20 @@ fn draw_task_dag(f: &mut Frame, area: Rect, app: &App, theme: Theme, graph: &Tas
             let x = area.x + 1
                 + (k * inner_w / count.max(1)) as u16
                 + ((slot.saturating_sub(bw as usize)) / 2) as u16;
-            let h = 3u16.min(area.y + area.height - y);
-            if h == 0 {
+            let rem_w = (area.x + area.width).saturating_sub(x);
+            if rem_w == 0 {
                 continue;
             }
             boxes[idx] = Some(TaskBox {
-                rect: Rect::new(x, y, bw.min(area.x + area.width - x), h),
+                rect: Rect::new(x, y, bw.min(rem_w), h),
             });
         }
     }
 
-    // Record centers for hit-testing (in `order` sequence).
-    let cells: Vec<(u16, u16)> = boxes
+    // Record centers for hit-testing (in `order` sequence). Clipped boxes
+    // record None — a phantom (0, 0) center let clicks select invisible
+    // tasks (selected/detail disagreed with the canvas).
+    let cells: Vec<Option<(u16, u16)>> = boxes
         .iter()
         .map(|b| {
             b.map(|b| {
@@ -1253,7 +1276,6 @@ fn draw_task_dag(f: &mut Frame, area: Rect, app: &App, theme: Theme, graph: &Tas
                     b.rect.y + b.rect.height / 2,
                 )
             })
-            .unwrap_or((0, 0))
         })
         .collect();
     *app.neurocode_viz.task_cells.borrow_mut() = cells;
@@ -1795,7 +1817,7 @@ fn draw_canvas(f: &mut Frame, area: Rect, app: &App, theme: Theme, snapshot: &Co
         }
         let is_sel = idx == selected;
         let is_neighbor = neighbors.contains(&idx);
-        let glyph = node_glyph(&nd.kind, is_sel || nd.primary && is_sel);
+        let glyph = node_glyph(&nd.kind, is_sel);
         let color = if is_sel {
             theme.accent.to_color()
         } else if nd.primary {

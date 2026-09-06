@@ -250,7 +250,7 @@ fn viz_state_reset_restores_graph_and_clears_task_cells() {
     let mut v = VizState::default();
     v.tab = VizTab::Tasks;
     v.selected = 7;
-    *v.task_cells.borrow_mut() = vec![(1, 1)];
+    *v.task_cells.borrow_mut() = vec![Some((1, 1))];
     v.reset();
     assert_eq!(v.tab, VizTab::Graph);
     assert_eq!(v.selected, 0);

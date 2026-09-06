@@ -250,32 +250,39 @@ fn store_full_text(url: &str, content: &str) -> Option<String> {
 }
 
 /// Port of `_truncate_with_footer` — (model_text, was_truncated).
+/// All budgets and counts are in CHARS (Python str semantics), not bytes.
 fn truncate_with_footer(content: &str, url: &str, char_limit: usize) -> (String, bool) {
-    if content.len() <= char_limit {
+    let total_chars = content.chars().count();
+    if total_chars <= char_limit {
         return (content.to_string(), false);
     }
     let head_budget = (char_limit as f64 * 0.75) as usize;
     let tail_budget = char_limit - head_budget;
 
-    let head_end = crate::truncate::floor_char_boundary(content, head_budget);
+    let head_end = crate::truncate::floor_char_boundary(
+        content,
+        crate::truncate::char_index_to_byte(content, head_budget),
+    );
     let mut head = &content[..head_end];
-    let tail_start = crate::truncate::ceil_char_boundary(content, content.len() - tail_budget);
+    let tail_start = crate::truncate::ceil_char_boundary(
+        content,
+        crate::truncate::char_index_to_byte(content, total_chars - tail_budget),
+    );
     let mut tail = &content[tail_start..];
 
     // Snap the head cut back to the last newline.
     if let Some(nl) = head.rfind('\n') {
-        if nl as f64 > head_budget as f64 * 0.5 {
+        if head[..nl].chars().count() as f64 > head_budget as f64 * 0.5 {
             head = &head[..nl];
         }
     }
     // Snap the tail cut forward to the next newline.
     if let Some(nl) = tail.find('\n') {
-        if (nl as f64) < tail_budget as f64 * 0.5 {
+        if (tail[..nl].chars().count() as f64) < tail_budget as f64 * 0.5 {
             tail = &tail[nl + 1..];
         }
     }
 
-    let total = content.len();
     let stored_path = store_full_text(url, content);
 
     let mut footer_lines: Vec<String> = vec![
@@ -283,9 +290,9 @@ fn truncate_with_footer(content: &str, url: &str, char_limit: usize) -> (String,
         format!("{} [TRUNCATED] {}", "─".repeat(8), "─".repeat(8)),
         format!(
             "Showing {} chars (head) + {} chars (tail) of {} total clean characters.",
-            commas(head.len() as u64),
-            commas(tail.len() as u64),
-            commas(total as u64)
+            commas(head.chars().count() as u64),
+            commas(tail.chars().count() as u64),
+            commas(total_chars as u64)
         ),
     ];
     match &stored_path {
@@ -681,5 +688,35 @@ mod tests {
         assert_eq!(extract_char_limit(&c, None), 15000);
         assert_eq!(extract_char_limit(&c, Some(100)), 2000);
         assert_eq!(extract_char_limit(&c, Some(1_000_000)), 500_000);
+    }
+
+    #[test]
+    fn footer_truncation_counts_chars_not_bytes() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = joey_core::constants::HomeOverrideGuard::new(dir.path().to_path_buf());
+        // 3000 chars of 3-byte UTF-8 (9000 bytes): a byte-based budget of
+        // 2000 would treat the page as 9000 "chars"; char accounting must
+        // report the true 3000.
+        let long: String = "日".repeat(3000);
+        let (text, truncated) = truncate_with_footer(&long, "https://example.com/utf8", 2000);
+        assert!(truncated);
+        let footer = text
+            .lines()
+            .find(|l| l.starts_with("Showing "))
+            .expect("footer present");
+        // head 1500 chars + tail 500 chars of 3000 total — all char counts.
+        assert_eq!(
+            footer,
+            "Showing 1,500 chars (head) + 500 chars (tail) of 3,000 total clean characters."
+        );
+        // Head/tail window sizes match the reported char counts.
+        let body = &text[..text.find("\n\n────────").unwrap()];
+        assert_eq!(body.chars().count(), 1500 + 500 + "\n\n[... middle omitted — see footer ...]\n\n".chars().count());
+        // Char budget at/above the char count must not truncate despite the
+        // 9000-byte length.
+        let (whole, t2) = truncate_with_footer(&long, "https://example.com/utf8", 3000);
+        assert_eq!(whole, long);
+        assert!(!t2);
     }
 }

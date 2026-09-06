@@ -510,3 +510,80 @@ fn conductor_prompt_dispatch_surface() {
         );
     }
 }
+
+/// Feature 026 T024/FR-008: the dynamic CURRENT LIFECYCLE STATE block is
+/// appended AFTER the full static doctrine, inside the {SPEC_KIT} slot.
+#[test]
+fn conductor_lifecycle_block_appended_after_doctrine() {
+    use joey_omo::agents::prompts::{conductor, conductor_prompt_with_lifecycle};
+    let snap = conductor::LifecycleSnapshot {
+        feature: "specs/026-please-fully-integrate".to_string(),
+        step: "Implement".to_string(),
+        guidance: "fan out implementors for unblocked tasks".to_string(),
+        spec_present: true,
+        plan_present: true,
+        tasks_present: true,
+    };
+    for (name, model) in [
+        ("default", "glm-5.2"),
+        ("gpt", "gpt-5.4"),
+        ("gpt_5_6", "gpt-5.6-sol"),
+    ] {
+        let out = conductor_prompt_with_lifecycle(model, Some(&snap));
+        assert!(
+            out.contains("SPEC-KIT LIFECYCLE DOCTRINE"),
+            "{name} variant must still embed the static doctrine"
+        );
+        assert!(
+            out.contains("CURRENT LIFECYCLE STATE (detected from disk at session start)"),
+            "{name} variant must carry the dynamic lifecycle block header"
+        );
+        assert!(
+            out.contains("specs/026-please-fully-integrate"),
+            "{name} variant must name the active feature"
+        );
+        assert!(
+            out.contains("Step: Implement"),
+            "{name} variant must name the current step"
+        );
+        assert!(
+            out.contains("[present]"),
+            "{name} variant must mark present artifacts"
+        );
+        // The doctrine END must appear BEFORE the dynamic block start.
+        let doctrine_tail = out.find("synthesize the completion report").unwrap();
+        let block_start = out.find("CURRENT LIFECYCLE STATE").unwrap();
+        assert!(
+            doctrine_tail < block_start,
+            "{name} variant: doctrine tail must precede the lifecycle block"
+        );
+    }
+}
+
+/// Feature 026 T024/FR-008: `None` snapshot renders byte-identically to the
+/// pre-feature static prompt.
+#[test]
+fn conductor_lifecycle_none_is_byte_identical() {
+    use joey_omo::agents::prompts::{conductor_prompt, conductor_prompt_with_lifecycle};
+    for model in ["glm-5.2", "gpt-5.4", "gpt-5.6-sol"] {
+        assert_eq!(
+            conductor_prompt_with_lifecycle(model, None),
+            conductor_prompt(model).as_str(),
+            "None snapshot must render byte-identically to conductor_prompt for {model}"
+        );
+    }
+}
+
+/// Feature 026 T024/FR-008: the plain dispatch surface never carries the
+/// dynamic block.
+#[test]
+fn conductor_doctrine_text_unchanged_by_snapshot() {
+    use joey_omo::agents::prompts::conductor_prompt;
+    for model in ["glm-5.2", "gpt-5.4", "gpt-5.6-sol"] {
+        let prompt = conductor_prompt(model);
+        assert!(
+            !prompt.contains("CURRENT LIFECYCLE STATE"),
+            "plain conductor_prompt must not carry the dynamic lifecycle block for {model}"
+        );
+    }
+}

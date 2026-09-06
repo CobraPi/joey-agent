@@ -57,6 +57,12 @@ impl BrowserManager {
                     Ok(el) => el,
                     Err(_) => continue, // hostile row: skip
                 };
+                // Non-finite rects (CSS calc/transform edge cases) must never
+                // reach the ordering/resolution paths — skip such rows.
+                let g = &el.geometry;
+                if !(g.x.is_finite() && g.y.is_finite() && g.w.is_finite() && g.h.is_finite()) {
+                    continue;
+                }
                 registry.push(el);
             }
         }

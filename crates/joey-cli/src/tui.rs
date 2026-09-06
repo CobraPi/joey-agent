@@ -269,6 +269,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
                 .unwrap_or_else(|_| "interrupt".to_string()),
             bg_items_tx,
             bg_items_rx,
+            speckit_hook_depth: 0,
         };
         session.submit(query.clone());
         loop {
@@ -326,6 +327,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
             .unwrap_or_else(|_| "interrupt".to_string()),
         bg_items_tx,
         bg_items_rx,
+        speckit_hook_depth: 0,
     };
     let (result, outro) = interactive_loop(session).await;
 
@@ -430,6 +432,10 @@ pub struct TuiSession {
     /// session keeps its own sender so the channel never reads as closed.
     pub bg_items_tx: tokio::sync::mpsc::UnboundedSender<TranscriptItem>,
     pub bg_items_rx: tokio::sync::mpsc::UnboundedReceiver<TranscriptItem>,
+    /// Recursion depth of speckit before-hook dispatch through handle_slash
+    /// (a known-speckit hook command re-enters the speckit arm; capped at
+    /// SPECKIT_HOOK_MAX_DEPTH — TUI parity with repl's handoff depth cap).
+    pub speckit_hook_depth: usize,
 }
 
 impl TuiSession {
@@ -443,6 +449,34 @@ impl TuiSession {
         crate::history::record(&prompt);
         if prompt.trim_start().starts_with('/') {
             return self.handle_slash(&prompt);
+        }
+        // Feature 026 (T012): dotted `speckit.<name> [args]` intercept —
+        // mirrors repl.rs process_input exactly (config-gated, unknown →
+        // error listing the surface, never shadowing user input).
+        if prompt.trim_start().starts_with("speckit.")
+            && crate::speckit_slash::speckit_enabled(&self.engine_spec.config)
+        {
+            let trimmed = prompt.trim_start().to_string();
+            return match crate::speckit_slash::dotted_to_slash(&trimmed) {
+                Some((canon, args)) => {
+                    let slash = if args.is_empty() {
+                        format!("/{canon}")
+                    } else {
+                        format!("/{canon} {args}")
+                    };
+                    self.handle_slash(&slash)
+                }
+                None => {
+                    let (name, _) =
+                        crate::speckit_slash::dotted_parts(&trimmed).unwrap_or((trimmed.as_str(), ""));
+                    for line in crate::speckit_slash::unknown_command_error(&format!("speckit-{name}")).lines() {
+                        self.tui.app_mut().push_item(TranscriptItem::Error {
+                            text: line.to_string(),
+                        });
+                    }
+                    false
+                }
+            };
         }
         let active_agent = self
             .tui
@@ -478,15 +512,22 @@ impl TuiSession {
     /// Shared by the submit() funnel and the Idle auto-drain (which must
     /// NOT re-join the remaining stash into the popped prompt).
     fn dispatch_turn(&mut self, turn_text: String, active_agent: String) {
+        // Engine-None: without an engine the turn silently vanished before
+        // (recorded into the transcript but never run) — surface it instead
+        // of losing the input.
+        if self.engine.is_none() {
+            self.tui.app_mut().push_item(TranscriptItem::Error {
+                text: "engine unavailable — press Ctrl-C twice to restart".into(),
+            });
+            return;
+        }
         // Only flip busy when there's actually an engine to run the turn —
         // otherwise the app wedges in Busy with no TurnFinished coming.
-        if self.engine.is_some() {
-            self.busy = true;
-            // Flip the App to Busy immediately so is_busy()-gated keys
-            // (Ctrl-C escalation, input styling) apply before TurnStart
-            // arrives.
-            self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
-        }
+        self.busy = true;
+        // Flip the App to Busy immediately so is_busy()-gated keys
+        // (Ctrl-C escalation, input styling) apply before TurnStart
+        // arrives.
+        self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
         if let Some(engine) = &self.engine {
             engine.send(crate::engine::EngineCommand::Submit {
                 prompt: turn_text,
@@ -1717,7 +1758,12 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 match crate::speckit_slash::status(&cwd) {
                     Ok(st) => {
-                        for line in crate::speckit_slash::render_status(&st).lines() {
+                        for line in crate::speckit_slash::render_status_with_config(
+                            &st,
+                            &self.engine_spec.config,
+                        )
+                        .lines()
+                        {
                             self.tui.app_mut().push_item(TranscriptItem::Notice {
                                 text: line.to_string(),
                                 kind: NoticeKind::Info,
@@ -1746,8 +1792,76 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
                     crate::speckit_slash::step_by_name(name),
                 ) {
                     (Some(root), Some(step)) => {
-                        match crate::speckit_slash::prepare_step(step, &root, &args, Some(step.skill)) {
-                            Ok(prep) => {
+                        // Feature 026 (T007): policy follows speckit.enabled
+                        // (FR-013) — mirrors repl.rs speckit_step_slash.
+                        let policy = if crate::speckit_slash::speckit_enabled(&self.engine_spec.config) {
+                            crate::speckit_slash::PrepPolicy::Native
+                        } else {
+                            crate::speckit_slash::PrepPolicy::Legacy
+                        };
+                        match crate::speckit_slash::prepare_step_opts(
+                            step,
+                            &root,
+                            &args,
+                            Some(step.skill),
+                            policy,
+                        ) {
+                            Ok(mut prep) => {
+                                // Hooks parity (T018/T019, FR-013) — mirrors
+                                // repl.rs speckit_step_slash: hook discovery
+                                // is gated on BOTH speckit.enabled and
+                                // speckit.hooks; when NOT allowed, the
+                                // resolved note section prepare baked into
+                                // the prompt is stripped exactly like the
+                                // repl path does.
+                                let short = step.name.strip_prefix("speckit-").unwrap_or(step.name);
+                                let hooks_allowed = policy
+                                    == crate::speckit_slash::PrepPolicy::Native
+                                    && crate::speckit_hooks::config_allows(&self.engine_spec.config);
+                                if !hooks_allowed && !prep.hooks_note.is_empty() {
+                                    if let Some(rest) = prep.prompt.strip_prefix(&prep.hooks_note) {
+                                        prep.prompt = rest.trim_start_matches('\n').to_string();
+                                    }
+                                    prep.hooks_note.clear();
+                                }
+                                // Engine-None abort: without an engine the
+                                // workflow turn can never run — fail BEFORE
+                                // the 'starting workflow' notice so the
+                                // transcript never promises a turn that
+                                // can't happen.
+                                if self.engine.is_none() {
+                                    self.tui.app_mut().push_item(TranscriptItem::Error {
+                                        text: "engine unavailable — press Ctrl-C twice to restart".into(),
+                                    });
+                                    return false;
+                                }
+                                // Mandatory before_<step> hooks (T018): a
+                                // failed mandatory hook aborts the step.
+                                // Known-speckit hook commands dispatch
+                                // recursively through this same slash
+                                // handling (depth-capped); other executable
+                                // hooks run as agent turns.
+                                if hooks_allowed {
+                                    for entry in crate::speckit_hooks::hooks_for(
+                                        &root,
+                                        &format!("before_{short}"),
+                                    ) {
+                                        if entry.optional
+                                            || !crate::speckit_hooks::is_executable(&entry)
+                                        {
+                                            continue;
+                                        }
+                                        if !self.run_speckit_hook(&root, &entry) {
+                                            self.tui.app_mut().push_item(TranscriptItem::Error {
+                                                text: format!(
+                                                    "mandatory hook '{}' failed — step aborted",
+                                                    entry.extension
+                                                ),
+                                            });
+                                            return false;
+                                        }
+                                    }
+                                }
                                 self.tui.app_mut().push_item(TranscriptItem::Notice {
                                     text: format!(
                                         "🧭 /{} — starting {} workflow (agent turn)",
@@ -2553,6 +2667,71 @@ pub fn handle_slash(&mut self, input: &str) -> bool {
         },
     }
     false
+}
+}
+
+/// Max recursion depth for speckit before-hooks dispatching through
+/// handle_slash (parity with repl's SPECKIT_HANDOFF_MAX_DEPTH).
+const SPECKIT_HOOK_MAX_DEPTH: usize = 3;
+
+impl TuiSession {
+/// Execute one mandatory speckit before-hook (T018, TUI parity with repl's
+/// run_mandatory_hook): a hook command normalizing to a known speckit
+/// command dispatches recursively through this TUI's own slash handling
+/// (depth-capped); anything else is submitted as an agent turn on the
+/// engine WITHOUT waiting. Returns false only when the hook cannot run at
+/// all (engine unavailable) — the caller aborts the step then.
+///
+/// best-effort: handle_slash is sync; before-hook agent turns are not
+/// awaited (repl path awaits).
+fn run_speckit_hook(&mut self, root: &std::path::Path, entry: &crate::speckit_hooks::HookEntry) -> bool {
+    let canon = crate::speckit_hooks::slash_form(&entry.command);
+    self.tui.app_mut().push_item(TranscriptItem::Notice {
+        text: format!("**Automatic Pre-Hook**: {}\nExecuting: `/{canon}\nEXECUTE_COMMAND: {}", entry.extension, entry.command),
+        kind: NoticeKind::Info,
+    });
+    let _ = root; // discovery already used it; kept for parity/readiness
+    let known_speckit = crate::speckit_slash::step_by_name(&canon).is_some()
+        || canon == "speckit-status"
+        || canon == "speckit-help";
+    if known_speckit && self.speckit_hook_depth < SPECKIT_HOOK_MAX_DEPTH {
+        self.speckit_hook_depth += 1;
+        let slash = if entry.prompt.is_empty() {
+            format!("/{canon}")
+        } else {
+            format!("/{canon} {}", entry.prompt)
+        };
+        self.handle_slash(&slash);
+        self.speckit_hook_depth -= 1;
+        true
+    } else {
+        // Engine-None → the hook turn can never run: abort.
+        let Some(engine) = &self.engine else {
+            self.tui.app_mut().push_item(TranscriptItem::Error {
+                text: "engine unavailable — press Ctrl-C twice to restart".into(),
+            });
+            return false;
+        };
+        let prompt = format!(
+            "Extension hook '{}' (from .specify/extensions.yml) instructs: command `{}` with prompt: {}",
+            entry.extension, entry.command, entry.prompt
+        );
+        let active_agent = self
+            .tui
+            .app()
+            .agent_roster
+            .get(self.tui.app().active_agent_index)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| "default".to_string());
+        engine.send(crate::engine::EngineCommand::Submit {
+            prompt,
+            active_agent,
+            announce: false,
+        });
+        self.busy = true;
+        self.tui.app_mut().mode = joey_tui::state::RunMode::Busy;
+        true
+    }
 }
 }
 

@@ -28,6 +28,68 @@ impl Default for GitStagingArea {
     }
 }
 
+/// Filter a unified `git diff` patch down to the sections touching files in
+/// `wanted` (paths as they appear after `+++ b/`).
+///
+/// Each per-file section starts with its `diff --git a/<p> b/<p>` line
+/// followed by the `--- a/<p>` / `+++ b/<p>` header pair; emitting from the
+/// `+++` line alone would produce a malformed patch `git apply` can't parse.
+/// While scanning we buffer the most recent `diff --git` + `--- a/` pair and
+/// emit them when the following `+++ b/` names a kept file, so each kept
+/// section stays well-formed.
+pub fn filter_patch_to_files(patch_text: &str, wanted: &std::collections::HashSet<&str>) -> String {
+    let mut out = String::new();
+    let mut current: Option<String> = None;
+    let mut header_buf: Vec<&str> = Vec::new();
+
+    for line in patch_text.lines() {
+        if let Some(p) = line.strip_prefix("+++ b/") {
+            let keep = wanted.contains(p);
+            if keep {
+                // Emit the buffered `diff --git` / `--- a/` header lines
+                // first, then this `+++ b/` line.
+                for h in header_buf.drain(..) {
+                    out.push_str(h);
+                    out.push('\n');
+                }
+                out.push_str(line);
+                out.push('\n');
+                current = Some(p.to_string());
+            } else {
+                header_buf.clear();
+                current = None;
+            }
+            continue;
+        }
+        if line.starts_with("diff --git ") {
+            // A new file section starts here: invalidate the previous
+            // section state and buffer the header until the `+++ b/` line
+            // decides whether this file is kept.
+            current = None;
+            header_buf.clear();
+            header_buf.push(line);
+            continue;
+        }
+        if line.starts_with("--- a/") {
+            // Buffer the `--- a/` header until we know whether the file is
+            // kept. (Only buffer while not inside a kept section: inside a
+            // kept section the next section's headers are preceded by a
+            // `diff --git` line that already reset the state.)
+            if current.is_none() {
+                header_buf.push(line);
+            }
+            continue;
+        }
+        if let Some(p) = current.as_deref() {
+            if wanted.contains(p) {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 #[async_trait]
 impl StagingArea for GitStagingArea {
     async fn open(
@@ -173,10 +235,11 @@ impl StagingArea for GitStagingArea {
         root: &StagingRoot,
         selection: &crate::staging::Selection,
     ) -> Result<ApplyOutcome, StagingError> {
-        // For staged mode: compute diff and apply to the PRIMARY worktree
-        // (cwd = the worktree itself — the old code used
-        // worktree.parent(), i.e. the temp dir, so `git apply` ran in the
-        // wrong repository and reviewed hunks never landed).
+        // For staged mode: compute the diff in the STAGING worktree (that's
+        // where the changes live) and apply it to the PRIMARY worktree —
+        // `git apply` must run with the primary repo root as cwd, never in
+        // the staging worktree itself (which already contains the changes,
+        // so hunks would never land in the user's repo).
         if root.mode == ChangeMode::Staged {
             let diff_output = Command::new("git")
                 .arg("diff")
@@ -192,33 +255,25 @@ impl StagingArea for GitStagingArea {
             let selected_patch = if selection.entries.is_empty() || selection.apply_all_accepted {
                 patch_text.clone()
             } else {
-                // Keep per-file diff sections for selected paths.
+                // Keep per-file diff sections (including their `diff --git`
+                // and `--- a/` headers) for selected paths.
                 let wanted: std::collections::HashSet<&str> = selection
                     .entries
                     .iter()
                     .map(|e| e.path.as_str())
                     .collect();
-                let mut out = String::new();
-                let mut current: Option<String> = None;
-                for line in patch_text.lines() {
-                    if let Some(p) = line.strip_prefix("+++ b/") {
-                        current = Some(p.to_string());
-                    }
-                    if current
-                        .as_deref()
-                        .map(|p| wanted.contains(p))
-                        .unwrap_or(false)
-                    {
-                        out.push_str(line);
-                        out.push('\n');
-                    }
-                }
-                out
+                filter_patch_to_files(&patch_text, &wanted)
             };
             if selected_patch.trim().is_empty() {
                 return Ok(ApplyOutcome::default());
             }
 
+            // Resolve the PRIMARY repo root from the staging worktree: a
+            // linked worktree's `.git` file points at
+            // `<primary>/.git/worktrees/<name>`, so the git-common-dir
+            // parent-of-parent is the primary worktree. This is where the
+            // reviewed hunks must land.
+            let primary_root = self.primary_root(&root.worktree).await?;
             let patch_file = std::env::temp_dir().join(format!("joey-apply-{}.patch", root.attempt_id));
             std::fs::write(&patch_file, selected_patch)?;
 
@@ -226,17 +281,30 @@ impl StagingArea for GitStagingArea {
                 .arg("apply")
                 .arg("--reject")
                 .arg(&patch_file)
-                .current_dir(&root.worktree)
+                .current_dir(&primary_root)
                 .output()
                 .await
                 .map_err(|e| StagingError::Git(format!("git apply failed: {e}")))?;
 
             let _ = std::fs::remove_file(&patch_file);
 
+            let mut warnings = Vec::new();
+            if !apply_output.status.success() {
+                // Surface the failure instead of silently reporting nothing:
+                // --reject leaves unappliable hunks in .rej files.
+                warnings.push(crate::staging::DependencyWarning {
+                    hunk_id: String::new(),
+                    depends_on: Vec::new(),
+                    message: format!(
+                        "git apply reported failures: {}{}",
+                        String::from_utf8_lossy(&apply_output.stdout),
+                        String::from_utf8_lossy(&apply_output.stderr)
+                    ),
+                });
+            }
+
             // Report the actually-applied paths (selection-relative).
             let applied: Vec<String> = if !apply_output.status.success() {
-                // --reject leaves unappliable hunks in .rej files; report
-                // what was requested with a warning rather than nothing.
                 Vec::new()
             } else {
                 selection
@@ -245,16 +313,10 @@ impl StagingArea for GitStagingArea {
                     .map(|e| e.path.clone())
                     .collect()
             };
-            return Ok(ApplyOutcome {
-                applied,
-                warnings: Vec::new(),
-            });
+            return Ok(ApplyOutcome { applied, warnings });
         }
 
-        Ok(ApplyOutcome {
-            applied: Vec::new(),
-            warnings: Vec::new(),
-        })
+        Ok(ApplyOutcome::default())
     }
 
     async fn discard(&self, root: &StagingRoot) -> Result<(), StagingError> {
@@ -279,6 +341,47 @@ impl StagingArea for GitStagingArea {
 }
 
 impl GitStagingArea {
+    /// Resolve the PRIMARY repo root from a staging (linked) worktree.
+    ///
+    /// `git rev-parse --git-common-dir` run inside a linked worktree points
+    /// at `<primary>/.git` (the shared common dir); its parent is the primary
+    /// worktree root. Falls back to the given `worktree` when resolution
+    /// fails (e.g. not a linked worktree).
+    async fn primary_root(&self, worktree: &Path) -> Result<std::path::PathBuf, StagingError> {
+        let output = Command::new("git")
+            .arg("rev-parse")
+            .arg("--git-common-dir")
+            .current_dir(worktree)
+            .output()
+            .await
+            .map_err(|e| StagingError::Git(format!("git rev-parse failed: {e}")))?;
+
+        if !output.status.success() {
+            return Ok(worktree.to_path_buf());
+        }
+
+        let common_dir_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if common_dir_str.is_empty() {
+            return Ok(worktree.to_path_buf());
+        }
+
+        let common_dir = std::path::PathBuf::from(&common_dir_str);
+        // `git rev-parse` returns paths relative to the worktree when they
+        // are inside it; make absolute before walking up.
+        let common_dir = if common_dir.is_absolute() {
+            common_dir
+        } else {
+            worktree.join(common_dir)
+        };
+        let canonical = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
+
+        // `<primary>/.git` -> `<primary>`
+        Ok(canonical
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| worktree.to_path_buf()))
+    }
+
     /// Get additions/removals count for a file.
     async fn diffstat(&self, worktree: &Path, path: &str) -> Result<(i32, i32), StagingError> {
         let output = Command::new("git")
@@ -359,6 +462,156 @@ mod tests {
             assert_eq!(root.mode, ChangeMode::Direct);
             assert_eq!(root.worktree, dir.path());
         }
+    }
+
+    /// A two-file patch filtered to one file yields a well-formed
+    /// single-file patch starting at its `diff --git` header.
+    #[test]
+    fn filter_patch_keeps_diff_git_header() {
+        let patch = "\
+diff --git a/alpha.md b/alpha.md
+index 1111111..2222222 100644
+--- a/alpha.md
++++ b/alpha.md
+@@ -1 +1 @@
+-old alpha
++new alpha
+diff --git a/beta.md b/beta.md
+index 3333333..4444444 100644
+--- a/beta.md
++++ b/beta.md
+@@ -1 +1 @@
+-old beta
++new beta
+";
+        let wanted: std::collections::HashSet<&str> = ["beta.md"].into_iter().collect();
+        let filtered = filter_patch_to_files(patch, &wanted);
+
+        assert!(
+            filtered.starts_with("diff --git a/beta.md b/beta.md\n"),
+            "filtered patch must start with the diff --git header: {filtered:?}"
+        );
+        assert!(filtered.contains("--- a/beta.md\n"));
+        assert!(filtered.contains("+++ b/beta.md\n"));
+        assert!(filtered.contains("+new beta"));
+        assert!(
+            !filtered.contains("alpha"),
+            "unselected file must be fully excluded: {filtered:?}"
+        );
+        assert_eq!(filtered.lines().count(), 6);
+    }
+
+    /// Filtering to all files preserves both sections, each well-formed.
+    #[test]
+    fn filter_patch_keeps_all_selected() {
+        let patch = "\
+diff --git a/alpha.md b/alpha.md
+--- a/alpha.md
++++ b/alpha.md
+@@ -1 +1 @@
+-old
++new
+diff --git a/beta.md b/beta.md
+--- a/beta.md
++++ b/beta.md
+@@ -1 +1 @@
+-old
++new
+";
+        let wanted: std::collections::HashSet<&str> = ["alpha.md", "beta.md"].into_iter().collect();
+        let filtered = filter_patch_to_files(patch, &wanted);
+        assert!(filtered.starts_with("diff --git a/alpha.md b/alpha.md\n"));
+        assert_eq!(filtered.matches("diff --git ").count(), 2);
+        assert_eq!(filtered.matches("--- a/").count(), 2);
+    }
+
+    /// Filtering to no matching file yields an empty patch.
+    #[test]
+    fn filter_patch_no_match_is_empty() {
+        let patch = "\
+diff --git a/alpha.md b/alpha.md
+--- a/alpha.md
++++ b/alpha.md
+@@ -1 +1 @@
+-old
++new
+";
+        let wanted: std::collections::HashSet<&str> = ["other.md"].into_iter().collect();
+        let filtered = filter_patch_to_files(patch, &wanted);
+        assert!(filtered.is_empty());
+    }
+
+    /// End-to-end: a staged apply of one selected file lands the change in
+    /// the PRIMARY repo, not the staging worktree, and reports it applied.
+    #[tokio::test]
+    async fn staged_apply_targets_primary_root() {
+        let primary = tempfile::tempdir().unwrap();
+        // git init + tracked files + initial commit so the worktree add has
+        // a HEAD and modifications show up in `git diff`.
+        let init_files = [("alpha.md", "alpha old\n"), ("beta.md", "beta old\n")];
+        for (name, contents) in init_files {
+            std::fs::write(primary.path().join(name), contents).unwrap();
+        }
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", "init"],
+        ] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(primary.path())
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let staging = GitStagingArea::new();
+        let root = staging
+            .open(primary.path(), "apply-test-1", ChangeMode::Staged, &Scope::default())
+            .await
+            .unwrap();
+
+        // Modify two tracked files in the staging worktree; only beta.md is
+        // selected for apply.
+        std::fs::write(root.worktree.join("alpha.md"), "alpha new\n").unwrap();
+        std::fs::write(root.worktree.join("beta.md"), "beta new\n").unwrap();
+
+        let selection = crate::staging::Selection {
+            entries: vec![crate::staging::SelectionEntry {
+                path: "beta.md".to_string(),
+                hunks: Vec::new(),
+            }],
+            apply_all_accepted: false,
+        };
+
+        let outcome = staging.apply(&root, &selection).await.unwrap();
+        assert!(
+            outcome.warnings.is_empty(),
+            "apply should succeed without warnings: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(outcome.applied, vec!["beta.md".to_string()]);
+
+        // The selected change must land in the PRIMARY worktree…
+        let primary_beta = std::fs::read_to_string(primary.path().join("beta.md"))
+            .expect("beta.md must be readable in the primary repo after apply");
+        assert_eq!(primary_beta, "beta new\n");
+        // …while the unselected file stays untouched there. (Had `git apply`
+        // run inside the staging worktree — the bug — the patch would have
+        // bounced off the already-modified files and nothing would have
+        // landed in the primary repo.)
+        let primary_alpha = std::fs::read_to_string(primary.path().join("alpha.md")).unwrap();
+        assert_eq!(primary_alpha, "alpha old\n");
+
+        staging.discard(&root).await.unwrap();
     }
 }
 

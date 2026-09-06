@@ -290,6 +290,15 @@ pub enum AgentEvent {
         /// The child's own event.
         event: Box<AgentEvent>,
     },
+    /// A task graph was published or updated by an orchestration surface
+    /// (the `task_graph` tool the HyperCode orchestrator uses, or the
+    /// execution-graph pipeline). Payload is a serialized
+    /// `joey_orchestration::task_graph::TaskGraph` (the same JSON shape
+    /// `EngineEvent::TaskGraphSnapshot` carries). Additive: UIs that don't
+    /// render task graphs can ignore it.
+    TaskGraphPublished {
+        graph: serde_json::Value,
+    },
 
     // ── OMO orchestration events ─────────────────────────────────────
     /// The active agent mode changed via Tab picker (T035, BC-015).

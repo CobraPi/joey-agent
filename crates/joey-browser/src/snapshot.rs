@@ -190,7 +190,9 @@ impl Snapshot {
                     a.1.geometry
                         .y
                         .partial_cmp(&b.1.geometry.y)
-                        .expect("finite f64")
+                        // NaN rects (CSS calc/transform edge cases) must not
+                        // panic the scan/action path — stable, total fallback.
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|(i, _)| i)
             {

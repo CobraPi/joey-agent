@@ -3601,7 +3601,7 @@ pub fn draw_help_overlay(f: &mut Frame, area: Rect, theme: Theme) {
         ("  explorer: +/−/wheel/0", "zoom in/out · reset view"),
         ("  explorer: Tab / ⏎", "cycle graph · nodes · feed panes"),
         ("  explorer: Esc / click title", "dock the explorer back"),
-        ("  explorer: 3", "tasks tab — live hypercode task DAG"),
+        ("  explorer: 3", "tasks tab — live task DAG (any published graph)"),
         ("Ctrl+L", "clear transcript view"),
         ("Ctrl+P", "back to the orchestrator tab (from a subagent pane)"),
         ("Ctrl+N", "expand / collapse the subagent rail (or click its title)"),
@@ -5570,7 +5570,13 @@ pub fn draw_completion_popup(f: &mut Frame, area: Rect, app: &App, theme: Theme)
 /// content, more rows. Either way the panel records its rect into
 /// `app.last_neurocode_rect` for mouse hit-testing.
 pub fn draw_neurocode_panel(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
-    if !app.neurocode_active || area.width == 0 || area.height == 0 {
+    // A published task graph alone also shows the docked panel (the click
+    // target that expands the explorer's Tasks view) — without the indexer
+    // the feed body just reads as empty.
+    if (!app.neurocode_active && app.task_graph.is_none())
+        || area.width == 0
+        || area.height == 0
+    {
         return;
     }
     // Record geometry for mouse hit-testing (click toggles docked ↔
@@ -5581,6 +5587,10 @@ pub fn draw_neurocode_panel(f: &mut Frame, area: Rect, app: &App, theme: Theme) 
 
     let title = if app.neurocode_expanded {
         " neurocode · context feed · click or Esc to dock "
+    } else if !app.neurocode_active {
+        // Graph-only docked panel (explorer-without-indexer): the panel is
+        // the click target that opens the explorer's Tasks view.
+        " neurocode · tasks · click to expand "
     } else {
         " neurocode · context feed · click to expand "
     };
@@ -5663,8 +5673,20 @@ pub fn draw_neurocode_panel(f: &mut Frame, area: Rect, app: &App, theme: Theme) 
 
     // Body: the live context text, hard-wrapped, windowed by scroll.
     if app.neurocode_context.is_empty() {
+        let msg = if !app.neurocode_active {
+            // Graph-only docked panel: summarize the DAG instead of the
+            // (absent) assembled context.
+            match &app.task_graph {
+                Some(g) => {
+                    format!(" ⚑ task graph · {} tasks · click to open", g.nodes.len())
+                }
+                None => " (no context assembled yet — send a prompt)".to_string(),
+            }
+        } else {
+            " (no context assembled yet — send a prompt)".to_string()
+        };
         lines.push(Line::styled(
-            " (no context assembled yet — send a prompt)",
+            msg,
             Style::default().fg(theme.fg_most_subtle.to_color()),
         ));
     } else {

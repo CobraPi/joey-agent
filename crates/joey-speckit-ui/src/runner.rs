@@ -5,6 +5,7 @@
 //! `contracts/workflow-runner.md`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -34,6 +35,10 @@ pub struct AttemptHandle {
     pub events: mpsc::Receiver<RunnerEvent>,
     /// Sender for interaction responses (answer/approve) written to stdin.
     pub respond_tx: mpsc::Sender<InteractionPayload>,
+    /// Shared handle to the runner subprocess. `cancel()` kills it via
+    /// `start_kill()`; the runner's wait task observes the exit and emits
+    /// the terminal `Status` event (`None` exit code → Cancelled).
+    pub child: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
 }
 
 /// A response to a pending interaction, written to the child's stdin.

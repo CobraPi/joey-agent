@@ -97,11 +97,17 @@ impl Joiner {
 
     /// Collect one task's changes from its isolated workspace (FR-016).
     ///
-    /// Produces `patches/<task-id>.patch` by running `git diff <baseline>`
-    /// inside the workspace (git failure or an empty repo ⇒ an empty patch
-    /// file, never an error), derives the actual write set from
+    /// Produces `patches/<task-id>.patch` by first recording untracked
+    /// files as intent-to-add (`git add -N .`, best-effort) so new files
+    /// show up in the diff, then running `git diff <baseline>` inside the
+    /// workspace (git failure ⇒ an empty patch file, never an error),
+    /// derives the actual write set from
     /// `git diff --name-only <baseline>`, and checks it against the task's
-    /// declared write set. FR-017 divergence check: any actual path not in
+    /// declared write set. A workspace whose `baseline_revision` is empty
+    /// (a non-git FullCopy) is rejected with `InvalidData`: its changes
+    /// cannot be collected as a patch, and an empty bundle would make
+    /// integrate silently report the task applied while discarding them.
+    /// FR-017 divergence check: any actual path not in
     /// the declared set is recorded as a `DivergenceReport` evidence record
     /// (referenced by id in the bundle); a `CommandOutput` evidence record
     /// with the patch size is always recorded.
@@ -112,6 +118,28 @@ impl Joiner {
         run: &mut RunHandle,
     ) -> std::io::Result<ChangeBundle> {
         let patch_path = run.patch_path(task.id.as_str());
+
+        // A workspace without a git baseline (non-git FullCopy) cannot be
+        // diffed: `git diff ""` fails, yielding an empty patch that
+        // integrate would treat as a no-op while silently discarding all
+        // of the task's changes. Surface instead of swallowing (FR-016).
+        if ws.baseline_revision.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot collect changes from a workspace without a git baseline",
+            ));
+        }
+
+        // Record untracked files as intent-to-add so files newly created
+        // by the child appear in both `git diff <baseline>` and
+        // `git diff --name-only <baseline>` (otherwise they are silently
+        // dropped and the FR-017 divergence check is blind to them).
+        // Best-effort: failure (e.g. an already-tracked clean tree, or
+        // git missing) is ignored, exactly like the diff failures below.
+        let _ = Command::new("git")
+            .args(["add", "-N", "."])
+            .current_dir(ws.path())
+            .output();
 
         // Produce the patch artifact. On git failure or an empty repo the
         // patch is empty — collection must never fail because of git.
@@ -418,6 +446,92 @@ mod tests {
         assert!(bundle.patch_path.is_file());
         assert!(fs::metadata(&bundle.patch_path).unwrap().len() > 0);
         assert!(!bundle.evidence_ids.is_empty());
+    }
+
+    #[test]
+    fn collect_includes_untracked_new_files() {
+        if !git_available() {
+            eprintln!("skipping: git unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let rev = init_scratch(&repo);
+
+        // Child creates a brand-NEW untracked file (nothing else changes).
+        let copy = tmp.path().join("copy-a");
+        copy_dir(&repo, &copy);
+        fs::write(copy.join("src/new_file.rs"), "fn brand_new() {}\n").unwrap();
+
+        let run_root = tmp.path().join("run");
+        let mut run = RunHandle::create_at(&run_root, "run-1", &rev).unwrap();
+        let node = task("task-a", &["src/new_file.rs"]);
+
+        let joiner = Joiner::new(&repo);
+        let bundle = joiner
+            .collect(&ws("task-a", &copy, &rev), &node, &mut run)
+            .unwrap();
+
+        // The untracked file must appear in the actual write set…
+        assert_eq!(
+            bundle.actual_write_set,
+            vec![PathBuf::from("src/new_file.rs")],
+            "untracked new files must be collected, not silently dropped"
+        );
+        // …and in the patch artifact (intent-to-add makes it diffable)…
+        let patch = fs::read_to_string(&bundle.patch_path).unwrap();
+        assert!(
+            patch.contains("src/new_file.rs"),
+            "patch must contain the new file: {patch}"
+        );
+        assert!(patch.contains("fn brand_new()"), "patch carries content");
+        // …so no divergence is flagged (it was declared).
+        let evidence_path = run_root.join("evidence").join("task-a.json");
+        let raw = fs::read_to_string(&evidence_path).unwrap();
+        assert!(
+            !raw.contains("\"divergence_report\""),
+            "declared new file is not a divergence: {raw}"
+        );
+
+        // End-to-end: the bundle integrates and the file lands in the root.
+        let report = joiner.integrate(&[bundle], |_| Ok(())).unwrap();
+        assert_eq!(report.applied_task_ids, vec!["task-a"]);
+        assert_eq!(
+            fs::read_to_string(repo.join("src/new_file.rs")).unwrap(),
+            "fn brand_new() {}\n"
+        );
+    }
+
+    #[test]
+    fn collect_rejects_workspace_without_git_baseline() {
+        if !git_available() {
+            eprintln!("skipping: git unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_scratch(&repo);
+
+        // Non-git FullCopy workspace: a plain directory copy with edits,
+        // whose baseline_revision is empty.
+        let copy = tmp.path().join("copy-nongit");
+        fs::create_dir_all(copy.join("src")).unwrap();
+        fs::write(copy.join("src/a.rs"), "fn a1() {}\n").unwrap();
+
+        let run_root = tmp.path().join("run");
+        let mut run = RunHandle::create_at(&run_root, "run-1", "").unwrap();
+        let node = task("task-a", &["src/a.rs"]);
+
+        let joiner = Joiner::new(&repo);
+        let err = joiner
+            .collect(&ws("task-a", &copy, ""), &node, &mut run)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("without a git baseline"),
+            "error message: {err}"
+        );
     }
 
     #[test]

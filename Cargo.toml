@@ -43,6 +43,7 @@ joey-omo = { path = "crates/joey-omo" }
 joey-neurocode = { path = "crates/joey-neurocode" }
 joey-neurocode-rag = { path = "crates/joey-neurocode-rag" }
 joey-copilot = { path = "crates/joey-copilot" }
+joey-speckit-ui = { path = "crates/joey-speckit-ui" }
 
 # NeuroCode (feature 015): deterministic multi-language AST parsing (FR-006).
 # Originally Java-only (specs/015, ~270KB); generalized to a language registry

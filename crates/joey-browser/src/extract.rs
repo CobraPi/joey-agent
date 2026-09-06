@@ -203,13 +203,16 @@ pub const MARKERS_JS: &str = r#"
   for (const m of markerSpec) {
     const box = document.createElement('div');
     box.setAttribute(SENTINEL, '1');
-    box.style.cssText = `position:absolute;left:${m.x}px;top:${m.y}px;width:${m.w}px;height:${m.h}px;border:2px solid #ff3b30;background:rgba(255,59,48,0.18);color:#fff;font:bold 12px monospace;display:flex;align-items:flex-start;justify-content:flex-start;padding:1px 3px;`;
+    // Hint geometry is document coords (scan adds scrollY) but this layer is
+    // position:fixed (viewport coords) — subtract the CURRENT scroll at draw
+    // time so markers land correctly on scrolled pages.
+    box.style.cssText = `position:absolute;left:${m.x - window.scrollX}px;top:${m.y - window.scrollY}px;width:${m.w}px;height:${m.h}px;border:2px solid #ff3b30;background:rgba(255,59,48,0.18);color:#fff;font:bold 12px monospace;display:flex;align-items:flex-start;justify-content:flex-start;padding:1px 3px;`;
     box.textContent = m.id;
     layer.appendChild(box);
     if (m.label) {
       const tag = document.createElement('div');
       tag.setAttribute(SENTINEL, '1');
-      tag.style.cssText = `position:absolute;left:${m.x}px;top:${m.y + m.h + 2}px;color:#fff;background:#ff3b30;font:bold 11px monospace;padding:1px 4px;`;
+      tag.style.cssText = `position:absolute;left:${m.x - window.scrollX}px;top:${m.y + m.h + 2 - window.scrollY}px;color:#fff;background:#ff3b30;font:bold 11px monospace;padding:1px 4px;`;
       tag.textContent = m.label;
       layer.appendChild(tag);
     }

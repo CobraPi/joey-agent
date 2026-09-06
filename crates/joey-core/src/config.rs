@@ -131,11 +131,15 @@ hypercode:
     enabled: true
     max_concurrent_workers: 16
     max_repair_attempts: 3
-_config_version: 34
+speckit:
+  enabled: true
+  lifecycle_context: true
+  hooks: true
+_config_version: 35
 "#;
 
 /// Config schema version written on save (upstream `_config_version`).
-pub const CONFIG_VERSION: i64 = 34;
+pub const CONFIG_VERSION: i64 = 35;
 
 static DEFAULTS: Lazy<Value> = Lazy::new(|| {
     // SAFETY: DEFAULT_CONFIG_YAML is a compile-time constant; if it were
@@ -985,12 +989,14 @@ static WARNED_CRED_KEYS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(
 /// Returns the list of files loaded.
 pub fn load_joey_dotenv(joey_home: Option<&Path>, project_env: Option<&Path>) -> Vec<PathBuf> {
     let mut loaded: Vec<PathBuf> = Vec::new();
+    // Delegate the fallback to `constants::joey_home()`: it resolves the
+    // process-local home override → `JOEY_HOME` env var → `~/.joey`, so the
+    // .env follows the same per-profile scoping as config.yaml. The previous
+    // inline env-var lookup ignored the override, so profile secrets never
+    // loaded when a HomeOverrideGuard was active (e.g. gateway sessions).
     let home: PathBuf = match joey_home {
         Some(p) => p.to_path_buf(),
-        None => match std::env::var("JOEY_HOME") {
-            Ok(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
-            _ => constants::user_home_dir().join(crate::branding::HOME_DIR_NAME),
-        },
+        None => constants::joey_home(),
     };
     let user_env = home.join(".env");
 
@@ -1462,8 +1468,6 @@ mod tests {
         }
     }
 
-    #[test]
-
     // ── Feature 016 (FR-015/FR-016): image-model config keys ──
 
     #[test]
@@ -1593,6 +1597,15 @@ mod tests {
     }
 
     #[test]
+    fn speckit_defaults_per_spec026() {
+        let cfg = Config::defaults();
+        assert!(cfg.get_bool("speckit.enabled", false));
+        assert!(cfg.get_bool("speckit.lifecycle_context", false));
+        assert!(cfg.get_bool("speckit.hooks", false));
+        assert_eq!(crate::config::CONFIG_VERSION, 35);
+    }
+
+    #[test]
     fn dotenv_override_semantics() {
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -1627,6 +1640,35 @@ mod tests {
         // export prefix recognized AND non-ASCII scrubbed from *_TOKEN.
         assert_eq!(std::env::var("JOEY_TEST_EXPORTED_TOKEN").unwrap(), "abcdef");
         std::env::remove_var("JOEY_TEST_EXPORTED_TOKEN");
+    }
+
+    #[test]
+    fn dotenv_fallback_honors_home_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home_lock = crate::constants::TEST_HOME_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "JOEY_TEST_DOTENV_OVERRIDE=from_override_home\n",
+        )
+        .unwrap();
+        // With an active HomeOverrideGuard (per-profile scoping, e.g. gateway
+        // sessions), the .env fallback must resolve through
+        // constants::joey_home() — same as config.yaml — not the base ~/.joey.
+        let _home = crate::constants::HomeOverrideGuard::new(dir.path().to_path_buf());
+        let loaded = load_joey_dotenv(None, None);
+        assert_eq!(
+            std::env::var("JOEY_TEST_DOTENV_OVERRIDE").unwrap(),
+            "from_override_home"
+        );
+        assert!(
+            loaded.iter().any(|p| p == &dir.path().join(".env")),
+            "override-home .env must be the one loaded: {:?}",
+            loaded
+        );
+        std::env::remove_var("JOEY_TEST_DOTENV_OVERRIDE");
     }
 
     #[test]

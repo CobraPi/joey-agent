@@ -720,10 +720,23 @@ where
         include_fallback_chunks,
         embed,
     )?;
-    let mut pairs: Vec<(ChunkRow, f32)> = candidates
-        .iter()
-        .filter_map(|c| fetch_chunk_row(store, &c.chunk_id).map(|row| (row, c.score)))
-        .collect();
+    let mut pairs: Vec<(ChunkRow, f32)> = Vec::with_capacity(candidates.len());
+    for c in &candidates {
+        match fetch_chunk_row(store, &c.chunk_id) {
+            Ok(row) => pairs.push((row, c.score)),
+            // The candidate's row vanished between the scan and this
+            // fetch (a refresh committed a purge in between — WAL gives
+            // per-statement snapshots, not cross-statement ones).
+            // Dropping just this candidate is correct: it no longer
+            // exists in committed truth.
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            // Real SQL failures (locked DB, IO) propagate through the
+            // leg's existing error channel — the FR-008 machinery turns
+            // them into keyword_only + mode_reason instead of the dense
+            // leg silently shrinking.
+            Err(e) => return Err(DenseLegError::Scan(ScanError::Sql(e))),
+        }
+    }
     if let Some(pattern) = file_filter {
         pairs.retain(|(row, _)| glob_match(pattern, &row.source_path));
     }
@@ -1034,14 +1047,18 @@ const CHUNK_COLUMNS: &str =
     "chunk_id, chunk_kind, source_path, start_line, end_line, symbol_name, \
      symbol_kind";
 
-fn fetch_chunk_row(store: &GraphStore, chunk_id: &str) -> Option<ChunkRow> {
+/// Fetch one `rag_chunks` row by id. Fallible (not `.ok()`) so transient
+/// SQL failures (locked DB, IO) propagate — callers distinguish "row
+/// genuinely gone" (`QueryReturnedNoRows`) from real errors; silently
+/// mapping everything to None dropped dense candidates on transient
+/// failures.
+fn fetch_chunk_row(store: &GraphStore, chunk_id: &str) -> rusqlite::Result<ChunkRow> {
     let sql = format!(
         "SELECT {CHUNK_COLUMNS} FROM rag_chunks WHERE chunk_id = ?1"
     );
     store
         .conn()
         .query_row(&sql, rusqlite::params![chunk_id], row_to_chunk)
-        .ok()
 }
 
 fn row_to_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
@@ -1058,10 +1075,14 @@ fn row_to_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
 
 /// Map an FTS symbol hit to its symbol-aligned chunk row (same file, same
 /// simple name). `None` when the artifact has no indexed chunk yet.
+/// `ORDER BY chunk_id` keeps the LIMIT 1 deterministic — without it SQLite
+/// picks an unspecified row when several chunks share the symbol (e.g. a
+/// symbol split into multiple line-range pieces), making leg composition
+/// nondeterministic across runs.
 fn find_symbol_chunk(store: &GraphStore, node: &CodeArtifactNode) -> Option<ChunkRow> {
     let sql = format!(
         "SELECT {CHUNK_COLUMNS} FROM rag_chunks \
-         WHERE source_path = ?1 AND symbol_name = ?2 LIMIT 1"
+         WHERE source_path = ?1 AND symbol_name = ?2 ORDER BY chunk_id LIMIT 1"
     );
     store
         .conn()
@@ -1210,6 +1231,13 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 /// have (FR-014 coverage). A chunk whose file is missing or whose line
 /// range falls outside the file simply doesn't match (never an error).
 /// Deterministic order: `chunk_id` ascending.
+///
+/// The scan is restricted at the SQL level to the rows this leg exists
+/// for: fallback chunks (`chunk_kind = 'fallback'`, i.e. no symbol and no
+/// FTS coverage — the `code_artifacts_fts` surface only indexes symbol
+/// artifacts). Symbol chunks are reachable via the FTS and LIKE legs;
+/// rescanning their bodies here materialized the entire `rag_chunks`
+/// table and read every indexed file per query for no additional hits.
 fn content_search_chunks(
     store: &GraphStore,
     project_root: &Path,
@@ -1220,7 +1248,8 @@ fn content_search_chunks(
     }
     // Group chunk rows by path so each file is read at most once.
     let mut rows: Vec<ChunkRow> = match store.conn().prepare(&format!(
-        "SELECT {CHUNK_COLUMNS} FROM rag_chunks ORDER BY chunk_id"
+        "SELECT {CHUNK_COLUMNS} FROM rag_chunks \
+         WHERE chunk_kind = 'fallback' ORDER BY chunk_id"
     )) {
         Ok(mut stmt) => match stmt.query_map([], row_to_chunk) {
             Ok(iter) => iter.filter_map(Result::ok).collect(),

@@ -215,6 +215,27 @@ fn build_orig_to_norm_map(original: &str) -> Vec<usize> {
     result
 }
 
+/// Map a normalized-string byte position back to the first original-string
+/// byte position covering it: a direct hit when the reverse map holds the
+/// position, otherwise a linear scan for the first orig position whose norm
+/// position is >= the target. Mid-expansion boundaries (e.g. inside the
+/// `...` a `…` normalizes to) never get a reverse-map entry — without the
+/// scan they would collapse to 0 and corrupt the replacement.
+fn norm_to_orig_with_fallback(
+    norm_to_orig: &std::collections::HashMap<usize, usize>,
+    orig_to_norm: &[usize],
+    norm_pos: usize,
+) -> Option<usize> {
+    if let Some(&orig) = norm_to_orig.get(&norm_pos) {
+        return Some(orig);
+    }
+    orig_to_norm
+        .iter()
+        .enumerate()
+        .find(|(_, &n)| n >= norm_pos)
+        .map(|(i, _)| i)
+}
+
 fn map_positions_norm_to_orig(orig_to_norm: &[usize], norm_matches: &Matches) -> Matches {
     let mut norm_to_orig_start: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
@@ -277,7 +298,12 @@ fn preserve_unicode_in_replacement(
             Tag::Equal => {
                 let i1b = norm_old_char_to_byte[i1];
                 let i2b = norm_old_char_to_byte[i2];
-                let orig_start = file_norm_to_orig.get(&i1b).copied().unwrap_or(0);
+                let orig_start = norm_to_orig_with_fallback(
+                    &file_norm_to_orig,
+                    &file_orig_to_norm,
+                    i1b,
+                )
+                .unwrap_or(0);
                 let mut orig_end = orig_start;
                 while orig_end < file_region.len() && file_orig_to_norm[orig_end] < i2b {
                     orig_end += 1;
@@ -668,12 +694,10 @@ fn map_normalized_positions(
 
     let mut original_matches = Vec::new();
     for &(norm_start, norm_end) in normalized_matches {
-        let orig_start = match norm_to_orig_start.get(&norm_start) {
-            Some(&s) => s,
-            None => match orig_to_norm.iter().enumerate().find(|(_, &n)| n >= norm_start) {
-                Some((i, _)) => i,
-                None => continue,
-            },
+        let Some(orig_start) =
+            norm_to_orig_with_fallback(&norm_to_orig_start, &orig_to_norm, norm_start)
+        else {
+            continue;
         };
         let mut orig_end = if norm_end > 0 {
             match norm_to_orig_end.get(&(norm_end - 1)) {
@@ -890,6 +914,30 @@ mod tests {
         // Unchanged spans keep the file's unicode (em dash, opening quote).
         assert!(r.new_content.contains('\u{2014}'), "em dash preserved: {}", r.new_content);
         assert!(r.new_content.contains("QUOTES"));
+    }
+
+    #[test]
+    fn unicode_normalized_mid_expansion_boundary_keeps_tail() {
+        // Regression: when a normalized edit boundary lands INSIDE an
+        // expansion (the `…` → `...` run), the norm→orig reverse map has no
+        // entry for the mid-run byte position and orig_start collapsed to 0,
+        // corrupting the replacement (duplicating the file's head). The
+        // fallback must scan for the first orig position with norm_pos >=
+        // target so the tail after the change is preserved.
+        let content = "say \u{2026} ok\n";
+        let r = run(content, "say ... ok", "x .. ok", false);
+        assert_eq!(r.strategy, Some("unicode_normalized"));
+        // Corrected head ("x ") + preserved tail (" ok"): the equal-run
+        // boundary inside the `…`→`...` expansion cannot split the ellipsis
+        // char, so it skips past it. What must NOT happen is the old
+        // corruption where orig_start collapsed to 0 and duplicated the
+        // file's head ("x say … ok").
+        assert_eq!(
+            r.new_content, "x  ok\n",
+            "corrected text with tail preserved, no head duplication"
+        );
+        assert!(!r.new_content.contains("say"), "old corruption duplicated the head");
+        assert!(r.new_content.ends_with(" ok\n"), "tail preserved");
     }
 
     #[test]

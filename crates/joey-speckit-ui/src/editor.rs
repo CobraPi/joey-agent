@@ -77,10 +77,11 @@ pub fn apply_edit(
             match replace_section(&current_content, heading, new_text) {
                 Some(content) => content,
                 None => {
-                    // Heading not found — fall back to whole-file replace
-                    // rather than silently failing. This matches the tolerant
-                    // philosophy: degrade gracefully.
-                    new_text.to_string()
+                    // Heading not found (or the heading input is empty).
+                    // Replacing the whole file because of a typo'd section
+                    // name would silently destroy the rest of the artifact —
+                    // reject instead; the file is left unmodified.
+                    return EditorResult::Error(format!("heading not found: {heading}"));
                 }
             }
         }
@@ -101,14 +102,21 @@ fn replace_section(content: &str, heading: &str, new_body: &str) -> Option<Strin
     let lines: Vec<&str> = content.lines().collect();
     let heading_lower = heading.trim().to_lowercase();
 
-    // Find the heading line index.
+    // An empty/whitespace heading input is ambiguous — it must not match the
+    // first heading. Reject before matching (surfaces as `apply_edit`'s
+    // heading-not-found Error).
+    if heading_lower.is_empty() {
+        return None;
+    }
+
+    // Find the heading line index (exact match on trimmed, lowercased text —
+    // substring matching let `a` match `Technical Context`).
     let heading_idx = lines.iter().position(|line| {
         let trimmed = line.trim();
         if trimmed.starts_with('#') {
             // Extract heading text (strip leading #s).
             let text = trimmed.trim_start_matches('#').trim();
             text.to_lowercase() == heading_lower
-                || text.to_lowercase().contains(&heading_lower)
         } else {
             false
         }
@@ -150,6 +158,16 @@ fn replace_section(content: &str, heading: &str, new_body: &str) -> Option<Strin
             result.push('\n');
         }
         // Lines between heading+1 and end_idx are replaced by new_body (already added).
+    }
+
+    // If the matched heading is the LAST line, the loop above never reaches
+    // i == heading_idx + 1, so the new body would be silently dropped —
+    // append it explicitly.
+    if heading_idx + 1 >= lines.len() {
+        result.push_str(new_body);
+        if !new_body.ends_with('\n') {
+            result.push('\n');
+        }
     }
 
     // Trim trailing newline to match original if original didn't have one.
@@ -232,6 +250,117 @@ mod tests {
                 assert!(updated.contains("# Plan"));
             }
             _ => panic!("expected Success"),
+        }
+    }
+
+    #[test]
+    fn section_replace_heading_not_found_errors_and_leaves_file_unchanged() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("plan.md");
+        let content = "# Plan\n\n## Summary\nold summary text\n\n## Technical Context\nkeep this\n";
+        std::fs::write(&path, content).unwrap();
+        let hash = content_hash(content);
+
+        // Typo'd heading must NOT fall back to whole-file replace.
+        let result = apply_edit(
+            &path,
+            "replacement body\n",
+            &hash,
+            &EditScope::Section {
+                heading: "Summmary".to_string(),
+            },
+            Vec::new(),
+        );
+
+        match result {
+            EditorResult::Error(e) => {
+                assert_eq!(e, "heading not found: Summmary");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn section_replace_substring_heading_does_not_match() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("plan.md");
+        let content = "# Plan\n\n## Summary\ntext\n\n## Technical Context\nkeep this\n";
+        std::fs::write(&path, content).unwrap();
+        let hash = content_hash(content);
+
+        // A substring of a heading ('a' ⊂ 'Technical Context') must not match.
+        let result = apply_edit(
+            &path,
+            "replacement\n",
+            &hash,
+            &EditScope::Section {
+                heading: "a".to_string(),
+            },
+            Vec::new(),
+        );
+        assert!(matches!(result, EditorResult::Error(_)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn section_replace_empty_heading_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("plan.md");
+        let content = "# Plan\n\n## Summary\ntext\n";
+        std::fs::write(&path, content).unwrap();
+        let hash = content_hash(content);
+
+        for heading in ["", "   "] {
+            let result = apply_edit(
+                &path,
+                "replacement\n",
+                &hash,
+                &EditScope::Section {
+                    heading: heading.to_string(),
+                },
+                Vec::new(),
+            );
+            match result {
+                EditorResult::Error(e) => {
+                    assert_eq!(e, format!("heading not found: {heading}"));
+                }
+                other => panic!("expected Error for {heading:?}, got {other:?}"),
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn section_replace_heading_as_last_line_appends_body() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("plan.md");
+        let content = "# Plan\n\n## Summary\nold text\n\n## Technical Context\n";
+        std::fs::write(&path, content).unwrap();
+        let hash = content_hash(content);
+
+        // The matched heading is the LAST line — the new body must be
+        // appended, not silently dropped.
+        let result = apply_edit(
+            &path,
+            "appended body",
+            &hash,
+            &EditScope::Section {
+                heading: "Technical Context".to_string(),
+            },
+            Vec::new(),
+        );
+
+        match result {
+            EditorResult::Success { .. } => {
+                let updated = std::fs::read_to_string(&path).unwrap();
+                assert!(updated.contains("# Plan"));
+                assert!(updated.contains("## Summary"));
+                assert!(updated.contains("old text"));
+                assert!(updated.contains("## Technical Context"));
+                assert!(updated.contains("appended body"));
+            }
+            other => panic!("expected Success, got {other:?}"),
         }
     }
 

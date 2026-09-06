@@ -344,8 +344,17 @@ impl RunHandle {
         let path = self.root.join("evidence").join(format!("{task_id}.json"));
         let mut records: Vec<EvidenceRecord> = Vec::new();
         if let Ok(existing) = fs::read_to_string(&path) {
-            if let Ok(parsed) = serde_json::from_str::<Vec<EvidenceRecord>>(&existing) {
-                records = parsed;
+            match serde_json::from_str::<Vec<EvidenceRecord>>(&existing) {
+                Ok(parsed) => records = parsed,
+                Err(e) => {
+                    // Never overwrite a corrupt evidence file with only
+                    // the new record — that destroys all prior evidence.
+                    // Surface and leave the file on disk untouched.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("corrupt evidence file {}: {e}", path.display()),
+                    ));
+                }
             }
         }
         records.push(record.clone());
@@ -422,6 +431,37 @@ mod tests {
         assert_eq!(stored[1].id, "ev-2");
         assert_eq!(stored[0].kind, EvidenceKind::CommandOutput);
         assert_eq!(stored[1].kind, EvidenceKind::ReviewOutcome);
+    }
+
+    #[test]
+    fn record_evidence_refuses_to_overwrite_corrupt_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("r-1");
+        let mut handle = RunHandle::create_at(&root, "r-1", "rev-1").unwrap();
+
+        // Simulate a corrupt evidence file on disk (e.g. truncated write).
+        let evidence_path = root.join("evidence").join("task-auth.json");
+        fs::write(&evidence_path, b"{not valid json").unwrap();
+
+        let err = handle
+            .record_evidence("task-auth", EvidenceKind::CommandOutput, serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("corrupt evidence file"),
+            "error message: {err}"
+        );
+        assert!(
+            err.to_string().contains("task-auth.json"),
+            "error names the file: {err}"
+        );
+
+        // The corrupt file is preserved on disk, NOT replaced by a fresh
+        // single-record array (prior evidence must never be destroyed).
+        assert_eq!(
+            fs::read_to_string(&evidence_path).unwrap(),
+            "{not valid json"
+        );
     }
 
     #[test]

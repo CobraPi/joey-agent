@@ -16,6 +16,7 @@ pub mod manager;
 pub mod scheduler;
 pub mod subagent;
 pub mod task_graph;
+pub mod task_graph_tool;
 pub mod team;
 pub mod tap;
 pub mod types;
@@ -28,6 +29,7 @@ pub use capacity::{
 pub use control_tool::SubagentControl;
 pub use delegation_tool::{CallOmoAgent, DelegateTask};
 pub use manager::{ManagerConfig, SubagentManager};
+pub use task_graph_tool::TaskGraphTool;
 pub use types::{
     Budgets, DelegationOverview, DelegationRequest, DelegationResult, DelegationState,
     StopReason, SubagentRole, TaskSpec, WorkHandle,
@@ -130,6 +132,12 @@ fn register_orchestration_inner(
     // registry as delegate_task — steer/stop any child this manager
     // dispatched (blocking or background).
     registry.register(std::sync::Arc::new(SubagentControl::new(manager.clone())));
+    // task_graph: publish/maintain the orchestration task graph. In-memory
+    // state + events only (benign). Registered unconditionally — exposure
+    // is scoped by the `task-graph` toolset.
+    registry.register(std::sync::Arc::new(crate::task_graph_tool::TaskGraphTool::new(
+        manager.clone(),
+    )));
     // Feature 022 (agent teams): shared task list + mailbox tools.
     // Registered unconditionally — exposure is scoped by the `team`
     // toolset, and the spawn-time gate in delegate_task errors

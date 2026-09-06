@@ -108,9 +108,11 @@ fn add_line_numbers(content: &str, start_line: usize, max_line_length: usize) ->
     numbered.join("\n")
 }
 
-/// Returns (kept_text, lines_kept, truncated).
+/// Returns (kept_text, lines_kept, truncated). The budget is in CHARS
+/// (upstream Python str semantics), not bytes.
 fn truncate_to_char_budget(content: &str, max_chars: usize) -> (String, usize, bool) {
-    if content.len() <= max_chars {
+    let total_chars = content.chars().count();
+    if total_chars <= max_chars {
         let lines = if content.is_empty() { 0 } else { content.matches('\n').count() + 1 };
         return (content.to_string(), lines, false);
     }
@@ -118,7 +120,7 @@ fn truncate_to_char_budget(content: &str, max_chars: usize) -> (String, usize, b
     let mut kept: Vec<&str> = Vec::new();
     let mut running = 0usize;
     for line in &lines {
-        let addition = line.len() + if kept.is_empty() { 0 } else { 1 };
+        let addition = line.chars().count() + if kept.is_empty() { 0 } else { 1 };
         if running + addition > max_chars {
             break;
         }
@@ -126,7 +128,7 @@ fn truncate_to_char_budget(content: &str, max_chars: usize) -> (String, usize, b
         running += addition;
     }
     if kept.is_empty() {
-        let cut = truncate::floor_char_boundary(lines[0], max_chars);
+        let cut = truncate::char_index_to_byte(lines[0], max_chars);
         return (lines[0][..cut].to_string(), 1, true);
     }
     let n = kept.len();
@@ -319,7 +321,7 @@ impl Tool for ReadFile {
 
         // ── Character-count guard (graceful char-budget truncation) ───
         let max_chars = max_read_chars(ctx);
-        if content.len() > max_chars {
+        if content.chars().count() > max_chars {
             let (trimmed, lines_kept, _) = truncate_to_char_budget(&content, max_chars);
             let next_offset = offset + lines_kept;
             let shown_end = offset + lines_kept - 1;
@@ -332,7 +334,7 @@ impl Tool for ReadFile {
                 total_lines,
                 next_offset
             );
-            if trimmed.split('\n').next().map(|l| l.len()).unwrap_or(0) >= max_chars {
+            if trimmed.split('\n').next().map(|l| l.chars().count()).unwrap_or(0) >= max_chars {
                 hint.push_str(
                     " Note: the first line alone exceeded the budget and was clamped mid-line; its remainder is not retrievable via offset.",
                 );

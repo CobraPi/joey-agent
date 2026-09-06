@@ -522,7 +522,7 @@ async fn visual_fallback_engages_on_canvas() {
     let registry = m.scan_to_registry().await.expect("scan");
     // The canvas page has ZERO actionable elements.
     assert!(
-        registry.elements.iter().all(|e| !e.interactable || e.role == "link" && false),
+        registry.elements.iter().all(|e| !e.interactable),
         "canvas page has no actionable elements"
     );
     // Visual observe: coarse grid (no DOM geometry).

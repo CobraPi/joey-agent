@@ -247,6 +247,69 @@ fn looks_like_path(token: &str) -> bool {
     FILE_EXTS.iter().any(|e| lower.ends_with(&format!(".{e}")))
 }
 
+/// Normalize a feature-scope entry to repo-relative form, lexically (no
+/// filesystem access): backslashes become forward slashes, then the path
+/// is rebuilt from `Path::components()` dropping `RootDir`/`ParentDir`/
+/// `CurDir` components. Stored `source_path` values are repo-relative
+/// with forward slashes (the ingest walk strips the project root), so
+/// `/abs/path/a.rs`, `specs/../src/a.rs`, and `src\a.rs` all normalize
+/// into that form instead of silently matching zero nodes.
+fn normalize_scope_path(raw: &str) -> String {
+    let unified = raw.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in std::path::Path::new(&unified).components() {
+        match comp {
+            std::path::Component::Normal(c) => {
+                if let Some(s) = c.to_str() {
+                    if !s.is_empty() {
+                        parts.push(s);
+                    }
+                }
+            }
+            // RootDir (`/abs/...`), ParentDir (`../`), CurDir (`./`) are
+            // dropped — the hint is repo-relative.
+            _ => {}
+        }
+    }
+    parts.join("/")
+}
+
+/// Normalize a feature-scope file list (spec-kit plan/tasks read+write
+/// sets, T027) into path hints. Each entry is trimmed and lexically
+/// normalized to repo-relative form (see [`normalize_scope_path`]:
+/// backslashes unified, root/parent/current-dir components dropped), and
+/// entries containing a path separator additionally contribute their bare
+/// file name (the form requests usually mention in prose). Deduped
+/// preserving first-seen order; identifiers stay empty — scope files
+/// seed path lookup, not FTS symbol search.
+pub fn scope_file_hints(scope_files: &[String]) -> DiscoveryHints {
+    let mut file_paths: Vec<String> = Vec::new();
+    for raw in scope_files {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let stripped = normalize_scope_path(trimmed);
+        if !stripped.is_empty() && !file_paths.iter().any(|p| p == &stripped) {
+            file_paths.push(stripped.to_string());
+        }
+        if stripped.contains('/') {
+            if let Some(name) = std::path::Path::new(&stripped)
+                .file_name()
+                .and_then(|s| s.to_str())
+            {
+                if !name.is_empty() && !file_paths.iter().any(|p| p == name) {
+                    file_paths.push(name.to_string());
+                }
+            }
+        }
+    }
+    DiscoveryHints {
+        identifiers: vec![],
+        file_paths,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +392,48 @@ mod tests {
     fn snake_case_identifier() {
         let h = extract_hints("run parse_user_config again");
         assert!(h.identifiers.contains(&"parse_user_config".to_string()));
+    }
+
+    #[test]
+    fn scope_file_hints_normalize_lexically() {
+        let h = scope_file_hints(&[
+            // Absolute path: only the root component is dropped (purely
+            // lexical — no filesystem access to know the project root).
+            "/abs/project/src/a.rs".to_string(),
+            // `..` components are dropped lexically (the preceding
+            // directory is kept — nothing is popped without a filesystem).
+            "specs/../src/a.rs".to_string(),
+            // Backslashes unify to forward slashes.
+            "src\\b.rs".to_string(),
+            // Plain repo-relative + `./` prefix forms still work.
+            "./src/c.rs".to_string(),
+            "  src/d.rs  ".to_string(),
+        ]);
+        assert_eq!(
+            h.file_paths,
+            vec![
+                "abs/project/src/a.rs".to_string(),
+                "a.rs".to_string(),
+                "specs/src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "b.rs".to_string(),
+                "src/c.rs".to_string(),
+                "c.rs".to_string(),
+                "src/d.rs".to_string(),
+                "d.rs".to_string(),
+            ]
+        );
+        assert!(h.identifiers.is_empty());
+    }
+
+    #[test]
+    fn scope_file_hints_empty_and_bare_names() {
+        // Empty scope → empty hints.
+        assert!(scope_file_hints(&[]).file_paths.is_empty());
+        // Bare file names (no separator) contribute only themselves.
+        let h = scope_file_hints(&["App.java".to_string()]);
+        assert_eq!(h.file_paths, vec!["App.java".to_string()]);
+        // A bare `./` collapses to nothing.
+        assert!(scope_file_hints(&["./".to_string()]).file_paths.is_empty());
     }
 }

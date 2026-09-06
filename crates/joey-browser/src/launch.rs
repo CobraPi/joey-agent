@@ -108,6 +108,9 @@ pub struct ManagedBrowser {
     pub child: Child,
     /// The ws debugger URL parsed from stderr.
     pub ws_url: String,
+    /// Ephemeral `--user-data-dir` profile dir; the owner removes it on
+    /// teardown (disconnect) so managed launches never leak temp dirs.
+    pub user_data_dir: PathBuf,
 }
 
 /// Launch a managed browser with an ephemeral debugging port.
@@ -152,7 +155,7 @@ pub async fn launch_managed(
             _ => break,
         };
         if let Some(ws) = parse_devtools_ws_url(&line) {
-            return Ok(ManagedBrowser { child, ws_url: ws });
+            return Ok(ManagedBrowser { child, ws_url: ws, user_data_dir: user_data });
         }
     }
     let _ = child.kill().await;

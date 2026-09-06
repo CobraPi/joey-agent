@@ -928,6 +928,26 @@ impl ContextCompressor {
         self.last_compression_made_progress = false;
     }
 
+    /// Re-apply the context-window-derived state after the model allocator
+    /// assigned a different window mid-session (FR-019 reallocation): the
+    /// SAME threshold math as `update_model`, without touching model
+    /// identity or resetting usage calibration (the model itself did not
+    /// change, only its allocated context window).
+    pub fn reallocate_context_window(&mut self, context_length: i64) {
+        self.context_length = context_length;
+        // Re-apply the small-context floor for the NEW window, starting from
+        // the originally-configured percent (raise-only, reversible on a
+        // small → large switch).
+        self.threshold_percent =
+            Self::effective_threshold_percent(context_length, self.configured_threshold_percent);
+        self.threshold_tokens =
+            Self::compute_threshold_tokens(context_length, self.threshold_percent, self.max_tokens);
+        let target_tokens = (self.threshold_tokens as f64 * self.summary_target_ratio) as i64;
+        self.tail_token_budget = target_tokens;
+        self.max_summary_tokens =
+            ((context_length as f64 * 0.05) as i64).min(SUMMARY_TOKENS_CEILING);
+    }
+
     // ── Session lifecycle (context_compressor.py:874-1026) ──────────────
 
     /// Reset all per-session state for /new or /reset (`on_session_reset`).
@@ -3085,6 +3105,26 @@ mod tests {
         // And back to small re-gains the floor.
         c.update_model("small-model", 200_000, "", "", "openrouter", "", None);
         assert_eq!(c.threshold_percent, 0.75);
+    }
+
+    #[test]
+    fn reallocate_context_window_recomputes_derived_thresholds() {
+        // 200K window with configured 0.50 → live 0.75, 150K tokens.
+        let mut c = make_compressor(200_000, 0.50);
+        assert_eq!(c.threshold_percent, 0.75);
+        assert_eq!(c.threshold_tokens, 150_000);
+        // Reallocating to a 1M window recomputes BOTH the live percent AND
+        // the derived token thresholds (the stale-threshold bug: patching
+        // only context_length + threshold_percent left threshold_tokens
+        // derived from the OLD window).
+        c.reallocate_context_window(1_000_000);
+        assert_eq!(c.threshold_percent, 0.50);
+        assert_eq!(c.threshold_tokens, 500_000);
+        assert_eq!(c.tail_token_budget, (500_000f64 * c.summary_target_ratio) as i64);
+        // And back to small re-gains the floor and its derived thresholds.
+        c.reallocate_context_window(200_000);
+        assert_eq!(c.threshold_percent, 0.75);
+        assert_eq!(c.threshold_tokens, 150_000);
     }
 
     // ── should_compress gating ──────────────────────────────────────────

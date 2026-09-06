@@ -560,7 +560,8 @@ fn tab_free_keybindings_remain_intact() {
     app.agent_picker_open = true;
     app.agent_picker_cursor = 0;
     // Forward/backward wrap behavior (BC-014/BC-017) doesn't touch input.
-    app.agent_picker_cursor = (app.agent_picker_cursor + 1) % 1;
+    // (`% 1` is always 0 — written explicitly to satisfy clippy::modulo_one.)
+    app.agent_picker_cursor = 0;
     assert_eq!(app.agent_picker_cursor, 0);
 }
 

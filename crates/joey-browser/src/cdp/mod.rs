@@ -11,9 +11,17 @@
 
 pub mod domains;
 
+/// Hard cap on awaiting any single CDP command response. JS dialogs
+/// (alert/confirm/prompt) pause the renderer and crashed targets never
+/// reply; without a cap, every `Runtime.evaluate` would hang forever.
+/// 30s matches common CDP client defaults (e.g. Puppeteer's protocol
+/// timeout).
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -78,7 +86,7 @@ enum ToWs {
 
 /// Connection to the browser endpoint.
 pub struct CdpConnection {
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     pending: Arc<Mutex<HashMap<u64, Pending>>>,
     writer: mpsc::UnboundedSender<ToWs>,
     /// Broadcast fan-out of protocol events (method, session_id, params).
@@ -96,12 +104,15 @@ impl CdpConnection {
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (writer_tx, mut writer_rx) = mpsc::unbounded_channel();
+        let next_id = Arc::new(AtomicU64::new(1));
 
         // Reader task: route responses to pending channels, events to fan-out.
         let pending: Arc<Mutex<HashMap<u64, Pending>>> =
             Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn({
             let pending = pending.clone();
+            let next_id = next_id.clone();
+            let writer_tx = writer_tx.clone();
             async move {
                 let mut stream = stream;
                 while let Some(msg) = stream.next().await {
@@ -130,6 +141,28 @@ impl CdpConnection {
                             .and_then(|s| s.as_str())
                             .map(str::to_string);
                         let params = v.get("params").cloned().unwrap_or(Value::Null);
+                        // Dialog auto-handling: a JS dialog blocks the
+                        // renderer, wedging any in-flight Runtime.evaluate.
+                        // Auto-accept on the dialog's own session so
+                        // evaluation proceeds; the event still fans out to
+                        // `next_event` consumers. Fire-and-forget: the id
+                        // comes from the shared counter (never collides with
+                        // send() ids) and no pending entry is registered —
+                        // the ack is dropped on arrival.
+                        if method == "Page.javascriptDialogOpening" {
+                            let id = next_id.fetch_add(1, Ordering::SeqCst);
+                            let mut body = json!({
+                                "id": id,
+                                "method": "Page.handleJavaScriptDialog",
+                                "params": { "accept": true },
+                            });
+                            if let Some(s) = session.as_ref() {
+                                body["sessionId"] = Value::String(s.clone());
+                            }
+                            if let Ok(text) = serde_json::to_string(&body) {
+                                let _ = writer_tx.send(ToWs::Send { _id: id, text });
+                            }
+                        }
                         let _ = event_tx.send((method.to_string(), session, params));
                     }
                 }
@@ -157,7 +190,7 @@ impl CdpConnection {
         });
 
         Ok(Arc::new(CdpConnection {
-            next_id: AtomicU64::new(1),
+            next_id,
             pending,
             writer: writer_tx,
             events: event_rx,
@@ -185,9 +218,16 @@ impl CdpConnection {
             self.pending.lock().await.remove(&id);
             return Err(BrowserError::NotConnected);
         }
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => Err(BrowserError::NotConnected),
+        match tokio::time::timeout(RESPONSE_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(BrowserError::NotConnected),
+            Err(_) => {
+                // Drop the pending entry so a late response finds nothing.
+                self.pending.lock().await.remove(&id);
+                Err(BrowserError::Protocol(format!(
+                    "timed out waiting for CDP response for {method}"
+                )))
+            }
         }
     }
 

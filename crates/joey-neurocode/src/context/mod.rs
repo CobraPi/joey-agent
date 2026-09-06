@@ -456,7 +456,22 @@ impl<'a> ContextAssembler<'a> {
 
         // 1. Discovery hints from the request text — identifiers the user
         // actually named (backticked, CamelCase, dotted refs).
-        let hints = discovery::extract_hints(&request.text);
+        // Feature scope (T027): a non-empty scope prepends its file paths
+        // ahead of the text-derived ones (deduped; text hints preserved
+        // after the scope entries). The identifiers cascade is unchanged,
+        // and an empty scope leaves the hints exactly as before.
+        let mut hints = discovery::extract_hints(&request.text);
+        let mut scope_paths: Vec<String> = Vec::new();
+        if !request.scope_files.is_empty() {
+            scope_paths = discovery::scope_file_hints(&request.scope_files).file_paths;
+            let mut merged = scope_paths.clone();
+            for p in hints.file_paths {
+                if !merged.iter().any(|x| x == &p) {
+                    merged.push(p);
+                }
+            }
+            hints.file_paths = merged;
+        }
         for ident in hints.identifiers.iter() {
             // Fetch generously: FTS also matches `declared_dependencies`
             // text, so dependents of the named type can crowd the true node
@@ -468,6 +483,24 @@ impl<'a> ContextAssembler<'a> {
             }
             if nodes.len() >= 5 {
                 break;
+            }
+        }
+
+        // 1.5 Feature-scope resolution (T027): for each scope entry not
+        // already covered by a collected node (path-suffix match), pull in
+        // that file's type-level nodes — the same node-lookup style the
+        // active-file stage below uses. Runs unconditionally when a scope
+        // is present: scoped files are targets even when the request text
+        // also matched symbols elsewhere. No-op when unscoped.
+        for scope_path in &scope_paths {
+            let resolved = nodes
+                .iter()
+                .any(|n| n.source_path.ends_with(scope_path.as_str()));
+            if resolved {
+                continue;
+            }
+            if let Ok(results) = self.graph.store().nodes_by_source_path(scope_path) {
+                nodes.extend(results);
             }
         }
 

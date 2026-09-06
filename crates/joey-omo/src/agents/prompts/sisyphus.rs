@@ -58,6 +58,8 @@ Create todos/tasks BEFORE starting any non-trivial work. This is your PRIMARY co
 - After each step: mark `completed` IMMEDIATELY (NEVER batch)
 - If scope changes: update before proceeding
 
+During a parallel fan-out wave, mark every dispatched item in_progress when the wave fires and complete each item as its specialist reports.
+
 **FAILURE TO USE TODOS ON NON-TRIVIAL TASKS = INCOMPLETE WORK.**
 
 Implementation starts only when the current turn explicitly asks for it with concrete scope. Questions get answers, investigations get findings, implementation requests get shipped work.
@@ -177,7 +179,7 @@ Report only evidence from this turn. "Should pass" means unverified. Fix failure
 <tasks>
 Use todos for implementation work with two or more real steps, cross-file edits, delegated work, or uncertain scope. Skip tracking for direct answers, pure exploration, and one-step edits.
 
-When tracking: call the todo tool before implementation, keep exactly one item `in_progress`, and mark an item completed the moment it lands. Never batch completions. If scope changes, revise the list before more edits.
+When tracking: call the todo tool before implementation, keep exactly one item `in_progress`, and mark an item completed the moment it lands. Never batch completions. If scope changes, revise the list before more edits. During a parallel fan-out wave, mark every dispatched item in_progress when the wave fires and complete each item as its specialist reports.
 </tasks>
 
 <communication>
@@ -405,7 +407,7 @@ MANDATORY: Replace internal confidence with external verification. Run `lsp_diag
 
 ## Task Management (CRITICAL)
 
-Create todos BEFORE starting any non-trivial work. Multi-step (2+ steps) → ALWAYS create todo first. Mark `in_progress` before starting (ONE at a time). Mark `completed` IMMEDIATELY after each step (NEVER batch). FAILURE TO USE TODOS = INCOMPLETE WORK."#
+Create todos BEFORE starting any non-trivial work. Multi-step (2+ steps) → ALWAYS create todo first. Mark `in_progress` before starting (ONE at a time). Mark `completed` IMMEDIATELY after each step (NEVER batch). FAILURE TO USE TODOS = INCOMPLETE WORK. During a parallel fan-out wave, mark every dispatched item in_progress when the wave fires and complete each item as its specialist reports."#
 }
 
 /// Select the Sisyphus prompt variant for the given model.

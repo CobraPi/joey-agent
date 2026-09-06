@@ -172,6 +172,9 @@ pub fn read_paginated(
     limit: usize,
     before: Option<&str>,
 ) -> Result<(Vec<WorkflowAttempt>, Option<String>), HistoryError> {
+    // Guard the limit: `attempts[limit - 1]` below would underflow on 0.
+    // Any caller asking for a zero/negative page gets the smallest sane page.
+    let limit = limit.max(1);
     let records = read_all(path)?;
     let mut attempts: Vec<WorkflowAttempt> = records.into_iter().map(|r| r.attempt).collect();
 
@@ -355,6 +358,20 @@ mod tests {
 
         let (page, next) = read_paginated(&history_file(dir.path(), "001"), 2, None).unwrap();
         assert_eq!(page.len(), 2);
+        assert!(next.is_some());
+    }
+
+    #[test]
+    fn read_paginated_zero_limit_does_not_underflow() {
+        let dir = tempdir().unwrap();
+        for i in 0..3 {
+            append(dir.path(), &make_attempt(&format!("a{i}"), "001", "plan")).unwrap();
+        }
+
+        // Regression: limit=0 used to hit `attempts[limit - 1]` → usize
+        // underflow panic. Must return a page (clamped to 1), not panic.
+        let (page, next) = read_paginated(&history_file(dir.path(), "001"), 0, None).unwrap();
+        assert_eq!(page.len(), 1);
         assert!(next.is_some());
     }
 

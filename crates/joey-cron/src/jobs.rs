@@ -761,8 +761,13 @@ impl CronStore {
     }
 
     /// Tolerant load: BOM strip, control-char repair, bare-list wrap,
-    /// per-record repair/containment. The bool reports whether repairs were
-    /// made that should be persisted by a mutating caller.
+    /// per-record repair/containment. Repairs are applied IN MEMORY ONLY —
+    /// this read path does NOT hold the jobs lock, so it must never write
+    /// jobs.json (mutating callers already hold the lock; re-locking here
+    /// would deadlock on the non-reentrant process mutex). Repairs are
+    /// idempotent on every load; the next mutating caller's save writes the
+    /// repaired envelope. The bool reports whether repairs were made that
+    /// should be persisted by a mutating caller.
     fn load_repaired(&self) -> Result<(Vec<Job>, bool)> {
         let (values, envelope_repaired) = self.read_jobs_values()?;
         let mut jobs = Vec::with_capacity(values.len());
@@ -814,20 +819,28 @@ impl CronStore {
                     Some(Value::Array(a)) => a,
                     _ => Vec::new(),
                 };
-                if strict_retry && !jobs.is_empty() {
-                    // Hit control-character corruption — rewrite with escaping.
-                    self.persist_values(&jobs)?;
-                    tracing::warn!("Auto-repaired jobs.json (had invalid control characters)");
+                let repaired = strict_retry && !jobs.is_empty();
+                if repaired {
+                    // Hit control-character corruption — repaired in memory;
+                    // the next mutating caller persists the escaped envelope.
+                    tracing::warn!(
+                        "Auto-repaired jobs.json in memory (had invalid control characters; \
+                         persisted on next mutation)"
+                    );
                 }
-                Ok((jobs, false))
+                Ok((jobs, repaired))
             }
             Value::Array(a) => {
-                // Bare array — wrap it back into {"jobs": [...]}.
-                if !a.is_empty() {
-                    self.persist_values(&a)?;
-                    tracing::warn!("Auto-repaired jobs.json (bare list wrapped as dict)");
+                // Bare array — wrap it back into {"jobs": [...]} in memory;
+                // the next mutating caller persists the envelope.
+                let repaired = !a.is_empty();
+                if repaired {
+                    tracing::warn!(
+                        "Auto-repaired jobs.json in memory (bare list wrapped as dict; \
+                         persisted on next mutation)"
+                    );
                 }
-                Ok((a, false))
+                Ok((a, repaired))
             }
             other => bail!(
                 "Cron database corrupted: expected {{'jobs': [...]}}, got {}",
@@ -843,13 +856,6 @@ impl CronStore {
     }
 
     fn save_unlocked(&self, jobs: &[Job]) -> Result<()> {
-        self.write_envelope(&JobsEnvelope {
-            jobs,
-            updated_at: now_isoformat(),
-        })
-    }
-
-    fn persist_values(&self, jobs: &[Value]) -> Result<()> {
         self.write_envelope(&JobsEnvelope {
             jobs,
             updated_at: now_isoformat(),
@@ -2519,7 +2525,7 @@ mod tests {
     }
 
     #[test]
-    fn load_wraps_bare_list_and_persists_envelope() {
+    fn load_wraps_bare_list_defers_persist_to_next_mutation() {
         let (_tmp, store) = store();
         write_raw(
             &store,
@@ -2527,23 +2533,64 @@ mod tests {
         );
         let jobs = store.load().unwrap();
         assert_eq!(jobs.len(), 1);
-        // The file was rewritten to the dict envelope shape.
+        // Repair is in-memory only: the file is NOT rewritten on load.
+        let raw = read_raw(&store);
+        assert!(raw.is_array(), "file stays a bare list until a mutation");
+
+        // The next mutating caller materializes the repaired envelope.
+        store
+            .create_job(Some("second"), "every 30m", CreateJobOptions::default())
+            .unwrap();
         let raw = read_raw(&store);
         assert!(raw.is_object());
+        assert_eq!(raw["jobs"].as_array().unwrap().len(), 2);
         assert_eq!(raw["jobs"][0]["id"], "job00000001");
         assert!(raw["updated_at"].is_string());
     }
 
     #[test]
-    fn load_escapes_control_characters() {
+    fn load_escapes_control_characters_defers_persist_to_next_mutation() {
         let (_tmp, store) = store();
-        write_raw(
-            &store,
-            "{\"jobs\": [{\"id\": \"ctl000000001\", \"name\": \"a\u{0001}b\", \"prompt\": \"p\", \"schedule\": {\"kind\": \"interval\", \"minutes\": 5}}], \"updated_at\": \"x\"}",
-        );
+        let raw_text = "{\"jobs\": [{\"id\": \"ctl000000001\", \"name\": \"a\u{0001}b\", \"prompt\": \"p\", \"schedule\": {\"kind\": \"interval\", \"minutes\": 5}}], \"updated_at\": \"x\"}";
+        write_raw(&store, raw_text);
         let jobs = store.load().unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].name, "a\u{0001}b");
+        // Repair is in-memory only: the file still holds the raw control char.
+        assert_eq!(
+            std::fs::read_to_string(store.dir().join("jobs.json")).unwrap(),
+            raw_text
+        );
+
+        // The next mutating caller writes the escaped (valid strict JSON) form.
+        store.save(&jobs).unwrap();
+        let raw = read_raw(&store);
+        assert_eq!(raw["jobs"][0]["name"], "a\u{0001}b");
+        assert_eq!(
+            raw["jobs"][0]["name"].to_string(),
+            "\"a\\u0001b\"",
+            "control char persisted escaped"
+        );
+    }
+
+    #[test]
+    fn load_bare_list_twice_is_idempotent() {
+        let (_tmp, store) = store();
+        write_raw(
+            &store,
+            r#"[{"id": "job00000001", "name": "n", "prompt": "p", "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"}}]"#,
+        );
+        let first = store.load().unwrap();
+        // No mutation between loads — the file is untouched, yet the second
+        // load repairs it again identically.
+        assert!(read_raw(&store).is_array());
+        let second = store.load().unwrap();
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, "job00000001");
     }
 
     #[test]

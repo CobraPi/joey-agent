@@ -62,6 +62,9 @@ pub struct HyperCodeConfig {
     pub explorer_configs: HashMap<String, RoleConfig>,
     /// Provider-specific model and settings for Implementor subagents.
     pub implementor_configs: HashMap<String, RoleConfig>,
+    /// Provider-specific model and settings for the risk-review subagent
+    /// (hypercode.reviewer table; opt-in via hypercode.reviewer.enabled).
+    pub reviewer_configs: HashMap<String, RoleConfig>,
     /// Max parallel workstreams per phase (0 = default).
     pub max_workstreams: usize,
     /// When HyperCode is enabled, run the MAIN agent as an orchestrator:
@@ -142,6 +145,7 @@ impl Default for HyperCodeConfig {
             enabled: false,
             explorer_configs: HashMap::new(),
             implementor_configs: HashMap::new(),
+            reviewer_configs: HashMap::new(),
             max_workstreams: 0,
             orchestrator_mode: true,
             team: TeamConfig::default(),
@@ -172,6 +176,22 @@ impl HyperCodeConfig {
                 model: String::new(),
                 max_tokens: 0,
                 max_turns: 12,
+                reasoning_level: String::new(),
+            })
+    }
+
+    /// Get the reviewer (risk-review subagent) config for the given provider,
+    /// or a sensible default. The reviewer is opt-in (hypercode.reviewer.enabled);
+    /// its model falls back to the implementor table, then the explorer table,
+    /// then the parent (see `reviewer_request_model` in hypercode_gate.rs).
+    pub(crate) fn get_reviewer_config(&self, provider: &str) -> RoleConfig {
+        self.reviewer_configs
+            .get(provider)
+            .cloned()
+            .unwrap_or_else(|| RoleConfig {
+                model: String::new(), // empty = chain fallback (implementor/explorer/parent)
+                max_tokens: 0,
+                max_turns: 8,
                 reasoning_level: String::new(),
             })
     }
@@ -234,6 +254,24 @@ impl HyperCodeConfig {
             }
         }
 
+        // Reviewer table (hypercode.reviewer): same per-provider parsing, but
+        // a top-level `enabled` key is the bool GATE (hypercode.reviewer.enabled
+        // handled via get_bool above), not a provider — skip it.
+        if let Some(table) = config.get("hypercode.reviewer") {
+            if let Some(mapping) = table.as_mapping() {
+                for (provider, value) in mapping {
+                    if let (Some(provider_str), Some(map)) = (provider.as_str(), value.as_mapping())
+                    {
+                        if provider_str == "enabled" {
+                            continue;
+                        }
+                        let rc = role_config_from_mapping(map);
+                        hc.reviewer_configs.insert(provider_str.to_string(), rc);
+                    }
+                }
+            }
+        }
+
         hc
     }
 
@@ -273,8 +311,11 @@ impl HyperCodeConfig {
 /// The orchestrator's effective toolsets: delegation + terminal (process
 /// monitoring/management) + read-only files + web research. It still never
 /// WRITES files or runs build/edit commands itself — those belong to the
-/// Implementor children.
-pub const ORCHESTRATOR_TOOLSET: &[&str] = &["delegation", "terminal", "file-read", "web"];
+/// Implementor children. On top of that, the orchestrator inherits the
+/// main agent's workflow — the session todo list (`todo`), the skills
+/// index (`skills` — restores the <available_skills> system-prompt
+/// section), and the task-graph planner (`task-graph`).
+pub const ORCHESTRATOR_TOOLSET: &[&str] = &["delegation", "terminal", "file-read", "web", "todo", "skills", "task-graph"];
 
 /// True when the main agent should run as a pure orchestrator right now:
 /// HyperCode enabled AND orchestrator_mode on.
@@ -353,8 +394,16 @@ pub fn orchestrator_persona_overlay(
         // the orchestrator still functions and reports the empty bench).
         return ORCHESTRATOR_PROMPT.to_string();
     }
+    // Feature 026 (T026/FR-008): feed the conductor the CURRENT lifecycle
+    // state snapshot (None when disabled/not a spec-kit repo → prompt is
+    // byte-identical to the pre-feature static one).
+    let snap = crate::speckit_lifecycle::lifecycle_snapshot_opt(config);
     match agent {
-        None | Some("default") => joey_omo::agents::prompts::conductor_prompt(model),
+        None | Some("default") => format!(
+            "{}\n\n{}",
+            joey_omo::agents::prompts::conductor_prompt_with_lifecycle(model, snap.as_ref()),
+            WORKFLOW_INHERITANCE_GUIDANCE
+        ),
         Some(name) => {
             let persona = match registry.get(name) {
                 Some(a) if a.resolved_model.is_some() => joey_omo::dispatch_system_prompt(
@@ -362,13 +411,17 @@ pub fn orchestrator_persona_overlay(
                     a.resolved_model.as_deref().unwrap_or(model),
                 )
                 .to_string(),
-                _ => joey_omo::agents::prompts::conductor_prompt(model),
+                _ => joey_omo::agents::prompts::conductor_prompt_with_lifecycle(
+                    model,
+                    snap.as_ref(),
+                ),
             };
             format!(
-                "{}\n\n{}\n\n{}",
+                "{}\n\n{}\n\n{}\n\n{}",
                 persona,
                 joey_omo::agents::prompts::conductor::hard_rules_core(),
-                joey_omo::agents::prompts::conductor::roster_briefing()
+                joey_omo::agents::prompts::conductor::roster_briefing(),
+                WORKFLOW_INHERITANCE_GUIDANCE
             )
         }
     }
@@ -988,6 +1041,47 @@ check output (command + outcome).\n\
 \n\
 Keep your final summary under 1000 tokens.";
 
+/// Workflow-inheritance guidance appended to every ACTIVE orchestrator
+/// persona overlay. NOTE: this same text is embedded VERBATIM as a section
+/// inside [`ORCHESTRATOR_PROMPT`] (just before "## Execution Modes") so the
+/// fixed prompt carries it too — the duplication is deliberate and MUST be
+/// kept in sync (edit both together).
+pub const WORKFLOW_INHERITANCE_GUIDANCE: &str = "\
+## Workflow inheritance (you keep the main agent's workflow)
+
+You inherit the SAME workflow disciplines the main agent runs with when
+orchestration is off. They are not optional and they are not delegated:
+
+- SKILLS: before planning, review the <available_skills> index in your
+  system prompt; if a skill matches the goal, load it with skill_view(name)
+  and let it shape the plan. Pass matching skills to children via the
+  load_skills field of delegate_task so they inherit the same guidance.
+- TODO LIST: immediately after writing your plan, record it as a todo list
+  with the todo tool (one item per task, in dependency order). Keep it
+  current: mark an item in_progress while its work runs, completed the
+  moment a specialist verifies it. The list is your drift alarm — if reality
+  and the list diverge, re-plan instead of drifting. During a parallel
+  fan-out wave, mark every dispatched item in_progress when the wave fires
+  and complete each item as its specialist reports.
+- TASK GRAPH: publish the plan as a dependency graph with the task_graph
+  tool (action=plan) right after the todo list, then keep it current with
+  action=update as tasks dispatch and complete. The user watches this graph
+  live in the TUI. Explicit dependencies, a visible ready set, and visible
+  blocked work are what keep a long orchestration on track — re-publish
+  (action=plan) whenever the plan changes rather than letting it go stale.
+  STRICT SCHEMA (get it right the first time — the validator rejects
+  guesswork): the graph is {\"format\":\"joey-taskgraph/1\",\"tasks\":[...]} and
+  EVERY task must carry ALL of: id (lowercase [a-z0-9-]), objective,
+  dependencies, read_set, write_set (relative paths), artifact_ids
+  (INTEGERS — use [] if unknown), role (\"explorer\"|\"implementor\"|
+  \"orchestrator\"), model_tier (\"economical\"|\"frontier\"), risk
+  (\"low\"|\"medium\"|\"high\"), acceptance (non-empty [{criterion, kind}]), and
+  verification {\"steps\":[...],\"risk_triggered_review\":false} (empty steps
+  fine; risk \"high\" needs a required:true step or risk_triggered_review:
+  true). No two dependency-unrelated tasks may write the same path. The
+  tool's own description carries the full field list — read it before the
+  first call.";
+
 /// Orchestrator system prompt (delegation-first; no direct file writes or
 /// code-manipulation commands).
 ///
@@ -1041,14 +1135,15 @@ YOUR SUBAGENTS (via delegate_task):\n\
   [filter]) — never the full test suite — and reports what changed plus\n\
   the real check output. (with hypercode.omo_specialists on, its default\n\
   model is the hephaestus agent's)\n\
-- subagent_type:\"<agent>\" — ANY registered OMO specialist by name:\n\
+These two roles are your DEFAULT and should cover nearly all work.\n\
+- subagent_type:\"<agent>\" — any registered OMO specialist by name:\n\
   sisyphus, hephaestus, prometheus, atlas, oracle, librarian, explore,\n\
-  multimodal-looker, metis, momus, sisyphus-junior. It runs under that\n\
-  agent's identity prompt and resolved model. Use it when a task fits a\n\
-  specialist better than explorer/implementor (e.g. oracle for\n\
-  architecture analysis, librarian for docs/OSS research, metis for gap\n\
-  analysis, momus for critique). Works in batch tasks[] too (per-task\n\
-  subagent_type).\n\
+  multimodal-looker, metis, momus, sisyphus-junior. EXPENSIVE — reserve\n\
+  named specialists for genuinely complicated work (deep architecture\n\
+  decisions, hard cross-cutting debugging, plan-gating critique) where\n\
+  explorer/implementor clearly cannot do the job; never for routine\n\
+  exploration, implementation, or review. Works in batch tasks[] too\n\
+  (per-task subagent_type).\n\
 \n\
 BRIEF QUALITY (execution orders, not problem statements):\n\
 - Every brief must be complete enough that the subagent never needs to\n\
@@ -1101,6 +1196,41 @@ about failures — your own verification is the single full-suite final\n\
 gate; everything else you report comes from Implementors' targeted\n\
 checks, so attribute it as such.\n\
 \n\
+## Workflow inheritance (you keep the main agent's workflow)
+
+You inherit the SAME workflow disciplines the main agent runs with when
+orchestration is off. They are not optional and they are not delegated:
+
+- SKILLS: before planning, review the <available_skills> index in your
+  system prompt; if a skill matches the goal, load it with skill_view(name)
+  and let it shape the plan. Pass matching skills to children via the
+  load_skills field of delegate_task so they inherit the same guidance.
+- TODO LIST: immediately after writing your plan, record it as a todo list
+  with the todo tool (one item per task, in dependency order). Keep it
+  current: mark an item in_progress while its work runs, completed the
+  moment a specialist verifies it. The list is your drift alarm — if reality
+  and the list diverge, re-plan instead of drifting. During a parallel
+  fan-out wave, mark every dispatched item in_progress when the wave fires
+  and complete each item as its specialist reports.
+- TASK GRAPH: publish the plan as a dependency graph with the task_graph
+  tool (action=plan) right after the todo list, then keep it current with
+  action=update as tasks dispatch and complete. The user watches this graph
+  live in the TUI. Explicit dependencies, a visible ready set, and visible
+  blocked work are what keep a long orchestration on track — re-publish
+  (action=plan) whenever the plan changes rather than letting it go stale.
+  STRICT SCHEMA (get it right the first time — the validator rejects
+  guesswork): the graph is {\"format\":\"joey-taskgraph/1\",\"tasks\":[...]} and
+  EVERY task must carry ALL of: id (lowercase [a-z0-9-]), objective,
+  dependencies, read_set, write_set (relative paths), artifact_ids
+  (INTEGERS — use [] if unknown), role (\"explorer\"|\"implementor\"|
+  \"orchestrator\"), model_tier (\"economical\"|\"frontier\"), risk
+  (\"low\"|\"medium\"|\"high\"), acceptance (non-empty [{criterion, kind}]), and
+  verification {\"steps\":[...],\"risk_triggered_review\":false} (empty steps
+  fine; risk \"high\" needs a required:true step or risk_triggered_review:
+  true). No two dependency-unrelated tasks may write the same path. The
+  tool's own description carries the full field list — read it before the
+  first call.
+
 ## Execution Modes (feature 022: agent teams)\n\
 \n\
 Choose the optimum execution mode per task. ALWAYS state your chosen mode with a one-to-two-sentence rationale before dispatching:\n\
@@ -1702,6 +1832,10 @@ pub(crate) fn delegation_succeeded(result: &joey_orchestration::DelegationResult
 /// Keeps US3 (scheduler-driven execution) runnable end-to-end without
 /// US5 — the real VerifyLoop adapter lands in T023 and replaces this type
 /// at the [`execute_graph_run`] / [`resume_execution_run`] call sites.
+// Never constructed in production builds: the T023 VerifyLoop-backed gate
+// replaced it at every live call site. Retained for its unit test
+// (`always_pass_gate_returns_passed`).
+#[allow(dead_code)]
 struct AlwaysPassGate;
 
 #[async_trait::async_trait]
@@ -1892,11 +2026,18 @@ fn sweep_stale_lessons(
 /// T036: gate construction shared by both runtime paths — the real
 /// VerifyLoop-backed gate WITH the production momus reviewer attached
 /// (T029/US8, FR-022: High-risk resumed tasks get reviewed, not
-/// notice-and-proceed).
+/// notice-and-proceed). The reviewer is OPT-IN: without
+/// `hypercode.reviewer.enabled` the gate runs reviewer-less and High-risk
+/// graphs take the existing notice-and-proceed branch in VerifyLoopGate::run.
 fn graph_gate(ctx: &HypercodeContext) -> crate::hypercode_gate::VerifyLoopGate {
-    crate::hypercode_gate::VerifyLoopGate::new(ctx.cwd.clone()).with_reviewer(
-        std::sync::Arc::new(crate::hypercode_gate::MomusReviewer::new(ctx.clone())),
-    )
+    let gate = crate::hypercode_gate::VerifyLoopGate::new(ctx.cwd.clone());
+    if ctx.config.get_bool("hypercode.reviewer.enabled", false) {
+        gate.with_reviewer(std::sync::Arc::new(
+            crate::hypercode_gate::MomusReviewer::new(ctx.clone()),
+        ))
+    } else {
+        gate
+    }
 }
 
 /// T036: post-run finalization shared by both runtime paths — record
@@ -3686,15 +3827,33 @@ mod tests {
         assert!(review_events.lock().unwrap().is_empty());
     }
 
-    /// T036: graph_gate attaches the production reviewer — the shared
-    /// constructor both runtime paths use (FR-022 on the resume path
-    /// too). Reuses the cheap model_ctx fixture (full construction is
-    /// heavy); a fresh gate starts with an empty audit trail.
+    /// T036: graph_gate attaches the production reviewer ONLY when the
+    /// opt-in gate `hypercode.reviewer.enabled` is set — the shared
+    /// constructor both runtime paths use. Reuses the cheap model_ctx
+    /// fixture shape (full construction is heavy); a fresh gate starts
+    /// with an empty audit trail.
     #[test]
     fn graph_gate_paths_attach_reviewer() {
-        let ctx = model_ctx("zai", None);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "hypercode:\n  reviewer:\n    enabled: true\n",
+        )
+        .unwrap();
+        let config = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let mut ctx = model_ctx("zai", None);
+        ctx.config = config;
         let gate = graph_gate(&ctx);
         assert!(gate.has_reviewer());
         assert!(gate.review_events().lock().unwrap().is_empty());
+    }
+
+    /// The default (no `hypercode.reviewer.enabled` key) attaches NO
+    /// reviewer — High-risk graphs take the notice-and-proceed branch.
+    #[test]
+    fn graph_gate_default_has_no_reviewer() {
+        let ctx = model_ctx("zai", None); // Config::defaults() — key absent
+        let gate = graph_gate(&ctx);
+        assert!(!gate.has_reviewer());
     }
 }

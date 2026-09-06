@@ -53,9 +53,19 @@ fn load_at(path: &std::path::Path) -> Vec<String> {
 /// back to proceeding unlocked after 5 s — history is best-effort and must
 /// never hang the UI on a wedged lock.
 fn with_history_lock<T>(path: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    with_history_lock_deadline(path, std::time::Duration::from_secs(5), f)
+}
+
+/// Deadline-parameterized core of [`with_history_lock`] so tests can exercise
+/// the wedged-lock fallback without waiting out the real 5 s budget.
+fn with_history_lock_deadline<T>(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+    f: impl FnOnce() -> T,
+) -> T {
     use std::io::ErrorKind;
     let lock_path = path.with_extension("lock");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + timeout;
     let mut locked = None;
     loop {
         match std::fs::OpenOptions::new()
@@ -89,9 +99,17 @@ fn with_history_lock<T>(path: &std::path::Path, f: impl FnOnce() -> T) -> T {
             Err(_) => break, // lock dir unwritable — proceed unlocked
         }
     }
+    let acquired = locked.is_some();
     let out = f();
     drop(locked);
-    let _ = std::fs::remove_file(&lock_path);
+    // Only remove the lock file when THIS caller created it. On the timeout
+    // fallback path the lock belongs to another live writer — deleting it
+    // would break their mutual exclusion (and could yank the file out from
+    // under a writer that then never cleans up, or worse, let a third
+    // writer in while the second still thinks it holds the lock).
+    if acquired {
+        let _ = std::fs::remove_file(&lock_path);
+    }
     out
 }
 
@@ -148,6 +166,42 @@ mod tests {
     #[test]
     fn encode_has_no_raw_newline() {
         assert!(!encode_entry("a\nb").contains('\n'));
+    }
+
+    /// Regression: the lock-file cleanup used to run unconditionally, even on
+    /// the wedged-lock timeout path where THIS caller never acquired the
+    /// lock — deleting a live writer's lock out from under them. When the
+    /// lock IS acquired it must still be cleaned up.
+    #[test]
+    fn lock_cleaned_up_when_acquired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".joey_history");
+        let lock_path = path.with_extension("lock");
+        let out = with_history_lock_deadline(&path, std::time::Duration::from_secs(1), || 7);
+        assert_eq!(out, 7);
+        assert!(
+            !lock_path.exists(),
+            "acquired lock must be removed after the cycle"
+        );
+    }
+
+    /// The wedged-lock fallback: another writer holds a FRESH (non-stale)
+    /// lock. This caller times out and proceeds unlocked — but must NOT
+    /// delete the other writer's lock file.
+    #[test]
+    fn wedged_lock_timeout_does_not_delete_foreign_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".joey_history");
+        let lock_path = path.with_extension("lock");
+        // Simulate a live writer: fresh lock file (modified now — far inside
+        // the 10 s staleness window).
+        std::fs::write(&lock_path, b"").unwrap();
+        let out = with_history_lock_deadline(&path, std::time::Duration::from_millis(50), || 9);
+        assert_eq!(out, 9, "falls back to proceeding unlocked");
+        assert!(
+            lock_path.exists(),
+            "timeout path must NOT remove another writer's lock"
+        );
     }
 }
 

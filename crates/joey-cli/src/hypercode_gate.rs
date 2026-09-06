@@ -10,6 +10,9 @@
 //! rejection findings enter the SAME DefectBundle/repair path as command
 //! failures, and a missing reviewer records a notice-and-proceed.
 pub struct VerifyLoopGate {
+    // Retained for forthcoming verification-loop wiring; not yet read by
+    // gate logic.
+    #[allow(dead_code)]
     project_root: std::path::PathBuf,
     pending_repairs: std::sync::Arc<std::sync::Mutex<Vec<joey_orchestration::evaluator::DefectBundle>>>,
     /// T029 (US8): reviewer invoked when the plan requests risk review;
@@ -278,32 +281,67 @@ pub(crate) enum ReviewVerdict {
 /// `VERDICT: REJECT: <text>` plus any `FINDING:` lines. None when no
 /// verdict is present (treated as a notice downstream).
 pub(crate) fn parse_verdict(summary: &str) -> Option<ReviewVerdict> {
-    let lower = summary.to_lowercase();
-    if lower.contains("verdict: approve") {
-        return Some(ReviewVerdict::Approve);
+    // ASCII-safe line-prefix match: a line "starts with" the prefix (after
+    // trim_start) iff its first bytes equal the prefix case-insensitively.
+    // Comparing the ASCII prefix bytewise keeps slicing at a char boundary.
+    fn line_prefix<'a>(line: &'a str, prefix: &[u8]) -> Option<&'a str> {
+        let t = line.trim_start();
+        let b = t.as_bytes();
+        if b.len() >= prefix.len() && b[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            Some(&t[prefix.len()..])
+        } else {
+            None
+        }
     }
-    if lower.contains("verdict: reject") {
-        let mut findings: Vec<String> = summary
-            .lines()
-            .filter(|l| l.trim_start().to_lowercase().starts_with("finding:"))
-            .map(|l| l.trim_start()[8..].trim().to_string())
-            .collect();
-        if let Some(idx) = lower.rfind("verdict: reject") {
-            let rest = &summary[idx + "verdict: reject".len()..];
-            let rest = rest.strip_prefix(':').unwrap_or(rest).trim();
-            if !rest.is_empty() {
-                let first = rest.lines().next().unwrap_or(rest).trim();
-                if !first.is_empty() && !findings.contains(&first.to_string()) {
-                    findings.push(first.to_string());
-                }
+
+    // Scan lines in REVERSE: only the LAST verdict-bearing line counts (a
+    // review that merely quotes the protocol mid-body — "the reviewer must
+    // emit `VERDICT: APPROVE`" — must not be classified by the quote).
+    let mut verdict_word: Option<&str> = None;
+    let mut verdict_rest: Option<String> = None;
+    for line in summary.lines().rev() {
+        if let Some(rest) = line_prefix(line, b"verdict:") {
+            let rest = rest.trim();
+            // Leading word, tolerant of the `REJECT:`/`REJECT` spellings.
+            let word = rest.split_whitespace().next().unwrap_or("").trim_end_matches(':');
+            let classified = if word.eq_ignore_ascii_case("approve") {
+                Some("approve")
+            } else if word.eq_ignore_ascii_case("reject") {
+                Some("reject")
+            } else {
+                None
+            };
+            if let Some(w) = classified {
+                verdict_word = Some(w);
+                verdict_rest = Some(rest.to_string());
+                break;
             }
         }
-        if findings.is_empty() {
-            findings.push("reviewer rejected the change without stating a finding".to_string());
-        }
-        return Some(ReviewVerdict::Reject(findings));
     }
-    None
+
+    match verdict_word? {
+        "approve" => Some(ReviewVerdict::Approve),
+        _ => {
+            let mut findings: Vec<String> = summary
+                .lines()
+                .filter_map(|l| line_prefix(l, b"finding:").map(|r| r.trim().to_string()))
+                .filter(|f| !f.is_empty())
+                .collect();
+            // The verdict-line remainder (after the leading word) is a
+            // finding too, when non-empty.
+            if let Some(rest) = verdict_rest {
+                let after_word = rest.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+                let after_word = after_word.trim().trim_start_matches(':').trim().to_string();
+                if !after_word.is_empty() && !findings.contains(&after_word) {
+                    findings.push(after_word);
+                }
+            }
+            if findings.is_empty() {
+                findings.push("reviewer rejected the change without stating a finding".to_string());
+            }
+            Some(ReviewVerdict::Reject(findings))
+        }
+    }
 }
 
 /// One recorded review event (audit trail; drained into the run's
@@ -338,6 +376,47 @@ impl MomusReviewer {
     }
 }
 
+/// Resolve the reviewer subagent's model WITHOUT dispatching (pure, unit-testable).
+///
+/// Chain (FR: never silently the orchestrator's model): reviewer table →
+/// implementor table → explorer table → None (None = inherit the parent, the
+/// same default children use). Derives the provider key the same way the
+/// dispatch call sites of `get_implementor_config` do (agent_config.provider).
+pub(crate) fn reviewer_request_model(ctx: &crate::hypercode::HypercodeContext) -> Option<String> {
+    let cfg = crate::hypercode::HyperCodeConfig::from_config(&ctx.config);
+    // Same provider derivation the dispatch call sites use
+    // (hypercode.rs: provider = ctx.agent_config.provider.clone()).
+    let provider = ctx.agent_config.provider.clone();
+    let reviewer = cfg.get_reviewer_config(&provider);
+    if !reviewer.model.is_empty() {
+        return Some(reviewer.model);
+    }
+    let implementor = cfg.get_implementor_config(&provider);
+    if !implementor.model.is_empty() {
+        return Some(implementor.model);
+    }
+    let explorer = cfg.get_explorer_config(&provider);
+    if !explorer.model.is_empty() {
+        return Some(explorer.model);
+    }
+    None
+}
+
+/// Parse a reasoning-level string ("none"|"low"|"medium"|"high"|"") the same
+/// way joey-cli's hypercode module does (empty/inherit ⇒ None).
+fn parse_role_reasoning_level(level: &str) -> Option<joey_providers::ReasoningEffort> {
+    crate::hypercode::parse_reasoning_level(level)
+}
+
+/// 0 ⇒ None (unset), else Some(n) — mirrors hypercode.rs's `nonzero`.
+fn nonzero_u32(n: usize) -> Option<u32> {
+    if n == 0 {
+        None
+    } else {
+        Some(n as u32)
+    }
+}
+
 #[async_trait::async_trait]
 impl RiskReviewer for MomusReviewer {
     async fn review(&self, objective: &str, workdir: &Path) -> ReviewVerdict {
@@ -352,6 +431,13 @@ impl RiskReviewer for MomusReviewer {
             workdir = workdir.display(),
             objective = objective,
         );
+        // Opt-in reviewer config (hypercode.reviewer.<provider>): model chain
+        // (reviewer → implementor → explorer → parent) plus optional
+        // max_turns/max_tokens/reasoning overrides, mirroring the field forms
+        // apply_hyper_role uses (delegation_tool.rs).
+        let provider = self.ctx.agent_config.provider.clone();
+        let hc = crate::hypercode::HyperCodeConfig::from_config(&self.ctx.config);
+        let reviewer_cfg = hc.get_reviewer_config(&provider);
         let req = DelegationRequest {
             // Mirror the field forms used by HypercodeDispatcher::dispatch
             // in hypercode.rs (~L1235-1257); only goal/category/toolsets/
@@ -359,11 +445,15 @@ impl RiskReviewer for MomusReviewer {
             goal,
             context: None,
             tasks: Vec::new(),
-            model: None,
+            model: reviewer_request_model(&self.ctx),
             toolsets: vec!["file".to_string(), "terminal".to_string()],
-            max_turns: Some(8),
-            reasoning: None,
-            max_tokens: None,
+            max_turns: Some(if reviewer_cfg.max_turns > 0 {
+                reviewer_cfg.max_turns
+            } else {
+                8
+            }),
+            reasoning: parse_role_reasoning_level(&reviewer_cfg.reasoning_level),
+            max_tokens: nonzero_u32(reviewer_cfg.max_tokens),
             persist: false,
             role: SubagentRole::Leaf,
             workdir: Some(workdir.to_path_buf()),
@@ -423,6 +513,126 @@ mod tests {
             steps,
             risk_triggered_review: false,
         }
+    }
+
+    /// Build a Config from raw YAML via a temp file (the config layer has no
+    /// in-memory constructor for user values) — same pattern hypercode.rs's
+    /// tests use.
+    fn config_with_yaml(yaml: &str) -> joey_core::Config {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), yaml).unwrap();
+        joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap()
+    }
+
+    /// Minimal HypercodeContext shaped like hypercode.rs's model_ctx fixture
+    /// (provider + config tree; the manager/registry are inert for the pure
+    /// chain fn and never dispatched).
+    fn chain_ctx(provider: &str, yaml: &str) -> crate::hypercode::HypercodeContext {
+        use joey_agent_core::AgentConfig;
+        use joey_orchestration::{ManagerConfig, SubagentManager};
+        use joey_tools::ToolRegistry;
+        crate::hypercode::HypercodeContext {
+            agent_config: AgentConfig {
+                model: "parent-model".to_string(),
+                provider: provider.to_string(),
+                base_url: String::new(),
+                api_key: None,
+                max_turns: 5,
+                api_max_retries: 1,
+                tool_delay: 0.0,
+                reasoning: None,
+                enabled_tools: Vec::new(),
+                max_tokens: None,
+                stream: false,
+                pass_session_id: false,
+                model_pinned: false,
+            },
+            config: config_with_yaml(yaml),
+            base_registry: ToolRegistry::new(),
+            manager: std::sync::Arc::new(SubagentManager::new(ManagerConfig::default())),
+            cwd: std::path::PathBuf::from("/tmp"),
+            parent_effective_model: None,
+            execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Reviewer model chain, case 1: an explicit reviewer-table model wins
+    /// over implementor and explorer entries.
+    #[test]
+    fn reviewer_model_chain_reviewer_table_wins() {
+        let ctx = chain_ctx(
+            "zai",
+            "hypercode:\n  reviewer:\n    zai:\n      model: reviewer-model\n  implementor:\n    zai:\n      model: impl-model\n  explorer:\n    zai:\n      model: explore-model\n",
+        );
+        assert_eq!(
+            reviewer_request_model(&ctx).as_deref(),
+            Some("reviewer-model"),
+            "reviewer-table model must win over implementor/explorer"
+        );
+    }
+
+    /// Case 2: no reviewer entry → falls back to the implementor table.
+    #[test]
+    fn reviewer_model_chain_falls_back_to_implementor() {
+        let ctx = chain_ctx(
+            "zai",
+            "hypercode:\n  implementor:\n    zai:\n      model: impl-model\n  explorer:\n    zai:\n      model: explore-model\n",
+        );
+        assert_eq!(reviewer_request_model(&ctx).as_deref(), Some("impl-model"));
+    }
+
+    /// Case 3: no reviewer/implementor entries → falls back to explorer.
+    #[test]
+    fn reviewer_model_chain_falls_back_to_explorer() {
+        let ctx = chain_ctx(
+            "zai",
+            "hypercode:\n  explorer:\n    zai:\n      model: explore-model\n",
+        );
+        assert_eq!(
+            reviewer_request_model(&ctx).as_deref(),
+            Some("explore-model")
+        );
+    }
+
+    /// Case 4: no tables configured → None (the request inherits the parent,
+    /// never a silently-resolved orchestrator model).
+    #[test]
+    fn reviewer_model_chain_none_when_no_tables() {
+        let ctx = chain_ctx("zai", "hypercode:\n  enabled: true\n");
+        assert_eq!(reviewer_request_model(&ctx), None);
+    }
+
+    /// A reviewer-table entry for a DIFFERENT provider must not leak into
+    /// this provider's chain (provider-keyed lookup).
+    #[test]
+    fn reviewer_model_chain_is_provider_keyed() {
+        let ctx = chain_ctx(
+            "zai",
+            "hypercode:\n  reviewer:\n    openai:\n      model: other-provider-model\n",
+        );
+        assert_eq!(reviewer_request_model(&ctx), None);
+    }
+
+    /// from_config: the `hypercode.reviewer` provider table parses, and a
+    /// top-level `enabled: true` under it is the bool GATE — not a provider.
+    #[test]
+    fn reviewer_table_parses_and_skips_enabled_gate_key() {
+        let tree = config_with_yaml(
+            "hypercode:\n  reviewer:\n    enabled: true\n    zai:\n      model: reviewer-model\n      max_turns: 5\n      max_tokens: 4096\n      reasoning_level: high\n",
+        );
+        let hc = crate::hypercode::HyperCodeConfig::from_config(&tree);
+        assert!(!hc.reviewer_configs.contains_key("enabled"));
+        let rc = hc.get_reviewer_config("zai");
+        assert_eq!(rc.model, "reviewer-model");
+        assert_eq!(rc.max_turns, 5);
+        assert_eq!(rc.max_tokens, 4096);
+        assert_eq!(rc.reasoning_level, "high");
+        // Default (unknown provider) shape mirrors explorer's: empty model,
+        // max_turns 8, empty reasoning.
+        let dflt = hc.get_reviewer_config("unknown-provider");
+        assert_eq!(dflt.model, "");
+        assert_eq!(dflt.max_turns, 8);
+        assert_eq!(dflt.reasoning_level, "");
     }
 
     /// T029: empty-steps plan with the review flag (the simplest
@@ -557,6 +767,61 @@ mod tests {
     #[test]
     fn parse_verdict_none_when_missing() {
         assert_eq!(parse_verdict("no verdict here"), None);
+    }
+
+    /// A review that QUOTES the protocol mid-body must not be classified by
+    /// the quote — only a real verdict line (the last one) counts.
+    #[test]
+    fn parse_verdict_protocol_quoting_then_real_reject() {
+        let summary = "The reviewer must end with `VERDICT: APPROVE` per protocol.\n\
+                       Everything looked acceptable in the quoted instructions.\n\
+                       VERDICT: REJECT: bad";
+        let v = parse_verdict(summary);
+        match v {
+            Some(ReviewVerdict::Reject(findings)) => {
+                assert!(
+                    findings.contains(&"bad".to_string()),
+                    "verdict-line remainder extracted: {findings:?}"
+                );
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// A quoted protocol mention followed by an APPROVE verdict line: the
+    /// real (last) verdict line wins, not the quote.
+    #[test]
+    fn parse_verdict_protocol_quoting_then_real_approve() {
+        let summary = "Protocol says emit `VERDICT: REJECT` on failure.\nVERDICT: APPROVE";
+        assert_eq!(parse_verdict(summary), Some(ReviewVerdict::Approve));
+    }
+
+    /// 'İ' (dotted capital I) lowercases to TWO chars — the old byte-index
+    /// math sliced mid-char and panicked. Must not panic, must classify.
+    #[test]
+    fn parse_verdict_turkish_i_no_panic() {
+        let summary = "İİİ review body\nVERDICT: APPROVE";
+        assert_eq!(parse_verdict(summary), Some(ReviewVerdict::Approve));
+        let summary = "İİİ review body\nFINDING: broken thing\nVERDICT: REJECT: wrong";
+        match parse_verdict(summary) {
+            Some(ReviewVerdict::Reject(findings)) => {
+                assert!(findings.contains(&"broken thing".to_string()));
+                assert!(findings.contains(&"wrong".to_string()));
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// The LAST verdict-bearing line wins when several appear.
+    #[test]
+    fn parse_verdict_last_line_wins() {
+        let summary = "VERDICT: APPROVE\nsecond thoughts\nVERDICT: REJECT: reverted";
+        match parse_verdict(summary) {
+            Some(ReviewVerdict::Reject(findings)) => {
+                assert!(findings.contains(&"reverted".to_string()));
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
     }
 
     // ── T029 (US8, FR-022): gate review paths ───────────────────────

@@ -361,6 +361,53 @@ async fn t008_background_single_returns_handle_fast() {
     }
 }
 
+/// Mixed batch (per-spec background): blocking siblings keep their blocking
+/// [i/total] result blocks in the content; ONLY the background spec yields
+/// a handle line. One spec with background:true must not reflag the whole
+/// batch (callers keep blocking results for the siblings).
+#[tokio::test]
+async fn mixed_batch_blocking_results_plus_background_handle() {
+    let base = spawn_mock_server(MockMode::Ok("MIXED-BLOCK")).await;
+    let (mgr, tool, ctx) = make_tool(base);
+
+    let res = tool
+        .execute(
+            json!({
+                "tasks": [
+                    {"goal": "Block A"},
+                    {"goal": "BG goal", "background": true},
+                    {"goal": "Block B"},
+                ]
+            }),
+            &ctx,
+        )
+        .await;
+    let out = match res {
+        ToolResult::Text(s) => s,
+        other => panic!("expected Text, got: {other:?}"),
+    };
+
+    // Segment layout in ORIGINAL task order: [1/3] block (4 lines),
+    // handle line, [3/3] block (4 lines).
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 9, "3 segments (4-line block, handle, 4-line block):\n{out}");
+    assert!(lines[0].contains("[1/3] goal: \"Block A\""), "out:\n{out}");
+    assert!(lines[1].contains("status: success"), "out:\n{out}");
+    assert!(lines[2].contains("summary: MIXED-BLOCK"), "blocking result must be in content:\n{out}");
+    assert!(lines[3].contains("tokens: 150"), "out:\n{out}");
+    let id = parse_handle_line(lines[4], "BG goal");
+    assert!(lines[5].contains("[3/3] goal: \"Block B\""), "out:\n{out}");
+    assert!(lines[6].contains("status: success"), "out:\n{out}");
+    assert!(lines[7].contains("summary: MIXED-BLOCK"), "out:\n{out}");
+    assert!(lines[8].contains("tokens: 150"), "out:\n{out}");
+
+    // The background child is visible in overview() from submit time.
+    assert!(
+        mgr.overview().iter().any(|r| r.child_id == id),
+        "handle id {id} not present in overview()"
+    );
+}
+
 /// (b) FR-013: more background tasks than max_concurrent_children are all
 /// accepted fast (none rejected), and overview() eventually shows all of
 /// them — excess work queues under the same limits.

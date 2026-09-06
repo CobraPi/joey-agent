@@ -691,7 +691,21 @@ impl McpClient {
         if let Some(params) = params {
             msg.insert("params".to_string(), params);
         }
-        self.write_line(&Value::Object(msg)).await?;
+        // Deadlock fix: writing the request to completion BEFORE reading
+        // only works while the request fits the OS pipe buffer. A
+        // tools/call with >64KB of args cannot finish writing until the
+        // server drains stdin, and a server that emits >64KB of stdout
+        // (notifications/logs) before draining stdin blocks its own stdout
+        // — both pipes then deadlock until tool_timeout. Upstream Python
+        // reads concurrently, so enter the read loop immediately and drive
+        // the write alongside it: a response carrying our id can only
+        // arrive after the server received the whole request, so reading
+        // before the write completes is safe; notifications/noise are
+        // skipped exactly as before.
+        let msg = Value::Object(msg);
+        let write = self.write_line(&msg);
+        tokio::pin!(write);
+        let mut write_done = false;
 
         let mut stdout = self.stdout.lock().await;
         let mut line = String::new();
@@ -702,12 +716,42 @@ impl McpClient {
             // able to grow memory without bound. `read_line` keeps
             // accumulating into `line`, so check the accumulated length
             // after each chunk-read and error out once the cap is exceeded.
-            let n = read_line_bounded(&mut stdout, &mut line, MAX_LINE_BYTES)
-                .await
-                .map_err(|exc| RequestError::Transport(format!(
-                    "MCP server '{}': {}",
-                    self.server_name, exc
-                )))?;
+            //
+            // The read future is scoped to this inner block: it holds a
+            // mutable borrow of `line` that must be released (by drop)
+            // before the frame is parsed below.
+            let n = {
+                let read = read_line_bounded(&mut stdout, &mut line, MAX_LINE_BYTES);
+                tokio::pin!(read);
+                if write_done {
+                    read.await
+                } else {
+                    // Write still in flight: drive it alongside the read.
+                    // Both futures are polled by reference (`&mut`) and the
+                    // non-selected one is only ever dropped after it ran to
+                    // completion — `read_line_bounded` cannot lose
+                    // already-consumed bytes and `write_all` cannot
+                    // double-write. Each loop iteration re-arms a read
+                    // while the write is pending, so the server's stdout is
+                    // drained line by line and a request larger than the OS
+                    // pipe buffer no longer deadlocks against a chatty
+                    // server.
+                    tokio::select! {
+                        res = &mut write => {
+                            write_done = true;
+                            // Surface write transport failures exactly as
+                            // the previous `write_line(...).await?` did.
+                            res?;
+                            read.await
+                        }
+                        res = &mut read => res,
+                    }
+                }
+            };
+            let n = n.map_err(|exc| RequestError::Transport(format!(
+                "MCP server '{}': {}",
+                self.server_name, exc
+            )))?;
             if n == 0 {
                 return Err(RequestError::Transport(format!(
                     "MCP server '{}' closed the connection",
@@ -951,6 +995,51 @@ printf '%s\n' '{"jsonrpc": "2.0", "id": 4, "result": {"isError": true, "content"
         let out = client.call_tool("alpha", json!({})).await;
         assert_eq!(out, r#"{"error": "boom [REDACTED]"}"#);
 
+        client.shutdown().await;
+    }
+
+    /// Regression test for the stdout deadlock while writing large requests:
+    /// a tools/call whose args exceed the OS pipe buffer (>64KB) cannot
+    /// finish `write_all` until the server drains stdin, and this server
+    /// emits >64KB of notification lines BEFORE draining stdin. With the old
+    /// write-then-read ordering both pipes fill and the exchange deadlocks
+    /// until tool_timeout; with the concurrent write/read the notifications
+    /// are drained while the write progresses and the call succeeds.
+    /// Covers write-in-flight -> notifications -> matching-response ordering.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn large_request_with_chatty_server_does_not_deadlock() {
+        let script = r#"
+IFS= read -r line
+printf '%s\n' '{"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "chatty", "version": "0"}}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "flood", "inputSchema": {"type": "object"}}]}}'
+# Build a ~200-byte notification payload, then flood stdout with ~1024 of
+# them (~200KB, well over the 64KB pipe buffer) BEFORE reading stdin.
+pad=""
+i=0
+while [ "$i" -lt 200 ]; do pad="${pad}N"; i=$((i+1)); done
+i=0
+while [ "$i" -lt 1024 ]; do
+  printf '{"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": "%s"}}\n' "$pad"
+  i=$((i+1))
+done
+# Only now drain the oversized tools/call request from stdin ...
+IFS= read -r line
+# ... and answer it (the response can only have arrived after the write).
+printf '%s\n' '{"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": "survived"}]}}'
+"#;
+        // 100KB of args: the serialized request far exceeds the pipe buffer.
+        let config = ServerConfig { timeout: Some(5.0), ..sh_server(script) };
+        let client = McpClient::connect("chatty", &config).await.expect("connect");
+        // Consume id 1 (tools/list) so the tools/call below is id 2, matching
+        // the scripted response.
+        client.list_tools().await.expect("list_tools");
+        let out = client
+            .call_tool("flood", json!({ "blob": "B".repeat(100_000) }))
+            .await;
+        assert_eq!(out, r#"{"result": "survived"}"#, "deadlocked or timed out: {out}");
         client.shutdown().await;
     }
 

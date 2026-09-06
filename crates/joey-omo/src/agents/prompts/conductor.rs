@@ -41,6 +41,10 @@ const HARD_RULES_CORE: &str = r#"HARD RULES (never relax, never bypass — these
 /// (contract invariant 3; FR-010: all OMO agents plus HyperCode roles are
 /// valid delegation targets in every orchestrator configuration).
 const ROSTER_BRIEFING: &str = r#"YOUR BENCH — full roster of valid delegation targets:
+DEFAULT DELEGATION: role:"explorer" and role:"implementor" are your
+workhorses — use them for nearly everything. Named specialists are
+expensive; dispatch them sparingly, only for genuinely complicated work
+where the two roles clearly cannot do the job.
 
 HyperCode roles (delegate_task with role):
 - role:"explorer" — read-only investigator. Give it focused FACTUAL
@@ -158,21 +162,64 @@ Dispatch patterns per step:
 - acceptance → exactly ONE final full-suite verification run (the FINAL
   GATE above), then synthesize the completion report."#;
 
+/// Runtime snapshot of the detected spec-kit lifecycle state (feature 026).
+/// Filled by the host CLI from on-disk artifacts; `None` renders the
+/// conductor prompt byte-identically to the pre-feature static prompt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LifecycleSnapshot {
+    /// Active feature directory, e.g. "specs/026-please-fully-integrate".
+    pub feature: String,
+    /// Derived current step name (Specify|Clarify|Plan|Tasks|Implement|Acceptance|None).
+    pub step: String,
+    /// One-line guidance for the current step.
+    pub guidance: String,
+    /// spec.md / plan.md / tasks.md presence.
+    pub spec_present: bool,
+    pub plan_present: bool,
+    pub tasks_present: bool,
+}
+
+/// Render the dynamic lifecycle block appended after the static doctrine.
+pub fn lifecycle_block(snap: &LifecycleSnapshot) -> String {
+    let mark = |b: bool| if b { "present" } else { "absent" };
+    format!(
+        "CURRENT LIFECYCLE STATE (detected from disk at session start):\n\
+         - Feature: {}\n\
+         - Step: {} — {}\n\
+         - Artifacts: spec.md [{}], plan.md [{}], tasks.md [{}]\n\
+         - Refresh by restarting the session or running /speckit-status.",
+        snap.feature, snap.step, snap.guidance,
+        mark(snap.spec_present), mark(snap.plan_present), mark(snap.tasks_present)
+    )
+}
+
 /// Expand a variant template: splice the shared hard-rules core, roster
 /// briefing, and spec-kit doctrine into their placeholders so every
 /// variant carries identical invariant blocks.
 fn render(template: &str) -> String {
+    render_with_lifecycle(template, None)
+}
+
+/// Expand a variant template with an optional lifecycle snapshot (feature
+/// 026 T024/FR-008): same substitutions as [`render`], but when `snap` is
+/// `Some` the `{SPEC_KIT}` placeholder resolves to the full static doctrine
+/// plus the dynamic CURRENT LIFECYCLE STATE block appended immediately
+/// after it (inside the same placeholder slot); when `None` the output is
+/// byte-identical to [`render`].
+fn render_with_lifecycle(template: &str, snap: Option<&LifecycleSnapshot>) -> String {
+    let spec_kit: String = match snap {
+        Some(s) => format!("{SPEC_KIT_DOCTRINE}\n\n{}", lifecycle_block(s)),
+        None => SPEC_KIT_DOCTRINE.to_string(),
+    };
     template
         .replace("{HARD_RULES}", HARD_RULES_CORE)
         .replace("{ROSTER}", ROSTER_BRIEFING)
-        .replace("{SPEC_KIT}", SPEC_KIT_DOCTRINE)
+        .replace("{SPEC_KIT}", &spec_kit)
 }
 
 // ── Variants ────────────────────────────────────────────────────────
 
-static DEFAULT: LazyLock<String> = LazyLock::new(|| {
-    render(
-        r#"<identity>
+const DEFAULT_TEMPLATE: &str = r#"<identity>
 You are the Conductor — the delegation-first orchestrator of a HyperCode
 pipeline, inheriting the conductor identity of Atlas, the Master
 Orchestrator from OhMyOpenCode.
@@ -244,18 +291,16 @@ All documentation. All git operations. All builds and targeted checks.
 NEVER: Write/edit/patch/delete files yourself. Run builds or tests while
 work is in flight. Trust a specialist's claim without verification. Answer
 ambiguity with 'use your judgment'.
-</boundaries>"#,
-    )
-});
+</boundaries>"#;
+
+static DEFAULT: LazyLock<String> = LazyLock::new(|| render(DEFAULT_TEMPLATE));
 
 /// The default conductor prompt (Claude and other non-GPT-specialized models).
 pub fn default() -> &'static str {
     &DEFAULT
 }
 
-static GPT: LazyLock<String> = LazyLock::new(|| {
-    render(
-        r#"<identity>
+const GPT_TEMPLATE: &str = r#"<identity>
 You are the Conductor — the delegation-first orchestrator of a HyperCode
 pipeline, calibrated for GPT-family models. You inherit the conductor
 identity of Atlas, the Master Orchestrator: conductor, not musician;
@@ -302,18 +347,16 @@ acceptance gate (full test suite, run once) is green.
 
 <spec_kit>
 {SPEC_KIT}
-</spec_kit>"#,
-    )
-});
+</spec_kit>"#;
+
+static GPT: LazyLock<String> = LazyLock::new(|| render(GPT_TEMPLATE));
 
 /// GPT-family variant — outcome-first with four hard invariants.
 pub fn gpt() -> &'static str {
     &GPT
 }
 
-static GPT_5_6: LazyLock<String> = LazyLock::new(|| {
-    render(
-        r#"You are the Conductor — delegation-first orchestrator of a HyperCode
+const GPT_5_6_TEMPLATE: &str = r#"You are the Conductor — delegation-first orchestrator of a HyperCode
 pipeline, calibrated for GPT-5.6. You inherit the conductor identity of
 Atlas, the Master Orchestrator: conductor, not musician; general, not
 soldier. You DELEGATE, COORDINATE, and VERIFY. You never write code, edit
@@ -353,9 +396,9 @@ specialist report. Auto-continue; stop only at verified completion.
 Write the final report (files changed, verification results, open items)
 only when every task is verified complete and the single final acceptance
 gate is green. Attribute specialist-reported checks accordingly. Never
-fabricate tool output or verification results."#,
-    )
-});
+fabricate tool output or verification results."#;
+
+static GPT_5_6: LazyLock<String> = LazyLock::new(|| render(GPT_5_6_TEMPLATE));
 
 /// GPT-5.6 variant — outcome-first, shorter process-heavy prompt
 /// (same calibration family as hephaestus `gpt_5_6`).
@@ -383,6 +426,26 @@ pub fn for_model(model: &str) -> &'static str {
         }
         _ => default(),
     }
+}
+
+/// Select the conductor prompt variant for the given model and render it
+/// with an optional [`LifecycleSnapshot`] (feature 026 T024/FR-008): the
+/// dynamic CURRENT LIFECYCLE STATE block is appended after the static
+/// spec-kit doctrine inside the `{SPEC_KIT}` slot. `None` yields output
+/// byte-identical to [`for_model`].
+pub fn for_model_with_lifecycle(model: &str, snap: Option<&LifecycleSnapshot>) -> String {
+    let lower = model.to_ascii_lowercase();
+    let template = match ModelFamily::detect(model) {
+        ModelFamily::Gpt => {
+            if lower.contains("5.6") || lower.contains("5-6") {
+                GPT_5_6_TEMPLATE
+            } else {
+                GPT_TEMPLATE
+            }
+        }
+        _ => DEFAULT_TEMPLATE,
+    };
+    render_with_lifecycle(template, snap)
 }
 
 #[cfg(test)]

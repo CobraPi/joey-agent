@@ -122,9 +122,17 @@ pub fn parse_heuristic_file(source: &str, ext: &str) -> Result<SourceExtraction,
 }
 
 /// Byte offset of the start of line `idx` (0-based).
+///
+/// Iterates `split('\n')` (NOT `lines()`): `lines()` strips a trailing
+/// `\r`, so CRLF sources would undercount 1 byte per line and every span
+/// after the first line would drift. `split('\n')` keeps the `\r` in each
+/// segment, so `len() + 1` accounts for the full `\r\n` separator. The
+/// `.min(source.len())` clamp mirrors the old end-handling for the final
+/// segment (which has no trailing newline; `split` also yields one extra
+/// empty tail segment that the clamp absorbs identically).
 fn prefix_len(source: &str, idx: usize) -> usize {
     source
-        .lines()
+        .split('\n')
         .take(idx)
         .map(|l| l.len() + 1)
         .sum::<usize>()
@@ -479,5 +487,43 @@ class UserService extends BaseService implements UserServiceInterface {
             .module_functions
             .iter()
             .any(|f| f.name == "do_thing"));
+    }
+
+    #[test]
+    fn crlf_source_spans_stay_aligned() {
+        // CRLF: each separator is 2 bytes (`\r\n`). `prefix_len` must keep
+        // the `\r` in its accounting or every span after line 1 drifts by
+        // one byte per preceding line.
+        let src = "class First\r\n\r\nclass Second\r\n    def helper\r\n    end\r\nend\r\n";
+        let ext = parse_heuristic_file(src, "rb").unwrap();
+        assert_eq!(ext.types.len(), 2);
+
+        // First type starts at byte 0.
+        assert_eq!(ext.types[0].start_byte as usize, 0);
+        // Its end is the start of the line AFTER its declaration line:
+        // "class First\r\n" is 13 bytes (the \r counts — that is the fix).
+        assert_eq!(ext.types[0].end_byte as usize, 13);
+        // Second type starts after "class First\r\n\r\n" (15 bytes).
+        assert_eq!(ext.types[1].start_byte as usize, 15);
+
+        // Cross-check against the raw bytes: the start byte must index the
+        // 'c' of "class Second".
+        assert_eq!(&src[15..20], "class");
+        // And its method's start byte must index the start of its line —
+        // spans are line-granular ("    def helper").
+        let helper = ext.types[1]
+            .methods
+            .iter()
+            .find(|m| m.name == "helper")
+            .expect("helper method extracted");
+        assert_eq!(
+            &src[helper.start_byte as usize..helper.start_byte as usize + "    def helper".len()],
+            "    def helper"
+        );
+        // The method's end byte is the start of the line after `def`.
+        assert_eq!(
+            helper.end_byte as usize,
+            15 + "class Second\r\n".len() + "    def helper\r\n".len()
+        );
     }
 }

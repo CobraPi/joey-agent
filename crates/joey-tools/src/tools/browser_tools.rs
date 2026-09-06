@@ -19,6 +19,41 @@ use joey_browser::session::BrowserManager;
 use joey_browser::BrowserConfig;
 
 // ---------------------------------------------------------------------------
+// URL-safety checker config capture
+// ---------------------------------------------------------------------------
+
+/// Config captured at lazy-connect time for the installed URL-safety checker.
+/// `None` until the first browser session connects; the installed checker
+/// falls back to `Config::defaults()` when unset.
+static URL_SAFETY_CONFIG: std::sync::RwLock<Option<joey_core::config::Config>> =
+    std::sync::RwLock::new(None);
+
+fn capture_url_safety_config(cfg: joey_core::config::Config) {
+    // SAFETY: internal RwLock; poisoning only occurs on a prior
+    // panic-while-locked, a bug.
+    let mut guard = URL_SAFETY_CONFIG.write().expect("url-safety config lock");
+    *guard = Some(cfg);
+}
+
+/// Named fn-pointer target for `install_url_safety_check`: same canonical
+/// `url_safety::is_safe_url` policy the web tools use (FR-020), evaluated
+/// against the user's config captured at connect time.
+fn installed_url_safety_check(u: &str) -> Result<(), String> {
+    // SAFETY: see capture_url_safety_config.
+    let guard = URL_SAFETY_CONFIG.read().expect("url-safety config lock");
+    let cfg = guard
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(joey_core::config::Config::defaults);
+    drop(guard);
+    if crate::url_safety::is_safe_url(u, &cfg) {
+        Ok(())
+    } else {
+        Err(format!("local/private network target refused: {u}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Handle
 // ---------------------------------------------------------------------------
 
@@ -71,21 +106,18 @@ impl BrowserHandle {
         // while disconnected connects lazily (attach when possible, else
         // managed launch) instead of erroring — mirrors /browser connect.
         if !self.is_connected() {
-            let cfg = joey_browser::BrowserConfig::from_config(
-                &joey_core::config::Config::load()
-                    .unwrap_or_else(|_| joey_core::config::Config::defaults()),
-            );
+            let config = joey_core::config::Config::load()
+                .unwrap_or_else(|_| joey_core::config::Config::defaults());
+            let cfg = joey_browser::BrowserConfig::from_config(&config);
             self.connect(cfg).await?;
             // The real URL-safety checker is injectable only from higher
             // crates; joey-tools installs the canonical policy directly
-            // (FR-020: same url_safety the web tools use).
-            joey_browser::url_safety_bridge::install_url_safety_check(|u| {
-                if crate::url_safety::is_safe_url(u, &joey_core::config::Config::defaults()) {
-                    Ok(())
-                } else {
-                    Err(format!("local/private network target refused: {u}"))
-                }
-            });
+            // (FR-020: same url_safety the web tools use). The bridge takes
+            // a stateless fn pointer, so the user's loaded config — the same
+            // one BrowserConfig was just built from — is captured in the
+            // process-global slot the installed checker reads.
+            capture_url_safety_config(config);
+            joey_browser::url_safety_bridge::install_url_safety_check(installed_url_safety_check);
         }
         let guard = self.manager.lock().await;
         let m = guard.as_ref().ok_or(joey_browser::BrowserError::NotConnected)?;
@@ -854,10 +886,44 @@ impl Tool for BrowserClickCoords {
 
 #[cfg(test)]
 mod tests {
+    use joey_core::Config;
+
     /// Fresh process: the process-global shared handle starts disconnected
     /// (T6: `BrowserHandle::is_connected` accessor for UI indicators).
     #[test]
     fn browser_shared_handle_starts_disconnected() {
         assert!(!crate::tools::browser_tools::shared_browser_handle().is_connected());
+    }
+
+    /// The installed checker must honor the config captured at lazy-connect
+    /// time (security.allow_private_urls etc.), not `Config::defaults()`.
+    /// Exercises `installed_url_safety_check` + `capture_url_safety_config`
+    /// directly — the full `BrowserHandle::run` path needs a live browser.
+    #[test]
+    fn installed_checker_uses_captured_config() {
+        let _lock = crate::test_env_lock();
+        std::env::remove_var("JOEY_ALLOW_PRIVATE_URLS");
+
+        // Defaults (nothing captured): private literal IPs are refused.
+        {
+            let mut guard = super::URL_SAFETY_CONFIG.write().unwrap();
+            *guard = None;
+        }
+        assert!(super::installed_url_safety_check("http://127.0.0.1:8080/").is_err());
+
+        // A user config enabling security.allow_private_urls is honored.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.yaml");
+        std::fs::write(&cfg_path, "security:\n  allow_private_urls: true\n").unwrap();
+        let cfg = Config::load_from(cfg_path).unwrap();
+        assert!(cfg.get_bool("security.allow_private_urls", false));
+        super::capture_url_safety_config(cfg);
+        assert!(super::installed_url_safety_check("http://127.0.0.1:8080/").is_ok());
+        // Cloud-metadata targets stay blocked regardless of the toggle.
+        assert!(super::installed_url_safety_check("http://169.254.169.254/").is_err());
+
+        // Reset the global slot so other tests see the no-capture default.
+        let mut guard = super::URL_SAFETY_CONFIG.write().unwrap();
+        *guard = None;
     }
 }

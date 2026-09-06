@@ -43,6 +43,7 @@ fn make_request(text: &str, active_rel: &str, project_root: &PathBuf) -> CodingR
         active_symbols: vec![],
         project_root: project_root.clone(),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     }
 }
 

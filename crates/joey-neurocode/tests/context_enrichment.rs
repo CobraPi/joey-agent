@@ -109,6 +109,7 @@ fn request(text: &str) -> CodingRequest {
         active_symbols: vec![],
         project_root: PathBuf::from("."),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     }
 }
 
@@ -237,6 +238,7 @@ fn tier_routing_follows_classification() {
         active_symbols: vec![],
         project_root: tmp.path().to_path_buf(),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     });
     assert_eq!(engine.resolve_tier_model().as_deref(), Some("eco-model"));
 
@@ -247,6 +249,7 @@ fn tier_routing_follows_classification() {
         active_symbols: vec![],
         project_root: tmp.path().to_path_buf(),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     });
     assert_eq!(engine.resolve_tier_model().as_deref(), Some("frontier-model"));
 }
@@ -284,6 +287,7 @@ fn stale_index_produces_warning() {
         active_symbols: vec![],
         project_root: project.path().to_path_buf(),
         token_budget_hint: 0,
+        scope_files: Vec::new(),
     };
     let ctx = engine.assemble_context(&req, ComplexityTier::Frontier);
     assert!(

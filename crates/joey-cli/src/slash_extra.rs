@@ -160,7 +160,14 @@ pub fn branch_session(
         .create_session("cli", None, std::env::current_dir().ok().map(|p| p.display().to_string()).as_deref())
         .unwrap_or_else(|_| joey_core::SessionDb::new_session_id());
     for m in &msgs {
-        let _ = db.add_message(m);
+        // `messages()` returns rows stamped with the SOURCE session id —
+        // re-inserting them verbatim would duplicate into the source. Clone
+        // each row, retarget it at the new session, and clear the row id so
+        // add_message inserts a fresh row.
+        let mut copy = m.clone();
+        copy.id = None;
+        copy.session_id = new_id.clone();
+        let _ = db.add_message(&copy);
     }
     if !name.is_empty() {
         let title = if name.trim().eq_ignore_ascii_case("fork") {
@@ -417,7 +424,7 @@ pub fn stop_background_processes() -> Lines {
         out.push("No background processes running.");
         return out;
     }
-    let mut killed = 0;
+    let mut killed = Vec::new();
     for id in running {
         if let Some(session) = guard.get_mut(&id) {
             // Signal the reaper to stop, then kill the child.
@@ -428,10 +435,16 @@ pub fn stop_background_processes() -> Lines {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            killed += 1;
+            killed.push(format!("  · {id} ({})", session.command));
         }
     }
-    out.push(format!("Stopped {killed} background process(es):"));
+    out.push(format!(
+        "Stopped {} background process(es):",
+        killed.len()
+    ));
+    for line in killed {
+        out.push(line);
+    }
     out
 }
 
@@ -740,9 +753,12 @@ pub fn fast_lines(config: &mut Config, args: &str) -> Lines {
             if let Err(e) = config.set_and_save("agent.fast_mode", mode) {
                 return Lines::single(format!("failed to save: {e}"));
             }
-            let scope = if global { " (saved globally)" } else { " (this session; --global to persist)" };
+            // Both scopes go through set_and_save — there is no session-only
+            // override mechanism, so the message must not claim one. --global
+            // is still parsed above to strip it from the mode argument.
+            let _ = global;
             Lines::single(format!(
-                "✓ Fast mode → {mode}{scope} — fast routes terse requests, skips niceties"
+                "✓ Fast mode → {mode} (saved) — fast routes terse requests, skips niceties"
             ))
         }
         Some(other) => Lines::single(format!("Usage: /fast [normal|fast] [--global] (got '{other}')")),
@@ -1680,5 +1696,61 @@ mod tests {
         std::fs::write(&p, b"fakepng").unwrap();
         let url = image_data_url(p.to_str().unwrap()).unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    /// Regression: /branch used to re-insert the source session's messages
+    /// verbatim — rows read via `messages()` still carry the SOURCE
+    /// session_id, so the "branched" copies landed back in the source
+    /// session and the new session stayed empty while /branch claimed
+    /// success. The branch must populate the NEW session and leave the
+    /// source untouched.
+    #[test]
+    fn branch_copies_messages_into_new_session_not_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = joey_core::SessionDb::open(dir.path().join("state.db")).unwrap();
+        let source = db.create_session("cli", None, None).unwrap();
+        for i in 0..3 {
+            let msg = joey_core::StoredMessage {
+                id: None,
+                session_id: source.clone(),
+                role: if i % 2 == 0 {
+                    joey_core::Role::User
+                } else {
+                    joey_core::Role::Assistant
+                },
+                content: format!("msg {i}"),
+                tool_calls: None,
+                tool_call_id: None,
+                tool_name: None,
+                timestamp: i as f64,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+            };
+            db.add_message(&msg).unwrap();
+        }
+        let source_count = db.messages(&source).unwrap().len();
+        assert_eq!(source_count, 3);
+
+        let (lines, new_id) = branch_session(&source, "my-branch", Some(&db));
+        assert!(lines.0.iter().any(|l| l.contains("Branched 3 message(s)")));
+        let new_id = new_id.expect("branch returns the new session id");
+
+        // New session got the copies...
+        assert_eq!(
+            db.messages(&new_id).unwrap().len(),
+            3,
+            "branched messages must land in the NEW session"
+        );
+        // ...and each copy is stamped with the new session id.
+        for m in db.messages(&new_id).unwrap() {
+            assert_eq!(m.session_id, new_id);
+        }
+        // Source unchanged — no duplicate re-insertion.
+        assert_eq!(
+            db.messages(&source).unwrap().len(),
+            source_count,
+            "source session must not gain duplicate rows"
+        );
     }
 }
