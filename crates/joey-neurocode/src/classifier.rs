@@ -209,12 +209,12 @@ impl ComplexityClassifier {
         let mut eco_hits = Vec::new();
         let mut frontier_hits = Vec::new();
         for kw in &self.economical_keywords {
-            if text_lower.contains(&kw.to_lowercase()) {
+            if contains_keyword(&text_lower, &kw.to_lowercase()) {
                 eco_hits.push(kw.clone());
             }
         }
         for kw in &self.frontier_keywords {
-            if text_lower.contains(&kw.to_lowercase()) {
+            if contains_keyword(&text_lower, &kw.to_lowercase()) {
                 frontier_hits.push(kw.clone());
             }
         }
@@ -244,10 +244,14 @@ impl ComplexityClassifier {
         // attached; with no graph the route is identical to the legacy
         // classifier (FR-005/SC-001 parity).
         let mut graph_hits: u32 = 0;
+        // Poison recovery (matches the codebase's established pattern):
+        // a panic elsewhere while holding the graph mutex must not take
+        // down every subsequent classify() call on the hot path — recover
+        // the inner graph and continue with graph evidence as normal.
         let graph_guard = self
             .graph
             .as_ref()
-            .map(|g| g.lock().expect("classifier graph mutex poisoned"));
+            .map(|g| g.lock().unwrap_or_else(|p| p.into_inner()));
         if let Some(graph) = graph_guard.as_deref() {
             let targets: Vec<crate::graph::CodeArtifactNode> = request
                 .active_file
@@ -429,6 +433,30 @@ impl ComplexityClassifier {
     }
 }
 
+/// Word-boundary keyword containment: `needle` matches `haystack` only
+/// when the character before/after every occurrence is non-alphanumeric
+/// (start/end of text count as boundaries). A bare `contains` let the
+/// economical keyword "test" fire on "latest"/"contest", skewing tier
+/// routing. Multi-word keywords ("unit test") match on the same rule
+/// applied at both ends of the phrase.
+fn contains_keyword(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_boundary = |c: Option<char>| c.map_or(true, |ch| !ch.is_alphanumeric());
+    let mut start = 0;
+    while let Some(idx) = haystack[start..].find(needle) {
+        let at = start + idx;
+        let before = haystack[..at].chars().next_back();
+        let after = haystack[at + needle.len()..].chars().next();
+        if is_boundary(before) && is_boundary(after) {
+            return true;
+        }
+        start = at + needle.len().max(1);
+    }
+    false
+}
+
 fn default_economical_keywords() -> Vec<String> {
     [
         "test", "getter", "setter", "boilerplate", "implement method", "junit", "mock",
@@ -481,6 +509,62 @@ mod tests {
         let route = clf.classify(&make_request("Write a JUnit test for UserServiceImpl.findById"));
         assert_eq!(route.tier, ComplexityTier::Economical);
         assert!(!route.overridden);
+    }
+
+    /// Finding #13: keyword matching is word-boundary based — "test" must
+    /// not fire on "latest"/"contest" (substring matches skewed tier
+    /// routing toward Economical for unrelated requests).
+    #[test]
+    fn keyword_match_respects_word_boundaries() {
+        let clf = ComplexityClassifier::default();
+        // "latest" contains "test" as a substring — must NOT be economical.
+        let route = clf.classify(&make_request("update to the latest version everywhere"));
+        assert_ne!(
+            route.tier,
+            ComplexityTier::Economical,
+            "'latest' must not fire the 'test' keyword: {}",
+            route.reasoning
+        );
+        // A real standalone "test" still fires.
+        let route = clf.classify(&make_request("write a test"));
+        assert_eq!(route.tier, ComplexityTier::Economical);
+        // And boundary punctuation counts: "test," / "(test)".
+        let route = clf.classify(&make_request("fix the flaky test, it fails"));
+        assert_eq!(route.tier, ComplexityTier::Economical);
+        // Multi-word keywords still match as phrases.
+        let route = clf.classify(&make_request("add a unit test for this"));
+        assert_eq!(route.tier, ComplexityTier::Economical);
+        // Hyphens are boundaries: "contest-driven" must not fire "test"…
+        let route = clf.classify(&make_request("make it contest-driven everywhere"));
+        assert_ne!(route.tier, ComplexityTier::Economical);
+        // …while "test-driven" does.
+        let route = clf.classify(&make_request("make it test-driven"));
+        assert_eq!(route.tier, ComplexityTier::Economical);
+    }
+
+    /// Finding #14: a poisoned graph mutex must degrade gracefully instead
+    /// of panicking the classify() hot path.
+    #[test]
+    fn poisoned_graph_mutex_does_not_panic_classify() {
+        let graph = DependencyGraph::open_in_memory().unwrap();
+        let shared = Arc::new(Mutex::new(graph));
+        // Poison the mutex: lock it on another thread and panic while the
+        // guard is held. `DependencyGraph` is `Send`, so the Arc crosses.
+        {
+            let shared = Arc::clone(&shared);
+            let handle = std::thread::spawn(move || {
+                let _guard = shared.lock().unwrap();
+                panic!("intentional poison while holding the graph mutex");
+            });
+            let _ = handle.join(); // expected panic; the mutex is now poisoned
+        }
+        assert!(shared.lock().is_err(), "mutex should be poisoned");
+
+        let clf = ComplexityClassifier::default().with_graph(shared);
+        let mut req = make_request("refactor this service");
+        req.active_file = Some("src/Thing.java".into());
+        let route = clf.classify(&req); // must not panic
+        assert_eq!(route.tier, ComplexityTier::Frontier);
     }
 
     #[test]

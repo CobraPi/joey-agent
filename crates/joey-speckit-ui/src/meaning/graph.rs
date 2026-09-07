@@ -152,7 +152,7 @@ fn wire_edges(nodes: &mut HashMap<SemanticId, SemanticNode>, documents: &[CstDoc
         // against the structure node's origin bytes.
         for file in &target_files {
             for struct_id in &structure_ids {
-                if structure_node_contains_path(nodes, struct_id, file) {
+                if structure_node_contains_path(nodes, documents, struct_id, file) {
                     if let Some(task) = nodes.get_mut(task_id) {
                         task.edges.push(Edge {
                             target: struct_id.clone(),
@@ -306,18 +306,64 @@ fn extract_task_refs(text: &str) -> Vec<String> {
 /// Does a ProjectStructureNode's origin contain a given file path?
 fn structure_node_contains_path(
     nodes: &HashMap<SemanticId, SemanticNode>,
+    documents: &[CstDocument],
     struct_id: &SemanticId,
     file: &str,
 ) -> bool {
-    // The structure node's expected_bytes isn't reachable here; we
-    // heuristically match on the file path's last segment appearing in the
-    // structure's origin artifact. This is conservative — a false positive
-    // just adds a Changes edge that the UI may or may not show.
-    let _ = (nodes, struct_id, file);
-    // Without byte access, skip Changes edge emission for now; the traceability
-    // spine's core (Implements, Verifies, DeliversValueFor, Governs) does not
-    // depend on it. Changes is a secondary edge for the file-tree highlight.
-    false
+    // The structure node's source bytes are reachable via its CST origin
+    // (the documents are available at wire time). A path "matches" when it
+    // appears in the tree as a suffix of one of its lines — the tree draws
+    // paths with `├──`/`└──` connectors and indentation, so we compare
+    // against each line's trailing path segment.
+    let origin = match nodes.get(struct_id) {
+        Some(n) => &n.origin,
+        None => return false,
+    };
+    let tree = origin_text_from(nodes, documents, origin);
+    if tree.is_empty() {
+        return false;
+    }
+    let file_norm = file.trim_start_matches("./");
+    tree.lines().any(|line| {
+        let t = line
+            .trim()
+            .trim_start_matches(['├', '└', '─', '│', ' '])
+            .trim();
+        // The tree lists directories with or without a trailing `/` — a
+        // task targeting `crates/foo/src/lib.rs` matches an exact
+        // `crates/foo/src/lib.rs` line or a directory prefix line
+        // (`crates/foo/` or `crates/foo`).
+        if t == file_norm {
+            return true;
+        }
+        let dir_prefix = if t.ends_with('/') { t.to_string() } else { format!("{t}/") };
+        file_norm.starts_with(&dir_prefix)
+    })
+}
+
+/// Read the raw source bytes a node's CST origin points at. Unlike
+/// `origin_text` (which takes the node), this works from a borrowed origin.
+fn origin_text_from(
+    nodes: &HashMap<SemanticId, SemanticNode>,
+    documents: &[CstDocument],
+    origin: &crate::meaning::NodeOrigin,
+) -> String {
+    for doc in documents {
+        if doc.artifact_path == origin.artifact {
+            if let Some(cst_node) = doc.get(origin.node) {
+                return cst_node.expected_bytes.clone();
+            }
+            let bytes = doc.materialize();
+            if origin.byte_end <= bytes.len() {
+                let slice = &bytes[origin.byte_start..origin.byte_end];
+                if let Ok(s) = std::str::from_utf8(slice) {
+                    return s.to_string();
+                }
+            }
+        }
+    }
+    let _ = nodes;
+    String::new()
 }
 
 /// Wire Requirement → UserStory (DeliversValueFor) edges by byte-range
@@ -391,9 +437,13 @@ fn wire_governs_edges(
                 format!("Principle {principle}"),
                 format!("constitution {principle}"),
                 format!("principle {principle}"),
-                format!("III {principle}").replace("III ", ""), // bare numeral fallback
             ];
-            if patterns.iter().any(|p| text.contains(p)) {
+            let named = patterns.iter().any(|p| text.contains(p));
+            // Bare numeral fallback: a standalone roman numeral (word
+            // boundaries on both sides), so principle "I" no longer matches
+            // the "I" inside "I/O" or arbitrary prose.
+            let bare = contains_standalone_roman(&text, principle);
+            if named || bare {
                 if let Some(req) = nodes.get_mut(req_id) {
                     req.edges.push(Edge {
                         target: gate_id.clone(),
@@ -403,6 +453,70 @@ fn wire_governs_edges(
             }
         }
     }
+}
+
+/// Does `text` contain `numeral` (a roman numeral like "III") as a standalone
+/// word? The match must be preceded by start-of-text/whitespace/opening
+/// punctuation and followed by end-of-text/whitespace/closing punctuation.
+/// This is what makes the bare-numeral Governs fallback safe: principle "I"
+/// must not match the "I" inside "I/O" (the following `/` is not a word
+/// terminator) or inside "Constitutional".
+fn contains_standalone_roman(text: &str, numeral: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(numeral) {
+        let start = search_from + rel;
+        let end = start + numeral.len();
+        let before_ok = text[..start]
+            .chars()
+            .next_back()
+            .map(|c| c.is_whitespace() || matches!(c, '(' | '[' | '"' | '“'))
+            .unwrap_or(true);
+        let after_ok = text[end..]
+            .chars()
+            .next()
+            .map(|c| c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '\'' | '’' | '"'))
+            .unwrap_or(true);
+        if before_ok && after_ok {
+            return true;
+        }
+        search_from = end;
+    }
+    false
+}
+
+/// Find the first case-insensitive occurrence of `needle` (an ASCII-lowercase
+/// verb) in `haystack` and return the substring of `haystack` starting right
+/// after it, as a slice of the ORIGINAL string. Matching is done directly on
+/// the original char-by-char (ASCII case folding), so returned byte offsets
+/// are always valid — unlike matching in a `to_lowercase()` copy, whose byte
+/// length can differ from the original for chars like 'İ' (U+0130).
+fn case_insensitive_suffix_after<'a>(haystack: &'a str, needle: &str) -> Option<&'a str> {
+    let needle_chars = needle.chars().count();
+    if needle_chars == 0 {
+        return None;
+    }
+    for (start, _) in haystack.char_indices() {
+        let mut matched = true;
+        for (k, nc) in needle.chars().enumerate() {
+            match haystack[start..].chars().nth(k) {
+                Some(hc) if hc.eq_ignore_ascii_case(&nc) => {}
+                _ => {
+                    matched = false;
+                    break;
+                }
+            }
+        }
+        if matched {
+            // Byte offset of the original char right after the match.
+            let byte_after = haystack[start..]
+                .char_indices()
+                .nth(needle_chars)
+                .map(|(b, _)| start + b)
+                .unwrap_or(haystack.len());
+            return haystack.get(byte_after..);
+        }
+    }
+    None
 }
 
 /// Infer entity relationships from Key Entity prose and cross-entity mentions
@@ -467,11 +581,14 @@ fn infer_entity_relationships(
             },
             None => continue,
         };
-        let lowered = description.to_lowercase();
         for (verb, rel) in explicit_verbs {
-            if let Some(v_pos) = lowered.find(verb) {
+            // Find the verb on the ORIGINAL string, case-insensitively.
+            // (We deliberately do NOT slice by an index found in a
+            // lowercased copy: to_lowercase can change byte lengths for
+            // some chars — e.g. 'İ' — which would land the slice mid-char
+            // and panic.)
+            if let Some(after) = case_insensitive_suffix_after(&description, verb) {
                 // After the verb, look for another known entity name.
-                let after = &description[v_pos + verb.len()..];
                 for other in &entity_names {
                     if other == &name {
                         continue;
@@ -738,6 +855,115 @@ mod tests {
         assert!(
             !explicit.is_empty(),
             "must emit an explicit Feature→Artifact relationship",
+        );
+    }
+
+    #[test]
+    fn rebuild_determinism_identical_docs_yield_identical_ids() {
+        // Two build_graph() calls over identical documents must produce
+        // identical semantic ids (auto-numbered nodes must not depend on a
+        // process-global counter — that broke id-keyed caching/diffing).
+        let spec = b"# Spec\n\nSome [NEEDS CLARIFICATION: what?] prose.\n\n**Checkpoint**: ready.\n\n- **FR-001**: Do X.\n";
+        let collect = || {
+            let doc = parse_bytes("spec.md", spec);
+            let g = build_graph("t", &[doc]);
+            let mut v: Vec<SemanticId> = g.nodes.keys().cloned().collect();
+            v.sort();
+            v
+        };
+        let ids1 = collect();
+        let ids2 = collect();
+        assert_eq!(
+            ids1, ids2,
+            "rebuilding over identical documents must yield identical node ids"
+        );
+        // And the auto ids must be position-derived, not counter-derived.
+        assert!(
+            ids1.iter().any(|id| id.contains("auto-clarify-")),
+            "clarify auto-id should be position-derived, got {ids1:?}"
+        );
+    }
+
+    #[test]
+    fn no_i_governs_edge_from_io_text() {
+        // A requirement mentioning "I/O" must NOT be governed by principle "I"
+        // via the bare-numeral fallback (the old `contains("I")` matched any
+        // text with a capital I anywhere).
+        let plan = b"# Plan\n\n## Constitution Check\n\n| # | Principle | Result | Notes |\n|---|-----------|--------|-------|\n| I | Simplicity | PASS | OK. |\n";
+        let spec = b"# Spec\n\n- **FR-002**: The system MUST handle I/O errors.\n";
+        let plan_doc = parse_bytes("plan.md", plan);
+        let spec_doc = parse_bytes("spec.md", spec);
+        let graph = build_graph("t", &[plan_doc, spec_doc]);
+
+        let req = graph.nodes.get("requirement:FR-002").expect("requirement exists");
+        assert!(
+            !req.edges.iter().any(|e| e.rel == EdgeKind::Governs && e.target == "gate:I"),
+            "\"I/O\" must not trigger a Governs edge to gate I, edges: {:?}",
+            req.edges
+        );
+
+        // But a genuine standalone numeral reference still wires the edge.
+        let spec2 = b"# Spec\n\n- **FR-003**: The design honors principle III fully.\n";
+        let plan2 = b"# Plan\n\n## Constitution Check\n\n| # | Principle | Result | Notes |\n|---|-----------|--------|-------|\n| III | Simplicity | PASS | OK. |\n";
+        let graph2 = build_graph(
+            "t",
+            &[parse_bytes("plan.md", plan2), parse_bytes("spec.md", spec2)],
+        );
+        let req2 = graph2.nodes.get("requirement:FR-003").expect("requirement exists");
+        assert!(
+            req2.edges.iter().any(|e| e.rel == EdgeKind::Governs && e.target == "gate:III"),
+            "standalone \"principle III\"... actually bare numeral III must wire Governs, edges: {:?}",
+            req2.edges
+        );
+    }
+
+    #[test]
+    fn verb_search_survives_case_expanding_chars() {
+        // 'İ' (U+0130) lowercases to TWO chars ("i̇"), shifting byte offsets
+        // between the original and lowered strings. The verb search must not
+        // panic on char-boundary slicing and must still find the entity.
+        let spec = "# Spec\n\n### Key Entities\n\n- **Feature**: A directory \u{0130}\u{0130}\u{0130} contains Artifact records.\n- **Artifact**: A document.\n".as_bytes();
+        let spec_doc = parse_bytes("spec.md", spec);
+        // Must not panic.
+        let graph = build_graph("t", &[spec_doc]);
+        let explicit = graph
+            .nodes
+            .values()
+            .filter(|n| n.kind == SemanticKind::EntityRelationship)
+            .filter(|n| matches!(
+                &n.props,
+                SemanticProps::EntityRelationship { confidence: Confidence::Explicit, source, target, .. }
+                    if source == "Feature" && target == "Artifact"
+            ))
+            .count();
+        assert!(explicit > 0, "verb + entity after İ must still be found");
+    }
+
+    #[test]
+    fn task_target_files_populate_and_changes_edge_emits() {
+        // A task citing a backtick path + a plan project-structure tree
+        // containing that path must yield a Changes edge (the graph builder
+        // never enriched target_files before; Changes edges never emitted).
+        let plan = "# Plan\n\n## Project Structure\n\n```text\nsrc/\n└── main.rs\n```\n".as_bytes();
+        let tasks = b"# Tasks\n\n- [ ] T001 [P] Implement the entrypoint in `src/main.rs`\n";
+        let plan_doc = parse_bytes("plan.md", plan);
+        let tasks_doc = parse_bytes("tasks.md", tasks);
+        let graph = build_graph("t", &[plan_doc, tasks_doc]);
+
+        let task = graph.nodes.get("task:T001").expect("task exists");
+        match &task.props {
+            SemanticProps::Task { target_files, .. } => {
+                assert!(
+                    target_files.iter().any(|f| f == "src/main.rs"),
+                    "backtick path must populate target_files, got {target_files:?}"
+                );
+            }
+            _ => panic!("expected Task props"),
+        }
+        assert!(
+            task.edges.iter().any(|e| e.rel == EdgeKind::Changes),
+            "task must carry a Changes edge to the structure node containing src/main.rs, edges: {:?}",
+            task.edges
         );
     }
 }

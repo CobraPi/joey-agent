@@ -209,6 +209,17 @@ impl BrowserManager {
                 return Err(BrowserError::Protocol(format!("navigation error: {err}")));
             }
         }
+        // Redirect re-validation: Page.navigate follows HTTP redirects
+        // server-side without re-running the gate above (this crate has no
+        // Fetch.requestPaused interception), so read back the committed
+        // main-frame URL and re-check it. See `final_url_blocked_with` for
+        // the known post-hoc limitation.
+        let final_url = self.frame_tree().await?.frameTree.frame.url;
+        final_url_blocked_with(
+            &final_url,
+            self.config.allow_local_urls,
+            crate::url_safety_bridge::url_safety_check,
+        )?;
         Ok(r)
     }
 
@@ -275,11 +286,13 @@ impl BrowserManager {
         Ok(count(&tree.frameTree))
     }
 
-    /// Current viewport metrics.
+    /// Current viewport metrics. `x`/`y`/`scroll_y` carry the CURRENT
+    /// scroll offsets (document-space → viewport-space conversion in
+    /// actions.rs relies on them being real, not zero).
     pub async fn viewport(&self) -> Result<crate::snapshot::Viewport, BrowserError> {
         let v = self
             .evaluate(
-                "({ x: 0, y: window.scrollY, w: window.innerWidth, h: window.innerHeight, scrollY: window.scrollY })",
+                "({ x: window.scrollX, y: window.scrollY, w: window.innerWidth, h: window.innerHeight, scrollY: window.scrollY })",
             )
             .await?;
         let num = |k: &str| v[k].as_f64().unwrap_or(0.0);
@@ -430,12 +443,7 @@ impl BrowserManager {
             if dismissible {
                 // Prefer the reject-style label the heuristics identified.
                 let label = ov["dismissalLabel"].as_str().unwrap_or("Reject all");
-                let js = format!(
-                    "(function(){{ const btns=[...document.querySelectorAll('button, a')]; \
-                    const b=btns.find(x=>(x.innerText||'').trim()==={lbl:?}); \
-                    if(b){{ b.click(); return 'dismissed'; }} return 'no-control'; }})()",
-                    lbl = label
-                );
+                let js = overlay_dismiss_js(label);
                 let _ = self.evaluate(&js).await;
             }
         }
@@ -462,6 +470,45 @@ async fn probe_ws_url(cdp_url: &str) -> Option<String> {
     resp.get("webSocketDebuggerUrl")
         .and_then(|u| u.as_str())
         .map(str::to_string)
+}
+
+/// Re-run the FR-020 URL-safety gate on the URL a navigation actually
+/// landed on. `Page.navigate` follows HTTP redirects without re-validating
+/// them (no Fetch.requestPaused interception exists in this crate), so the
+/// committed main-frame URL is read back after navigation and re-checked
+/// here. `allow_local_urls` disables the gate, mirroring the initial check.
+///
+/// KNOWN LIMITATION (post-hoc): by the time this runs the browser has
+/// already fetched the redirect-target content; this gate blocks further
+/// tool-level interaction with the disallowed landing page, but not the
+/// initial fetch itself. The CDP reader task (cdp/mod.rs) does broadcast
+/// `Page.frameNavigated` events carrying committed URLs, but
+/// `CdpConnection::next_event` requires `&mut self` behind the shared
+/// `Arc`, so wiring a live event consumer would be a structural change
+/// beyond this seam — this read-back gate is the minimal, testable fix.
+fn final_url_blocked_with(
+    final_url: &str,
+    allow_local_urls: bool,
+    check: fn(&str) -> Result<(), String>,
+) -> Result<(), BrowserError> {
+    if allow_local_urls {
+        return Ok(());
+    }
+    check(final_url).map_err(BrowserError::UrlBlocked)
+}
+
+/// Build the overlay-dismiss probe/click JS for a dismissal label.
+/// The label is embedded as a JSON string literal (serde_json) — Rust
+/// `{:?}` Debug escaping emits sequences like `\u{1}` that are INVALID
+/// JavaScript, whereas JSON escapes (`\u0001`) are valid in both
+/// languages (mirrors `js_str` in actions.rs).
+fn overlay_dismiss_js(label: &str) -> String {
+    format!(
+        "(function(){{ const btns=[...document.querySelectorAll('button, a')]; \
+        const b=btns.find(x=>(x.innerText||'').trim()==={lbl}); \
+        if(b){{ b.click(); return 'dismissed'; }} return 'no-control'; }})()",
+        lbl = crate::actions::js_str(label)
+    )
 }
 
 /// Pick the navigation-history entry one step back from a
@@ -501,6 +548,49 @@ mod tests {
         // Empty history.
         let empty: Value = serde_json::from_str(r#"{"currentIndex":0,"entries":[]}"#).unwrap();
         assert_eq!(back_entry_id(&empty), None);
+    }
+
+    /// FIX (redirect gate): the final-URL re-check maps a disallowed
+    /// landing URL to `UrlBlocked`, passes public landings, and is
+    /// disabled by `allow_local_urls` — via a deterministic checker
+    /// seam (no live browser, no global url_safety_bridge state).
+    #[test]
+    fn redirect_final_url_gate_blocks_disallowed_landing() {
+        fn deny_internal(u: &str) -> Result<(), String> {
+            if u.contains(".internal") {
+                Err(format!("local/private network target refused: {u}"))
+            } else {
+                Ok(())
+            }
+        }
+        assert!(matches!(
+            final_url_blocked_with("http://attacker.internal/x", false, deny_internal),
+            Err(BrowserError::UrlBlocked(_))
+        ));
+        assert!(final_url_blocked_with("https://example.com/", false, deny_internal).is_ok());
+        // allow_local_urls disables the gate entirely (same as initial check).
+        assert!(final_url_blocked_with("http://attacker.internal/x", true, deny_internal).is_ok());
+    }
+
+    /// FIX (overlay JS): the dismiss label is JSON-encoded, so labels
+    /// containing quotes/backslashes produce VALID JavaScript, and the
+    /// embedded literal round-trips back to the original label.
+    #[test]
+    fn overlay_dismiss_js_valid_for_labels_with_quotes() {
+        let label = "Re\"ject 'all'";
+        let js = overlay_dismiss_js(label);
+        // Never a Rust-Debug-escaped literal (e.g. \u{1}).
+        assert!(!js.contains("\\u{"));
+        // Extract the string literal after `===` and round-trip it.
+        let start = js.find("===").unwrap() + 3;
+        let end = start + js[start..].find(");").unwrap();
+        let literal = &js[start..end];
+        let parsed: String = serde_json::from_str(literal)
+            .unwrap_or_else(|e| panic!("literal {literal:?} is not valid JSON/JS: {e}"));
+        assert_eq!(parsed, label);
+        // Backslashes in the label also survive as valid JS escapes.
+        let js2 = overlay_dismiss_js("a\\b");
+        assert!(js2.contains("\"a\\\\b\""));
     }
 }
 

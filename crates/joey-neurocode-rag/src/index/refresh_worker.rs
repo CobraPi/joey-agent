@@ -25,8 +25,13 @@
 //!    COMMIT is the swap.
 //! 4. `refresh_state` flips back `refreshing → idle` in its own transaction
 //!    — on the error path too, so the flag never stays stuck.
-//! 5. The fingerprint sidecar is rewritten from store truth (committed
-//!    `rag_chunks` paths × current disk state), healing any drift.
+//! 5. The fingerprint sidecar is written from the DETECTION-TIME
+//!    fingerprints (step 3's T1 state) — never re-hashed from disk after
+//!    the commit. A file edited between detection (T1) and the sidecar
+//!    write (T2) must keep its T1 fingerprint: the committed chunks
+//!    reflect T1 content, so the sidecar must too, or the edit would be
+//!    permanently skipped (detect_changes hash-confirms current sha ==
+//!    sidecar sha ⇒ not modified).
 //!
 //! WAL note: `GraphStore::open` sets `PRAGMA journal_mode=WAL` (plus
 //! `foreign_keys=ON` and `busy_timeout=5000`) on every open — see
@@ -94,6 +99,11 @@ impl Default for RefreshWorkerOptions {
 pub struct RefreshReport {
     pub delta: ChangeDelta,
     pub outcome: RefreshOutcome,
+    /// The DETECTION-TIME (T1) fingerprints of every walked file — exactly
+    /// what was persisted to the sidecar (when a sidecar path exists).
+    /// Exposed for tests/diagnostics; the authoritative copy is the
+    /// sidecar itself.
+    pub detection_fingerprints: Vec<FileFingerprint>,
 }
 
 /// Run one full atomic refresh of `store` from the tree at `root`.
@@ -125,7 +135,9 @@ pub fn run_refresh(
     let previous = reconstruct_previous(store, root);
 
     // 3. Detect + refresh (refresh_incremental owns the single data
-    //    transaction; its COMMIT is the swap point).
+    //    transaction; its COMMIT is the swap point). The detection-time
+    //    (T1) fingerprints travel OUT of detect_and_refresh so step 5 can
+    //    persist them — the sidecar must never re-hash disk post-commit.
     let result = detect_and_refresh(store, root, &previous, embedder, profile, options);
 
     // 4. Flag down whatever happened — the flag must never stay stuck.
@@ -140,17 +152,21 @@ pub fn run_refresh(
 
     // 5. Persist the next refresh's "previous state" — only after a
     //    successful commit, so the sidecar never describes rolled-back
-    //    data. Best-effort: a lost sidecar heals via reconstruct's
-    //    disk-fingerprint fallback next refresh.
-    if result.is_ok() {
-        persist_fingerprints(store, root);
+    //    data. DETECTION-TIME fingerprints only (T1): re-fingerprinting
+    //    current disk here would record post-commit edits as
+    //    already-indexed and permanently skip them. Best-effort: a lost
+    //    sidecar heals via reconstruct's disk-fingerprint fallback next
+    //    refresh.
+    if let Ok(report) = result.as_ref() {
+        persist_fingerprints(store, &report.detection_fingerprints);
     }
 
     result
 }
 
 /// Steps 3's body, isolated so the flag-down in [`run_refresh`] runs on
-/// both the success and error paths.
+/// both the success and error paths. Returns the report carrying the
+/// detection-time (T1) fingerprints alongside the delta/outcome.
 fn detect_and_refresh(
     store: &GraphStore,
     root: &Path,
@@ -159,8 +175,8 @@ fn detect_and_refresh(
     profile: &EmbedProfile,
     options: &RefreshWorkerOptions,
 ) -> Result<RefreshReport, RefreshError> {
-    let delta = if options.rename_assist {
-        incremental::detect_changes_with_rename_assist(
+    let detection = if options.rename_assist {
+        incremental::detect_changes_with_rename_assist_detailed(
             root,
             previous,
             &incremental::default_indexable_filter,
@@ -168,7 +184,7 @@ fn detect_and_refresh(
             &GitRenameAssist::new(root),
         )
     } else {
-        incremental::detect_changes(
+        incremental::detect_changes_detailed(
             root,
             previous,
             &incremental::default_indexable_filter,
@@ -178,14 +194,18 @@ fn detect_and_refresh(
     let outcome = incremental::refresh_incremental(
         store,
         root,
-        &delta,
+        &detection.delta,
         embedder,
         profile,
         options.quantization,
         &options.chunk_options,
         &options.budgets,
     )?;
-    Ok(RefreshReport { delta, outcome })
+    Ok(RefreshReport {
+        delta: detection.delta,
+        outcome,
+        detection_fingerprints: detection.fingerprints,
+    })
 }
 
 /// Flip `refresh_state` to `refreshing`, ensuring the `rag_index_meta`
@@ -364,23 +384,27 @@ fn load_fingerprint_sidecar(store: &GraphStore) -> Option<Vec<FileFingerprint>> 
     Some(out)
 }
 
-/// Persist the post-refresh fingerprint state (store truth × current
-/// disk). Best-effort by design: failure costs only the healing ladder's
-/// re-detection next refresh, never correctness — so errors are logged,
-/// not propagated.
+/// Persist the post-refresh fingerprint state to the sidecar. Best-effort
+/// by design: failure costs only the healing ladder's re-detection next
+/// refresh, never correctness — so errors are logged, not propagated.
 ///
-/// **Index truth, not disk truth**: the sidecar lists exactly the paths
-/// with committed `rag_chunks` rows, fingerprinted against the CURRENT
-/// disk state for those paths only. A disk-wide `snapshot_tree` here
-/// would fingerprint budget-deferred files (present on disk, never
-/// actually indexed because `max_files_per_turn` < backlog) as-if-indexed
-/// — and `detect_changes` trusts this sidecar as previous state, so they
-/// would be PERMANENTLY skipped. Files on disk but absent from
-/// `rag_chunks` stay OUT of the sidecar and re-detect next refresh,
-/// exactly as FR-004 requires.
-fn persist_fingerprints(store: &GraphStore, root: &Path) {
+/// **Detection-time (T1) fingerprints, filtered to index truth**: the
+/// caller passes the fingerprint set change detection observed DURING the
+/// refresh (step 3), and this write keeps only the paths with committed
+/// `rag_chunks` rows. Disk is NEVER re-hashed here — a file edited between
+/// detection (T1) and this sidecar write (T2) keeps its T1 fingerprint
+/// (the committed chunks reflect T1 content), so the next refresh's
+/// hash-confirm sees current sha ≠ sidecar sha ⇒ modified ⇒ the edit is
+/// indexed. A disk-wide `snapshot_tree` here would fingerprint
+/// budget-deferred files (present on disk, never actually indexed because
+/// `max_files_per_turn` < backlog) as-if-indexed — and detect_changes
+/// trusts this sidecar as previous state, so they would be PERMANENTLY
+/// skipped. Files on disk but absent from `rag_chunks` stay OUT of the
+/// sidecar and re-detect next refresh, exactly as FR-004 requires.
+fn persist_fingerprints(store: &GraphStore, detection: &[FileFingerprint]) {
     let Some(sidecar_path) = fingerprint_sidecar_path(store) else { return };
 
+    // Index truth: only paths with committed rows belong in the sidecar.
     let indexed_paths: Vec<String> = {
         let conn = store.conn();
         let Ok(mut stmt) = conn.prepare("SELECT DISTINCT source_path FROM rag_chunks") else {
@@ -391,34 +415,21 @@ fn persist_fingerprints(store: &GraphStore, root: &Path) {
         };
         rows.flatten().collect()
     };
+    let indexed: std::collections::HashSet<&str> =
+        indexed_paths.iter().map(|s| s.as_str()).collect();
 
-    let map: std::collections::BTreeMap<String, FingerprintEntry> = indexed_paths
-        .into_iter()
-        .map(|source_path| {
-            match incremental::fingerprint_file(root, Path::new(&source_path)) {
-                Ok(fp) => FingerprintEntry {
-                    source_path: fp.source_path,
-                    mtime: chrono::DateTime::<chrono::Utc>::from(fp.mtime).to_rfc3339(),
-                    size: fp.size,
-                    sha256: fp.sha256,
-                },
-                // Committed rows whose file vanished mid-refresh (between
-                // the data commit and this sidecar write) keep the same
-                // sentinel reconstruct_previous uses for gone files: the
-                // next refresh classifies them `removed` and purges,
-                // instead of silently leaking committed chunks forever.
-                Err(_) => FingerprintEntry {
-                    mtime: chrono::DateTime::<chrono::Utc>::from(
-                        std::time::SystemTime::UNIX_EPOCH,
-                    )
-                    .to_rfc3339(),
-                    size: 0,
-                    sha256: String::new(),
-                    source_path,
-                },
-            }
+    let map: std::collections::BTreeMap<String, FingerprintEntry> = detection
+        .iter()
+        .filter(|fp| indexed.contains(fp.source_path.as_str()))
+        .map(|fp| {
+            let e = FingerprintEntry {
+                source_path: fp.source_path.clone(),
+                mtime: chrono::DateTime::<chrono::Utc>::from(fp.mtime).to_rfc3339(),
+                size: fp.size,
+                sha256: fp.sha256.clone(),
+            };
+            (e.source_path.clone(), e)
         })
-        .map(|e| (e.source_path.clone(), e))
         .collect();
     let json = serde_json::to_string_pretty(&map).unwrap_or_default();
     if let Err(e) = std::fs::write(&sidecar_path, json) {
@@ -748,6 +759,79 @@ mod tests {
     }
 
     // ── end-to-end orchestration ────────────────────────────────────────
+
+    /// T1 fingerprints: the sidecar records the content state change
+    /// detection observed — NEVER a post-commit re-hash. A file edited
+    /// MID-REFRESH (between detection and the sidecar write) keeps its
+    /// detection-time sha in the sidecar, so the next refresh detects
+    /// the edit instead of permanently skipping it.
+    #[test]
+    fn sidecar_records_detection_time_fingerprints_not_post_commit_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = GraphStore::open(&root.join("graph.db")).unwrap();
+        let original = multi_chunk_source("a", 3);
+        write(root, "a.py", &original);
+        // The detection-time (T1) fingerprint of the original content.
+        let t1 = incremental::fingerprint_file(root, &PathBuf::from("a.py")).unwrap();
+
+        // The embedder edits a.py MID-REFRESH (inside embed_texts — after
+        // detection hashed the file, after the source was read for
+        // chunking, before the sidecar write): the classic T1→T2 window.
+        struct MidRefreshEditEmbedder {
+            dim: usize,
+            edit: Option<(PathBuf, String)>,
+        }
+        impl ChunkEmbedder for MidRefreshEditEmbedder {
+            fn embed_texts(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+                if let Some((path, content)) = self.edit.take() {
+                    std::fs::write(&path, content).unwrap();
+                }
+                Ok(texts.iter().map(|t| unit_vector(self.dim, t)).collect())
+            }
+        }
+
+        let profile = default_profile();
+        let mut embedder = MidRefreshEditEmbedder {
+            dim: profile.dim as usize,
+            edit: Some((root.join("a.py"), multi_chunk_source("a", 99))),
+        };
+        let report = run_refresh(
+            &store,
+            root,
+            &mut embedder,
+            &profile,
+            &RefreshWorkerOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.outcome.files_indexed, 1);
+
+        // The sidecar must carry the T1 sha — the ORIGINAL content's —
+        // not the post-commit on-disk state the mid-refresh edit left.
+        let sidecar = load_fingerprint_sidecar(&store).expect("sidecar written");
+        let entry = sidecar
+            .iter()
+            .find(|fp| fp.source_path == "a.py")
+            .expect("a.py in sidecar");
+        assert_eq!(
+            entry.sha256, t1.sha256,
+            "sidecar keeps detection-time (T1) sha, never re-hashed post-commit"
+        );
+
+        // Consequence: the mid-refresh edit is NOT permanently skipped —
+        // the next refresh hash-confirms disk ≠ sidecar ⇒ modified.
+        let mut embedder2 = FastEmbedder::new(profile.dim as usize);
+        let second = run_refresh(
+            &store,
+            root,
+            &mut embedder2,
+            &profile,
+            &RefreshWorkerOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(second.delta.modified, vec![PathBuf::from("a.py")]);
+        assert_eq!(second.outcome.files_reindexed, 1);
+    }
 
     /// Cold index → mutate (add/modify/remove) → second refresh: the
     /// worker's previous-state reconstruction (store truth) drives correct

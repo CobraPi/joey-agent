@@ -481,7 +481,7 @@ fn pane_scroll_keys_top_bottom_move_and_clamp() {
 /// single top title — placement parity, not just string parity.
 #[test]
 fn pane_header_scroll_info_rides_top_title_when_it_fits() {
-    let mut a = focused_pane_app(40);
+    let a = focused_pane_app(40);
     let _ = render_frame(&a, 140, 30); // records pane geometry
     let rows = render_rows(&a, 140, 30);
     let (top, _bottom) = pane_title_rows(&a);

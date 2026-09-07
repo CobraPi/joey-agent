@@ -107,6 +107,11 @@ impl Joiner {
     /// (a non-git FullCopy) is rejected with `InvalidData`: its changes
     /// cannot be collected as a patch, and an empty bundle would make
     /// integrate silently report the task applied while discarding them.
+    /// The same rejection applies when the workspace is not a git work
+    /// tree even though `baseline_revision` is non-empty — a FullCopy
+    /// workspace excludes `.git` (see `workspace::FULL_COPY_EXCLUDE_DIRS`)
+    /// yet may carry the PARENT's recorded baseline; there every git
+    /// invocation below would fail into a swallowed empty patch.
     /// FR-017 divergence check: any actual path not in
     /// the declared set is recorded as a `DivergenceReport` evidence record
     /// (referenced by id in the bundle); a `CommandOutput` evidence record
@@ -127,6 +132,34 @@ impl Joiner {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "cannot collect changes from a workspace without a git baseline",
+            ));
+        }
+
+        // A non-empty recorded baseline is not sufficient: a FullCopy
+        // workspace excludes `.git`, so `git add -N`/`git diff` inside it
+        // would all fail and be swallowed into an EMPTY patch + EMPTY
+        // actual write set — the worker's changes would be silently
+        // dropped while integrate reports the task "applied". Hard-check
+        // that ws.path() is actually inside a git work tree (a linked
+        // GitWorktree passes; a FullCopy copy does not) before diffing.
+        // `git rev-parse --is-inside-work-tree` prints `true` and exits 0
+        // inside a work tree; anything else (non-zero exit outside a
+        // repository, or `false`) fails the check.
+        let inside = Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(ws.path())
+            .output();
+        let is_work_tree = matches!(inside, Ok(out) if out.status.success()
+            && String::from_utf8_lossy(&out.stdout).trim() == "true");
+        if !is_work_tree {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "cannot collect changes from {}: not a git work tree \
+                     (FullCopy workspaces exclude .git; worker output \
+                     cannot be captured as a patch)",
+                    ws.path().display()
+                ),
             ));
         }
 
@@ -530,6 +563,48 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("without a git baseline"),
+            "error message: {err}"
+        );
+    }
+
+    /// Regression (finding #7): a FullCopy workspace excludes `.git` but a
+    /// non-empty baseline_revision may still be recorded from the parent
+    /// repo. `git add -N`/`git diff` would all fail and be swallowed into
+    /// an empty patch — silently dropping the worker's changes. collect()
+    /// must return an explicit Err, never an empty bundle.
+    #[test]
+    fn collect_rejects_gitless_workspace_with_recorded_baseline() {
+        if !git_available() {
+            eprintln!("skipping: git unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let rev = init_scratch(&repo);
+
+        // FullCopy-shaped workspace: a copy WITHOUT `.git` (exactly what
+        // workspace::full_copy produces), worker edits inside it, and a
+        // NON-EMPTY baseline recorded from the parent.
+        let copy = tmp.path().join("copy-fullcopy");
+        copy_dir(&repo, &copy);
+        fs::remove_dir_all(copy.join(".git")).unwrap();
+        fs::write(copy.join("src/a.rs"), "fn a1() {}\n").unwrap();
+
+        let run_root = tmp.path().join("run");
+        let mut run = RunHandle::create_at(&run_root, "run-1", &rev).unwrap();
+        let node = task("task-a", &["src/a.rs"]);
+
+        let joiner = Joiner::new(&repo);
+        let err = joiner
+            .collect(&ws("task-a", &copy, &rev), &node, &mut run)
+            .expect_err("git-less copy with a recorded baseline must be rejected");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "error kind: {err}"
+        );
+        assert!(
+            err.to_string().contains("not a git work tree"),
             "error message: {err}"
         );
     }

@@ -38,9 +38,9 @@ const STOPWORDS: &[&str] = &[
     "very", "much", "more", "most", "some", "any", "all", "but", "not", "you", "your", "are",
     "was", "our", "its", "using", "use", "make", "makes", "made", "keep", "keeps", "take",
     "takes", "give", "gives", "need", "needs", "want", "wants", "help", "works", "working",
-    "please", "where", "which", "what", "them", "they", "will", "shall", "than", "then",
+    "please", "where", "which", "what", "them", "they", "will", "shall", "than",
     "because", "since", "here", "how", "why", "who", "one", "two", "get", "set", "put", "add",
-    "remove", "check", "make", "sure", "based", "only", "ever", "each", "every", "other",
+    "remove", "check", "sure", "based", "only", "ever", "each", "every", "other",
 ];
 
 const MAX_IDENTIFIERS: usize = 10;
@@ -313,6 +313,17 @@ pub fn scope_file_hints(scope_files: &[String]) -> DiscoveryHints {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopwords_contain_no_duplicates() {
+        // A duplicate entry is dead weight and a copy-paste hazard (it has
+        // happened: "then" was listed twice). STOPWORDS has no order
+        // semantics, so uniqueness is the only invariant worth pinning.
+        let mut seen = std::collections::HashSet::new();
+        for w in STOPWORDS {
+            assert!(seen.insert(*w), "STOPWORDS contains a duplicate: {w}");
+        }
+    }
 
     #[test]
     fn backtick_span_is_top_identifier() {

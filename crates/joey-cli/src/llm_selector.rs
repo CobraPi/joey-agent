@@ -263,10 +263,31 @@ fn cmd_pool(engine: &SelectorEngine) -> Result<String, String> {
     Ok(out)
 }
 
+/// Persist the selector enabled flag to `model.selector.enabled` so the
+/// `/llm-selector enable|disable` choice survives restarts (query.rs reads
+/// the config key back at engine construction). Follows the crate's config
+/// persistence precedent (`HyperCodeConfig::save_enabled`): fresh
+/// `Config::load()` + `set_and_save`. Persistence failures are surfaced as
+/// Err (the in-memory toggle already happened; the user must know the
+/// choice was not saved).
+fn persist_selector_enabled(enabled: bool) -> Result<(), String> {
+    let mut config = joey_core::Config::load()
+        .map_err(|e| format!("Failed to load config: {e}"))?;
+    config
+        .set_and_save(
+            "model.selector.enabled",
+            if enabled { "true" } else { "false" },
+        )
+        .map_err(|e| format!("Failed to save config: {e}"))
+}
+
 fn cmd_enable(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let q = SelectorQuery::new(engine);
     q.enable();
+    // The in-memory toggle above is lost on restart — persist the choice
+    // (finding #6: enable/disable was never written back to config).
+    persist_selector_enabled(true)?;
     Ok(
         "LLM Selector enabled. Select the 'auto' model to engage dynamic allocation.\n"
             .to_string(),
@@ -303,6 +324,8 @@ fn cmd_disable(engine: &SelectorEngine) -> Result<String, String> {
     use joey_llm_selector::SelectorQuery;
     let q = SelectorQuery::new(engine);
     q.disable();
+    // Symmetric with cmd_enable: persist the disabled choice.
+    persist_selector_enabled(false)?;
     Ok("LLM Selector disabled. Using the configured model for all modules.\n".to_string())
 }
 
@@ -823,5 +846,31 @@ pub(crate) mod tests {
             llm_selector_slash_text("diagnoser").unwrap(),
             "Diagnoser model: (unset)\n"
         );
+    }
+
+    /// Finding #6 regression: `/llm-selector enable|disable` must persist
+    /// `model.selector.enabled` back to config (the in-memory toggle alone
+    /// was lost on restart). TestEnvGuard pins JOEY_HOME at a tempdir, so
+    /// the `Config::load()` inside the command reads/writes a throwaway
+    /// config.yaml and a fresh load observes the written key.
+    #[test]
+    fn enable_disable_persists_model_selector_enabled() {
+        let _g = TestEnvGuard::new();
+        // Baseline: key absent in a fresh temp home.
+        assert!(!joey_core::Config::load()
+            .unwrap()
+            .get_bool("model.selector.enabled", false));
+
+        // Full command path: enable writes through to config.
+        llm_selector_slash_text("enable").expect("enable succeeds");
+        assert!(joey_core::Config::load()
+            .unwrap()
+            .get_bool("model.selector.enabled", false));
+
+        // Disable flips the persisted value back.
+        llm_selector_slash_text("disable").expect("disable succeeds");
+        assert!(!joey_core::Config::load()
+            .unwrap()
+            .get_bool("model.selector.enabled", true));
     }
 }

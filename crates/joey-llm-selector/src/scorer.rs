@@ -69,7 +69,16 @@ impl ColdStartScorer {
                 .then_with(|| {
                     let ca = a.cost.map(|c| c.input_per_mtok + c.output_per_mtok);
                     let cb = b.cost.map(|c| c.input_per_mtok + c.output_per_mtok);
-                    ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
+                    // Unknown cost (None) ranks LAST (+inf), never first:
+                    // Option's Ord would sort None before any Some(x),
+                    // inverting the cheapest-capable intent for cost-free
+                    // catalogs (Copilot sets cost: None everywhere, so an
+                    // unknown-cost model would always beat a priced one).
+                    // NaN still compares Equal — the sort stays total and
+                    // deterministic.
+                    let ea = ca.unwrap_or(f64::INFINITY);
+                    let eb = cb.unwrap_or(f64::INFINITY);
+                    ea.partial_cmp(&eb).unwrap_or(std::cmp::Ordering::Equal)
                 })
         });
         ranked
@@ -240,6 +249,50 @@ mod tests {
         };
         let pick = ColdStartScorer::pick(&p, &reqs).unwrap();
         assert_eq!(pick.id, "cheap");
+    }
+
+    #[test]
+    fn test_cost_tiebreak_ranks_priced_before_unknown() {
+        // Regression: within a tier, unknown cost (None — e.g. Copilot's
+        // cost-free catalog) must rank AFTER priced models. Option's Ord
+        // would sort None first, inverting the cheapest-capable intent.
+        let p = pool(vec![
+            CandidateModel {
+                id: "unknown-cost".to_string(),
+                provider: "test".to_string(),
+                context_window: 128_000,
+                supports_tools: true,
+                supports_vision: true,
+                tier: CapabilityTier::Versatile,
+                cost: None,
+            },
+            CandidateModel {
+                id: "priced".to_string(),
+                provider: "test".to_string(),
+                context_window: 128_000,
+                supports_tools: true,
+                supports_vision: true,
+                tier: CapabilityTier::Versatile,
+                cost: Some(Cost {
+                    input_per_mtok: 1.0,
+                    output_per_mtok: 3.0,
+                }),
+            },
+        ]);
+        let reqs = ModuleRequirements {
+            needs_tools: true,
+            needs_vision: true,
+            min_context_window: 1000,
+        };
+        let pick = ColdStartScorer::pick(&p, &reqs).unwrap();
+        assert_eq!(
+            pick.id, "priced",
+            "a priced model must outrank an unknown-cost model within a tier"
+        );
+        // Full ordering: priced first, unknown last.
+        let ranked = ColdStartScorer::rank(&p, &reqs);
+        assert_eq!(ranked[0].id, "priced");
+        assert_eq!(ranked[1].id, "unknown-cost");
     }
 
     #[test]

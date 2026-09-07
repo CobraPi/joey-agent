@@ -53,8 +53,10 @@ impl IsolatedWorkspace {
 }
 
 /// Marker file written at the root of a full-copy workspace. Its presence
-/// records that the workspace is a copy (not a linked worktree), and its
-/// contents hold the baseline revision.
+/// records that the workspace is a copy (not a linked worktree); its
+/// contents are empty (a full copy excludes `.git`, so there is no usable
+/// baseline — `Joiner::collect` rejects such workspaces rather than
+/// emitting a silently-empty patch).
 const FULL_COPY_MARKER: &str = ".joey-worktree-copy";
 
 /// Directory names excluded from the full-copy fallback.
@@ -121,8 +123,9 @@ impl WorkspaceIsolation {
     /// `git worktree add --detach <target>`. On any failure — including git
     /// being entirely missing — the fallback is a recursive full copy of the
     /// project (excluding build/dependency/VCS directories), after which the
-    /// marker file records the baseline revision. A missing git binary never
-    /// fails `prepare`; a copy failure does.
+    /// marker file records the workspace as a FullCopy with an EMPTY
+    /// baseline (a copy excludes `.git` and can never be diffed). A missing
+    /// git binary never fails `prepare`; a copy failure does.
     pub fn prepare(&self, task: &TaskNode) -> io::Result<IsolatedWorkspace> {
         let target = self.worktree_path(task.id.as_str());
 
@@ -172,13 +175,21 @@ impl WorkspaceIsolation {
         }
 
         // Full-copy fallback: git missing or worktree add failed. Copy
-        // failure (unlike git absence) IS an error.
+        // failure (unlike git absence) IS an error. The baseline is
+        // deliberately recorded as EMPTY: a full copy excludes `.git`, so
+        // it is not a git work tree and its changes can never be diffed
+        // into a patch — `Joiner::collect` rejects workspaces without a
+        // git baseline (and, defensively, any non-work-tree path), which
+        // is the honest outcome instead of a silently-empty patch
+        // (finding #7). The parent's baseline is still available via
+        // `baseline_revision(&self.project_root)` by any caller that
+        // needs it for run bookkeeping.
         full_copy(&self.project_root, &target)?;
-        std::fs::write(target.join(FULL_COPY_MARKER), &baseline)?;
+        std::fs::write(target.join(FULL_COPY_MARKER), "")?;
         Ok(IsolatedWorkspace {
             task_id: task.id.to_string(),
             path: target,
-            baseline_revision: baseline,
+            baseline_revision: String::new(),
             mode: WorktreeMode::FullCopy,
         })
     }
@@ -395,6 +406,45 @@ mod tests {
             !ws.path().join("node_modules").exists(),
             "excluded directories must not be copied"
         );
+    }
+
+    /// Regression (finding #7, spawn side): when the project root IS a git
+    /// repo but `git worktree add` fails, the FullCopy fallback must NOT
+    /// record the parent's baseline — a full copy excludes `.git`, so the
+    /// recorded baseline could never be diffed and `Joiner::collect` would
+    /// silently emit an empty patch. The baseline must be empty so the
+    /// existing empty-baseline guard rejects such workspaces explicitly.
+    #[test]
+    fn full_copy_fallback_records_empty_baseline() {
+        if !which_git() {
+            eprintln!("skip: git not available");
+            return;
+        }
+        let Some(repo) = scratch_repo() else {
+            eprintln!("skip: scratch repo unavailable");
+            return;
+        };
+        // Force the worktree failure deterministically: `.git/worktrees`
+        // as a regular file makes `git worktree add` refuse to proceed.
+        std::fs::write(repo.path().join(".git").join("worktrees"), b"x").unwrap();
+        let parent_baseline =
+            baseline_revision(repo.path()).expect("parent repo still has HEAD");
+
+        let run_dir = tempfile::tempdir().unwrap();
+        let iso = WorkspaceIsolation::new(repo.path(), run_dir.path());
+        let node = minimal_task("task-fc", &["src/a.rs"]);
+
+        let ws = iso.prepare(&node).expect("prepare should fall back, not fail");
+        assert_eq!(ws.mode, WorktreeMode::FullCopy, "poisoned worktree add must fall back");
+        assert!(
+            !ws.path().join(".git").exists(),
+            "full copy must not carry .git"
+        );
+        assert!(
+            ws.baseline_revision.is_empty(),
+            "FullCopy must record an EMPTY baseline, not the parent's {parent_baseline}"
+        );
+        assert!(ws.path().join(FULL_COPY_MARKER).is_file());
     }
 
     #[test]

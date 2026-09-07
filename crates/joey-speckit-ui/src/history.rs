@@ -151,11 +151,18 @@ pub fn read_all(path: &Path) -> Result<Vec<HistoryRecord>, HistoryError> {
 }
 
 /// Write all records to a file atomically (temp + rename).
+///
+/// `records` are given newest-first (the order `read_all` returns); the file
+/// is written oldest-first, canonicalizing the on-disk invariant: oldest
+/// line first, appends go to end-of-file. Rewrites (`update_in_place`,
+/// `sweep_expired`) must never flip that order, or the next `read_all`
+/// reversal would return oldest-first and break `read_paginated`'s
+/// newest-first cursor contract.
 fn write_all(path: &Path, records: &[HistoryRecord]) -> Result<(), HistoryError> {
     let tmp = path.with_extension("jsonl.tmp");
     {
         let mut file = std::fs::File::create(&tmp)?;
-        for record in records {
+        for record in records.iter().rev() {
             let line = serde_json::to_string(record)?;
             writeln!(file, "{line}")?;
         }
@@ -241,9 +248,8 @@ pub fn sweep_expired(joey_home: &Path, now: chrono::DateTime<chrono::Utc>) -> Re
         if kept.is_empty() {
             let _ = std::fs::remove_file(&path);
         } else {
-            // read_all preserves file order (oldest-first); keep it that way
-            // for append-order on disk. (The old double-reverse was an
-            // identity — confusing but correct.)
+            // read_all returns newest-first; write_all canonicalizes back to
+            // oldest-first on disk (append order).
             write_all(&path, &kept)?;
         }
     }
@@ -381,6 +387,76 @@ mod tests {
         let record = HistoryRecord::new(attempt);
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"schema_version\":1"));
+    }
+
+    /// Regression (review finding 2): rewrites must not flip the on-disk
+    /// oldest-first order. Round-trip: append a1,a2 → update_in_place(a1) →
+    /// file still oldest-first → read_all newest-first → read_paginated
+    /// newest-first → sweep_expired → file still oldest-first.
+    #[test]
+    fn rewrites_preserve_oldest_first_file_order() {
+        let dir = tempdir().unwrap();
+        let path = history_file(dir.path(), "001");
+        append(dir.path(), &make_attempt("a1", "001", "plan")).unwrap();
+        append(dir.path(), &make_attempt("a2", "001", "tasks")).unwrap();
+
+        // update_in_place rewrites the whole file; order must stay
+        // oldest-first on disk (a1 line before a2 line).
+        let mut updated = make_attempt("a1", "001", "plan");
+        updated.status = AttemptStatus::Failed;
+        update_in_place(dir.path(), &updated).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let ids: Vec<String> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<HistoryRecord>(l).ok())
+            .map(|r| r.attempt.attempt_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["a1".to_string(), "a2".to_string()],
+            "file must stay oldest-first after update_in_place"
+        );
+
+        // read_all / read_paginated contracts: newest-first.
+        let records = read_all(&path).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.attempt.attempt_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a2", "a1"],
+            "read_all must return newest-first"
+        );
+        let (page, _) = read_paginated(&path, 10, None).unwrap();
+        assert_eq!(
+            page.iter().map(|a| a.attempt_id.as_str()).collect::<Vec<_>>(),
+            vec!["a2", "a1"],
+            "read_paginated must return newest-first"
+        );
+
+        // sweep_expired rewrites too; order must still be oldest-first.
+        // NOTE (finisher fix): `make_attempt` hardcodes
+        // `expires_at: 2026-04-01`, which is in the past relative to the
+        // real clock — sweeping at `Utc::now()` removed BOTH records and
+        // deleted the file (deterministic NotFound below). Sweep at a fixed
+        // pre-expiry instant instead so both records are KEPT and the
+        // rewrite path (the thing under test) still runs — deterministic
+        // forever, no wall-clock dependence.
+        let sweep_now: chrono::DateTime<chrono::Utc> =
+            "2026-01-01T00:00:00Z".parse().unwrap();
+        sweep_expired(dir.path(), sweep_now).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let ids: Vec<String> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<HistoryRecord>(l).ok())
+            .map(|r| r.attempt.attempt_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["a1".to_string(), "a2".to_string()],
+            "file must stay oldest-first after sweep_expired"
+        );
     }
 }
 

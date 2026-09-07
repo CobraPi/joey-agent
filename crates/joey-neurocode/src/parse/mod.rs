@@ -110,7 +110,14 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
             match registry::parse_any(&path, &content) {
                 Some(Ok(extraction)) => ParsedFile::Ok { rel_path, extraction },
                 Some(Err(e)) => ParsedFile::Err { rel_path, error: e },
-                None => unreachable!("supported extensions always parse"),
+                // is_supported_extension and parse_any are maintained as
+                // parallel tables; a half-wired language (ext in one, not
+                // the other) must skip this file, not panic the whole
+                // ingest walk.
+                None => ParsedFile::Err {
+                    rel_path,
+                    error: "no extractor registered for a supported extension".to_string(),
+                },
             }
         })
         .collect();
@@ -385,6 +392,16 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
         result.errors.push(format!("tombstone pass failed: {}", e));
     }
 
+    // ── Purge pass ─────────────────────────────────────────────────
+    // Tombstoned rows (status='Deleted') lingered forever: the unique key
+    // (fqcn, kind, source_path) made a renamed file insert a duplicate row
+    // under the new path while the old-path row and its edges stayed, so
+    // the DB grew unboundedly. Purge them for good — same cadence as the
+    // tombstone pass.
+    if let Err(e) = graph.purge_deleted_paths() {
+        result.errors.push(format!("purge pass failed: {}", e));
+    }
+
     result
 }
 
@@ -616,6 +633,121 @@ mod tests {
             !has_edge(&graph, order.id, order.id, EdgeKind::Injects),
             "suffix match must not create an OrderService→OrderService self-edge"
         );
+    }
+
+    /// Finding #1: renamed/removed files left tombstoned rows forever —
+    /// after a rename + re-ingest the old-path rows and their edges must
+    /// be purged, and the new path must own the nodes.
+    #[test]
+    fn renamed_file_old_path_rows_and_edges_purged_after_reingest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("Service.java"),
+            "package com.example;\npublic interface Service {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("Client.java"),
+            "package com.example;\npublic class Client implements Service {}\n",
+        )
+        .unwrap();
+
+        let graph = DependencyGraph::open_in_memory().unwrap();
+        let result = ingest_project(&graph, tmp.path());
+        assert!(result.errors.is_empty(), "ingestion errors: {:?}", result.errors);
+        let client = node_by_fqcn(&graph, "com.example.Client");
+        let service = node_by_fqcn(&graph, "com.example.Service");
+        assert!(has_edge(&graph, client.id, service.id, EdgeKind::Implements));
+
+        // Rename Client.java → Customer.java; the old path's rows must go.
+        // A real rename moves both the file and the type it declares.
+        std::fs::rename(src.join("Client.java"), src.join("Customer.java")).unwrap();
+        std::fs::write(
+            src.join("Customer.java"),
+            "package com.example;\npublic class Customer implements Service {}\n",
+        )
+        .unwrap();
+        let result = ingest_project(&graph, tmp.path());
+        assert!(result.errors.is_empty(), "re-ingestion errors: {:?}", result.errors);
+
+        // Old-path row is gone entirely (find_node has no status filter —
+        // a tombstoned row would still be found).
+        assert!(
+            graph
+                .store()
+                .find_node(
+                    "com.example.Client",
+                    &crate::graph::node::ArtifactKind::Class,
+                    "src/Client.java"
+                )
+                .unwrap()
+                .is_none(),
+            "old-path row must be purged after the rename re-ingest"
+        );
+        // The old node's edges are gone too. Inbound edges to Service are
+        // NOT empty (the renamed Customer also implements Service), so the
+        // invariant is that none of them originate from the purged node id.
+        let service_after = node_by_fqcn(&graph, "com.example.Service");
+        let inbound: Vec<_> = graph.traverse_to(service_after.id, None).unwrap();
+        assert!(
+            !inbound.iter().any(|(from, _)| *from == client.id),
+            "edges referencing the purged old-path node must be deleted: {:?}",
+            inbound
+        );
+        // The renamed file is ingested under its new path.
+        let customer = node_by_fqcn(&graph, "com.example.Customer");
+        assert_eq!(customer.source_path, "src/Customer.java");
+        assert!(has_edge(&graph, customer.id, service_after.id, EdgeKind::Implements));
+
+        // Removal: delete the file entirely; its rows vanish as well.
+        std::fs::remove_file(src.join("Customer.java")).unwrap();
+        let result = ingest_project(&graph, tmp.path());
+        assert!(result.errors.is_empty(), "re-ingestion errors: {:?}", result.errors);
+        assert!(
+            graph
+                .store()
+                .find_node(
+                    "com.example.Customer",
+                    &crate::graph::node::ArtifactKind::Class,
+                    "src/Customer.java"
+                )
+                .unwrap()
+                .is_none(),
+            "removed file's rows must be purged after re-ingest"
+        );
+    }
+
+    /// Finding #19: a registry disagreement (ext in SUPPORTED_EXTENSIONS
+    /// but with no extractor and no heuristic route) must surface as a
+    /// per-file parse error, not an ingest-wide panic. The walk filter and
+    /// parse_any share compile-time tables, so the None arm is only
+    /// reachable on future half-wired edits — the closest observable
+    /// behavior today is that unsupported extensions skip cleanly.
+    #[test]
+    fn unsupported_ext_file_skips_not_panics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("App.java"),
+            "package com.example;\npublic class App {}\n",
+        )
+        .unwrap();
+        // Unsupported extension: must be skipped by the walk (not parsed,
+        // not an error, never a panic).
+        std::fs::write(src.join("data.xyz"), "garbage {{{\n").unwrap();
+
+        let graph = DependencyGraph::open_in_memory().unwrap();
+        let result = ingest_project(&graph, tmp.path());
+        assert!(
+            result.errors.is_empty(),
+            "unsupported ext must skip cleanly, errors: {:?}",
+            result.errors
+        );
+        assert_eq!(result.files_scanned, 1, "only the supported file is scanned");
+        assert_eq!(result.artifacts_seen, 1);
     }
 
     /// Bug: the simple-name index (first-wins across files) was consulted

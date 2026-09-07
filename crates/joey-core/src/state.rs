@@ -882,14 +882,22 @@ impl SessionDb {
             // Refresh the session counters to the active totals. tool_call_count
             // must recount the SAME unit add_message increments: the number of
             // entries in each tool_calls JSON array (hermes_state.py:4221-4268),
-            // not the number of rows carrying a tool_calls value.
+            // not the number of rows carrying a tool_calls value. The CASE arms
+            // mirror add_message's tolerance EXACTLY (NULL/'' → 0, JSON null → 0,
+            // array → length, malformed or non-array JSON → 1): bare
+            // json_array_length RAISES on malformed JSON, which would roll back
+            // the whole soft-delete above.
             conn.execute(
                 "UPDATE sessions SET message_count = \
                     (SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND active = 1), \
                     tool_call_count = \
-                    (SELECT COALESCE(SUM(json_array_length(tool_calls)), 0) FROM messages \
-                     WHERE session_id = ?1 AND active = 1 \
-                       AND tool_calls IS NOT NULL AND tool_calls != '') \
+                    (SELECT COALESCE(SUM(CASE \
+                        WHEN tool_calls IS NULL OR tool_calls = '' THEN 0 \
+                        WHEN json_valid(tool_calls) AND json_type(tool_calls) = 'array' \
+                            THEN json_array_length(tool_calls) \
+                        WHEN json_valid(tool_calls) AND json_type(tool_calls) = 'null' THEN 0 \
+                        ELSE 1 END), 0) FROM messages \
+                     WHERE session_id = ?1 AND active = 1) \
                  WHERE id = ?1",
                 params![session_id],
             )?;
@@ -1847,6 +1855,44 @@ INSERT INTO messages (session_id, role, content, timestamp) VALUES ('old_joey_se
             "recount must SUM json_array_length(tool_calls), not COUNT rows"
         );
         assert_eq!(s.message_count, 2);
+    }
+
+    /// Build u0 / a0(tool_calls) / u1 / a1, rewind 1 exchange (drops u1+a1),
+    /// and return the recounted tool_call_count of the session — a0 stays
+    /// active, so the recount reflects exactly how a0's tool_calls value is
+    /// counted.
+    fn recount_after_rewind(tool_calls: Option<&str>) -> i64 {
+        let db = SessionDb::open_in_memory().unwrap();
+        let sid = db.create_session("cli", None, None).unwrap();
+        db.add_message(&StoredMessage::new(&sid, Role::User, "u0")).unwrap();
+        let mut a0 = StoredMessage::new(&sid, Role::Assistant, "");
+        a0.tool_calls = tool_calls.map(String::from);
+        db.add_message(&a0).unwrap();
+        db.add_message(&StoredMessage::new(&sid, Role::User, "u1")).unwrap();
+        db.add_message(&StoredMessage::new(&sid, Role::Assistant, "a1")).unwrap();
+        let removed = db.rewind_last_user_exchanges(&sid, 1).unwrap();
+        assert_eq!(removed, 2);
+        db.get_session(&sid).unwrap().unwrap().tool_call_count
+    }
+
+    /// Regression: the rewind recount must tolerate malformed / non-array
+    /// tool_calls JSON exactly like add_message does (Err or non-array → 1,
+    /// JSON null / empty / SQL NULL → 0). Previously the recount used bare
+    /// json_array_length, which RAISES on malformed JSON inside the write
+    /// transaction and rolled back the whole /undo soft-delete; valid object
+    /// JSON also drifted (recounted 0 where add_message counts 1).
+    #[test]
+    fn rewind_recount_mirrors_add_message_tool_calls_tolerance() {
+        // (a) malformed JSON: rewind must succeed (not raise) and count 1.
+        assert_eq!(recount_after_rewind(Some("oops")), 1);
+        // (b) object JSON: Ok(non-array) counts as 1 in add_message.
+        assert_eq!(recount_after_rewind(Some(r#"{"a":1}"#)), 1);
+        // (c) valid array: counts its length.
+        assert_eq!(recount_after_rewind(Some(r#"[{"id":"a"},{"id":"b"},{"id":"c"}]"#)), 3);
+        // (d) JSON null, empty string, and SQL NULL all count 0.
+        assert_eq!(recount_after_rewind(Some("null")), 0);
+        assert_eq!(recount_after_rewind(Some("")), 0);
+        assert_eq!(recount_after_rewind(None), 0);
     }
 
     #[test]

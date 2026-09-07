@@ -82,20 +82,32 @@ pub struct IsoStamp {
 }
 
 /// Parse an ISO timestamp with Python-`fromisoformat` leniency:
-/// `YYYY-MM-DD` (midnight), `T` or space separator, optional seconds,
-/// optional `.fraction` (truncated to microseconds), trailing `Z`, and
-/// `+HH[:MM[:SS]]` / `+HHMM` offsets.
+/// `YYYY-MM-DD` or basic `YYYYMMDD` (midnight), `T` or space separator,
+/// optional minutes and seconds, optional `.fraction` (truncated to
+/// microseconds), trailing `Z` (uppercase only), and `+HH[:MM[:SS]]` /
+/// `+HHMM[SS]` offsets with an optional fractional-second suffix.
 pub fn parse_isoformat(input: &str) -> Result<IsoStamp> {
     let s = input.trim();
     parse_isoformat_inner(s).ok_or_else(|| anyhow!("Invalid isoformat string: '{}'", input))
 }
 
 fn parse_isoformat_inner(s: &str) -> Option<IsoStamp> {
-    if s.len() < 10 || !s.is_ascii() {
+    if s.len() < 8 || !s.is_ascii() {
         return None;
     }
-    let date = NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").ok()?;
-    if s.len() == 10 {
+    // Dashed `YYYY-MM-DD` or basic `YYYYMMDD` (CPython 3.11+ accepts the
+    // basic form, including `20230101T14...`; year-only `2023` is rejected
+    // there, so only these two date shapes are allowed).
+    let dashed = s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-';
+    let date = if dashed {
+        NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").ok()?
+    } else if s.len() >= 8 && s.as_bytes()[..8].iter().all(|b| b.is_ascii_digit()) {
+        NaiveDate::parse_from_str(&s[..8], "%Y%m%d").ok()?
+    } else {
+        return None;
+    };
+    let dlen = if dashed { 10 } else { 8 };
+    if s.len() == dlen {
         return Some(IsoStamp {
             naive: date.and_time(NaiveTime::MIN),
             offset: None,
@@ -103,8 +115,9 @@ fn parse_isoformat_inner(s: &str) -> Option<IsoStamp> {
     }
     // CPython's fromisoformat grammar is `YYYY-MM-DD[*HH[:MM...]]` where `*`
     // is ANY single separator character ('T' and ' ' in practice).
-    let rest = &s[11..];
-    let (rest, zulu) = match rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z')) {
+    let rest = &s[dlen + 1..];
+    // Lowercase `z` is NOT a Zulu marker in CPython — strip only 'Z'.
+    let (rest, zulu) = match rest.strip_suffix('Z') {
         Some(r) => (r, true),
         None => (rest, false),
     };
@@ -139,7 +152,11 @@ fn parse_two_digits(s: &str) -> Option<u32> {
 fn parse_time_part(t: &str) -> Option<NaiveTime> {
     let mut parts = t.split(':');
     let hour = parse_two_digits(parts.next()?)?;
-    let minute = parse_two_digits(parts.next()?)?;
+    // CPython 3.11+: `T14` (hour only) is valid, minute defaults to 00.
+    let minute = match parts.next() {
+        Some(m) => parse_two_digits(m)?,
+        None => 0,
+    };
     let (second, micro) = match parts.next() {
         None => (0, 0),
         Some(sec_part) => {
@@ -175,13 +192,28 @@ fn parse_offset_part(o: &str) -> Option<FixedOffset> {
         b'-' => -1,
         _ => return None,
     };
-    let rest = &o[1..];
+    let mut rest = &o[1..];
+    // CPython 3.11+: any offset form may carry an optional fractional-second
+    // suffix (`+01:02:03.5`, `+010203.5`, `+01:02.5`, `+01.5`), truncated
+    // like time fractions. chrono offsets have whole-second resolution, so
+    // the fraction is validated then dropped.
+    if let Some((r, f)) = rest.split_once('.') {
+        if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        rest = r;
+    }
     let (h, m, s) = match rest.len() {
         2 => (parse_two_digits(rest)?, 0, 0),
         4 => (parse_two_digits(&rest[..2])?, parse_two_digits(&rest[2..])?, 0),
         5 if rest.as_bytes()[2] == b':' => {
             (parse_two_digits(&rest[..2])?, parse_two_digits(&rest[3..])?, 0)
         }
+        6 => (
+            parse_two_digits(&rest[..2])?,
+            parse_two_digits(&rest[2..4])?,
+            parse_two_digits(&rest[4..])?,
+        ),
         8 if rest.as_bytes()[2] == b':' && rest.as_bytes()[5] == b':' => (
             parse_two_digits(&rest[..2])?,
             parse_two_digits(&rest[3..5])?,
@@ -1157,7 +1189,9 @@ impl CronStore {
         let Some(job) = self.resolve_job_ref(job_ref)? else {
             return Ok(None);
         };
-        let next_run_at = compute_next_run(&job.schedule, None);
+        // Anchor on the actual last run (mirrors mark_job_run / repair flows)
+        // so pause+resume does not re-base the cadence on the resume instant.
+        let next_run_at = compute_next_run(&job.schedule, job.last_run_at.as_deref());
         if next_run_at.is_none() && job.schedule.kind_str() == "once" {
             let run_at = job
                 .schedule
@@ -2333,8 +2367,42 @@ mod tests {
         // CPython quirk: ANY single character separates date and time.
         let st = parse_isoformat("2026-02-03X14:00").unwrap();
         assert_eq!(st.naive, naive(2026, 2, 3, 14, 0, 0, 0));
-        // Rejections carry the Python error shape.
-        for bad in ["nope", "2026-13-99", "2026-02-03T25:00", "2026-2-3", "2026-02-03T14:00abc"] {
+        // Python 3.11+: hour-only time `T14` parses with minute=00.
+        let st = parse_isoformat("2011-11-04T14").unwrap();
+        assert_eq!(st.naive, naive(2011, 11, 4, 14, 0, 0, 0));
+        assert!(st.offset.is_none());
+        let st = parse_isoformat("2011-11-04T14+05:00").unwrap();
+        assert_eq!(st.naive, naive(2011, 11, 4, 14, 0, 0, 0));
+        assert_eq!(st.offset, FixedOffset::east_opt(18000));
+        // Python 3.11+: basic-format date `YYYYMMDD`.
+        let st = parse_isoformat("20230101").unwrap();
+        assert_eq!(st.naive, naive(2023, 1, 1, 0, 0, 0, 0));
+        assert!(st.offset.is_none());
+        let st = parse_isoformat("20230101T14").unwrap();
+        assert_eq!(st.naive, naive(2023, 1, 1, 14, 0, 0, 0));
+        // Python 3.11+: fractional-second offsets (fraction truncated).
+        let st = parse_isoformat("2011-11-04T00:00:00+01:02:03.5").unwrap();
+        assert_eq!(st.offset, FixedOffset::east_opt(3723));
+        let st = parse_isoformat("2023-01-01T00:00:00+010203.5").unwrap();
+        assert_eq!(st.offset, FixedOffset::east_opt(3723));
+        let st = parse_isoformat("2023-01-01T00:00:00+01:02.5").unwrap();
+        assert_eq!(st.offset, FixedOffset::east_opt(3720));
+        // Python 3.11+: 6-digit compact offset `+HHMMSS`.
+        let st = parse_isoformat("2023-01-01T00:00:00+010203").unwrap();
+        assert_eq!(st.offset, FixedOffset::east_opt(3723));
+        let st = parse_isoformat("2023-01-01T00:00:00-010203").unwrap();
+        assert_eq!(st.offset, FixedOffset::east_opt(-3723));
+        // Rejections carry the Python error shape. Lowercase `z` and
+        // year-only `2023` are rejected by CPython too.
+        for bad in [
+            "nope",
+            "2026-13-99",
+            "2026-02-03T25:00",
+            "2026-2-3",
+            "2026-02-03T14:00abc",
+            "2026-02-03T14:00:00z",
+            "2023",
+        ] {
             let err = parse_isoformat(bad).unwrap_err().to_string();
             assert_eq!(err, format!("Invalid isoformat string: '{}'", bad));
         }
@@ -2959,6 +3027,35 @@ mod tests {
             err.ends_with("is in the past (grace window: 120s) and will never fire."),
             "{err}"
         );
+    }
+
+    /// Regression: resume must honor the job's last_run_at so an interval
+    /// cadence survives pause/resume. A job that last ran at T with an
+    /// `every 1h` schedule, resumed at T+10m, must next run at T+1h — not
+    /// resume+1h (which would silently stretch the interval).
+    #[test]
+    fn resume_keeps_interval_cadence_from_last_run() {
+        let (_tmp, store) = store();
+        let job = store
+            .create_job(Some("p"), "every 60m", CreateJobOptions::default())
+            .unwrap();
+        // Simulate a completed run 10 minutes ago: last_run_at = T,
+        // paused since; resume happens "at T+10m".
+        let last_run = time_now() - Duration::minutes(10);
+        let mut stored = store.get_job(&job.id).unwrap().unwrap();
+        stored.last_run_at = Some(fmt_isoformat(&last_run));
+        store.save(&[stored]).unwrap();
+        store.pause_job(&job.id, Some("brb")).unwrap();
+
+        let resumed = store.resume_job(&job.id).unwrap().unwrap();
+        let next = ensure_aware_str(resumed.next_run_at.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            next.timestamp(),
+            (last_run + Duration::minutes(60)).timestamp(),
+            "next_run must be last_run + interval, not resume-time + interval"
+        );
+        // And it is still in the future relative to the resume instant.
+        assert!(next > time_now());
     }
 
     #[test]

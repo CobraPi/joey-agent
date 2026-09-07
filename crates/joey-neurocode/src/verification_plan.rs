@@ -43,10 +43,13 @@ impl VerificationPlan {
     }
 
     /// Derive a module-scoped plan (FR-001): keep only the steps whose
-    /// `command` contains any of `impacted_modules` as a substring, mark
-    /// every kept step `required = true`, and drop the rest.
-    /// `risk_triggered_review` and `acceptance_criteria` are carried over
-    /// unchanged. An empty `impacted_modules` yields a plan with no steps.
+    /// `command` mentions any of `impacted_modules` as a whole token (a
+    /// module equals a command token/path component, delimited by
+    /// non-identifier characters — `joey-core` does NOT keep a
+    /// `joey-core-extra` step), mark every kept step `required = true`,
+    /// and drop the rest. `risk_triggered_review` and
+    /// `acceptance_criteria` are carried over unchanged. An empty
+    /// `impacted_modules` yields a plan with no steps.
     pub fn scoped(&self, impacted_modules: &[String]) -> VerificationPlan {
         VerificationPlan {
             steps: self
@@ -55,7 +58,7 @@ impl VerificationPlan {
                 .filter(|step| {
                     impacted_modules
                         .iter()
-                        .any(|module| step.command.contains(module.as_str()))
+                        .any(|module| command_mentions_module(&step.command, module))
                 })
                 .map(|step| VerificationStep {
                     required: true,
@@ -85,6 +88,28 @@ impl VerificationPlan {
         }
         self
     }
+}
+
+/// Whether `command` mentions `module` as a whole token: the module must
+/// equal a whitespace-separated command token (e.g. `-p joey-core`'s
+/// argument) or a sub-delimited component of one (a path like
+/// `crates/joey-core/src` splits on `/`, `=`, `:`, `,`, `;`).
+///
+/// A bare substring match kept `joey-core-extra` steps for a `joey-core`
+/// scope — crate-prefix siblings must not survive scoping.
+fn command_mentions_module(command: &str, module: &str) -> bool {
+    if module.is_empty() {
+        return false;
+    }
+    /// A character that can delimit a module name inside a command token:
+    /// path separators, `=` (key=value args), `:` (drive letters/goal
+    /// selectors), and `,`/`;` (lists).
+    fn is_delimiter(c: char) -> bool {
+        matches!(c, '/' | '\\' | '=' | ':' | ',' | ';')
+    }
+    command.split_whitespace().any(|token| {
+        token == module || token.split(is_delimiter).any(|part| part == module)
+    })
 }
 
 #[cfg(test)]

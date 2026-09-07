@@ -38,7 +38,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::embed::local_onnx::InputKind;
-use crate::embed::profiles::{default_profile, lookup, EmbedProfile, Pooling};
+use crate::embed::profiles::{lookup, EmbedProfile, Pooling};
 use crate::embed::{BackendKind, EmbedError, EmbedPrefixes, EmbedderInfo, EmbeddingBackend};
 
 /// Wire path appended to the configured `base_url`.
@@ -228,7 +228,23 @@ impl OpenAiCompat {
             .timeout(Duration::from_secs(timeout_secs.max(1) as u64))
             .build()
             .map_err(|e| EmbedError::Other(format!("http client build: {}", e)))?;
-        let profile = lookup(&model).unwrap_or_else(default_profile);
+        // Unknown model id: ERROR, never a silent nomic fallback — nomic's
+        // `search_query:`/`search_document:` prefixes and 768-dim would be
+        // wrong for e.g. bge-m3 (1024-dim, instruction-free), corrupting
+        // the index or surfacing later as per-row DimMismatch. The model
+        // id must name an accepted profile.
+        let profile = lookup(&model).ok_or_else(|| {
+            EmbedError::UnknownProfile(format!(
+                "model {:?} has no accepted profile (accepted: {}); refusing to apply a \
+                 wrong-dim/wrong-prefix default",
+                model,
+                crate::embed::profiles::PROFILES
+                    .iter()
+                    .map(|p| p.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
         Ok(Self { http, base_url, model, api_key, profile, kind })
     }
 
@@ -659,6 +675,23 @@ mod tests {
     }
 
     // ── descriptor / health ─────────────────────────────────────────────
+
+    /// Unknown model id: construction FAILS with `UnknownProfile` —
+    /// never a silent default-profile fallback (wrong dim/prefixes would
+    /// corrupt the index or surface later as per-row DimMismatch).
+    #[test]
+    fn openai_unknown_model_is_unknown_profile_never_silent_fallback() {
+        let err = OpenAiCompat::documents(
+            "http://localhost:9999".into(),
+            "bge-m3".into(),
+            String::new(),
+            1,
+        )
+        .err()
+        .expect("construction must fail");
+        assert!(matches!(err, EmbedError::UnknownProfile(_)), "got: {err}");
+        assert!(err.to_string().contains("bge-m3"), "names the model");
+    }
 
     #[test]
     fn openai_describe_embedder_is_static_and_profile_pinned() {

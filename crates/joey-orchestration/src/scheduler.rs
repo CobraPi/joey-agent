@@ -235,7 +235,12 @@ impl Scheduler {
         let ledger_m = tokio::sync::Mutex::new(&mut ledger);
         let stats_m = Mutex::new(&mut stats);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(
-            self.config.max_concurrent_workers,
+            // #3 (review finding): `max_concurrent_workers = 0` would build
+            // a zero-permit semaphore — `acquire_owned()` in `process_task`
+            // then blocks forever because no permit can ever be released.
+            // Clamp to at least one worker so a degenerate config still
+            // completes waves instead of deadlocking every wave.
+            self.config.max_concurrent_workers.max(1),
         ));
 
         loop {
@@ -441,10 +446,13 @@ async fn process_task(
         Ok(permit) => permit,
         Err(_) => {
             with_run(run_m, |r| {
+                // The task is still Pending here: the deferral check runs
+                // BEFORE the Pending→Ready transition below, so log the
+                // actual state at decision time (finding #9), not "Ready".
                 let entry = DecisionEntry::new(
                     id.as_str(),
-                    "Ready",
-                    "Ready",
+                    "Pending",
+                    "Pending",
                     "deferred_concurrency_cap",
                     vec![],
                     "queued beyond concurrency cap",

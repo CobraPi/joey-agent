@@ -128,6 +128,21 @@ pub struct ActionResult {
     pub detail: String,
 }
 
+/// Pure document→viewport coordinate transform for Input.dispatchMouseEvent:
+/// the scanner reports element geometry in DOCUMENT space
+/// (`getBoundingClientRect().y + window.scrollY`, extract.rs), but CDP
+/// Input events take VIEWPORT coordinates. Subtract the current scroll
+/// offset and clamp to >= 0 (elements fully above/left of the viewport
+/// clamp to its edge instead of dispatching negative coordinates).
+pub(crate) fn doc_to_viewport_coords(
+    x: f64,
+    y: f64,
+    scroll_x: f64,
+    scroll_y: f64,
+) -> (f64, f64) {
+    ((x - scroll_x).max(0.0), (y - scroll_y).max(0.0))
+}
+
 impl BrowserManager {
     /// The pre-action pipeline: re-scan (fresh registry), resolve the
     /// descriptor through the cascade, then execute the verb (FR-005).
@@ -181,10 +196,18 @@ impl BrowserManager {
         Ok(registry)
     }
 
+    /// Convert a document-space (x, y) pair to viewport space for CDP
+    /// Input events (see `doc_to_viewport_coords`).
+    async fn to_viewport(&self, x: f64, y: f64) -> Result<(f64, f64), BrowserError> {
+        let vp = self.viewport().await?;
+        Ok(doc_to_viewport_coords(x, y, vp.x, vp.scroll_y))
+    }
+
     /// Click via coordinate at element center (works for handlerless too).
     pub async fn click(&self, target: &TargetDescriptor) -> Result<ActionResult, BrowserError> {
         let (_, el, by) = self.resolve_fresh(target).await?;
-        let (x, y) = el.geometry.center();
+        let (cx, cy) = el.geometry.center();
+        let (x, y) = self.to_viewport(cx, cy).await?;
         self.dispatch_click(x, y).await?;
         Ok(ActionResult {
             ok: true,
@@ -269,7 +292,8 @@ impl BrowserManager {
     /// Hover (menus that only open on hover).
     pub async fn hover(&self, target: &TargetDescriptor) -> Result<ActionResult, BrowserError> {
         let (_, el, by) = self.resolve_fresh(target).await?;
-        let (x, y) = el.geometry.center();
+        let (cx, cy) = el.geometry.center();
+        let (x, y) = self.to_viewport(cx, cy).await?;
         let page = self.ensure_page().await?;
         self.conn()?
             .send("Input.dispatchMouseEvent", mouse_event(MouseEventType::Moved, x, y, "none", 0), Some(&page.session_id))
@@ -328,8 +352,10 @@ impl BrowserManager {
     ) -> Result<ActionResult, BrowserError> {
         let (_, src, by_s) = self.resolve_fresh(source).await?;
         let (_, tgt, by_t) = self.resolve_fresh(target).await?;
-        let (sx, sy) = src.geometry.center();
-        let (tx, ty) = tgt.geometry.center();
+        let (scx, scy) = src.geometry.center();
+        let (tcx, tcy) = tgt.geometry.center();
+        let (sx, sy) = self.to_viewport(scx, scy).await?;
+        let (tx, ty) = self.to_viewport(tcx, tcy).await?;
         let page = self.ensure_page().await?;
         let s = &page.session_id;
         self.conn()?.send("Input.dispatchMouseEvent", mouse_event(MouseEventType::Moved, sx, sy, "none", 0), Some(s)).await?;
@@ -421,5 +447,33 @@ impl BrowserManager {
             Ok(Err(e)) => Err(e),
             Err(_) => Err(BrowserError::SettleTimeout { waited_ms: self.config.hard_timeout.as_millis() as u64 }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FIX (coordinate space): scanner geometry is DOCUMENT space; CDP
+    /// Input events are VIEWPORT space. The transform subtracts the scroll
+    /// offsets and clamps to >= 0.
+    #[test]
+    fn doc_to_viewport_subtracts_scroll_and_clamps() {
+        // Element at doc (100, 2500), page scrolled to (50, 2000).
+        let (x, y) = doc_to_viewport_coords(100.0, 2500.0, 50.0, 2000.0);
+        assert_eq!((x, y), (50.0, 500.0));
+
+        // No scroll → identity.
+        let (x, y) = doc_to_viewport_coords(100.0, 2500.0, 0.0, 0.0);
+        assert_eq!((x, y), (100.0, 2500.0));
+
+        // Element fully above/left of the viewport clamps at the edge —
+        // never negative coordinates.
+        let (x, y) = doc_to_viewport_coords(10.0, 100.0, 50.0, 2000.0);
+        assert_eq!((x, y), (0.0, 0.0));
+
+        // Partially off-viewport element lands inside at its visible edge.
+        let (x, y) = doc_to_viewport_coords(60.0, 1990.0, 50.0, 2000.0);
+        assert_eq!((x, y), (10.0, 0.0));
     }
 }

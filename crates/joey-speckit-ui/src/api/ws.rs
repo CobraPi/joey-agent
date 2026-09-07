@@ -229,18 +229,55 @@ async fn meaning_stream_handler(
         .into_response()
 }
 
-/// Send the current semantic graph on connection, then keep the connection
-/// open responding to pings (a real deployment hooks the watcher for pushes).
+/// Send the current semantic graph on connection, then re-send it whenever a
+/// watched artifact changes (the watcher events drive the cache recompute —
+/// FR-040 pushes the refreshed graph so widgets update live).
 async fn meaning_stream_loop(mut socket: WebSocket, state: AppState, feature_id: String) {
+    let feature_dir = state.repo_root.join("specs").join(&feature_id);
+
+    // Subscribe to the feature directory's watcher (shared per-dir; dropping
+    // the receiver detaches this subscriber).
+    let mut rx = match crate::watcher::watch_feature_dir(&feature_dir) {
+        Ok(rx) => Some(rx),
+        Err(e) => {
+            tracing::warn!(error = %e, feature = %feature_id, "meaning stream: watcher unavailable; serving initial graph only");
+            None
+        }
+    };
+
     // Send the initial graph.
     let graph_json = build_meaning_json(&state, &feature_id);
-    let _ = socket
+    if socket
         .send(Message::Text(graph_json.to_string().into()))
-        .await;
+        .await
+        .is_err()
+    {
+        return;
+    }
 
-    // Keep the connection open, responding to messages.
+    // Keep the connection open: recompute + push on watcher events (cache
+    // recompute seam, FR-040), respond to pings.
     loop {
         tokio::select! {
+            event = async { match rx.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }} => {
+                match event {
+                    Some(_evt) => {
+                        // Cache recompute: the graph is derived from the
+                        // current file bytes, so rebuild and push.
+                        let graph_json = build_meaning_json(&state, &feature_id);
+                        if socket.send(Message::Text(graph_json.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => {
+                        // Watcher torn down — keep serving pings; no more pushes.
+                        rx = None;
+                    }
+                }
+            }
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Ping(data))) => {

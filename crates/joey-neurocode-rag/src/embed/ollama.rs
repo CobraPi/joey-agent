@@ -31,7 +31,7 @@ use crate::embed::local_onnx::InputKind;
 use crate::embed::openai_compat::{
     l2_normalize, map_send_error, map_status_with_body, prefixed_input,
 };
-use crate::embed::profiles::{default_profile, lookup, EmbedProfile, Pooling};
+use crate::embed::profiles::{lookup, EmbedProfile, Pooling};
 use crate::embed::{BackendKind, EmbedError, EmbedPrefixes, EmbedderInfo, EmbeddingBackend};
 
 /// Wire path appended to the configured `base_url`.
@@ -113,7 +113,24 @@ impl OllamaNative {
             .map_err(|e| EmbedError::Other(format!("http client build: {}", e)))?;
         let keep_alive =
             if keep_alive.trim().is_empty() { DEFAULT_KEEP_ALIVE.to_string() } else { keep_alive };
-        let profile = lookup(&model).unwrap_or_else(default_profile);
+        // Unknown model id: ERROR, never a silent nomic fallback — nomic's
+        // `search_query:`/`search_document:` prefixes and 768-dim would be
+        // wrong for e.g. bge-m3 (1024-dim, instruction-free), corrupting
+        // the index or surfacing later as per-row DimMismatch. The model
+        // id must name an accepted profile (same rule as the
+        // OpenAI-compatible backend).
+        let profile = lookup(&model).ok_or_else(|| {
+            EmbedError::UnknownProfile(format!(
+                "model {:?} has no accepted profile (accepted: {}); refusing to apply a \
+                 wrong-dim/wrong-prefix default",
+                model,
+                crate::embed::profiles::PROFILES
+                    .iter()
+                    .map(|p| p.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
         Ok(Self { http, base_url, model, api_key, keep_alive, profile, kind })
     }
 
@@ -422,6 +439,37 @@ mod tests {
     }
 
     // ── descriptor / health ─────────────────────────────────────────────
+
+    /// Unknown model id: construction FAILS with `UnknownProfile` —
+    /// never a silent default-profile fallback (nomic's prefixes and
+    /// 768-dim would be wrong for e.g. bge-m3, corrupting the index or
+    /// surfacing later as per-row DimMismatch at write time).
+    #[test]
+    fn ollama_unknown_model_is_unknown_profile_never_silent_fallback() {
+        let err = OllamaNative::documents(
+            "http://localhost:11434".into(),
+            "bge-m3".into(),
+            String::new(),
+            String::new(),
+            1,
+        )
+        .err()
+        .expect("construction must fail");
+        assert!(matches!(err, EmbedError::UnknownProfile(_)), "got: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("bge-m3"), "names the model: {msg}");
+        // Same rule on the query adapter.
+        let err = OllamaNative::query(
+            "http://localhost:11434".into(),
+            "totally-unknown-model".into(),
+            String::new(),
+            String::new(),
+            1,
+        )
+        .err()
+        .expect("query adapter must fail too");
+        assert!(matches!(err, EmbedError::UnknownProfile(_)), "got: {err}");
+    }
 
     #[test]
     fn ollama_describe_embedder_is_static_and_profile_pinned() {

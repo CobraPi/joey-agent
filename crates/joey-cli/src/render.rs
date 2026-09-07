@@ -397,6 +397,49 @@ fn count_visual_lines(text: &str, width: usize) -> u32 {
     lines.max(1)
 }
 
+/// Finding #4 (render.rs:923): per-delta visual-line counting over-counts a
+/// logical line split across streaming deltas — `count_visual_lines` floors
+/// at 1, so every unterminated continuation delta allocates a phantom row.
+/// This carry-based counter appends each delta to a tail buffer, counts only
+/// fully-terminated visual lines (via `count_visual_lines` on the terminated
+/// segment, terminator excluded), and keeps the unterminated tail for the
+/// next delta. The tail's rows are allocated when it is terminated later or
+/// flushed at Done (`finish`).
+#[derive(Default)]
+struct StreamLineCounter {
+    /// Unterminated tail carried across deltas.
+    tail: String,
+    /// Visual lines counted so far (terminated segments only).
+    lines: u32,
+}
+
+impl StreamLineCounter {
+    /// Feed one streaming delta; returns the running visual-line count
+    /// (terminated lines only — the tail is not yet allocated).
+    fn push(&mut self, delta: &str, width: usize) -> u32 {
+        self.tail.push_str(delta);
+        let mut consumed = 0;
+        for (i, b) in self.tail.bytes().enumerate() {
+            if b == b'\n' {
+                let segment = &self.tail[consumed..=i];
+                self.lines += count_visual_lines(segment.trim_end_matches('\n'), width);
+                consumed = i + 1;
+            }
+        }
+        self.tail.drain(..consumed);
+        self.lines
+    }
+
+    /// Finalize at Done: allocate the remaining tail's visual rows.
+    fn finish(&mut self, width: usize) -> u32 {
+        if !self.tail.is_empty() {
+            self.lines += count_visual_lines(&self.tail, width);
+            self.tail.clear();
+        }
+        self.lines
+    }
+}
+
 /// Guard: if line count somehow overflows, skip caret rendering.
 fn streamed_line_count_overflow(count: &u32) -> bool {
     *count > 5000
@@ -550,7 +593,10 @@ fn finalize_live_rendering(
 pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: RenderOptions) -> String {
     let mut final_text = String::new();
     let mut streamed_any = false;
-    let mut streamed_line_count: u32 = 0;
+    // Finding #4: carry-based visual-line counter (T044 wrapping still via
+    // count_visual_lines; the unterminated tail no longer allocates rows
+    // until it is terminated or finalized at Done).
+    let mut streamed_lines = StreamLineCounter::default();
     // True when something other than streamed content deltas printed since
     // the first delta (a tool block, notice, error…). The Done reflow clears
     // N lines above the cursor — with interleaved output those lines contain
@@ -920,7 +966,9 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 turn_in_progress = true;
                 // Track visual lines for US3 markdown reflow on Done (T044: uses
                 // unicode-width-aware wrapping count, not raw \n count).
-                streamed_line_count += count_visual_lines(&d, box_width());
+                // Finding #4: feed the carry-based counter so a logical line
+                // split across deltas is not over-counted.
+                streamed_lines.push(&d, box_width());
             }
             AgentEvent::AssistantMessage(text) => {
                 final_text = text;
@@ -1367,6 +1415,9 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 // text contains markdown, clear the streamed region and re-print
                 // it once as formatted markdown. Only when interactive (cursor
                 // control is required). NonInteractive keeps the raw stream.
+                // Finding #4: finalize the carry counter first so the trailing
+                // unterminated tail is allocated before reflow decisions.
+                let streamed_line_count = streamed_lines.finish(box_width());
                 // SAFETY GATE (Done-reflow fix): additionally require the
                 // region to be contiguous (no interleaved arm output — every
                 // printing arm now marks it), bounded (overflow guard), and
@@ -1605,7 +1656,7 @@ pub async fn render_turn(mut rx: mpsc::UnboundedReceiver<AgentEvent>, opts: Rend
                 // is currently visible, paint one. This gives the impression
                 // of a blinking caret at the end of the streamed text while
                 // waiting for the next token.
-                if caret_active && !caret_visible && !streamed_line_count_overflow(&streamed_line_count) {
+                if caret_active && !caret_visible && !streamed_line_count_overflow(&streamed_lines.lines) {
                     let frame = caret_profile.frames
                         [usize::from(crate::animation::tick_phase(caret_profile, tick_count))];
                     let color = (caret_profile.color)(t);
@@ -2370,6 +2421,49 @@ mod tests {
 
         // Multi-byte: 3 emoji (each 2 cols wide) in a 4-col terminal.
         assert_eq!(count_visual_lines("😀😀😀", 4), 2);
+    }
+
+    // ── Finding #4: carry-based counting of line-split deltas. ──
+    #[test]
+    fn stream_line_counter_counts_split_line_as_one() {
+        // A single logical line delivered across 4 deltas must count 1, not 4.
+        let mut c = StreamLineCounter::default();
+        for piece in ["Hel", "lo, ", "wor", "ld"] {
+            c.push(piece, 80);
+        }
+        // Before termination the tail has not allocated any rows yet.
+        assert_eq!(c.lines, 0);
+        assert_eq!(c.finish(80), 1);
+    }
+
+    #[test]
+    fn stream_line_counter_terminates_and_wraps() {
+        // Two logical lines, each split across deltas; width 5 forces the
+        // second (10 chars) to wrap into 2 visual rows → 3 total.
+        let mut c = StreamLineCounter::default();
+        c.push("hello\n", 5);
+        assert_eq!(c.lines, 1); // terminated immediately
+        c.push("aaaaa", 5);
+        c.push("bbbbb", 5);
+        assert_eq!(c.lines, 1); // tail still unterminated
+        assert_eq!(c.finish(5), 3); // 1 + wrapped 2
+        // finish() is idempotent once the tail is drained.
+        assert_eq!(c.finish(5), 3);
+    }
+
+    #[test]
+    fn stream_line_counter_handles_multiple_newlines_per_delta() {
+        // Delta containing several terminated lines + an unterminated tail.
+        let mut c = StreamLineCounter::default();
+        c.push("one\ntwo\nthr", 80);
+        assert_eq!(c.lines, 2);
+        c.push("ee\n", 80);
+        assert_eq!(c.lines, 3);
+        assert_eq!(c.finish(80), 3);
+        // Blank lines still count.
+        c.push("\n\n", 80);
+        assert_eq!(c.lines, 5);
+        assert_eq!(c.finish(80), 5);
     }
 
     // ── T040: StreamingCaret profile is addressable and has non-empty

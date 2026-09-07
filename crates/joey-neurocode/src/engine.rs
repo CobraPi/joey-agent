@@ -1019,7 +1019,12 @@ impl NeuroCodeEngine for DefaultEngine {
             }
         }
         let result = self.index_project();
-        if result.errors.is_empty() || result.files_scanned > 0 {
+        // Reset the trackers (clear edits + restart the debounce window)
+        // only on an error-free run. A partial failure (files scanned AND
+        // errors) used to clear the trackers too — edits that failed to
+        // index were forgotten and the stale graph was trusted until the
+        // next threshold crossing. An empty-but-clean run still resets.
+        if result.errors.is_empty() {
             if let Ok(mut tracker) = self.auto_index.lock() {
                 tracker.note_reindexed();
             }

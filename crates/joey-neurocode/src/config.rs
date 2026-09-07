@@ -238,7 +238,12 @@ impl Default for VerifyConfig {
 
 impl VerifyConfig {
     fn from_config(cfg: &joey_core::Config) -> Self {
-        let max_fix = cfg.get_i64("neurocode.verify.max_fix_iterations", 3) as u32;
+        // A negative value must fall back to the default (3), NOT the raw
+        // `as u32` cast (-1 → u32::MAX ≈ 4 billion fix iterations). Zero
+        // stays zero — it's a legitimate "no fix budget" configuration
+        // (VerifyOutcome's zero-budget escalation depends on it).
+        let raw_max_fix = cfg.get_i64("neurocode.verify.max_fix_iterations", 3);
+        let max_fix = if raw_max_fix < 0 { 3 } else { raw_max_fix as u32 };
         let steps = parse_verify_steps(cfg);
         Self {
             steps,
@@ -314,10 +319,15 @@ impl Default for ClassifierConfig {
 impl ClassifierConfig {
     fn from_config(cfg: &joey_core::Config) -> Self {
         Self {
-            scope_fanout_frontier_threshold: cfg.get_i64(
-                "neurocode.classifier.scope_fanout_frontier_threshold",
-                4,
-            ) as usize,
+            // .max(0): a negative i64 cast to usize wraps to ~1.8e19, so
+            // `scope > threshold` would never fire and the frontier
+            // scope-fanout signal would be silently disabled.
+            scope_fanout_frontier_threshold: cfg
+                .get_i64(
+                    "neurocode.classifier.scope_fanout_frontier_threshold",
+                    4,
+                )
+                .max(0) as usize,
             economical_keywords: opt_str_list(cfg, "neurocode.classifier.economical_keywords"),
             frontier_keywords: opt_str_list(cfg, "neurocode.classifier.frontier_keywords"),
         }
@@ -370,6 +380,62 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.verify.max_fix_iterations, 3);
         assert_eq!(cfg.classifier.scope_fanout_frontier_threshold, 4);
+    }
+
+    /// Finding #7: a negative `neurocode.verify.max_fix_iterations` must
+    /// clamp to the default (3) — the raw `as u32` cast turned -1 into
+    /// u32::MAX (an effectively infinite fix loop).
+    #[test]
+    fn negative_max_fix_iterations_clamps_to_default() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "neurocode:\n  verify:\n    max_fix_iterations: -1\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        assert_eq!(nc.verify.max_fix_iterations, 3, "negative must fall back to default 3");
+
+        // Non-negative values still pass through untouched (0 is a
+        // legitimate "no fix budget" configuration).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "neurocode:\n  verify:\n    max_fix_iterations: 0\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        assert_eq!(nc.verify.max_fix_iterations, 0);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "neurocode:\n  verify:\n    max_fix_iterations: 7\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        assert_eq!(nc.verify.max_fix_iterations, 7);
+    }
+
+    /// Finding #8: a negative scope-fanout threshold must clamp to 0, not
+    /// wrap to ~1.8e19 (which silently disabled the frontier fanout signal).
+    #[test]
+    fn negative_scope_fanout_threshold_clamps_to_zero() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "neurocode:\n  classifier:\n    scope_fanout_frontier_threshold: -5\n",
+        )
+        .unwrap();
+        let cfg = joey_core::Config::load_from(tmp.path().to_path_buf()).unwrap();
+        let nc = NeuroCodeConfig::from_config(&cfg);
+        assert_eq!(
+            nc.classifier.scope_fanout_frontier_threshold, 0,
+            "negative must clamp to 0 (any scope > 0 then leans frontier)"
+        );
     }
 
     #[test]

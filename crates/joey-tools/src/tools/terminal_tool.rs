@@ -442,7 +442,19 @@ const ALWAYS_STRIP_KEYS: &[&str] = &[
 /// `_sanitize_subprocess_env`: strip Joey-managed secrets, apply the HOME
 /// contract via `joey_core::constants::apply_subprocess_home_env`).
 fn sanitized_env() -> indexmap::IndexMap<String, String> {
-    let mut env: indexmap::IndexMap<String, String> = std::env::vars().collect();
+    // vars_os + lossy conversion: `std::env::vars()` PANICS when any env var
+    // is non-UTF-8, which would take down the whole terminal tool for every
+    // command. Upstream Python iterates `os.environ` (bytes-native) and can
+    // never fail here. Lossy-convert both key and value — normal (valid
+    // UTF-8) environments are byte-identical to the old behavior.
+    let mut env: indexmap::IndexMap<String, String> = std::env::vars_os()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
     for key in ALWAYS_STRIP_KEYS {
         env.shift_remove(*key);
     }
@@ -460,6 +472,17 @@ fn sanitized_env() -> indexmap::IndexMap<String, String> {
     }
     joey_core::constants::apply_subprocess_home_env(&mut env);
     env
+}
+
+/// Sentinel prefix marking an infrastructure spawn/exec/pipe failure returned
+/// in the output slot by `run_command_unix`/`run_command_windows`. Starts with
+/// a NUL byte so no real child output can collide with it (see the
+/// classification check in `Terminal::execute_foreground`).
+const SPAWN_FAIL_SENTINEL: &str = "\0__JOEY_SPAWN_FAILED__\n";
+
+/// Wrap an infrastructure failure message in the spawn-failure sentinel.
+fn spawn_fail_msg(detail: String) -> String {
+    format!("{}{}", SPAWN_FAIL_SENTINEL, detail)
 }
 
 /// Port of `_interpret_exit_code` — human-readable notes for non-erroneous
@@ -699,11 +722,22 @@ impl Tool for Terminal {
 
         // Spawn/exec failures surface in the error field (upstream:
         // {"output": "", "exit_code": -1, "error": "Command execution failed: ..."}).
-        if returncode == -1 && !timed_out && raw_output.starts_with("Failed to ") {
+        // A dedicated prefix sentinel distinguishes infrastructure spawn/exec
+        // failures from REAL child output: the old check
+        // (`raw_output.starts_with("Failed to ")`) misclassified any child
+        // whose actual output began with "Failed to " (e.g. a command killed
+        // by SIGHUP printing a "Failed to ..." line) as a spawn failure and
+        // DISCARDED the captured output. The sentinel is only ever produced
+        // by `run_command`'s own spawn/pipe-failure paths — a child cannot
+        // forge it because the prefix contains a NUL byte, which shells
+        // cannot emit via ordinary write()s in practice, and even if it did,
+        // the message is still surfaced verbatim rather than dropped.
+        if returncode == -1 && !timed_out && raw_output.starts_with(SPAWN_FAIL_SENTINEL) {
             return ToolResult::Text(dumps(&json!({
                 "output": "",
                 "exit_code": -1,
-                "error": format!("Command execution failed: {}", raw_output),
+                "error": format!("Command execution failed: {}",
+                    raw_output.trim_start_matches(SPAWN_FAIL_SENTINEL)),
             })));
         }
 
@@ -786,6 +820,28 @@ impl Terminal {
             .get("notify_on_complete")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        // Finding #11 (review tools.md): watch_patterns was declared in the
+        // schema/description but never read — silently ignored. Minimal
+        // honest semantics: when non-empty AND notify_on_complete is false
+        // (documented mutual exclusion: "when both are set, watch_patterns
+        // is dropped" — with notify=true the reaper's one-shot notice
+        // already fires), a watcher waits for process exit and emits the
+        // completion notice only if any pattern appears in the captured
+        // output tail. No mid-process poller; a single notice at exit
+        // trivially satisfies the documented rate limit.
+        let watch_patterns: Vec<String> = if notify_on_complete {
+            Vec::new()
+        } else {
+            args.get("watch_patterns")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| p.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
 
         let shell = match cached_shell() {
             Some(s) => s,
@@ -870,6 +926,74 @@ impl Terminal {
             }
         }
 
+        // Finding #11: watch_patterns watcher. When the reaper records the
+        // outcome (`completed`), if any pattern appears in the captured
+        // output tail, emit the completion notice line (same delivery
+        // shape as the notify_on_complete notice). The watcher exits at
+        // process exit either way; a 10-minute safety deadline bounds the
+        // task if the session never completes.
+        if !watch_patterns.is_empty() {
+            let sid = session_id.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now()
+                    + tokio::time::Duration::from_secs(10 * 60);
+                loop {
+                    if tokio::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    enum WatchState {
+                        Running,
+                        Gone,
+                        Done(crate::tools::process_tool::ProcessOutcome),
+                    }
+                    let state = {
+                        let registry = crate::tools::process_tool::process_registry();
+                        let reg = registry.lock().unwrap_or_else(|p| p.into_inner());
+                        match reg.get(&sid) {
+                            None => WatchState::Gone, // session reaped/removed
+                            Some(s) => match &s.completed {
+                                Some(o) => WatchState::Done(o.clone()),
+                                None => WatchState::Running,
+                            },
+                        }
+                    };
+                    match state {
+                        WatchState::Gone => return,
+                        WatchState::Running => {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                        WatchState::Done(outcome) => {
+                            let combined =
+                                format!("{}\n{}", outcome.stdout_tail, outcome.stderr_tail);
+                            if watch_patterns.iter().any(|p| combined.contains(p.as_str())) {
+                                // Best-effort immediate feedback + session-
+                                // persistent delivery (same shape as the
+                                // reaper's notify_on_complete notice, so the
+                                // agent drains it at the next turn boundary).
+                                ctx.emit_progress(&format!(
+                                    "[background {} completed: watch pattern matched]\n",
+                                    sid
+                                ));
+                                ctx.push_background_completion(
+                                    crate::context::BackgroundCompletion {
+                                        session_id: sid.clone(),
+                                        exit_code: outcome.exit_code,
+                                        output_tail: outcome.stdout_tail,
+                                        elapsed_secs: outcome.elapsed_secs,
+                                    },
+                                );
+                            }
+                            // No match → no notice (the documented
+                            // "matches" semantics), and no mid-process
+                            // spam in any case: at most one notice.
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+
         ToolResult::Text(dumps(&json!({
             "output": format!("Background process started. Use process(action=\"poll\", session_id=\"{}\") to check output.", session_id),
             "exit_code": -1,
@@ -947,11 +1071,11 @@ async fn run_command_unix(
 
     let (mut reader, writer) = match os_pipe::pipe() {
         Ok(p) => p,
-        Err(e) => return (format!("Failed to execute command: {}", e), -1, false, false),
+        Err(e) => return (spawn_fail_msg(format!("Failed to execute command: {}", e)), -1, false, false),
     };
     let writer2 = match writer.try_clone() {
         Ok(w) => w,
-        Err(e) => return (format!("Failed to execute command: {}", e), -1, false, false),
+        Err(e) => return (spawn_fail_msg(format!("Failed to execute command: {}", e)), -1, false, false),
     };
 
     let mut cmd = tokio::process::Command::new(&wrapper.argv0);
@@ -960,6 +1084,12 @@ async fn run_command_unix(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(writer))
         .stderr(std::process::Stdio::from(writer2));
+    // Put the child in its OWN process group (pgid == child pid). On
+    // timeout/interrupt we kill the whole group via killpg(2) so orphaned
+    // grandchildren (e.g. `sleep 300 &` disowned by the wrapper, or
+    // daemonizing commands) don't survive the kill of the direct child.
+    // The group is new, so this can never signal the agent's own group.
+    cmd.process_group(0);
     cmd.env_clear();
     for (k, v) in sanitized_env() {
         cmd.env(k, v);
@@ -967,7 +1097,7 @@ async fn run_command_unix(
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return (format!("Failed to spawn command: {}", e), -1, false, false),
+        Err(e) => return (spawn_fail_msg(format!("Failed to spawn command: {}", e)), -1, false, false),
     };
     // Parent must drop its writer ends or the reader never sees EOF.
     drop(cmd);
@@ -1011,26 +1141,25 @@ async fn run_command_unix(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let (output, interrupted) = stream_output(Box::new(reader), ctx, deadline).await;
 
-    // On cooperative interrupt, kill the child immediately and return the
-    // partial output captured so far. The agent's post-dispatch interrupt
-    // check closes the turn; here we just stop the command promptly.
+    // On cooperative interrupt, kill the child (and its process group)
+    // immediately and return the partial output captured so far. The agent's
+    // post-dispatch interrupt check closes the turn; here we just stop the
+    // command promptly.
     if interrupted {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        kill_process_group(&mut child).await;
         return (output, 124, false, true);
     }
 
-    // Wait for the child to exit (it should already be done or about to be
+    // Wait for the child to exit (it should already be done or about to
     // since the pipe is closed after stream_output returns).
     let mut timed_out = false;
     let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
         Ok(Ok(s)) => Some(s),
         Ok(Err(_)) => None,
         Err(_) => {
-            // Child didn't exit within 5s of pipe EOF — kill it.
+            // Child didn't exit within 5s of pipe EOF — kill it (group).
             timed_out = true;
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            kill_process_group(&mut child).await;
             None
         }
     };
@@ -1157,7 +1286,7 @@ async fn run_command_windows(
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return (format!("Failed to spawn command: {}", e), -1, false, false),
+        Err(e) => return (spawn_fail_msg(format!("Failed to spawn command: {}", e)), -1, false, false),
     };
 
     let stdout = child.stdout.take();
@@ -1172,7 +1301,8 @@ async fn run_command_windows(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let (output, interrupted) = stream_output(Box::new(reader), ctx, deadline).await;
 
-    // On cooperative interrupt, kill the child immediately.
+    // On cooperative interrupt, kill the child immediately (no process
+    // groups on this platform — direct kill only).
     if interrupted {
         let _ = child.start_kill();
         let _ = child.wait().await;
@@ -1299,6 +1429,30 @@ impl ChunkSource for UnixFdReader {
             return Some(self.buf[..n].to_vec());
         }
     }
+}
+
+/// Kill the child AND its whole process group. The foreground wrapper spawns
+/// with `process_group(0)`, so the child leads group == its own pid;
+/// `killpg(pgid, SIGKILL)` reaps orphaned grandchildren too. The pgid used
+/// is exactly the child's own pid (the group it leads by construction), so
+/// the kill can never be redirected onto an unrelated group; if the child
+/// somehow left its group, killpg ESRCHs harmlessly and the direct
+/// start_kill below still reaps the child. Best-effort: errors are ignored,
+/// matching the old `start_kill`-only semantics. Unix only — the Windows
+/// runner keeps direct start_kill (no process groups on that platform).
+#[cfg(unix)]
+async fn kill_process_group(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let pgid = pid as i32;
+        // SAFETY: plain killpg(2) syscall; pgid > 0; errors ignored.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+    // Belt-and-braces: also kill the direct child (covers the child having
+    // left the group between spawn and here).
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 /// Extract the exit code from an `ExitStatus` using the same logic as the
@@ -1931,6 +2085,183 @@ mod tests {
                 Ok(Shell::Bash(_)) | Ok(Shell::PowerShell(_)) => {}
                 Err(_) => {}
             }
+        }
+    }
+
+    // ── Finding #11 (review tools.md): watch_patterns regression ─────────
+
+    /// Spawn-failure sentinel: real child output that merely STARTS with
+    /// "Failed to " (e.g. a SIGHUP-killed command's error line) must NOT be
+    /// classified as a spawn failure — the output is real and must be
+    /// preserved, and the exit code / error fields reflect an actual run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sighup_like_failed_to_output_is_not_spawn_failure() {
+        let c = ctx();
+        // The command runs, prints "Failed to ..." on stdout, then exits 1.
+        // The OLD classifier (`starts_with("Failed to ")` + returncode -1)
+        // only misfired for returncode -1; here the run itself succeeds so
+        // this pins the common path: output preserved verbatim.
+        let v = parse(
+            &Terminal
+                .execute(json!({"command": "echo 'Failed to load config'; exit 1"}), &c)
+                .await,
+        );
+        assert_eq!(v["exit_code"], 1);
+        let out = v["output"].as_str().unwrap();
+        assert!(
+            out.contains("Failed to load config"),
+            "real output starting with 'Failed to ' must be preserved: {out:?}"
+        );
+        assert_ne!(
+            v["error"], "Command execution failed: Failed to load config",
+            "must not be misclassified as a spawn failure"
+        );
+    }
+
+    /// The sentinel prefix itself: an infrastructure failure marked with
+    /// SPAWN_FAIL_SENTINEL is unwrapped into the pinned wire format
+    /// (`{"output": "", "exit_code": -1, "error": "Command execution failed: <msg>"}`),
+    /// while the sentinel never leaks into the error text.
+    #[test]
+    fn spawn_fail_sentinel_unwraps_to_pinned_envelope() {
+        let sentinel_output = spawn_fail_msg("Failed to spawn command: No such file".to_string());
+        assert!(sentinel_output.starts_with(SPAWN_FAIL_SENTINEL));
+        // The unwrap used by the classifier.
+        let unwrapped = sentinel_output.trim_start_matches(SPAWN_FAIL_SENTINEL);
+        assert_eq!(unwrapped, "Failed to spawn command: No such file");
+        // The sentinel must be distinguishable from any "Failed to " text.
+        assert_ne!(sentinel_output, "Failed to spawn command: No such file");
+    }
+
+    /// Process-group kill: a backgrounded grandchild that outlives the
+    /// direct child is reaped by the group kill. Before the fix, only the
+    /// wrapper child got start_kill() and the disowned grandchild survived
+    /// (it stayed in the inherited group but was never signalled).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_kills_orphaned_grandchildren() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let c = ctx().with_interrupt_flag(Some(flag.clone()));
+
+        // Marker file the grandchild creates if it survives the kill.
+        let marker = std::env::temp_dir().join(format!("joey-pgroup-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let marker_str = marker.to_str().unwrap().to_string();
+
+        // Wrapper (direct child) backgrounds a grandchild that sleeps 2s
+        // then touches the marker, then the wrapper itself sleeps long.
+        let cmd = format!(
+            "( sleep 2; touch {m} ) & disown -a; sleep 30",
+            m = marker_str
+        );
+
+        // Raise the interrupt ~1s in: stream_output's 100ms interrupt poll
+        // fires and run_command_unix kills the whole process group.
+        flag.store(false, Ordering::SeqCst);
+        let setter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let v = parse(&Terminal.execute(json!({"command": cmd}), &c).await);
+        let _ = setter.await;
+        assert_eq!(v["exit_code"], 124, "interrupted command reports 124: {v}");
+
+        // If the grandchild wrongly survived, it touches the marker at ~2s.
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+        assert!(
+            !marker.exists(),
+            "grandchild must be killed by the process-group kill"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// #11: watch_patterns with a matching pattern (and
+    /// notify_on_complete=false) fires exactly one completion notice at
+    /// process exit; the notice carries the session id.
+    #[cfg(unix)] // relies on a real background spawn + reaper + watcher
+    #[tokio::test]
+    async fn watch_patterns_match_fires_completion_notice() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let c = ctx().with_progress_sender(Some(tx));
+
+        let res = Terminal
+            .execute(
+                json!({
+                    "command": "echo startup_complete_marker",
+                    "background": true,
+                    "watch_patterns": ["startup_complete_marker"],
+                }),
+                &c,
+            )
+            .await;
+        let v = parse(&res);
+        let sid = v["session_id"].as_str().expect("session_id").to_string();
+
+        let notice = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match rx.recv().await {
+                    Some(msg) if msg.contains(&sid) => return msg,
+                    Some(_) => continue,
+                    None => return String::new(),
+                }
+            }
+        })
+        .await
+        .expect("no watch-pattern notice within 15s");
+        assert!(
+            notice.contains("watch pattern matched"),
+            "notice must identify the watch-pattern trigger: {notice:?}"
+        );
+    }
+
+    /// #11 negative: a pattern that never matches produces NO notice (the
+    /// watcher exits when the session completes without a match).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watch_patterns_no_match_no_notice() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let c = ctx().with_progress_sender(Some(tx));
+
+        let res = Terminal
+            .execute(
+                json!({
+                    "command": "echo ordinary_output",
+                    "background": true,
+                    "watch_patterns": ["never_appears_anywhere"],
+                }),
+                &c,
+            )
+            .await;
+        let v = parse(&res);
+        let sid = v["session_id"].as_str().expect("session_id").to_string();
+
+        // Wait for process completion first…
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let done = {
+                let reg = crate::tools::process_tool::process_registry();
+                let reg = reg.lock().unwrap_or_else(|p| p.into_inner());
+                reg.get(&sid)
+                    .map(|s| s.completed.is_some())
+                    .unwrap_or(true)
+            };
+            if done || std::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // …then confirm no notice ever references the session.
+        let later = tokio::time::timeout(Duration::from_millis(750), rx.recv()).await;
+        if let Ok(Some(msg)) = later {
+            assert!(
+                !msg.contains(&sid),
+                "no notice expected for unmatched pattern: {msg:?}"
+            );
         }
     }
 }

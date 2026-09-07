@@ -1548,6 +1548,7 @@ mod tests {
         assert_eq!(cfg.get_str("terminal.max_concurrent", ""), "auto");
     }
 
+    #[test]
     fn defaults_match_upstream() {
         let cfg = Config::defaults();
         // Local deviation: upstream ships model.default "" + provider "auto"

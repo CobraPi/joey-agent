@@ -107,6 +107,12 @@ pub struct ProcessSession {
     pub reaper_handle: Option<JoinHandle<()>>,
     /// Set by the reaper when the child exits; read by poll/wait/list.
     pub completed: Option<ProcessOutcome>,
+    /// When the session completed (set together with `completed`). Used by
+    /// the eviction policy: oldest-COMPLETED sessions are reaped first, NOT
+    /// oldest-started — a long-running session that just finished must not
+    /// be the first evicted (it would lose its output/notice to a dozen
+    /// stale short-lived corpses that happen to have started later).
+    pub completed_at: Option<Instant>,
     /// Ensures the completion event fires exactly once.
     pub completion_notified: bool,
 }
@@ -125,6 +131,7 @@ impl ProcessSession {
             last_poll_pos: 0,
             reaper_handle: None,
             completed: None,
+            completed_at: None,
             completion_notified: false,
         }
     }
@@ -179,18 +186,26 @@ pub fn reap_completed_sessions() {
     let registry = process_registry();
     let mut reg = registry.lock().unwrap_or_else(|p| p.into_inner());
 
-    // Collect (session_id, elapsed_secs) for completed sessions, oldest first.
-    let mut completed: Vec<(String, f64)> = reg
+    // Collect (session_id, completion timestamp) for completed sessions.
+    // Order by COMPLETION time, not start time: a long-running session that
+    // JUST finished must be the LAST evicted, not the first — the old
+    // started_at-elapsed ordering evicted it first (highest elapsed) and
+    // destroyed its just-recorded output/completion notice while dozens of
+    // stale short-lived corpses (started later, completed earlier) survived.
+    // Fallback to started_at for entries completed before the
+    // completed_at field existed (defensive; can't normally happen).
+    let mut completed: Vec<(String, Instant)> = reg
         .iter()
         .filter(|(_, s)| s.completed.is_some())
-        .map(|(id, s)| (id.clone(), s.started_at.elapsed().as_secs_f64()))
+        .map(|(id, s)| (id.clone(), s.completed_at.unwrap_or(s.started_at)))
         .collect();
     if completed.len() <= MAX_COMPLETED_SESSIONS {
         return;
     }
 
-    // Oldest (highest elapsed_secs) get reaped first.
-    completed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Oldest-completed (smallest Instant) get reaped first — ascending order,
+    // evicting from the front, mirroring the old descending-elapsed sort.
+    completed.sort_by(|a, b| a.1.cmp(&b.1));
     let to_reap = completed.len().saturating_sub(MAX_COMPLETED_SESSIONS);
     for (id, _) in completed.into_iter().take(to_reap) {
         // Abort any lingering reaper handle before dropping the session.
@@ -310,6 +325,7 @@ async fn finalize_session(session_id: &str, ctx: &ToolContext) {
             return; // session removed (killed/closed) — nothing to record.
         };
         session.completed = Some(outcome.clone());
+        session.completed_at = Some(Instant::now());
         if session.notify_on_complete && !session.completion_notified {
             session.completion_notified = true;
             Some(format!(
@@ -780,5 +796,103 @@ mod tests {
             let reg = registry.lock().unwrap();
             assert!(reg.is_empty(), "registry should be empty after reap on empty");
         }
+    }
+
+    /// Regression: eviction must order by COMPLETION time, not start time.
+    /// A long-running session that JUST completed must survive while an
+    /// older-COMPLETED short session (started later) is evicted first —
+    /// the old started_at-elapsed ordering evicted the just-finished
+    /// long-runner first and destroyed its output/notice.
+    ///
+    /// Spawns real (already-exited) children so `ProcessSession` can be
+    /// constructed, then fakes distinct started_at/completed_at orderings.
+    #[tokio::test]
+    async fn reap_evicts_by_completion_time_not_start_time() {
+        let registry = process_registry();
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.clear();
+        }
+
+        // Make a real dead child (exits immediately) for each session.
+        async fn dead_child() -> Child {
+            let mut c = tokio::process::Command::new("sleep")
+                .arg("0")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn sleep 0");
+            let _ = c.wait().await;
+            c
+        }
+
+        let mut reg = registry.lock().unwrap();
+        // Age helper: checked_sub avoids a panic on a just-booted machine
+        // whose monotonic clock is younger than the offset.
+        let aged = |secs: u64| Instant::now().checked_sub(Duration::from_secs(secs)).unwrap_or_else(Instant::now);
+        // Fill MAX_COMPLETED_SESSIONS stale corpses: started later,
+        // completed EARLIER (long ago).
+        for i in 0..MAX_COMPLETED_SESSIONS {
+            let mut s = ProcessSession::new(
+                format!("stale-{i}"),
+                dead_child().await,
+                "true".into(),
+                "/tmp".into(),
+            );
+            s.started_at = aged(100);
+            s.completed = Some(ProcessOutcome {
+                exit_code: 0,
+                stdout_tail: "stale".into(),
+                stderr_tail: String::new(),
+                truncated: false,
+                elapsed_secs: 0.0,
+            });
+            s.completed_at = Some(aged(90));
+            reg.insert(format!("stale-{i}"), s);
+        }
+        // The long-runner: started MUCH earlier (oldest by start), but
+        // completed JUST NOW.
+        let mut long_runner = ProcessSession::new(
+            "long-runner".into(),
+            dead_child().await,
+            "long".into(),
+            "/tmp".into(),
+        );
+        long_runner.started_at = aged(1000);
+        long_runner.completed = Some(ProcessOutcome {
+            exit_code: 0,
+            stdout_tail: "precious output".into(),
+            stderr_tail: String::new(),
+            truncated: false,
+            elapsed_secs: 1000.0,
+        });
+        long_runner.completed_at = Some(Instant::now());
+        reg.insert("long-runner".into(), long_runner);
+
+        // Now MAX_COMPLETED_SESSIONS + 1 completed → exactly 1 eviction.
+        drop(reg);
+        reap_completed_sessions();
+
+        let reg = registry.lock().unwrap();
+        assert!(
+            reg.contains_key("long-runner"),
+            "just-completed long-runner must survive eviction"
+        );
+        assert_eq!(
+            reg.len(),
+            MAX_COMPLETED_SESSIONS,
+            "registry must be capped at MAX_COMPLETED_SESSIONS"
+        );
+        // All survivors except the long-runner are stale corpses.
+        let stale_count = reg
+            .keys()
+            .filter(|k| k.starts_with("stale-"))
+            .count();
+        assert_eq!(stale_count, MAX_COMPLETED_SESSIONS - 1);
+        drop(reg);
+
+        // Cleanup for other tests sharing the global registry.
+        registry.lock().unwrap().clear();
     }
 }

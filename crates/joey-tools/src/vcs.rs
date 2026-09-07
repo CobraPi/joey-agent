@@ -400,9 +400,23 @@ impl CheckpointManager {
         ref_name(&self.hash16)
     }
 
+    /// Whether this project's ref exists in the shared store.
+    ///
+    /// Must distinguish "ref absent" from "git call failed": the probe
+    /// allows BOTH exit 0 (ref resolved — stdout carries the oid) and
+    /// exit 1 (`rev-parse --verify --quiet` reports a missing ref with
+    /// empty stdout), while spawn errors, timeouts, and any other exit
+    /// code propagate as `Err`. The previous `run_git_bool`-based
+    /// implementation folded every failure into `Ok(false)`, so a
+    /// transient git failure made `checkpoint_internal` guess
+    /// `is_initial = true` and build a parentless commit — orphaning all
+    /// prior history once `update-ref` moved the ref (review finding #9).
     fn ref_exists(&self) -> Result<bool> {
-        let ok = self.run_git_bool(&["rev-parse", "--verify", "--quiet", &self.ref_name()]);
-        Ok(ok)
+        let resolved = self.run_git_capture(
+            &["rev-parse", "--verify", "--quiet", &self.ref_name()],
+            &[0, 1],
+        )?;
+        Ok(!resolved.is_empty())
     }
 
     /// Enforce FR-007's max single tracked file size cap: unstage (but
@@ -469,7 +483,15 @@ impl CheckpointManager {
 
     /// List all checkpoints (newest first).
     pub fn list(&self) -> Result<Vec<Checkpoint>> {
-        if !self.enabled || !self.ref_exists().unwrap_or(false) {
+        // The disabled fast-path stays silent, but a *transient* git
+        // failure while probing the ref must surface as `Err` — the old
+        // `unwrap_or(false)` swallowed it and returned an empty list, so
+        // `revert` then failed with a bogus "checkpoint not found"
+        // (review finding #10).
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        if !self.ref_exists()? {
             return Ok(Vec::new());
         }
         self.list_internal()
@@ -876,14 +898,6 @@ impl CheckpointManager {
         cmd.args(args);
         cmd.current_dir(&self.work_tree);
         run_with_timeout(cmd, git_timeout(), allowed.unwrap_or(&[0])).ok()
-    }
-
-    fn run_git_bool(&self, args: &[&str]) -> bool {
-        let mut cmd = Command::new("git");
-        self.git_env(&mut cmd);
-        cmd.args(args);
-        cmd.current_dir(&self.work_tree);
-        run_with_timeout(cmd, git_timeout(), &[0]).is_ok()
     }
 }
 
@@ -1538,6 +1552,122 @@ mod tests {
             elapsed < Duration::from_secs(4),
             "should not hang beyond the 400ms test timeout + overhead, took {:?}",
             elapsed
+        );
+    }
+
+    /// Create a fake `git` shim (to be prepended to PATH) that fails
+    /// every `rev-parse` invocation with exit code 3 — simulating a
+    /// transient ref-probe failure — while delegating all other
+    /// subcommands to the real git binary. Must be created BEFORE PATH
+    /// is modified (it bakes in the real git's absolute path).
+    fn revparse_broken_git_shim() -> tempfile::TempDir {
+        let real_git = which::which("git").expect("git required");
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("git");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"rev-parse\" ]; then\n    exit 3\n  fi\ndone\nexec \"{}\" \"$@\"\n",
+                real_git.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim, perms).unwrap();
+        }
+        dir
+    }
+
+    /// Regression (review finding #9): a transient failure of the
+    /// `rev-parse --verify` ref probe must NOT be read as "ref absent".
+    /// The old `run_git_bool` probe folded every failure (timeout, spawn
+    /// error, unexpected exit code) into `Ok(false)`, so
+    /// `checkpoint_internal` concluded `is_initial = true` and committed
+    /// a parentless `commit-tree` — orphaning all prior history once
+    /// `update-ref` moved the ref. The probe now allows only exit 0/1
+    /// (present/absent) and propagates anything else, so the checkpoint
+    /// fails cleanly (`None`) and the ref is left untouched.
+    #[test]
+    fn transient_ref_probe_failure_preserves_history() {
+        let _lock = crate::test_env_lock();
+        if !git_available() {
+            return;
+        }
+        let (_home, dir, _guard) = test_setup();
+        let work_tree = dir.path();
+        std::fs::write(work_tree.join("a.txt"), "v1").unwrap();
+
+        let mut mgr = CheckpointManager::new("refprobe-test", work_tree);
+        assert_eq!(mgr.checkpoint("first").unwrap(), 1);
+        let tip_before = mgr
+            .run_git_capture(&["rev-parse", &mgr.ref_name()], &[0])
+            .unwrap();
+
+        let shim_dir = revparse_broken_git_shim();
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", shim_dir.path().display(), orig_path),
+        );
+
+        // New content would otherwise justify checkpoint #2 — with the
+        // old bug this succeeded and orphaned checkpoint #1's chain.
+        std::fs::write(work_tree.join("b.txt"), "v2").unwrap();
+        let result = mgr.checkpoint("should fail cleanly");
+
+        std::env::set_var("PATH", &orig_path);
+
+        assert_eq!(
+            result, None,
+            "checkpoint must fail, not guess is_initial on a transient probe failure"
+        );
+        let tip_after = mgr
+            .run_git_capture(&["rev-parse", &mgr.ref_name()], &[0])
+            .unwrap();
+        assert_eq!(
+            tip_before, tip_after,
+            "ref must NOT move when the probe fails (history preserved)"
+        );
+        // History is intact and still reachable.
+        assert_eq!(mgr.list().unwrap().len(), 1);
+    }
+
+    /// Regression (review finding #10): `list()` must surface a transient
+    /// ref-probe failure as `Err` instead of silently returning an empty
+    /// list — the old `unwrap_or(false)` made `revert` subsequently fail
+    /// with a bogus "checkpoint not found".
+    #[test]
+    fn list_transient_failure_returns_err() {
+        let _lock = crate::test_env_lock();
+        if !git_available() {
+            return;
+        }
+        let (_home, dir, _guard) = test_setup();
+        let work_tree = dir.path();
+        std::fs::write(work_tree.join("a.txt"), "x").unwrap();
+
+        let mut mgr = CheckpointManager::new("list-err-test", work_tree);
+        mgr.checkpoint("first").unwrap();
+
+        let shim_dir = revparse_broken_git_shim();
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", shim_dir.path().display(), orig_path),
+        );
+
+        let listed = mgr.list();
+
+        std::env::set_var("PATH", &orig_path);
+
+        assert!(
+            listed.is_err(),
+            "list() must propagate a transient git failure as Err, got {:?}",
+            listed
         );
     }
 

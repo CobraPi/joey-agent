@@ -280,8 +280,8 @@ impl TaskGraph {
     /// 1. no dependency cycles (`rules::CYCLE`),
     /// 2. every dependency references an existing id (`rules::UNKNOWN_DEP`),
     /// 3. no two concurrently-dispatchable tasks share a write-set path
-    ///    (`rules::WRITE_OVERLAP`) — ancestor-related pairs are sequenced and
-    ///    therefore legal,
+    ///    (`rules::WRITE_OVERLAP`) — ancestor-related pairs are sequenced
+    ///    and therefore legal,
     /// 4. all read/write paths are relative, normalized, and inside the
     ///    project root (`rules::PATH_ESCAPE`),
     /// 5. every task has at least one acceptance criterion
@@ -316,7 +316,10 @@ impl TaskGraph {
             }
         }
 
-        // (3) no two concurrently-dispatchable tasks share a write-set path.
+        // (3) no two concurrently-dispatchable tasks share a write-set
+        // path. Empty write sets are undeclared — the scheduler's
+        // ConflictAnalyzer sequences them at dispatch, so they are not
+        // enforced here at validation.
         let ids: Vec<&TaskId> = self.nodes.keys().collect();
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
@@ -1125,6 +1128,48 @@ mod tests {
         assert_eq!(g.validate(), Ok(()));
     }
 
+    /// Restored contract: empty write sets are undeclared — the
+    /// scheduler's ConflictAnalyzer sequences them at dispatch — so an
+    /// empty×empty pair VALIDATES; only a shared concrete write path is
+    /// rejected (see `validate_rejects_concurrent_write_overlap`).
+    #[test]
+    fn validate_allows_concurrent_empty_write_sets() {
+        // Two independent tasks, both with empty (undeclared) write
+        // sets, are legal at validate level: undeclared writers are
+        // sequenced by the scheduler's ConflictAnalyzer at dispatch.
+        let g = graph(vec![node("task-a", &[]), node("task-b", &[])]);
+        assert_eq!(g.validate(), Ok(()), "empty×empty pair is legal");
+
+        // A dependency edge between them also stays legal …
+        let g = graph(vec![
+            node("task-a", &[]),
+            node("task-b", &["task-a"]),
+        ]);
+        assert_eq!(g.validate(), Ok(()), "sequenced empty writers are legal");
+
+        // … and a single task with an empty write set remains valid.
+        let g = graph(vec![node("solo", &[])]);
+        assert_eq!(g.validate(), Ok(()), "a lone undeclared writer is legal");
+
+        // … and one declared + one undeclared writer stays legal (the
+        // declared path cannot overlap an unknown set) …
+        let mut a = node("task-a", &[]);
+        a.write_set = vec![PathBuf::from("src/a.rs")];
+        let g = graph(vec![a, node("task-b", &[])]);
+        assert_eq!(g.validate(), Ok(()), "declared+undeclared pair is legal");
+
+        // … while a SHARED concrete write path is still rejected.
+        let mut a = node("task-a", &[]);
+        a.write_set = vec![PathBuf::from("src/main.rs")];
+        let mut b = node("task-b", &[]);
+        b.write_set = vec![PathBuf::from("src/main.rs")];
+        let g = graph(vec![a, b]);
+        let errs = g.validate().unwrap_err();
+        let overlap = rule_errors(&errs, rules::WRITE_OVERLAP);
+        assert_eq!(overlap.len(), 1, "exactly one WRITE_OVERLAP: {:?}", errs);
+        assert_eq!(overlap[0].task_ids, vec!["task-a", "task-b"]);
+    }
+
     #[test]
     fn validate_rejects_path_escape() {
         // ParentDir component in write_set.
@@ -1671,6 +1716,9 @@ mod tests {
             assert_eq!(node.status, TaskStatus::Pending);
             assert_eq!(node.attempts, 0);
         }
+        // Empty write sets are undeclared; the scheduler's
+        // ConflictAnalyzer sequences them at dispatch, so the converted
+        // graph (three unrelated empty-write-set tasks) validates.
         assert_eq!(g.validate(), Ok(()));
     }
 
@@ -1685,7 +1733,10 @@ mod tests {
         let g = TaskGraph::from_workstreams(&legacy, "rev");
         let keys: Vec<&str> = g.nodes.keys().map(|k| k.as_str()).collect();
         assert_eq!(keys, vec!["workstream-", "workstream-a-7", "workstream-b-2-s"]);
-        assert_eq!(g.validate(), Ok(()), "sanitized ids always validate");
+        // Sanitization still always succeeds; empty write sets are
+        // undeclared (sequenced at dispatch, not enforced at validation),
+        // so the converted graph validates.
+        assert_eq!(g.validate(), Ok(()));
     }
 
     #[test]

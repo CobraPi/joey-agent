@@ -10,30 +10,27 @@
 /// Commands that are safe to auto-approve (read-only, no side effects).
 /// Matched as a prefix: the command must start with one of these followed
 /// by a space, hyphen, or end-of-string.
+///
+/// Wrapper/prefix commands (env, nice, nohup, set, time, timeout, unset)
+/// are deliberately excluded: they approve whatever arbitrary inner
+/// command follows them (e.g. `env rm -rf /`).
 const SAFE_COMMANDS: &[&str] = &[
     "cal",
     "date",
     "df",
     "du",
     "echo",
-    "env",
     "free",
     "groups",
     "hostname",
     "id",
     "ls",
-    "nice",
-    "nohup",
     "printenv",
     "ps",
     "pwd",
-    "set",
-    "time",
-    "timeout",
     "top",
     "type",
     "uname",
-    "unset",
     "uptime",
     "whatis",
     "whereis",
@@ -62,10 +59,34 @@ const SAFE_GIT_SUBCOMMANDS: &[&str] = &[
     "git tag",
 ];
 
-/// Metacharacters that indicate command chaining — their presence
-/// disqualifies auto-approval (the command could pipe into something
-/// dangerous).
-const CHAINING_METACHARACTERS: &[&str] = &[";", "|", "&&", "$(", "`"];
+/// Metacharacters that indicate command chaining or redirection — their
+/// presence disqualifies auto-approval (the command could pipe into
+/// something dangerous, or redirect output into a sensitive file).
+const CHAINING_METACHARACTERS: &[&str] =
+    &[";", "|", "&&", "$(", "`", ">", "<", ">>", "&", "\n"];
+
+/// Per-subcommand denylist of flags that make an otherwise read-only git
+/// subcommand mutate state (delete branches/tags, edit messages, write
+/// files, run external diff tools, …). After a SAFE_GIT_SUBCOMMANDS
+/// prefix matches, any token in the remainder that matches a denylisted
+/// flag disqualifies auto-approval.
+fn git_flag_denylist(subcommand: &str) -> Option<&'static [&'static str]> {
+    match subcommand {
+        "git branch" => Some(&["-d", "-D", "-m", "--edit", "-e", "--force", "-f"]),
+        "git tag" => Some(&["-d", "-D", "-f", "-s", "-u", "--force", "--delete"]),
+        "git diff" => Some(&["--output", "--ext-diff", "--no-index"]),
+        _ => None,
+    }
+}
+
+/// Check if a token matches a denylisted flag. Matches both the bare
+/// flag (`--output`) and the `=`-attached value form (`--output=file`).
+fn token_matches_flag(token: &str, flag: &str) -> bool {
+    token == flag
+        || token
+            .strip_prefix(flag)
+            .is_some_and(|rest| rest.starts_with('='))
+}
 
 /// Check if a command contains chaining metacharacters.
 /// If so, it cannot be auto-approved regardless of the base command.
@@ -108,9 +129,33 @@ pub fn is_safe_read_only_command(command: &str) -> bool {
     for safe_git in SAFE_GIT_SUBCOMMANDS {
         if let Some(rest) = cmd_lower.strip_prefix(safe_git) {
             // Must be followed by space, hyphen, or end-of-string.
-            if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('-') {
-                return true;
+            if !(rest.is_empty() || rest.starts_with(' ') || rest.starts_with('-')) {
+                continue;
             }
+            // `git remote` is only safe in its bare listing forms: any
+            // mutating subcommand (add/remove/rename/set-url/…) must be
+            // rejected. Safe usage: `git remote`, `git remote -v`,
+            // `git remote show <name>`.
+            if *safe_git == "git remote" {
+                let tokens: Vec<&str> = rest.split_whitespace().collect();
+                let is_bare_or_verbose = tokens.is_empty()
+                    || tokens == ["-v"]
+                    || tokens == ["--verbose"]
+                    || (tokens.first() == Some(&"show") && tokens.len() == 2);
+                if !is_bare_or_verbose {
+                    return false;
+                }
+            }
+            // Reject denylisted destructive flags for this subcommand.
+            if let Some(denied) = git_flag_denylist(safe_git) {
+                let has_denied_flag = rest
+                    .split_whitespace()
+                    .any(|token| denied.iter().any(|flag| token_matches_flag(token, flag)));
+                if has_denied_flag {
+                    return false;
+                }
+            }
+            return true;
         }
     }
 
@@ -240,5 +285,62 @@ mod tests {
     fn test_case_insensitive() {
         assert!(is_safe_read_only_command("LS"));
         assert!(is_safe_read_only_command("Git Status"));
+    }
+
+    #[test]
+    fn test_wrapper_prefixes_not_safe() {
+        // Finding #1: wrapper prefixes must not auto-approve inner commands.
+        assert!(!is_safe_read_only_command("env rm -rf /"));
+        assert!(!is_safe_read_only_command("nice rm -rf /"));
+        assert!(!is_safe_read_only_command("nohup rm -rf /"));
+        assert!(!is_safe_read_only_command("timeout 10 rm -rf /"));
+        assert!(!is_safe_read_only_command("time rm -rf /"));
+        assert!(!is_safe_read_only_command("set VAR=1"));
+        assert!(!is_safe_read_only_command("unset PATH"));
+        assert!(!is_safe_read_only_command("env"));
+    }
+
+    #[test]
+    fn test_redirection_not_safe() {
+        // Finding #2: redirection must not bypass approval.
+        assert!(!is_safe_read_only_command("echo x > file"));
+        assert!(!is_safe_read_only_command("echo pwned > ~/.ssh/authorized_keys"));
+        assert!(!is_safe_read_only_command("cat < file"));
+        assert!(!is_safe_read_only_command("echo x >> file"));
+        assert!(!is_safe_read_only_command("ls & bg"));
+        assert!(!is_safe_read_only_command("ls\nrm -rf /"));
+    }
+
+    #[test]
+    fn test_git_destructive_flags_not_safe() {
+        // Finding #3: destructive git flag suffixes must be rejected.
+        assert!(!is_safe_read_only_command("git branch -d main"));
+        assert!(!is_safe_read_only_command("git branch -D main"));
+        assert!(!is_safe_read_only_command("git branch -m new-name"));
+        assert!(!is_safe_read_only_command("git tag -f v1"));
+        assert!(!is_safe_read_only_command("git tag -d v1"));
+        assert!(!is_safe_read_only_command("git tag --delete v1"));
+        assert!(!is_safe_read_only_command("git diff --output=/tmp/x HEAD~"));
+        assert!(!is_safe_read_only_command("git diff --output f HEAD~1"));
+        assert!(!is_safe_read_only_command("git diff --ext-diff HEAD~1"));
+        assert!(!is_safe_read_only_command("git diff --no-index a b"));
+        assert!(!is_safe_read_only_command("git remote add x https://y"));
+        assert!(!is_safe_read_only_command("git remote remove origin"));
+        assert!(!is_safe_read_only_command("git remote rename a b"));
+        assert!(!is_safe_read_only_command("git remote set-url origin https://y"));
+    }
+
+    #[test]
+    fn test_still_safe_after_hardening() {
+        // Previously-safe read-only usage must remain auto-approved.
+        assert!(is_safe_read_only_command("ls -la"));
+        assert!(is_safe_read_only_command("git status"));
+        assert!(is_safe_read_only_command("git diff HEAD~1"));
+        assert!(is_safe_read_only_command("git branch -a"));
+        assert!(is_safe_read_only_command("git remote"));
+        assert!(is_safe_read_only_command("git remote -v"));
+        assert!(is_safe_read_only_command("git remote show origin"));
+        assert!(is_safe_read_only_command("git config --get user.name"));
+        assert!(is_safe_read_only_command("git config --list"));
     }
 }

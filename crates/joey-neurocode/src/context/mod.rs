@@ -579,6 +579,10 @@ impl<'a> ContextAssembler<'a> {
     ) -> ExpansionOutcome {
         let mut expanded: Vec<ExpandedNode> = Vec::new();
         let mut visited: HashSet<NodeId> = primary.iter().map(|n| n.id).collect();
+        // Nodes found but excluded because the expanded-node budget was
+        // full — counted across the Pega pre-seeding below AND the
+        // best-first frontier loop.
+        let mut dropped_for_budget: usize = 0;
 
         // Pega rule-reference expansion from primary nodes' metadata (T059).
         for n in primary {
@@ -586,24 +590,32 @@ impl<'a> ContextAssembler<'a> {
                 for reference in &meta.references_rules {
                     if let Some(node) = self.find_rule_by_reference(reference) {
                         if visited.insert(node.id) {
-                            expanded.push(ExpandedNode {
-                                node,
-                                reason: ExpansionReason::ReferencesRule,
-                                via: Some(n.id),
-                                depth: 1,
-                            });
+                            if expanded.len() >= budget.max_expanded_nodes {
+                                dropped_for_budget += 1;
+                            } else {
+                                expanded.push(ExpandedNode {
+                                    node,
+                                    reason: ExpansionReason::ReferencesRule,
+                                    via: Some(n.id),
+                                    depth: 1,
+                                });
+                            }
                         }
                     }
                 }
                 if let Some(parent) = &meta.inherits_from {
                     if let Some(node) = self.find_rule_by_reference(parent) {
                         if visited.insert(node.id) {
-                            expanded.push(ExpandedNode {
-                                node,
-                                reason: ExpansionReason::InheritsRule,
-                                via: Some(n.id),
-                                depth: 1,
-                            });
+                            if expanded.len() >= budget.max_expanded_nodes {
+                                dropped_for_budget += 1;
+                            } else {
+                                expanded.push(ExpandedNode {
+                                    node,
+                                    reason: ExpansionReason::InheritsRule,
+                                    via: Some(n.id),
+                                    depth: 1,
+                                });
+                            }
                         }
                     }
                 }
@@ -662,7 +674,6 @@ impl<'a> ContextAssembler<'a> {
             seed(n, &mut order, &mut frontier);
         }
 
-        let mut dropped_for_budget: usize = 0;
         // Defensive traversal cap: hub nodes (big classes, widely-injected
         // utilities) can seed hundreds of frontier entries; every pop costs
         // a store lookup. The render budget is ≤ 24 nodes, so a cap of 12×
@@ -754,6 +765,10 @@ impl<'a> ContextAssembler<'a> {
                     }
                 }
                 for (pnode, reason) in pega_followups {
+                    if expanded.len() >= budget.max_expanded_nodes {
+                        dropped_for_budget += 1;
+                        continue;
+                    }
                     expanded.push(ExpandedNode {
                         node: pnode,
                         reason,

@@ -254,10 +254,16 @@ struct ContextInner {
 
 impl ToolContext {
     pub fn new(cwd: PathBuf, config: Config, session_id: impl Into<String>) -> Self {
-        let turn_budget_chars = config.get_i64(
-            "tool_output.turn_budget_chars",
-            crate::storage::DEFAULT_TURN_BUDGET_CHARS as i64,
-        ) as usize;
+        let turn_budget_chars = {
+            let raw = config.get_i64(
+                "tool_output.turn_budget_chars",
+                crate::storage::DEFAULT_TURN_BUDGET_CHARS as i64,
+            );
+            // Mirror truncate::positive(): a non-positive value falls back to
+            // the documented default instead of wrapping a negative i64 into
+            // a huge usize (which would make the budget effectively infinite).
+            if raw > 0 { raw as usize } else { crate::storage::DEFAULT_TURN_BUDGET_CHARS }
+        };
         Self {
             inner: Arc::new(ContextInner {
                 cwd,

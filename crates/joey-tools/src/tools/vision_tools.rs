@@ -15,18 +15,61 @@ use serde_json::{json, Value};
 use crate::context::ToolContext;
 use crate::registry::{Tool, ToolResult};
 
-/// MIME sniffing by extension (lean: no `infer`/`mime_guess` dependency).
-fn mime_for(path: &str) -> &'static str {
+/// MIME sniffing (lean: no `infer`/`mime_guess` dependency). Extension first;
+/// unknown/missing extensions fall back to magic-byte sniffing so a .bmp or
+/// binary blob is never mislabeled as image/jpeg on its way to the provider.
+fn mime_for(path: &str) -> Result<&'static str, String> {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".png") {
-        "image/png"
+        return Ok("image/png");
     } else if lower.ends_with(".gif") {
-        "image/gif"
+        return Ok("image/gif");
     } else if lower.ends_with(".webp") {
-        "image/webp"
-    } else {
-        "image/jpeg"
+        return Ok("image/webp");
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        return Ok("image/jpeg");
+    } else if lower.ends_with(".bmp") {
+        return Ok("image/bmp");
+    } else if lower.ends_with(".tiff") || lower.ends_with(".tif") {
+        return Ok("image/tiff");
+    } else if lower.ends_with(".avif") {
+        return Ok("image/avif");
+    } else if lower.ends_with(".heic") {
+        return Ok("image/heic");
     }
+    // Unknown extension: sniff magic bytes.
+    match sniff_magic(path)? {
+        Some(mime) => Ok(mime),
+        None => Err(format!(
+            "cannot determine image type of '{path}': unknown extension and unrecognized magic bytes"
+        )),
+    }
+}
+
+/// Magic-byte sniffing for common image formats.
+fn sniff_magic(path: &str) -> Result<Option<&'static str>, String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("cannot read image '{path}': {e}"))?;
+    let mut buf = [0u8; 12];
+    let n = f
+        .read(&mut buf)
+        .map_err(|e| format!("cannot read image '{path}': {e}"))?;
+    let b = &buf[..n];
+    Ok(if b.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if b.starts_with(b"BM") {
+        Some("image/bmp")
+    } else if b.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || b.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
+        Some("image/tiff")
+    } else {
+        None
+    })
 }
 
 /// Read the image and return a data-URL content part for the model.
@@ -36,9 +79,10 @@ fn image_part(path: &str) -> Result<Value, String> {
         return Err("image exceeds 15 MB limit".into());
     }
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let mime = mime_for(path)?;
     Ok(json!({
         "type": "image_url",
-        "image_url": { "url": format!("data:{};base64,{}", mime_for(path), b64) }
+        "image_url": { "url": format!("data:{};base64,{}", mime, b64) }
     }))
 }
 
@@ -154,11 +198,40 @@ mod tests {
 
     #[test]
     fn mime_sniffing() {
-        assert_eq!(mime_for("/tmp/shot.PNG"), "image/png");
-        assert_eq!(mime_for("a.jpg"), "image/jpeg");
-        assert_eq!(mime_for("a.webp"), "image/webp");
-        assert_eq!(mime_for("a.gif"), "image/gif");
-        assert_eq!(mime_for("noext"), "image/jpeg");
+        assert_eq!(mime_for("/tmp/shot.PNG").unwrap(), "image/png");
+        assert_eq!(mime_for("a.jpg").unwrap(), "image/jpeg");
+        assert_eq!(mime_for("a.jpeg").unwrap(), "image/jpeg");
+        assert_eq!(mime_for("a.webp").unwrap(), "image/webp");
+        assert_eq!(mime_for("a.gif").unwrap(), "image/gif");
+        assert_eq!(mime_for("a.bmp").unwrap(), "image/bmp");
+        assert_eq!(mime_for("a.tiff").unwrap(), "image/tiff");
+        assert_eq!(mime_for("a.tif").unwrap(), "image/tiff");
+        assert_eq!(mime_for("a.avif").unwrap(), "image/avif");
+        assert_eq!(mime_for("a.heic").unwrap(), "image/heic");
+        // Unknown extension with no file: errors instead of mislabeling.
+        assert!(mime_for("noext").is_err());
+    }
+
+    #[test]
+    fn magic_byte_sniffing_fills_unknown_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        // PNG magic under an extensionless filename.
+        let p = dir.path().join("screenshot");
+        std::fs::write(&p, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        assert_eq!(mime_for(p.to_str().unwrap()).unwrap(), "image/png");
+        // JPEG magic.
+        let j = dir.path().join("photo");
+        std::fs::write(&j, [0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
+        assert_eq!(mime_for(j.to_str().unwrap()).unwrap(), "image/jpeg");
+        // BMP magic.
+        let b = dir.path().join("bitmap");
+        std::fs::write(&b, b"BM\x00\x00").unwrap();
+        assert_eq!(mime_for(b.to_str().unwrap()).unwrap(), "image/bmp");
+        // Unrecognized bytes: error, not a jpeg label.
+        let u = dir.path().join("mystery");
+        std::fs::write(&u, b"not an image at all").unwrap();
+        let err = mime_for(u.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("cannot determine image type"), "{err}");
     }
 
     #[tokio::test]

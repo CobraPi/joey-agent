@@ -712,11 +712,12 @@ pub fn resolve(
     let (profile, _unknown_model_name) = profile_or_default(&cfg.model)?;
     let decision = resolve_kind(cfg.backend, profile.name, &cfg.model_dir)?;
 
-    // T032: where consent.json lives for this project. The store's own
-    // path is not exposed; the per-project db path of the process CWD is
-    // the same location pipelines open their store at (and
-    // ConsentRecord::load treats a missing dir as absent anyway).
-    let consent_dir = consent_dir_from_cwd();
+    // T032: where consent.json lives for this project — derived from the
+    // STORE'S db path when one is passed (the project actually being
+    // served), falling back to the CWD-derived per-project path. Deriving
+    // from the process CWD alone read the WRONG project's consent record
+    // whenever the store was opened for a different root.
+    let consent_dir = consent_dir_for(store);
 
     match decision.kind {
         BackendKind::KeywordOnly => Ok((decision, None)),
@@ -764,6 +765,30 @@ pub fn resolve(
             Ok((decision, Some(backend)))
         }
     }
+}
+
+/// The consent directory for this resolution: when a store is passed,
+/// the directory holding THAT store's `graph.db` (via SQLite's own
+/// `PRAGMA database_list` — the store does not expose its path), so the
+/// gate reads the consent record of the project actually being served,
+/// not whatever directory the process happens to run from. Falls back
+/// to the CWD-derived per-project path when no store is given (or the
+/// store is in-memory, where no consent record can live anyway).
+fn consent_dir_for(store: Option<&GraphStore>) -> Option<PathBuf> {
+    if let Some(store) = store {
+        let path: Option<String> = store
+            .conn()
+            .query_row("SELECT file FROM pragma_database_list WHERE seq = 0", [], |r| {
+                r.get(0)
+            })
+            .ok();
+        if let Some(file) = path {
+            if !file.is_empty() {
+                return Path::new(&file).parent().map(|p| p.to_path_buf());
+            }
+        }
+    }
+    consent_dir_from_cwd()
 }
 
 /// The consent directory for the current process: parent of the
@@ -1186,6 +1211,31 @@ mod tests {
         ] {
             assert!(!base_url_is_loopback(url), "{url} must NOT be loopback");
         }
+    }
+
+    /// The consent directory follows the STORE'S db path (the project
+    /// actually being served), not the process CWD — resolving for a
+    /// store opened under another root must read THAT project's
+    /// consent.json, never whatever directory the process runs from.
+    #[test]
+    fn consent_dir_derives_from_store_path_not_process_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = GraphStore::open(&project.join("graph.db")).unwrap();
+        // SQLite reports the db path with symlinks resolved (macOS temp
+        // dirs live under /private/var) — canonicalize the expectation.
+        let canonical = std::fs::canonicalize(&project).unwrap();
+        assert_eq!(
+            consent_dir_for(Some(&store)),
+            Some(canonical),
+            "the gate must read the served project's consent record"
+        );
+        // No store → the CWD-derived fallback, which is a DIFFERENT
+        // directory than the served project's (tempdir ≠ cwd-derived).
+        let fallback = consent_dir_for(None);
+        assert_ne!(fallback, Some(project), "fallback must not mirror the store dir");
+        assert_eq!(fallback, consent_dir_from_cwd());
     }
 
     /// Edge case 6 (first half): unconsented NON-loopback remote refuses

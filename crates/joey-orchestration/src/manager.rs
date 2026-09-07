@@ -287,6 +287,54 @@ impl ChildRegistry {
     }
 }
 
+/// RAII owner for the per-child control bridge task (#1 review finding).
+///
+/// The bridge loop polls the child's interrupt flag / steer slot every 50 ms
+/// forever — there is no condition under which it ends on its own. Without
+/// this guard, any early exit from `dispatch_single_with_overrides` (a panic
+/// in `run_with_tap` unwinding past the linear `bridge.abort()`, or
+/// cancellation of the whole dispatch future — e.g. a tool timeout dropping
+/// it) leaked the detached loop along with every `Arc` it holds (the child's
+/// interrupt/steer handles, the Agent's interrupt/steer handles).
+///
+/// `Drop` aborts the task unconditionally (cheap, idempotent, safe at any
+/// task state); the normal-completion path calls [`BridgeGuard::cancel`],
+/// which sets the loop's cooperative stop flag and consumes the guard
+/// WITHOUT aborting — the loop then exits at its next tick (≤50 ms) after
+/// one final poll, so a stop/steer signalled in that window is still
+/// delivered into the (finished) child handles harmlessly.
+struct BridgeGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl BridgeGuard {
+    fn new(handle: tokio::task::JoinHandle<()>, stop: Arc<AtomicBool>) -> Self {
+        Self {
+            handle: Some(handle),
+            stop,
+        }
+    }
+
+    /// Normal completion: signal the loop's stop flag so it exits
+    /// cooperatively, and take the handle so `Drop` does NOT abort — the
+    /// detached loop exits on its own within one tick (≤50 ms).
+    fn cancel(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _detached = self.handle.take();
+    }
+}
+
+impl Drop for BridgeGuard {
+    fn drop(&mut self) {
+        // Panic/cancel path: the loop may never see the stop flag, so abort
+        // is the only guaranteed termination (idempotent if already done).
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// Shared state for the grant-back watcher (T005): tracks how many
 /// parent-pool permits are currently lent to the child pool, with a lock
 /// serializing lend/reclaim steps so the watcher can never lend more than
@@ -689,6 +737,22 @@ impl SubagentManager {
         }
     }
 
+    /// Force-finalize a still-running child as `Failed` (#6 review
+    /// finding): the background watcher calls this when a child TASK dies
+    /// without producing a `DelegationResult` (panic inside the run, task
+    /// aborted). The child's own terminal archival never ran, so without
+    /// this its registry entry would stay `Running` until
+    /// `shutdown`/session end and the orchestrator would never see an
+    /// outcome. One-way like `complete`; also reclaims grant-back permits
+    /// when this was the last running child (mirrors the normal path).
+    pub(crate) fn complete_failed(&self, id: u64, result: &DelegationResult) {
+        self.registry.complete(id, result);
+        if self.registry.running_is_empty() {
+            self.grant_back
+                .reclaim_all(&self.semaphore, &self.child_semaphore);
+        }
+    }
+
     /// `ensure_grant_back_watcher` for EXTERNAL callers that hold the
     /// top-level manager (feature 020 background dispatch): seeds the
     /// watcher with the REAL pool sizes instead of the transient child
@@ -1005,24 +1069,6 @@ impl SubagentManager {
         // subagent_control log ring fills without shadowing any host tap.
         let recorder = self.recorder_tap();
 
-        // Emit SubagentSpawn event (per-dispatch channel + live tap).
-        let spawn_ev = AgentEvent::SubagentSpawn {
-            id,
-            goal: req.goal.clone(),
-            model: model.clone(),
-            toolset_summary: ts_sum.clone(),
-            depth: self.depth,
-        };
-        if let Some(tx) = event_tx {
-            let _ = tx.send(spawn_ev.clone());
-        }
-        if let Some(tap) = &tap {
-            let _ = tap.send(spawn_ev.clone());
-        }
-        if let Some(rec) = &recorder {
-            let _ = rec.send(spawn_ev);
-        }
-
         let mut subagent = match Subagent::new(
             req,
             parent_config,
@@ -1133,7 +1179,15 @@ impl SubagentManager {
         };
         if self.child_pool_owner {
             // Pre-signaled manager-wide interrupt must reach the child.
-            child_interrupt.store(self.interrupt.load(Ordering::SeqCst), Ordering::SeqCst);
+            // OR-only (#5 review finding): storing the manager flag
+            // unconditionally would CLEAR a pending per-child stop recorded
+            // in the spawn→start window (`stop_child` set the pre-registered
+            // handle's flag while this dispatch was starting) whenever the
+            // manager-wide flag is false — the stop would be silently lost.
+            // Same pattern as the forwarder in subagent.rs.
+            if self.interrupt.load(Ordering::SeqCst) {
+                child_interrupt.store(true, Ordering::SeqCst);
+            }
             if !pre_registered {
                 let task = TaskSpec {
                     goal: req.goal.clone(),
@@ -1159,6 +1213,31 @@ impl SubagentManager {
             // be lent to the child pool while the parent stays idle.
             self.ensure_grant_back_watcher();
         }
+
+        // Emit SubagentSpawn event (per-dispatch channel + live tap).
+        // #10 (review finding): emitted AFTER the registry insert — a host
+        // reacting to the event with `stop_child`/`steer_child` previously
+        // hit the "No subagent with id N" unknown-id window because the
+        // event was emitted before the child was registered. Construction
+        // failures emit SubagentFailed below without a spawn event (the
+        // child never spawned).
+        let spawn_ev = AgentEvent::SubagentSpawn {
+            id,
+            goal: req.goal.clone(),
+            model: model.clone(),
+            toolset_summary: ts_sum.clone(),
+            depth: self.depth,
+        };
+        if let Some(tx) = event_tx {
+            let _ = tx.send(spawn_ev.clone());
+        }
+        if let Some(tap) = &tap {
+            let _ = tap.send(spawn_ev.clone());
+        }
+        if let Some(rec) = &recorder {
+            let _ = rec.send(spawn_ev);
+        }
+
         let child_sem = if self.child_pool_owner {
             self.child_semaphore.clone()
         } else {
@@ -1170,27 +1249,42 @@ impl SubagentManager {
         // flag and steer slot and forwards them into the child Agent's
         // handles, so `stop_child`/`steer_child` act on exactly this child
         // (the manager-wide flag keeps flowing through the subagent's own
-        // forwarder, unchanged). Aborted right after the run finishes —
-        // same pattern as the interrupt forwarder in subagent.rs.
+        // forwarder, unchanged).
+        //
+        // #1 review finding: the loop has no natural exit condition, so it
+        // is owned by a [`BridgeGuard`] — `Drop` ABORTS it, so a panic in
+        // `run_with_tap` or cancellation of this whole dispatch future
+        // (e.g. a tool timeout drops it) can never again skip cleanup and
+        // leak the loop with every Arc it holds. The normal path calls
+        // [`BridgeGuard::cancel`], which sets the loop's stop flag so it
+        // exits cooperatively at its next tick (≤50 ms).
         let agent_interrupt = subagent.agent.interrupt_handle();
         let agent_steer = subagent.agent.steer_handle();
         let bridge_flag = child_interrupt.clone();
         let bridge_steer = child_steer.clone();
-        let bridge = tokio::spawn(async move {
-            loop {
-                if bridge_flag.load(Ordering::SeqCst) {
-                    agent_interrupt.store(true, Ordering::SeqCst);
-                }
-                if let Ok(mut slot) = bridge_steer.lock() {
-                    if !slot.is_empty() {
-                        let text = std::mem::take(&mut *slot);
-                        drop(slot);
-                        Agent::steer_via_handle(&agent_steer, &text);
+        let bridge_stop = Arc::new(AtomicBool::new(false));
+        let bridge_stop_flag = bridge_stop.clone();
+        let bridge = BridgeGuard::new(
+            tokio::spawn(async move {
+                loop {
+                    if bridge_stop_flag.load(Ordering::SeqCst) {
+                        break;
                     }
+                    if bridge_flag.load(Ordering::SeqCst) {
+                        agent_interrupt.store(true, Ordering::SeqCst);
+                    }
+                    if let Ok(mut slot) = bridge_steer.lock() {
+                        if !slot.is_empty() {
+                            let text = std::mem::take(&mut *slot);
+                            drop(slot);
+                            Agent::steer_via_handle(&agent_steer, &text);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        });
+            }),
+            bridge_stop,
+        );
 
         let start = Instant::now();
         let result = subagent
@@ -1202,7 +1296,10 @@ impl SubagentManager {
                 self.config().subagent_recovery_attempts,
             )
             .await;
-        bridge.abort();
+        // Normal completion: cooperative stop — the child is done and the
+        // flagged loop exits on its own; no abort needed (and Drop's abort
+        // is suppressed by consuming the guard).
+        bridge.cancel();
         let elapsed = start.elapsed().as_secs_f64();
 
         // T004: archive the finished child into the session history
@@ -1331,9 +1428,29 @@ impl SubagentManager {
             parent_config_tree,
             &parent_config.provider,
         ) {
-            // Surface the routing error as a failed batch of one entry — the
-            // caller contract (Vec<DelegationResult>) stays intact.
+            // #2 (review finding): an unknown per-task role is a caller
+            // error. `dispatch_batch_with_roles` returns a
+            // `Vec<DelegationResult>` (one per task, order-preserving), so
+            // surface it as a failed result PER TASK — every entry fails
+            // with the routing error, the length/order contract holds, and
+            // the error reaches the model instead of a silent warn that
+            // dispatched the tasks un-profiled.
             tracing::warn!("hypercode role routing failed: {e}");
+            return tasks
+                .iter()
+                .map(|spec| DelegationResult {
+                    goal: spec.goal.clone(),
+                    summary: String::new(),
+                    success: false,
+                    error: Some(e.clone()),
+                    token_usage: Default::default(),
+                    wall_clock: Duration::ZERO,
+                    model: String::new(),
+                    iterations: 0,
+                    persisted_session_id: None,
+                    stop_reason: None,
+                })
+                .collect();
         }
 
         self.dispatch_requests(&requests, parent_config, parent_config_tree, base_registry, event_tx)
@@ -1670,6 +1787,128 @@ mod tests {
             iterations: 1,
             persisted_session_id: None,
             stop_reason: None,
+        }
+    }
+
+    /// A failed DelegationResult (registry archival input) — mirrors what
+    /// `complete_failed` / the #6 panic path archives.
+    fn failed_result(goal: &str, error: &str) -> DelegationResult {
+        DelegationResult {
+            goal: goal.to_string(),
+            summary: String::new(),
+            success: false,
+            error: Some(error.to_string()),
+            token_usage: Default::default(),
+            wall_clock: Duration::ZERO,
+            model: String::new(),
+            iterations: 0,
+            persisted_session_id: None,
+            stop_reason: None,
+        }
+    }
+
+    /// #6 regression: `complete_failed` archives a `Running` child as a
+    /// one-way terminal `Failed` record (the background watcher's
+    /// panic-to-Failed path) — status flips to Failed, the entry leaves
+    /// `running`, a late duplicate archival no-ops, and it is idempotent
+    /// for an unknown id.
+    #[test]
+    fn complete_failed_archives_one_way_failed_record() {
+        let mgr = SubagentManager::new(ManagerConfig::default());
+        register_child(&mgr, 31, "panicked-child");
+
+        let result = failed_result("panicked-child", "background child task panicked: boom");
+        mgr.complete_failed(31, &result);
+
+        // Terminal record: Failed with the synthesized error.
+        let status = mgr.child_status(31).expect("archived record");
+        match status.state {
+            DelegationState::Failed { ref error } => {
+                assert_eq!(error, "background child task panicked: boom");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(status.goal, "panicked-child");
+        assert!(mgr.registry.running_is_empty(), "left the running map");
+
+        // One-way: a second archival (late natural completion) no-ops.
+        assert!(mgr.registry.complete(31, &ok_result("late")).is_none());
+        assert!(matches!(
+            mgr.child_status(31).unwrap().state,
+            DelegationState::Failed { .. }
+        ));
+
+        // Idempotent for an id this manager never had.
+        mgr.complete_failed(999, &failed_result("ghost", "x"));
+        assert!(mgr.child_status(999).is_none());
+    }
+
+    /// #2 regression: `dispatch_batch_with_roles` with an unknown per-task
+    /// role must return one FAILED result per task (length/order contract
+    /// intact) carrying the routing error — not silently dispatch the
+    /// tasks un-profiled after a warn.
+    #[tokio::test]
+    async fn dispatch_batch_with_roles_unknown_role_fails_every_task() {
+        let mgr = SubagentManager::new(ManagerConfig::default());
+        let tasks = vec![
+            TaskSpec {
+                goal: "first".to_string(),
+                role: Some("wat".to_string()),
+                ..task_spec("first")
+            },
+            task_spec("second"),
+        ];
+        let results = mgr
+            .dispatch_batch_with_roles(
+                &tasks,
+                None,
+                &[],
+                &test_agent_config(),
+                &Config::defaults(),
+                &ToolRegistry::new(),
+                None,
+            )
+            .await;
+        assert_eq!(results.len(), 2, "one result per task, order preserved");
+        assert!(results.iter().all(|r| !r.success), "every task failed");
+        assert_eq!(results[0].goal, "first");
+        assert_eq!(results[1].goal, "second");
+        let err = results[0].error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("Unknown role 'wat'"),
+            "error names the bad role: {err}"
+        );
+    }
+
+    /// Minimal fixture helpers for the dispatch_batch_with_roles test.
+    fn task_spec(goal: &str) -> TaskSpec {
+        TaskSpec {
+            goal: goal.to_string(),
+            context: None,
+            model: None,
+            toolsets: vec![],
+            role: None,
+            subagent_type: None,
+            background: false,
+            budgets: None,
+        }
+    }
+
+    fn test_agent_config() -> AgentConfig {
+        AgentConfig {
+            model: "parent-model".into(),
+            provider: "openai".into(),
+            base_url: "http://127.0.0.1:9/v1".into(),
+            api_key: None,
+            max_turns: 2,
+            api_max_retries: 1,
+            tool_delay: 0.0,
+            reasoning: None,
+            enabled_tools: Vec::new(),
+            max_tokens: None,
+            stream: false,
+            pass_session_id: false,
+            model_pinned: false,
         }
     }
 

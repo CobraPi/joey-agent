@@ -598,6 +598,22 @@ fn pane_flush_reasoning(pane: &mut SubagentPane) {
     }
 }
 
+/// Review finding #2: resolve every still-Running Tool item in a
+/// transcript ring to `terminal` — used by the parent-side Done/Failed
+/// arms when a child's stream ends without the ToolEnd (or any
+/// per-child terminal event) ever arriving (orchestrator interrupt).
+/// Done-status is a neutral "no more output is coming"; Failed marks the
+/// interrupted case.
+fn resolve_running_tools(transcript: &mut VecDeque<TranscriptItem>, terminal: ToolStatus) {
+    for it in transcript.iter_mut() {
+        if let TranscriptItem::Tool { status, .. } = it {
+            if *status == ToolStatus::Running {
+                *status = terminal;
+            }
+        }
+    }
+}
+
 /// Apply a child event to a pane — a reduced version of the main
 /// `App::apply` logic covering the display-relevant subset. Lifecycle
 /// events (`TurnStart`/`Done`/`Failed` from the CHILD) intentionally do
@@ -2342,6 +2358,18 @@ impl App {
                     self.last_final_text = text;
                 }
                 self.active_agents.clear();
+                // Review finding #2: a pane still Running here will get no
+                // per-child terminal event (the orchestrator's Done ends
+                // every surviving child's stream). Sweep them to a
+                // completed/neutral terminal state so the rail never shows
+                // an eternal spinner; Stopped stays terminal (never
+                // overwritten).
+                for pane in &mut self.subagent_panes {
+                    if pane.status == SubagentStatus::Running {
+                        pane.status = SubagentStatus::Done;
+                    }
+                    resolve_running_tools(&mut pane.transcript, ToolStatus::Done);
+                }
                 // T064: stale activity-panel entries are cleaned up, but the
                 // per-subagent PANES deliberately survive the turn — the
                 // user can still click a completed child's tab and read its
@@ -2368,6 +2396,17 @@ impl App {
                             *status = ToolStatus::Failed;
                         }
                     }
+                }
+                // Review finding #2: the orchestrator's Failed interrupts
+                // every child — per-child SubagentFailed events will not
+                // arrive. Sweep each pane: still-Running panes go Failed and
+                // their Running Tool items resolve to Failed. Stopped stays
+                // terminal (never overwritten).
+                for pane in &mut self.subagent_panes {
+                    if pane.status == SubagentStatus::Running {
+                        pane.status = SubagentStatus::Failed;
+                    }
+                    resolve_running_tools(&mut pane.transcript, ToolStatus::Failed);
                 }
                 self.push_item(TranscriptItem::Error { text: err.clone() });
                 self.last_error = Some(err);
@@ -5848,6 +5887,158 @@ mod subagent_stopped_tests {
             app.subagent_entries[0].status,
             SubagentStatus::Stopped,
             "entry stays Stopped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod orchestrator_terminal_sweep_tests {
+    //! Review finding #2: the orchestrator's Done/Failed ends every
+    //! surviving child's stream — per-child terminal events will NOT
+    //! arrive. The parent-side arms must sweep the subagent panes:
+    //! still-Running panes reach a terminal status and their Running
+    //! Tool items resolve (no eternal spinners). Stopped panes are
+    //! already terminal and are never overwritten (T030 parity).
+    use super::*;
+
+    fn spawn(app: &mut App, id: u64, goal: &str) {
+        app.apply(AgentEvent::SubagentSpawn {
+            id,
+            goal: goal.into(),
+            model: "m".into(),
+            toolset_summary: "all".into(),
+            depth: 0,
+        });
+    }
+
+    /// A child mid-tool (ToolStart received, no ToolEnd).
+    fn stage_running_tool(app: &mut App, id: u64) {
+        app.apply(AgentEvent::SubagentEvent {
+            id,
+            event: Box::new(AgentEvent::ToolStart {
+                name: "terminal".into(),
+                emoji: "💻".into(),
+                summary: "cargo build".into(),
+            }),
+        });
+    }
+
+    /// Every pane's Tool items with their statuses, in order.
+    fn tool_statuses(pane: &SubagentPane) -> Vec<ToolStatus> {
+        pane.transcript
+            .iter()
+            .filter_map(|it| match it {
+                TranscriptItem::Tool { status, .. } => Some(*status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Done sweeps still-Running panes to Done and resolves their Running
+    /// Tool items to Done — the child's own events ended with the turn.
+    #[test]
+    fn done_sweep_resolves_running_panes_and_tools() {
+        let mut app = App::new("s", "m");
+        spawn(&mut app, 7, "child a");
+        spawn(&mut app, 9, "child b");
+        stage_running_tool(&mut app, 7);
+        stage_running_tool(&mut app, 9);
+        // Complete child 9 normally (its own terminal event DID arrive).
+        app.apply(AgentEvent::SubagentComplete {
+            id: 9,
+            goal: "child b".into(),
+            success: true,
+            summary_preview: "ok".into(),
+            token_usage: joey_providers::Usage::default(),
+            duration_secs: 1.0,
+        });
+
+        app.apply(AgentEvent::Done {
+            final_text: "orchestrator done".into(),
+            usage: joey_providers::Usage::default(),
+            iterations: 1,
+        });
+
+        assert_eq!(
+            app.subagent_panes[0].status,
+            SubagentStatus::Done,
+            "still-Running pane swept to Done"
+        );
+        assert_eq!(
+            tool_statuses(&app.subagent_panes[0]),
+            vec![ToolStatus::Done],
+            "Running Tool resolved to Done (no eternal spinner)"
+        );
+        // The normally-completed pane keeps its own terminal state.
+        assert_eq!(app.subagent_panes[1].status, SubagentStatus::Done);
+        assert_eq!(
+            tool_statuses(&app.subagent_panes[1]),
+            vec![ToolStatus::Done]
+        );
+    }
+
+    /// Failed sweeps still-Running panes to Failed and resolves their
+    /// Running Tool items to Failed (interrupted, not completed).
+    #[test]
+    fn failed_sweep_marks_running_panes_and_tools_failed() {
+        let mut app = App::new("s", "m");
+        spawn(&mut app, 7, "child a");
+        stage_running_tool(&mut app, 7);
+
+        app.apply(AgentEvent::Failed("orchestrator exploded".into()));
+
+        assert_eq!(
+            app.subagent_panes[0].status,
+            SubagentStatus::Failed,
+            "still-Running pane swept to Failed"
+        );
+        assert_eq!(
+            tool_statuses(&app.subagent_panes[0]),
+            vec![ToolStatus::Failed],
+            "Running Tool resolved to Failed (interrupted)"
+        );
+        // The orchestrator's own error still lands on the main transcript.
+        assert!(matches!(
+            app.transcript.back(),
+            Some(TranscriptItem::Error { text }) if text == "orchestrator exploded"
+        ));
+    }
+
+    /// A Stopped pane is terminal — the sweeps must never overwrite it
+    /// (same invariant SubagentComplete/SubagentFailed honor, T030).
+    #[test]
+    fn sweeps_never_overwrite_stopped_panes() {
+        let mut app = App::new("s", "m");
+        spawn(&mut app, 7, "child a");
+        app.apply(AgentEvent::SubagentStopped {
+            id: 7,
+            goal: "child a".into(),
+            reason: "operator_requested".into(),
+            summary_preview: "partial".into(),
+        });
+        app.apply(AgentEvent::Failed("turn failed".into()));
+        assert_eq!(
+            app.subagent_panes[0].status,
+            SubagentStatus::Stopped,
+            "Stopped stays terminal under the Failed sweep"
+        );
+        // And under the Done sweep.
+        spawn(&mut app, 9, "child b");
+        app.apply(AgentEvent::SubagentStopped {
+            id: 9,
+            goal: "child b".into(),
+            reason: "operator_requested".into(),
+            summary_preview: "partial".into(),
+        });
+        app.apply(AgentEvent::Done {
+            final_text: "done".into(),
+            usage: joey_providers::Usage::default(),
+            iterations: 1,
+        });
+        assert_eq!(
+            app.subagent_panes[1].status,
+            SubagentStatus::Stopped,
+            "Stopped stays terminal under the Done sweep"
         );
     }
 }

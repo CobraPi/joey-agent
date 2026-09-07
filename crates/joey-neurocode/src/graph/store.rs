@@ -401,6 +401,34 @@ impl GraphStore {
         )
     }
 
+    /// Purge every row previously tombstoned as `Deleted`, plus the
+    /// `graph_edges` rows touching them, in one transaction. Returns the
+    /// number of purged artifact rows.
+    ///
+    /// The tombstone pass alone left renamed/deleted paths lingering
+    /// forever: `code_artifacts`' unique key is (fqcn, kind, source_path),
+    /// so a renamed file inserted a duplicate row under the new path while
+    /// the old-path row (and its edges) stayed. Purging old-path rows lets
+    /// renamed paths insert cleanly. RAG chunks cascade via their
+    /// `ON DELETE CASCADE` foreign key.
+    pub fn purge_deleted_paths(&self) -> rusqlite::Result<usize> {
+        // unchecked_transaction: the store shares one connection across
+        // `&self` methods (no `&mut self` available for `transaction()`).
+        let tx = self.conn.unchecked_transaction()?;
+        // Edges first: graph_edges references code_artifacts(id) with no
+        // ON DELETE clause, so deleting artifacts before their edges would
+        // violate the foreign key on disk-backed stores (FKs are ON there).
+        tx.execute(
+            "DELETE FROM graph_edges
+             WHERE from_id IN (SELECT id FROM code_artifacts WHERE status='Deleted')
+                OR to_id   IN (SELECT id FROM code_artifacts WHERE status='Deleted')",
+            [],
+        )?;
+        let purged = tx.execute("DELETE FROM code_artifacts WHERE status='Deleted'", [])?;
+        tx.commit()?;
+        Ok(purged)
+    }
+
     /// Look up a node by FQCN + kind + source_path (the unique key).
     pub fn find_node(
         &self,
@@ -1080,6 +1108,67 @@ mod tests {
         assert_eq!(store.set_status_for_path("src/Client.java", "Active").unwrap(), 1);
         assert_eq!(store.set_status_for_path("src/Hub.java", "Active").unwrap(), 1);
         assert_eq!(store.traverse_from(client_id, None).unwrap().len(), 1);
+    }
+
+    /// Purge pass (finding #1): tombstoned rows must be DELETEd (rows +
+    /// edges), not just hidden — the unique key (fqcn, kind, source_path)
+    /// must be freed so a renamed path inserts cleanly, and edges touching
+    /// purged ids must not linger and re-attach to a reused rowid.
+    #[test]
+    fn purge_deleted_paths_removes_rows_and_edges() {
+        let store = GraphStore::open_in_memory().unwrap();
+        // Insert b first so a gets the HIGHER rowid — deleting a makes the
+        // next insert reuse a's rowid (max+1), which makes a lingering
+        // stale edge observable.
+        let b = CodeArtifactNode::new(
+            ArtifactKind::Interface,
+            "com.ex.Service".into(),
+            "com.ex".into(),
+            "src/Service.java".into(),
+        );
+        let a = CodeArtifactNode::new(
+            ArtifactKind::Class,
+            "com.ex.Client".into(),
+            "com.ex".into(),
+            "src/Client.java".into(),
+        );
+        let b_id = store.upsert_node(&b).unwrap();
+        let a_id = store.upsert_node(&a).unwrap();
+        store.upsert_edge(a_id, b_id, EdgeKind::Implements).unwrap();
+
+        // Tombstone a, then purge.
+        assert_eq!(store.set_status_for_path("src/Client.java", "Deleted").unwrap(), 1);
+        assert_eq!(store.purge_deleted_paths().unwrap(), 1);
+
+        // The row is GONE (not merely hidden as Deleted — find_node has no
+        // status filter, so Some here would mean the row survived).
+        assert!(
+            store
+                .find_node("com.ex.Client", &ArtifactKind::Class, "src/Client.java")
+                .unwrap()
+                .is_none(),
+            "purged row must be physically deleted"
+        );
+        // The survivor is untouched.
+        assert!(
+            store
+                .find_node("com.ex.Service", &ArtifactKind::Interface, "src/Service.java")
+                .unwrap()
+                .is_some()
+        );
+
+        // The unique key is freed: re-inserting the same (fqcn, kind, path)
+        // triple works. With b holding the max rowid, the re-insert reuses
+        // a's old rowid — so a stale edge would re-attach here.
+        let re_id = store.upsert_node(&a).unwrap();
+        assert_eq!(re_id, a_id, "rowid should be reused after the purge");
+        assert!(
+            store.traverse_from(re_id, None).unwrap().is_empty(),
+            "edges touching the purged row must have been deleted too"
+        );
+
+        // Purging with nothing deleted is a no-op.
+        assert_eq!(store.purge_deleted_paths().unwrap(), 0);
     }
 
     #[test]

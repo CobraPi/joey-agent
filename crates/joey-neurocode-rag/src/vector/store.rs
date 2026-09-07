@@ -34,6 +34,10 @@ pub use crate::vector::quantize::{QuantizeError, Quantization as VectorQuantizat
 pub enum VectorStoreError {
     /// SQLite failure (rolls the whole batch back).
     Sql(rusqlite::Error),
+    /// `chunks` and `vectors` are not parallel slices (caller bug — an
+    /// error, never a panic: a hard assert would crash the whole
+    /// indexing pipeline over a caller mistake).
+    MismatchedSlices { chunks: usize, vectors: usize },
     /// A vector whose dimensionality ≠ the profile's `embed_dim` — rejected
     /// at write time per data-model.md §2 validation rules.
     DimMismatch { chunk_id: String, expected: u32, got: usize },
@@ -48,6 +52,10 @@ impl std::fmt::Display for VectorStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VectorStoreError::Sql(e) => write!(f, "rag store sql error: {e}"),
+            VectorStoreError::MismatchedSlices { chunks, vectors } => write!(
+                f,
+                "write_index: chunks ({chunks}) and vectors ({vectors}) must be parallel slices"
+            ),
             VectorStoreError::DimMismatch { chunk_id, expected, got } => write!(
                 f,
                 "vector dim mismatch for chunk {chunk_id}: expected {expected}, got {got}"
@@ -110,11 +118,12 @@ pub fn write_index(
     vectors: &[Option<Vec<f32>>],
     purge_paths: &[&str],
 ) -> Result<(), VectorStoreError> {
-    assert_eq!(
-        chunks.len(),
-        vectors.len(),
-        "write_index: chunks and vectors must be parallel"
-    );
+    if chunks.len() != vectors.len() {
+        return Err(VectorStoreError::MismatchedSlices {
+            chunks: chunks.len(),
+            vectors: vectors.len(),
+        });
+    }
     let conn = store.conn();
     // unchecked_transaction: GraphStore hands out &Connection (immutable);
     // dropping the Transaction on the error path rolls the batch back.
@@ -184,6 +193,10 @@ pub fn write_index(
 
     // 3. Vector rows (encode + upsert). The dim check fires BEFORE the
     //    offending write; the whole transaction still rolls back on error.
+    //    A chunk whose new vector is None gets any EXISTING rag_vectors
+    //    row deleted — otherwise the chunk claims "not yet embedded"
+    //    (embed_model/embed_dim NULL) while dense_scan still scores its
+    //    stale vector.
     {
         let mut vec_stmt = tx.prepare(
             r#"
@@ -196,7 +209,15 @@ pub fn write_index(
             "#,
         )?;
         for (chunk, vector) in chunks.iter().zip(vectors.iter()) {
-            let Some(v) = vector else { continue };
+            let Some(v) = vector else {
+                // "Not yet embedded": drop a stale vector row if one
+                // survives from a previous embed of this chunk_id.
+                tx.execute(
+                    "DELETE FROM rag_vectors WHERE chunk_id = ?1",
+                    params![chunk.chunk_id],
+                )?;
+                continue;
+            };
             if v.len() != profile.dim as usize {
                 return Err(VectorStoreError::DimMismatch {
                     chunk_id: chunk.chunk_id.clone(),
@@ -388,6 +409,74 @@ mod tests {
         assert_eq!(chunk_count(store.conn()).unwrap(), 0);
         assert_eq!(vector_count(store.conn()).unwrap(), 0);
         assert!(load_index_meta(store.conn()).unwrap().is_none());
+    }
+
+    /// Non-parallel chunks/vectors is a CALLER BUG → MismatchedSlices
+    /// error, never a panic (a hard assert would crash the whole
+    /// indexing pipeline) — and nothing lands (checked before the tx).
+    #[test]
+    fn mismatched_slices_is_an_error_never_a_panic() {
+        let (_tmp, store) = temp_store();
+        let profile = default_profile();
+        let source = "x = 1\ny = 2\n";
+        let extraction = fallback_extraction(source);
+        let chunks =
+            build_chunk_records(&extraction, source, "m.py", &store, &ChunkOptions::default());
+        assert!(!chunks.is_empty());
+        // Vectors shorter than chunks — the caller bug the check guards.
+        let short: Vec<Option<Vec<f32>>> = Vec::new();
+        let err = write_index(&store, profile, Quantization::F32, &chunks, &short, &[])
+            .unwrap_err();
+        assert!(
+            matches!(err, VectorStoreError::MismatchedSlices { chunks: c, vectors: 0 } if c == chunks.len()),
+            "got: {err:?}"
+        );
+        assert_eq!(chunk_count(store.conn()).unwrap(), 0, "nothing landed");
+        assert_eq!(vector_count(store.conn()).unwrap(), 0, "nothing landed");
+    }
+
+    /// A chunk re-written with a None vector ("not yet embedded") must
+    /// have any STALE rag_vectors row from a previous embed deleted —
+    /// otherwise dense_scan keeps scoring the old vector while the chunk
+    /// claims embed_model/embed_dim NULL.
+    #[test]
+    fn none_vector_rewrites_delete_stale_vector_rows() {
+        let (_tmp, store) = temp_store();
+        let profile = default_profile();
+        let source = "x = 1\ny = 2\n";
+        let extraction = fallback_extraction(source);
+        let chunks =
+            build_chunk_records(&extraction, source, "m.py", &store, &ChunkOptions::default());
+        let embedded: Vec<Option<Vec<f32>>> = chunks
+            .iter()
+            .map(|_| Some(vec![0.5f32; profile.dim as usize]))
+            .collect();
+        write_index(&store, profile, Quantization::F32, &chunks, &embedded, &[]).unwrap();
+        assert_eq!(vector_count(store.conn()).unwrap(), chunks.len() as u64);
+
+        // Re-write the SAME chunks with None vectors.
+        let unembedded: Vec<Option<Vec<f32>>> = chunks.iter().map(|_| None).collect();
+        write_index(&store, profile, Quantization::F32, &chunks, &unembedded, &[]).unwrap();
+        assert_eq!(
+            chunk_count(store.conn()).unwrap(),
+            chunks.len() as u64,
+            "chunk rows stay ('not yet embedded')"
+        );
+        assert_eq!(
+            vector_count(store.conn()).unwrap(),
+            0,
+            "stale vector rows must be deleted, not left behind"
+        );
+        let (model, dim): (Option<String>, Option<i64>) = store
+            .conn()
+            .query_row(
+                "SELECT embed_model, embed_dim FROM rag_chunks LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(model.is_none(), "embed_model NULL again");
+        assert!(dim.is_none(), "embed_dim NULL again");
     }
 
     #[test]

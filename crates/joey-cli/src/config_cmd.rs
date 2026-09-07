@@ -388,6 +388,13 @@ fn env_display(var: &str) -> String {
     }
 }
 
+/// `display.streaming` is a BOOL key — read it as one and render "true"/"false"
+/// (mirrors the show_reasoning handling above; a get_str read of a bool YAML
+/// value falls through to the default and always printed "false").
+fn streaming_display(config: &Config) -> String {
+    config.get_bool("display.streaming", false).to_string()
+}
+
 pub fn show_config() -> Result<i32> {
     let config = Config::load()?;
 
@@ -425,7 +432,7 @@ pub fn show_config() -> Result<i32> {
         "Reasoning:",
         if config.get_bool("display.show_reasoning", true) { "on" } else { "off" },
     );
-    kv("Streaming:", &config.get_str("display.streaming", "false"));
+    kv("Streaming:", &streaming_display(&config));
     kv("Progress:", &config.get_str("display.tool_progress", "all"));
 
     render::section("Terminal");
@@ -448,4 +455,27 @@ pub fn show_config() -> Result<i32> {
     println!("{}", Color::DarkGray.paint("  joey model           # Select default model"));
     println!();
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `display.streaming` is a BOOL key. Reading it via get_str
+    /// always fell through to the "false" default even when the config said
+    /// `display.streaming: true` — show must render the actual bool.
+    #[test]
+    fn streaming_display_reads_bool_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "display:\n  streaming: true\n").unwrap();
+        let config = Config::load_from(path).unwrap();
+        assert_eq!(streaming_display(&config), "true");
+
+        // Unset key falls back to the documented default (false).
+        let path = dir.path().join("empty.yaml");
+        std::fs::write(&path, "").unwrap();
+        let config = Config::load_from(path).unwrap();
+        assert_eq!(streaming_display(&config), "false");
+    }
 }

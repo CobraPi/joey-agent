@@ -6,6 +6,10 @@
 //! a `<persisted-output>` preview + path envelope. A 200K per-turn aggregate
 //! budget (layer 3) spills further results once exceeded; the accumulator
 //! lives on [`crate::ToolContext`] (`turn_budget()`).
+//!
+//! Char budgets in this module count CHARS (Python `str` semantics), not
+//! bytes — the threshold check and the preview-size label use
+//! `str::chars().count()`.
 
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -79,7 +83,7 @@ pub fn safe_result_filename(tool_use_id: &str) -> String {
 /// Port of `generate_preview` — truncate at the last newline within
 /// `max_chars`. Returns (preview, has_more).
 pub fn generate_preview(content: &str, max_chars: usize) -> (String, bool) {
-    if content.len() <= max_chars {
+    if content.chars().count() <= max_chars {
         return (content.to_string(), false);
     }
     let cut = crate::truncate::floor_char_boundary(content, max_chars);
@@ -115,7 +119,7 @@ pub fn build_persisted_message(
     msg.push_str(
         "Use the read_file tool with offset and limit to access specific sections of this output.\n\n",
     );
-    msg.push_str(&format!("Preview (first {} chars):\n", preview.len()));
+    msg.push_str(&format!("Preview (first {} chars):\n", preview.chars().count()));
     msg.push_str(preview);
     if has_more {
         msg.push_str("\n...");

@@ -206,6 +206,43 @@ impl SelectorEngine {
         self.provider.read().unwrap().clone()
     }
 
+    /// The provider's default concrete model id (FR-020 last resort).
+    ///
+    /// Resolution order: copilot-wire providers use the curated copilot
+    /// catalog list (mirrors joey-cli's model_catalog); every other known
+    /// provider uses its profile — the first curated `fallback_models`
+    /// entry, else its `default_aux_model`. An unknown/empty provider name
+    /// bottoms out in the OpenRouter aggregator's first curated fallback —
+    /// the same terminal default `resolve_profile` itself falls back to.
+    ///
+    /// Always returns a concrete, non-`auto` id so the activation sentinel
+    /// can never reach the provider wire.
+    pub(crate) fn provider_default_model(&self) -> String {
+        let provider = self.provider();
+        if joey_providers::profile::is_copilot_wire(&provider) {
+            // SAFETY: the curated copilot fallback list is a non-empty const.
+            return joey_providers::copilot::fallback_models()
+                .into_iter()
+                .next()
+                .expect("copilot fallback list is non-empty");
+        }
+        let from_profile = joey_providers::profile::get_profile(&provider).and_then(|p| {
+            p.fallback_models
+                .first()
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    (!p.default_aux_model.is_empty()).then(|| p.default_aux_model.to_string())
+                })
+        });
+        from_profile.unwrap_or_else(|| {
+            // SAFETY: "openrouter" is a registered profile whose curated
+            // fallback list is non-empty (profile.rs PROFILES).
+            joey_providers::profile::get_profile("openrouter")
+                .and_then(|p| p.fallback_models.first().map(|s| s.to_string()))
+                .expect("openrouter profile has curated fallback models")
+        })
+    }
+
     /// Install the LLM judge client for the detached learning loop (FR-008,
     /// T076). When set, the learning loop asks the judge for a per-module
     /// `p_j` before falling back to the heuristic. Pass `None` to disable the
@@ -577,6 +614,12 @@ impl SelectorEngine {
                 e.updated_at = Some(chrono::Utc::now().to_rfc3339());
                 let path = self.map_path_override.clone().unwrap_or_else(AllocationMap::path);
                 let _ = map.save_to(&path);
+                // Also invalidate the per-turn cache (mirrors pin_module):
+                // a cached pinned id would keep serving until the next turn
+                // otherwise, hiding the unpin from same-turn resolves.
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.allocations.remove(module);
+                }
                 Ok(())
             }
             None => Err(format!("module {} is not in the allocation map", module)),
@@ -619,7 +662,8 @@ impl SelectorEngine {
             };
         }
         // Empty pool AND cfg is "auto"/empty: still never the literal "auto"
-        // sentinel (FR-020). Substitute the first provider-curated fallback.
+        // sentinel (FR-020). Substitute the first provider-curated fallback,
+        // else the provider's default model id.
         if cfg_model == "auto" || cfg_model.is_empty() {
             if let Some(fb) = fallbacks.first() {
                 return Allocation {
@@ -627,6 +671,10 @@ impl SelectorEngine {
                     source: AllocationSource::DegradedFallback,
                 };
             }
+            return Allocation {
+                model_id: self.provider_default_model(),
+                source: AllocationSource::DegradedFallback,
+            };
         }
         Allocation {
             model_id: cfg_model,
@@ -670,8 +718,11 @@ impl ModelAllocator for SelectorEngine {
                     source: AllocationSource::DisabledFallback,
                 };
             }
+            // FR-020: still never the literal "auto"/empty sentinel — even
+            // with no curated fallbacks, substitute the provider's default
+            // concrete model id.
             return Allocation {
-                model_id: cfg_model,
+                model_id: self.provider_default_model(),
                 source: AllocationSource::DisabledFallback,
             };
         }
@@ -716,13 +767,30 @@ impl ModelAllocator for SelectorEngine {
         // Cache miss: resolve from the map.
         let map = self.map.read().unwrap();
         if let Some(entry) = map.get(&module) {
-            // Honor pinned entries verbatim (FR-012).
+            // Honor pinned entries verbatim (FR-012) — but still re-check
+            // FR-005 capabilities and FR-014 pool membership for THIS turn
+            // (same check the cached path above applies): a pinned model
+            // that left the pool or cannot serve this turn (e.g. no vision
+            // on an image turn) must degrade rather than go to the wire.
             if entry.pinned || entry.implicit_pin {
-                let alloc = Allocation {
-                    model_id: entry.model_id.clone(),
-                    source: AllocationSource::Cached,
+                let pinned_usable = {
+                    let pool = self.pool.read().unwrap();
+                    pool.get(&entry.model_id)
+                        .map(|m| ColdStartScorer::satisfies(m, &reqs))
+                        .unwrap_or(false)
                 };
-                return alloc;
+                if pinned_usable {
+                    let alloc = Allocation {
+                        model_id: entry.model_id.clone(),
+                        source: AllocationSource::Cached,
+                    };
+                    return alloc;
+                }
+                // Pinned but incapable/stale for this turn → degraded
+                // fallback (never re-resolve over a user pin, and never
+                // serve the dead/incapable id).
+                drop(map);
+                return self.degraded_fallback();
             }
             // FR-014: if the cached model id is stale (not in pool), re-resolve.
             // FR-005: if the model is live but incapable of THIS turn's
@@ -1690,6 +1758,81 @@ mod tests {
             .is_some());
     }
 
+    /// FR-020 regression (review finding #2): with NO provider-curated
+    /// fallbacks, an empty pool + `auto`/empty configured model must still
+    /// never surface the literal `auto` sentinel (or an empty id) — neither
+    /// from the disabled path of `resolve` nor from `degraded_fallback`.
+    /// Both must substitute the provider's default concrete model id.
+    #[test]
+    fn test_auto_sentinel_never_leaked_even_without_fallbacks() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: "auto".to_string(), // pool empty → inactive
+            ..Default::default()
+        };
+        let (engine, _dir) = make_engine(cfg, AllocationMap::default());
+        engine.set_provider("zai".to_string());
+        // fallback_models deliberately left EMPTY (default state).
+        let alloc = engine.resolve(ModuleId::MainTurn, false, true, 1000);
+        assert_ne!(
+            alloc.model_id,
+            "auto",
+            "FR-020: 'auto' must never leak from resolve (no-fallback case)"
+        );
+        assert!(
+            !alloc.model_id.is_empty(),
+            "an empty model id must never leak from resolve"
+        );
+        // zai profile's first curated fallback is the provider default here.
+        assert_eq!(alloc.model_id, "glm-5.2");
+        assert_eq!(alloc.source, AllocationSource::DisabledFallback);
+
+        // Same invariant on the degraded_fallback site directly.
+        let degraded = engine.degraded_fallback();
+        assert_ne!(degraded.model_id, "auto");
+        assert!(!degraded.model_id.is_empty());
+        assert_eq!(degraded.model_id, "glm-5.2");
+        assert_eq!(degraded.source, AllocationSource::DegradedFallback);
+    }
+
+    /// FR-020 complement: the copilot-wire providers substitute the curated
+    /// copilot catalog default, and an unknown/empty provider name bottoms
+    /// out in the OpenRouter aggregator default (mirroring resolve_profile's
+    /// terminal fallback).
+    #[test]
+    fn test_provider_default_model_concrete_per_provider() {
+        let cfg = SelectorConfig::default();
+        let (copilot_engine, _d1) = make_engine(cfg.clone(), AllocationMap::default());
+        copilot_engine.set_provider("copilot".to_string());
+        assert_eq!(copilot_engine.provider_default_model(), "gpt-5.4");
+
+        let (anon_engine, _d2) = make_engine(cfg, AllocationMap::default());
+        anon_engine.set_provider(String::new());
+        assert_eq!(
+            anon_engine.provider_default_model(),
+            "anthropic/claude-sonnet-4.6"
+        );
+    }
+
+    /// FR-020 complement: an empty (not just "auto") configured model id
+    /// must not leak either.
+    #[test]
+    fn test_empty_configured_model_never_leaked() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: String::new(), // empty, pool empty → inactive
+            ..Default::default()
+        };
+        let (engine, _dir) = make_engine(cfg, AllocationMap::default());
+        engine.set_provider("zai".to_string());
+        let alloc = engine.resolve(ModuleId::MainTurn, false, true, 1000);
+        assert!(!alloc.model_id.is_empty());
+        assert_ne!(alloc.model_id, "auto");
+        let degraded = engine.degraded_fallback();
+        assert!(!degraded.model_id.is_empty());
+        assert_ne!(degraded.model_id, "auto");
+    }
+
     // ── Phase 5: diagnoser learning loop (T040/T041/T044) ──────────────────
 
     /// Helper: build an engine with a multi-tier pool and a pre-allocated module.
@@ -1852,6 +1995,162 @@ mod tests {
             "failure",
         );
         assert!(result.is_none(), "implicit_pin must not be reallocated");
+    }
+
+    /// Review finding #4 regression: `unpin_module` must invalidate the
+    /// per-turn cache (mirroring pin_module) — otherwise a cached pinned id
+    /// keeps serving until the next turn and the unpin has no same-turn
+    /// effect. After unpin + cache invalidation, the next resolve re-resolves
+    /// from the map entry (still the pinned model's id, now unpinned), and a
+    /// capability change takes effect immediately rather than next turn.
+    #[test]
+    fn test_unpin_invalidates_turn_cache() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: "auto".to_string(),
+            ..Default::default()
+        };
+        let mut map = AllocationMap::default();
+        map.enabled = true;
+        map.entries.push(AllocationEntry {
+            module: ModuleId::MainTurn,
+            model_id: "model-a".to_string(),
+            pinned: true,
+            implicit_pin: false,
+            reason: "user pin".to_string(),
+            estimated_performance: None,
+            updated_at: None,
+        });
+        let (engine, _dir) = make_engine_with_pool(
+            cfg,
+            map,
+            vec![
+                test_model("model-a", true, true, 128_000),
+                test_model("model-b", true, true, 128_000),
+            ],
+        );
+        engine.refresh_at_turn_start(); // caches model-a for the turn
+        let alloc = engine.resolve(ModuleId::MainTurn, false, true, 1000);
+        assert_eq!(alloc.model_id, "model-a");
+
+        // User unpins and pins the OTHER model mid-turn. Without cache
+        // invalidation, resolve would keep serving model-a from the cache
+        // until the next turn.
+        engine
+            .unpin_module(&ModuleId::MainTurn)
+            .expect("unpin must succeed");
+        engine
+            .pin_module(ModuleId::MainTurn, "model-b".to_string())
+            .expect("pin must succeed");
+        let alloc = engine.resolve(ModuleId::MainTurn, false, true, 1000);
+        assert_eq!(
+            alloc.model_id, "model-b",
+            "unpin must invalidate the per-turn cache so same-turn resolves see the new state"
+        );
+    }
+
+    /// Review finding #5 regression: a pinned entry whose model cannot serve
+    /// THIS turn (pinned vision-less model on an image turn) must degrade
+    /// instead of going to the wire verbatim. The FR-005 capability check
+    /// the cached path applies must also gate the pinned map path.
+    #[test]
+    fn test_pinned_entry_capability_failure_degrades() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: "auto".to_string(),
+            ..Default::default()
+        };
+        let mut map = AllocationMap::default();
+        map.enabled = true;
+        map.entries.push(AllocationEntry {
+            module: ModuleId::MainTurn,
+            model_id: "model-novision".to_string(), // pinned, NO vision
+            pinned: true,
+            implicit_pin: false,
+            reason: "user pin".to_string(),
+            estimated_performance: None,
+            updated_at: None,
+        });
+        let (engine, _dir) = make_engine_with_pool(
+            cfg,
+            map,
+            vec![
+                test_model("model-v", true, true, 128_000), // pool-first: the degrade target
+                test_model("model-novision", true, false, 128_000), // NO vision (pinned)
+            ],
+        );
+        // No refresh_at_turn_start → per-turn cache empty → pinned map path.
+        // Turn has images → the pinned model is incapable (FR-005).
+        let alloc = engine.resolve(ModuleId::MainTurn, true, true, 1000);
+        assert_ne!(
+            alloc.model_id, "model-novision",
+            "a pinned vision-less model must not serve an image turn"
+        );
+        assert_eq!(alloc.source, AllocationSource::DegradedFallback);
+    }
+
+    /// Review finding #5 complement: a pinned model that has LEFT the pool
+    /// (FR-014 staleness) must degrade too, not be returned verbatim.
+    #[test]
+    fn test_pinned_entry_stale_not_served_verbatim() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: "auto".to_string(),
+            ..Default::default()
+        };
+        let mut map = AllocationMap::default();
+        map.enabled = true;
+        map.entries.push(AllocationEntry {
+            module: ModuleId::MainTurn,
+            model_id: "gone-from-pool".to_string(), // pinned, NOT in pool
+            pinned: true,
+            implicit_pin: false,
+            reason: "user pin".to_string(),
+            estimated_performance: None,
+            updated_at: None,
+        });
+        let (engine, _dir) = make_engine_with_pool(
+            cfg,
+            map,
+            vec![test_model("live-model", true, true, 128_000)],
+        );
+        let alloc = engine.resolve(ModuleId::MainTurn, false, true, 1000);
+        assert_ne!(
+            alloc.model_id, "gone-from-pool",
+            "a pinned id absent from the pool must not be served verbatim"
+        );
+    }
+
+    /// Review finding #5 control: a pinned model that IS capable and in the
+    /// pool is still honored verbatim (FR-012) — the new gate only fires on
+    /// capability/pool failure.
+    #[test]
+    fn test_pinned_entry_capable_still_honored() {
+        let cfg = SelectorConfig {
+            enabled: true,
+            configured_model: "auto".to_string(),
+            ..Default::default()
+        };
+        let mut map = AllocationMap::default();
+        map.enabled = true;
+        map.entries.push(AllocationEntry {
+            module: ModuleId::MainTurn,
+            model_id: "model-v".to_string(),
+            pinned: true,
+            implicit_pin: false,
+            reason: "user pin".to_string(),
+            estimated_performance: None,
+            updated_at: None,
+        });
+        let (engine, _dir) = make_engine_with_pool(
+            cfg,
+            map,
+            vec![test_model("model-v", true, true, 128_000)],
+        );
+        // Image turn the pinned vision model CAN serve.
+        let alloc = engine.resolve(ModuleId::MainTurn, true, true, 1000);
+        assert_eq!(alloc.model_id, "model-v");
+        assert_eq!(alloc.source, AllocationSource::Cached);
     }
 
     /// T041: `append_diagnostic_and_persist` appends the record, increments

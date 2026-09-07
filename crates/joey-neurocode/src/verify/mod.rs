@@ -159,14 +159,18 @@ impl VerifyLoop {
             }
             iterations += 1;
             // Re-run only the failed steps, updating results in place.
-            for step_cfg in &self.config.steps {
+            // Results are keyed by step INDEX (run_steps maps 1:1 over
+            // config.steps in order), not by step name: duplicate step
+            // names in a config are a user error that must not leave stale
+            // slots — name-keyed matching wrote every re-run into the FIRST
+            // slot and left later duplicates at their first-run failure.
+            for (slot_idx, step_cfg) in self.config.steps.iter().enumerate() {
                 let needs_rerun = results
-                    .iter()
-                    .any(|r| r.step_name == step_cfg.name && !r.passed && !r.skipped);
+                    .get(slot_idx)
+                    .map_or(false, |r| !r.passed && !r.skipped);
                 if needs_rerun {
-                    let fresh = self.run_step(step_cfg, project_root);
-                    if let Some(slot) = results.iter_mut().find(|r| r.step_name == step_cfg.name) {
-                        *slot = fresh;
+                    if let Some(slot) = results.get_mut(slot_idx) {
+                        *slot = self.run_step(step_cfg, project_root);
                     }
                 }
             }

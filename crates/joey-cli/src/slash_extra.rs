@@ -126,7 +126,10 @@ pub fn undo_exchange(
     });
     match db.rewind_last_user_exchanges(session_id, n) {
         Ok(0) => {
+            // Nothing was rewound — resubmitting would RE-SEND the last user
+            // input without undoing anything, so no resubmission here.
             out.push(format!("Nothing to undo (no active user exchange left)."));
+            return (out, None);
         }
         Ok(removed) => {
             out.push(format!(
@@ -1136,10 +1139,11 @@ pub mod cron {
                 }
             }
             Some(other) => {
-                // /cron <schedule> <prompt> shorthand: first token parses as a
-                // schedule → create; else usage.
+                // /cron <schedule> <prompt> shorthand: the schedule may span
+                // multiple tokens ("every 2 hours", "0 9 * * *"), so decide
+                // with the real parser — usage only when nothing parses.
                 let rest = args.trim();
-                if looks_like_schedule(other) {
+                if split_schedule_prompt(rest).is_some() {
                     create_job(&mut out, rest);
                 } else {
                     out.push(format!("Usage: /cron [list|create <schedule> <prompt>|pause|resume|run|remove] (got '{other}')"));
@@ -1149,25 +1153,67 @@ pub mod cron {
         out
     }
 
-    fn looks_like_schedule(s: &str) -> bool {
-        s.chars().all(|c| c.is_ascii_digit() || matches!(c, 'm' | 'h' | 'd' | '*' | '/' | ',' | '-' | ' '))
-            && !s.is_empty()
-            && (s.contains(|c: char| c.is_ascii_digit()) && (s.ends_with('m') || s.ends_with('h') || s.ends_with('d') || s.contains('*') || s.contains('/')))
+    /// Split `<schedule> <prompt>` on the first token prefix that genuinely
+    /// parses as a schedule via the real parser (`joey_cron::parse_schedule`,
+    /// the same one `CronStore::create_job` uses) — multi-token schedules
+    /// like "every 2 hours" or "0 9 * * *" included. Returns `None` when no
+    /// prefix parses. The prompt is empty only when the whole input is the
+    /// schedule (callers surface their own usage line for that).
+    pub(crate) fn split_schedule_prompt(rest: &str) -> Option<(String, String)> {
+        // Byte spans of the whitespace-separated tokens; slicing the
+        // ORIGINAL string keeps the schedule and prompt verbatim (no
+        // whitespace collapsing). Boundaries are ASCII, so slicing is
+        // always at char boundaries.
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let bytes = rest.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if start < i {
+                spans.push((start, i));
+            }
+        }
+        for k in 1..=spans.len() {
+            let schedule = &rest[spans[0].0..spans[k - 1].1];
+            if joey_cron::parse_schedule(schedule).is_ok() {
+                let prompt = rest[spans[k - 1].1..].trim();
+                return Some((schedule.to_string(), prompt.to_string()));
+            }
+        }
+        None
     }
 
     fn create_job(out: &mut Lines, rest: &str) {
-        let mut it = rest.splitn(2, char::is_whitespace);
-        let Some(schedule) = it.next().map(str::trim).filter(|s| !s.is_empty()) else {
+        // The schedule may span multiple tokens ("every 2 hours",
+        // "0 9 * * *"): take the first token prefix that genuinely parses;
+        // when nothing parses, hand the first token to the store so the
+        // user sees the real parse error.
+        let (schedule, prompt) = match split_schedule_prompt(rest) {
+            Some(split) => split,
+            None => {
+                let mut it = rest.splitn(2, char::is_whitespace);
+                (
+                    it.next().unwrap_or("").trim().to_string(),
+                    it.next().unwrap_or("").trim().to_string(),
+                )
+            }
+        };
+        if schedule.is_empty() {
             out.push("Usage: /cron create <schedule> <prompt> · schedules: 30m · every 2h · 0 9 * * *");
             return;
-        };
-        let prompt = it.next().map(str::trim).unwrap_or("");
+        }
         if prompt.is_empty() {
             out.push("Usage: /cron create <schedule> <prompt>");
             return;
         }
         let store = CronStore::open_default();
-        match store.create_job(Some(prompt), schedule, joey_cron::CreateJobOptions::default()) {
+        match store.create_job(Some(prompt.as_str()), schedule.as_str(), joey_cron::CreateJobOptions::default()) {
             Ok(job) => {
                 out.push(format!("✓ Created job {} — {}", job.id, job.schedule_display));
                 out.push(format!("  Next run: {}", job.next_run_at.as_deref().unwrap_or("?")));
@@ -1628,6 +1674,51 @@ mod tests {
         assert_eq!(sanitize_filename("///"), "session");
     }
 
+    /// Regression: /undo with nothing rewound (rewind_last_user_exchanges
+    /// returned Ok(0)) must NOT resubmit. The live history still carries the
+    /// last user message, so the old code re-sent it as a brand-new turn
+    /// even though nothing was undone.
+    #[test]
+    fn undo_with_no_active_exchange_returns_no_resubmit() {
+        let db = joey_core::SessionDb::open_in_memory().unwrap();
+        let session = db.create_session("cli", None, None).unwrap();
+        // Empty DB session (Ok(0) rewind) but a NON-empty live history —
+        // the exact combination that used to re-submit the last input.
+        let history = vec![
+            joey_providers::Message::user("hello there"),
+            joey_providers::Message::assistant("hi!"),
+        ];
+        let (lines, resubmit) = undo_exchange(&session, 1, &history, Some(&db));
+        assert!(
+            lines.0.iter().any(|l| l.contains("Nothing to undo")),
+            "{lines:?}"
+        );
+        assert!(resubmit.is_none(), "Ok(0) rewind must not resubmit, got {resubmit:?}");
+    }
+
+    /// Counterpart: a real rewind still returns the undone user message.
+    #[test]
+    fn undo_with_active_exchange_still_resubmits() {
+        let db = joey_core::SessionDb::open_in_memory().unwrap();
+        let session = db.create_session("cli", None, None).unwrap();
+        db.add_message(&joey_core::StoredMessage::new(
+            &session,
+            joey_core::Role::User,
+            "please redo this",
+        ))
+        .unwrap();
+        db.add_message(&joey_core::StoredMessage::new(
+            &session,
+            joey_core::Role::Assistant,
+            "done",
+        ))
+        .unwrap();
+        let history = vec![joey_providers::Message::user("please redo this")];
+        let (lines, resubmit) = undo_exchange(&session, 1, &history, Some(&db));
+        assert!(lines.0.iter().any(|l| l.contains("Undid 2 message(s)")), "{lines:?}");
+        assert_eq!(resubmit.as_deref(), Some("please redo this"));
+    }
+
     #[test]
     fn moa_prompt_mentions_three_proposals() {
         let (lines, prompt) = moa_prompt("improve the README");
@@ -1645,13 +1736,39 @@ mod tests {
 
     #[test]
     fn schedule_detection() {
-        // via the public handle: "/cron 45m do x" creates a job only if the
-        // first token looks like a schedule. We can't run create (writes to
-        // the real store), so exercise looks_like_schedule indirectly by
-        // matching known-good/bad shapes through handle with an unknown
-        // subcommand path.
+        // via the public handle: "/cron <not-a-schedule> …" must land on the
+        // usage line — the shorthand decision now runs the real parser
+        // (split_schedule_prompt) on every token prefix.
         let out = cron::handle("definitely-not-a-schedule");
         assert!(out.0.iter().any(|l| l.contains("Usage")));
+    }
+
+    /// Regression (#7): the shorthand parse decision must accept
+    /// multi-token schedules, not just single-token first tokens.
+    #[test]
+    fn cron_shorthand_splits_multi_token_schedules() {
+        use super::cron::split_schedule_prompt as split;
+        // "every 2 hours" style intervals span multiple tokens.
+        assert_eq!(
+            split("every 2 hours summarize my inbox"),
+            Some(("every 2 hours".to_string(), "summarize my inbox".to_string()))
+        );
+        // Cron expressions: all five fields are the schedule.
+        assert_eq!(
+            split("0 9 * * * morning brief"),
+            Some(("0 9 * * *".to_string(), "morning brief".to_string()))
+        );
+        // Single-token durations unchanged.
+        assert_eq!(
+            split("30m ping"),
+            Some(("30m".to_string(), "ping".to_string()))
+        );
+        // Prompt is empty only when the whole input is the schedule.
+        assert_eq!(split("every 2h"), Some(("every 2h".to_string(), String::new())));
+        // Non-schedules (the old looks_like_schedule false-negative class
+        // is gone, but genuine non-schedules still fall through to usage).
+        assert_eq!(split("definitely-not-a-schedule"), None);
+        assert_eq!(split(""), None);
     }
 
     #[test]

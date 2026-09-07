@@ -220,7 +220,12 @@ pub fn dense_scan(
 
     // Parallel decode + dot product; collect preserves row order so any
     // error surfaced is deterministic (first corrupt row in scan order).
-    let scored: Result<Vec<DenseCandidate>, ScanError> = rows
+    // A correct-length BLOB can still decode to non-finite values (NaN
+    // scale prefix in int8, NaN f32 words) — such a row is corrupt and is
+    // SKIPPED (counted), never surfaced: total_cmp orders NaN greatest, so
+    // a NaN candidate would take a top-k slot ahead of every real hit.
+    let corrupt_scores = std::sync::atomic::AtomicUsize::new(0);
+    let scored: Result<Vec<Option<DenseCandidate>>, ScanError> = rows
         .par_iter()
         .map(|r| {
             if r.dim != q_dim {
@@ -238,14 +243,25 @@ pub fn dense_scan(
                 }
             })?;
             // Both sides unit-length ⇒ dot == cosine.
-            let score = v.iter().zip(&q).map(|(a, b)| a * b).sum();
-            Ok(DenseCandidate {
+            let score: f32 = v.iter().zip(&q).map(|(a, b)| a * b).sum();
+            if !score.is_finite() {
+                corrupt_scores.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(None);
+            }
+            Ok(Some(DenseCandidate {
                 chunk_id: r.chunk_id.clone(),
                 score,
-            })
+            }))
         })
         .collect();
-    let mut candidates = scored?;
+    // Fold the Option layer away (None = skipped non-finite row).
+    let mut candidates: Vec<DenseCandidate> = scored?.into_iter().flatten().collect();
+    let corrupt_scores = corrupt_scores.into_inner();
+    if corrupt_scores > 0 {
+        eprintln!(
+            "[joey neurocode] dense scan skipped {corrupt_scores} non-finite vector row(s)"
+        );
+    }
 
     // Deterministic top-k: score desc, then chunk_id lexical asc.
     candidates.sort_by(|a, b| {
@@ -494,6 +510,35 @@ mod tests {
         let filtered = dense_scan(&conn, &[1.0, 0.0], 10, false).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].chunk_id, "sym");
+    }
+
+    /// Non-finite DECODED values (NaN f32 words, NaN int8 scale) are
+    /// corrupt rows: SKIPPED (counted), never surfaced and never an error
+    /// — total_cmp orders NaN greatest, so a NaN candidate would steal a
+    /// top-k slot ahead of every real hit.
+    #[test]
+    fn non_finite_rows_are_skipped_not_surfaced_nor_errors() {
+        let conn = test_db();
+        // Healthy row: unit vector along the query axis.
+        insert_chunk(&conn, "good", "symbol");
+        insert_vector(&conn, "good", 2, "f32", &encode_f32(&[1.0, 0.0]));
+        // NaN f32 words — a correct-length blob that decodes to NaN.
+        insert_chunk(&conn, "nan_f32", "symbol");
+        let nan_words: Vec<u8> = [f32::NAN, f32::NAN]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        insert_vector(&conn, "nan_f32", 2, "f32", &nan_words);
+        // NaN int8 scale prefix + benign codes.
+        insert_chunk(&conn, "nan_q8", "symbol");
+        let mut nan_q8 = f32::NAN.to_le_bytes().to_vec();
+        nan_q8.extend([0i8, 0].iter().map(|&c| c as u8));
+        insert_vector(&conn, "nan_q8", 2, "int8", &nan_q8);
+
+        let ranked = dense_scan(&conn, &[1.0, 0.0], 5, true).unwrap();
+        assert_eq!(ranked.len(), 1, "only the healthy row survives: {ranked:?}");
+        assert_eq!(ranked[0].chunk_id, "good");
+        assert!((ranked[0].score - 1.0).abs() < 1e-6);
     }
 
     #[test]

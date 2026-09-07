@@ -34,6 +34,29 @@ pub struct GoalState {
     pub set_at: String,
 }
 
+// ── Atomic write helper (VR-004 hardening, mirrors boulder.rs) ──────
+
+/// Unique sibling temp path for atomic writes: same directory (same
+/// filesystem, so rename is atomic), `.goals.json.<pid>.<thread-id>.tmp`
+/// so concurrent writers don't clobber each other's temp files.
+///
+/// Duplicated from `boulder.rs` (the same pattern there guards
+/// `boulder.json`); the helper is small and private to each module.
+fn atomic_temp_path(dest: &Path) -> std::path::PathBuf {
+    let mut name = dest.file_name().map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "goals.json".to_string());
+    name.push_str(&format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        thread_id(),
+    ));
+    dest.parent().unwrap_or_else(|| Path::new(".")).join(name)
+}
+
+fn thread_id() -> String {
+    format!("{:?}", std::thread::current().id())
+}
+
 impl GoalState {
     /// Read the goal state from a `.omo/` directory.
     /// Missing file returns None (no goal set).
@@ -45,6 +68,14 @@ impl GoalState {
     }
 
     /// Write the goal state to a `.omo/` directory.
+    ///
+    /// Atomic (mirrors `boulder.rs::BoulderState::write`): a plain
+    /// `fs::write` truncates the target and streams bytes, so a crash
+    /// mid-write corrupts `goals.json` (silently read as `None` on the
+    /// next load). Instead: write to a uniquely named temp file in the
+    /// same directory, fsync it, then rename over the target — rename
+    /// within a directory is atomic on POSIX, so readers never observe
+    /// a partial file.
     pub fn write(&self, omo_dir: &Path) -> std::io::Result<()> {
         let path = omo_dir.join("goals.json");
         if let Some(parent) = path.parent() {
@@ -52,7 +83,25 @@ impl GoalState {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+
+        use std::io::Write;
+        let tmp = atomic_temp_path(&path);
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            // Write + fsync the temp file BEFORE renaming so the renamed
+            // file's contents are durable, not just its directory entry.
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+        }
+        // Rename over the destination. On Windows, rename onto an existing
+        // file fails, so remove first — the small window is fine here
+        // because the replacement is a complete, fsynced file.
+        #[cfg(windows)]
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
     }
 
     /// Clear (remove) the goal state file.
@@ -280,5 +329,46 @@ mod tests {
         .unwrap();
         let goal = GoalState::read(omo).unwrap();
         assert!(goal.subgoals.is_empty());
+    }
+
+    /// #12 regression: `write` is atomic — it writes a sibling temp file,
+    /// fsyncs, and renames over the target, so a crash mid-write can never
+    /// leave a truncated `goals.json` (which would silently read as `None`).
+    /// Metaphor for surviving interruption: after every write the directory
+    /// holds exactly one complete, parseable `goals.json` and zero temp
+    /// litter; an overwrite replaces the previous content wholesale.
+    #[test]
+    fn goal_write_is_atomic_temp_fsync_rename() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let omo = dir.path();
+
+        let goal = GoalState::new("s1".into(), "first objective".into());
+        goal.write(omo).unwrap();
+
+        // Temp file is gone (renamed into place), target parses completely.
+        let leftovers: Vec<_> = std::fs::read_dir(omo)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+        assert_eq!(GoalState::read(omo).unwrap().objective, "first objective");
+
+        // Overwrite: the rename path must replace the previous file whole —
+        // a reader between writes only ever sees the old OR the new content.
+        let goal2 = GoalState::new("s2".into(), "second objective".into());
+        goal2.write(omo).unwrap();
+        let back = GoalState::read(omo).unwrap();
+        assert_eq!(back.objective, "second objective");
+        assert_eq!(back.session_id, "s2");
+
+        // Still exactly one non-temp file: goals.json itself.
+        let files: Vec<String> = std::fs::read_dir(omo)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, vec!["goals.json".to_string()]);
     }
 }

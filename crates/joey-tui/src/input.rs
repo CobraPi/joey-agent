@@ -9,6 +9,8 @@
 //! offsets are derived at the edit site so multibyte input (é, emoji, CJK)
 //! can never split a UTF-8 boundary.
 
+use unicode_width::UnicodeWidthChar;
+
 /// Byte offset of character index `col` in `line` (end of line if past it).
 fn byte_idx(line: &str, col: usize) -> usize {
     line.char_indices().nth(col).map(|(i, _)| i).unwrap_or(line.len())
@@ -346,11 +348,41 @@ impl Input {
     /// Compute the visible scroll offset so the cursor stays on screen given
     /// a viewport of `height` rows × `width` content columns.
     /// Returns (first_visible_line, first_visible_char_col).
+    ///
+    /// Review finding #5: `width` is a display-CELL budget (the consumer,
+    /// widgets.rs draw_input, crops by summed unicode widths), so the
+    /// horizontal offset must be computed in the same unit. Walking char
+    /// indices against `width` drifted with wide glyphs (CJK/emoji occupy
+    /// two cells but one char): the tail-keep window under- or over-shot,
+    /// letting the rendered cursor escape the box. Here we walk chars left
+    /// of the cursor summing their display widths until everything from the
+    /// crop start to the cursor fits the budget — cell-consistent with both
+    /// the crop and the cursor-column math in the consumer.
     pub fn view_offset(&self, height: usize, width: usize) -> (usize, usize) {
         let h = height.max(1);
         let first = self.cursor_line.saturating_sub(h - 1);
         let w = width.max(1);
-        let x = if self.cursor_col >= w { self.cursor_col + 1 - w } else { 0 };
+        let line: Vec<char> = self.lines[self.cursor_line].chars().collect();
+        let cur = self.cursor_col.min(line.len());
+        // Display width of the char window [x, cur): the crop start x is a
+        // CHAR index (the consumer crops with chars().skip(x_off)).
+        let width_of = |x: usize| -> usize {
+            line[x..cur].iter().map(|c| c.width().unwrap_or(0)).sum()
+        };
+        // Cells needed by the char under the cursor (the cursor renders on
+        // it); the cursor's own empty cell (1) at end-of-line / zero-width.
+        let char_cell_need = line
+            .get(cur)
+            .map(|c| c.width().unwrap_or(0))
+            .filter(|w| *w > 0)
+            .unwrap_or(1);
+        // Smallest x whose tail window fits the cell budget; keep at least
+        // one char under the cursor when the cursor char itself is wider
+        // than the whole budget (degenerate narrow viewport).
+        let mut x = 0;
+        while x < cur && width_of(x) + char_cell_need > w {
+            x += 1;
+        }
         (first, x)
     }
 
@@ -589,5 +621,75 @@ mod tests {
         i.insert_char('\x07'); // BEL
         i.insert_char('b');
         assert_eq!(i.text(), "ab");
+    }
+
+    /// Review finding #5 (ASCII sanity): for single-cell glyphs the
+    /// display-cell math must reproduce the legacy char-index math —
+    /// no crop while the line fits, tail-window crop when it doesn't.
+    #[test]
+    fn view_offset_ascii_matches_legacy_math() {
+        let mut i = Input::new();
+        i.insert_str("hello"); // cursor at end (col 5)
+        assert_eq!(i.view_offset(10, 10), (0, 0), "fits: no crop");
+        assert_eq!(i.view_offset(10, 8), (0, 0));
+        assert_eq!(
+            i.view_offset(10, 3),
+            (0, 3),
+            "tail window keeps the cursor in the box"
+        );
+    }
+
+    /// Review finding #5: wide glyphs (CJK = 2 cells per char) must not
+    /// let the rendered cursor escape the cell budget — the crop start is
+    /// chosen so window [x, cursor) + the cursor's own cell(s) fit `width`
+    /// cells, matching the consumer's (widgets.rs draw_input) summed-width
+    /// crop. The old char-index math returned x=1 here, leaving an 8-cell
+    /// window in a 5-cell box.
+    #[test]
+    fn view_offset_wide_glyphs_keep_cursor_in_cell_budget() {
+        let mut i = Input::new();
+        i.insert_str("漢漢漢漢漢"); // 5 chars = 10 cells, cursor col 5
+        let (_line, x) = i.view_offset(10, 5);
+        let window_cells: usize = "漢漢漢漢漢"
+            .chars()
+            .skip(x)
+            .map(|c| c.width().unwrap_or(0))
+            .sum();
+        assert!(
+            window_cells + 1 <= 5,
+            "window ({window_cells} cells) + cursor cell must fit the 5-cell budget (x={x})"
+        );
+        // Minimal crop: exactly two wide chars fit ahead of the cursor.
+        assert_eq!(x, 3);
+    }
+
+    /// Review finding #5 (mixed widths): the crop start is the smallest
+    /// char index whose window-to-cursor display width fits the budget.
+    #[test]
+    fn view_offset_mixed_width_line_uses_minimal_crop() {
+        let mut i = Input::new();
+        i.insert_str("ab漢漢cd"); // cells 1+1+2+2+1+1 = 8, cursor col 6
+        let (_l, x) = i.view_offset(10, 5);
+        let width: usize = "ab漢漢cd"
+            .chars()
+            .skip(x)
+            .map(|c| c.width().unwrap_or(0))
+            .sum();
+        assert!(width + 1 <= 5, "window+cursor fits (x={x}, width={width})");
+        assert_eq!(x, 3, "minimal crop start: 漢cd (4 cells) + cursor");
+    }
+
+    /// Review finding #5 (degenerate narrow viewport): when the char under
+    /// the cursor is wider than the whole budget, keep at least that char
+    /// visible — the crop pins at the cursor rather than past it.
+    #[test]
+    fn view_offset_narrower_than_cursor_char_keeps_cursor_visible() {
+        let mut i = Input::new();
+        i.insert_str("a漢"); // cursor col 2 (on 漢, 2 cells), budget 1
+        let (_l, x) = i.view_offset(10, 1);
+        assert_eq!(
+            x, 2,
+            "crop pinned at the cursor: the wide char itself stays visible"
+        );
     }
 }

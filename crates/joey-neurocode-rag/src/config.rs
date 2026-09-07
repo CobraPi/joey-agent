@@ -120,6 +120,10 @@ pub const DEFAULT_RELATION_MAX_DEPTH: i64 = 2;
 pub const RELATION_MAX_DEPTH_MIN: i64 = 0;
 pub const RELATION_MAX_DEPTH_MAX: i64 = 2;
 pub const DEFAULT_QUANTIZE_THRESHOLD: i64 = 100000;
+/// Refresh budgets are floors: 0 files / 0 bytes would stall every
+/// refresh forever (nothing ever indexed) while looking like a valid
+/// configuration, so the values clamp to at least 1.
+pub const REFRESH_MAX_PER_TURN_MIN: i64 = 1;
 pub const DEFAULT_REFRESH_MAX_FILES_PER_TURN: i64 = 50;
 pub const DEFAULT_REFRESH_MAX_BYTES_PER_TURN: i64 = 52428800;
 pub const DEFAULT_TIMEOUT_SECS: i64 = 30;
@@ -355,10 +359,16 @@ impl RagConfig {
             include_fallback_chunks: config.get_bool(KEY_INCLUDE_FALLBACK_CHUNKS, true),
             quantize_threshold: config.get_i64(KEY_QUANTIZE_THRESHOLD, DEFAULT_QUANTIZE_THRESHOLD),
             prefetch_enabled: config.get_bool(KEY_PREFETCH_ENABLED, false),
-            refresh_max_files_per_turn: config
-                .get_i64(KEY_REFRESH_MAX_FILES_PER_TURN, DEFAULT_REFRESH_MAX_FILES_PER_TURN),
-            refresh_max_bytes_per_turn: config
-                .get_i64(KEY_REFRESH_MAX_BYTES_PER_TURN, DEFAULT_REFRESH_MAX_BYTES_PER_TURN),
+            refresh_max_files_per_turn: clamp_i64(
+                config.get_i64(KEY_REFRESH_MAX_FILES_PER_TURN, DEFAULT_REFRESH_MAX_FILES_PER_TURN),
+                REFRESH_MAX_PER_TURN_MIN,
+                i64::MAX,
+            ),
+            refresh_max_bytes_per_turn: clamp_i64(
+                config.get_i64(KEY_REFRESH_MAX_BYTES_PER_TURN, DEFAULT_REFRESH_MAX_BYTES_PER_TURN),
+                REFRESH_MAX_PER_TURN_MIN,
+                i64::MAX,
+            ),
             timeout_secs: config.get_i64(KEY_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS),
             copilot_model,
             copilot_provider_active,

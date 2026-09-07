@@ -31,20 +31,20 @@ pub fn classify(_feature_id: &str, artifact: &str, node: &CstNode) -> Option<Sem
         // List-item patterns (requirements, tasks, success criteria, checks,
         // key entities, checkpoints).
         (CstKind::ListItem, CstProps::ListItem { text, .. }) => {
-            classify_list_item(text)?
+            classify_list_item(text, &origin)?
         }
         // Paragraphs: clarify markers, GWT scenarios, technical-context fields,
         // checkpoint lines.
         (CstKind::Paragraph, CstProps::Paragraph { text }) => {
-            classify_paragraph(text)?
+            classify_paragraph(text, &origin)?
         }
         // Table rows in plan.md: Constitution Check rows and Complexity Tracking
         // rows are classified at the row level (graph.rs handles the table
         // structure; here we handle the row when it arrives with enough text).
-        (CstKind::TableRow, _) => classify_table_row(node)?,
+        (CstKind::TableRow, _) => classify_table_row(node, artifact)?,
         // Code fences: project structure trees (plan.md).
         (CstKind::CodeFence { .. }, CstProps::CodeFence { content }) => {
-            classify_code_fence(content, node)?
+            classify_code_fence(content, node, artifact)?
         }
         // Table cells in isolation are not classified (handled at row level).
         // Inline tags, raw ranges: not classified.
@@ -106,7 +106,9 @@ fn classify_heading(text: &str) -> Option<(SemanticKind, SemanticProps, Semantic
 }
 
 /// Classify a list-item text. Returns (kind, props, semantic_id).
-fn classify_list_item(text: &str) -> Option<(SemanticKind, SemanticProps, SemanticId)> {
+/// `origin` supplies the document position used to derive deterministic
+/// auto-ids (see `auto_id`).
+fn classify_list_item(text: &str, origin: &NodeOrigin) -> Option<(SemanticKind, SemanticProps, SemanticId)> {
     let trimmed = text.trim_start();
 
     // `- **FR-NNN**: ...` (requirement)
@@ -179,7 +181,7 @@ fn classify_list_item(text: &str) -> Option<(SemanticKind, SemanticProps, Semant
         return Some((
             SemanticKind::AcceptanceScenario,
             SemanticProps::AcceptanceScenario { given, when, then },
-            sid("acceptance_scenario", &auto_number()),
+            sid("acceptance_scenario", &auto_id("scenario", origin)),
         ));
     }
 
@@ -187,8 +189,9 @@ fn classify_list_item(text: &str) -> Option<(SemanticKind, SemanticProps, Semant
 }
 
 /// Classify a paragraph text (clarify markers, technical-context fields,
-/// checkpoint lines, entity prose).
-fn classify_paragraph(text: &str) -> Option<(SemanticKind, SemanticProps, SemanticId)> {
+/// checkpoint lines, entity prose). `origin` supplies the document position
+/// used to derive deterministic auto-ids.
+fn classify_paragraph(text: &str, origin: &NodeOrigin) -> Option<(SemanticKind, SemanticProps, SemanticId)> {
     // `[NEEDS CLARIFICATION: ...]`
     if let Some(marker_text) = extract_clarify_marker(text) {
         return Some((
@@ -197,7 +200,7 @@ fn classify_paragraph(text: &str) -> Option<(SemanticKind, SemanticProps, Semant
                 text: marker_text,
                 owning_requirement: None,
             },
-            sid("clarify", &auto_number()),
+            sid("clarify", &auto_id("clarify", origin)),
         ));
     }
 
@@ -209,7 +212,7 @@ fn classify_paragraph(text: &str) -> Option<(SemanticKind, SemanticProps, Semant
                 label,
                 blocking: Some(true),
             },
-            sid("checkpoint", &auto_number()),
+            sid("checkpoint", &auto_id("checkpoint", origin)),
         ));
     }
 
@@ -385,10 +388,34 @@ fn parse_task_body(text: &str) -> (bool, Vec<String>, bool, String) {
     let parallel = after_checkbox.contains("[P]");
     let description = after_checkbox.to_string();
 
-    // Target files: look for "in path" or backtick-quoted paths.
-    let target_files = Vec::new(); // simplified — graph builder enriches
+    // Target files: extract inline-code file paths (`crates/foo/src/bar.rs`)
+    // from the description — same logic as parser::tasks::extract_target_files
+    // (parser/tasks.rs), which the graph builder cannot reach from here
+    // without re-deriving the description from bytes. This populates
+    // Task.target_files so Changes edges (graph.rs) can emit.
+    let target_files = extract_target_files_from_description(&description);
 
     (parallel, target_files, completed, description)
+}
+
+/// Extract inline-code file paths (`` `crates/foo/src/bar.rs` ``) as target
+/// files. Port of `parser::tasks::extract_target_files` (parser/tasks.rs).
+fn extract_target_files_from_description(description: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut start: Option<usize> = None;
+    for (idx, ch) in description.char_indices() {
+        if ch == '`' {
+            if let Some(s) = start.take() {
+                let candidate = &description[s..idx];
+                if candidate.contains('/') || candidate.ends_with(".rs") || candidate.ends_with(".md") {
+                    files.push(candidate.to_string());
+                }
+            } else {
+                start = Some(idx + 1);
+            }
+        }
+    }
+    files
 }
 
 fn extract_story_ref(description: &str) -> Option<SemanticId> {
@@ -527,7 +554,7 @@ fn extract_technical_context_field(text: &str) -> Option<(String, String)> {
 /// Classify a Constitution Check or Complexity Tracking table row. Reads the
 /// row's expected_bytes (the raw markdown) because pulldown-cmark gives us
 /// `TableRow` nodes whose cell text is embedded in the bytes.
-fn classify_table_row(node: &CstNode) -> Option<(SemanticKind, SemanticProps, SemanticId)> {
+fn classify_table_row(node: &CstNode, artifact: &str) -> Option<(SemanticKind, SemanticProps, SemanticId)> {
     let bytes = &node.expected_bytes;
     // Split on `|` to get the cells. Skip leading/trailing empty cells
     // produced by leading/trailing `|`.
@@ -571,7 +598,7 @@ fn classify_table_row(node: &CstNode) -> Option<(SemanticKind, SemanticProps, Se
                     why_needed: cells[1].to_string(),
                     rejected_alternative: cells[2].to_string(),
                 },
-                sid("violation", &auto_id_from_text(&rule)),
+                sid("violation", &auto_id_from_text(&rule, node, artifact)),
             ));
         }
     }
@@ -584,7 +611,7 @@ fn classify_table_row(node: &CstNode) -> Option<(SemanticKind, SemanticProps, Se
 /// iterates the rest. For the single-node `classify()` contract, we emit a
 /// single ProjectStructureNode whose props carry the full tree (the frontend
 /// tree-diff widget renders it).
-fn classify_code_fence(content: &str, node: &CstNode) -> Option<(SemanticKind, SemanticProps, SemanticId)> {
+fn classify_code_fence(content: &str, node: &CstNode, artifact: &str) -> Option<(SemanticKind, SemanticProps, SemanticId)> {
     // Only treat `text` fences (or unlabeled fences) as project structures.
     // A `rust`/`json` fence is content, not a structure tree.
     let lang = match &node.kind {
@@ -599,7 +626,7 @@ fn classify_code_fence(content: &str, node: &CstNode) -> Option<(SemanticKind, S
     if !looks_like_project_tree(content) {
         return None;
     }
-    let id = sid("proj_structure", &auto_id_from_text(&node.expected_bytes));
+    let id = sid("proj_structure", &auto_id_from_text(&node.expected_bytes, node, artifact));
     Some((SemanticKind::ProjectStructureNode, SemanticProps::None, id))
 }
 
@@ -644,8 +671,10 @@ fn is_separator_row(cells: &[&str]) -> bool {
 }
 
 /// Derive a short, stable id from free-form text (used for violations and
-/// structure nodes that don't carry an explicit id).
-fn auto_id_from_text(text: &str) -> String {
+/// structure nodes that don't carry an explicit id). When the text yields no
+/// usable slug, fall back to the deterministic position-based `auto_id`
+/// (never a process-global counter — ids must be rebuild-stable).
+fn auto_id_from_text(text: &str, node: &CstNode, artifact: &str) -> String {
     let lowered = text.to_lowercase();
     let slug: String = lowered
         .chars()
@@ -654,7 +683,15 @@ fn auto_id_from_text(text: &str) -> String {
         .collect();
     let trimmed = slug.trim_matches('-').to_string();
     if trimmed.is_empty() {
-        auto_number()
+        auto_id(
+            "text",
+            &NodeOrigin {
+                artifact: artifact.to_string(),
+                node: node.id,
+                byte_start: node.byte_start,
+                byte_end: node.byte_end,
+            },
+        )
     } else {
         trimmed
     }
@@ -681,11 +718,15 @@ pub(crate) fn extract_requirement_refs_from_text(text: &str) -> Vec<String> {
     refs
 }
 
-fn auto_number() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("auto-{n}")
+/// Derive a deterministic auto id for nodes without an explicit semantic id.
+/// Keyed by artifact + byte position — stable per document position, so a
+/// rebuild over identical documents yields identical ids (regression-tested
+/// in graph.rs: `rebuild_determinism_*`). Replaces the former process-global
+/// `AtomicU64` counter, which produced different ids per build and broke
+/// id-keyed caching/diffing.
+fn auto_id(kind: &str, origin: &NodeOrigin) -> String {
+    let artifact = origin.artifact.rsplit('/').next().unwrap_or(&origin.artifact);
+    format!("auto-{kind}-{artifact}-{}", origin.byte_start)
 }
 
 #[cfg(test)]

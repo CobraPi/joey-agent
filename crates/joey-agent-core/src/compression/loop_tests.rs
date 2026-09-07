@@ -412,6 +412,66 @@ async fn e2e_three_attempt_cap() {
     );
 }
 
+// ── Output-cap detour has its own budget (review #10) ───────────────────
+
+/// Three pure output-cap adjustments must NOT burn the shared
+/// compression_attempts budget: a subsequent genuine input-overflow still
+/// gets its compression attempts and recovers. Previously the detour
+/// incremented compression_attempts, so the follow-up overflow Fataled
+/// with "max compression attempts reached" although compression had never
+/// been attempted.
+#[tokio::test(start_paused = true)]
+async fn e2e_output_cap_adjustments_do_not_burn_compression_budget() {
+    let _l = lock();
+    let cap_err = || {
+        Err(ProviderError::ContextOverflow(
+            "max_tokens is too large: 200000. This model supports at most 8192 output tokens. \
+             Request had available_tokens: 8192."
+                .to_string(),
+        ))
+    };
+    let overflow = || {
+        Err(ProviderError::from_status(
+            400,
+            "the input exceeds the context window",
+            None,
+        ))
+    };
+    let mut fx = fixture(vec![
+        cap_err(),
+        cap_err(),
+        cap_err(),
+        overflow(),
+        Ok(text_resp("ok")),
+    ]);
+    seed_history(&mut fx.agent, 60);
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let result = fx.agent.run_turn("go", tx).await;
+    assert_eq!(result.final_text, "ok");
+    assert!(!result.fatal, "turn must recover, not Fatal");
+    // 3 output-cap retries + 1 overflow (compressed) + 1 success.
+    assert_eq!(fx.transport.request_count(), 5, "3 cap + 1 overflow + 1 ok");
+    let ns = notices(&drain(&mut rx));
+    assert!(
+        ns.iter().any(|n| n.starts_with("⚠️  Output cap too large")),
+        "{:?}",
+        ns
+    );
+    // The genuine overflow DID get to compress on its own untouched budget.
+    assert!(
+        ns.iter().any(|n| n.starts_with("🗜️ Context too large")),
+        "{:?}",
+        ns
+    );
+    // ...and the compression-attempts Fatal never fired.
+    assert!(
+        !ns.iter().any(|n| n.contains("Max compression attempts")),
+        "{:?}",
+        ns
+    );
+}
+
 // ── Context probe: provider-reported limit updates the compressor ───────
 
 #[tokio::test(start_paused = true)]

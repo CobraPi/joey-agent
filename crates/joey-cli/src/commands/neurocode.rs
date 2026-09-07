@@ -556,6 +556,13 @@ fn expected_files_from_manifest(
 
     let mut out: Vec<(String, String)> = Vec::new();
     for (name, hash) in files {
+        // A compromised mirror must not write outside the fetch root:
+        // artifact names must be bare file names (no '/', '\', '..', '').
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+            return Err(format!(
+                "manifest entry '{name}' for '{profile}' must be a bare file name"
+            ));
+        }
         let h = hash
             .as_str()
             .ok_or_else(|| format!("manifest entry '{name}' for '{profile}' is not a hash string"))?
@@ -2761,6 +2768,41 @@ mod model_fetch_tests {
         assert!(expected_files_from_manifest(&non_obj, "p1").is_err());
         let not_manifest = serde_json::json!([1, 2]);
         assert!(expected_files_from_manifest(&not_manifest, "p1").is_err());
+    }
+
+    /// Regression (#11): manifest artifact names must be bare file names —
+    /// path-carrying names ('../x', '/abs', 'a/b', 'a\\b', '..') and the
+    /// empty name are refused BEFORE any download/mirror copy; a bare name
+    /// like 'model.graphml' is accepted.
+    #[test]
+    fn manifest_refuses_path_carrying_artifact_names() {
+        let mk = |name: &str| {
+            let mut entry = serde_json::Map::new();
+            entry.insert(MODEL_FILE.to_string(), serde_json::json!("a".repeat(64)));
+            entry.insert(TOKENIZER_FILE.to_string(), serde_json::json!("b".repeat(64)));
+            entry.insert(name.to_string(), serde_json::json!("c".repeat(64)));
+            serde_json::json!({ "profiles": { "p1": entry } })
+        };
+        for bad in ["../x", "/abs", "a/b", "a\\b", "..", ""] {
+            let err = expected_files_from_manifest(&mk(bad), "p1")
+                .err()
+                .unwrap_or_else(|| panic!("artifact name '{bad:?}' must be refused"));
+            assert!(
+                err.contains(bad) || bad.is_empty(),
+                "refusal must name the artifact: {err} (artifact {bad:?})"
+            );
+            assert!(err.contains("bare file name"), "refusal reason: {err}");
+        }
+        // Bare extra names are accepted (existing behavior, now pinned).
+        let ok = serde_json::json!({
+            "profiles": { "p1": {
+                MODEL_FILE: "a".repeat(64),
+                TOKENIZER_FILE: "b".repeat(64),
+                "model.graphml": "c".repeat(64),
+            } }
+        });
+        let files = expected_files_from_manifest(&ok, "p1").unwrap();
+        assert!(files.iter().any(|(n, _)| n == "model.graphml"));
     }
 
     /// Staged-verification refusal logic, server-less.

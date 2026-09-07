@@ -83,6 +83,15 @@ impl DependencyGraph {
         Ok(deleted)
     }
 
+    /// Purge pass: permanently DELETE every node previously marked Deleted
+    /// (and its edges). Runs at the same cadence as the tombstone pass —
+    /// tombstoned rows for renamed/removed files are removed for good so
+    /// the unique key (fqcn, kind, source_path) lets renamed paths insert
+    /// cleanly and the DB doesn't grow unboundedly.
+    pub fn purge_deleted_paths(&self) -> rusqlite::Result<usize> {
+        self.store.purge_deleted_paths()
+    }
+
     /// FTS5 search over artifact symbols.
     pub fn query_fts(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<CodeArtifactNode>> {
         self.store.query_fts(query, limit)

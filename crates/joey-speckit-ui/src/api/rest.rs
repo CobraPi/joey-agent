@@ -1,7 +1,7 @@
 //! REST endpoints per `contracts/speckit-ui-api.md`.
 
 use axum::{
-    extract::{Path as AxPath, State},
+    extract::{FromRequest, Path as AxPath, Request, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, patch, post},
@@ -104,9 +104,118 @@ pub fn routes() -> Router<AppState> {
         .route("/api/features/:id/meaning/clarify/:marker_id/answer", post(post_clarify_answer_012))
 }
 
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn test_router() -> (Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let feature_dir = dir.path().join("specs").join("001-test");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        std::fs::write(
+            feature_dir.join("spec.md"),
+            "# Spec\n\n- **FR-001**: Must do a thing.\n",
+        )
+        .unwrap();
+        (routes().with_state(AppState::new(dir.path().to_path_buf())), dir)
+    }
+
+    async fn send(app: &Router, body: &'static str) -> (axum::http::StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(Method::PATCH)
+            .uri("/api/features/001-test/spec")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        (status, json)
+    }
+
+    /// Malformed JSON syntax must produce the `{error,message}` envelope,
+    /// not axum's default plain-text rejection body (400).
+    #[tokio::test]
+    async fn malformed_json_body_returns_error_envelope() {
+        let (app, _dir) = test_router();
+        let (status, json) = send(&app, "{ not json").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "invalid_json", "body was: {json}");
+        assert!(
+            json["message"].as_str().unwrap().contains("invalid JSON request body"),
+            "body was: {json}"
+        );
+    }
+
+    /// Syntactically valid JSON that fails to deserialize into the handler's
+    /// request type keeps axum's 422 but uses the envelope (400/422 both
+    /// enveloped; the status comes from the rejection itself).
+    #[tokio::test]
+    async fn wrong_shape_json_body_returns_error_envelope() {
+        let (app, _dir) = test_router();
+        let (status, json) = send(&app, r#"{ "unexpected": true }"#).await;
+        assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["error"], "invalid_json", "body was: {json}");
+        assert!(json["message"].is_string(), "body was: {json}");
+    }
+
+    /// A well-formed request still reaches the handler normally.
+    #[tokio::test]
+    async fn valid_json_body_still_reaches_handler() {
+        let (app, dir) = test_router();
+        let current = std::fs::read_to_string(dir.path().join("specs/001-test/spec.md")).unwrap();
+        let hash = crate::conflict::content_hash(&current);
+        let body = format!(
+            "{{\"target\":{{\"id\":\"FR-001\"}},\"new_text\":\"- **FR-001**: Updated.\",\"based_on_hash\":\"{hash}\"}}"
+        );
+        let (status, json) = send(&app, body.leak()).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "body was: {json}");
+        assert!(json.get("content_hash").is_some(), "body was: {json}");
+    }
+}
+
 /// Shared error body shape: `{ "error": ..., "message": ... }`.
 fn error_body(code: &str, message: impl Into<String>) -> Json<serde_json::Value> {
     Json(json!({ "error": code, "message": message.into() }))
+}
+
+/// JSON body extractor whose rejections use the shared `{error,message}`
+/// envelope instead of axum's built-in plain-text rejection bodies.
+///
+/// `Json<T>`'s default rejection short-circuits the handler with a bare
+/// text body (`Failed to parse the request body as JSON...`), bypassing the
+/// API error envelope every other error path uses. This wrapper delegates
+/// to `Json<T>` and maps any `JsonRejection` to
+/// `error_body("invalid_json", ...)` while keeping the rejection's own
+/// status code (400 syntax / 422 data mismatch / 415 missing content-type).
+pub struct ApiJson<T>(pub T);
+
+#[async_trait::async_trait]
+impl<T, S> FromRequest<S> for ApiJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = axum::response::Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => Err((
+                rejection.status(),
+                error_body(
+                    "invalid_json",
+                    format!("invalid JSON request body: {}", rejection.body_text()),
+                ),
+            )
+                .into_response()),
+        }
+    }
 }
 
 /// Path-traversal guard rejection (same shape `post_patch` already uses):
@@ -316,7 +425,7 @@ struct PatchSpecRequest {
 async fn patch_spec(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
-    Json(body): Json<PatchSpecRequest>,
+    ApiJson(body): ApiJson<PatchSpecRequest>,
 ) -> impl IntoResponse {
     if !crate::parser::discovery::is_safe_feature_id(&id) {
         return invalid_feature_id();
@@ -394,7 +503,7 @@ struct PatchTaskRequest {
 async fn patch_task(
     State(state): State<AppState>,
     AxPath((id, task_id)): AxPath<(String, String)>,
-    Json(body): Json<PatchTaskRequest>,
+    ApiJson(body): ApiJson<PatchTaskRequest>,
 ) -> impl IntoResponse {
     if !crate::parser::discovery::is_safe_feature_id(&id) {
         return invalid_feature_id();
@@ -512,7 +621,7 @@ struct ClarifyAnswerRequest {
 async fn post_clarify_answer(
     State(_state): State<AppState>,
     AxPath((id, _session_id)): AxPath<(String, String)>,
-    Json(_body): Json<ClarifyAnswerRequest>,
+    ApiJson(_body): ApiJson<ClarifyAnswerRequest>,
 ) -> impl IntoResponse {
     // Path-traversal guard (see post_patch).
     if !crate::parser::discovery::is_safe_feature_id(&id) {
@@ -650,7 +759,7 @@ struct InitRequest {
 #[tracing::instrument(skip(state))]
 async fn post_init(
     State(state): State<AppState>,
-    Json(body): Json<InitRequest>,
+    ApiJson(body): ApiJson<InitRequest>,
 ) -> impl IntoResponse {
     match commands::run_init(&state.repo_root, &body.integration, &body.script).await {
         Ok(result) => (
@@ -806,7 +915,7 @@ impl Default for PatchScope {
 async fn patch_artifact(
     State(state): State<AppState>,
     AxPath((id, path)): AxPath<(String, String)>,
-    Json(body): Json<PatchArtifactRequest>,
+    ApiJson(body): ApiJson<PatchArtifactRequest>,
 ) -> impl IntoResponse {
     if !crate::parser::discovery::is_safe_feature_id(&id) {
         return invalid_feature_id();
@@ -1007,7 +1116,7 @@ struct OverrideRequest {
 async fn put_step_override(
     State(state): State<AppState>,
     AxPath((id, step)): AxPath<(String, String)>,
-    Json(body): Json<OverrideRequest>,
+    ApiJson(body): ApiJson<OverrideRequest>,
 ) -> impl IntoResponse {
     if !crate::parser::discovery::is_safe_feature_id(&id) {
         return invalid_feature_id();
@@ -1057,7 +1166,7 @@ struct RunRequest {
 async fn post_workflow_run(
     State(state): State<AppState>,
     AxPath((id, step)): AxPath<(String, String)>,
-    Json(body): Json<RunRequest>,
+    ApiJson(body): ApiJson<RunRequest>,
 ) -> impl IntoResponse {
     if !crate::parser::discovery::is_safe_feature_id(&id) {
         return invalid_feature_id();
@@ -1273,7 +1382,7 @@ struct AnswerRequest {
 async fn post_attempt_answer(
     State(state): State<AppState>,
     AxPath(attempt_id): AxPath<String>,
-    Json(body): Json<AnswerRequest>,
+    ApiJson(body): ApiJson<AnswerRequest>,
 ) -> impl IntoResponse {
     tracing::info!(attempt = %attempt_id, interaction = %body.interaction_id, "answer received");
 
@@ -1314,7 +1423,7 @@ struct ApproveRequest {
 async fn post_attempt_approve(
     State(state): State<AppState>,
     AxPath(attempt_id): AxPath<String>,
-    Json(body): Json<ApproveRequest>,
+    ApiJson(body): ApiJson<ApproveRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
         attempt = %attempt_id,
@@ -1500,7 +1609,7 @@ struct ApplyRequest {
 async fn post_changes_apply(
     State(state): State<AppState>,
     AxPath(attempt_id): AxPath<String>,
-    Json(body): Json<ApplyRequest>,
+    ApiJson(body): ApiJson<ApplyRequest>,
 ) -> impl IntoResponse {
     tracing::info!(attempt = %attempt_id, apply_all = body.apply_all_accepted, "apply requested");
 
@@ -1624,7 +1733,7 @@ async fn get_preferences(
 async fn put_preferences(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
-    Json(body): Json<crate::model::WorkspacePreference>,
+    ApiJson(body): ApiJson<crate::model::WorkspacePreference>,
 ) -> impl IntoResponse {
     if !crate::parser::discovery::is_safe_feature_id(&id) {
         return invalid_feature_id();
@@ -1752,7 +1861,7 @@ struct SetupPreviewRequest {
 #[tracing::instrument(skip(state))]
 async fn post_setup_preview(
     State(state): State<AppState>,
-    Json(req): Json<SetupPreviewRequest>,
+    ApiJson(req): ApiJson<SetupPreviewRequest>,
 ) -> impl IntoResponse {
     // Derive a slug from the brief.
     let slug_base: String = req
@@ -1808,7 +1917,7 @@ struct SetupCommitRequest {
 #[tracing::instrument(skip(state))]
 async fn post_setup_commit(
     State(state): State<AppState>,
-    Json(req): Json<SetupCommitRequest>,
+    ApiJson(req): ApiJson<SetupCommitRequest>,
 ) -> impl IntoResponse {
     // Body-controlled feature id lands in a filesystem path — validate.
     if !crate::parser::discovery::is_safe_feature_id(&req.feature_id) {
@@ -2311,7 +2420,7 @@ struct PatchRequest {
 async fn post_patch(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
-    Json(req): Json<PatchRequest>,
+    ApiJson(req): ApiJson<PatchRequest>,
 ) -> impl IntoResponse {
     // Path-traversal guard: `id` and `req.artifact` are request-controlled
     // and land in a filesystem path unchecked (percent-encoded `..` passes
@@ -2837,7 +2946,7 @@ struct ClarifyAnswerRequest012 {
 async fn post_clarify_answer_012(
     State(state): State<AppState>,
     AxPath((id, marker_id)): AxPath<(String, String)>,
-    Json(req): Json<ClarifyAnswerRequest012>,
+    ApiJson(req): ApiJson<ClarifyAnswerRequest012>,
 ) -> impl IntoResponse {
     if !crate::parser::discovery::is_safe_feature_id(&id) {
         return invalid_feature_id();
@@ -2892,7 +3001,7 @@ struct HunkAcceptRequest {
 async fn post_hunk_accept(
     State(_state): State<AppState>,
     AxPath((id, hunk_id)): AxPath<(String, String)>,
-    Json(req): Json<HunkAcceptRequest>,
+    ApiJson(req): ApiJson<HunkAcceptRequest>,
 ) -> impl IntoResponse {
     // Path-traversal guard (see post_patch).
     if !crate::parser::discovery::is_safe_feature_id(&id) {

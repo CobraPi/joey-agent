@@ -138,10 +138,26 @@ impl StagingArea for GitStagingArea {
 
     async fn checkpoint(&self, root: &StagingRoot) -> Result<Checkpoint, StagingError> {
         // git add -A && git write-tree to get a tree-ish.
-        let add_output = Command::new("git")
-            .arg("add")
-            .arg("-A")
-            .current_dir(&root.worktree)
+        //
+        // In direct mode the staging runs against a DEDICATED index file
+        // (outside the repo, so it can't stage itself into the snapshot)
+        // — `git add -A` against the user's real index would pollute it
+        // with our snapshot. Staged mode owns its temp worktree, so the
+        // worktree's own index is fine (and keeps agent-created files
+        // tracked, so later HEAD-based diffs see them).
+        let dedicated_index: Option<std::path::PathBuf> = match root.mode {
+            ChangeMode::Direct => Some(
+                std::env::temp_dir().join(format!("joey-stage-index-{}", root.attempt_id)),
+            ),
+            ChangeMode::Staged => None,
+        };
+
+        let mut add_cmd = Command::new("git");
+        add_cmd.arg("add").arg("-A").current_dir(&root.worktree);
+        if let Some(idx) = &dedicated_index {
+            add_cmd.env("GIT_INDEX_FILE", idx);
+        }
+        let add_output = add_cmd
             .output()
             .await
             .map_err(|e| StagingError::Git(format!("git add failed: {e}")))?;
@@ -153,9 +169,12 @@ impl StagingArea for GitStagingArea {
             )));
         }
 
-        let tree_output = Command::new("git")
-            .arg("write-tree")
-            .current_dir(&root.worktree)
+        let mut write_tree_cmd = Command::new("git");
+        write_tree_cmd.arg("write-tree").current_dir(&root.worktree);
+        if let Some(idx) = &dedicated_index {
+            write_tree_cmd.env("GIT_INDEX_FILE", idx);
+        }
+        let tree_output = write_tree_cmd
             .output()
             .await
             .map_err(|e| StagingError::Git(format!("git write-tree failed: {e}")))?;
@@ -165,6 +184,11 @@ impl StagingArea for GitStagingArea {
                 "git write-tree failed: {}",
                 String::from_utf8_lossy(&tree_output.stderr)
             )));
+        }
+
+        // The dedicated index was only needed to compute the tree; remove it.
+        if let Some(idx) = &dedicated_index {
+            let _ = std::fs::remove_file(idx);
         }
 
         let tree_ish = format!("sha1:{}", String::from_utf8_lossy(&tree_output.stdout).trim());
@@ -177,9 +201,14 @@ impl StagingArea for GitStagingArea {
     }
 
     async fn diff(&self, root: &StagingRoot) -> Result<ChangeSet, StagingError> {
-        // git diff --name-status to enumerate changed files.
+        // git diff <base> --name-status to enumerate changed files. The
+        // base is HEAD (not the index): checkpoint() stages everything, so
+        // a bare worktree-vs-index diff would see nothing afterwards.
+        // HEAD-based diffing shows what changed since the checkpoint.
+        let base = Self::diff_base(&root.worktree).await;
         let output = Command::new("git")
             .arg("diff")
+            .arg(&base)
             .arg("--name-status")
             .current_dir(&root.worktree)
             .output()
@@ -241,8 +270,13 @@ impl StagingArea for GitStagingArea {
         // the staging worktree itself (which already contains the changes,
         // so hunks would never land in the user's repo).
         if root.mode == ChangeMode::Staged {
+            // Diff against HEAD (not the bare worktree-vs-index diff):
+            // checkpoint() stages everything into the index, after which a
+            // bare `git diff` in the staging worktree would be empty.
+            let base = Self::diff_base(&root.worktree).await;
             let diff_output = Command::new("git")
                 .arg("diff")
+                .arg(&base)
                 .current_dir(&root.worktree)
                 .output()
                 .await
@@ -341,6 +375,48 @@ impl StagingArea for GitStagingArea {
 }
 
 impl GitStagingArea {
+    /// Resolve the base for worktree-wide diffs: HEAD when it exists, the
+    /// empty tree otherwise (unborn branch).
+    ///
+    /// A bare `git diff` compares worktree-vs-index and goes blind after
+    /// `checkpoint` staged everything; diffing against this base keeps
+    /// post-checkpoint edits visible.
+    async fn diff_base(worktree: &Path) -> String {
+        // `rev-parse --verify --quiet HEAD` fails on a repo with no commits.
+        let head = Command::new("git")
+            .arg("rev-parse")
+            .arg("--verify")
+            .arg("--quiet")
+            .arg("HEAD")
+            .current_dir(worktree)
+            .output()
+            .await;
+        if let Ok(out) = head {
+            if out.status.success() {
+                return "HEAD".to_string();
+            }
+        }
+        // Unborn branch: diff against the empty tree (`git mktree` on empty
+        // stdin yields it for either object format). stdin is /dev/null so
+        // the read hits EOF immediately.
+        let mktree = Command::new("git")
+            .arg("mktree")
+            .stdin(std::process::Stdio::null())
+            .current_dir(worktree)
+            .output()
+            .await;
+        if let Ok(out) = mktree {
+            if out.status.success() {
+                let tree = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !tree.is_empty() {
+                    return tree;
+                }
+            }
+        }
+        // Last resort: literal HEAD (a diff error then surfaces upstream).
+        "HEAD".to_string()
+    }
+
     /// Resolve the PRIMARY repo root from a staging (linked) worktree.
     ///
     /// `git rev-parse --git-common-dir` run inside a linked worktree points
@@ -383,10 +459,16 @@ impl GitStagingArea {
     }
 
     /// Get additions/removals count for a file.
+    ///
+    /// Diffs against HEAD (via `diff_base`) for the same reason as
+    /// `diff()`: after a checkpoint staged everything, a bare
+    /// worktree-vs-index `--numstat` returns empty.
     async fn diffstat(&self, worktree: &Path, path: &str) -> Result<(i32, i32), StagingError> {
+        let base = Self::diff_base(worktree).await;
         let output = Command::new("git")
             .arg("diff")
             .arg("--numstat")
+            .arg(&base)
             .arg("--")
             .arg(path)
             .current_dir(worktree)
@@ -610,6 +692,85 @@ diff --git a/alpha.md b/alpha.md
         // landed in the primary repo.)
         let primary_alpha = std::fs::read_to_string(primary.path().join("alpha.md")).unwrap();
         assert_eq!(primary_alpha, "alpha old\n");
+
+        staging.discard(&root).await.unwrap();
+    }
+
+    /// Regression (review finding 3): checkpoint() stages everything
+    /// (`git add -A`), after which a bare worktree-vs-index `git diff` is
+    /// empty. diff() must diff against HEAD so post-checkpoint edits stay
+    /// visible. Also asserts the direct-mode checkpoint uses a dedicated
+    /// index and leaves the user's shared index alone.
+    #[tokio::test]
+    async fn diff_shows_post_checkpoint_changes() {
+        let primary = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(primary.path())
+                .output()
+                .await
+                .unwrap();
+            assert!(out.status.success(), "git {:?} failed", args);
+        }
+        std::fs::write(primary.path().join("spec.md"), "line\n").unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "init"]] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(primary.path())
+                .output()
+                .await
+                .unwrap();
+            assert!(out.status.success(), "git {:?} failed", args);
+        }
+
+        let staging = GitStagingArea::new();
+        let root = staging
+            .open(
+                primary.path(),
+                "diff-cp-1",
+                ChangeMode::Direct,
+                &Scope::default(),
+            )
+            .await
+            .unwrap();
+
+        // Edit, checkpoint (stages everything), then edit FURTHER — the
+        // post-checkpoint edit must still be visible to diff().
+        std::fs::write(primary.path().join("spec.md"), "line\nline2\n").unwrap();
+        staging.checkpoint(&root).await.unwrap();
+        std::fs::write(primary.path().join("spec.md"), "line\nline2\nline3\n").unwrap();
+
+        let changes = staging.diff(&root).await.unwrap();
+        assert!(
+            changes.files.iter().any(|f| f.path == "spec.md"),
+            "post-checkpoint edit must be visible in diff(); got {:?}",
+            changes.files
+        );
+
+        // Direct-mode checkpoint must not pollute the user's shared index:
+        // spec.md must be modified-but-UNSTAGED (" M"), not staged ("M ",
+        // "MM" — which is what the old shared-index checkpoint produced).
+        let status = Command::new("git")
+            .arg("status")
+            .arg("--porcelain")
+            .current_dir(primary.path())
+            .output()
+            .await
+            .unwrap();
+        let status = String::from_utf8_lossy(&status.stdout);
+        let spec_line = status
+            .lines()
+            .find(|l| l.ends_with("spec.md"))
+            .unwrap_or_else(|| panic!("spec.md missing from status:\n{status}"));
+        assert!(
+            spec_line.starts_with(" M"),
+            "checkpoint must not stage into the shared index; status line: {spec_line:?}"
+        );
 
         staging.discard(&root).await.unwrap();
     }

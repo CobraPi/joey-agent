@@ -24,15 +24,60 @@ pub struct TodoItem {
     pub status: String,
 }
 
+/// Per-session todo list plus a last-touch timestamp for LRU eviction.
+struct SessionTodos {
+    items: Vec<TodoItem>,
+    last_touch: std::time::Instant,
+}
+
+impl Default for SessionTodos {
+    fn default() -> Self {
+        Self { items: Vec::new(), last_touch: std::time::Instant::now() }
+    }
+}
+
+/// Sessions are never explicitly ended in this process, so the global store
+/// retains at most the [`MAX_SESSIONS`] most recently touched sessions and
+/// evicts the rest (bounded memory in long-lived processes).
+const MAX_SESSIONS: usize = 64;
+
 /// Global per-session todo store (session_id → items).
-fn store() -> &'static Mutex<HashMap<String, Vec<TodoItem>>> {
-    static STORE: OnceLock<Mutex<HashMap<String, Vec<TodoItem>>>> = OnceLock::new();
+fn store() -> &'static Mutex<HashMap<String, SessionTodos>> {
+    static STORE: OnceLock<Mutex<HashMap<String, SessionTodos>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Read the current todo list for a session (for CLI rendering).
+/// Evict least-recently-touched sessions beyond the cap. `keep` (the session
+/// about to be inserted/touched) is never an eviction candidate.
+fn evict_stale(map: &mut HashMap<String, SessionTodos>, keep: &str) {
+    // Leave room for a possible fresh insert of `keep`.
+    let cap = if map.contains_key(keep) { MAX_SESSIONS } else { MAX_SESSIONS - 1 };
+    while map.len() > cap {
+        let Some(oldest) = map
+            .iter()
+            .filter(|(k, _)| k.as_str() != keep)
+            .min_by_key(|(_, v)| v.last_touch)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+}
+
+/// Read the current todo list for a session (for CLI rendering). Touches the
+/// session's LRU entry — a session whose todos are still being rendered is
+/// active and must not be evicted.
 pub fn current(session_id: &str) -> Vec<TodoItem> {
-    store().lock().unwrap().get(session_id).cloned().unwrap_or_default()
+    // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
+    let mut guard = store().lock().unwrap();
+    match guard.get_mut(session_id) {
+        Some(entry) => {
+            entry.last_touch = std::time::Instant::now();
+            entry.items.clone()
+        }
+        None => Vec::new(),
+    }
 }
 
 /// Render the list with the upstream status markers
@@ -212,9 +257,14 @@ impl Tool for Todo {
         let items: Vec<TodoItem> = {
             // SAFETY: internal Mutex/RwLock; poisoning indicates a bug, not external input.
             let mut guard = store().lock().unwrap();
-            let list = guard.entry(ctx.session_id().to_string()).or_default();
+            let session_id = ctx.session_id().to_string();
+            if let Some(entry) = guard.get_mut(&session_id) {
+                entry.last_touch = std::time::Instant::now();
+            }
+            evict_stale(&mut guard, &session_id);
+            let list = guard.entry(session_id).or_default();
             match todos_val {
-                None | Some(Value::Null) => list.clone(),
+                None | Some(Value::Null) => list.items.clone(),
                 Some(v) => {
                     // Guard: LLM sometimes sends todos as a JSON string.
                     let parsed: Value = match v {
@@ -241,8 +291,8 @@ impl Tool for Todo {
                             }
                         ));
                     };
-                    write_items(list, &arr, merge);
-                    list.clone()
+                    write_items(&mut list.items, &arr, merge);
+                    list.items.clone()
                 }
             }
         };
@@ -374,6 +424,54 @@ mod tests {
         assert_eq!(v["todos"][0]["content"], "from string");
         let err = parse(&Todo.execute(json!({"todos": "not json"}), &c).await);
         assert_eq!(err["error"], "todos must be a list of objects, got unparseable string");
+    }
+
+    #[test]
+    fn lru_eviction_keeps_most_recent_64() {
+        // Deterministic, on a local map: the global store is shared with
+        // parallel tests, which would make eviction-order assertions racy.
+        let now = std::time::Instant::now();
+        let mut map: HashMap<String, SessionTodos> = (0..=80)
+            .map(|i| {
+                let entry = SessionTodos {
+                    items: vec![TodoItem {
+                        id: "1".into(),
+                        content: "x".into(),
+                        status: "pending".into(),
+                    }],
+                    // s80 newest, s0 oldest.
+                    last_touch: now - std::time::Duration::from_secs((80 - i) as u64),
+                };
+                (format!("s{i}"), entry)
+            })
+            .collect();
+        // Evict with the newest session as the keeper.
+        evict_stale(&mut map, "s80");
+        assert_eq!(map.len(), MAX_SESSIONS);
+        assert!(map.contains_key("s80"), "keeper survives");
+        assert!(map.contains_key("s17"), "64th-newest survives");
+        assert!(!map.contains_key("s16"), "65th-newest evicted");
+        assert!(!map.contains_key("s0"), "oldest evicted");
+
+        // Fresh-insert path: an unknown keeper makes room for itself.
+        let mut map2: HashMap<String, SessionTodos> = (0..64)
+            .map(|i| {
+                let entry = SessionTodos {
+                    items: Vec::new(),
+                    last_touch: now - std::time::Duration::from_secs((63 - i) as u64),
+                };
+                (format!("t{i}"), entry)
+            })
+            .collect();
+        assert_eq!(map2.len(), MAX_SESSIONS);
+        evict_stale(&mut map2, "fresh");
+        // Unknown keeper: evict down to cap-1, making room for the insert.
+        assert_eq!(map2.len(), MAX_SESSIONS - 1, "room made for the fresh insert");
+        map2.entry("fresh".to_string()).or_default();
+        assert_eq!(map2.len(), MAX_SESSIONS, "cap respected after fresh insert");
+        assert!(map2.contains_key("fresh"), "fresh insert kept");
+        assert!(!map2.contains_key("t0"), "oldest evicted for the fresh insert");
+        assert!(map2.contains_key("t1"));
     }
 
     #[test]

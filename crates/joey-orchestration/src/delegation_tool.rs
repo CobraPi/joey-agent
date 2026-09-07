@@ -973,7 +973,11 @@ impl DelegateTask {
                 &self.parent_config_tree,
                 &self.parent_config.provider,
             ) {
-                tracing::warn!("hypercode role routing failed: {e}");
+                // #2 (review finding): an unknown per-task role is a
+                // caller error — surface it, never route the task
+                // un-profiled (a role'd task dispatched without its
+                // toolset/model restrictions silently violates intent).
+                return ToolResult::Error(e);
             }
             // T021: a top-level budgets object applies to EVERY child in the
             // wave (contracts/delegation-tools.md; per-task override out of
@@ -1122,7 +1126,8 @@ impl DelegateTask {
                 &self.parent_config_tree,
                 &self.parent_config.provider,
             ) {
-                tracing::warn!("hypercode role routing failed: {e}");
+                // #2 (review finding): task-level error, not a silent warn.
+                return Err(e);
             }
             Ok(self
                 .manager
@@ -1159,7 +1164,8 @@ impl DelegateTask {
                 &self.parent_config_tree,
                 &self.parent_config.provider,
             ) {
-                tracing::warn!("hypercode role routing failed: {e}");
+                // #2 (review finding): task-level error, not a silent warn.
+                return Err(e);
             }
             Ok(self
                 .manager

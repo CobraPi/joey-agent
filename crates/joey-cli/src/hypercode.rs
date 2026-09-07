@@ -2292,10 +2292,12 @@ async fn execute_graph_run(
     };
 
     let config = GraphSchedulerConfig {
+        // .max(1): a 0 would deadlock the scheduler's semaphore (#3) — the
+        // scheduler side also clamps, this keeps the read site honest.
         max_concurrent_workers: ctx
             .config
             .get_i64("hypercode.execution_graph.max_concurrent_workers", 16)
-            .max(0) as usize,
+            .max(1) as usize,
         max_repair_attempts: ctx
             .config
             .get_i64("hypercode.execution_graph.max_repair_attempts", 3)
@@ -2493,10 +2495,12 @@ pub async fn resume_execution_run(
         f(graph.snapshot());
     }
     let config = GraphSchedulerConfig {
+        // .max(1): same #3 clamp as the execute path — 0 deadlocks the
+        // scheduler's semaphore on resume.
         max_concurrent_workers: ctx
             .config
             .get_i64("hypercode.execution_graph.max_concurrent_workers", 16)
-            .max(0) as usize,
+            .max(1) as usize,
         max_repair_attempts: ctx
             .config
             .get_i64("hypercode.execution_graph.max_repair_attempts", 3)

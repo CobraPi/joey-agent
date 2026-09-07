@@ -36,11 +36,16 @@ fn path_for(target: &str) -> PathBuf {
 }
 
 fn char_limit(ctx: &ToolContext, target: &str) -> usize {
-    if target == "user" {
-        ctx.config().get_i64("memory.user_char_limit", DEFAULT_USER_CHAR_LIMIT as i64) as usize
+    let (key, default) = if target == "user" {
+        ("memory.user_char_limit", DEFAULT_USER_CHAR_LIMIT)
     } else {
-        ctx.config().get_i64("memory.memory_char_limit", DEFAULT_MEMORY_CHAR_LIMIT as i64) as usize
-    }
+        ("memory.memory_char_limit", DEFAULT_MEMORY_CHAR_LIMIT)
+    };
+    // Mirror truncate::positive(): a non-positive value falls back to the
+    // default instead of wrapping a negative i64 into a huge usize limit
+    // (which would defeat the budget guard).
+    let raw = ctx.config().get_i64(key, default as i64);
+    if raw > 0 { raw as usize } else { default }
 }
 
 fn read_entries(path: &PathBuf) -> Vec<String> {

@@ -459,21 +459,14 @@ impl McpClient {
         {
             Ok(Ok(())) => Ok(client),
             Ok(Err(exc)) => {
-                let claimed_prefix = client.wire_prefix.clone();
+                // shutdown() releases the claimed prefix itself (exactly
+                // once, before child teardown) — unregistering again here
+                // could release a prefix another task reclaimed in between.
                 client.shutdown().await;
-                global_wire_prefix_registry()
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .unregister(&claimed_prefix);
                 Err(exc)
             }
             Err(_) => {
-                let claimed_prefix = client.wire_prefix.clone();
                 client.shutdown().await;
-                global_wire_prefix_registry()
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .unregister(&claimed_prefix);
                 Err(anyhow::anyhow!(
                     "MCP server '{}': initialize handshake timed out after {:.0}s",
                     server_name,
@@ -809,7 +802,17 @@ impl McpClient {
     /// well-behaved server exit on its own, as the SDK's session unwind
     /// does), wait briefly, then escalate SIGTERM → SIGKILL (the SDK's
     /// terminate-then-kill sequence with its 2s timeout).
+    ///
+    /// The wire prefix claimed in [`McpClient::connect`] is released FIRST,
+    /// before any potentially-blocking child teardown, so a server
+    /// disconnected and later reconnected reclaims its plain prefix instead
+    /// of drifting to `_2`, `_3`, ... forever.
     pub async fn shutdown(self) {
+        let claimed_prefix = self.wire_prefix.clone();
+        global_wire_prefix_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unregister(&claimed_prefix);
         let McpClient { mut child, stdin, stdout, .. } = self;
         drop(stdin);
         drop(stdout);
@@ -1218,6 +1221,74 @@ IFS= read -r line
         assert_eq!(b.take_warnings().len(), 1);
         a.shutdown().await;
         b.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Wire-prefix release on shutdown (no leak across reconnects)
+    // ---------------------------------------------------------------------
+
+    /// shutdown() must release the prefix claimed by connect(): a server
+    /// disconnected and later reconnected reclaims the SAME plain prefix
+    /// instead of drifting to `_2`, `_3`, ... forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_releases_wire_prefix_for_reconnect() {
+        let script = r#"
+IFS= read -r line
+printf '%s\n' '{"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "s", "version": "0"}}}'
+IFS= read -r line
+"#;
+        // Unique name so concurrently-running tests can't collide on it in
+        // the process-global registry.
+        let first = McpClient::connect("recycle-me", &sh_server(script)).await.expect("connect 1");
+        let prefix_one = first.wire_prefix().to_string();
+        first.shutdown().await;
+
+        let second = McpClient::connect("recycle-me", &sh_server(script)).await.expect("connect 2");
+        let prefix_two = second.wire_prefix().to_string();
+        second.shutdown().await;
+
+        assert_eq!(prefix_one, "recycle_me", "plain prefix expected on first connect");
+        assert_eq!(
+            prefix_one, prefix_two,
+            "reconnect must reclaim the same wire prefix (got {prefix_one} then {prefix_two})"
+        );
+    }
+
+    /// Registry-level check of the same invariant: unregister returns the
+    /// exact claimed entry (register's prefix strings are unique, so
+    /// removing by prefix cannot touch another server's claim).
+    #[test]
+    fn registry_unregister_returns_claimed_prefix_to_next_claimant() {
+        let mut reg = WirePrefixRegistry::new();
+        let (p1, _) = reg.register("srv");
+        assert_eq!(p1, "srv");
+        reg.unregister(&p1);
+        let (p2, warning) = reg.register("srv");
+        assert_eq!(p2, "srv", "must reclaim the plain prefix after unregister");
+        assert!(warning.is_none(), "reclaim after release must not warn");
+    }
+
+    /// Unregistering one claim must not disturb a different claimant's
+    /// entry (including collision-disambiguated ones).
+    #[test]
+    fn registry_unregister_removes_exactly_the_claimed_entry() {
+        let mut reg = WirePrefixRegistry::new();
+        let (p1, _) = reg.register("my-server");   // "my_server"
+        let (p2, _) = reg.register("my_server");   // "my_server_2"
+        reg.unregister(&p1);
+        // The disambiguated claim survives; re-registering the first name
+        // now reclaims the plain prefix without a third suffix.
+        let (p3, w3) = reg.register("my.server");
+        assert_eq!(p3, "my_server");
+        assert!(w3.is_none());
+        let (p4, w4) = reg.register("my server");
+        assert_eq!(p4, "my_server_3", "next suffix must skip the surviving claim");
+        assert!(w4.is_some());
+        // p2's claim is untouched and removable exactly once.
+        reg.unregister(&p2);
+        let (p5, _) = reg.register("my:server");
+        assert_eq!(p5, "my_server_2");
     }
 
     // ---------------------------------------------------------------------

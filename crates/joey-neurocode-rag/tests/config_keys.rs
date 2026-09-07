@@ -208,6 +208,33 @@ fn batch_size_out_of_range_falls_back_to_default() {
 }
 
 #[test]
+fn refresh_per_turn_budgets_clamp_to_at_least_one() {
+    let ctx = temp_home();
+    std::env::remove_var(ENV_API_KEY_NAME);
+    // 0 would stall every refresh forever (nothing ever indexed);
+    // negatives likewise — both clamp up to the floor of 1.
+    let rag = RagConfig::load(&config_with(
+        &ctx,
+        "neurocode:\n  rag:\n    refresh:\n      max_files_per_turn: 0\n      max_bytes_per_turn: 0\n",
+    ));
+    assert_eq!(rag.refresh_max_files_per_turn, 1, "files floor is 1");
+    assert_eq!(rag.refresh_max_bytes_per_turn, 1, "bytes floor is 1");
+    let rag = RagConfig::load(&config_with(
+        &ctx,
+        "neurocode:\n  rag:\n    refresh:\n      max_files_per_turn: -5\n      max_bytes_per_turn: -100\n",
+    ));
+    assert_eq!(rag.refresh_max_files_per_turn, 1, "negative files → 1");
+    assert_eq!(rag.refresh_max_bytes_per_turn, 1, "negative bytes → 1");
+    // In-range values pass through untouched (no upper clamp).
+    let rag = RagConfig::load(&config_with(
+        &ctx,
+        "neurocode:\n  rag:\n    refresh:\n      max_files_per_turn: 7\n      max_bytes_per_turn: 123456\n",
+    ));
+    assert_eq!(rag.refresh_max_files_per_turn, 7);
+    assert_eq!(rag.refresh_max_bytes_per_turn, 123456);
+}
+
+#[test]
 fn context_window_lines_clamps_0_200() {
     let ctx = temp_home();
     std::env::remove_var(ENV_API_KEY_NAME);

@@ -97,8 +97,8 @@ fn strip_bom(text: &str) -> (&str, bool) {
 fn add_line_numbers(content: &str, start_line: usize, max_line_length: usize) -> String {
     let mut numbered = Vec::new();
     for (i, line) in content.split('\n').enumerate() {
-        let line = if line.len() > max_line_length {
-            let cut = truncate::floor_char_boundary(line, max_line_length);
+        let line = if line.chars().count() > max_line_length {
+            let cut = truncate::char_index_to_byte(line, max_line_length);
             format!("{}... [truncated]", &line[..cut])
         } else {
             line.to_string()
@@ -342,7 +342,9 @@ impl Tool for ReadFile {
             content = trimmed;
             result.insert("content".into(), json!(content));
             result.insert("truncated".into(), json!(true));
-            result.insert("truncated_by".into(), json!("bytes"));
+            // Budget is chars (see truncate_to_char_budget) — label must
+            // match, upstream uses char semantics.
+            result.insert("truncated_by".into(), json!("chars"));
             result.insert("next_offset".into(), json!(next_offset));
             result.insert("hint".into(), json!(hint));
         }
@@ -1709,7 +1711,9 @@ fn parse_search_context_line(line: &str) -> Option<(String, u64, String)> {
 }
 
 fn clamp_500(s: &str) -> String {
-    let cut = truncate::floor_char_boundary(s, 500);
+    // Upstream clamps match content at 500 CHARS (Python str semantics),
+    // not 500 bytes.
+    let cut = truncate::char_index_to_byte(s, 500);
     s[..cut].to_string()
 }
 
@@ -1890,11 +1894,14 @@ async fn search_with_rg(
         let all_files: Vec<String> =
             stdout.trim().split('\n').filter(|f| !f.is_empty()).map(str::to_string).collect();
         let total = all_files.len() as u64;
+        // Mirror search_files_rg: hitting the `head -n fetch_limit` cap
+        // means more files may exist beyond what we captured.
+        let head_capped = all_files.len() >= fetch_limit;
         let page: Vec<String> = all_files.into_iter().skip(offset).take(limit).collect();
         return SearchResult {
             files: page,
             total_count: total,
-            truncated: limit_reason.is_some(),
+            truncated: head_capped || limit_reason.is_some(),
             limit_reason,
             ..Default::default()
         };
@@ -1909,10 +1916,13 @@ async fn search_with_rg(
             }
         }
         let total: u64 = counts.values().sum();
+        // `head -n fetch_limit` capped stdout: more matching files exist.
+        let head_capped =
+            stdout.lines().filter(|l| !l.trim().is_empty()).count() >= fetch_limit;
         return SearchResult {
             counts,
             total_count: total,
-            truncated: limit_reason.is_some(),
+            truncated: head_capped || limit_reason.is_some(),
             limit_reason,
             ..Default::default()
         };
@@ -2393,6 +2403,137 @@ mod tests {
         );
         assert!(v["error"].as_str().unwrap().starts_with("Path not found: "));
         assert_eq!(v["total_count"], 0);
+    }
+
+    // ── Char-budget semantics regressions (review findings #4,#5,#14) ──
+    // Upstream Python uses str (char) semantics everywhere; these tests pin
+    // that a char budget cuts at N CHARS, not N bytes (a 3-byte CJK char
+    // must not count as 3).
+
+    #[test]
+    fn add_line_numbers_truncates_by_chars_not_bytes() {
+        // 60 CJK chars = 180 bytes; max_line_length=50 must keep 50 CHARS
+        // (byte semantics would cut at ~16 chars / 50 bytes).
+        let line = "あ".repeat(60);
+        let out = add_line_numbers(&line, 1, 50);
+        let expected = format!("1|{}... [truncated]", "あ".repeat(50));
+        assert_eq!(out, expected);
+        // Under budget: untouched.
+        let short = "あ".repeat(50);
+        assert_eq!(add_line_numbers(&short, 1, 50), format!("1|{}", short));
+    }
+
+    #[test]
+    fn clamp_500_counts_chars_not_bytes() {
+        // 600 CJK chars = 1800 bytes; clamp must keep 500 chars, not 166.
+        let s = "あ".repeat(600);
+        let clamped = clamp_500(&s);
+        assert_eq!(clamped.chars().count(), 500);
+        assert_eq!(clamped, "あ".repeat(500));
+        // Short content passes through.
+        assert_eq!(clamp_500("hello"), "hello");
+    }
+
+    #[tokio::test]
+    async fn read_file_char_budget_labels_truncated_by_chars() {
+        // 60 lines x 2001 chars -> numbered content exceeds the 100_000-char
+        // read budget; the budget is chars, so truncated_by must say "chars".
+        let dir = tempfile::tempdir().unwrap();
+        let content: String = (0..60)
+            .map(|_| format!("{}\n", "x".repeat(2001)))
+            .collect();
+        std::fs::write(dir.path().join("big.txt"), content).unwrap();
+        let ctx = ctx_in(dir.path());
+        let v = parse(&ReadFile.execute(json!({"path": "big.txt"}), &ctx).await);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["truncated_by"], "chars");
+        assert_eq!(v["next_offset"], 50);
+    }
+
+    // ── Head-cap truncation regressions (review findings #6,#7) ────────
+    // rg's `head -n fetch_limit` caps captured stdout; when the cap is hit
+    // more results may exist, so truncated must be true (mirroring
+    // search_files_rg), not only on timeout.
+
+    /// Parse a tool JSON payload that may carry the appended
+    /// "\n\n[Hint: ...]" truncation suffix (which makes the raw string
+    /// non-parseable as-is).
+    fn parse_with_hint(result: &ToolResult) -> Value {
+        let s = result.to_content_string();
+        let json_part = s.split("\n\n[Hint").next().unwrap_or(&s);
+        serde_json::from_str(json_part).unwrap()
+    }
+
+    #[tokio::test]
+    async fn search_files_only_mode_marks_truncated_when_head_capped() {
+        if which::which("rg").is_err() {
+            return; // fallback walker path has no head cap to exercise
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        for i in 0..6 {
+            std::fs::write(dir.path().join(format!("f{}.txt", i)), "needle here\n").unwrap();
+        }
+        // limit=5, offset=0 -> fetch_limit=5; rg -l finds 6 files but head
+        // caps stdout at 5 lines -> truncated must be reported.
+        let v = parse_with_hint(
+            &SearchFiles
+                .execute(
+                    json!({"pattern": "needle", "path": ".", "output_mode": "files_only", "limit": 5}),
+                    &ctx,
+                )
+                .await,
+        );
+        assert_eq!(v["truncated"], true, "head-capped files_only must report truncated");
+        assert_eq!(v["total_count"], 5);
+        assert_eq!(v["files"].as_array().unwrap().len(), 5);
+        // Below the cap: not truncated.
+        let v2 = parse(
+            &SearchFiles
+                .execute(
+                    json!({"pattern": "needle", "path": ".", "output_mode": "files_only", "limit": 10}),
+                    &ctx,
+                )
+                .await,
+        );
+        assert!(v2.get("truncated").is_none(), "6 files under a fetch_limit of 10 is complete");
+        assert_eq!(v2["total_count"], 6);
+    }
+
+    #[tokio::test]
+    async fn search_count_mode_marks_truncated_when_head_capped() {
+        if which::which("rg").is_err() {
+            return; // fallback walker path has no head cap to exercise
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        for i in 0..6 {
+            std::fs::write(dir.path().join(format!("f{}.txt", i)), "needle here\n").unwrap();
+        }
+        // 6 matching files -> rg -c emits 6 lines; head caps at fetch_limit=5
+        // -> captured stdout line count reached the cap -> truncated.
+        let v = parse_with_hint(
+            &SearchFiles
+                .execute(
+                    json!({"pattern": "needle", "path": ".", "output_mode": "count", "limit": 5}),
+                    &ctx,
+                )
+                .await,
+        );
+        assert_eq!(v["truncated"], true, "head-capped count must report truncated");
+        assert_eq!(v["counts"].as_object().unwrap().len(), 5);
+        assert_eq!(v["total_count"], 5);
+        // Below the cap: not truncated.
+        let v2 = parse(
+            &SearchFiles
+                .execute(
+                    json!({"pattern": "needle", "path": ".", "output_mode": "count", "limit": 10}),
+                    &ctx,
+                )
+                .await,
+        );
+        assert!(v2.get("truncated").is_none());
+        assert_eq!(v2["total_count"], 6);
     }
 
     // ── FR-006/SC-005 regression tests ──────────────────────────────

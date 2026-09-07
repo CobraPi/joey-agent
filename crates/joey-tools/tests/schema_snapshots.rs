@@ -250,7 +250,7 @@ fn web_search_schema() {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of results to return. Defaults to 5.",
+                    "description": "Maximum number of results to return. Defaults to 5. Requests above 20 are clamped to 20.",
                     "minimum": 1,
                     "maximum": 100,
                     "default": 5

@@ -147,7 +147,7 @@ static TOOLSETS: Lazy<HashMap<&'static str, Toolset>> = Lazy::new(|| {
         "file",
         Toolset {
             description: "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
-            tools: &["read_file", "write_file", "patch", "search_files"],
+            tools: &["read_file", "write_file", "patch", "multi_edit", "search_files"],
             includes: &[],
         },
     );
@@ -262,6 +262,7 @@ static TOOLSETS: Lazy<HashMap<&'static str, Toolset>> = Lazy::new(|| {
                 "read_file",
                 "write_file",
                 "patch",
+                "multi_edit",
                 "search_files",
                 "vision_analyze",
                 "skills_list",
@@ -398,7 +399,10 @@ mod tests {
 
     #[test]
     fn resolves_leaf() {
-        assert_eq!(resolve("file"), vec!["patch", "read_file", "search_files", "write_file"]);
+        assert_eq!(
+            resolve("file"),
+            vec!["multi_edit", "patch", "read_file", "search_files", "write_file"]
+        );
         assert_eq!(resolve("file-read"), vec!["read_file", "search_files"]);
         assert_eq!(resolve("search"), vec!["web_search"]);
         assert_eq!(resolve("delegation"), vec!["delegate_task", "subagent_control"]);
@@ -441,10 +445,11 @@ mod tests {
     fn coding_membership_verbatim() {
         let tools = resolve("coding");
         // 32 upstream-declared members + 4 additive browser verbs (feature
-        // 016: hover/select_option/drag/click_coords). Deliberate, spec'd
-        // deviation recorded in specs/016-please-modify-joey (FR-018 note).
-        assert_eq!(tools.len(), 36);
-        for t in ["execute_code", "browser_cdp", "skill_manage", "clarify"] {
+        // 016: hover/select_option/drag/click_coords) + multi_edit (also in
+        // the `file` toolset). Deliberate, spec'd deviation recorded in
+        // specs/016-please-modify-joey (FR-018 note).
+        assert_eq!(tools.len(), 37);
+        for t in ["execute_code", "browser_cdp", "skill_manage", "clarify", "multi_edit"] {
             assert!(tools.contains(&t.to_string()));
         }
         assert!(!tools.contains(&"cronjob".to_string()));

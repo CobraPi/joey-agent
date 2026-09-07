@@ -105,14 +105,37 @@ impl TeamMailbox {
     }
 
     /// Send a message to a member.
-    pub fn send(&self, from: &str, to: &str, content: &str) {
+    ///
+    /// The recipient's inbox is capped at `limit` (drop-oldest), mirroring
+    /// the orchestration counterpart's `message_limit` behavior
+    /// (`orchestration/team.rs` `TeamRecord::send`): a chatty member can
+    /// never grow another member's inbox without bound.
+    pub fn send(&self, from: &str, to: &str, content: &str, limit: usize) {
         let msg = TeamMessage {
             from: from.to_string(),
             to: to.to_string(),
             content: content.to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
-        self.messages.lock().unwrap().push(msg);
+        let mut msgs = self.messages.lock().unwrap();
+        msgs.push(msg);
+        // Cap the recipient's inbox: drop the OLDEST messages addressed to
+        // `to` until it holds at most `limit`.
+        let excess = msgs
+            .iter()
+            .filter(|m| m.to == to)
+            .count()
+            .saturating_sub(limit);
+        let mut dropped = 0;
+        let mut i = 0;
+        while i < msgs.len() && dropped < excess {
+            if msgs[i].to == to {
+                msgs.remove(i);
+                dropped += 1;
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Receive all messages addressed to a member (and remove them).
@@ -152,6 +175,11 @@ pub struct TeamTask {
     pub title: String,
     pub status: TeamTaskStatus,
     pub claimed_by: Option<String>,
+    /// Member recorded as having completed the task (audit trail; set by
+    /// `complete` from the claimer). `#[serde(default)]` keeps older
+    /// serialized task lists loadable.
+    #[serde(default)]
+    pub completed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +204,7 @@ impl TeamTaskList {
             title: title.to_string(),
             status: TeamTaskStatus::Pending,
             claimed_by: None,
+            completed_by: None,
         });
         id
     }
@@ -192,12 +221,24 @@ impl TeamTaskList {
         }
     }
 
-    /// Complete a task.
-    pub fn complete(&self, task_id: &str, success: bool) {
+    /// Complete a Running task (Done/Failed), recording the completing
+    /// member (the claimer) for audit.
+    ///
+    /// Mirrors the orchestration counterpart (`orchestration/team.rs`
+    /// `TeamRecord::complete`): unknown ids and non-Running tasks are
+    /// rejected with an error instead of silently overwriting status — a
+    /// Pending (never-claimed) task can no longer be marked Done/Failed.
+    pub fn complete(&self, task_id: &str, success: bool) -> Result<TeamTaskStatus, String> {
         let mut tasks = self.tasks.lock().unwrap();
-        if let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) {
-            task.status = if success { TeamTaskStatus::Done } else { TeamTaskStatus::Failed };
+        let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) else {
+            return Err(format!("unknown task '{task_id}'"));
+        };
+        if task.status != TeamTaskStatus::Running {
+            return Err(format!("task '{task_id}' is not Running"));
         }
+        task.status = if success { TeamTaskStatus::Done } else { TeamTaskStatus::Failed };
+        task.completed_by = task.claimed_by.clone();
+        Ok(task.status)
     }
 
     /// List all tasks.
@@ -301,6 +342,15 @@ fn truncate(s: &str, max: usize) -> String {
 /// Default tmux session name prefix used by [`TmuxVisualizer`].
 pub const DEFAULT_TMUX_SESSION: &str = "joey-omo-team";
 
+/// Build a tmux pane target in `session:window.pane` grammar.
+///
+/// The visualizer's session has a single window ("team", index 0), so
+/// member/pane `i` is addressed as `{session}:0.{i}`. (`{session}:{i}`
+/// would be WINDOW grammar — window `i` — which does not exist here.)
+fn pane_target(session: &str, pane: usize) -> String {
+    format!("{}:0.{}", session, pane)
+}
+
 /// A tmux-based live visualizer for team mode (T156).
 ///
 /// When team mode is active and `TeamModeConfig.tmux_visualization` is true,
@@ -403,15 +453,19 @@ impl TmuxVisualizer {
             if name.is_empty() {
                 continue;
             }
+            // Pane targets use tmux's `session:window.pane` grammar (see
+            // [`pane_target`]): the session has a single window "team" at
+            // index 0, so member i lives at `{session}:0.{i}`.
+            let target = pane_target(&self.session, i);
             let select = self
-                .run_tmux(&["select-pane", "-t", &format!("{}:{}", self.session, i)])
+                .run_tmux(&["select-pane", "-t", &target])
                 .await
                 .is_ok();
             if select {
                 let _ = self.run_tmux(&[
                     "select-pane",
                     "-t",
-                    &format!("{}:{}", self.session, i),
+                    &target,
                     "-T",
                     name,
                 ]).await;
@@ -439,10 +493,12 @@ impl TmuxVisualizer {
         // pipe-pane-free approach: clear + send the block as keys.
         let block = activity.render_block();
         // Clear the pane then write the block via send-keys.
+        // `session:window.pane` grammar — see [`pane_target`].
+        let target = pane_target(&self.session, pane);
         self.run_tmux(&[
             "send-keys",
             "-t",
-            &format!("{}:{}", self.session, pane),
+            &target,
             "C-c",
             "clear",
             "Enter",
@@ -456,7 +512,7 @@ impl TmuxVisualizer {
             self.run_tmux(&[
                 "send-keys",
                 "-t",
-                &format!("{}:{}", self.session, pane),
+                &target,
                 &format!("printf '%s\\n' '{}'", safe),
                 "Enter",
             ]).await?;
@@ -646,8 +702,8 @@ mod tests {
     #[test]
     fn team_mailbox_send_receive() {
         let mailbox = TeamMailbox::new();
-        mailbox.send("lead", "worker1", "do task A");
-        mailbox.send("lead", "worker2", "do task B");
+        mailbox.send("lead", "worker1", "do task A", 10);
+        mailbox.send("lead", "worker2", "do task B", 10);
 
         let worker1_msgs = mailbox.receive("worker1");
         assert_eq!(worker1_msgs.len(), 1);
@@ -657,15 +713,88 @@ mod tests {
         assert!(mailbox.receive("worker1").is_empty());
     }
 
+    /// #17 regression: a member's inbox is capped at `limit` (drop-oldest),
+    /// mirroring the orchestration counterpart's `message_limit` behavior.
+    #[test]
+    fn team_mailbox_inbox_capped_drop_oldest() {
+        let mailbox = TeamMailbox::new();
+        for i in 0..5 {
+            mailbox.send("lead", "worker1", &format!("msg {i}"), 3);
+        }
+        let msgs = mailbox.poll("worker1");
+        assert_eq!(msgs.len(), 3, "inbox capped at limit");
+        // OLDEST dropped: only messages 2..5 remain, newest kept.
+        assert_eq!(msgs[0].content, "msg 2");
+        assert_eq!(msgs[2].content, "msg 4");
+    }
+
+    /// #17 regression: the cap is per-recipient — one member's traffic
+    /// never evicts another member's messages.
+    #[test]
+    fn team_mailbox_cap_is_per_recipient() {
+        let mailbox = TeamMailbox::new();
+        for i in 0..5 {
+            mailbox.send("lead", "chatty", &format!("noise {i}"), 2);
+        }
+        mailbox.send("lead", "quiet", "important", 2);
+        let quiet = mailbox.poll("quiet");
+        assert_eq!(quiet.len(), 1);
+        assert_eq!(quiet[0].content, "important");
+        let chatty = mailbox.poll("chatty");
+        assert_eq!(chatty.len(), 2);
+        assert_eq!(chatty[0].content, "noise 3");
+    }
+
     #[test]
     fn team_task_list_claim_complete() {
         let tasks = TeamTaskList::new();
         let id = tasks.add("Implement feature");
         assert!(tasks.claim(&id, "worker1"));
         assert!(!tasks.claim(&id, "worker2")); // Already claimed
-        tasks.complete(&id, true);
+        tasks.complete(&id, true).expect("Running task completes");
         let all = tasks.list();
         assert_eq!(all[0].status, TeamTaskStatus::Done);
+        assert_eq!(all[0].completed_by.as_deref(), Some("worker1"));
+    }
+
+    /// #16 regression: a Pending (never-claimed) task cannot be completed.
+    #[test]
+    fn team_task_complete_rejects_pending() {
+        let tasks = TeamTaskList::new();
+        let id = tasks.add("Unclaimed work");
+        let err = tasks.complete(&id, true).expect_err("Pending must be rejected");
+        assert!(err.contains("not Running"), "unexpected error: {err}");
+        assert_eq!(tasks.list()[0].status, TeamTaskStatus::Pending);
+    }
+
+    /// #16 regression: unknown task ids error instead of silently no-op.
+    #[test]
+    fn team_task_complete_rejects_unknown_id() {
+        let tasks = TeamTaskList::new();
+        let err = tasks.complete("task_missing", true).expect_err("unknown id");
+        assert!(err.contains("unknown task"), "unexpected error: {err}");
+    }
+
+    /// #16 regression: double-complete of a Done task is rejected.
+    #[test]
+    fn team_task_complete_rejects_done() {
+        let tasks = TeamTaskList::new();
+        let id = tasks.add("Once only");
+        tasks.claim(&id, "worker1");
+        tasks.complete(&id, true).unwrap();
+        let err = tasks.complete(&id, true).expect_err("Done must be rejected");
+        assert!(err.contains("not Running"), "unexpected error: {err}");
+    }
+
+    /// #16 regression: failed completion also records the completing member.
+    #[test]
+    fn team_task_complete_failed_records_member() {
+        let tasks = TeamTaskList::new();
+        let id = tasks.add("Risky work");
+        tasks.claim(&id, "worker2");
+        let status = tasks.complete(&id, false).expect("Running task can fail");
+        assert_eq!(status, TeamTaskStatus::Failed);
+        assert_eq!(tasks.list()[0].completed_by.as_deref(), Some("worker2"));
     }
 
     // ── T156: TmuxVisualizer ──
@@ -856,6 +985,27 @@ mod tests {
         assert_eq!(truncate("1234567890", 5), "1234…");
         // No underflow at boundary.
         assert_eq!(truncate("exact", 5), "exact");
+    }
+
+    /// #4 regression: pane targets must use `session:window.pane` grammar
+    /// (`{session}:0.{pane}` — single window "team" at index 0), never the
+    /// WINDOW grammar `{session}:{pane}`.
+    #[test]
+    fn tmux_pane_targets_use_window_pane_grammar() {
+        assert_eq!(pane_target(DEFAULT_TMUX_SESSION, 0), "joey-omo-team:0.0");
+        assert_eq!(pane_target(DEFAULT_TMUX_SESSION, 1), "joey-omo-team:0.1");
+        assert_eq!(pane_target(DEFAULT_TMUX_SESSION, 7), "joey-omo-team:0.7");
+        // The old (buggy) window grammar must never be produced.
+        for pane in 0..8 {
+            assert_ne!(pane_target("s", pane), format!("s:{}", pane));
+        }
+        // Two components after the session: `0` (window) + pane index.
+        for pane in 0..8 {
+            let t = pane_target(DEFAULT_TMUX_SESSION, pane);
+            let suffix = t.strip_prefix(&format!("{DEFAULT_TMUX_SESSION}:")).unwrap();
+            let pane_str = pane.to_string();
+            assert_eq!(suffix.split('.').collect::<Vec<&str>>(), vec!["0", pane_str.as_str()]);
+        }
     }
 
     /// FR-044 regression: the default config carries the tmux_visualization

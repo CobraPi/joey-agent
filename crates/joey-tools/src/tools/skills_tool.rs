@@ -121,8 +121,18 @@ pub fn discover_with(ctx: Option<&ToolContext>) -> Vec<SkillEntry> {
             let Ok(content) = std::fs::read_to_string(&skill_md) else {
                 continue;
             };
+            // Fast path: parse frontmatter from the first 4000 chars. If the
+            // closing `---` delimiter isn't inside that head (oversized
+            // frontmatter), fall back to parsing the full file — capped at
+            // 64K chars so a pathological SKILL.md can't blow up discovery.
             let head: String = content.chars().take(4000).collect();
-            let (frontmatter, body) = parse_frontmatter(&head);
+            let (frontmatter, body) = match parse_frontmatter(&head) {
+                (fm, _) if fm.is_empty() && head.trim_start().starts_with("---") => {
+                    let full: String = content.chars().take(64 * 1024).collect();
+                    parse_frontmatter(&full)
+                }
+                parsed => parsed,
+            };
             let dir_name = skill_md
                 .parent()
                 .and_then(|p| p.file_name())
@@ -750,6 +760,27 @@ mod tests {
         let v = parse(&SkillsList.execute(json!({}), &ctx).await);
         // The only skill is disabled → empty listing message.
         assert_eq!(v["message"], "No skills found in skills/ directory.");
+    }
+
+    #[test]
+    fn oversized_frontmatter_falls_back_to_full_file() {
+        let (_ctx, _g, home) = setup_home();
+        // Frontmatter whose closing --- lies past the 4000-char head.
+        let pad = "x".repeat(4500);
+        let dir = home.join("skills").join("bigfm");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: bigfm\ndescription: {pad}\n---\n\n# bigfm\nBody.\n"),
+        )
+        .unwrap();
+        let skills = discover_with(None);
+        let big = skills.iter().find(|s| s.name == "bigfm").expect("bigfm discovered");
+        // Name comes from frontmatter (not the dirname fallback) and the
+        // description is the (capped) frontmatter description.
+        assert_eq!(big.name, "bigfm");
+        assert!(big.description.starts_with('x'), "desc from frontmatter");
+        assert_eq!(big.description.chars().count(), MAX_DESCRIPTION_LENGTH);
     }
 
     // ── Copilot project skills (`.github/skills`) ───────────────────────

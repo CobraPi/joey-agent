@@ -19,6 +19,7 @@
 //! child spawns exist on this path.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use joey_agent_core::{AgentConfig, AgentEvent};
 use joey_core::Config;
@@ -632,19 +633,55 @@ fn spawn_wave(
         let tx_for_child = child_event_tx.or(tx);
 
         join_set.spawn(async move {
-            let result = mgr
-                .dispatch_single_with_overrides(
-                    &req,
-                    &parent_cfg,
-                    &config_tree,
-                    &registry,
-                    tx_for_child.as_ref(),
-                    dm.as_deref(),
-                    max_turns,
-                    max_spawn_depth,
-                    id,
-                )
-                .await;
+            // #6 (review finding): a PANIC inside the dispatch future would
+            // surface as a JoinError in the watcher — the child's own
+            // terminal archival (FR-019) never ran and the completion tap
+            // never fired, so the child sat `Running` until shutdown and
+            // the orchestrator never learned its outcome (violating US2-2).
+            // Catch it HERE, where the child id, goal, and registry-sharing
+            // manager are in scope: archive a terminal `Failed` record and
+            // return it as a normal result, so archival AND the completion
+            // tap behave exactly like any other failed child.
+            let goal = req.goal.clone();
+            let result =
+                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    mgr.dispatch_single_with_overrides(
+                        &req,
+                        &parent_cfg,
+                        &config_tree,
+                        &registry,
+                        tx_for_child.as_ref(),
+                        dm.as_deref(),
+                        max_turns,
+                        max_spawn_depth,
+                        id,
+                    ),
+                ))
+                .await
+                {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let msg = panic_message(&payload);
+                        let detail = format!("background child task panicked: {msg}");
+                        tracing::warn!(child_id = id, "{detail}");
+                        let result = DelegationResult {
+                            goal,
+                            summary: String::new(),
+                            success: false,
+                            error: Some(detail),
+                            token_usage: Default::default(),
+                            wall_clock: Duration::ZERO,
+                            model: String::new(),
+                            iterations: 0,
+                            persisted_session_id: None,
+                            stop_reason: None,
+                        };
+                        // One-way like the child's own archival (no-op if
+                        // the panic struck after it had already completed).
+                        mgr.complete_failed(id, &result);
+                        result
+                    }
+                };
             (id, result)
         });
     }
@@ -666,14 +703,26 @@ fn spawn_wave(
                     }
                 }
                 Err(join_err) => {
-                    // A panicked/aborted child task: its registry entry (if
-                    // registered) is wound down by `shutdown`/session end;
-                    // never panic the watcher.
-                    tracing::warn!("background child task failed: {join_err}");
+                    // Unreachable for panics (caught inside the child above);
+                    // only a task ABORT can land here, and a task id cannot
+                    // be recovered from `JoinError` on this tokio version —
+                    // so the id is logged inside the message for triage.
+                    // Never panic the watcher.
+                    tracing::warn!("background child task aborted: {join_err}");
                 }
             }
         }
     })
+}
+
+/// Best-effort human-readable form of a panic payload (`&str`, `String`,
+/// or anything else → placeholder) for the #6 panic-to-`Failed` path.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_string())
 }
 
 #[cfg(test)]
@@ -693,6 +742,119 @@ mod tests {
             persisted_session_id: None,
             stop_reason: None,
         }
+    }
+
+    /// #6 regression: `panic_message` extracts &str/String payloads and
+    /// falls back to the placeholder for exotic panic types.
+    #[test]
+    fn panic_message_extracts_known_payloads() {
+        let s: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(&s), "boom");
+        let s: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
+        assert_eq!(panic_message(&s), "boom");
+        let n: Box<dyn std::any::Any + Send> = Box::new(42_u32);
+        assert_eq!(panic_message(&n), "unknown panic payload");
+    }
+
+    /// #6 regression (end-to-end): a PANIC inside a background child's
+    /// dispatch is converted to a normal `Ok((id, failed_result))` join —
+    /// the registry entry the wave pre-registered is finalized as a
+    /// one-way terminal `Failed` record, and the completion tap fires
+    /// exactly once with the synthesized result. The watcher itself stays
+    /// alive and drains the rest of the set.
+    #[tokio::test]
+    async fn panicked_background_child_finalizes_failed_and_fires_tap() {
+        let manager = crate::manager::SubagentManager::new(
+            crate::manager::ManagerConfig::default(),
+        );
+
+        // Pre-register exactly what a background wave does at spawn.
+        let id = manager.next_id();
+        let spec = TaskSpec {
+            goal: "panic-goal".to_string(),
+            context: None,
+            model: None,
+            toolsets: vec![],
+            role: None,
+            subagent_type: None,
+            background: true,
+            budgets: None,
+        };
+        manager.pre_register_child(id, spec);
+
+        // A completion tap that records every firing.
+        let fired = Arc::new(std::sync::Mutex::new(Vec::<BackgroundCompletion>::new()));
+        let fired_clone = fired.clone();
+        let tap: BackgroundCompletionTap = Arc::new(move |c| fired_clone.lock().unwrap().push(c));
+
+        // Drive the wave machinery: one child whose dispatch future panics.
+        // spawn_wave needs the full dispatch plumbing, so exercise the same
+        // catch-unwind + complete_failed + tap path through a JoinSet with
+        // an explicitly panicking future.
+        let mgr = manager.shared_child_manager();
+        let mut join_set: JoinSet<(u64, DelegationResult)> = JoinSet::new();
+        join_set.spawn(async move {
+            let goal = "panic-goal".to_string();
+            let result = match futures::FutureExt::catch_unwind(
+                std::panic::AssertUnwindSafe(async {
+                    panic!("kaboom");
+                }),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(payload) => {
+                    let msg = panic_message(&payload);
+                    let detail = format!("background child task panicked: {msg}");
+                    let result = DelegationResult {
+                        goal,
+                        summary: String::new(),
+                        success: false,
+                        error: Some(detail),
+                        token_usage: Default::default(),
+                        wall_clock: Duration::ZERO,
+                        model: String::new(),
+                        iterations: 0,
+                        persisted_session_id: None,
+                        stop_reason: None,
+                    };
+                    mgr.complete_failed(id, &result);
+                    result
+                }
+            };
+            (id, result)
+        });
+
+        // Watcher loop (same shape as spawn_wave's).
+        let watcher_tap = tap;
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((child_id, result)) => {
+                    watcher_tap(BackgroundCompletion { child_id, result });
+                }
+                Err(_) => panic!("panic must be caught inside the child task"),
+            }
+        }
+
+        // Terminal registry record: Failed, goal preserved.
+        let status = manager.child_status(id).expect("terminal record");
+        match status.state {
+            DelegationState::Failed { ref error } => {
+                assert!(error.contains("kaboom"), "error: {error}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(status.goal, "panic-goal");
+
+        // Tap fired exactly once with the synthesized failed result.
+        let fired = fired.lock().unwrap();
+        assert_eq!(fired.len(), 1, "tap fired once");
+        assert!(!fired[0].result.success);
+        assert!(
+            fired[0].result.error.as_deref().unwrap_or_default().contains("kaboom"),
+            "tap error: {:?}",
+            fired[0].result.error
+        );
     }
 
     #[test]

@@ -217,6 +217,20 @@ impl LspManager {
     /// Ensure the LSP server for this file type is running (lazy start).
     /// Returns the config name on success.
     fn ensure_client(&mut self, config_name: &str) -> Result<&mut LspClient, LspError> {
+        // Finding #12 (review tools.md): if the entry exists but its
+        // process is dead (request watchdog SIGKILLed a hung server, or
+        // the server exited on its own), drop the dead entry so a fresh
+        // server starts below. Previously the dead client stayed in the
+        // map forever and every later request failed writing to its stdin.
+        let dead = match self.clients.get_mut(config_name) {
+            Some(client) => matches!(client.process.try_wait(), Ok(Some(_)) | Err(_)),
+            None => false,
+        };
+        if dead {
+            if let Some(mut client) = self.clients.remove(config_name) {
+                let _ = client.process.kill(); // reap any straggler
+            }
+        }
         if !self.clients.contains_key(config_name) {
             let cfg = self
                 .configs
@@ -230,6 +244,23 @@ impl LspManager {
         Ok(self.clients.get_mut(config_name).unwrap())
     }
 
+    /// Finding #12 (review tools.md): a request that failed with an I/O
+    /// error means the server process is gone — a write to its dead stdin
+    /// hit EPIPE, or the read side saw EOF after the request watchdog
+    /// SIGKILLed a hung server. Evict the dead client from the map so the
+    /// NEXT `ensure_client` respawns the server, exactly as `request`'s
+    /// doc comment always promised; previously the dead entry stayed in
+    /// the map forever and every later LSP call failed. The kill is
+    /// best-effort (the process is usually already dead; this just reaps
+    /// any straggler so it can't be orphaned).
+    fn evict_if_io_error(&mut self, config_name: &str, err: &LspError) {
+        if matches!(err, LspError::Io(_)) {
+            if let Some(mut client) = self.clients.remove(config_name) {
+                let _ = client.process.kill();
+            }
+        }
+    }
+
     /// Get diagnostics for a file. Starts the server if needed.
     pub fn diagnostics(&mut self, path: &str) -> Result<Vec<Diagnostic>, LspError> {
         let abs = self.resolve_path(path);
@@ -238,23 +269,30 @@ impl LspManager {
             .ok_or(LspError::NoServerForType)?
             .0
             .to_string();
-        let client = self.ensure_client(&config_name)?;
-        client.open_document(&abs)?;
-        // Synchronize: fire a cheap request. Servers publish diagnostics
-        // after didOpen asynchronously; by the time they answer ANY
-        // subsequent request, the publishDiagnostics notification is already
-        // in the pipe — `request()`'s read loop captures it on the way past
-        // (the old code slept 500ms then drained nothing, so diagnostics
-        // were only ever captured incidentally).
-        let _ = client.request(
-            "textDocument/documentSymbol",
-            json!({ "textDocument": { "uri": path_to_uri(&abs) } }),
-        );
-        Ok(client
-            .diagnostics
-            .get(&abs)
-            .cloned()
-            .unwrap_or_default())
+        let (sync, diags) = {
+            let client = self.ensure_client(&config_name)?;
+            // Synchronize: fire a cheap request. Servers publish diagnostics
+            // after didOpen asynchronously; by the time they answer ANY
+            // subsequent request, the publishDiagnostics notification is already
+            // in the pipe — `request()`'s read loop captures it on the way past
+            // (the old code slept 500ms then drained nothing, so diagnostics
+            // were only ever captured incidentally). A failure here is
+            // deliberately swallowed (diagnostics are best-effort) but the
+            // dead-client eviction below still fires so the next call
+            // respawns (#12).
+            let sync = client.open_document(&abs).and_then(|_| {
+                client.request(
+                    "textDocument/documentSymbol",
+                    json!({ "textDocument": { "uri": path_to_uri(&abs) } }),
+                )
+            });
+            let diags = client.diagnostics.get(&abs).cloned().unwrap_or_default();
+            (sync, diags)
+        };
+        if let Err(e) = &sync {
+            self.evict_if_io_error(&config_name, e);
+        }
+        Ok(diags)
     }
 
     /// Go to definition.
@@ -270,16 +308,22 @@ impl LspManager {
             .ok_or(LspError::NoServerForType)?
             .0
             .to_string();
-        let client = self.ensure_client(&config_name)?;
-        client.open_document(&abs)?;
-        let result = client.request(
-            "textDocument/definition",
-            json!({
-                "textDocument": { "uri": path_to_uri(&abs) },
-                "position": { "line": line, "character": character }
-            }),
-        )?;
-        Ok(parse_locations(result))
+        let result = {
+            let client = self.ensure_client(&config_name)?;
+            client.open_document(&abs).and_then(|_| {
+                client.request(
+                    "textDocument/definition",
+                    json!({
+                        "textDocument": { "uri": path_to_uri(&abs) },
+                        "position": { "line": line, "character": character }
+                    }),
+                )
+            })
+        };
+        if let Err(e) = &result {
+            self.evict_if_io_error(&config_name, e);
+        }
+        Ok(parse_locations(result?))
     }
 
     /// Find references.
@@ -295,17 +339,23 @@ impl LspManager {
             .ok_or(LspError::NoServerForType)?
             .0
             .to_string();
-        let client = self.ensure_client(&config_name)?;
-        client.open_document(&abs)?;
-        let result = client.request(
-            "textDocument/references",
-            json!({
-                "textDocument": { "uri": path_to_uri(&abs) },
-                "position": { "line": line, "character": character },
-                "context": { "includeDeclaration": true }
-            }),
-        )?;
-        Ok(parse_locations(result))
+        let result = {
+            let client = self.ensure_client(&config_name)?;
+            client.open_document(&abs).and_then(|_| {
+                client.request(
+                    "textDocument/references",
+                    json!({
+                        "textDocument": { "uri": path_to_uri(&abs) },
+                        "position": { "line": line, "character": character },
+                        "context": { "includeDeclaration": true }
+                    }),
+                )
+            })
+        };
+        if let Err(e) = &result {
+            self.evict_if_io_error(&config_name, e);
+        }
+        Ok(parse_locations(result?))
     }
 
     /// Document symbols.
@@ -316,15 +366,19 @@ impl LspManager {
             .ok_or(LspError::NoServerForType)?
             .0
             .to_string();
-        let client = self.ensure_client(&config_name)?;
-        client.open_document(&abs)?;
-        let result = client.request(
-            "textDocument/documentSymbol",
-            json!({
-                "textDocument": { "uri": path_to_uri(&abs) }
-            }),
-        )?;
-        Ok(parse_symbols(result))
+        let result = {
+            let client = self.ensure_client(&config_name)?;
+            client.open_document(&abs).and_then(|_| {
+                client.request(
+                    "textDocument/documentSymbol",
+                    json!({ "textDocument": { "uri": path_to_uri(&abs) } }),
+                )
+            })
+        };
+        if let Err(e) = &result {
+            self.evict_if_io_error(&config_name, e);
+        }
+        Ok(parse_symbols(result?))
     }
 
     /// Rename a symbol.
@@ -341,17 +395,23 @@ impl LspManager {
             .ok_or(LspError::NoServerForType)?
             .0
             .to_string();
-        let client = self.ensure_client(&config_name)?;
-        client.open_document(&abs)?;
-        let result = client.request(
-            "textDocument/rename",
-            json!({
-                "textDocument": { "uri": path_to_uri(&abs) },
-                "position": { "line": line, "character": character },
-                "newName": new_name
-            }),
-        )?;
-        Ok(parse_workspace_edits(result))
+        let result = {
+            let client = self.ensure_client(&config_name)?;
+            client.open_document(&abs).and_then(|_| {
+                client.request(
+                    "textDocument/rename",
+                    json!({
+                        "textDocument": { "uri": path_to_uri(&abs) },
+                        "position": { "line": line, "character": character },
+                        "newName": new_name
+                    }),
+                )
+            })
+        };
+        if let Err(e) = &result {
+            self.evict_if_io_error(&config_name, e);
+        }
+        Ok(parse_workspace_edits(result?))
     }
 
     /// Resolve a relative path against the workspace root.
@@ -644,6 +704,54 @@ impl LspClient {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
+/// Percent-encode a single byte if it is not URI-unreserved.
+/// Unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~" (RFC 3986 §2.3).
+/// Finding #13 (review tools.md): LSP URIs must percent-encode reserved
+/// bytes — without it, paths containing spaces, '#' or '%' produce URIs
+/// the server re-parses differently, and diagnostics keyed under the
+/// encoded URI never match the raw-path lookup.
+fn encode_uri_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Percent-decode a URI path component ('%' + 2 hex digits → byte).
+/// Invalid/truncated escapes are passed through verbatim (defensive —
+/// servers may send non-conforming URIs).
+fn decode_uri_path(uri: &str) -> String {
+    let bytes = uri.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| -> Option<u8> {
+                match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                }
+            };
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn path_to_uri(path: &str) -> String {
     let abs = if Path::new(path).is_absolute() {
         path.to_string()
@@ -653,11 +761,12 @@ fn path_to_uri(path: &str) -> String {
             .map(|c| c.join(path).to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string())
     };
-    format!("file://{}", abs)
+    format!("file://{}", encode_uri_path(&abs))
 }
 
 fn uri_to_path(uri: &str) -> String {
-    uri.strip_prefix("file://").unwrap_or(uri).to_string()
+    let stripped = uri.strip_prefix("file://").unwrap_or(uri);
+    decode_uri_path(stripped)
 }
 
 fn severity_string(severity: u64) -> String {
@@ -962,5 +1071,228 @@ mod tests {
         // parse_workspace_edits with no changes key at all.
         let edits = parse_workspace_edits(json!({ "result": null }));
         assert!(edits.is_empty());
+    }
+
+    // ── Finding #12 (review tools.md): dead-client eviction ────────────
+
+    /// Minimal fake LSP server (python3). Answers `initialize` and every
+    /// request with an empty result. Controlled by a marker file in the
+    /// CWD (the manager sets CWD = workspace root): on the FIRST run
+    /// (marker absent) it answers initialize, creates the marker, and
+    /// exits — simulating a server that dies mid-session; on later runs
+    /// (marker present) it serves forever.
+    const FAKE_LSP_SERVER: &str = r#"
+import sys, json, os
+
+MARKER = "fake_lsp_first_run_done"
+first_run = not os.path.exists(MARKER)
+
+def readmsg():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line or line == b"\r\n":
+            break
+        k, _, v = line.decode().partition(":")
+        headers[k.strip().lower()] = v.strip()
+    n = int(headers.get("content-length", 0))
+    return json.loads(sys.stdin.buffer.read(n))
+
+def sendmsg(obj):
+    body = json.dumps(obj).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = readmsg()
+    if msg is None:
+        break
+    if msg.get("method") == "initialize":
+        sendmsg({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {}}})
+        if first_run:
+            open(MARKER, "w").close()
+            sys.exit(0)
+    elif "id" in msg:
+        sendmsg({"jsonrpc": "2.0", "id": msg["id"], "result": []})
+"#;
+
+    fn fake_lsp_config(root: &std::path::Path) -> HashMap<String, LspServerConfig> {
+        let script = root.join("fake_lsp_server.py");
+        std::fs::write(&script, FAKE_LSP_SERVER).unwrap();
+        let mut configs = HashMap::new();
+        configs.insert(
+            "python".to_string(),
+            LspServerConfig {
+                command: "python3".to_string(),
+                args: vec![script.to_string_lossy().to_string()],
+                file_types: vec!["py".to_string()],
+                root_markers: vec![],
+                init_options: None,
+            },
+        );
+        configs
+    }
+
+    /// #12 regression (public API): a request I/O error (write to a dead
+    /// stdin / EOF after the server dies) must EVICT the dead client so
+    /// the next call RESPAWNS the server instead of failing forever.
+    /// Run 1 of the fake server answers `initialize` then exits; the first
+    /// document_symbols call therefore fails with Io. Run 2 serves
+    /// normally; the second call must succeed.
+    #[test]
+    fn io_error_evicts_dead_client_and_next_call_respawns() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mgr = LspManager::new(root.path(), fake_lsp_config(root.path()));
+
+        let file = root.path().join("x.py");
+        std::fs::write(&file, "x = 1\n").unwrap();
+
+        // First call: server dies right after initialize → request fails
+        // with an I/O error (and the dead entry is evicted).
+        let first = mgr.document_symbols(file.to_str().unwrap());
+        assert!(
+            matches!(first, Err(LspError::Io(_))),
+            "first call should fail with Io (server died), got {:?}",
+            first
+        );
+        assert!(
+            !matches!(first, Err(LspError::ServerError(_))),
+            "failure must be I/O (dead server), not a protocol error"
+        );
+
+        // Second call: ensure_client must have respawned the server —
+        // previously the dead entry stayed in the map and this (and every
+        // later) call failed forever.
+        let second = mgr.document_symbols(file.to_str().unwrap());
+        assert!(
+            second.is_ok(),
+            "second call must respawn the server and succeed, got {:?}",
+            second
+        );
+    }
+
+    /// #12 regression (watchdog-kill shape): an entry whose child process
+    /// was SIGKILLed (exactly what the request watchdog leaves behind)
+    /// must be detected by ensure_client and replaced by a fresh spawn.
+    #[test]
+    fn killed_client_entry_is_detected_and_respawned() {
+        let root = tempfile::tempdir().unwrap();
+        // Marker pre-created → the fake server serves forever on run 1.
+        std::fs::write(root.path().join("fake_lsp_first_run_done"), "").unwrap();
+        let mut mgr = LspManager::new(root.path(), fake_lsp_config(root.path()));
+
+        // Manually insert a dead client: spawn a real child, kill it, wait
+        // for it to be reaped, and register it under the "python" config
+        // (simulating what the watchdog leaves in self.clients).
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let stdin: Box<dyn Write + Send> = Box::new(child.stdin.take().unwrap());
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        mgr.clients.insert(
+            "python".to_string(),
+            LspClient {
+                process: child,
+                stdin,
+                stdout,
+                diagnostics: HashMap::new(),
+                next_id: 1,
+                initialized: false,
+            },
+        );
+
+        let file = root.path().join("x.py");
+        std::fs::write(&file, "x = 1\n").unwrap();
+
+        // Without the fix this fails forever (dead stdin); with it, the
+        // dead entry is dropped and a fresh server is spawned.
+        let result = mgr.document_symbols(file.to_str().unwrap());
+        assert!(
+            result.is_ok(),
+            "request after watchdog-kill must respawn the server, got {:?}",
+            result
+        );
+    }
+
+    // ── Finding #13 (review tools.md): URI percent-encoding ────────────
+
+    /// #13: paths with spaces percent-encode and round-trip.
+    #[test]
+    fn uri_encoding_spaces_roundtrip() {
+        let path = "/tmp/my dir/file name.rs";
+        let uri = path_to_uri(path);
+        assert_eq!(uri, "file:///tmp/my%20dir/file%20name.rs");
+        assert_eq!(uri_to_path(&uri), path);
+    }
+
+    /// #13: '#' and '%' are reserved and must be encoded; round-trip holds.
+    #[test]
+    fn uri_encoding_hash_and_percent_roundtrip() {
+        for path in ["/tmp/a#b/file.rs", "/tmp/100%/weird#name.py"] {
+            let uri = path_to_uri(path);
+            assert!(uri.contains("%23") || !path.contains('#'), "hash encoded: {uri}");
+            assert!(uri.contains("%25") || !path.contains('%'), "percent encoded: {uri}");
+            assert_eq!(uri_to_path(&uri), path, "round-trip must restore the raw path");
+        }
+    }
+
+    /// #13: diagnostics published under an ENCODED URI must be keyed under
+    /// the decoded raw path so `diagnostics.get(&abs)` finds them.
+    #[test]
+    fn diagnostics_keyed_under_decoded_path() {
+        let raw = "/tmp/my dir/a#b.rs";
+        let uri = path_to_uri(raw); // encoded
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri,
+                "diagnostics": [
+                    { "range": { "start": { "line": 3, "character": 7 },
+                                  "end": { "line": 3, "character": 9 } },
+                      "severity": 1, "message": "boom" }
+                ]
+            }
+        });
+        let mut sleep_child = std::process::Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin: Box<dyn Write + Send> = Box::new(sleep_child.stdin.take().unwrap());
+        let stdout = BufReader::new(sleep_child.stdout.take().unwrap());
+        let mut client = LspClient {
+            process: sleep_child,
+            stdin,
+            stdout,
+            diagnostics: HashMap::new(),
+            next_id: 1,
+            initialized: false,
+        };
+        client.handle_diagnostics(&msg);
+        let diags = client
+            .diagnostics
+            .get(raw) // lookup uses the RAW path (manager `diagnostics()`)
+            .expect("diagnostics must be findable under the raw decoded path");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "boom");
+        assert_eq!(diags[0].line, 3);
+        let _ = client.process.kill();
+    }
+
+    /// #13: malformed percent-escapes pass through verbatim (defensive).
+    #[test]
+    fn uri_decoding_malformed_escapes_verbatim() {
+        assert_eq!(uri_to_path("file:///a%2"), "/a%2");
+        assert_eq!(uri_to_path("file:///a%zz"), "/a%zz");
+        assert_eq!(uri_to_path("file:///100%"), "/100%");
     }
 }

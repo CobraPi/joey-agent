@@ -422,6 +422,20 @@ fn restore_terminal() {
     joey_core::logging::set_console_suppressed(false);
 }
 
+/// Map `inner`'s Err onto a restored terminal: the wrapper half of
+/// [`Tui::enter`], extracted so the restore-on-error contract is
+/// assertable without a real TTY. On Err the restore callback runs
+/// exactly once; Ok passes through untouched.
+fn restore_on_err<T>(inner: io::Result<T>, restore: impl FnOnce()) -> io::Result<T> {
+    match inner {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            restore();
+            Err(e)
+        }
+    }
+}
+
 /// The TUI controller. Generic over the ratatui backend so tests can drive
 /// `handle_key` against a `TestBackend` without a real TTY; the default
 /// type parameter keeps the crossterm/stdout surface unchanged for hosts.
@@ -521,6 +535,26 @@ pub fn neurocode_explorer_owns_keys(app: &App) -> bool {
             .map_or(true, |pane| pane.spawned_by_neurocode)
 }
 
+/// True when `key` is the Ctrl+C combo (crossterm reports it as
+/// `Char('c')` + CONTROL). Shared by every overlay/swallow handler that
+/// needs to let the global interrupt/quit escape (review finding #7).
+fn is_ctrl_c(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+impl<B: ratatui::backend::Backend> Tui<B> {
+    /// The action the global Ctrl+C arm emits: Interrupt when a turn is
+    /// busy, Quit otherwise (engine-actor escalation model — see the
+    /// global arm's comment in `handle_key`).
+    fn ctrl_c_action(&mut self) -> Option<TuiAction> {
+        if self.app.is_busy() {
+            return Some(TuiAction::Interrupt);
+        }
+        self.app.mode = RunMode::Quitting;
+        Some(TuiAction::Quit)
+    }
+}
+
 /// T011 (US2, FR-003): pane-side counterpart of `App::item_is_expandable`
 /// (same kinds: tool calls, file diffs, reasoning blocks). The pane
 /// transcript lives on `SubagentPane`, which has no such helper, so the
@@ -537,20 +571,29 @@ fn pane_item_is_expandable(item: &TranscriptItem) -> bool {
 /// backend (the default type parameter), so it lives on the concrete type.
 impl Tui<FrameBackend> {
     /// Enter the alternate screen and create the terminal.
+    ///
+    /// Raw mode is enabled first; every later failure unwinds through
+    /// [`restore_terminal`] (the same sequence `leave`/Drop/the panic hook
+    /// use), so a partial enter leaves the shell usable for the caller's
+    /// line-REPL fallback instead of a wrecked raw-mode alternate screen.
     pub fn enter(app: App, theme: Theme) -> io::Result<Self> {
         install_panic_hook();
         enable_raw_mode()?;
+        restore_on_err(Self::enter_inner(app, theme), restore_terminal)
+    }
+
+    /// Post-raw-mode half of [`Tui::enter`]: claims the alternate screen,
+    /// builds the terminal, and constructs the controller. Reached only
+    /// with raw mode already on — every `?` here is a partial-failure
+    /// path the enter wrapper restores.
+    fn enter_inner(app: App, theme: Theme) -> io::Result<Self> {
         let mut stdout = io::stdout();
-        if let Err(e) = execute!(
+        execute!(
             stdout,
             EnterAlternateScreen,
             EnableBracketedPaste,
             EnableMouseCapture
-        ) {
-            // Leave the shell usable for the caller's line-REPL fallback.
-            let _ = disable_raw_mode();
-            return Err(e);
-        }
+        )?;
         // The alternate screen now owns the TTY: redirect tracing's stderr
         // console layer to logs/tui-console.log so verbose output can't
         // paint into the TUI's input box. Cleared by restore_terminal.
@@ -923,6 +966,13 @@ impl<B: ratatui::backend::Backend> Tui<B> {
 
         // Help overlay swallows keys until dismissed.
         if self.show_help {
+            // Review finding #7: Ctrl+C must not die in the swallow —
+            // close the overlay AND propagate the interrupt/quit the
+            // global arm (which sits below this block) would emit.
+            if is_ctrl_c(&key) {
+                self.show_help = false;
+                return self.ctrl_c_action();
+            }
             match key.code {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') | KeyCode::Enter => {
                     self.show_help = false;
@@ -1157,6 +1207,13 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // Agent picker overlay swallows keys until dismissed (BC-014).
         if self.app.agent_picker_open {
             let roster_len = self.app.agent_roster.len();
+            // Review finding #7: Ctrl+C escapes the swallow — close the
+            // picker AND propagate interrupt/quit (the global Ctrl+C arm
+            // below never runs while the picker owns the keys).
+            if is_ctrl_c(&key) {
+                self.app.agent_picker_open = false;
+                return self.ctrl_c_action();
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.app.agent_picker_open = false;
@@ -1435,9 +1492,13 @@ impl<B: ratatui::backend::Backend> Tui<B> {
             // T031/T146: Plain Up (no modifier) on single-line input switches
             // focus to the transcript, restoring the behavior Tab used to have
             // before it was repurposed for agent switching.
+            // Review finding #1: ALT is excluded too — with NeuroCode active
+            // (and no panes), Alt+Up must fall through to the neurocode feed
+            // scroll arm below instead of recalling history.
             KeyCode::Up
                 if self.focus == Focus::Input
                     && !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
                     && self.input.line_count() == 1 =>
             {
                 // History recall — reedline/CLI parity. Plain Up on a
@@ -2126,6 +2187,19 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// pre-pane behavior, constitution VII). The rendered indicator
     /// mirrors the TARGET view (`draw_search_bar` routes it).
     fn handle_search_key(&mut self, key: KeyEvent) -> Option<TuiAction> {
+        // Review finding #6: Ctrl-combos are never text. Without this guard
+        // Ctrl+C types 'c' into the query and the global Ctrl+C handler
+        // (below the search routing in handle_key) is unreachable while the
+        // bar is open. Ctrl+C closes the bar AND emits the global arm's
+        // interrupt/quit; other Ctrl-combos fall through as no-ops (this
+        // handler runs before every global arm).
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if is_ctrl_c(&key) {
+                self.close_search();
+                return self.ctrl_c_action();
+            }
+            return None;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.close_search();
@@ -2208,6 +2282,17 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// no-op that keeps the overlay open, mirroring Submit's empty-guard),
     /// printables/Backspace edit the draft.
     fn handle_steer_key(&mut self, key: KeyEvent) -> Option<TuiAction> {
+        // Review finding #6: same guard as handle_search_key — Ctrl-combos
+        // must never land in the draft as text. Ctrl+C discards the draft
+        // AND emits the global arm's interrupt/quit (which this handler
+        // otherwise shadows); other Ctrl-combos are no-ops.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if is_ctrl_c(&key) {
+                self.steer = None;
+                return self.ctrl_c_action();
+            }
+            return None;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.steer = None;
@@ -2669,6 +2754,42 @@ mod key_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, KeyEventKind, KeyEventState};
     use ratatui::backend::TestBackend;
 
+    /// `Tui::enter`'s wrapper contract: a partial failure AFTER raw mode
+    /// was enabled must run the restore callback (disable_raw_mode +
+    /// LeaveAlternateScreen via restore_terminal) so the fallback line REPL
+    /// starts in a clean shell. A real TTY isn't testable in CI, so this
+    /// asserts on the extracted `restore_on_err` wrapper the enter path
+    /// routes through — Err ⇒ restore ran exactly once; Ok ⇒ never.
+    #[test]
+    fn enter_failure_path_restores_terminal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Err after alt-screen claim ⇒ restore runs.
+        let restored = AtomicUsize::new(0);
+        let res: io::Result<()> = Err(io::Error::new(io::ErrorKind::Other, "boom"));
+        assert!(restore_on_err(res, || {
+            restored.fetch_add(1, Ordering::SeqCst);
+        })
+        .is_err());
+        assert_eq!(restored.load(Ordering::SeqCst), 1, "restore must run on Err");
+
+        // Ok ⇒ restore never runs (success must not unwind the terminal).
+        let restored = AtomicUsize::new(0);
+        let res: io::Result<u32> = Ok(7);
+        assert_eq!(
+            restore_on_err(res, || {
+                restored.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap(),
+            7
+        );
+        assert_eq!(
+            restored.load(Ordering::SeqCst),
+            0,
+            "restore must not run on Ok"
+        );
+    }
+
     fn tui_with_history(entries: &[&str]) -> Tui<TestBackend> {
         let mut app = App::new("s", "m");
         for e in entries {
@@ -2806,6 +2927,35 @@ mod key_tests {
         // j/k scrolling now; typing 'g' shouldn't insert into input.
         t.handle_key(char_evt('g'));
         assert!(t.input.is_empty());
+    }
+
+    /// Review finding #1: ALT is excluded from the plain-Up history arm.
+    /// With NeuroCode active and NO panes, Alt+Up must reach the neurocode
+    /// feed-scroll arm (scroll increments) instead of recalling history —
+    /// and never swaps the draft for a history entry.
+    #[test]
+    fn alt_up_with_neurocode_does_not_recall_history() {
+        let mut t = tui_with_history(&["one", "two", "three"]);
+        t.app.apply(joey_agent_core::AgentEvent::NeuroCodeActive { active: true });
+        t.handle_key(char_evt('d')); // a draft to prove it survives
+        let alt_up = KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::ALT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        t.handle_key(alt_up);
+        assert_eq!(
+            t.input.text(), "d",
+            "Alt+Up must not recall history (no draft swap)"
+        );
+        assert_eq!(
+            t.app.neurocode_scroll, 1,
+            "Alt+Up reached the neurocode feed-scroll arm"
+        );
+        // Plain Up still recalls — the exclusion didn't break the arm.
+        t.handle_key(up());
+        assert_eq!(t.input.text(), "three", "plain Up still recalls history");
     }
 }
 
@@ -6383,6 +6533,133 @@ mod pane_stop_steer_key_tests {
         assert!(t.handle_key(char_key('s')).is_none());
         assert!(!t.app.search_open, "'s' did not open search (steer wins)");
         assert!(t.steer.is_some(), "'s' opened the steer overlay instead");
+    }
+
+    /// Review finding #6: Ctrl+C while the steer overlay is open must NOT
+    /// type 'c' into the draft — it discards the draft AND emits the
+    /// global arm's action (Interrupt when busy, Quit when idle).
+    #[test]
+    fn steer_overlay_ctrl_c_discards_draft_and_emits_global_action() {
+        let mut t = tui();
+        spawn_two_panes_focused_on_second(&mut t);
+        t.handle_key(char_key('s'));
+        for c in "steer this".chars() {
+            t.handle_key(char_key(c));
+        }
+        // Idle → Quit.
+        let action = t.handle_key(plain_ctrl_c());
+        assert!(matches!(action, Some(TuiAction::Quit)), "idle Ctrl+C quits");
+        assert!(t.steer.is_none(), "overlay closed (draft discarded)");
+        assert_eq!(t.input.text(), "", "nothing typed into the input box");
+
+        // Busy → Interrupt.
+        let mut t2 = tui();
+        spawn_two_panes_focused_on_second(&mut t2);
+        t2.handle_key(char_key('s'));
+        t2.app_mut().mode = crate::state::RunMode::Busy;
+        let action = t2.handle_key(plain_ctrl_c());
+        assert!(
+            matches!(action, Some(TuiAction::Interrupt)),
+            "busy Ctrl+C interrupts"
+        );
+        assert!(t2.steer.is_none(), "overlay closed under interrupt too");
+    }
+
+    /// Review finding #6: other Ctrl-combos are no-ops inside the steer
+    /// overlay (never text, never an action) — only Ctrl+C escapes.
+    #[test]
+    fn steer_overlay_other_ctrl_combos_are_noops() {
+        let mut t = tui();
+        spawn_two_panes_focused_on_second(&mut t);
+        t.handle_key(char_key('s'));
+        for c in "keep".chars() {
+            t.handle_key(char_key(c));
+        }
+        let mut ctrl_u = plain(KeyCode::Char('u'));
+        ctrl_u.modifiers = KeyModifiers::CONTROL;
+        assert!(t.handle_key(ctrl_u).is_none(), "no action emitted");
+        assert_eq!(
+            t.steer.as_ref().unwrap().text, "keep",
+            "Ctrl-combo neither typed nor cleared the draft"
+        );
+        assert!(t.steer.is_some(), "overlay still open");
+    }
+
+    /// Review finding #6: Ctrl+C while the SEARCH bar is open must not
+    /// type 'c' into the query — it closes the bar AND emits the global
+    /// action; other Ctrl-combos are swallowed no-ops (never query text).
+    #[test]
+    fn search_bar_ctrl_c_closes_and_emits_global_action() {
+        let mut t = tui();
+        t.focus = Focus::Transcript;
+        t.handle_key(char_key('/'));
+        assert!(t.app.search_open, "bar opened");
+        for c in "que".chars() {
+            t.handle_key(char_key(c));
+        }
+        let action = t.handle_key(plain_ctrl_c());
+        assert!(matches!(action, Some(TuiAction::Quit)), "idle Ctrl+C quits");
+        assert!(!t.app.search_open, "bar closed");
+        assert_eq!(t.app.search_query, "", "query cleared");
+
+        // Other Ctrl-combos: swallowed, no action, no text.
+        let mut t2 = tui();
+        t2.focus = Focus::Transcript;
+        t2.handle_key(char_key('/'));
+        let mut ctrl_a = plain(KeyCode::Char('a'));
+        ctrl_a.modifiers = KeyModifiers::CONTROL;
+        assert!(t2.handle_key(ctrl_a).is_none(), "no action");
+        assert_eq!(
+            t2.app.search_query, "",
+            "Ctrl-combo must not type into the query"
+        );
+        assert!(t2.app.search_open, "bar still open");
+    }
+
+    /// Review finding #7: Ctrl+C while the help overlay is open must
+    /// close it AND propagate the interrupt/quit the global arm would
+    /// have emitted — not die in the swallow.
+    #[test]
+    fn help_overlay_ctrl_c_closes_and_emits_global_action() {
+        let mut t = tui();
+        t.show_help = true;
+        let action = t.handle_key(plain_ctrl_c());
+        assert!(matches!(action, Some(TuiAction::Quit)));
+        assert!(!t.show_help, "overlay closed");
+
+        let mut t2 = tui();
+        t2.show_help = true;
+        t2.app_mut().mode = crate::state::RunMode::Busy;
+        let action = t2.handle_key(plain_ctrl_c());
+        assert!(matches!(action, Some(TuiAction::Interrupt)));
+        assert!(!t2.show_help, "overlay closed under interrupt");
+    }
+
+    /// Review finding #7: Ctrl+C while the agent picker is open must
+    /// close it AND propagate interrupt/quit (the global Ctrl+C arm
+    /// never runs while the picker owns the keys).
+    #[test]
+    fn agent_picker_ctrl_c_closes_and_emits_global_action() {
+        let mut t = tui();
+        t.app.agent_picker_open = true;
+        let action = t.handle_key(plain_ctrl_c());
+        assert!(matches!(action, Some(TuiAction::Quit)));
+        assert!(!t.app.agent_picker_open, "picker closed");
+
+        let mut t2 = tui();
+        t2.app.agent_picker_open = true;
+        t2.app_mut().mode = crate::state::RunMode::Busy;
+        let action = t2.handle_key(plain_ctrl_c());
+        assert!(matches!(action, Some(TuiAction::Interrupt)));
+        assert!(!t2.app.agent_picker_open, "picker closed under interrupt");
+    }
+
+    /// Ctrl+C event builder (crossterm reports the combo as Char('c') +
+    /// CONTROL — the is_ctrl_c guard's exact shape).
+    fn plain_ctrl_c() -> KeyEvent {
+        let mut ev = plain(KeyCode::Char('c'));
+        ev.modifiers = KeyModifiers::CONTROL;
+        ev
     }
 
     /// (c) Precedence in the transcript layer: with a pane focused, `x`

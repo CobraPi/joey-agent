@@ -2359,6 +2359,10 @@ fn model_slash(st: &mut ReplState, args: &str) {
             // The rebuild re-reads config; keep the NeuroCode engine scoped
             // to the (possibly changed) live provider (TUI parity).
             refresh_neurocode_engine(st);
+            // Keep the REPL's model snapshot (used by dispatch_system_prompt
+            // and status) in sync with the rebuilt agent's current model —
+            // mirror of the session-start capture (`config.model()`).
+            st.model = build_agent_config(&st.config, &st.overrides).model;
             if global {
                 if let Err(e) = st.config.set_and_save("model.default", &model) {
                     render::error(&format!("failed to persist model.default: {}", e));
@@ -2629,6 +2633,45 @@ fn show_sessions(st: &ReplState) {
             s.message_count,
             if title.is_empty() { Color::DarkGray.paint("(untitled)").to_string() } else { title }
         );
+    }
+}
+
+/// `/config set` — route exactly like `joey config set` (config_cmd::set_value,
+/// which is private and therefore replicated here): env-shaped keys
+/// ([`joey_core::config::is_env_config_key`]) persist to `.env` via
+/// [`joey_core::config::save_env_value`]; everything else lands in
+/// config.yaml through the session's Config snapshot (set_and_save applies
+/// upstream set-time coercion — and the same env routing as a backstop).
+fn repl_config_set(config: &mut Config, key: &str, value: &str) -> Result<()> {
+    if joey_core::config::is_env_config_key(key) {
+        joey_core::config::save_env_value(&key.to_uppercase(), value)?;
+        render::success(&format!(
+            "✓ Set {} in {}",
+            key,
+            joey_core::constants::env_path().display()
+        ));
+        return Ok(());
+    }
+    config.set_and_save(key, value)?;
+    render::success(&format!(
+        "✓ Set {} = {} in {}",
+        key,
+        mask_config_set_value(key, value),
+        config.path().display()
+    ));
+    Ok(())
+}
+
+/// Display form of a value written via `/config set`: secret-shaped leaf
+/// keys are masked (parity with config_cmd::set_value / upstream
+/// `_SECRET_CONFIG_KEYS`; the const is private there, so mirrored here).
+fn mask_config_set_value(key: &str, value: &str) -> String {
+    const SECRET_CONFIG_KEYS: &[&str] = &["api_key", "token", "secret", "password", "auth_token"];
+    let leaf = key.rsplit('.').next().unwrap_or(key).to_lowercase();
+    if SECRET_CONFIG_KEYS.contains(&leaf.as_str()) && !value.is_empty() {
+        joey_core::redact::mask_secret_default(value)
+    } else {
+        value.to_string()
     }
 }
 

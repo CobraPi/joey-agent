@@ -105,7 +105,7 @@ fn set_disabled(name: &str, disable: bool) -> Result<i32> {
         return Ok(1);
     }
     let mut config = joey_core::Config::load()?;
-    let mut list: Vec<String> = config.get_str_list("skills.disabled");
+    let mut list: Vec<String> = disabled_list(&config);
     let verb = if disable { "disable" } else { "enable" };
     if disable {
         if list.iter().any(|s| s == name) {
@@ -121,11 +121,36 @@ fn set_disabled(name: &str, disable: bool) -> Result<i32> {
             return Ok(0);
         }
     }
-    let joined = list.join(",");
-    config.set_and_save("skills.disabled", &joined)?;
+    // Write a proper YAML sequence — get_str_list (the reader) only parses
+    // sequences, so a comma-joined scalar would be inert.
+    let seq = serde_yaml::Value::Sequence(
+        list.iter()
+            .cloned()
+            .map(serde_yaml::Value::String)
+            .collect(),
+    );
+    config.set_value_and_save("skills.disabled", seq)?;
     println!("{}", Color::Green.paint(format!("✓ {verb}d skill '{name}'")));
     println!("  (applies to new sessions and after /reload-skills)");
     Ok(0)
+}
+
+/// Read the disabled-skill list. Sequences (the canonical form this command
+/// writes) parse via `get_str_list`; a legacy comma-joined scalar (written
+/// by older builds) is split on commas as a read-side migration nicety.
+fn disabled_list(config: &joey_core::Config) -> Vec<String> {
+    let list = config.get_str_list("skills.disabled");
+    if list.is_empty() {
+        if let Some(scalar) = config.get("skills.disabled").and_then(|v| v.as_str()) {
+            return scalar
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+    }
+    list
 }
 
 /// `joey skills config` — where skills live + manual install instructions.
@@ -208,4 +233,85 @@ fn list(enabled_only: bool) -> Result<i32> {
     );
     println!();
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the process-global joey home to a temp dir under the shared
+    /// override lock (same pattern as the neurocode tests) so config.yaml
+    /// writes and skill discovery land in a temp home, never `~/.joey`.
+    struct PinnedHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _guard: joey_core::constants::HomeOverrideGuard,
+        _dir: tempfile::TempDir,
+    }
+
+    fn pinned_home() -> (PinnedHome, std::path::PathBuf) {
+        let lock = joey_core::constants::TEST_HOME_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.clone());
+        (PinnedHome { _lock: lock, _guard: guard, _dir: dir }, home)
+    }
+
+    fn make_skill(home: &std::path::Path, name: &str) {
+        let dir = home.join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {name} skill\n---\n\n# {name}\n"),
+        )
+        .unwrap();
+    }
+
+    /// Regression (#8): disable/enable must write a YAML SEQUENCE — the
+    /// reader (`get_str_list`) only parses sequences, so the old
+    /// comma-joined scalar was inert.
+    #[test]
+    fn disable_writes_sequence_and_round_trips() {
+        let (_h, home) = pinned_home();
+        make_skill(&home, "demo");
+        make_skill(&home, "other");
+
+        // Disable two skills → both survive a reload through the reader.
+        assert_eq!(set_disabled("demo", true).unwrap(), 0);
+        assert_eq!(set_disabled("other", true).unwrap(), 0);
+        let cfg = joey_core::Config::load().unwrap();
+        assert_eq!(
+            cfg.get_str_list("skills.disabled"),
+            vec!["demo".to_string(), "other".to_string()]
+        );
+        // On disk it is a sequence, not a comma-joined scalar.
+        let raw = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(
+            !raw.contains("disabled: demo,other") && !raw.contains("disabled: 'demo,other'"),
+            "scalar form must not be written, got: {raw}"
+        );
+
+        // Enable round-trips the same way.
+        assert_eq!(set_disabled("demo", false).unwrap(), 0);
+        let cfg = joey_core::Config::load().unwrap();
+        assert_eq!(cfg.get_str_list("skills.disabled"), vec!["other".to_string()]);
+    }
+
+    /// Read-side migration nicety (#8): a legacy comma-joined scalar is
+    /// parsed as a list by the command's read helper only.
+    #[test]
+    fn legacy_scalar_disabled_list_is_comma_split() {
+        let (_h, home) = pinned_home();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.yaml"), "skills:\n  disabled: 'alpha, beta'\n").unwrap();
+        let cfg = joey_core::Config::load().unwrap();
+        // The generic reader still returns nothing for a scalar...
+        assert!(cfg.get_str_list("skills.disabled").is_empty());
+        // ...but the command's read helper migrates it.
+        assert_eq!(
+            disabled_list(&cfg),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+    }
 }

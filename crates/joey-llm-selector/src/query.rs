@@ -133,17 +133,30 @@ impl<'a> SelectorQuery<'a> {
     }
 
     /// Enable the selector (FR-002).
+    ///
+    /// Persists `model.selector.enabled: true` to the joey config layer
+    /// (config.yaml) in addition to the in-memory config + allocation map:
+    /// the startup consumer reads that key fresh each session
+    /// (`try_build_allocator` → `get_bool("model.selector.enabled", false)`),
+    /// and the engine's `update_config` persists only the allocation map —
+    /// without the config write the toggle would be lost on restart.
+    /// Persistence failures are logged, not fatal (session state still
+    /// applies), mirroring the engine's best-effort map saves.
     pub fn enable(&self) {
         let mut cfg = self.engine.config_snapshot();
         cfg.enabled = true;
         self.engine.update_config(cfg);
+        persist_enabled_flag(true);
     }
 
     /// Disable the selector (FR-002). Falls back to the configured model.
+    ///
+    /// Persists `model.selector.enabled: false` — see [`Self::enable`].
     pub fn disable(&self) {
         let mut cfg = self.engine.config_snapshot();
         cfg.enabled = false;
         self.engine.update_config(cfg);
+        persist_enabled_flag(false);
     }
 
     /// Set the learning budget (FR-009).
@@ -171,6 +184,27 @@ impl<'a> SelectorQuery<'a> {
 }
 
 // ── Engine accessors needed by the query API ───────────────────────────────
+
+/// Best-effort persistence of `model.selector.enabled` to the joey config
+/// layer (FR-002: the enable/disable toggle must survive restarts).
+///
+/// Loads the user's config.yaml via joey-core's layered loader, writes the
+/// dotted key with `set_and_save` (atomic write, `true`/`false` coerced to a
+/// YAML bool), and logs on failure — never fatal (the in-memory session
+/// state was already applied). Loading fresh (rather than caching a Config
+/// on the engine) guarantees we merge into whatever the user last saved,
+/// exactly like the `joey config set` path.
+fn persist_enabled_flag(enabled: bool) {
+    let value = if enabled { "true" } else { "false" };
+    let result = joey_core::Config::load()
+        .and_then(|mut c| c.set_and_save("model.selector.enabled", value));
+    if let Err(e) = result {
+        tracing::warn!(
+            "llm-selector: failed to persist model.selector.enabled={}: {}",
+            enabled, e
+        );
+    }
+}
 
 impl SelectorEngine {
     /// Get the configured model id.
@@ -258,6 +292,54 @@ pub fn render_status(report: &StatusReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map::AllocationMap;
+
+    /// Review finding #1 regression: enable/disable must persist
+    /// `model.selector.enabled` to the joey config layer so the toggle
+    /// survives a restart — the startup consumer (`try_build_allocator`)
+    /// reads that key fresh from config.yaml each session, not from the
+    /// allocation map. Round-trips a simulated restart via `Config::load()`.
+    #[test]
+    fn test_enable_disable_persists_to_config() {
+        use joey_core::Config;
+        // Serialize with any other home-override users (cross-crate lock),
+        // and pin home to a tempdir so the config write/read round-trips
+        // through an isolated config.yaml.
+        let _override_lock = joey_core::constants::TEST_HOME_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let _home =
+            joey_core::constants::HomeOverrideGuard::new(dir.path().to_path_buf());
+
+        let cfg = SelectorConfig {
+            enabled: false,
+            configured_model: "auto".to_string(),
+            ..Default::default()
+        };
+        let engine = SelectorEngine::new_with_map_path(
+            cfg,
+            AllocationMap::default(),
+            dir.path().join("allocations.json"),
+        );
+        let q = SelectorQuery::new(&engine);
+        assert!(!engine.is_active());
+
+        q.enable();
+        // Simulated restart: the consumer loads config fresh.
+        let fresh = Config::load().unwrap();
+        assert!(
+            fresh.get_bool("model.selector.enabled", false),
+            "enable must survive a restart (persisted to config.yaml)"
+        );
+
+        q.disable();
+        let fresh = Config::load().unwrap();
+        assert!(
+            !fresh.get_bool("model.selector.enabled", true),
+            "disable must survive a restart (persisted to config.yaml)"
+        );
+    }
 
     #[test]
     fn test_render_disabled() {

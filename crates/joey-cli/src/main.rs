@@ -403,6 +403,14 @@ pub fn scan_profile_flag(argv: &[String]) -> (Option<String>, Option<(usize, usi
     (None, None)
 }
 
+/// Derive the profile name from a JOEY_HOME path that already points at a
+/// profile directory (`<root>/profiles/<name>`): the final path component.
+/// Finding #5: used by `apply_profile_override`'s early-return branch so the
+/// active-profile name is recorded instead of falling through to "default".
+fn profile_name_from_home(path: &std::path::Path) -> Option<String> {
+    path.file_name().and_then(|n| n.to_str()).map(|n| n.to_string())
+}
+
 /// Apply `-p/--profile` BEFORE clap runs: set `JOEY_HOME` to the profile home
 /// (`<root>/profiles/<name>`) and strip the flag from argv. Falls back to the
 /// sticky `<root>/active_profile` file.
@@ -416,6 +424,12 @@ fn apply_profile_override(argv: &mut Vec<String>) {
                 let p = std::path::PathBuf::from(home.trim());
                 if p.parent().and_then(|d| d.file_name()).map(|n| n == "profiles").unwrap_or(false)
                 {
+                    // Finding #5: derive and record the profile name before
+                    // returning — previously ACTIVE_PROFILE stayed unset here
+                    // and main() pinned "default".
+                    if let Some(name) = profile_name_from_home(&p) {
+                        let _ = ACTIVE_PROFILE.set(name);
+                    }
                     return;
                 }
             }
@@ -480,7 +494,11 @@ async fn main() {
     let mut tail: Vec<String> = argv.split_off(1);
     apply_profile_override(&mut tail);
     argv.extend(tail);
-    let _ = ACTIVE_PROFILE.set("default".to_string());
+    // Finding #5: only pin "default" when nothing was set — never clobber a
+    // name recorded by apply_profile_override (flag or derived-from-home).
+    if ACTIVE_PROFILE.get().is_none() {
+        let _ = ACTIVE_PROFILE.set("default".to_string());
+    }
 
     let cli = match Cli::try_parse_from(&argv) {
         Ok(c) => c,
@@ -759,6 +777,47 @@ mod tests {
         let (name, strip) = scan_profile_flag(&args);
         assert_eq!(name, None);
         assert_eq!(strip, None);
+    }
+
+    // ── Finding #5: ACTIVE_PROFILE derivation from a profile-dir home. ──
+
+    #[test]
+    fn profile_name_from_home_derives_final_component() {
+        use std::path::Path;
+        assert_eq!(
+            profile_name_from_home(Path::new("/home/u/.joey/profiles/coder")),
+            Some("coder".to_string())
+        );
+        assert_eq!(
+            profile_name_from_home(Path::new("/home/u/.joey/profiles/work-2")),
+            Some("work-2".to_string())
+        );
+        // Trailing separator still yields the final component.
+        assert_eq!(
+            profile_name_from_home(Path::new("/home/u/.joey/profiles/coder/")),
+            Some("coder".to_string())
+        );
+        // Degenerate paths (root / empty) have no final component.
+        assert_eq!(profile_name_from_home(Path::new("/")), None);
+        assert_eq!(profile_name_from_home(Path::new("")), None);
+    }
+
+    #[test]
+    fn active_profile_set_never_clobbers_existing_value() {
+        // OnceLock::set is a no-op when already initialized — this is the
+        // exact get-or-init semantics main() relies on after Finding #5:
+        // apply_profile_override's value survives the "default" pin, and the
+        // pin only lands when nothing was set.
+        let lock: OnceLock<String> = OnceLock::new();
+        let _ = lock.set("coder".to_string());
+        let _ = lock.set("default".to_string());
+        assert_eq!(lock.get().map(String::as_str), Some("coder"));
+
+        let fresh: OnceLock<String> = OnceLock::new();
+        if fresh.get().is_none() {
+            let _ = fresh.set("default".to_string());
+        }
+        assert_eq!(fresh.get().map(String::as_str), Some("default"));
     }
 
     #[test]

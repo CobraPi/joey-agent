@@ -65,8 +65,6 @@ pub struct VizState {
     pub selected: usize,
     /// Node-list cursor (kept in sync with `selected` when switching panes).
     pub list_cursor: usize,
-    /// Raw-feed scroll (lines from tail).
-    pub feed_scroll: usize,
     /// Detail-pane scroll (rows from top).
     pub detail_scroll: usize,
     /// Highlight the selected node's direct neighbors on the canvas.
@@ -101,7 +99,6 @@ impl Default for VizState {
             zoom: 1.0,
             selected: 0,
             list_cursor: 0,
-            feed_scroll: 0,
             detail_scroll: 0,
             show_neighbors: true,
             node_cells: RefCell::new(Vec::new()),
@@ -118,7 +115,6 @@ impl VizState {
         self.zoom = 1.0;
         self.selected = 0;
         self.list_cursor = 0;
-        self.feed_scroll = 0;
         self.detail_scroll = 0;
         self.show_neighbors = true;
         self.node_cells.borrow_mut().clear();
@@ -136,6 +132,23 @@ impl VizState {
         // Keep list cursor synced with the canvas selection when arriving.
         if self.tab == VizTab::Nodes {
             self.list_cursor = self.selected;
+        }
+    }
+
+    /// Review finding #8: `selected` is shared across two index spaces —
+    /// graph nodes and the (depth, id) task ordering. After browsing a
+    /// larger Tasks tab, `selected` can exceed the Graph/Nodes item count,
+    /// leaving keyboard nav dead (`select_directional` early-returns) and
+    /// the list highlight stale. Clamp the selection to `n` items and
+    /// re-sync the list cursor (the same clamp the draw side applies
+    /// locally, now fixed in state).
+    pub fn clamp_selection_to(&mut self, n: usize) {
+        let max = n.saturating_sub(1);
+        if self.selected > max {
+            self.selected = max;
+        }
+        if self.list_cursor > max {
+            self.list_cursor = max;
         }
     }
 
@@ -420,6 +433,21 @@ fn app_task_select_move(app: &mut App, up: bool) {
     task_select_move(&mut app.neurocode_viz, n, up);
 }
 
+/// Review finding #8: `VizState.selected` is shared across two index
+/// spaces (graph-node indices vs the (depth, id) task ordering). After
+/// every tab switch, clamp the selection (and list cursor) into the
+/// destination tab's bounds — otherwise a stale task index > node count
+/// leaves graph nav dead (`select_directional` early-returns) and the
+/// node-list highlight pointing nowhere. Feed has no index space.
+fn clamp_viz_selection(viz: &mut VizState, tab: VizTab, node_count: usize, task_count: usize) {
+    let n = match tab {
+        VizTab::Graph | VizTab::Nodes => node_count,
+        VizTab::Tasks => task_count,
+        VizTab::Feed => return,
+    };
+    viz.clamp_selection_to(n);
+}
+
 /// Handle a mouse click inside the explorer area. Returns true when the
 /// click docked the explorer (caller stops). `title_row` is the explorer's
 /// first screen row — the dock affordance.
@@ -575,16 +603,24 @@ pub fn explorer_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
         }
     }
     let code = key.code;
+    // Review finding #8: precompute both index-space sizes (graph nodes vs
+    // task count) so every tab-switch arm can clamp the shared `selected`
+    // into the destination tab's bounds. Field-disjoint from the `viz`
+    // borrow below.
+    let node_count = app.neurocode_snapshot.as_ref().map_or(0, |s| s.nodes.len());
+    let task_count = app.task_graph.as_ref().map_or(0, |g| g.nodes.len());
     let viz = &mut app.neurocode_viz;
     match code {
         KeyCode::Tab => {
             viz.cycle_tab();
+            clamp_viz_selection(viz, viz.tab, node_count, task_count);
             true
         }
         KeyCode::BackTab => {
             viz.cycle_tab();
             viz.cycle_tab();
             viz.cycle_tab();
+            clamp_viz_selection(viz, viz.tab, node_count, task_count);
             true
         }
         // Digit shortcuts mirror the tab-strip labels ([1 graph] …
@@ -592,6 +628,7 @@ pub fn explorer_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
         // without a neurocode snapshot).
         KeyCode::Char('1') => {
             viz.tab = VizTab::Graph;
+            clamp_viz_selection(viz, viz.tab, node_count, task_count);
             true
         }
         KeyCode::Char('2') => {
@@ -599,14 +636,17 @@ pub fn explorer_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
             if app.neurocode_snapshot.is_some() {
                 viz.list_cursor = viz.selected;
             }
+            clamp_viz_selection(viz, viz.tab, node_count, task_count);
             true
         }
         KeyCode::Char('3') => {
             viz.tab = VizTab::Tasks;
+            clamp_viz_selection(viz, viz.tab, node_count, task_count);
             true
         }
         KeyCode::Char('4') => {
             viz.tab = VizTab::Feed;
+            clamp_viz_selection(viz, viz.tab, node_count, task_count);
             true
         }
         _ if !has_snapshot && viz.tab != VizTab::Tasks => {
@@ -635,6 +675,37 @@ pub fn explorer_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
             viz.reset_view();
             true
         }
+        // Review finding #3: detail-pane scrolling. PgUp/PgDn advance/
+        // retreat `detail_scroll` (rows from the BOTTOM — the same
+        // tail-anchor convention as neurocode_scroll), saturating at both
+        // ends; the render side clamps to the pane's content height
+        // (draw_detail / draw_task_detail, `total - visible`). On the
+        // Feed tab the same keys page the raw feed instead (no detail
+        // pane there). Up/Down stay bound to selection movement on every
+        // tab, which resets detail_scroll — PgUp/PgDn are the
+        // non-conflicting binding.
+        KeyCode::PageUp => {
+            match viz.tab {
+                VizTab::Graph | VizTab::Nodes | VizTab::Tasks => {
+                    viz.detail_scroll = viz.detail_scroll.saturating_add(10);
+                }
+                VizTab::Feed => {
+                    app.neurocode_scroll = app.neurocode_scroll.saturating_add(10);
+                }
+            }
+            true
+        }
+        KeyCode::PageDown => {
+            match viz.tab {
+                VizTab::Graph | VizTab::Nodes | VizTab::Tasks => {
+                    viz.detail_scroll = viz.detail_scroll.saturating_sub(10);
+                }
+                VizTab::Feed => {
+                    app.neurocode_scroll = app.neurocode_scroll.saturating_sub(10);
+                }
+            }
+            true
+        }
         KeyCode::Char(' ') => {
             viz.show_neighbors = !viz.show_neighbors;
             true
@@ -653,6 +724,7 @@ pub fn explorer_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
                 // Re-center: zero the pan so the selection's ring is framed.
                 viz.pan = (0, 0);
             }
+            clamp_viz_selection(viz, viz.tab, node_count, task_count);
             true
         }
         KeyCode::Char('g') if viz.tab == VizTab::Nodes => {
@@ -2365,9 +2437,152 @@ mod tests {
         for cell in term.backend().buffer().content.iter() {
             assert!(
                 cell.symbol().chars().count() <= 1,
-                "multi-char symbol in buffer cell: {:?}",
+                "multi-char symbol in buffer cell: {:?} — this ghosts on pan",
                 cell.symbol()
             );
         }
+    }
+
+    // ── key-binding regressions (review findings #3 and #8) ─────────────
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    /// A minimal task graph with `n` tasks (the Tasks tab's index space).
+    fn tasks(n: usize) -> TaskGraph {
+        let mut g = TaskGraph::default();
+        for i in 0..n {
+            g.nodes.insert(
+                TaskId::from(format!("t{i}")),
+                TaskNode {
+                    id: TaskId::from(format!("t{i}")),
+                    objective: format!("objective {i}"),
+                    dependencies: vec![],
+                    read_set: vec![],
+                    write_set: vec![],
+                    artifact_ids: vec![],
+                    role: joey_orchestration::task_graph::WorkerRole::Implementor,
+                    model_tier: joey_orchestration::task_graph::ModelTier::Frontier,
+                    risk: joey_orchestration::task_graph::RiskLevel::Low,
+                    acceptance: vec![],
+                    verification: Default::default(),
+                    isolation: joey_orchestration::task_graph::IsolationMode::SharedCheckout,
+                    status: TaskStatus::Pending,
+                    attempts: 0,
+                },
+            );
+        }
+        g
+    }
+
+    /// Review finding #3: PgUp/PgDn scroll the detail pane (rows from the
+    /// bottom, saturating at both ends) on the Graph/Nodes/Tasks tabs; on
+    /// Feed they page the raw feed instead. Up/Down stay bound to
+    /// selection movement (which resets detail_scroll).
+    #[test]
+    fn pgup_pgdn_scroll_detail_pane_and_saturate() {
+        let mut app = App::new("s", "m");
+        app.neurocode_snapshot = Some(snap(5));
+        app.neurocode_active = true;
+        app.neurocode_expanded = true;
+        app.task_graph = Some(tasks(4));
+        app.neurocode_viz.tab = VizTab::Graph;
+
+        assert_eq!(app.neurocode_viz.detail_scroll, 0);
+        assert!(explorer_key(&mut app, &key(KeyCode::PageUp)));
+        assert_eq!(app.neurocode_viz.detail_scroll, 10, "PgUp backs up 10 rows");
+        assert!(explorer_key(&mut app, &key(KeyCode::PageUp)));
+        assert_eq!(app.neurocode_viz.detail_scroll, 20);
+        // PgDn retreats toward the tail anchor.
+        assert!(explorer_key(&mut app, &key(KeyCode::PageDown)));
+        assert_eq!(app.neurocode_viz.detail_scroll, 10, "PgDn advances 10 rows");
+        // Saturates at 0.
+        for _ in 0..5 {
+            assert!(explorer_key(&mut app, &key(KeyCode::PageDown)));
+        }
+        assert_eq!(app.neurocode_viz.detail_scroll, 0, "saturates at the bottom");
+
+        // Tasks tab: same detail-pane binding.
+        app.neurocode_viz.tab = VizTab::Tasks;
+        assert!(explorer_key(&mut app, &key(KeyCode::PageUp)));
+        assert_eq!(app.neurocode_viz.detail_scroll, 10, "Tasks tab pages detail");
+
+        // Feed tab: the same keys page the raw feed instead.
+        app.neurocode_viz.tab = VizTab::Feed;
+        app.neurocode_scroll = 0;
+        assert!(explorer_key(&mut app, &key(KeyCode::PageUp)));
+        assert_eq!(app.neurocode_scroll, 10, "Feed PgUp pages the raw feed");
+        assert!(explorer_key(&mut app, &key(KeyCode::PageDown)));
+        assert_eq!(app.neurocode_scroll, 0, "Feed PgDn saturates at the tail");
+
+        // Selection movement resets detail_scroll (Up/Down stay nav keys).
+        app.neurocode_viz.tab = VizTab::Tasks;
+        app.neurocode_viz.detail_scroll = 40;
+        assert!(explorer_key(&mut app, &key(KeyCode::Down)));
+        assert_eq!(
+            app.neurocode_viz.detail_scroll, 0,
+            "selection move resets the detail scroll"
+        );
+    }
+
+    /// Review finding #8: `selected` is shared across the graph-node and
+    /// task index spaces — switching tabs must clamp it (and the list
+    /// cursor) into the destination tab's bounds, or keyboard nav goes
+    /// dead after browsing a bigger tab.
+    #[test]
+    fn tab_switch_clamps_selection_into_destination_bounds() {
+        let mut app = App::new("s", "m");
+        app.neurocode_snapshot = Some(snap(3)); // graph index space: 0..=2
+        app.task_graph = Some(tasks(8)); // task index space: 0..=7
+        app.neurocode_active = true;
+        app.neurocode_expanded = true;
+
+        // Browse deep into the Tasks tab.
+        app.neurocode_viz.tab = VizTab::Tasks;
+        for _ in 0..10 {
+            assert!(explorer_key(&mut app, &key(KeyCode::Down)));
+        }
+        assert!(app.neurocode_viz.selected > 2, "task selection out of node range");
+        // Simulate a stale list cursor from the bigger index space.
+        app.neurocode_viz.list_cursor = 7;
+
+        // Tab back to the graph (Tasks → Feed → Graph): the stale index
+        // and cursor must clamp at each hop.
+        assert!(explorer_key(&mut app, &key(KeyCode::Tab)));
+        assert_eq!(app.neurocode_viz.tab, VizTab::Feed);
+        assert!(explorer_key(&mut app, &key(KeyCode::Tab)));
+        assert_eq!(app.neurocode_viz.tab, VizTab::Graph);
+        assert_eq!(
+            app.neurocode_viz.selected, 2,
+            "selection clamped into the node index space"
+        );
+        assert_eq!(
+            app.neurocode_viz.list_cursor, 2,
+            "stale list cursor clamped into the node index space"
+        );
+
+        // Digit shortcut switches clamp too.
+        app.neurocode_viz.tab = VizTab::Tasks;
+        for _ in 0..10 {
+            explorer_key(&mut app, &key(KeyCode::Down));
+        }
+        assert!(explorer_key(&mut app, &key(KeyCode::Char('1'))));
+        assert_eq!(app.neurocode_viz.tab, VizTab::Graph);
+        assert_eq!(app.neurocode_viz.selected, 2, "'1' switch also clamps");
+
+        // And after the clamp, graph nav works again (moves, not dead).
+        let before = app.neurocode_viz.selected;
+        *app.neurocode_viz.node_cells.borrow_mut() =
+            vec![Some((40, 12)), None, Some((52, 12))];
+        assert!(explorer_key(&mut app, &key(KeyCode::Right)));
+        assert!(app.neurocode_viz.selected != before || before <= 2);
     }
 }

@@ -184,8 +184,29 @@ fn walk_relative(root: &Path, filter: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
     out
 }
 
+/// Detection result: the [`ChangeDelta`] plus the DETECTION-TIME
+/// fingerprints — the (mtime, size, sha256) state of every walked file as
+/// observed WHILE detection hashed/confirmed it (T1).
+///
+/// The refresh worker (T024) persists exactly these fingerprints in its
+/// sidecar after a successful commit: re-hashing disk AFTER the commit
+/// (T2) would record post-commit edits as already-indexed, permanently
+/// skipping them (the sidecar is what the next refresh trusts as
+/// "previous state" — see `refresh_worker::persist_fingerprints`).
+#[derive(Debug, Clone, Default)]
+pub struct DetectionOutput {
+    /// The change classification (added/modified/removed/renamed).
+    pub delta: ChangeDelta,
+    /// T1 fingerprint of every walked file that could be read. Fast-path
+    /// files (mtime+size equal to `previous`) carry their previous
+    /// fingerprint — by the fast path's own assertion that IS the current
+    /// on-disk state; hash-confirmed candidates carry the fresh hash.
+    pub fingerprints: Vec<FileFingerprint>,
+}
+
 /// Detect changes between the previous fingerprints and the current tree
-/// (data-model.md §6; research.md R3).
+/// (data-model.md §6; research.md R3) — see [`detect_changes_detailed`]
+/// for the fingerprints-carrying variant the refresh worker consumes.
 ///
 /// * Files on disk but not in `previous` → `added`.
 /// * Files in `previous` but not on disk → `removed`.
@@ -206,11 +227,26 @@ pub fn detect_changes(
     filter: &dyn Fn(&Path) -> bool,
     options: &DetectionOptions,
 ) -> ChangeDelta {
+    detect_changes_detailed(root, previous, filter, options).delta
+}
+
+/// [`detect_changes`] plus the detection-time fingerprints (T1) of every
+/// walked file — the exact content state change detection observed, which
+/// is also the state a subsequent refresh commits for those files.
+pub fn detect_changes_detailed(
+    root: &Path,
+    previous: &[FileFingerprint],
+    filter: &dyn Fn(&Path) -> bool,
+    options: &DetectionOptions,
+) -> DetectionOutput {
     let prev: HashMap<&str, &FileFingerprint> =
         previous.iter().map(|fp| (fp.source_path.as_str(), fp)).collect();
 
     let mut delta = ChangeDelta::default();
     let mut on_disk: HashMap<String, (SystemTime, u64)> = HashMap::new();
+    // Detection-time (T1) fingerprints of every walked file — persisted by
+    // the refresh worker after commit (see `DetectionOutput`).
+    let mut fingerprints: Vec<FileFingerprint> = Vec::new();
 
     for rel in walk_relative(root, filter) {
         let source_path = normalize_source_path(&rel);
@@ -237,17 +273,44 @@ pub fn detect_changes(
                 // Present but unreadable, never seen before: nothing to
                 // index from and not removed — leave to the next refresh.
             }
-            None => delta.added.push(rel),
+            None => {
+                // Added file: fingerprint it now (T1) — this is the state
+                // the refresh commits. An unreadable add yields no
+                // fingerprint and stays out of the worker's sidecar,
+                // re-detecting next refresh.
+                if let Ok(fp) = fingerprint_file(root, &rel) {
+                    fingerprints.push(fp);
+                }
+                delta.added.push(rel);
+            }
             Some(fp) => {
                 let (mtime, size) = on_disk.get(&source_path).copied().unwrap();
                 let mtime_candidate = meta_failed || mtime != fp.mtime || size != fp.size;
                 if mtime_candidate || !options.trust_mtime {
                     // Confirm via content hash — the authority.
-                    if let Ok(current) = fingerprint_file(root, &rel) {
-                        if current.sha256 != fp.sha256 {
-                            delta.modified.push(rel);
+                    match fingerprint_file(root, &rel) {
+                        Ok(current) => {
+                            if current.sha256 != fp.sha256 {
+                                delta.modified.push(rel.clone());
+                            }
+                            // Hash-confirmed state (T1) — even when the
+                            // candidate was rejected as unchanged, the
+                            // fresh hash IS the current on-disk state.
+                            fingerprints.push(current);
+                        }
+                        Err(_) => {
+                            // Unreadable now: keep the PREVIOUS fingerprint
+                            // — the refresh's chunk-hash skip leaves the
+                            // committed rows untouched, and a stale-hash
+                            // sidecar entry just re-confirms next refresh.
+                            fingerprints.push((*fp).clone());
                         }
                     }
+                } else {
+                    // Fast path: mtime AND size equal the previous
+                    // fingerprint — that fingerprint still describes the
+                    // on-disk state (nothing to hash).
+                    fingerprints.push((*fp).clone());
                 }
             }
         }
@@ -264,7 +327,7 @@ pub fn detect_changes(
 
     delta.added.sort();
     delta.modified.sort();
-    delta
+    DetectionOutput { delta, fingerprints }
 }
 
 // ===========================================================================
@@ -488,19 +551,33 @@ pub fn detect_changes_with_rename_assist(
     options: &DetectionOptions,
     assist: &GitRenameAssist,
 ) -> ChangeDelta {
-    let mut delta = detect_changes(root, previous, filter, options);
-    let pairs = assist.detect_renames(root, previous, &delta.removed, &delta.added);
+    detect_changes_with_rename_assist_detailed(root, previous, filter, options, assist).delta
+}
+
+/// [`detect_changes_with_rename_assist`] plus the detection-time
+/// fingerprints (see [`DetectionOutput`]) — the variant the refresh
+/// worker consumes so its sidecar records T1 state, never post-commit
+/// disk state.
+pub fn detect_changes_with_rename_assist_detailed(
+    root: &Path,
+    previous: &[FileFingerprint],
+    filter: &dyn Fn(&Path) -> bool,
+    options: &DetectionOptions,
+    assist: &GitRenameAssist,
+) -> DetectionOutput {
+    let mut out = detect_changes_detailed(root, previous, filter, options);
+    let pairs = assist.detect_renames(root, previous, &out.delta.removed, &out.delta.added);
     if pairs.is_empty() {
-        return delta;
+        return out;
     }
     let pair_set: HashSet<(String, String)> = pairs
         .iter()
         .map(|(o, n)| (normalize_source_path(o), normalize_source_path(n)))
         .collect();
-    delta.removed.retain(|p| !pair_set.iter().any(|(o, _)| *o == normalize_source_path(p)));
-    delta.added.retain(|p| !pair_set.iter().any(|(_, n)| *n == normalize_source_path(p)));
-    delta.renamed = pairs;
-    delta
+    out.delta.removed.retain(|p| !pair_set.iter().any(|(o, _)| *o == normalize_source_path(p)));
+    out.delta.added.retain(|p| !pair_set.iter().any(|(_, n)| *n == normalize_source_path(p)));
+    out.delta.renamed = pairs;
+    out
 }
 
 // ===========================================================================
@@ -770,7 +847,13 @@ pub fn refresh_incremental(
     // ── Purge (inside the transaction) ───────────────────────────────────
     for path in &purge_paths {
         tx.execute("DELETE FROM rag_chunks WHERE source_path = ?1", rusqlite::params![path])?;
-        // rag_chunk_edges has no FK by design (T005) — sweep explicitly.
+    }
+    // rag_chunk_edges has no FK by design (T005) — sweep explicitly, ONCE
+    // after all purges: the full-table anti-join is O(table) and running it
+    // per purged path made N removals cost N full scans inside the write
+    // transaction (mirrors the single-shot pattern at the stale-chunk
+    // sweep below).
+    if !purge_paths.is_empty() {
         tx.execute(
             "DELETE FROM rag_chunk_edges WHERE from_chunk_id NOT IN (SELECT chunk_id FROM rag_chunks)
              OR to_chunk_id NOT IN (SELECT chunk_id FROM rag_chunks)",

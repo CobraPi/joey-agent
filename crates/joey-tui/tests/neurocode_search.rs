@@ -251,7 +251,7 @@ mod tui_output_path {
     use super::*;
     use joey_tui::state::{NoticeKind, TranscriptItem};
     use joey_tui::widgets::item_lines_for_test;
-    use ratatui::style::{Color, Style};
+    use ratatui::style::Color;
 
     fn notice(text: &str) -> TranscriptItem {
         TranscriptItem::Notice {

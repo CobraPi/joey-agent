@@ -208,7 +208,10 @@ fn legacy_conversion_equivalence() {
         },
     ];
     let g = TaskGraph::from_workstreams(&legacy, "base");
-    assert_eq!(g.validate(), Ok(()), "converted graph must validate");
+    // Restored contract: empty write sets are undeclared — the
+    // scheduler's ConflictAnalyzer sequences them at dispatch — so the
+    // converted graph (two unrelated empty-write-set tasks) validates.
+    assert_eq!(g.validate(), Ok(()), "empty×empty pair is legal");
     assert_eq!(g.nodes.len(), 2);
 
     // objective = focus, 1:1.
@@ -221,8 +224,8 @@ fn legacy_conversion_equivalence() {
         "Update docs"
     );
 
-    // Undeclared writes ⇒ shared checkout and empty write sets; the empty
-    // write pair is accepted (validate() Ok above) …
+    // Undeclared writes ⇒ shared checkout and empty write sets; empty
+    // write sets are sequenced at dispatch, not enforced at validation …
     for key in ["workstream-1", "workstream-2"] {
         let n = g.node(&id(key)).unwrap();
         assert_eq!(n.isolation, IsolationMode::SharedCheckout);

@@ -539,6 +539,11 @@ pub struct Agent {
     /// One-shot output-cap override for the next request (upstream
     /// `agent._ephemeral_max_output_tokens`, conversation_loop.py:3658).
     pub(crate) ephemeral_max_output_tokens: Option<u32>,
+    /// Per-turn output-cap adjustments made by the overflow handler's
+    /// max_tokens detour. Deliberately SEPARATE from the turn's shared
+    /// `compression_attempts` budget: pure output-cap retries are not
+    /// compression and must not burn compression attempts (review #10).
+    output_cap_adjustments: u32,
     /// Warning-dedup state (upstream `_last_compression_summary_warning`,
     /// `_last_aux_fallback_warning_key`, `_last_compression_lock_warning_sid`).
     pub(crate) last_compression_summary_warning: Option<String>,
@@ -697,6 +702,7 @@ impl Agent {
             compressor,
             compression_enabled,
             ephemeral_max_output_tokens: None,
+            output_cap_adjustments: 0,
             last_compression_summary_warning: None,
             last_aux_fallback_warning_key: None,
             last_compression_lock_warning_sid: None,
@@ -1546,19 +1552,37 @@ impl Agent {
                     let old_model = std::mem::replace(&mut self.config.model, fb.model);
                     let old_provider =
                         std::mem::replace(&mut self.provider_name, client.profile().name.to_string());
+                    // Sync the runtime config like switch_model: after
+                    // failover, config.provider/base_url/api_key must describe
+                    // the LIVE backend, not the failed one — later paths read
+                    // them (handle_context_overflow_error passes
+                    // config.base_url/api_key to compressor.update_model and
+                    // would re-poison the compressor with the dead provider).
+                    self.config.provider = fb.provider.clone();
+                    match fb.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(url) => self.config.base_url = url.to_string(),
+                        // No override → the new profile's default endpoint
+                        // (switch_model: "`base_url` empty → the new profile's
+                        // default endpoint"), never the failed provider's URL.
+                        None => self.config.base_url = client.profile().base_url.to_string(),
+                    }
+                    self.config.api_key = fb.api_key.clone();
                     self.client = client;
                     self.rewrite_prompt_model_identity();
                     // Recalibrate the compressor for the new runtime
                     // (model_switch → compressor.update_model — context length
                     // via the catalog; config override applies to the PRIMARY
-                    // model only, so it is not forwarded here).
+                    // model only, so it is not forwarded here). The REAL
+                    // fallback credential is forwarded so aux summary calls
+                    // authenticate against the new backend.
                     let new_ctx = compression::get_model_context_length(&self.config.model, None);
-                    let base_url = fb.base_url.clone().unwrap_or_default();
+                    let base_url = self.config.base_url.clone();
+                    let api_key = self.config.api_key.clone().unwrap_or_default();
                     self.compressor.update_model(
                         &self.config.model,
                         new_ctx,
                         &base_url,
-                        "",
+                        &api_key,
                         &self.provider_name,
                         "",
                         None,
@@ -2033,7 +2057,18 @@ impl Agent {
         // semaphore is set (subagent dispatch throttling). The permit is
         // held through the call and dropped on return.
         let _permit = if let Some(sem) = &self.provider_permit {
-            Some(sem.acquire().await.expect("semaphore not closed"))
+            // A closed semaphore means orchestration shut the limiter down
+            // mid-turn; proceed unthrottled instead of panicking the turn
+            // (review #11).
+            match sem.acquire().await {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    tracing::warn!(
+                        "provider concurrency limiter closed; proceeding unthrottled"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -2099,6 +2134,13 @@ impl Agent {
     ) -> Result<NormalizedResponse, TurnAbort> {
         let max_retries = self.config.api_max_retries.max(1);
         let mut retry_count: usize = 0;
+        // Total fallback activations this call block may make. The chain is
+        // finite, but the per-fallback retry_count reset (upstream parity,
+        // kept) means an unbounded walk makes ~N*(1+max_retries) provider
+        // calls before any Fatal escapes — cap activations at the chain
+        // length so exhaustion terminates in Fatal instead of looping.
+        let max_fallback_activations = self.fallback_chain.len();
+        let mut fallback_activations: usize = 0;
         loop {
             let req = if with_tools {
                 self.build_request(tools, Some(tx))
@@ -2173,9 +2215,10 @@ impl Agent {
                         }
                         // Non-retryable: try the fallback chain before
                         // aborting (conversation_loop.py:3918-3937).
-                        if e.should_failover() {
+                        if e.should_failover() && fallback_activations < max_fallback_activations {
                             if let Some(notice) = self.try_activate_fallback() {
                                 let _ = tx.send(AgentEvent::Notice(notice));
+                                fallback_activations += 1;
                                 retry_count = 0;
                                 *compression_attempts = 0;
                                 continue;
@@ -2184,15 +2227,18 @@ impl Agent {
                         return Err(TurnAbort::Fatal(e.to_string()));
                     }
                     if retry_count >= max_retries {
-                        if let Some(notice) = self.try_activate_fallback() {
-                            let _ = tx.send(AgentEvent::Notice(format!(
-                                "⚠️ Max retries ({}) exhausted — trying fallback...",
-                                max_retries
-                            )));
-                            let _ = tx.send(AgentEvent::Notice(notice));
-                            retry_count = 0;
-                            *compression_attempts = 0;
-                            continue;
+                        if fallback_activations < max_fallback_activations {
+                            if let Some(notice) = self.try_activate_fallback() {
+                                let _ = tx.send(AgentEvent::Notice(format!(
+                                    "⚠️ Max retries ({}) exhausted — trying fallback...",
+                                    max_retries
+                                )));
+                                let _ = tx.send(AgentEvent::Notice(notice));
+                                fallback_activations += 1;
+                                retry_count = 0;
+                                *compression_attempts = 0;
+                                continue;
+                            }
                         }
                         let _ = tx.send(AgentEvent::Notice(format!(
                             "❌ API failed after {} retries — {}",
@@ -2361,7 +2407,10 @@ impl Agent {
                 "",
                 if tools.is_empty() { None } else { Some(tools) },
             );
-            let local_available_out = old_ctx - request_input_estimate;
+            // saturating_sub: the rough estimator can legitimately exceed
+            // the catalog context floor; a plain `-` panics in debug builds
+            // on overflow (review #8).
+            let local_available_out = old_ctx.saturating_sub(request_input_estimate);
             let safe_out = if local_available_out > 0 {
                 (available_out.min(local_available_out) - 64).max(1)
             } else {
@@ -2377,18 +2426,24 @@ impl Agent {
                 compression::compressor::commafy(request_input_estimate),
                 compression::compressor::commafy(old_ctx)
             )));
-            *compression_attempts += 1;
-            if *compression_attempts > MAX_COMPRESSION_ATTEMPTS {
+            // Output-cap adjustments are NOT compression: charge their own
+            // budget (review #10) so three pure cap retries can't Fatal the
+            // turn through the shared compression_attempts counter without
+            // any compression having been attempted. Bounded separately so
+            // the Retry short-circuit (which skips the retry_count check)
+            // still terminates on a persistently cap-erroring provider.
+            self.output_cap_adjustments += 1;
+            if self.output_cap_adjustments > MAX_COMPRESSION_ATTEMPTS {
                 let _ = tx.send(AgentEvent::Notice(format!(
-                    "❌ Max compression attempts ({}) reached.",
+                    "❌ Max output-cap adjustments ({}) reached.",
                     MAX_COMPRESSION_ATTEMPTS
                 )));
                 let _ = tx.send(AgentEvent::Notice(
-                    "   💡 Try /new to start a fresh conversation, or /compress to retry compression."
+                    "   💡 Lower model.max_tokens in config.yaml, or try /new to start a fresh conversation."
                         .to_string(),
                 ));
                 return OverflowOutcome::Fatal(format!(
-                    "Context length exceeded: max compression attempts ({}) reached.",
+                    "Output cap too large: max output-cap adjustments ({}) reached.",
                     MAX_COMPRESSION_ATTEMPTS
                 ));
             }
@@ -2532,6 +2587,8 @@ impl Agent {
         // pin every later request to max_tokens=1-style caps. Clear it here;
         // the overflow handler re-arms it within THIS turn when needed.
         self.ephemeral_max_output_tokens = None;
+        // Fresh per-turn output-cap-adjustment budget (review #10).
+        self.output_cap_adjustments = 0;
         // New user turn → the NeuroCode intercept's dedupe key is stale;
         // clear it so THIS turn's request assembles fresh context (even if
         // the user repeats the same text verbatim).
@@ -2714,6 +2771,9 @@ impl Agent {
                 // gets a fresh chance (conversation_loop.py:1162-1169), and
                 // don't charge an iteration for the compaction pass.
                 empty_content_retries = 0;
+                // The one-shot post-tool empty nudge is part of that
+                // retry/empty-response state — re-arm it too (review #9).
+                post_tool_empty_retried = false;
                 continue;
             }
 
@@ -2793,6 +2853,9 @@ impl Agent {
             }
             // A successful response consumed any one-shot output-cap override.
             self.ephemeral_max_output_tokens = None;
+            // ...and re-arms the output-cap adjustment budget (review #10):
+            // the bound is on CONSECUTIVE adjustments without progress.
+            self.output_cap_adjustments = 0;
 
             let mut tool_calls = resp.tool_calls.clone();
             let finish_str = finish_reason_str(resp.finish_reason);
@@ -3097,22 +3160,48 @@ impl Agent {
             self.config.max_turns
         )));
         self.push_message(Message::user(MAX_ITERATIONS_SUMMARY_REQUEST), None);
+        // Interrupt beats the summary retry: when the summary call was
+        // aborted (user Ctrl-C), stop making provider calls and return the
+        // interrupted result instead of masking the abort behind the canned
+        // failure message. Other errors keep the upstream fallback-message
+        // behavior (empty → one retry → canned message).
+        let mut interrupted_text: Option<String> = None;
         let mut summary = match self.call_with_retries(false, &[], &tx, &mut compression_attempts).await {
             Ok(resp) => {
                 accumulate_usage(&mut total_usage, &self.usage_or_estimate(&[], &resp));
                 strip_think_blocks(&resp.content).trim().to_string()
             }
-            Err(_) => String::new(),
+            Err(TurnAbort::Interrupted(text)) => {
+                interrupted_text = Some(text);
+                String::new()
+            }
+            Err(TurnAbort::Fatal(_)) => String::new(),
         };
-        if summary.is_empty() {
+        if interrupted_text.is_none() && summary.is_empty() {
             // One retry (handle_max_iterations "Retry summary generation").
             summary = match self.call_with_retries(false, &[], &tx, &mut compression_attempts).await {
                 Ok(resp) => {
                     accumulate_usage(&mut total_usage, &self.usage_or_estimate(&[], &resp));
                     strip_think_blocks(&resp.content).trim().to_string()
                 }
-                Err(_) => String::new(),
+                Err(TurnAbort::Interrupted(text)) => {
+                    interrupted_text = Some(text);
+                    String::new()
+                }
+                Err(TurnAbort::Fatal(_)) => String::new(),
             };
+        }
+        if let Some(text) = interrupted_text {
+            self.drop_trailing_synthetic_scaffolding();
+            self.close_interrupted_tool_sequence(&text);
+            self.rag_auto_refresh();
+            self.neurocode_auto_reindex(&tx).await;
+            let _ = tx.send(AgentEvent::Done {
+                final_text: text.clone(),
+                usage: total_usage.clone(),
+                    iterations: api_calls,
+            });
+            return TurnResult { final_text: text, usage: total_usage, iterations: api_calls, interrupted: true, fatal: false, fatal_provider_error: false };
         }
         if summary.is_empty() {
             summary = "I reached the iteration limit and couldn't generate a summary.".to_string();
@@ -7333,6 +7422,189 @@ mod tests {
         assert!(
             !r.fatal_provider_error,
             "behavioral fatal must not trigger provider recovery"
+        );
+    }
+
+    // ── Fallback chain: runtime-config sync (#1) ──────────────────────
+
+    /// Regression (#1): try_activate_fallback must sync the runtime config
+    /// like switch_model — after failover, config.provider/base_url/api_key
+    /// describe the LIVE fallback backend, not the failed provider, and the
+    /// compressor receives the real api_key (not ""). Without this, later
+    /// paths reading config (e.g. handle_context_overflow_error) re-poison
+    /// the compressor with the dead backend and aux summary auth breaks.
+    #[test]
+    fn try_activate_fallback_syncs_runtime_config() {
+        let _l = lock();
+        let mut fx = fixture(vec![], 10, 3, None);
+
+        // Entry 1: explicit base_url override + api_key.
+        fx.agent.fallback_chain = vec![
+            FallbackEntry {
+                provider: "deepseek".to_string(),
+                model: "deepseek-chat".to_string(),
+                base_url: Some("https://fb1.example.com/v1".to_string()),
+                api_key: Some("fb-key-1".to_string()),
+            },
+            // Entry 2: no override → the new profile's default endpoint and
+            // no explicit credential.
+            FallbackEntry {
+                provider: "nous".to_string(),
+                model: "hermes-3-405b".to_string(),
+                base_url: None,
+                api_key: None,
+            },
+        ];
+
+        let notice = fx.agent.try_activate_fallback().expect("first fallback activates");
+        assert!(notice.contains("deepseek"), "notice names the fallback: {notice}");
+        // Config describes the fallback, not the failed openrouter runtime.
+        assert_eq!(fx.agent.config.provider, "deepseek");
+        assert_eq!(fx.agent.config.base_url, "https://fb1.example.com/v1");
+        assert_eq!(fx.agent.config.api_key.as_deref(), Some("fb-key-1"));
+        assert_ne!(fx.agent.config.provider, "openrouter");
+        assert_ne!(fx.agent.config.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(fx.agent.provider_name, "deepseek");
+        // The compressor was recalibrated with the REAL credential + URL.
+        assert_eq!(fx.agent.compressor.provider, "deepseek");
+        assert_eq!(fx.agent.compressor.base_url, "https://fb1.example.com/v1");
+        assert_eq!(fx.agent.compressor.api_key, "fb-key-1");
+
+        let _ = fx.agent.try_activate_fallback().expect("second fallback activates");
+        // No override → profile default endpoint; no credential → None/"".
+        assert_eq!(fx.agent.config.provider, "nous");
+        assert_eq!(fx.agent.config.api_key, None);
+        assert_eq!(
+            fx.agent.config.base_url,
+            fx.agent.client.profile().base_url,
+            "no fb.base_url → the new profile's default endpoint"
+        );
+        assert_ne!(fx.agent.config.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(fx.agent.compressor.provider, "nous");
+        assert_eq!(fx.agent.compressor.api_key, "");
+        assert_eq!(fx.agent.compressor.base_url, fx.agent.client.profile().base_url);
+    }
+
+    // ── Fallback chain: total-activation cap (#7) ─────────────────────
+
+    /// Regression (#7): a chain of 2 fallbacks with a persistently failing
+    /// provider terminates in Fatal after a bounded number of calls —
+    /// (chain + primary) × api_max_retries total attempts — instead of a
+    /// retry storm. Per-fallback retry_count reset stays (upstream parity);
+    /// the cap is on TOTAL activations per call block.
+    #[tokio::test(start_paused = true)]
+    async fn fallback_retry_storm_capped_terminates_fatal() {
+        let _l = lock();
+        let err = || Err(ProviderError::ServerError("boom".to_string()));
+        // api_max_retries = 2 → 2 total attempts per backend. Primary +
+        // 2 fallbacks = 3 backends → exactly 6 calls before Fatal.
+        let mut fx = fixture(vec![err(), err(), err(), err(), err(), err()], 10, 2, None);
+        fx.agent.fallback_chain = vec![
+            FallbackEntry {
+                provider: "deepseek".to_string(),
+                model: "deepseek-chat".to_string(),
+                base_url: Some("https://fb1.example.com/v1".to_string()),
+                api_key: Some("fb-key-1".to_string()),
+            },
+            FallbackEntry {
+                provider: "nous".to_string(),
+                model: "hermes-3-405b".to_string(),
+                base_url: None,
+                api_key: None,
+            },
+        ];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert!(result.fatal, "persistently failing chain must end Fatal");
+        assert_eq!(
+            fx.transport.request_count(),
+            6,
+            "3 backends × 2 total attempts — bounded, no retry storm"
+        );
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Notice(n) if n.contains("trying fallback")
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Failed(f) if f.contains("after 2 retries")
+        )));
+    }
+
+    // ── Max-iterations summary: interrupt not swallowed (#3) ─────────
+
+    /// Transport that answers the first (tool-calling) request normally,
+    /// then — on the max-iterations SUMMARY call — sets the agent's
+    /// interrupt flag and fails: Ctrl-C landing during the summary request.
+    struct SummaryInterruptTransport {
+        slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl Transport for SummaryInterruptTransport {
+        async fn complete(&self, _req: &ProviderRequest) -> Result<NormalizedResponse, ProviderError> {
+            let n = {
+                let mut c = self.calls.lock().unwrap();
+                let n = *c;
+                *c += 1;
+                n
+            };
+            if n == 0 {
+                Ok(tool_resp(
+                    vec![ToolCall::new("c1", "echo", "{}")],
+                    FinishReason::ToolCalls,
+                ))
+            } else {
+                if let Some(flag) = self.slot.lock().unwrap().as_ref() {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                Err(ProviderError::ServerError("ctrl-c during summary".to_string()))
+            }
+        }
+        async fn stream(
+            &self,
+            req: &ProviderRequest,
+            _tx: mpsc::UnboundedSender<StreamEvent>,
+        ) -> Result<NormalizedResponse, ProviderError> {
+            self.complete(req).await
+        }
+    }
+
+    /// Regression (#3): a user interrupt during the max-iterations summary
+    /// call must surface as an INTERRUPTED turn — not be retried and not be
+    /// masked by the canned "couldn't generate a summary" message.
+    #[tokio::test]
+    async fn max_iterations_summary_interrupt_is_not_swallowed() {
+        let _l = lock();
+        // max_turns=1: one tool round, then the budget-exhausted summary call.
+        let mut fx = fixture(vec![], 1, 3, None);
+        let slot: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+        let transport = Arc::new(SummaryInterruptTransport {
+            slot: slot.clone(),
+            calls: Mutex::new(0),
+        });
+        fx.agent.set_transport_for_tests(transport.clone());
+        *slot.lock().unwrap() = Some(fx.agent.interrupt_handle());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("go", tx).await;
+        assert!(result.interrupted, "summary-call interrupt must surface as interrupted");
+        assert!(!result.fatal);
+        assert!(
+            result.final_text.to_lowercase().contains("interrupted"),
+            "final text reports the interrupt, not the canned failure: {}",
+            result.final_text
+        );
+        assert_ne!(
+            result.final_text,
+            "I reached the iteration limit and couldn't generate a summary."
+        );
+        assert_eq!(
+            *transport.calls.lock().unwrap(),
+            2,
+            "tool call + interrupted summary — no summary retry after abort"
         );
     }
 }

@@ -655,21 +655,118 @@ fn build_runner() -> joey_cron::JobRunner {
                 .map_err(|e| anyhow::anyhow!("agent init failed: {}", e))?;
             agent.set_provider_semaphore(manager.semaphore());
             let prompt = build_cron_prompt(&job);
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let drain = tokio::spawn(async move {
-                let mut failed: Option<String> = None;
-                while let Some(ev) = rx.recv().await {
-                    if let joey_agent_core::AgentEvent::Failed(m) = ev {
-                        failed = Some(m);
-                    }
-                }
-                failed
-            });
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (drain, stop_tx) = spawn_failure_drain(rx);
             let result = agent.run_turn(&prompt, tx).await;
+            let _ = stop_tx.send(()).await;
             if let Some(err) = drain.await.ok().flatten() {
                 anyhow::bail!("{}", err);
             }
             Ok(result.final_text)
         })
     })
+}
+
+/// Drain agent events silently; only the Failed message matters. A bare
+/// `rx.recv()`-until-close would hang: background-process reapers
+/// (process_tool.rs) hold ToolContext clones whose progress_tx keeps the
+/// turn's event forwarder — and through it a tx clone — alive for the
+/// lifetime of every child process the turn spawned. So the drain also
+/// listens for a stop signal, then flushes whatever is still queued behind
+/// it (same pattern as oneshot.rs). Returns (join handle, stop signal).
+fn spawn_failure_drain(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<joey_agent_core::AgentEvent>,
+) -> (
+    tokio::task::JoinHandle<Option<String>>,
+    tokio::sync::mpsc::Sender<()>,
+) {
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let drain = tokio::spawn(async move {
+        let mut failed: Option<String> = None;
+        loop {
+            tokio::select! {
+                ev = rx.recv() => {
+                    match ev {
+                        Some(ev) => {
+                            if let joey_agent_core::AgentEvent::Failed(m) = ev {
+                                failed = Some(m);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = stop_rx.recv() => {
+                    // Flush events still queued behind the stop signal.
+                    while let Ok(ev) = rx.try_recv() {
+                        if let joey_agent_core::AgentEvent::Failed(m) = ev {
+                            failed = Some(m);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        failed
+    });
+    (drain, stop_tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (#9): the drain task must terminate when only reapers
+    /// (still holding a tx clone) keep the channel open — a bare
+    /// `rx.recv()`-until-close would hang forever. The stop signal ends the
+    /// loop and the try_recv flush still surfaces a Failed event that was
+    /// queued behind the signal.
+    #[tokio::test]
+    async fn drain_terminates_while_reapers_hold_tx_and_flushes_failure() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<joey_agent_core::AgentEvent>();
+        let (drain, stop_tx) = spawn_failure_drain(rx);
+        // The turn dropped its tx, but a reaper still holds one alive.
+        let reaper_tx = tx.clone();
+        drop(tx);
+        reaper_tx
+            .send(joey_agent_core::AgentEvent::ContentDelta("…".into()))
+            .unwrap();
+        // Stop arrives while the reaper's tx still lives.
+        stop_tx.send(()).await.unwrap();
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("drain must terminate despite a live tx (reaper)")
+            .unwrap();
+        assert!(failed.is_none(), "no Failed event was sent");
+    }
+
+    /// The flush still catches a Failed event queued behind the stop
+    /// signal, and the normal close path (all tx dropped) still ends the
+    /// drain.
+    #[tokio::test]
+    async fn drain_flushes_failed_event_and_ends_on_disconnect() {
+        use joey_agent_core::AgentEvent;
+        // (a) Failed queued after stop → surfaced by the try_recv flush.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let (drain, stop_tx) = spawn_failure_drain(rx);
+        tx.send(AgentEvent::ContentDelta("x".into())).unwrap();
+        stop_tx.send(()).await.unwrap();
+        tx.send(AgentEvent::Failed("boom".into())).unwrap();
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("drain must terminate after stop")
+            .unwrap();
+        assert_eq!(failed.as_deref(), Some("boom"));
+        drop(tx);
+
+        // (b) All senders dropped (no stop needed) → drain still ends.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let (drain, _stop_tx) = spawn_failure_drain(rx);
+        tx.send(AgentEvent::ContentDelta("y".into())).unwrap();
+        drop(tx);
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("drain must terminate when all tx drop")
+            .unwrap();
+        assert!(failed.is_none());
+    }
 }
