@@ -527,6 +527,14 @@ never runs on tokio's async workers: call sites wrap the pool in
   deliberate local preference, asserted in `config::tests`). Setup-wizard
   behavior is unaffected: with no API keys configured the first-run guard
   still triggers.
+- **Config auto-population deviation (2026-09-07):** upstream keeps
+  config.yaml sparse (only user-set keys; `config migrate` is the explicit
+  user-driven refresh command, not yet ported here). This build
+  auto-materializes the complete defaults-over-user tree into config.yaml at
+  load time (first run → pure defaults; subsequent loads → full merged tree,
+  pre-env-expansion, idempotent). Corrupt files and
+  `JOEY_IGNORE_USER_CONFIG=1` are never materialized; `save()` semantics
+  unchanged.
 - **Setup-wizard scope:** the wizard implements upstream's numbered-list
   fallback UI (the curses radiolist/searchable menus are unported); the
   Gemini free-tier probe (needs the unported native Gemini adapter), the

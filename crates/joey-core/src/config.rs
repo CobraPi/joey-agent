@@ -5,10 +5,11 @@
 //!   DEFAULT_CONFIG  <  ~/.joey/config.yaml  <  `${VAR}` expansion from the
 //!   process env (after ~/.joey/.env is loaded with OVERRIDE semantics).
 //!
-//! The struct holds BOTH the raw user document (what `save` persists — only
-//! user-set keys, never the merged defaults tree) and the merged view used
-//! for reads. Parse failures never fail the load: the last-known-good config
-//! (or defaults) is served, with a stderr warning and a timestamped backup
+//! The struct holds BOTH the raw user document (what `save` persists — the
+//! user's own keys, or the full defaults tree on a materialized first run,
+//! never the `${VAR}`-expanded view) and the merged view used for reads.
+//! Parse failures never fail the load: the last-known-good config (or
+//! defaults) is served, with a stderr warning and a timestamped backup
 //! of the corrupt file.
 
 use std::collections::{HashMap, HashSet};
@@ -184,38 +185,59 @@ impl Config {
     /// config for this path (or the defaults) is served, a stderr warning is
     /// emitted, and the corrupt file is backed up with a timestamp
     /// (config.py:7345-7397).
+    ///
+    /// Load-time materialization: on a successful read the on-disk file is
+    /// brought up to the FULL config tree (defaults ⊕ user values,
+    /// pre-expansion) so users can see and edit every knob. Skipped entirely
+    /// under `JOEY_IGNORE_USER_CONFIG=1` and for corrupt/non-mapping files;
+    /// write failures warn and never fail the load.
     pub fn load_from(path: PathBuf) -> Result<Self> {
-        match read_user_doc(&path) {
-            Ok(user_doc) => {
-                let root = build_root(&user_doc);
-                LAST_GOOD_BY_PATH
-                    .lock()
-                    // SAFETY: LAST_GOOD_BY_PATH is an internal Mutex; poisoning
-                    // only occurs on a prior panic-while-locked, a bug.
-                    .expect("config lkg lock")
-                    .insert(path.clone(), root.clone());
-                Ok(Self { user_doc, root, path })
-            }
-            Err(parse_err) => {
-                let lkg = LAST_GOOD_BY_PATH
-                    .lock()
-                    // SAFETY: LAST_GOOD_BY_PATH is an internal Mutex; poisoning
-                    // only occurs on a prior panic-while-locked, a bug.
-                    .expect("config lkg lock")
-                    .get(&path)
-                    .cloned();
-                warn_config_parse_failure(&path, &parse_err, lkg.is_some());
-                let root = match lkg {
-                    Some(good) => good,
-                    None => build_root(&Value::Mapping(Mapping::new())),
-                };
-                Ok(Self {
-                    user_doc: Value::Mapping(Mapping::new()),
-                    root,
-                    path,
-                })
-            }
+        if ignore_user_config() {
+            // Exactly today's ignored-load behavior: serve defaults, no
+            // writes of any kind (no materialization).
+            return Self::load_user_doc(path, Value::Mapping(Mapping::new()));
         }
+        match read_user_doc(&path) {
+            Ok(raw_user_doc) => {
+                let user_doc = materialize_config_file(&path, &raw_user_doc);
+                Self::load_user_doc(path, user_doc)
+            }
+            Err(parse_err) => Self::load_corrupt(path, parse_err),
+        }
+    }
+
+    /// Finish a successful read: merge + expand, record last-known-good.
+    fn load_user_doc(path: PathBuf, user_doc: Value) -> Result<Self> {
+        let root = build_root(&user_doc);
+        LAST_GOOD_BY_PATH
+            .lock()
+            // SAFETY: LAST_GOOD_BY_PATH is an internal Mutex; poisoning
+            // only occurs on a prior panic-while-locked, a bug.
+            .expect("config lkg lock")
+            .insert(path.clone(), root.clone());
+        Ok(Self { user_doc, root, path })
+    }
+
+    /// Corrupt/non-mapping file: warn, back up, serve the last-known-good
+    /// root (or defaults). No materialization write.
+    fn load_corrupt(path: PathBuf, parse_err: String) -> Result<Self> {
+        let lkg = LAST_GOOD_BY_PATH
+            .lock()
+            // SAFETY: LAST_GOOD_BY_PATH is an internal Mutex; poisoning
+            // only occurs on a prior panic-while-locked, a bug.
+            .expect("config lkg lock")
+            .get(&path)
+            .cloned();
+        warn_config_parse_failure(&path, &parse_err, lkg.is_some());
+        let root = match lkg {
+            Some(good) => good,
+            None => build_root(&Value::Mapping(Mapping::new())),
+        };
+        Ok(Self {
+            user_doc: Value::Mapping(Mapping::new()),
+            root,
+            path,
+        })
     }
 
     /// Build config purely from defaults (no disk) — used in tests / headless.
@@ -419,11 +441,65 @@ fn read_user_doc(path: &Path) -> std::result::Result<Value, String> {
 /// the user doc is empty because of a parse failure, the caller's fallback
 /// is handled by `load_from` retaining the previous last-known-good root.
 fn build_root(user_doc: &Value) -> Value {
+    expand_env_vars(&merged_tree(user_doc))
+}
+
+/// DEFAULTS ⊕ user_doc, normalized — the shared merge pipeline (everything
+/// `build_root` does BEFORE `${VAR}` expansion). This is also the tree
+/// materialized to config.yaml at load time: pre-expansion, so user-authored
+/// `${VAR}` placeholders persist verbatim on disk.
+fn merged_tree(user_doc: &Value) -> Value {
     let mut merged = DEFAULTS.clone();
     let user = pre_move_root_max_turns(user_doc.clone());
     deep_merge(&mut merged, user);
-    let normalized = normalize_root_model_keys(normalize_max_turns(merged));
-    expand_env_vars(&normalized)
+    normalize_root_model_keys(normalize_max_turns(merged))
+}
+
+/// Load-time materialization of config.yaml (feature: auto-populate every
+/// setting). Returns the user document the Config should carry in memory:
+/// ALWAYS the full pre-expansion merged tree (defaults ⊕ user), so a
+/// subsequent `save` persists every setting — the file never oscillates
+/// between full and sparse across load/save cycles.
+///
+/// * File missing (first run): write the full defaults tree and return it.
+/// * File parsed as a mapping: rewrite the file to the full
+///   defaults ⊕ user tree ONLY when it differs; return the merged tree.
+/// * Unreadable file (permissions / directory): return the merged tree
+///   without writing.
+///
+/// Write failures warn via `tracing::warn!` and never fail the load.
+fn materialize_config_file(path: &Path, raw_user_doc: &Value) -> Value {
+    if !path.exists() {
+        let tree = merged_tree(&Value::Mapping(Mapping::new()));
+        write_materialized(path, &tree);
+        return tree;
+    }
+    let merged = merged_tree(raw_user_doc);
+    let serialized = serde_yaml::to_string(&merged).unwrap_or_default();
+    match std::fs::read_to_string(path) {
+        // Unreadable file (e.g. permissions, or the path is a directory):
+        // keep today's behavior — no rewrite; serve the merged defaults.
+        Err(_) => {}
+        Ok(on_disk) => {
+            if on_disk != serialized {
+                write_materialized(path, &merged);
+            }
+        }
+    }
+    merged
+}
+
+fn write_materialized(path: &Path, tree: &Value) {
+    if let Err(err) = utils::atomic_yaml_write(path, tree) {
+        tracing::warn!(
+            "Failed to materialize {} with the full config tree ({}); \
+             continuing with in-memory defaults",
+            path.display(),
+            err
+        );
+        return;
+    }
+    secure_file(path);
 }
 
 /// Load-time pre-merge normalization: a root-level `max_turns` in the user
@@ -1693,7 +1769,7 @@ mod tests {
     }
 
     #[test]
-    fn save_writes_only_user_keys() {
+    fn save_persists_materialized_full_tree() {
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
@@ -1704,13 +1780,18 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let doc: Value = serde_yaml::from_str(&text).unwrap();
         let map = doc.as_mapping().unwrap();
-        // Only the user's keys + _config_version — never the defaults tree.
-        assert!(map.contains_key(skey("display")));
-        assert!(map.contains_key(skey("agent")));
-        assert!(map.contains_key(skey("_config_version")));
-        assert_eq!(map.len(), 3, "no default contamination: {:?}", map);
-        assert_eq!(doc["_config_version"].as_i64(), Some(crate::config::CONFIG_VERSION));
+        // The user's own values survive the save...
+        assert_eq!(doc["display"]["compact"].as_bool(), Some(true));
         assert_eq!(doc["agent"]["max_turns"].as_i64(), Some(42));
+        // ...the version stamp is written...
+        assert_eq!(doc["_config_version"].as_i64(), Some(crate::config::CONFIG_VERSION));
+        // ...and EVERY default section is present: upstream keeps saves
+        // sparse; this build deliberately persists the full materialized
+        // tree (see PORTING.md deviation entry, 2026-09-07).
+        for key in DEFAULTS.as_mapping().unwrap().keys() {
+            let k = key.as_str().expect("default keys are strings");
+            assert!(map.contains_key(skey(k)), "section {:?} missing", k);
+        }
 
         // Round-trip: reload sees merged values.
         let cfg2 = Config::load_from(path).unwrap();
@@ -2041,5 +2122,166 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bak, "- a\n- b\n");
+    }
+
+    // ── Load-time materialization of config.yaml ─────────────────────────
+
+    #[test]
+    fn first_run_creates_config_with_all_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        assert!(!path.exists());
+
+        let cfg = Config::load_from(path.clone()).unwrap();
+
+        // The file now exists and parses as a mapping.
+        assert!(path.exists(), "config.yaml materialized on first run");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let doc: Value = serde_yaml::from_str(&text).unwrap();
+        let map = doc.as_mapping().expect("materialized file is a mapping");
+        // EVERY top-level section present in DEFAULT_CONFIG_YAML is on disk.
+        for key in DEFAULTS.as_mapping().unwrap().keys() {
+            let k = key.as_str().expect("default keys are strings");
+            assert!(map.contains_key(skey(k)), "section {:?} missing", k);
+        }
+        // Defaults are served in memory too.
+        assert_eq!(cfg.get_i64("agent.max_turns", 0), 90);
+        #[cfg(unix)]
+        {
+            assert_eq!(file_mode(&path), Some(0o600), "materialized file is 0600");
+        }
+    }
+
+    #[test]
+    fn load_materializes_full_tree_preserving_user_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "agent:\n  max_turns: 42\nmodel:\n  default: my-model\n").unwrap();
+
+        let cfg = Config::load_from(path.clone()).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let doc: Value = serde_yaml::from_str(&text).unwrap();
+        let map = doc.as_mapping().unwrap();
+        // Every default section is now present...
+        for key in DEFAULTS.as_mapping().unwrap().keys() {
+            let k = key.as_str().expect("default keys are strings");
+            assert!(map.contains_key(skey(k)), "section {:?} missing", k);
+        }
+        // ...and the user's values survived the overlay.
+        assert_eq!(doc["agent"]["max_turns"].as_i64(), Some(42));
+        assert_eq!(doc["model"]["default"].as_str(), Some("my-model"));
+        // Reads see the merged view.
+        assert_eq!(cfg.get_i64("agent.max_turns", 0), 42);
+        assert_eq!(cfg.model(), "my-model");
+        assert_eq!(cfg.get_i64("agent.api_max_retries", 0), 3);
+    }
+
+    #[test]
+    fn materialization_is_idempotent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        Config::load_from(path.clone()).unwrap(); // materializes
+
+        let bytes_before = std::fs::read(&path).unwrap();
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        Config::load_from(path.clone()).unwrap();
+
+        let bytes_after = std::fs::read(&path).unwrap();
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(bytes_before, bytes_after, "no rewrite on second load");
+        assert_eq!(mtime_before, mtime_after, "file untouched (mtime unchanged)");
+    }
+
+    #[test]
+    fn env_placeholders_not_persisted() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("JOEY_TEST_MODEL_X");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "model:\n  default: \"${JOEY_TEST_MODEL_X}\"\n").unwrap();
+
+        Config::load_from(path.clone()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("${JOEY_TEST_MODEL_X}"),
+            "placeholder persisted verbatim, not expanded: {}",
+            text
+        );
+
+        // With the var set, reads expand — but the file keeps the placeholder.
+        std::env::set_var("JOEY_TEST_MODEL_X", "expanded-model-value");
+        let cfg = Config::load_from(path.clone()).unwrap();
+        assert_eq!(cfg.model(), "expanded-model-value");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("${JOEY_TEST_MODEL_X}"),
+            "placeholder still verbatim after re-load: {}",
+            text
+        );
+        std::env::remove_var("JOEY_TEST_MODEL_X");
+    }
+
+    #[test]
+    fn ignore_user_config_skips_materialization() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+
+        std::env::set_var("JOEY_IGNORE_USER_CONFIG", "1");
+        let cfg = Config::load_from(path.clone()).unwrap();
+        std::env::remove_var("JOEY_IGNORE_USER_CONFIG");
+
+        assert!(!path.exists(), "no file created under JOEY_IGNORE_USER_CONFIG=1");
+        assert_eq!(cfg.get_i64("agent.max_turns", 0), 90);
+    }
+
+    #[test]
+    fn corrupt_config_not_materialized() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "display: [unclosed\n").unwrap();
+
+        Config::load_from(path.clone()).unwrap();
+
+        // The corrupt file itself is untouched (only the .corrupt.<ts>.bak
+        // sibling may appear) — no full-tree rewrite of config.yaml.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "display: [unclosed\n");
+    }
+
+    #[test]
+    fn materialize_write_failure_does_not_break_load() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Missing parent directory: the load must succeed regardless of
+        // whether the materialization write can create the directory.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-such-parent").join("config.yaml");
+        let cfg = Config::load_from(path.clone()).unwrap();
+        assert_eq!(cfg.get_i64("agent.max_turns", 0), 90);
+
+        // A genuinely unwritable target: a FILE occupies the parent-dir slot,
+        // so create_dir_all fails — warn-and-continue, never an error.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"").unwrap();
+        let blocked = blocker.join("config.yaml");
+        let cfg = Config::load_from(blocked).unwrap();
+        assert_eq!(cfg.get_i64("agent.max_turns", 0), 90);
+    }
+
+    #[test]
+    fn round_trip_defaults_stable() {
+        // Serializer drift would break materialization idempotence: the
+        // second load re-serializes the parsed tree and must produce
+        // byte-identical output.
+        let once = serde_yaml::to_string(&*DEFAULTS).unwrap();
+        let reparsed: Value = serde_yaml::from_str(&once).unwrap();
+        let twice = serde_yaml::to_string(&reparsed).unwrap();
+        assert_eq!(once, twice);
     }
 }

@@ -28,9 +28,11 @@ Key behaviors:
 - **Dotted-path keys** — reads and writes use dotted paths
   (`terminal.backend`, `agent.max_turns`); numeric segments index into lists
   (`custom_providers.0.name`).
-- **`save` writes ONLY the user document** + `_config_version: 33` — the
-  merged defaults tree never contaminates config.yaml. Atomic write, then
-  chmod 0600.
+- **`save` writes ONLY the user document** + `_config_version` (currently 35). Atomic
+  write, then chmod 0600. Since load-time materialization (below), the user
+  document IS the full merged tree, so a post-materialization `save` persists
+  the complete tree — but materialization itself happens at load time, not
+  in `save`.
 - **Parse failures never fail the load**: last-known-good merged config (or
   defaults) is served, a stderr warning fires once per file mtime/size, and
   the corrupt file is backed up as `config.yaml.corrupt.<timestamp>.bak`.
@@ -44,6 +46,30 @@ Key behaviors:
     single-dot parse; keys typed string in the schema are never coerced.
 - **In-memory model override**: `set_model_override` (per-invocation
   `--model`) mutates only the merged view, never disk.
+
+### Load-time materialization (auto-populated config.yaml)
+
+Every config load (`Config::load` / `load_from`) materializes config.yaml:
+
+- **First run** (config.yaml does not exist): the file is created containing
+  the complete defaults tree — every configurable setting with its default
+  value — written atomically with 0600 permissions.
+- **Existing, parsing config.yaml**: it is rewritten (only when content
+  differs) to the full merged tree = defaults deep-merged with the user's
+  values, in normalized form. User-set values are preserved; every default
+  key becomes visible/editable in the file. The in-memory user document
+  becomes this full tree, so subsequent saves persist it. Idempotent: no
+  rewrite when on-disk content already matches.
+- **`${VAR}` placeholders are NEVER expanded in the file** — env expansion
+  remains a runtime overlay; precedence is unchanged
+  (DEFAULTS < config.yaml < `${VAR}` expansion from process env).
+- **Corrupt/non-mapping config files**: unchanged behavior (backed up,
+  defaults served) — never materialized.
+- **`JOEY_IGNORE_USER_CONFIG=1`**: no materialization writes at all.
+- **Write failures** are logged warnings and never break startup.
+- `Config::save()` semantics unchanged (still writes the user document +
+  `_config_version`; after materialization the user document IS the full
+  tree).
 
 ### `.env` loading (`load_joey_dotenv`)
 
@@ -234,7 +260,7 @@ process-local override (profiles) → `JOEY_HOME` env → platform default
 
 ```
 ~/.joey/
-  config.yaml          layered config (user keys only)
+  config.yaml          layered config (auto-materialized full tree at load)
   .env                 credentials (0600)
   .op.env              optional 1Password bootstrap token
   state.db             SQLite session store (schema v22)
