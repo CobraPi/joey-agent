@@ -39,7 +39,7 @@
 //!   the clamp is consumed by context expansion in T027).
 //! - `neurocode.rag.relation_max_depth`: clamped **0–2** (default 2).
 //! - `neurocode.rag.backend`: enum `auto | local_onnx | openai_compat |
-//!   ollama`; unknown value → warning + fallback to `auto`.
+//!   ollama | copilot`; unknown value → warning + fallback to `auto`.
 //!
 //! ## `~` expansion
 //!
@@ -96,8 +96,9 @@ pub const KEY_REFRESH_MAX_FILES_PER_TURN: &str = "neurocode.rag.refresh.max_file
 pub const KEY_REFRESH_MAX_BYTES_PER_TURN: &str = "neurocode.rag.refresh.max_bytes_per_turn";
 /// HTTP timeout for embedding calls and model-fetch downloads.
 pub const KEY_TIMEOUT_SECS: &str = "neurocode.rag.timeout_secs";
-/// Model id on the Copilot embeddings wire (Joey-native provider-following
-/// extension; NOT part of the pinned 18-key contract table).
+/// Model id on the Copilot embeddings wire for the explicit `copilot`
+/// backend (Joey-native extension; NOT part of the pinned 18-key contract
+/// table).
 pub const KEY_COPILOT_MODEL: &str = "neurocode.rag.copilot.model";
 
 /// Env var name `neurocode.rag.api_key` is persisted under (`.env`).
@@ -201,7 +202,8 @@ pub enum RagBackend {
     OpenAiCompat,
     /// Ollama native `POST {base_url}/api/embed`.
     Ollama,
-    /// GitHub Copilot `POST {base}/embeddings` (provider-following). Copilot,
+    /// GitHub Copilot `POST {base}/embeddings` — an explicit backend that
+    /// works with any LLM provider (independent of `model.provider`).
     Copilot,
 }
 
@@ -283,15 +285,12 @@ pub struct RagConfig {
     pub refresh_max_bytes_per_turn: i64,
     /// `neurocode.rag.timeout_secs` (default 30).
     pub timeout_secs: i64,
-    /// `neurocode.rag.copilot.model` (default `metis-1024-I16-Binary`,
-    /// 1024-dim, served via the GitHub-native embeddings endpoint;
+    /// `neurocode.rag.copilot.model` — the model id for the explicit
+    /// `copilot` backend (default `metis-1024-I16-Binary`, 1024-dim,
+    /// served via the GitHub-native embeddings endpoint;
     /// `text-embedding-3-small` (1536-dim) remains supported via the
     /// OpenAI-style endpoint).
     pub copilot_model: String,
-    /// Derived at load: `model.provider` selects a Copilot wire (see
-    /// [`provider_selects_copilot`]) — the CLI wiring switches the `auto`
-    /// embedding backend to the Copilot embeddings endpoint when true.
-    pub copilot_provider_active: bool,
 }
 
 impl RagConfig {
@@ -332,8 +331,6 @@ impl RagConfig {
         let batch_size = validate_batch_size(config.get_i64(KEY_BATCH_SIZE, DEFAULT_BATCH_SIZE));
 
         let copilot_model = config.get_str(KEY_COPILOT_MODEL, DEFAULT_COPILOT_MODEL);
-        let copilot_provider_active =
-            provider_selects_copilot(&config.get_str("model.provider", "auto"));
 
         Self {
             enabled: config.get_bool(KEY_ENABLED, false),
@@ -371,7 +368,6 @@ impl RagConfig {
             ),
             timeout_secs: config.get_i64(KEY_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS),
             copilot_model,
-            copilot_provider_active,
         }
     }
 
@@ -409,16 +405,6 @@ pub fn default_model_dir(profile: &str) -> PathBuf {
 /// (see module docs).
 pub fn is_env_routed_key(dotted: &str) -> bool {
     dotted == KEY_API_KEY
-}
-
-/// Whether a `model.provider` value selects a Copilot wire — the
-/// provider-following embedding switch. Aliases mirror joey-providers
-/// profile.rs (`is_copilot_wire` + the github-* alias set).
-pub fn provider_selects_copilot(provider: &str) -> bool {
-    matches!(
-        provider.trim().to_lowercase().as_str(),
-        "copilot" | "github-copilot" | "github-models" | "github" | "ai-usage-hud"
-    )
 }
 
 /// Set a `neurocode.rag.*` key and persist, routing `neurocode.rag.api_key`
@@ -499,14 +485,8 @@ mod tests {
     fn copilot_extensions() {
         assert_eq!(RagBackend::parse("copilot"), Some(RagBackend::Copilot));
         assert_eq!(RagBackend::Copilot.as_str(), "copilot");
-        assert!(provider_selects_copilot("Copilot"));
-        assert!(provider_selects_copilot(" github-copilot "));
-        assert!(provider_selects_copilot("ai-usage-hud"));
-        assert!(!provider_selects_copilot("zai"));
-        assert!(!provider_selects_copilot("openai"));
         let cfg = RagConfig::load(&Config::defaults());
         assert_eq!(cfg.copilot_model, DEFAULT_COPILOT_MODEL);
-        assert!(!cfg.copilot_provider_active);
     }
 
     #[test]

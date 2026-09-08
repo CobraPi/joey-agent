@@ -79,10 +79,9 @@ pub fn neurocode_slash_provider_scoped_text(args: &str, live_provider: &str) -> 
 }
 
 /// `/neurocode backend [value]` — show or persistently set the RAG
-/// embedding backend (`neurocode.rag.backend`). An explicit backend
-/// (e.g. `local_onnx` or `copilot`) overrides provider-following `auto`
-/// resolution, so the embedding backend can be switched regardless of the
-/// selected provider.
+/// embedding backend (`neurocode.rag.backend`). The embedding backend is
+/// independent of the LLM provider; auto resolves locally (local_onnx or
+/// keyword-only).
 pub fn neurocode_backend_command_text(
     parts: &[&str],
     config: &mut joey_core::Config,
@@ -95,7 +94,7 @@ pub fn neurocode_backend_command_text(
             format!(
                 "Embedding backend: {current}\n\
                  Set with: /neurocode backend <auto|local_onnx|openai_compat|ollama|copilot>\n\
-                 An explicit backend overrides provider-based auto selection."
+                 The embedding backend is independent of the LLM provider; auto resolves locally (local_onnx or keyword-only)."
             )
         }
         Some(raw) => match joey_neurocode_rag::config::RagBackend::parse(raw.trim()) {
@@ -104,7 +103,7 @@ pub fn neurocode_backend_command_text(
                 match config.set_and_save(KEY_BACKEND, value.as_str()) {
                     Ok(()) => format!(
                         "Embedding backend: {previous} -> {value} (saved)\n\
-                         Explicit backends override provider-based auto selection."
+                         The embedding backend is independent of the LLM provider."
                     ),
                     Err(err) => format!("Failed to save embedding backend: {err}"),
                 }
@@ -231,9 +230,8 @@ fn neurocode_dispatch(args: &str, live_provider: Option<&str>) -> NeurocodeOutco
         }
 
         // `/neurocode backend [value]` — show or persistently set the RAG
-        // embedding backend. An explicit backend overrides provider-based
-        // `auto` resolution, so users can pin local_onnx or copilot
-        // regardless of the selected provider.
+        // embedding backend. The embedding backend is selected solely by
+        // neurocode.rag.backend; copilot works with any LLM provider.
         "backend" => NeurocodeOutcome::Text(neurocode_backend_command_text(
             &parts[1..],
             &mut config,
@@ -1783,15 +1781,7 @@ fn backend_health_and_degradation(
     // Resolve the backend decision (filesystem-only; never a network call).
     let profile = joey_neurocode_rag::embed::profiles::lookup(&rag.model)
         .unwrap_or_else(joey_neurocode_rag::embed::profiles::default_profile);
-    // Provider-following switch — mirror of neurocode_rag_wiring: `auto` +
-    // Copilot provider -> Copilot embeddings backend (explicit wins).
-    let backend = if rag.backend == joey_neurocode_rag::config::RagBackend::Auto
-        && rag.copilot_provider_active
-    {
-        joey_neurocode_rag::config::RagBackend::Copilot
-    } else {
-        rag.backend
-    };
+    let backend = rag.backend;
     let profile_name = if backend == joey_neurocode_rag::config::RagBackend::Copilot {
         joey_neurocode_rag::embed::copilot::profile_for(&rag.copilot_model)
             .name
@@ -1809,7 +1799,7 @@ fn backend_health_and_degradation(
                 "degraded (keyword_only)".to_string()
             }
             joey_neurocode_rag::embed::BackendKind::Copilot => {
-                "configured (copilot embeddings via provider)".to_string()
+                "configured (copilot embeddings)".to_string()
             }
             _ => "unavailable".to_string(),
         },

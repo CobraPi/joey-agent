@@ -478,3 +478,36 @@ fn copilot_model_defaults_to_metis() {
     let rag = RagConfig::load(&Config::defaults());
     assert_eq!(rag.copilot_model, "metis-1024-I16-Binary");
 }
+
+// ─── 7. Backend independence from the LLM provider ──────────────────────────
+
+/// The embedding backend is a pure function of `neurocode.rag.*` keys:
+/// `model.provider` must never influence it. Explicit `backend=copilot`
+/// works with ANY LLM provider (e.g. z.ai), and an explicit non-copilot
+/// backend stays put even when the provider is a Copilot wire.
+#[test]
+fn backend_is_independent_of_llm_provider() {
+    let ctx = temp_home();
+    std::env::remove_var(ENV_API_KEY_NAME);
+
+    // The user's exact scenario: embedding backend=copilot + LLM provider=z.ai.
+    let rag = RagConfig::load(&config_with(
+        &ctx,
+        "model:\n  provider: zai\nneurocode:\n  rag:\n    backend: copilot\n",
+    ));
+    assert_eq!(
+        rag.backend, RagBackend::Copilot,
+        "explicit copilot backend must work with any LLM provider (zai)"
+    );
+
+    // The inverse: a copilot LLM provider must NOT drag the backend off an
+    // explicit local choice.
+    let rag = RagConfig::load(&config_with(
+        &ctx,
+        "model:\n  provider: copilot\nneurocode:\n  rag:\n    backend: local_onnx\n",
+    ));
+    assert_eq!(
+        rag.backend, RagBackend::LocalOnnx,
+        "explicit local_onnx backend must stay put under a copilot LLM provider"
+    );
+}

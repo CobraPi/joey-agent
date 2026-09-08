@@ -120,18 +120,9 @@ pub(crate) fn resolve_query_backend(
     rag: &RagConfig,
     store: Option<&joey_neurocode::graph::GraphStore>,
 ) -> Result<(ResolvedBackend, Option<Arc<dyn EmbeddingBackend>>), EmbedError> {
-    // Provider-following switch (Joey-native): when the LLM provider is a
-    // Copilot wire and the backend is `auto`, embeddings follow the provider
-    // onto Copilot's `/embeddings` endpoint instead of the local ONNX model.
-    // An EXPLICIT backend value always wins (opt-out: set `local_onnx` etc.).
-    let backend = if rag.backend == RagBackend::Auto && rag.copilot_provider_active {
-        RagBackend::Copilot
-    } else {
-        rag.backend
-    };
-    let profile = effective_profile(rag, backend);
+    let profile = effective_profile(rag, rag.backend);
     let profile_name = profile.name.to_string();
-    let decision = embed::resolve_kind(backend, &profile_name, &rag.model_dir)?;
+    let decision = embed::resolve_kind(rag.backend, &profile_name, &rag.model_dir)?;
     let consent_dir = consent_dir_for_cwd();
     match decision.kind {
         BackendKind::KeywordOnly => Ok((decision, None)),
@@ -185,18 +176,9 @@ pub(crate) fn resolve_documents_backend(
     rag: &RagConfig,
     store: Option<&joey_neurocode::graph::GraphStore>,
 ) -> Result<(ResolvedBackend, Option<Arc<dyn EmbeddingBackend>>), EmbedError> {
-    // Provider-following switch (Joey-native): when the LLM provider is a
-    // Copilot wire and the backend is `auto`, embeddings follow the provider
-    // onto Copilot's `/embeddings` endpoint instead of the local ONNX model.
-    // An EXPLICIT backend value always wins (opt-out: set `local_onnx` etc.).
-    let backend = if rag.backend == RagBackend::Auto && rag.copilot_provider_active {
-        RagBackend::Copilot
-    } else {
-        rag.backend
-    };
-    let profile = effective_profile(rag, backend);
+    let profile = effective_profile(rag, rag.backend);
     let profile_name = profile.name.to_string();
-    let decision = embed::resolve_kind(backend, &profile_name, &rag.model_dir)?;
+    let decision = embed::resolve_kind(rag.backend, &profile_name, &rag.model_dir)?;
     let consent_dir = consent_dir_for_cwd();
     match decision.kind {
         BackendKind::KeywordOnly => Ok((decision, None)),
@@ -283,14 +265,7 @@ pub(crate) fn execute_rag_search(
     let graph = DependencyGraph::open_for_project(project_root)
         .map_err(|e| SearchError::Store(format!("cannot open the project graph: {e}")))?;
     let resolved = resolve_query_backend(rag, Some(graph.store()));
-    let profile = effective_profile(
-        rag,
-        if rag.backend == RagBackend::Auto && rag.copilot_provider_active {
-            RagBackend::Copilot
-        } else {
-            rag.backend
-        },
-    );
+    let profile = effective_profile(rag, rag.backend);
     match resolved {
         // Real backend: embed the query leg (the pipeline pre-applies the
         // profile QUERY prefix; strip it and let the backend re-apply it).
@@ -525,15 +500,10 @@ pub(crate) fn run_production_refresh(
     let graph = DependencyGraph::open_for_project(root)
         .map_err(|e| format!("cannot open the project graph: {e}"))?;
     let store = graph.store();
-    // Effective profile for the RESOLVED backend (copilot ⇒ 1024d
+    // Effective profile for the configured backend (copilot ⇒ 1024d
     // metis-1024-I16-Binary via copilot_model, not the 768d rag.model
     // default) — the same resolution the embedder below will use.
-    let resolved_backend = if rag.backend == RagBackend::Auto && rag.copilot_provider_active {
-        RagBackend::Copilot
-    } else {
-        rag.backend
-    };
-    let profile = effective_profile(rag, resolved_backend);
+    let profile = effective_profile(rag, rag.backend);
 
     let resolved = resolve_documents_backend(rag, Some(store));
     match resolved {
@@ -738,14 +708,7 @@ impl RagPrefetchSource for ProductionRagPrefetchSource {
         }
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let graph = DependencyGraph::open_for_project(&root).ok()?;
-        let profile = effective_profile(
-            &rag,
-            if rag.backend == RagBackend::Auto && rag.copilot_provider_active {
-                RagBackend::Copilot
-            } else {
-                rag.backend
-            },
-        );
+        let profile = effective_profile(&rag, rag.backend);
         let request = SearchRequest {
             query: tokens.join(" "),
             file_filter: None,
@@ -804,7 +767,7 @@ pub(crate) fn install_rag_injections(agent: &mut joey_agent_core::Agent, config:
 }
 
 #[cfg(test)]
-mod copilot_switch_tests {
+mod backend_selection_tests {
     use super::*;
 
     /// Serializes tests in this module that mutate the endpoint env vars
@@ -826,14 +789,8 @@ mod copilot_switch_tests {
     /// tests never take, so no additional lock is needed for them.)
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn rag_copilot_provider() -> RagConfig {
-        let mut rag = RagConfig::default();
-        rag.copilot_provider_active = true; // model.provider == copilot
-        rag
-    }
-
     #[test]
-    fn auto_follows_copilot_provider() {
+    fn explicit_copilot_backend_resolves() {
         // Hermetic: this machine may export AI_USAGE_HUD_BASE_URL (proxy),
         // which flips the default Copilot model — detach from the ambient
         // env for the duration (save/remove/restore, same pattern as the
@@ -851,16 +808,14 @@ mod copilot_switch_tests {
         );
         std::env::remove_var("COPILOT_API_BASE_URL");
         std::env::remove_var("AI_USAGE_HUD_BASE_URL");
-        let rag = rag_copilot_provider();
+        let mut rag = RagConfig::default();
+        rag.backend = RagBackend::Copilot;
         let (decision, backend) = resolve_query_backend(&rag, None).unwrap();
         assert_eq!(decision.kind, BackendKind::Copilot);
         let info = backend.expect("backend constructed").describe_embedder();
         assert_eq!(info.backend_kind, BackendKind::Copilot);
         assert_eq!(info.model, "metis-1024-I16-Binary");
         assert_eq!(info.dim, 1024);
-        let (decision, backend) = resolve_documents_backend(&rag, None).unwrap();
-        assert_eq!(decision.kind, BackendKind::Copilot);
-        assert_eq!(backend.expect("backend").describe_embedder().model, "metis-1024-I16-Binary");
         if let Some(v) = saved.0 {
             std::env::set_var("COPILOT_API_BASE_URL", v);
         }
@@ -870,43 +825,34 @@ mod copilot_switch_tests {
     }
 
     #[test]
-    fn auto_follows_copilot_provider_behind_pinned_proxy() {
-        // ENV_LOCK serializes the endpoint-env mutations below against the
-        // sibling env-guard tests in this module (see ENV_LOCK docs), and
-        // the sibling module locks (fixed alphabetical order documented on
-        // ENV_LOCK: engine.rs, then llm_selector.rs) serialize them
-        // cross-module.
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard1 = crate::engine::actor_tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard2 = crate::llm_selector::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved_api = std::env::var("COPILOT_API_BASE_URL").ok();
-        let saved_hud = std::env::var("AI_USAGE_HUD_BASE_URL").ok();
-        std::env::remove_var("COPILOT_API_BASE_URL");
-        std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://127.0.0.1:9317"); // off-githubcopilot
-        let rag = rag_copilot_provider();
-        let (decision, backend) = resolve_query_backend(&rag, None).unwrap();
+    fn explicit_copilot_backend_ignores_llm_provider() {
+        // The embedding backend is a pure function of `neurocode.rag.*`
+        // keys — RagConfig no longer carries any provider field at all, so
+        // an explicit `backend=copilot` works with ANY LLM provider
+        // (e.g. z.ai) by construction. Both the query and the documents
+        // adapters must resolve Copilot.
+        let mut rag = RagConfig::default();
+        rag.backend = RagBackend::Copilot;
+        let (decision, _backend) = resolve_query_backend(&rag, None).unwrap();
         assert_eq!(decision.kind, BackendKind::Copilot);
-        let info = backend.expect("backend constructed").describe_embedder();
-        assert_eq!(info.model, "text-embedding-3-small");
-        assert_eq!(info.dim, 1536);
-        let (_, backend) = resolve_documents_backend(&rag, None).unwrap();
-        assert_eq!(backend.expect("backend").describe_embedder().model, "text-embedding-3-small");
-        let profile = effective_profile(&rag, RagBackend::Copilot);
-        assert_eq!(profile.name, "text-embedding-3-small");
-        assert_eq!(profile.dim, 1536);
-        std::env::remove_var("AI_USAGE_HUD_BASE_URL");
-        if let Some(v) = saved_api { std::env::set_var("COPILOT_API_BASE_URL", v); }
-        if let Some(v) = saved_hud { std::env::set_var("AI_USAGE_HUD_BASE_URL", v); }
+        let (decision, _backend) = resolve_documents_backend(&rag, None).unwrap();
+        assert_eq!(decision.kind, BackendKind::Copilot);
     }
 
     #[test]
-    fn explicit_backend_wins_over_provider_following() {
-        let mut rag = rag_copilot_provider();
-        rag.backend = RagBackend::OpenAiCompat;
-        rag.base_url = "http://embed.example.invalid".into();
+    fn auto_never_implicitly_selects_copilot() {
+        // `auto` resolves strictly through the local ladder — it can never
+        // implicitly become Copilot. Point model_dir at a nonexistent temp
+        // path so resolve_kind degrades to KeywordOnly deterministically on
+        // any machine (mirrors the #[ignore]d default_stays_local_ladder,
+        // without its machine-state dependence).
+        let mut rag = RagConfig::default();
+        rag.model_dir = std::env::temp_dir()
+            .join(format!("joey-rag-test-no-artifacts-{}", std::process::id()));
         let (decision, backend) = resolve_query_backend(&rag, None).unwrap();
-        assert_eq!(decision.kind, BackendKind::OpenAiCompat);
-        assert_eq!(backend.expect("backend").describe_embedder().backend_kind, BackendKind::OpenAiCompat);
+        assert_eq!(decision.kind, BackendKind::KeywordOnly);
+        assert_ne!(decision.kind, BackendKind::Copilot);
+        assert!(backend.is_none());
     }
 
     #[test]
@@ -926,7 +872,7 @@ mod copilot_switch_tests {
         );
         std::env::remove_var("COPILOT_API_BASE_URL");
         std::env::remove_var("AI_USAGE_HUD_BASE_URL");
-        let rag = rag_copilot_provider();
+        let rag = RagConfig::default();
         let profile = effective_profile(&rag, RagBackend::Copilot);
         assert_eq!(profile.name, "metis-1024-I16-Binary");
         assert_eq!(profile.dim, 1024);
@@ -936,15 +882,6 @@ mod copilot_switch_tests {
         if let Some(v) = saved.1 {
             std::env::set_var("AI_USAGE_HUD_BASE_URL", v);
         }
-    }
-
-    #[test]
-    fn effective_profile_non_copilot_uses_rag_model() {
-        let mut rag = RagConfig::default();
-        rag.copilot_provider_active = true; // must NOT matter for local backends
-        let profile = effective_profile(&rag, RagBackend::LocalOnnx);
-        assert_eq!(profile.name, profiles::default_profile().name);
-        assert_eq!(profile.dim, profiles::default_profile().dim);
     }
 
     #[test]

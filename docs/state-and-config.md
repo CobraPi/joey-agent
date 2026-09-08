@@ -219,16 +219,23 @@ persisted task lists.
 `.ambiguous_default`, `neurocode.verify.max_fix_iterations`,
 `neurocode.pega.version`.
 
-### GitHub Copilot embeddings (provider-following)
+### GitHub Copilot embeddings (explicit backend)
 
-When `model.provider` selects a Copilot wire (`copilot`, `github-copilot`,
-`github-models`, `github`, or `ai-usage-hud`) and `neurocode.rag.backend`
-is `auto`, RAG embeddings switch from the local ONNX model to GitHub
-Copilot's OpenAI-compatible `POST {base}/embeddings` endpoint
+Copilot embeddings are enabled only by setting
+`neurocode.rag.backend = copilot`; the embedding backend is fully
+independent of the LLM provider — Copilot embeddings work with ANY chat
+provider (e.g. z.ai). The `auto` backend never makes a network call: it
+resolves through the local ladder only (LocalOnnx when the model
+artifacts verify, else keyword-only).
+
+With `backend = copilot`, RAG embeddings call GitHub Copilot's
+OpenAI-compatible `POST {base}/embeddings` endpoint
 (`https://api.githubcopilot.com`; override via `COPILOT_API_BASE_URL` or
-`AI_USAGE_HUD_BASE_URL`). Auth reuses the Copilot chat credential
-(`neurocode.rag.api_key`, else `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/
-`GITHUB_TOKEN`, else `gh auth token`). Key: `neurocode.rag.copilot.model`
+`AI_USAGE_HUD_BASE_URL`; the dotcom embeddings endpoint defaults to
+`https://api.github.com`, override via `COPILOT_DOTCOM_EMBEDDINGS_BASE_URL`).
+Auth is independent of the LLM provider's credentials: `neurocode.rag.api_key`,
+else `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`.
+Key: `neurocode.rag.copilot.model`
 — embeddings model for the copilot backend. Default:
 `metis-1024-I16-Binary` (GitHub dotcom embeddings endpoint,
 `api.github.com`). When a custom Copilot endpoint is pinned
@@ -242,8 +249,7 @@ request), the copilot backend truncates each embed input to ~23 KB and
 splits larger batches into sequential sub-requests (at most 64 items and
 ~850 KB of input text each). Because the endpoint is
 non-loopback, code egress still requires per-project consent
-(`/neurocode consent ack`). Setting `neurocode.rag.backend` explicitly
-(e.g. `local_onnx`) keeps the local model even under a Copilot provider.
+(`/neurocode consent ack`).
 
 **mcp**: `mcp_servers` (mapping of server configs; also project-level
 `.joey/mcp.json` / `.mcp.json`).

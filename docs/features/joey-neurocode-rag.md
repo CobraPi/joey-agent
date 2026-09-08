@@ -55,7 +55,7 @@ Tests: `config_keys.rs`, `profiles.rs`, `v2_migration.rs`, `dense_index.rs`,
 | `embed::local_onnx` | PRIMARY in-process ONNX embedder |
 | `embed::openai_compat` | `POST {base_url}/v1/embeddings` (T030) |
 | `embed::ollama` | `POST {base_url}/api/embed` native (T030) |
-| `embed::copilot` | GitHub Copilot `POST {base}/embeddings`, provider-following (Joey-native extension) |
+| `embed::copilot` | GitHub Copilot `POST {base}/embeddings`, explicit-backend-only (Joey-native extension) |
 | `embed` (mod) | `EmbeddingBackend` trait, `BackendKind` registry, `EmbedError` taxonomy, `auto` resolution, consent gate |
 | `index::chunker` | symbol-aligned + fallback coarse chunks, `content_hash`, derived chunk edges (T012/T028) |
 | `index::incremental` | mtime+SHA-256 change detection, git rename assist, budgeted refresh (T021–T023) |
@@ -111,7 +111,7 @@ keyed by `BackendKind` (`local_onnx`, `openai_compat`, `ollama`, `copilot`,
 | `LocalOnnx` | in-process `ort` inference; dylib located via `neurocode.rag.local.ort_dylib_path` → `ORT_DYLIB_PATH` → system | PRIMARY; fully local, consent-free; offline `tokenizer.json` loading (padded `encode_batch`), never downloads; artifacts pass the SHA-256 integrity gate before any ort work |
 | `OpenAiCompat` | `POST {base_url}/v1/embeddings`, Bearer when api_key non-empty | covers OpenAI, Voyage, Ollama's `/v1` compat endpoint with zero per-vendor code; order restored via the response `index` field; client-side L2 |
 | `Ollama` | `POST {base_url}/api/embed` | native truncate/keep_alive control (`truncate: true`, `keep_alive` default `"5m"`); positional array order; a loopback `base_url` counts as LOCAL (consent-free) |
-| `Copilot` | `POST {base}/embeddings` (no `/v1` prefix) | auth reuses `joey_providers::copilot::CopilotAuth` (same token exchange as chat, one credential lifecycle); api.github.com dotcom serves the native Metis family (`metis-1024-I16-Binary`, raw credential, GitHub-native body `inputs`/`input_type`/`embedding_model`); api.githubcopilot.com CAPI fallback serves `text-embedding-3-small` (OpenAI-style body, `input` as JSON array — string inputs are rejected 400); a pinned custom endpoint skips the token exchange like chat traffic. Input caps: 23,000 B per input, 850,000 B per request, 64 items per sub-request |
+| `Copilot` | `POST {base}/embeddings` (no `/v1` prefix) | selected ONLY by explicit `neurocode.rag.backend = copilot`; independent of the LLM provider (works with any chat provider). Auth uses `joey_providers::copilot::CopilotAuth` token-exchange machinery with credentials resolved independently of the chat provider: `neurocode.rag.api_key`, else `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`; api.github.com dotcom serves the native Metis family (`metis-1024-I16-Binary`, raw credential, GitHub-native body `inputs`/`input_type`/`embedding_model`); api.githubcopilot.com CAPI fallback serves `text-embedding-3-small` (OpenAI-style body, `input` as JSON array — string inputs are rejected 400); a pinned custom endpoint skips the token exchange like chat traffic. Input caps: 23,000 B per input, 850,000 B per request, 64 items per sub-request |
 | `KeywordOnly` | degradation marker | `auto` resolution with no verifiable local artifacts — the pipeline runs its FTS5 keyword leg only, with an explicit FR-008 indication; resolving here never involves a network call |
 
 `auto` resolution probes the local `model_dir` artifact gate ONLY (no dylib,

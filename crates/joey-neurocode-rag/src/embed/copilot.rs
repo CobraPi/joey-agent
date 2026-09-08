@@ -1,9 +1,9 @@
-//! GitHub Copilot embeddings backend (REMOTE, provider-following).
+//! GitHub Copilot embeddings backend (REMOTE, explicit backend).
 //!
 //! `POST {base_url}/embeddings` — the Copilot models API's OpenAI-compatible
-//! embeddings endpoint (NO `/v1` prefix). Activated by the joey-cli wiring
-//! when `model.provider` selects a Copilot wire and `neurocode.rag.backend`
-//! is `auto` (an explicit backend value always wins). Auth reuses
+//! embeddings endpoint (NO `/v1` prefix). Activated ONLY by the explicit
+//! `neurocode.rag.backend = copilot` setting — fully decoupled from
+//! `model.provider` (works with any LLM provider). Auth reuses
 //! `joey_providers::copilot::CopilotAuth` — the SAME token exchange
 //! (`api.github.com/copilot_internal/v2/token`, cached with expiry margin)
 //! the chat provider uses, so embeddings and chat share one credential
