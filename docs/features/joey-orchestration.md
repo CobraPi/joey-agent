@@ -397,7 +397,7 @@ layer to avoid a circular dependency. Toolset mechanics are described in
 - `tests/isolation.rs` — child context isolation; parent history untouched (US2/AC1).
 - `tests/isolation_join.rs` — isolation + joiner end-to-end (spec-023 T020).
 - `tests/model_selection.rs` — per-subagent model selection in a mixed batch (SC-004).
-- `tests/neurocode_cascade.rs` — parent NeuroCode engine flows into children; same graph.db (FR-021).
+- `tests/neurocode_cascade.rs` — orchestrator-only injection: with a live parent NeuroCode engine, dispatched children's provider requests carry NO NeuroCode Context (FR-021 revised 2026-09-08).
 - `tests/notices.rs` — background completion notices: one per failure, bounded size (T011/T012).
 - `tests/parallel_batch.rs` — parallel batch wall-clock vs slowest child (SC-001).
 - `tests/parallel_tap.rs` — event tap receives lifecycle + wrapped child events.
@@ -415,4 +415,4 @@ layer to avoid a circular dependency. Toolset mechanics are described in
 - [joey-agent-core.md](joey-agent-core.md) — the `Agent` turn loop children run
 - [joey-tools.md](joey-tools.md) — tool registry, toolsets, filtering
 - [joey-cli.md](joey-cli.md) — registration wiring, HyperCode engine
-- [joey-neurocode.md](joey-neurocode.md) — NeuroCode engine cascade (feature 015)
+- [joey-neurocode.md](joey-neurocode.md) — NeuroCode engine (feature 015; injection now orchestrator-only)

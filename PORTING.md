@@ -928,6 +928,7 @@ ingest fixes: `ingest_project` now counts edges only on successful upsert
 and surfaces edge/tombstone errors in `IngestionResult.errors`; anti-pattern
 hit bump + domain-source listing failures are logged via `tracing::warn`
 instead of silently swallowed.
+  - Revised 2026-09-08: NeuroCode injection is now orchestrator-only. The SubagentManager engine plumbing (manager set_neurocode_engine, child propagation) was removed; subagents receive no injected NeuroCode Context. FR-021 cascade superseded by user directive.
 
 ## Copilot reverse-proxy integration (2026-08-14)
 
@@ -1580,6 +1581,18 @@ persona text is newly authored, NOT an upstream port).
   mapping — explorer→explore, implementor→hephaestus, orchestrator→
   atlas; the chains are preserved behind
   `hypercode.omo_specialists.enabled=false`.
+
+Orchestrator-centric role doctrine (2026-09-08): the explorer and
+implementor role prompts/directives (`crates/joey-cli/src/hypercode.rs`,
+`crates/joey-orchestration/src/delegation_tool.rs`, conductor
+ROSTER_BRIEFING) were rewritten as dumb-executor directives — subagents
+hold no context, make no decisions, and apply their brief verbatim;
+all high-level planning and decision making lives with the orchestrator,
+which is mandated to carve work into the smallest scoped tasks possible
+(one question per Explorer, one function/file/edit-cluster per
+Implementor). Deliberate deviation from any upstream persona wording:
+none of this text is upstream-ported; it is Joey-native guidance.
+- Revised 2026-09-08: explorer/implementor role directives tightened to absolute dumb-slave execution (brief-named commands/edits/checks only; NO changes on ambiguous briefs); every orchestrator prompt and conductor variant now carries an explicit NEVER-delegate-planning-or-decisions hard rule.
 
 ## HyperCode workflow inheritance + task-graph planning (2026-09-03)
 

@@ -307,13 +307,6 @@ pub(crate) fn hypercode_context_for_agent(
     let manager = std::sync::Arc::new(joey_orchestration::SubagentManager::new(
         joey_orchestration::ManagerConfig::from_config(config),
     ));
-    // Feature 015 (hypercode cascade, FR-021): hypercode pipeline children
-    // share the parent session's NeuroCode engine — same graph.db, and a
-    // task-targeted NeuroCode Context assembled into each child's system
-    // prompt.
-    if let Some(engine) = agent.neurocode_engine() {
-        manager.set_neurocode_engine(engine);
-    }
     crate::hypercode::HypercodeContext {
         agent_config,
         config: config.clone(),
@@ -801,6 +794,10 @@ async fn engine_task(
                 // Keep the live flag authoritative for later
                 // switch_model/switch_agent overlay re-application.
                 orchestrator_on = on;
+                // Roles-only delegation gate follows the toggle (same source of truth
+                // as the line-REPL path: hypercode.enabled && orchestrator_mode —
+                // here the command itself carries the new state).
+                joey_orchestration::set_orchestrator_roles_only(on);
                 // /hypercode toggle (orchestrator mode): swap the tool
                 // surface + overlay on the LIVE agent — no agent rebuild
                 // needed. The system prompt's tool section was baked at

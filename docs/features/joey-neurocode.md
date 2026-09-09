@@ -29,18 +29,24 @@ the config table below); RAG and indexing do not.
 - **Consumers**: `joey-agent-core` consumes only the narrow
   [`NeuroCodeEngine`] trait (the graph store, ingestion pipeline, classifier
   internals, and feedback loop are private to this crate — Constitution VI).
-  `joey-orchestration` children share the engine `Arc` so subagents reuse the
-  same `graph.db` instead of re-indexing (FR-021);
+  The NeuroCode engine is installed on the orchestrator/main session
+  only; dispatched subagents receive no injected NeuroCode Context — the
+  orchestrator includes any code-map facts a child needs directly in its
+  brief (FR-021 cascade superseded 2026-09-08);
   `joey-tui` renders the context-graph snapshot;
   `joey-neurocode-rag` builds its chunk/vector store inside this crate's
   schema; `joey-cli` wires the `/neurocode` command and the auto-reindex
   turn-hook (see [joey-cli.md](joey-cli.md),
   [joey-agent-core.md](joey-agent-core.md),
   [joey-orchestration.md](joey-orchestration.md), [joey-tui.md](joey-tui.md)).
-- **Engine flows to subagents (FR-021)**: a subagent engine constructed for
-  the same project root lazily opens the SAME per-project `graph.db` the parent
-  built — no re-ingestion, no private index. `Agent::neurocode_engine()`
-  exposes the shared `Arc<dyn NeuroCodeEngine>` for exactly this.
+- **Orchestrator-only injection (revised 2026-09-08)**: The NeuroCode engine
+  is installed on the orchestrator/main session only; dispatched subagents
+  receive no injected NeuroCode Context — the orchestrator includes any
+  code-map facts a child needs directly in its brief. At the engine layer,
+  engines constructed for the same project root still lazily open the SAME
+  per-project `graph.db` the parent built — no re-ingestion, no private index
+  — and `Agent::neurocode_engine()` exposes the main session's
+  `Arc<dyn NeuroCodeEngine>`.
 - Everything is offline and deterministic: no network calls on the hot path
   (`classify` / `assemble_context` are non-async, O(1) on cached/indexed
   state — FR-017).
@@ -378,7 +384,7 @@ RAG keys (`neurocode.rag.*`) are documented in
 | `enterprise_analysis.rs` | spec-023 unified analysis plane |
 | `status_persistence.rs` | `/neurocode status` reads a previously built graph |
 | `regression_disabled.rs` | byte-identical behavior when disabled |
-| `subagent_cascade.rs` | FR-021 subagent graph sharing |
+| `subagent_cascade.rs` | engine-layer graph.db sharing by project root (FR-021); manager-level cascade removed 2026-09-08 — orchestrator-only injection |
 | `rag_schema_migration.rs` | v2 → v3 additive RAG migration |
 
 Run scoped: `cargo test -p joey-neurocode`.
@@ -387,7 +393,7 @@ Run scoped: `cargo test -p joey-neurocode`.
 
 - [joey-neurocode-rag.md](joey-neurocode-rag.md) — semantic RAG over this graph
 - [joey-agent-core.md](joey-agent-core.md) — turn-loop integration
-- [joey-orchestration.md](joey-orchestration.md) — subagent graph sharing (FR-021)
+- [joey-orchestration.md](joey-orchestration.md) — orchestrator-only NeuroCode injection policy (FR-021 revised 2026-09-08)
 - [joey-tools.md](joey-tools.md) — `neurocode_*` tools
 - [joey-cli.md](joey-cli.md) — `/neurocode` command
 - [joey-tui.md](joey-tui.md) — context-graph visualization

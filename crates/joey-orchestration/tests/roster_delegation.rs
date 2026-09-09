@@ -19,8 +19,8 @@ use std::sync::Arc;
 use joey_agent_core::AgentConfig;
 use joey_core::Config;
 use joey_orchestration::{
-    CallOmoAgent, CategoryResolver, DelegateTask, ManagerConfig, ResolvedDelegation,
-    SubagentManager,
+    set_orchestrator_roles_only, CallOmoAgent, CategoryResolver, DelegateTask, ManagerConfig,
+    ResolvedDelegation, SubagentManager,
 };
 use joey_tools::context::ToolContext;
 use joey_tools::registry::{Tool, ToolResult};
@@ -406,4 +406,44 @@ async fn role_enrichment_composes_with_named_routing() {
         !saw_chain_warning,
         "named routing fills the model gap; no FR-006 chain warning expected, got: {events:?}"
     );
+}
+
+/// HyperCode roles-only gate, flag OFF: the full schema (named-agent,
+/// category, load_skills routing) is advertised and a single-mode dispatch
+/// with subagent_type resolves through the mock resolver — public-surface
+/// parity for normal sessions (repo constitution: regression tests for
+/// public-surface changes). Flag-on assertions live in
+/// tests/orchestrator_role_gate.rs so this file stays flag-off.
+#[test]
+fn flag_off_keeps_full_schema_and_named_routing() {
+    set_orchestrator_roles_only(false);
+    let (tool, _ctx) = make_tool(None);
+    let schema: Value = tool.parameters();
+    let props = &schema["properties"];
+    assert!(props.get("subagent_type").is_some(), "flag off keeps subagent_type");
+    assert!(props.get("category").is_some(), "flag off keeps category");
+    assert!(props.get("load_skills").is_some(), "flag off keeps load_skills");
+    set_orchestrator_roles_only(false);
+}
+
+/// Flag OFF + dispatch: a single-mode call with subagent_type resolves
+/// (reuses the make_tool + AllRosterResolver pattern from
+/// all_eleven_roster_names_are_accepted; the dispatch failure without
+/// credentials is expected and proves we got PAST validation).
+#[tokio::test]
+async fn flag_off_named_dispatch_resolves() {
+    set_orchestrator_roles_only(false);
+    let resolver: Arc<dyn CategoryResolver> = Arc::new(AllRosterResolver);
+    let (tool, ctx) = make_tool(Some(resolver));
+    let args = json!({ "goal": "trivial", "subagent_type": "oracle" });
+    let result = tool.execute(args, &ctx).await;
+    assert!(
+        !matches!(result, ToolResult::Error(ref e) if e.contains("HyperCode orchestrator mode")),
+        "flag off must never hit the restriction error, got: {result:?}"
+    );
+    assert!(
+        !matches!(result, ToolResult::Error(ref e) if e.contains("unknown or unavailable")),
+        "named routing must resolve under flag off, got: {result:?}"
+    );
+    set_orchestrator_roles_only(false);
 }

@@ -185,6 +185,12 @@ pub(crate) fn build_agent_parts(
     // happens in Explorer/Implementor children (cost-efficient: the powerful
     // main model only ever sees summaries and makes decisions).
     let orchestrator_on = crate::hypercode::apply_orchestrator_to_agent_config(config, &mut agent_cfg);
+    // HyperCode roles-only delegation gate: restrict the orchestrator
+    // session's delegate_task to role routing (explorer/implementor) —
+    // named-agent/category/load_skills routing is rejected and the tool
+    // schema omits those parameters. Set BEFORE any dispatch; also updated
+    // at the /hypercode toggle below (TUI path: engine.rs SetOrchestratorMode).
+    joey_orchestration::set_orchestrator_roles_only(orchestrator_on);
     let ctx = ToolContext::new(cwd.to_path_buf(), config.clone(), session_id.to_string());
     let mut registry = ToolRegistry::with_builtins();
 
@@ -257,13 +263,6 @@ pub(crate) fn build_agent_parts(
         // (FR-009 parity). Default false preserves pre-spec behavior.
         let rag_enabled = config.get_bool("neurocode.rag.enabled", false);
         joey_tools::builtins::register_neurocode_rag_tools(&mut registry, rag_enabled, Some(backend));
-    }
-    // Feature 015 (hypercode cascade, FR-021): share the engine with the
-    // orchestration manager so delegate_task children open the SAME
-    // graph.db (no re-indexing) and get a task-targeted NeuroCode Context
-    // in their system prompt.
-    if let Some(engine) = &neurocode_engine {
-        manager.set_neurocode_engine(engine.clone());
     }
     joey_orchestration::register_orchestration_with_resolver_and_allocator(
         &mut registry,
@@ -1756,6 +1755,12 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
                     if let Ok(refreshed) = Config::load() {
                         st.config = refreshed;
                     }
+                    // Roles-only delegation gate follows the toggle: recompute
+                    // from the REFRESHED config (enabled && orchestrator_mode
+                    // — the stale startup snapshot would misread the new state).
+                    joey_orchestration::set_orchestrator_roles_only(
+                        crate::hypercode::orchestrator_active(&st.config),
+                    );
                     // The NeuroCode engine snapshots the hypercode gate at
                     // build time — rebuild it so tier-model routing follows
                     // the new state immediately instead of on next start.
@@ -1775,6 +1780,15 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
                     // Configured): re-snapshot the NeuroCode engine's hypercode
                     // gate so tier routing follows the new orchestrator state.
                     refresh_neurocode_engine(st);
+                    // Roles-only delegation gate: orchestrator_mode changed —
+                    // recompute from the persisted config (hypercode.enabled
+                    // && orchestrator_mode).
+                    if let Ok(refreshed) = Config::load() {
+                        st.config = refreshed;
+                        joey_orchestration::set_orchestrator_roles_only(
+                            crate::hypercode::orchestrator_active(&st.config),
+                        );
+                    }
                     render::success(&msg);
                 }
                 Ok(crate::hypercode::HyperCodeOutput::Run { goal }) => {

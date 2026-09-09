@@ -270,7 +270,13 @@ byte-identically to plain subagent delegation.
 the team — that child is the LEAD: an Orchestrator-role child with the
 team-lead directive (decompose the objective → `team_tasks add` with
 dependencies → spawn teammates with explorer/implementor role profiles →
-synthesize) and the `delegation` + `team` toolsets. The lead's model:
+synthesize) and the `delegation` + `team` toolsets. Role doctrine: the
+lead/orchestrator owns all planning and decision making and mandates the
+smallest scoped tasks possible (one question per Explorer, one
+function/file/edit-cluster per Implementor); explorers are read-only
+executors answering single-question lookups with raw facts, and
+implementors are dumb executors applying fully-specified minimal-scope
+briefs verbatim. The lead's model:
 an explicit `hypercode.team.lead_model` always wins; otherwise it
 defaults to the orchestrator tier's mapping — `atlas` under specialists
 ON (`hypercode.omo_specialists.enabled`, default), the legacy chain

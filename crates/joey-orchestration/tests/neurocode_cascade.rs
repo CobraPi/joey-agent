@@ -1,14 +1,10 @@
-//! Feature 015 FR-021 (hypercode cascade): the parent session's NeuroCode
-//! engine must flow into dispatched subagents so each child reuses the
-//! SAME graph.db (open, never re-index) and its per-request intercept
-//! (`apply_neurocode_intercept` in joey-agent-core) assembles a
-//! task-targeted NeuroCode Context into the CHILD's system prompt.
-//!
-//! The proof is end-to-end: a `delegate_task` dispatch against a local
-//! mock OpenAI-compatible server that CAPTURES the raw request body. The
-//! body must contain the assembled "## NeuroCode Context" block naming the
-//! task's target artifacts when an engine is installed — and must NOT when
-//! none is.
+//! Orchestrator-only NeuroCode injection policy: the parent session's
+//! NeuroCode engine is installed on the orchestrator/main agent ONLY.
+//! Dispatched subagents receive NO NeuroCode Context — the manager no
+//! longer carries or propagates an engine, so even with a live engine in
+//! the parent session the child's provider request carries no context
+//! block. The orchestrator pastes any code-map facts its children need
+//! directly into their briefs.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -160,11 +156,9 @@ fn write_project(root: &std::path::Path) {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// FR-021 positive: with the parent's engine installed on the manager, the
-/// dispatched child's PROVIDER REQUEST carries the task-targeted NeuroCode
-/// Context (assembled from the shared graph.db) in its system prompt.
+/// Orchestrator-only policy: even with a live NeuroCode engine built for the parent session, the dispatched child's provider request carries NO NeuroCode Context.
 #[tokio::test]
-async fn neurocode_context_reaches_child_system_prompt() {
+async fn subagents_never_receive_neurocode_context() {
     let tmp = TempDir::new().unwrap();
     write_project(tmp.path());
 
@@ -178,10 +172,9 @@ async fn neurocode_context_reaches_child_system_prompt() {
     // The parent session's engine — children must share this exact engine.
     let mut nc = NeuroCodeConfig::default();
     nc.enabled = true;
-    let engine: Arc<dyn NeuroCodeEngine> = Arc::new(DefaultEngine::new(nc, tmp.path().to_path_buf()));
+    let _engine: Arc<dyn NeuroCodeEngine> = Arc::new(DefaultEngine::new(nc, tmp.path().to_path_buf()));
 
     let manager = Arc::new(SubagentManager::new(Default::default()));
-    manager.set_neurocode_engine(engine);
 
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let base = spawn_capturing_server(bodies.clone()).await;
@@ -207,12 +200,8 @@ async fn neurocode_context_reaches_child_system_prompt() {
 
     let body = bodies.lock().unwrap()[0].clone();
     assert!(
-        body.contains("NeuroCode Context"),
-        "child request body lacks the NeuroCode Context block:\n{body}"
-    );
-    assert!(
-        body.contains("UserServiceImpl"),
-        "child request body lacks the task target UserServiceImpl:\n{body}"
+        !body.contains("NeuroCode Context"),
+        "child request body must NOT contain a NeuroCode Context (orchestrator-only injection):\n{body}"
     );
 }
 
