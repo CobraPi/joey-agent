@@ -1910,6 +1910,15 @@ struct HypercodeDispatcher<'a> {
     outcome_store: Option<
         Arc<std::sync::Mutex<joey_neurocode::memory::outcomes::OutcomeStore>>,
     >,
+    /// T016 (feature 027): episodic-memory store shared with post-run
+    /// episode recording; None unless `neurocode.memory.enabled` (the
+    /// memory feature's own key — NOT enterprise_context). Arc<Mutex>
+    /// mirrors `outcome_store`: rusqlite's Connection is Send-but-not-Sync,
+    /// and `dispatch` holds `&self` across an await (dispatcher must be
+    /// Sync).
+    memory_episode_store: Option<
+        Arc<std::sync::Mutex<joey_neurocode::memory::episodes::EpisodeStore>>,
+    >,
     /// T028: (task_id, failure_signature) for every repair re-dispatch.
     repair_log: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
@@ -1996,6 +2005,62 @@ pub(crate) fn record_verified_outcomes(
     recorded
 }
 
+/// T016 (feature 027): record one memory episode per Completed graph task
+/// (`Workstream` kind) — the Completed-only gate mirrors
+/// [`record_verified_outcomes`]; failures are already captured by the
+/// repair/verified-outcome side. Insert is fire-and-collect through the
+/// store's sanitization choke point (redaction inherited per U1 — never
+/// pre-redacted); a store error skips that node (count only successes).
+pub(crate) fn record_memory_episodes(
+    store: &joey_neurocode::memory::episodes::EpisodeStore,
+    graph: &TaskGraph,
+    run_id: &str,
+) -> usize {
+    use joey_neurocode::memory::episodes::{
+        EpisodeKind, EpisodeOutcome, EpisodeSource, MemoryEpisode,
+    };
+    use joey_orchestration::task_graph::TaskStatus;
+
+    let max_episodes = joey_neurocode_rag::config::MemoryConfig::load(
+        &joey_core::Config::load().unwrap_or_else(|_| joey_core::Config::defaults()),
+    )
+    .max_episodes
+    .max(1) as usize;
+
+    let mut recorded = 0usize;
+    for (id, node) in graph.nodes.iter() {
+        if node.status != TaskStatus::Completed {
+            continue;
+        }
+        let episode = MemoryEpisode {
+            id: String::new(), // store stamps a content-derived id
+            kind: EpisodeKind::Workstream,
+            title: node.objective.chars().take(200).collect(),
+            task: node.objective.clone(),
+            context: node
+                .write_set
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            // TaskNode carries no result/summary text — approach stays
+            // empty (the run's evidence rows carry the detail).
+            approach: String::new(),
+            outcome: EpisodeOutcome::Success,
+            lessons: String::new(),
+            source: EpisodeSource::Hypercode,
+            origin_run: run_id.to_string(),
+            evidence_ids: vec![format!("runs/{}/nodes/{}.json", run_id, id.as_str())],
+            created_at: String::new(), // store stamps
+            updated_at: String::new(), // store stamps
+        };
+        if matches!(store.insert(&episode, None, max_episodes), Ok(Some(_))) {
+            recorded += 1;
+        }
+    }
+    recorded
+}
+
 /// T036: flag-gated outcome-store open shared by `execute_graph_run` and
 /// `resume_execution_run` (US7/FR-025) — opens `outcomes.db` next to the
 /// neurocode graph DB; flag-off runs get `None` (SC-001 parity). Extracted
@@ -2022,6 +2087,54 @@ fn open_outcome_store(
     } else {
         None
     }
+}
+
+/// T016 (feature 027): flag-gated episode-store open shared by both graph
+/// run paths and the legacy pipeline — opens the episodic-memory store on
+/// the per-project neurocode graph DB (`memory_episodes` lives in
+/// graph.db, schema v4), deriving the directory exactly the way
+/// [`open_outcome_store`] does; flag-off runs get `None` (FR-010 parity).
+/// The gate is MemoryConfig's OWN key (`neurocode.memory.enabled`), NOT
+/// the enterprise_context flag the outcome store uses.
+fn open_memory_episode_store(
+    ctx: &HypercodeContext,
+) -> Option<Arc<std::sync::Mutex<joey_neurocode::memory::episodes::EpisodeStore>>> {
+    if joey_neurocode_rag::config::MemoryConfig::load(&ctx.config).enabled {
+        let db_path = joey_neurocode::graph::store::project_graph_db_path(&ctx.cwd);
+        match db_path.parent().map(|p| p.to_path_buf()) {
+            Some(dir) => {
+                let _ = std::fs::create_dir_all(&dir);
+                joey_neurocode::memory::episodes::EpisodeStore::open(&db_path)
+                    .ok()
+                    .map(|s| Arc::new(std::sync::Mutex::new(s)))
+            }
+            None => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// T017 (feature 027): pure composition of the dispatch goal prefix —
+/// verified-lessons text (when present) followed by the bounded memory
+/// block from [`joey_agent_core::memory_hook::format_memory_block`]
+/// (preferences section first, episodes second, whole-entry truncation
+/// under `char_limit`). Empty sections yield a block-free prefix, so the
+/// disabled / silent-skip paths stay byte-identical to the lessons-only
+/// goal.
+fn compose_memory_goal_prefix(
+    lessons: Option<&str>,
+    prefs: &[String],
+    eps: &[String],
+    char_limit: usize,
+) -> String {
+    let mut prefix = lessons.unwrap_or("").to_string();
+    let block = joey_agent_core::memory_hook::format_memory_block(prefs, eps, char_limit);
+    if !block.is_empty() {
+        prefix.push_str(&block);
+        prefix.push('\n');
+    }
+    prefix
 }
 
 /// T036 (FR-026/SC-008): pre-run material-change sweep shared by both
@@ -2076,6 +2189,9 @@ fn graph_gate(ctx: &HypercodeContext) -> crate::hypercode_gate::VerifyLoopGate {
 /// from the execute path.
 fn finalize_graph_run(
     outcome_store: &Option<Arc<std::sync::Mutex<joey_neurocode::memory::outcomes::OutcomeStore>>>,
+    memory_episode_store: &Option<
+        Arc<std::sync::Mutex<joey_neurocode::memory::episodes::EpisodeStore>>,
+    >,
     review_events: &std::sync::Arc<
         std::sync::Mutex<Vec<crate::hypercode_gate::ReviewEvent>>,
     >,
@@ -2096,6 +2212,18 @@ fn finalize_graph_run(
             );
             tracing::info!(
                 "hypercode: recorded {recorded} verified-outcome lesson(s) (FR-025; unverified tasks yield none)"
+            );
+        }
+    }
+
+    // T016 (feature 027): one memory episode per Completed task — the
+    // episodic-memory mirror of the block above, through the store's
+    // sanitization choke point (redaction inherited per U1).
+    if let Some(store) = memory_episode_store.as_ref() {
+        if let Ok(guard) = store.lock() {
+            let recorded = record_memory_episodes(&guard, graph, run.run_id());
+            tracing::info!(
+                "hypercode: recorded {recorded} memory episode(s) (feature 027 write side)"
             );
         }
     }
@@ -2219,9 +2347,82 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
                 }
             }
         }
+        // T017 (feature 027): read side — bounded memory sections
+        // (learned preferences + relevant past episodes) prepended AFTER
+        // the verified-lessons prefix and BEFORE the task text. Gated on
+        // the T016 episode store being present (= `neurocode.memory.enabled`);
+        // every failure below skips silently so the goal degrades to the
+        // lessons-only prefix (byte-identical to the memory-off path).
+        let goal_prefix = if self.memory_episode_store.is_some() {
+            let mem = joey_neurocode_rag::config::MemoryConfig::load(&self.ctx.config);
+            let db_path = joey_neurocode::graph::store::project_graph_db_path(&self.ctx.cwd);
+            let top_k = mem.top_k as usize;
+            let mut pref_lines: Vec<String> = Vec::new();
+            let mut ep_lines: Vec<String> = Vec::new();
+            // Cheap per-dispatch SQLite opens; any error skips silently.
+            if let Ok(graph_store) = joey_neurocode::graph::store::GraphStore::open(&db_path) {
+                if let Ok(pref_store) =
+                    joey_neurocode::memory::preferences::PreferenceStore::open(&db_path)
+                {
+                    if let Ok(prefs) = pref_store.resolve_active(None, top_k) {
+                        pref_lines = prefs
+                            .iter()
+                            .map(|p| {
+                                format!(
+                                    "{}: {} ({}, confidence {}%)",
+                                    p.category,
+                                    p.statement,
+                                    p.origin.as_str(),
+                                    p.confidence
+                                )
+                            })
+                            .collect();
+                    }
+                }
+                let query: String = task.objective.chars().take(2000).collect();
+                if let Ok(hits) = joey_neurocode_rag::memory_search::search_memory(
+                    graph_store.conn(),
+                    &joey_neurocode_rag::config::RagConfig::load(&self.ctx.config),
+                    None,
+                    &joey_neurocode_rag::memory_search::MemorySearchRequest {
+                        query,
+                        top_k,
+                    },
+                ) {
+                    if let Some(store) = self.memory_episode_store.as_ref() {
+                        if let Ok(guard) = store.lock() {
+                            for hit in hits.iter().filter(|h| h.item_kind == "episode") {
+                                if let Ok(Some(ep)) = guard.get(&hit.item_id) {
+                                    let task_head: String = ep.task.chars().take(160).collect();
+                                    ep_lines.push(format!(
+                                        "{} — {} ({}): {}",
+                                        ep.title,
+                                        ep.outcome.as_str(),
+                                        ep.created_at,
+                                        task_head
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            compose_memory_goal_prefix(
+                if lesson_prefix.is_empty() {
+                    None
+                } else {
+                    Some(&lesson_prefix)
+                },
+                &pref_lines,
+                &ep_lines,
+                joey_agent_core::memory_hook::clamp_char_limit(mem.injection_char_limit),
+            )
+        } else {
+            lesson_prefix
+        };
         let req_goal_base = format!(
             "{}Implement HyperCode task {}:\n{}\n(Project root: {})",
-            lesson_prefix,
+            goal_prefix,
             task.id.as_str(),
             task.objective,
             workdir.display()
@@ -2359,6 +2560,7 @@ async fn execute_graph_run(
         run_root: root.clone(),
         repair_queue: gate.repair_queue(),
         outcome_store: outcome_store.clone(),
+        memory_episode_store: open_memory_episode_store(ctx),
         repair_log: repair_log.clone(),
     };
     stats = {
@@ -2374,7 +2576,14 @@ async fn execute_graph_run(
     // T036: shared post-run finalization — record verified-outcome
     // lessons (FR-025) and drain the review audit trail into
     // ReviewOutcome evidence (US8), identical to the resume path.
-    finalize_graph_run(&outcome_store, &review_events, &graph, &mut run, &repair_log);
+    finalize_graph_run(
+        &outcome_store,
+        &dispatcher.memory_episode_store,
+        &review_events,
+        &graph,
+        &mut run,
+        &repair_log,
+    );
 
     // ── Integration phase (Spec 023 T020 / US4, FR-016…FR-018) ─────────
     // Collect a ChangeBundle from every Completed isolated-worktree task
@@ -2550,6 +2759,7 @@ pub async fn resume_execution_run(
         run_root: root.clone(),
         repair_queue: gate.repair_queue(),
         outcome_store: outcome_store.clone(),
+        memory_episode_store: open_memory_episode_store(ctx),
         repair_log: repair_log.clone(),
     };
     let stats = {
@@ -2561,7 +2771,14 @@ pub async fn resume_execution_run(
             .run_to_completion(&mut graph, &mut run, &dispatcher, &gate, &ctx.cwd)
             .await
     };
-    finalize_graph_run(&outcome_store, &review_events, &graph, &mut run, &repair_log);
+    finalize_graph_run(
+        &outcome_store,
+        &dispatcher.memory_episode_store,
+        &review_events,
+        &graph,
+        &mut run,
+        &repair_log,
+    );
     tracing::info!(
         "hypercode: resumed run {run_id} — {} completed, {} failed, {} degraded, {} blocked",
         stats.completed, stats.failed, stats.degraded, stats.blocked_remaining
@@ -2914,6 +3131,46 @@ pub async fn run_hypercode(
     report.build_summaries = build_results.iter().map(|r| r.summary.clone()).collect();
     report.successes = build_results.iter().map(|r| r.success).collect();
     report.total_secs = started.elapsed().as_secs_f64();
+
+    // T016 (feature 027): legacy-path memory episodes — one per completed
+    // workstream, success AND failure (the Completed-only success gate
+    // applies to the graph path; here the build result decides the
+    // outcome), gated on `neurocode.memory.enabled` and written through
+    // the store's sanitization choke point (redaction inherited per U1 —
+    // never pre-redacted). The legacy pipeline has no dispatcher, so the
+    // shared helper is called directly with the run's ctx.
+    let mem = joey_neurocode_rag::config::MemoryConfig::load(&ctx.config);
+    if mem.enabled {
+        if let Some(store) = open_memory_episode_store(ctx) {
+            if let Ok(guard) = store.lock() {
+                use joey_neurocode::memory::episodes::{
+                    EpisodeKind, EpisodeOutcome, EpisodeSource, MemoryEpisode,
+                };
+                for (i, ws) in workstreams.iter().enumerate() {
+                    let episode = MemoryEpisode {
+                        id: String::new(), // store stamps a content-derived id
+                        kind: EpisodeKind::Workstream,
+                        title: ws.focus.clone(),
+                        task: ws.focus.clone(),
+                        context: String::new(),
+                        approach: report.build_summaries[i].clone(),
+                        outcome: if report.successes[i] {
+                            EpisodeOutcome::Success
+                        } else {
+                            EpisodeOutcome::Failure
+                        },
+                        lessons: String::new(),
+                        source: EpisodeSource::Hypercode,
+                        origin_run: String::new(), // no evidence run id on this path
+                        evidence_ids: Vec::new(),
+                        created_at: String::new(), // store stamps
+                        updated_at: String::new(), // store stamps
+                    };
+                    let _ = guard.insert(&episode, None, mem.max_episodes.max(1) as usize);
+                }
+            }
+        }
+    }
 
     // ── Phase 4: Synthesize (in-memory merge; no extra LLM call) ──────
     if let Some(cb) = progress {
@@ -3838,7 +4095,7 @@ mod tests {
                 detail: "d".into(),
             },
         ]));
-        finalize_graph_run(&outcome_store, &review_events, &graph, &mut run, &repair_log);
+        finalize_graph_run(&outcome_store, &None, &review_events, &graph, &mut run, &repair_log);
         // (i) exactly one recorded lesson, keyed by the node's task signature
         let rows = outcome_store
             .as_ref()
@@ -3889,5 +4146,180 @@ mod tests {
         let ctx = model_ctx("zai", None); // Config::defaults() — key absent
         let gate = graph_gate(&ctx);
         assert!(!gate.has_reviewer());
+    }
+}
+
+/// Feature 027 (T018): memory read-side tests — pure prefix composition,
+/// the T016/T017 disabled gate, and the Completed-only episode capture.
+#[cfg(test)]
+mod hypercode_memory_tests {
+    use super::*;
+
+    /// Minimal TaskNode with a settable runtime status (mirrors mod
+    /// tests' status_node — TaskNode carries 14 fields).
+    fn memory_status_node(id: &str, status: TaskStatus) -> TaskNode {
+        TaskNode {
+            id: TaskId::new(id).unwrap(),
+            objective: format!("objective for {id}"),
+            dependencies: vec![],
+            read_set: vec![],
+            write_set: vec![std::path::PathBuf::from("src/a.rs")],
+            artifact_ids: vec![],
+            role: joey_orchestration::task_graph::WorkerRole::Implementor,
+            model_tier: joey_orchestration::task_graph::ModelTier::Economical,
+            risk: joey_orchestration::task_graph::RiskLevel::Low,
+            acceptance: vec![joey_orchestration::task_graph::AcceptanceCriterion {
+                criterion: "it works".to_string(),
+                kind: "manual".to_string(),
+            }],
+            verification: VerificationPlanView::default(),
+            isolation: IsolationMode::SharedCheckout,
+            status,
+            attempts: 0,
+        }
+    }
+
+    /// Minimal context mirroring mod tests' model_ctx —
+    /// open_memory_episode_store only reads config + cwd (full
+    /// construction is heavy; Config::defaults() leaves
+    /// `neurocode.memory.enabled` unset → disabled).
+    fn memory_ctx() -> HypercodeContext {
+        HypercodeContext {
+            agent_config: AgentConfig {
+                model: "config-raw-model".to_string(),
+                provider: "zai".to_string(),
+                base_url: String::new(),
+                api_key: None,
+                max_turns: 5,
+                api_max_retries: 1,
+                tool_delay: 0.0,
+                reasoning: None,
+                enabled_tools: Vec::new(),
+                max_tokens: None,
+                stream: false,
+                pass_session_id: false,
+                model_pinned: false,
+            },
+            config: joey_core::Config::defaults(),
+            base_registry: ToolRegistry::new(),
+            manager: Arc::new(SubagentManager::new(
+                joey_orchestration::ManagerConfig::default(),
+            )),
+            cwd: std::path::PathBuf::from("/tmp"),
+            parent_effective_model: None,
+            execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Non-empty prefs+eps ⇒ both memory sections present, with lessons
+    /// BEFORE the memory sections.
+    #[test]
+    fn goal_prefix_contains_memory_sections_when_enabled() {
+        let lessons =
+            "Verified lessons for this exact task signature (outcome memory):\n- l1\n\n";
+        let prefs = vec!["style: prefer small fns (explicit, confidence 90%)".to_string()];
+        let eps = vec!["refactor parser — success (2026-01-01): did the thing".to_string()];
+        let prefix = compose_memory_goal_prefix(Some(lessons), &prefs, &eps, 2048);
+        assert!(
+            prefix.contains("## Learned preferences"),
+            "prefs section present: {prefix}"
+        );
+        assert!(
+            prefix.contains("## Relevant past episodes"),
+            "episodes section present: {prefix}"
+        );
+        assert!(prefix.contains(lessons), "lessons preserved verbatim: {prefix}");
+        let lessons_pos = prefix.find("Verified lessons").unwrap();
+        let prefs_pos = prefix.find("## Learned preferences").unwrap();
+        let eps_pos = prefix.find("## Relevant past episodes").unwrap();
+        assert!(
+            lessons_pos < prefs_pos && prefs_pos < eps_pos,
+            "ordering lessons → prefs → episodes: {prefix}"
+        );
+    }
+
+    /// Empty prefs+eps ⇒ no memory headers; lessons still present.
+    #[test]
+    fn goal_prefix_omits_memory_when_empty() {
+        let lessons =
+            "Verified lessons for this exact task signature (outcome memory):\n- l1\n\n";
+        let prefix = compose_memory_goal_prefix(Some(lessons), &[], &[], 2048);
+        assert!(!prefix.contains("## Learned preferences"), "{prefix}");
+        assert!(!prefix.contains("## Relevant past episodes"), "{prefix}");
+        assert_eq!(prefix, lessons, "lessons-only prefix is byte-identical");
+        assert_eq!(
+            compose_memory_goal_prefix(None, &[], &[], 2048),
+            "",
+            "no lessons, no memory ⇒ empty prefix"
+        );
+    }
+
+    /// Small char budget ⇒ whole-entry truncation: the over-budget
+    /// entry's unique marker is absent and the block fits the budget.
+    #[test]
+    fn goal_prefix_respects_char_budget() {
+        let over_budget = format!("{} ZZUNIQUEMARKER {}", "x".repeat(400), "y".repeat(400));
+        let prefs = vec![
+            "style: prefer small fns (explicit, confidence 90%)".to_string(),
+            over_budget,
+        ];
+        let prefix = compose_memory_goal_prefix(None, &prefs, &[], 300);
+        assert!(
+            !prefix.contains("ZZUNIQUEMARKER"),
+            "over-budget entry dropped whole: {prefix}"
+        );
+        assert!(
+            prefix.len() <= 300,
+            "block within budget: {} chars: {prefix}",
+            prefix.len()
+        );
+        assert!(prefix.contains("prefer small fns"), "fitting entry kept: {prefix}");
+    }
+
+    /// T016 write side: only Completed nodes record episodes — one
+    /// Workstream/Hypercode episode with run-node evidence; Pending absent.
+    #[test]
+    fn graph_episodes_captured_only_for_completed_nodes() {
+        use joey_neurocode::memory::episodes::{EpisodeKind, EpisodeSource};
+
+        let store = joey_neurocode::memory::episodes::EpisodeStore::open_in_memory().unwrap();
+        let mut graph = TaskGraph::default();
+        graph.nodes.insert(
+            TaskId::new("task-done").unwrap(),
+            memory_status_node("task-done", TaskStatus::Completed),
+        );
+        graph.nodes.insert(
+            TaskId::new("task-pend").unwrap(),
+            memory_status_node("task-pend", TaskStatus::Pending),
+        );
+        assert_eq!(record_memory_episodes(&store, &graph, "run-m1"), 1);
+        let rows = store.list_recent(100).unwrap();
+        assert_eq!(rows.len(), 1, "exactly one episode for the Completed node");
+        assert_eq!(rows[0].kind, EpisodeKind::Workstream);
+        assert_eq!(rows[0].source, EpisodeSource::Hypercode);
+        assert_eq!(
+            rows[0].evidence_ids,
+            vec!["runs/run-m1/nodes/task-done.json".to_string()]
+        );
+        assert_ne!(rows[0].title, "objective for task-pend", "Pending node absent");
+    }
+
+    /// MemoryConfig disabled ⇒ no episode store (gate) AND empty memory
+    /// inputs ⇒ lessons-only prefix (the disabled regression).
+    #[test]
+    fn disabled_is_byte_identical() {
+        let ctx = memory_ctx(); // Config::defaults() — memory flag absent
+        assert!(
+            open_memory_episode_store(&ctx).is_none(),
+            "disabled MemoryConfig opens no episode store"
+        );
+        let lessons =
+            "Verified lessons for this exact task signature (outcome memory):\n- l1\n\n";
+        assert_eq!(
+            compose_memory_goal_prefix(Some(lessons), &[], &[], 2048),
+            lessons,
+            "empty memory inputs keep the lessons-only goal byte-identical"
+        );
+        assert_eq!(compose_memory_goal_prefix(None, &[], &[], 2048), "");
     }
 }

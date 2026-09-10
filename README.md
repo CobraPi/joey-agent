@@ -336,6 +336,11 @@ Available in the line REPL and the `--tui` dashboard. Bare `/neurocode` (or
 /neurocode domain remove <id>            Remove a domain source by its numeric id.
                                          (aliases: rm, delete)
 
+/neurocode memory <subcommand>           Inspect and manage adaptive memory
+                                         (feature 027, default-off). Grammar:
+                                         status, list, show, search, correct,
+                                         delete, enable, disable.
+
 /neurocode --help | help | -h            Usage summary.
 ```
 

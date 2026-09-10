@@ -321,6 +321,16 @@ pub(crate) fn build_agent_parts(
     // default-off gate preserves zero-change parity (FR-009).
     crate::neurocode_rag_wiring::install_rag_injections(&mut agent, config);
 
+    // Feature 027 (T012): production adaptive-memory runtime (capture/
+    // prefetch/distill adapters over the neurocode stores + rag memory
+    // helpers) when `neurocode.memory.enabled` — default off ⇒ no-op.
+    crate::neurocode_memory_wiring::install_memory_runtime(
+        &mut agent,
+        config,
+        cwd,
+        session_id,
+    );
+
     // Populate the OMO category resolver with the now-available provider
     // profile + active model (T057/T135). This enables category/subagent_type
     // delegation in the delegate_task tool.

@@ -16,6 +16,7 @@ mod history;
 mod hypercode;
 mod hypercode_gate;
 mod llm_selector;
+mod neurocode_memory_wiring;
 mod neurocode_rag_wiring;
 mod neurocode_wiring;
 mod slash_menu;

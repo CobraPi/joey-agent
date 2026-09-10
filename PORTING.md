@@ -1726,3 +1726,47 @@ deviation, see below).
 3. `__SPECKIT_COMMAND_*__` markers render to the slash form
    `/speckit-<name>` (single canonical form per FR-003's
    one-implementation rule).
+
+## NeuroCode Adaptive Memory (feature 027, 2026-09-10)
+
+**Status**: Deliberate-deviation subsystem (Joey-original, no upstream
+equivalent — this is a Joey-side extension, not upstream parity work;
+upstream Hermes has no episodic/semantic agent-memory surface).
+
+Joey-native long-lived memory layered on the existing per-project
+neurocode store (`specs/027-please-enhance-neurocode/`):
+
+- **Two-tier memory model** in the per-project `graph.db`: episodic
+  memory (`memory_episodes` — per-task execution records) and semantic
+  memory (`memory_preferences` — distilled, durable statements about the
+  project/user). Schema migrates additively v3→v4
+  (`NEUROCODE_SCHEMA_VERSION = 4`); v3 databases open unchanged and
+  simply gain the empty memory tables — keyword/graph/RAG behavior is
+  untouched until memory is enabled. No joey-core `state.db` /
+  SCHEMA_VERSION change.
+- **Retrieval reuses the RAG machinery**: `joey-neurocode-rag::memory_search`
+  rides the same hybrid-search pattern as code retrieval (similarity +
+  keyword legs over the memory tables, fused client-side).
+- **Turn-end capture + system-prompt injection via a MemoryRuntime
+  hook** (`joey-agent-core::memory_hook`): the turn loop captures a
+  `MemoryTurnSummary` at turn end and injects retrieved memories into
+  the effective system prompt (top-k preferences + relevant episodes,
+  capped by `neurocode.memory.injection_char_limit`). Learning is fully
+  automatic and ungated per the user's Q1 clarification — no approval
+  gate anywhere on the memory path.
+- **HyperCode read/write integration**: retrieved memory rides the
+  goal-prefix sections (alongside the existing lessons), and each
+  completed work unit records an episode.
+- **Command surface**: `/neurocode memory` (enable/disable/status)
+  per `contracts/neurocode-memory-command.md`.
+
+Config keys (additive, `RAG_CONFIG_KEYS` pattern):
+`neurocode.memory.enabled` (false), `.top_k` (5),
+`.injection_char_limit` (2048), `.max_episodes` (500, FIFO eviction),
+`.distill_model` ("" = NeuroCode economical tier) — full contract in
+`specs/027-please-enhance-neurocode/contracts/`
+`neurocode-memory-config-keys.md`.
+
+**Disabled state is byte-identical**: with
+`neurocode.memory.enabled = false` (the default) no turn is captured,
+nothing is injected, and prompts/behavior are unchanged.

@@ -100,6 +100,49 @@ fn split_expanded_feed(total: u16) -> (u16, u16) {
     (transcript, total - transcript)
 }
 
+/// Resolve the on-screen window (Rect) that contains the selection anchor
+/// cell, for clipping the text-selection overlay. Uses the hit-test rects
+/// the widgets record at render time — the same geometry mouse hit-testing
+/// trusts (`App::last_*_rect` cells). Pane windows are preferred while a
+/// subagent pane is focused (same precedence as mouse click hit-testing);
+/// the rail is always a candidate since it coexists with a focused pane.
+/// When no recorded window contains the anchor (header/status-bar drags,
+/// or the first frame before any widget recorded geometry), the full frame
+/// area is returned — so drags anchored outside every window keep the
+/// pre-fix behavior byte-for-byte.
+fn selection_window(app: &App, anchor: (u16, u16), pane_focused: bool, frame: Rect) -> Rect {
+    let (row, col) = anchor;
+    let contains = |r: Rect| {
+        row >= r.y && row < r.y + r.height && col >= r.x && col < r.x + r.width
+    };
+    let from_cell = |c: (u16, u16, u16, u16)| Rect::new(c.0, c.1, c.2, c.3);
+    if pane_focused {
+        for r in [
+            from_cell(app.last_pane_text_area.get()),
+            from_cell(app.last_pane_stats_rect.get()),
+            from_cell(app.last_subagent_rail_rect.get()),
+        ] {
+            if r.width > 0 && r.height > 0 && contains(r) {
+                return r;
+            }
+        }
+    }
+    for r in [
+        from_cell(app.last_text_area.get()),
+        from_cell(app.last_reasoning_rect.get()),
+        from_cell(app.last_stats_rect.get()),
+        from_cell(app.last_output_viewer_rect.get()),
+        from_cell(app.last_neurocode_rect.get()),
+        from_cell(app.last_hypercode_rect.get()),
+        from_cell(app.last_subagent_rail_rect.get()),
+    ] {
+        if r.width > 0 && r.height > 0 && contains(r) {
+            return r;
+        }
+    }
+    frame
+}
+
 /// Render the body region: transcript (left) + sidebar (right), including
 /// the NeuroCode expanded-mode takeover of the main area. Extracted from
 /// `Tui::draw` so tests can drive the REAL layout against a TestBackend
@@ -861,15 +904,32 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 let bottom = bottom.min(area.height.saturating_sub(1));
                 let right = right.min(area.width.saturating_sub(1));
                 if top <= bottom && left <= right {
+                    // Bounds fix: the selection lives inside ONE on-screen
+                    // window. Resolve the window containing the anchor cell
+                    // (range.0 is ALWAYS the press cell — handle_mouse_down
+                    // sets both ends to it and drag/up only ever replace the
+                    // head end) and clip each row's span, and the vertical
+                    // range, to that window. Without this, multi-line
+                    // selections painted middle rows across the FULL
+                    // terminal width — overflowing the transcript into the
+                    // rail, borders, and sidebar.
+                    let clip =
+                        selection_window(app, (r1, c1), app.focused_subagent.is_some(), area);
                     // Line-wise bounds: the first row starts at the press
-                    // column, the last row ends at the release column, rows in
-                    // between span the full width.
-                    let row_from = |row: u16| if row == top { left } else { 0 };
-                    let row_to =
-                        |row: u16| if row == bottom { right + 1 } else { area.width };
+                    // column, the last row ends at the release column, rows
+                    // in between span the window's full width.
+                    let row_from = |row: u16| {
+                        let start = if row == top { left } else { 0 };
+                        start.max(clip.x)
+                    };
+                    let row_to = |row: u16| {
+                        let end = if row == bottom { right + 1 } else { area.width };
+                        end.min(clip.x + clip.width)
+                    };
+                    let in_clip = |row: u16| clip.y <= row && row < clip.y + clip.height;
                     if selection.pending_copy {
                         let mut text = String::new();
-                        for row in top..=bottom {
+                        for row in (top..=bottom).filter(|row| in_clip(*row)) {
                             let buf = f.buffer_mut();
                             let mut line = String::new();
                             for col in row_from(row)..row_to(row) {
@@ -885,7 +945,8 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                         }
                         selection.pending_copy = false;
                         if !text.trim().is_empty() {
-                            *app.pending_selection_copy.borrow_mut() = Some(text);
+                            *app.pending_selection_copy.borrow_mut() =
+                                Some(text.trim_end_matches('\n').to_string());
                         }
                     }
                     // Highlight: brand-primary background with near-black
@@ -893,7 +954,7 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                     let hl = Style::default()
                         .bg(theme.primary.to_color())
                         .fg(theme.bg_void.to_color());
-                    for row in top..=bottom {
+                    for row in (top..=bottom).filter(|row| in_clip(*row)) {
                         for col in row_from(row)..row_to(row) {
                             f.buffer_mut()[(col, row)].set_style(hl);
                         }
@@ -6993,5 +7054,108 @@ mod text_selection_tests {
             crossterm::event::KeyCode::Esc,
         ));
         assert!(!t.has_selection(), "Esc cleared the selection");
+    }
+
+    /// Regression (highlight overflow): a multi-row drag inside the main
+    /// transcript window must not paint middle rows across the full
+    /// terminal width — cells beyond the window's right edge (sidebar /
+    /// borders) keep their background, and the anchor row still starts at
+    /// the press column.
+    #[test]
+    fn multi_row_selection_stays_inside_transcript_window() {
+        let mut t = tui();
+        t.draw().unwrap(); // records last_text_area
+        let (tx, ty, tw, th) = t.app.last_text_area.get();
+        assert!(tw >= 20 && th >= 6, "transcript window recorded: {tx},{ty} {tw}x{th}");
+        let row_mid = ty + 1;
+        let row_bottom = ty + 2;
+        t.handle_mouse_down(ty, tx + 2);
+        t.handle_mouse_drag(row_bottom, tx + 6);
+        let _ = t.handle_mouse_up(row_bottom, tx + 6);
+        t.draw().unwrap();
+        let buf = t.terminal.backend().0.buffer();
+        let brand = ratatui::style::Color::Rgb(0x22, 0xE4, 0xE8);
+        assert_eq!(
+            buf[(tx, row_mid)].bg,
+            brand,
+            "middle row highlighted from the window's left edge"
+        );
+        assert_ne!(
+            buf[(tx + tw, row_mid)].bg,
+            brand,
+            "highlight never crosses the window's right edge"
+        );
+        assert_eq!(
+            buf[(tx + 2, ty)].bg,
+            brand,
+            "anchor row starts at the press column"
+        );
+        assert_ne!(
+            buf[(tx + 1, ty)].bg,
+            brand,
+            "cell left of the press column stays unstyled"
+        );
+    }
+
+    /// Pane-focused drag clips to the PANE window: with a focused subagent
+    /// pane, a multi-row selection stays inside the pane's recorded text
+    /// area even though the main-transcript rect also exists.
+    #[test]
+    fn pane_focused_selection_clips_to_pane_window() {
+        let mut t = tui();
+        t.app.apply(joey_agent_core::AgentEvent::SubagentSpawn {
+            id: 7,
+            goal: "clip probe".into(),
+            model: "m".into(),
+            toolset_summary: "all".into(),
+            depth: 0,
+        });
+        t.app.focused_subagent = Some(0);
+        t.draw().unwrap(); // pane renders + records last_pane_text_area
+        let (px, py, pw, ph) = t.app.last_pane_text_area.get();
+        assert!(pw >= 20 && ph >= 6, "pane window recorded: {px},{py} {pw}x{ph}");
+        let row_mid = py + 1;
+        let row_bottom = py + 2;
+        t.handle_mouse_down(py, px + 2);
+        t.handle_mouse_drag(row_bottom, px + 6);
+        let _ = t.handle_mouse_up(row_bottom, px + 6);
+        t.draw().unwrap();
+        let buf = t.terminal.backend().0.buffer();
+        let brand = ratatui::style::Color::Rgb(0x22, 0xE4, 0xE8);
+        assert_eq!(
+            buf[(px, row_mid)].bg,
+            brand,
+            "pane middle row highlighted from the pane's left edge"
+        );
+        assert_ne!(
+            buf[(px + pw, row_mid)].bg,
+            brand,
+            "highlight never crosses the pane's right edge"
+        );
+    }
+
+    /// selection_window: containment resolution, pane preference, and the
+    /// full-frame fallback for anchors outside every recorded window.
+    #[test]
+    fn selection_window_resolves_and_falls_back() {
+        let app = App::new("s", "m");
+        let frame = ratatui::layout::Rect::new(0, 0, 100, 30);
+        // Nothing recorded (all cells (0,0,0,0)) → full-frame fallback.
+        assert_eq!(selection_window(&app, (0, 0), false, frame), frame);
+        // Recorded transcript window contains the anchor.
+        app.last_text_area.set((2, 3, 60, 20));
+        assert_eq!(
+            selection_window(&app, (5, 10), false, frame),
+            ratatui::layout::Rect::new(2, 3, 60, 20)
+        );
+        // Pane focused → the pane window wins for a cell inside BOTH the
+        // pane window and the main window.
+        app.last_pane_text_area.set((30, 3, 30, 20));
+        assert_eq!(
+            selection_window(&app, (5, 35), true, frame),
+            ratatui::layout::Rect::new(30, 3, 30, 20)
+        );
+        // Anchor outside every recorded window → frame fallback.
+        assert_eq!(selection_window(&app, (29, 10), true, frame), frame);
     }
 }

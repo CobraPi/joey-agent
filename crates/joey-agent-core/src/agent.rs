@@ -30,6 +30,7 @@ use rayon::prelude::*;
 
 use crate::compression::{self, ContextCompressor};
 use crate::events::AgentEvent;
+use crate::memory_hook;
 use crate::prompt::{build_system_prompt, PromptInputs};
 
 /// Mid-turn steer markers (upstream prompt_builder.py STEER_MARKER_OPEN/
@@ -613,6 +614,10 @@ pub struct Agent {
     /// run_turn start and whenever the gate closes. Never mutated after
     /// the request is built (T033).
     pub(crate) rag_prefetch_context: std::sync::Mutex<Option<String>>,
+    /// ── Feature 027 (adaptive memory) ──────────────────────────────
+    /// Memory runtime (T010). None ⇒ no injection and no capture ever
+    /// (the production implementation is wired in joey-cli, T012).
+    pub(crate) memory_runtime: Option<Arc<dyn memory_hook::MemoryRuntime>>,
 }
 
 impl Agent {
@@ -723,6 +728,7 @@ impl Agent {
             rag_refresh_phase: Arc::new(std::sync::Mutex::new(RagRefreshPhase::Idle)),
             rag_refresh_handle: std::sync::Mutex::new(None),
             rag_prefetch_context: std::sync::Mutex::new(None),
+            memory_runtime: None,
         })
     }
 
@@ -1077,6 +1083,34 @@ impl Agent {
                 }
             }
         }
+        // Feature 027 (adaptive memory): the bounded memory block for THIS
+        // turn — appended ONLY when `neurocode.memory.enabled` is set AND
+        // the installed runtime reports itself active (double gate; the
+        // key literal mirrors `joey_neurocode_rag::config::`
+        // `KEY_MEMORY_ENABLED` the same way rag_keys mirrors RAG_CONFIG_KEYS
+        // — a normal dependency is deliberately avoided, see rag_keys
+        // docs). None/empty block ⇒ nothing appended, prompt byte-identical.
+        if self.ctx.config().get_bool("neurocode.memory.enabled", false) {
+            if let Some(rt) = &self.memory_runtime {
+                if rt.enabled() {
+                    let prompt = self
+                        .history
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "user")
+                        .map(|m| m.text_content())
+                        .unwrap_or_default();
+                    if !prompt.trim().is_empty() {
+                        if let Some(block) = rt.prefetch_block(&prompt) {
+                            if !block.is_empty() {
+                                combined.push_str("\n\n");
+                                combined.push_str(&block);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         combined
     }
 
@@ -1132,6 +1166,82 @@ impl Agent {
         }
     }
 
+    /// Feature 027 (T011): post-turn adaptive-memory capture. Mirrors the
+    /// neurocode_auto_reindex precedent — called on every run_turn exit path,
+    /// gated, and never allowed to break the turn. The MemoryRuntime impl
+    /// does the real work off this thread (spawn internally per contract).
+    ///
+    /// Field sourcing is best-effort from the live transcript slice added
+    /// THIS turn (older turns live below `turn_start_idx`):
+    /// `user_prompt`/`assistant_final` reuse the t010 prefetch lookup style
+    /// (last user / assistant text message); `files_touched` extracts the
+    /// `path` argument from write-class tool calls (write_file/patch/
+    /// multi_edit/terminal per the tool registry naming); `tools_used` is
+    /// the distinct set of invoked tool names. turn_error is a per-site
+    /// literal (the call-site knows which exit path it is).
+    async fn neurocode_memory_capture(&self, turn_start_idx: usize, turn_error: bool) {
+        let Some(rt) = self.memory_runtime.as_ref() else {
+            return;
+        };
+        if !self.ctx.config().get_bool("neurocode.memory.enabled", false) {
+            return;
+        }
+        if !rt.enabled() {
+            return;
+        }
+        // Same lookup style as the t010 prefetch prompt: last user message
+        // text — but scoped to THIS turn's slice so multi-turn sessions
+        // capture the request that drove the episode being recorded.
+        let turn = &self.history[turn_start_idx.min(self.history.len())..];
+        let user_prompt = turn
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.text_content())
+            .unwrap_or_default();
+        let assistant_final = turn
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .map(|m| m.text_content())
+            .unwrap_or_default();
+        // Write-class tool names per the registry naming (write_file/patch/
+        // multi_edit file tools + terminal; multi_edit is the batch sibling
+        // of patch in the same toolset).
+        const WRITE_CLASS_TOOLS: [&str; 4] = ["write_file", "patch", "multi_edit", "terminal"];
+        let mut files_touched: Vec<String> = Vec::new();
+        let mut tools_used: Vec<String> = Vec::new();
+        for m in turn.iter() {
+            for tc in &m.tool_calls {
+                if !tools_used.contains(&tc.function.name) {
+                    tools_used.push(tc.function.name.clone());
+                }
+                if WRITE_CLASS_TOOLS.contains(&tc.function.name.as_str()) {
+                    // Best-effort path extraction from the JSON arguments
+                    // (write_file/patch/multi_edit take `path`; terminal has
+                    // none — command mutations surface via file_tracker
+                    // instead, which is not consulted here).
+                    if let Ok(args) = serde_json::from_str::<Value>(&tc.function.arguments) {
+                        if let Some(p) = args.get("path").and_then(Value::as_str) {
+                            if !p.is_empty() && !files_touched.contains(&p.to_string()) {
+                                files_touched.push(p.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let summary = memory_hook::MemoryTurnSummary {
+            user_prompt,
+            assistant_final,
+            files_touched,
+            tools_used,
+            turn_error,
+            session_key: self.session_id.clone().unwrap_or_default(),
+        };
+        rt.capture_turn(&summary);
+    }
+
     // ── Feature 021 (NeuroCode RAG): background refresh + pre-fetch ────
 
     /// Observable RAG refresh state for status reporting (T025/FR-004,
@@ -1160,6 +1270,20 @@ impl Agent {
     /// backend).
     pub fn set_rag_prefetch_source(&mut self, source: Option<Arc<dyn RagPrefetchSource>>) {
         self.rag_prefetch_source = source;
+    }
+
+    /// Install (or clear with `None`) the adaptive-memory runtime (feature
+    /// 027, T010 wiring — implemented in joey-cli, T012). The injection
+    /// append in `effective_system_prompt` consults it ONLY when
+    /// `neurocode.memory.enabled` is set AND the runtime reports itself
+    /// active (double gate).
+    pub fn set_memory_runtime(&mut self, rt: Option<Arc<dyn memory_hook::MemoryRuntime>>) {
+        self.memory_runtime = rt;
+    }
+
+    /// The installed adaptive-memory runtime, if any (feature 027).
+    pub fn memory_runtime(&self) -> Option<&Arc<dyn memory_hook::MemoryRuntime>> {
+        self.memory_runtime.as_ref()
     }
 
     /// The pre-fetch block injected into the current turn's context, if
@@ -2676,6 +2800,12 @@ impl Agent {
             self.push_message(Message::user(notice), None);
         }
 
+        // Feature 027 (T011): transcript slice boundary — marks the start
+        // of THIS turn's transcript INCLUDING the user message, so every
+        // exit path can summarize exactly this turn's messages/tool calls
+        // (neurocode_memory_capture reads the slice from this index).
+        let turn_start_idx = self.history.len();
+
         self.push_message(self.take_pending_images_into(user_input), None);
 
         // Live context view: baseline snapshot with the user turn appended.
@@ -2703,6 +2833,7 @@ impl Agent {
                 // trigger must read the pre-reindex tracker state.
                 self.rag_auto_refresh();
                 self.neurocode_auto_reindex(&tx).await;
+                self.neurocode_memory_capture(turn_start_idx, true).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: final_text.clone(),
                     usage: total_usage.clone(),
@@ -2799,6 +2930,7 @@ impl Agent {
                     self.close_interrupted_tool_sequence(&text);
                     self.rag_auto_refresh();
                     self.neurocode_auto_reindex(&tx).await;
+                    self.neurocode_memory_capture(turn_start_idx, true).await;
                     let _ = tx.send(AgentEvent::Done {
                         final_text: text.clone(),
                         usage: total_usage.clone(),
@@ -2813,6 +2945,7 @@ impl Agent {
                     self.push_message(Message::assistant(err.clone()), None);
                     self.rag_auto_refresh();
                     self.neurocode_auto_reindex(&tx).await;
+                    self.neurocode_memory_capture(turn_start_idx, true).await;
                     let _ = tx.send(AgentEvent::Failed(err));
                     return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: true, fatal_provider_error: true };
                 }
@@ -2987,6 +3120,7 @@ impl Agent {
                     self.close_interrupted_tool_sequence("");
                     self.rag_auto_refresh();
                     self.neurocode_auto_reindex(&tx).await;
+                    self.neurocode_memory_capture(turn_start_idx, true).await;
                     let _ = tx.send(AgentEvent::Done {
                         final_text: final_text.clone(),
                         usage: total_usage.clone(),
@@ -3061,6 +3195,7 @@ impl Agent {
                 ));
                 self.rag_auto_refresh();
                 self.neurocode_auto_reindex(&tx).await;
+                self.neurocode_memory_capture(turn_start_idx, false).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: partial.clone(),
                     usage: total_usage.clone(),
@@ -3127,6 +3262,7 @@ impl Agent {
                 final_text = "(empty)".to_string();
                 self.rag_auto_refresh();
                 self.neurocode_auto_reindex(&tx).await;
+                self.neurocode_memory_capture(turn_start_idx, true).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: final_text.clone(),
                     usage: total_usage.clone(),
@@ -3144,6 +3280,7 @@ impl Agent {
             self.emit_context_snapshot(&tx);
             self.rag_auto_refresh();
             self.neurocode_auto_reindex(&tx).await;
+            self.neurocode_memory_capture(turn_start_idx, false).await;
             let _ = tx.send(AgentEvent::Done {
                 final_text: final_text.clone(),
                 usage: total_usage.clone(),
@@ -3196,6 +3333,7 @@ impl Agent {
             self.close_interrupted_tool_sequence(&text);
             self.rag_auto_refresh();
             self.neurocode_auto_reindex(&tx).await;
+            self.neurocode_memory_capture(turn_start_idx, true).await;
             let _ = tx.send(AgentEvent::Done {
                 final_text: text.clone(),
                 usage: total_usage.clone(),
@@ -3210,6 +3348,7 @@ impl Agent {
         }
         self.rag_auto_refresh();
         self.neurocode_auto_reindex(&tx).await;
+        self.neurocode_memory_capture(turn_start_idx, false).await;
         let _ = tx.send(AgentEvent::AssistantMessage(summary.clone()));
         let _ = tx.send(AgentEvent::Done {
             final_text: summary.clone(),
@@ -7277,6 +7416,199 @@ mod tests {
                 "context must be byte-identical with pre-fetch off ({yaml:?})"
             );
         }
+        let _ = guard;
+    }
+
+    // ── Feature 027 (adaptive memory) tests — T011/T013 ────────────────
+
+    /// A recording MemoryRuntime: enabled, prefetch returns None, capture
+    /// clones every summary into a shared vec.
+    struct RecordingMemoryRuntime {
+        captured: Arc<Mutex<Vec<memory_hook::MemoryTurnSummary>>>,
+    }
+
+    impl memory_hook::MemoryRuntime for RecordingMemoryRuntime {
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn prefetch_block(&self, _prompt: &str) -> Option<String> {
+            None
+        }
+        fn capture_turn(&self, summary: &memory_hook::MemoryTurnSummary) {
+            self.captured.lock().unwrap().push(summary.clone());
+        }
+    }
+
+    /// T011: the success-exit path (plain final answer, no tool calls)
+    /// hands the memory runtime exactly ONE MemoryTurnSummary with
+    /// turn_error == false, the turn's user prompt, and a non-empty
+    /// assistant final.
+    #[tokio::test]
+    async fn capture_called_on_success_exit() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let config = rag_yaml_config(
+            home.path(),
+            "neurocode:\n  memory:\n    enabled: true\n",
+        );
+        let (mut agent, _transport) = rag_agent_at(
+            home.path(),
+            cwd.path(),
+            config,
+            vec![Ok(text_resp("all done, shipped it"))],
+        );
+        let captured: Arc<Mutex<Vec<memory_hook::MemoryTurnSummary>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        agent.set_memory_runtime(Some(Arc::new(RecordingMemoryRuntime {
+            captured: captured.clone(),
+        })));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = agent.run_turn("please fix the flaky test", tx).await;
+        assert_eq!(result.final_text, "all done, shipped it");
+        let summaries = captured.lock().unwrap().clone();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "exactly one capture on the success exit"
+        );
+        let s = &summaries[0];
+        assert!(!s.turn_error, "success exit reports turn_error == false");
+        assert!(
+            s.user_prompt.contains("please fix the flaky test"),
+            "user_prompt carries the turn's request: {:?}",
+            s.user_prompt
+        );
+        assert!(
+            !s.assistant_final.is_empty(),
+            "assistant_final is non-empty: {:?}",
+            s.assistant_final
+        );
+        let _ = guard;
+    }
+
+    /// T015: transport that sets the agent's cooperative interrupt flag and
+    /// then fails the provider call — Ctrl-C landing during the first API
+    /// request (the `SummaryInterruptTransport` pattern, wired to a
+    /// memory-enabled fixture).
+    struct InterruptingErrorTransport {
+        slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    }
+
+    #[async_trait]
+    impl Transport for InterruptingErrorTransport {
+        async fn complete(&self, _req: &ProviderRequest) -> Result<NormalizedResponse, ProviderError> {
+            if let Some(flag) = self.slot.lock().unwrap().as_ref() {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Err(ProviderError::ServerError("ctrl-c during request".to_string()))
+        }
+        async fn stream(
+            &self,
+            req: &ProviderRequest,
+            _tx: mpsc::UnboundedSender<StreamEvent>,
+        ) -> Result<NormalizedResponse, ProviderError> {
+            self.complete(req).await
+        }
+    }
+
+    /// T015: a turn that ends INTERRUPTED (interrupt flag set during the
+    /// provider call — `TurnAbort::Interrupted`) still hands the memory
+    /// runtime exactly ONE summary, flagged turn_error == true.
+    #[tokio::test]
+    async fn capture_flags_interrupted_exit_as_error() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let config = rag_yaml_config(
+            home.path(),
+            "neurocode:\n  memory:\n    enabled: true\n",
+        );
+        let (mut agent, _transport) = rag_agent_at(home.path(), cwd.path(), config, vec![]);
+        let captured: Arc<Mutex<Vec<memory_hook::MemoryTurnSummary>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        agent.set_memory_runtime(Some(Arc::new(RecordingMemoryRuntime {
+            captured: captured.clone(),
+        })));
+        // Wire the interrupt-setting transport to the agent's real handle.
+        let slot: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+        let transport = Arc::new(InterruptingErrorTransport { slot: slot.clone() });
+        agent.set_transport_for_tests(transport);
+        *slot.lock().unwrap() = Some(agent.interrupt_handle());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = agent.run_turn("please fix the flaky test", tx).await;
+        assert!(result.interrupted, "turn must surface as interrupted");
+        assert!(!result.fatal, "interrupt is not a fatal provider error");
+        let summaries = captured.lock().unwrap().clone();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "exactly one capture on the interrupted exit"
+        );
+        assert!(
+            summaries[0].turn_error,
+            "interrupted exit reports turn_error == true"
+        );
+        let _ = guard;
+    }
+
+    /// T015: a turn with one write-class tool round (a `write_file` call
+    /// carrying a `path` argument) followed by a plain final answer captures
+    /// that path in files_touched and the tool name in tools_used.
+    #[tokio::test]
+    async fn capture_collects_files_touched_from_write_tools() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let config = rag_yaml_config(
+            home.path(),
+            "neurocode:\n  memory:\n    enabled: true\n",
+        );
+        let (mut agent, _transport) = rag_agent_at(
+            home.path(),
+            cwd.path(),
+            config,
+            vec![
+                Ok(tool_resp(
+                    vec![ToolCall::new(
+                        "c1",
+                        "write_file",
+                        r#"{"path":"/tmp/t015-demo.rs"}"#,
+                    )],
+                    FinishReason::ToolCalls,
+                )),
+                Ok(text_resp("wrote the file, all good")),
+            ],
+        );
+        let captured: Arc<Mutex<Vec<memory_hook::MemoryTurnSummary>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        agent.set_memory_runtime(Some(Arc::new(RecordingMemoryRuntime {
+            captured: captured.clone(),
+        })));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = agent.run_turn("write the demo file", tx).await;
+        assert_eq!(result.final_text, "wrote the file, all good");
+        let summaries = captured.lock().unwrap().clone();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "exactly one capture after the final answer"
+        );
+        let s = &summaries[0];
+        assert_eq!(
+            s.files_touched,
+            vec!["/tmp/t015-demo.rs".to_string()],
+            "files_touched contains exactly the write_file path: {:?}",
+            s.files_touched
+        );
+        assert!(
+            s.tools_used.contains(&"write_file".to_string()),
+            "tools_used contains the tool name: {:?}",
+            s.tools_used
+        );
         let _ = guard;
     }
 

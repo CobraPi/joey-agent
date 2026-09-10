@@ -15,6 +15,7 @@ pub mod guidance;
 pub mod hooks;
 pub mod image_model;
 pub mod loop_detection;
+pub mod memory_hook;
 pub mod prompt;
 pub mod threat_scan;
 pub mod verification;
@@ -24,6 +25,7 @@ pub use compression::ContextCompressor;
 pub use events::AgentEvent;
 pub use hooks::PreToolUseRunner;
 pub use loop_detection::LoopDetector;
+pub use memory_hook::{MemoryRuntime, MemoryTurnSummary};
 pub use prompt::{build_system_prompt, PromptInputs};
 
 /// Serializes tests that override the process-global joey home.

@@ -274,6 +274,40 @@ Memory (`memory/`):
 - **Outcome memory** (`outcomes.rs`): verified completions feed lessons back
   into task context (`TaskContext.lessons`).
 
+## Adaptive memory (feature 027)
+
+Spec 027 layers an **episodic + semantic adaptive memory** over the structural
+graph and the RAG index: completed turns are captured as episodes, distilled
+into durable semantic preferences, and the most relevant memories are injected
+into later turns as a compact block beside the RAG prefetch. The whole feature
+is default-off (`neurocode.memory.enabled = false`); a disabled session
+behaves exactly as before.
+
+- **Episodic + semantic model**: `memory_episodes` records what happened —
+  one episode per completed turn, captured at turn end on both success and
+  error exits (hypercode goal-prefix sections and each completed plan unit
+  get their own episodes). `memory_preferences` holds the distilled durable
+  facts. Both, plus `memory_vectors` for semantic recall, are schema-v4
+  tables in the same per-project `graph.db` (see
+  [On-disk store](#on-disk-store)).
+- **Distillation**: episodes condense into preferences via a deterministic
+  heuristic; setting `neurocode.memory.distill_model` to a provider model
+  switches distillation to provider-assisted.
+- **Injection**: retrieval is bounded per section by
+  `neurocode.memory.top_k` (5) and the whole block by
+  `neurocode.memory.injection_char_limit` (2048); the episode store is
+  capped at `neurocode.memory.max_episodes` (500, oldest evicted first).
+  The block renders beside the RAG prefetch, never replacing it.
+- **Sanitization choke point**: captured and injected memory text passes
+  the same untrusted-content sanitization/threat-scan layers as every other
+  external input before it reaches the model.
+- **Command surface**: `/neurocode memory` inspects and manages the store —
+  grammar `status | list | show | search | correct | delete | enable |
+  disable` (see [joey-cli.md](joey-cli.md)).
+
+The retrieval leg reuses the RAG embedding machinery — see
+[joey-neurocode-rag.md](joey-neurocode-rag.md).
+
 ## Verification loop
 
 Config (`verify.steps[]`, each `{ name, command, parse = "plain",

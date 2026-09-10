@@ -219,6 +219,15 @@ persisted task lists.
 `.ambiguous_default`, `neurocode.verify.max_fix_iterations`,
 `neurocode.pega.version`.
 
+**neurocode.memory** (feature 027, off by default):
+`neurocode.memory.enabled` (false) — master switch; disabled sessions are
+byte-identical to pre-027 behavior. `neurocode.memory.top_k` (5) —
+retrieved memories per injected section.
+`neurocode.memory.injection_char_limit` (2048) — character cap on the
+injected memory block. `neurocode.memory.max_episodes` (500) — episode
+store cap, oldest evicted first. `neurocode.memory.distill_model` ("") —
+provider model for episode distillation; empty = heuristic-only.
+
 ### GitHub Copilot embeddings (explicit backend)
 
 Copilot embeddings are enabled only by setting
