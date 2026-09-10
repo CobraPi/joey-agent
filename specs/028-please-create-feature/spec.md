@@ -8,6 +8,12 @@
 
 **Input**: User description: "please create this feature - make sure to enable all the new features by default" — building on the user's detailed context-economy request: the practical goal is functional losslessness — everything needed stays reachable, not necessarily resident; context is treated as a small working set with pointers, not a complete record. Six techniques: (1) externalize state aggressively, with findings written to a scratchpad as they are discovered so later cleanup is safe; (2) ruthless tool-output management (relevant fields only, pagination, one-line summaries after processing, deduplication); (3) sub-agents for context isolation returning distilled conclusions; (4) compaction with structured summaries that preserve decisions, exact IDs/paths/values, constraints, and open questions, keeping recent turns verbatim and never dropping the current task; (5) a pinned, deterministically-maintained current-state block; (6) just-in-time retrieval with verification rather than silent retrieval misses. Smaller wins: concise-output instruction, pointer citation over content pasting. Pitfalls to mitigate: lossy summaries, broken references to pruned content (stable markers plus re-fetch), cache-invalidation cost of deletion (compact at natural boundaries, not continuously), and attention degradation in over-long contexts.
 
+## Clarifications
+
+### Session 2026-09-10
+
+- Q: What happens to scratchpad content when its session ends? → A: Kept on disk after session end; discoverable via existing session search; cleaned only by existing retention policies (no new retention machinery).
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Details Survive Context Cleanups (Priority: P1)
@@ -131,7 +137,7 @@ All mechanisms ship enabled by default. Each is independently disableable throug
 
 ### Functional Requirements
 
-- **FR-001**: System MUST provide a session-scoped scratchpad the assistant can append findings to and read back on demand, kept outside the conversation so its content survives context cleanup; it MUST be enabled by default with a disable switch.
+- **FR-001**: System MUST provide a session-scoped scratchpad the assistant can append findings to and read back on demand, kept outside the conversation so its content survives context cleanup; scratchpad content MUST persist after the session ends, remain discoverable through existing session search, and be cleaned only by existing retention policies; it MUST be enabled by default with a disable switch.
 - **FR-002**: System MUST redact secrets and credentials from scratchpad content before persisting it.
 - **FR-003**: System MUST bound scratchpad entry size, rejecting oversized entries with actionable guidance to summarize.
 - **FR-004**: System MUST maintain a deterministic current-state block — task-list status, pointers to key external references, and progress — presented to the assistant each turn, bounded in size, produced by fixed rules rather than model recollection; enabled by default with a disable switch; omitted entirely when there is nothing to show.
@@ -148,7 +154,7 @@ All mechanisms ship enabled by default. Each is independently disableable throug
 
 ### Key Entities *(include if feature involves data)*
 
-- **Scratchpad**: Session-scoped external record of findings (paths, identifiers, values, decisions) appendable and re-readable by the assistant; survives context cleanup; secrets redacted on write.
+- **Scratchpad**: Session-scoped external record of findings (paths, identifiers, values, decisions) appendable and re-readable by the assistant; survives context cleanup and persists beyond its session, discoverable via existing session search; secrets redacted on write.
 - **State Block**: Rule-rendered, size-bounded current-state section (task status, reference pointers, progress) shown to the assistant each turn; never persisted to the conversation record; absent when empty.
 - **Condensed Tool Result**: One-line replacement for an already-processed tool result, carrying a stable marker showing where the detail went and how to re-fetch it.
 - **Boundary Cleanup**: A cleanup event executed once at a task boundary (complete or empty task list) when usage exceeds the boundary threshold; coexists with the pressure-based backstop via a shared attempt/cooldown budget.
@@ -168,7 +174,7 @@ All mechanisms ship enabled by default. Each is independently disableable throug
 ## Assumptions
 
 - "Enable all the new features by default" means every mechanism in this spec is active on a fresh installation after upgrade, requiring no user action; existing sessions and records remain valid without migration.
-- The scratchpad is session-scoped in this version; cross-session and per-project scoping are future options, and existing cross-session search remains the mechanism for recalling older work.
+- The scratchpad is scoped per session for writing (each session keeps its own); its content persists on disk after the session ends, is recallable through existing session search, and is cleaned only by existing retention policies — no new retention machinery; cross-session and per-project sharing are future options.
 - Disable switches use the existing configuration surface (no new settings interface); per-mechanism switches are additive configuration, not renames of existing options.
 - Existing cleanup machinery (structured summarization template, protected windows, failure cooldowns, attempt caps) is extended rather than replaced; its current protections are treated as non-regression requirements.
 - Existing delegation and sub-agent machinery already returns distilled summaries; this feature preserves and reinforces it rather than rebuilding it.
