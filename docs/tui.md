@@ -290,7 +290,7 @@ helpers the main view uses (`parity by construction`):
   `pbcopy` / `xclip -selection clipboard` / `wl-copy`, falling back to
   an OSC 52 escape sequence; a `✓ Copied N chars` transcript notice (or
   error) confirms. Out-of-range pane/index is a safe no-op.
-- **Mouse drag-select** — press and drag the left button across ANY on-screen text (transcript, panes, stats page, popups, status bar); release to copy the highlighted selection to the system clipboard (✓ notice confirms). Esc or a new press clears the highlight. A plain click (press + release on the same cell) still performs the click action; only a drag selects.
+- **Mouse drag-select** — press and drag the left button across ANY on-screen text (transcript, panes, stats page, popups, status bar); release to copy the highlighted selection to the system clipboard (✓ notice confirms). Esc or a new press clears the highlight. A plain click (press + release on the same cell) still performs the click action; only a drag selects. Multi-line selections stay bounded to the window the drag started in (transcript, pane, stats page, output viewer) — the highlight never spills across the rail, borders, or sidebar.
 - **Search** — **Ctrl+S** (input focus) or **/** (transcript focus)
   opens the search bar over the pane; typing runs live, **Enter** jumps
   to the first (newest) match, **n / N** walk matches with wrap-around.

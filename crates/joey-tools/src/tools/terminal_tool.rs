@@ -2152,10 +2152,10 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
         let marker_str = marker.to_str().unwrap().to_string();
 
-        // Wrapper (direct child) backgrounds a grandchild that sleeps 2s
+        // Wrapper (direct child) backgrounds a grandchild that sleeps 4s
         // then touches the marker, then the wrapper itself sleeps long.
         let cmd = format!(
-            "( sleep 2; touch {m} ) & disown -a; sleep 30",
+            "( sleep 4; touch {m} ) & disown -a; sleep 30",
             m = marker_str
         );
 
@@ -2171,8 +2171,8 @@ mod tests {
         let _ = setter.await;
         assert_eq!(v["exit_code"], 124, "interrupted command reports 124: {v}");
 
-        // If the grandchild wrongly survived, it touches the marker at ~2s.
-        tokio::time::sleep(Duration::from_millis(2600)).await;
+        // If the grandchild wrongly survived, it touches the marker at ~4s.
+        tokio::time::sleep(Duration::from_millis(5200)).await;
         assert!(
             !marker.exists(),
             "grandchild must be killed by the process-group kill"

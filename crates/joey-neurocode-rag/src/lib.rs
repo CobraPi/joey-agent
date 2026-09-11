@@ -28,6 +28,7 @@
 
 pub mod config;
 pub mod consent;
+pub mod memory_search;
 pub mod parity;
 
 // T010: `embed` grew a real mod.rs (trait + registry + auto resolution) —

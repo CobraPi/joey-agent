@@ -498,12 +498,6 @@ pub struct SubagentManager {
     /// TUI startup order — starved). Shared via `Arc` with the transient
     /// per-child managers so batch/background children feed it too.
     recorder_tap: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<AgentEvent>>>>,
-    /// Feature 015 (hypercode cascade): the parent session's NeuroCode
-    /// engine, shared BY REFERENCE so the transient per-child managers a
-    /// batch/background dispatch creates all read the latest install.
-    /// Children reuse the SAME graph.db (FR-021: open, never re-index).
-    neurocode_engine:
-        Arc<std::sync::Mutex<Option<Arc<dyn joey_neurocode::NeuroCodeEngine>>>>,
     /// CHILD REGISTRY (feature 020, T004): live children keyed by the
     /// global child id (each with PER-CHILD interrupt/steer handles so
     /// `stop_child`/`steer_child` act on exactly one child) plus the
@@ -571,7 +565,6 @@ impl SubagentManager {
             interrupt: Arc::new(AtomicBool::new(false)),
             event_tap: std::sync::Mutex::new(None),
             recorder_tap: Arc::new(std::sync::Mutex::new(None)),
-            neurocode_engine: Arc::new(std::sync::Mutex::new(None)),
             registry: Arc::new(ChildRegistry::default()),
             child_pool_owner: true,
         }
@@ -599,19 +592,6 @@ impl SubagentManager {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         local.or_else(crate::tap::global_tap)
-    }
-
-    /// Feature 015 (hypercode cascade): install the parent session's
-    /// NeuroCode engine so dispatched children share the SAME graph.db
-    /// (FR-021) and each child's request intercept assembles a
-    /// task-targeted NeuroCode Context into its system prompt.
-    pub fn set_neurocode_engine(&self, engine: Arc<dyn joey_neurocode::NeuroCodeEngine>) {
-        *self.neurocode_engine.lock().unwrap_or_else(|p| p.into_inner()) = Some(engine);
-    }
-
-    /// The installed NeuroCode engine, if any (feature 015 cascade).
-    pub fn neurocode_engine(&self) -> Option<Arc<dyn joey_neurocode::NeuroCodeEngine>> {
-        self.neurocode_engine.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Install the SECONDARY recorder tap (feature 020, T029): an internal
@@ -730,10 +710,6 @@ impl SubagentManager {
             // T029: the recorder tap is manager state shared by reference —
             // transient children keep feeding the same recorder channel.
             recorder_tap: self.recorder_tap.clone(),
-            // Feature 015 (hypercode cascade): the parent session's engine
-            // slot is shared by reference — transient children see the
-            // latest install and reuse the SAME graph.db (FR-021).
-            neurocode_engine: self.neurocode_engine.clone(),
         }
     }
 
@@ -1135,15 +1111,6 @@ impl SubagentManager {
             }
         };
 
-        // Feature 015 (hypercode cascade, FR-021): share the parent
-        // session's NeuroCode engine with the child. The child opens the
-        // SAME graph.db (no re-indexing) and its per-request intercept
-        // assembles a task-targeted NeuroCode Context into its system
-        // prompt, so subagents start with the code map in hand.
-        if let Some(engine) = self.neurocode_engine() {
-            subagent.agent.set_neurocode_engine(engine);
-        }
-
         // T004/T005: register the child with PER-CHILD interrupt + steer
         // handles, and switch its provider-permit source to the CHILD pool
         // (the parent pool keeps its reserved share free — SC-007). Pool
@@ -1497,9 +1464,6 @@ impl SubagentManager {
         // the shared slot by Arc so children installed after this snapshot
         // (e.g. a recorder attached later) are still seen.
         let recorder = self.recorder_tap.clone();
-        // Feature 015 (hypercode cascade): the shared engine slot — children
-        // read the latest install at dispatch time (FR-021).
-        let engine_slot = self.neurocode_engine.clone();
         // T005: children are about to run — start the grant-back watcher
         // (no-op when already spawned or the reservation is disabled).
         if !requests.is_empty() {
@@ -1533,7 +1497,6 @@ impl SubagentManager {
             let interrupt = self.interrupt.clone();
             let tap = tap.clone();
             let recorder = recorder.clone();
-            let engine_slot = engine_slot.clone();
             let slots = slots.clone();
             // Allocate the child's stable id from the PARENT manager's
             // counter so ids are unique + monotonic across the whole
@@ -1568,10 +1531,6 @@ impl SubagentManager {
                     // T029: shared by reference with the parent manager —
                     // batch children feed the recorder alongside the tap.
                     recorder_tap: recorder.clone(),
-                    // Feature 015 (hypercode cascade): shared by
-                    // reference — batch children reuse the SAME
-                    // graph.db (FR-021).
-                    neurocode_engine: engine_slot.clone(),
                 };
                 let result = mgr
                     .dispatch_single_with_overrides(

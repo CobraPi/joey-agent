@@ -35,6 +35,26 @@ pub use types::{
     StopReason, SubagentRole, TaskSpec, WorkHandle,
 };
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// HyperCode orchestrator session gate: when set, delegate_task only
+/// accepts HyperCode role routing (explorer/implementor). Named-agent
+/// (subagent_type), category, and load_skills delegation are rejected,
+/// and the tool schema omits those parameters. Restricts ONLY the
+/// main orchestrator session's tool instance — children and normal
+/// sessions never set it.
+static ORCHESTRATOR_ROLES_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Set the HyperCode orchestrator roles-only gate (user requirement:
+/// "Enforce explorer/implementor-only delegation in delegate_task for
+/// HyperCode orchestrator sessions"). Called by the CLI layer at agent
+/// build time and on the /hypercode toggle; children and normal sessions
+/// never set it.
+pub fn set_orchestrator_roles_only(on: bool) { ORCHESTRATOR_ROLES_ONLY.store(on, Ordering::SeqCst); }
+
+/// Read the HyperCode orchestrator roles-only gate.
+pub fn orchestrator_roles_only() -> bool { ORCHESTRATOR_ROLES_ONLY.load(Ordering::SeqCst) }
+
 /// Result of resolving a category or subagent_type to its model + prompt_append.
 /// Returned by the CategoryResolver trait so joey-orchestration can resolve
 /// OMO categories without depending on joey-omo (avoids circular dependency).

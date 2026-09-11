@@ -71,4 +71,9 @@ pub use verification_plan::{VerificationPlan, VerificationStep};
 /// (contracts/rag-store-schema.md). v2 databases migrate in place on open
 /// and simply gain empty RAG tables; keyword/graph behavior is unchanged
 /// until RAG is enabled.
-pub const NEUROCODE_SCHEMA_VERSION: u32 = 3;
+/// v4: additive memory tables (`memory_episodes`, `memory_preferences`,
+/// `memory_vectors`) per feature 027, spec
+/// `specs/027-please-enhance-neurocode` (contracts/neurocode-memory-storage.md).
+/// v3 databases migrate in place on open and simply gain empty memory
+/// tables; graph/RAG behavior is unchanged.
+pub const NEUROCODE_SCHEMA_VERSION: u32 = 4;

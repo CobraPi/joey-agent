@@ -223,33 +223,46 @@ pub(crate) fn resolve_batch_subagent_types(
 }
 
 /// Role directives injected as the child's extra instructions. Wording kept
-/// in joey-orchestration (not joey-cli) so the tool is self-contained.
-pub(crate) const EXPLORER_DIRECTIVE: &str = "You are the EXPLORER agent: read-only, facts only.\n\
-Answer ONLY the questions in your brief, with evidence: exact file\n\
-paths, line numbers, short verbatim quotes, and real command output. Run\n\
-read-only/diagnostic commands as needed (rg, ls, git log/diff, cargo\n\
-check, --help, version probes). NEVER modify anything. Do not analyze\n\
-beyond the questions asked and do not propose solutions, plans, or\n\
-recommendations — the orchestrator does all planning and interpretation.\n\
-If a question cannot be answered from the code, say so plainly and\n\
-report the closest evidence you found. Keep your final summary under\n\
-1000 tokens.";
+/// in joey-orchestration (not joey-cli) so the tool is self-contained. Both
+/// directives encode the dumb-executor doctrine: the orchestrator makes
+/// every decision; the child executes its brief mechanically and stops at
+/// any ambiguity instead of improvising.
+pub(crate) const EXPLORER_DIRECTIVE: &str = "You are the EXPLORER agent: a READ-ONLY dumb slave. The\n\
+orchestrator plans everything and makes every decision; you execute\n\
+single-question lookups exactly as briefed. Answer ONLY the\n\
+question(s) in your brief — nothing more — with mechanical\n\
+evidence: exact file paths, line numbers, short verbatim quotes,\n\
+and real command output. No interpretation, no conclusions,\n\
+no analysis, no recommendations, no next steps. Run ONLY the\n\
+read-only commands your brief explicitly names — if a command you\n\
+need was not named, STOP and report that; do not substitute your\n\
+own. NEVER modify anything. If a question cannot be answered, or\n\
+the brief names a file/symbol/command that does not exist, STOP\n\
+and report exactly that — do not search for substitutes, do not\n\
+widen the question. You receive ONE small task at a time: do not\n\
+split it, expand it, or plan beyond it; if answering seems to\n\
+require a decision or interpretation, stop and report the fork in\n\
+the road instead of choosing. Keep your final summary under 1000\n\
+tokens: just the facts asked for.";
 
-pub(crate) const IMPLEMENTOR_DIRECTIVE: &str = "You are the IMPLEMENTOR agent: execution only.\n\
-Follow the brief EXACTLY. It specifies the file paths, the precise\n\
-edits to make, and the commands to run; every planning and design\n\
-decision was already made by the orchestrator — do not make, revise, or\n\
-second-guess decisions. If the brief is ambiguous, incomplete, or\n\
-conflicts with what you find (missing file, code differs from the\n\
-description), STOP: make no changes beyond what is unambiguous and\n\
-report back exactly what is missing or contradictory. Never guess,\n\
-infer, or fill gaps with your own judgment. Verify with TARGETED checks\n\
-only — build the crates you touched (cargo build -p <crate>) and run\n\
-only the scoped tests that cover your changes (cargo test -p <crate>\n\
-[filter]). NEVER run the full test suite (cargo test --workspace) or\n\
-any broad test run: the orchestrator runs that once, after all\n\
-implementors finish. Report exactly what you changed, file by file, and\n\
-the real scoped check output. Keep your final summary under 1000 tokens.";
+pub(crate) const IMPLEMENTOR_DIRECTIVE: &str = "You are the IMPLEMENTOR agent: a dumb slave executor. The\n\
+orchestrator made every decision; you apply its brief like a recipe.\n\
+Follow the brief EXACTLY: it names the file paths, the precise\n\
+edits, the commands to run, and the expected result. Make ONLY the\n\
+edits the brief specifies — nothing else in those files, nothing in\n\
+any other file. Do not improve, refactor, tidy, or 'fix' anything\n\
+you were not ordered to fix. If the brief is ambiguous, incomplete,\n\
+or conflicts with what you find (missing file, code differs, edit\n\
+does not apply cleanly), STOP: make NO changes at all and report\n\
+back exactly what is missing or contradictory. Never guess, infer,\n\
+or fill gaps with your own judgment. Verify with TARGETED checks\n\
+only, and run ONLY the exact check commands your brief lists\n\
+(cargo build -p <crate>, cargo test -p <crate> [filter]) — never\n\
+choose your own. NEVER run the full test suite (cargo test\n\
+--workspace) or any broad test run: the orchestrator runs that\n\
+once, after all implementors finish. Report exactly what you\n\
+changed, file by file, and the real scoped check output. Keep your\n\
+final summary under 1000 tokens.";
 
 /// Resolve a DelegationRequest patch for a HyperCode role: toolsets, role
 /// config (model/turns/tokens/reasoning) unless the caller set explicit
@@ -420,7 +433,12 @@ impl Tool for DelegateTask {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        // HyperCode orchestrator sessions (roles-only gate): the schema must
+        // not advertise named-agent (subagent_type), category, or load_skills
+        // routing — top-level AND per-task inside tasks[]. Flag off keeps
+        // the schema byte-identical (public-surface parity).
+        let restrict = crate::orchestrator_roles_only();
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "goal": {
@@ -503,7 +521,21 @@ impl Tool for DelegateTask {
                     "description": "Member name (mailbox identity) when `team` is set. Must be unique within the team. Defaults to 'lead' for a new team; required for later members."
                 }
             }
-        })
+        });
+        if restrict {
+            if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+                props.remove("category");
+                props.remove("subagent_type");
+                props.remove("load_skills");
+            }
+            if let Some(items) = schema
+                .pointer_mut("/properties/tasks/items/properties")
+                .and_then(|p| p.as_object_mut())
+            {
+                items.remove("subagent_type");
+            }
+        }
+        schema
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
@@ -538,6 +570,27 @@ impl Tool for DelegateTask {
                     ));
                 }
             }
+            // HyperCode orchestrator sessions reject per-task named/category/
+            // skill routing the same way as the top-level fields above. The
+            // scan runs over the RAW tasks array (before serde parses task
+            // specs) so unknown/extra fields can't slip through silently,
+            // and before any dispatch.
+            if crate::orchestrator_roles_only() {
+                for item in tasks_value
+                    .unwrap()
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    for field in ["subagent_type", "category", "load_skills"] {
+                        if item.get(field).is_some_and(|v| !v.is_null()) {
+                            return ToolResult::Error(format!(
+                                "'{field}' in tasks[] is not available in HyperCode orchestrator mode — delegate via role:'explorer' or role:'implementor' only."
+                            ));
+                        }
+                    }
+                }
+            }
             return self.execute_batch(tasks_value.unwrap(), &args, budgets).await;
         }
 
@@ -550,6 +603,19 @@ impl Tool for DelegateTask {
                 );
             }
         };
+
+        // HyperCode orchestrator sessions only accept role routing — named
+        // (subagent_type), category, and load_skills delegation are rejected
+        // with a clear error BEFORE any resolution/dispatch.
+        if crate::orchestrator_roles_only() {
+            for field in ["category", "subagent_type", "load_skills"] {
+                if args.get(field).is_some_and(|v| !v.is_null()) {
+                    return ToolResult::Error(format!(
+                        "'{field}' is not available in HyperCode orchestrator mode — delegate via role:'explorer' or role:'implementor' only."
+                    ));
+                }
+            }
+        }
 
         // Extract OMO category/subagent_type (T057/T058/T135).
         let category = args.get("category").and_then(|v| v.as_str()).map(String::from);
@@ -1295,6 +1361,12 @@ impl Tool for CallOmoAgent {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
+        // Defense-in-depth: the tool is already outside the orchestrator
+        // toolset, but if it is ever reached in a HyperCode orchestrator
+        // session, refuse — role routing only.
+        if crate::orchestrator_roles_only() {
+            return ToolResult::Error("call_omo_agent is not available in HyperCode orchestrator mode — delegate via role:'explorer' or role:'implementor' only.".to_string());
+        }
         // Force subagent_type to be present (BC-012).
         if args.get("subagent_type").and_then(|v| v.as_str()).is_none() {
             return ToolResult::Error(
@@ -1401,6 +1473,19 @@ mod role_tests {
         let append = req.prompt_append.unwrap();
         assert!(append.starts_with("caller content"));
         assert!(append.contains("EXPLORER"));
+    }
+
+    #[test]
+    fn role_directives_are_dumb_executor_doctrine() {
+        assert!(EXPLORER_DIRECTIVE.contains("READ-ONLY dumb slave"));
+        assert!(EXPLORER_DIRECTIVE.contains("single-question lookups"));
+        assert!(EXPLORER_DIRECTIVE.contains("no analysis, no recommendations"));
+        assert!(EXPLORER_DIRECTIVE.contains("commands your brief explicitly names"));
+        assert!(IMPLEMENTOR_DIRECTIVE.contains("dumb slave executor"));
+        assert!(IMPLEMENTOR_DIRECTIVE.contains("like a recipe"));
+        assert!(IMPLEMENTOR_DIRECTIVE.contains("not ordered to fix"));
+        assert!(IMPLEMENTOR_DIRECTIVE.contains("make NO changes at all"));
+        assert!(IMPLEMENTOR_DIRECTIVE.contains("check commands your brief lists"));
     }
 
     #[test]

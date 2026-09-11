@@ -45,6 +45,31 @@ fn default_persona_is_delegation_first() {
     assert!(!overlay.contains("{HARD_RULES}"), "no unexpanded placeholder");
 }
 
+/// Post-FR-010 revision: the conductor overlay advertises ONLY the two
+/// HyperCode roles — no subagent_type / named-agent delegation surface.
+#[test]
+fn conductor_overlay_advertises_only_hypercode_roles() {
+    let overlay = crate::hypercode::orchestrator_persona_overlay(
+        &hc_on(),
+        None,
+        "glm-5.2",
+        &avail(&["glm-5.2"]),
+        &overrides(),
+    );
+    assert!(
+        overlay.contains("role:\"explorer\""),
+        "overlay must advertise role:\"explorer\""
+    );
+    assert!(
+        overlay.contains("role:\"implementor\""),
+        "overlay must advertise role:\"implementor\""
+    );
+    assert!(
+        !overlay.contains("subagent_type"),
+        "overlay must not advertise subagent_type delegation"
+    );
+}
+
 /// FR-012: with the integration inactive (either flag off), the overlay is
 /// byte-identical to the fixed ORCHESTRATOR_PROMPT.
 #[test]
@@ -80,6 +105,18 @@ fn empty_registry_degrades_to_fixed_prompt() {
         &overrides(),
     );
     assert_eq!(overlay, crate::hypercode::ORCHESTRATOR_PROMPT.to_string());
+}
+
+/// Post-revision: the fixed ORCHESTRATOR_PROMPT fallback must not
+/// advertise named-agent routing the tool now rejects.
+#[test]
+fn fixed_orchestrator_prompt_is_roles_only() {
+    let p = crate::hypercode::ORCHESTRATOR_PROMPT;
+    assert!(p.contains("role:\"explorer\""), "explorer role advertised");
+    assert!(p.contains("role:\"implementor\""), "implementor role advertised");
+    assert!(p.contains("COMPLETE bench"), "complete-bench wording present");
+    assert!(!p.contains("subagent_type:"), "must not advertise subagent_type: routing");
+    assert!(!p.contains("sisyphus"), "must not advertise named agents");
 }
 
 /// Spec edge: the orchestrator toolset restriction is persona-independent.

@@ -928,6 +928,7 @@ ingest fixes: `ingest_project` now counts edges only on successful upsert
 and surfaces edge/tombstone errors in `IngestionResult.errors`; anti-pattern
 hit bump + domain-source listing failures are logged via `tracing::warn`
 instead of silently swallowed.
+  - Revised 2026-09-08: NeuroCode injection is now orchestrator-only. The SubagentManager engine plumbing (manager set_neurocode_engine, child propagation) was removed; subagents receive no injected NeuroCode Context. FR-021 cascade superseded by user directive.
 
 ## Copilot reverse-proxy integration (2026-08-14)
 
@@ -1581,6 +1582,18 @@ persona text is newly authored, NOT an upstream port).
   atlas; the chains are preserved behind
   `hypercode.omo_specialists.enabled=false`.
 
+Orchestrator-centric role doctrine (2026-09-08): the explorer and
+implementor role prompts/directives (`crates/joey-cli/src/hypercode.rs`,
+`crates/joey-orchestration/src/delegation_tool.rs`, conductor
+ROSTER_BRIEFING) were rewritten as dumb-executor directives — subagents
+hold no context, make no decisions, and apply their brief verbatim;
+all high-level planning and decision making lives with the orchestrator,
+which is mandated to carve work into the smallest scoped tasks possible
+(one question per Explorer, one function/file/edit-cluster per
+Implementor). Deliberate deviation from any upstream persona wording:
+none of this text is upstream-ported; it is Joey-native guidance.
+- Revised 2026-09-08: explorer/implementor role directives tightened to absolute dumb-slave execution (brief-named commands/edits/checks only; NO changes on ambiguous briefs); every orchestrator prompt and conductor variant now carries an explicit NEVER-delegate-planning-or-decisions hard rule.
+
 ## HyperCode workflow inheritance + task-graph planning (2026-09-03)
 
 **Status**: Complete (Joey-native extension; no upstream equivalent —
@@ -1713,3 +1726,122 @@ deviation, see below).
 3. `__SPECKIT_COMMAND_*__` markers render to the slash form
    `/speckit-<name>` (single canonical form per FR-003's
    one-implementation rule).
+
+## NeuroCode Adaptive Memory (feature 027, 2026-09-10)
+
+**Status**: Deliberate-deviation subsystem (Joey-original, no upstream
+equivalent — this is a Joey-side extension, not upstream parity work;
+upstream Hermes has no episodic/semantic agent-memory surface).
+
+Joey-native long-lived memory layered on the existing per-project
+neurocode store (`specs/027-please-enhance-neurocode/`):
+
+- **Two-tier memory model** in the per-project `graph.db`: episodic
+  memory (`memory_episodes` — per-task execution records) and semantic
+  memory (`memory_preferences` — distilled, durable statements about the
+  project/user). Schema migrates additively v3→v4
+  (`NEUROCODE_SCHEMA_VERSION = 4`); v3 databases open unchanged and
+  simply gain the empty memory tables — keyword/graph/RAG behavior is
+  untouched until memory is enabled. No joey-core `state.db` /
+  SCHEMA_VERSION change.
+- **Retrieval reuses the RAG machinery**: `joey-neurocode-rag::memory_search`
+  rides the same hybrid-search pattern as code retrieval (similarity +
+  keyword legs over the memory tables, fused client-side).
+- **Turn-end capture + system-prompt injection via a MemoryRuntime
+  hook** (`joey-agent-core::memory_hook`): the turn loop captures a
+  `MemoryTurnSummary` at turn end and injects retrieved memories into
+  the effective system prompt (top-k preferences + relevant episodes,
+  capped by `neurocode.memory.injection_char_limit`). Learning is fully
+  automatic and ungated per the user's Q1 clarification — no approval
+  gate anywhere on the memory path.
+- **HyperCode read/write integration**: retrieved memory rides the
+  goal-prefix sections (alongside the existing lessons), and each
+  completed work unit records an episode.
+- **Command surface**: `/neurocode memory` (enable/disable/status)
+  per `contracts/neurocode-memory-command.md`.
+
+Config keys (additive, `RAG_CONFIG_KEYS` pattern):
+`neurocode.memory.enabled` (false), `.top_k` (5),
+`.injection_char_limit` (2048), `.max_episodes` (500, FIFO eviction),
+`.distill_model` ("" = NeuroCode economical tier) — full contract in
+`specs/027-please-enhance-neurocode/contracts/`
+`neurocode-memory-config-keys.md`.
+
+**Disabled state is byte-identical**: with
+`neurocode.memory.enabled = false` (the default) no turn is captured,
+nothing is injected, and prompts/behavior are unchanged.
+
+## Feature 028 — Context Economy (Joey-only additions, date 2026-09-10)
+
+All additions are Joey-only (no upstream counterpart); upstream-verbatim
+strings untouched. Default-on with per-mechanism disable switches (FR-013);
+when-disabled byte parity asserted in tests (agent-core tests/parity.rs +
+inline agent.rs tests + joey-tools tests/parity.rs).
+
+1. CONTEXT_ECONOMY_GUIDANCE constant
+   (crates/joey-agent-core/src/guidance.rs) — Joey-only guidance text
+   injected via the gated prompt pattern (prompt.rs, gated on scratchpad
+   tool present + agent.context_economy_guidance). Wording pinned in
+   specs/028-please-create-feature/contracts/state-block-injection.md
+   §Guidance.
+2. State-block marker wording — "[STATE BLOCK — deterministic,
+   auto-maintained]" first line (crates/joey-agent-core/src/state_block.rs);
+   block appended as Message::user to the request CLONE ONLY at
+   build_request (never self.history, never persisted); dedupe key =
+   "{last user text}#{turn ordinal}" (neurocode last-user-text pattern
+   extended with the loop ordinal — retries within a model call reuse the
+   block; iteration advance re-renders with current PROGRESS). DEVIATION
+   NOTE: pure last-user-text keying was the contract's literal wording; the
+   composite key is a refinement (R3e wants the loop variable as the
+   PROGRESS numerator — pure keying would freeze PROGRESS at the first
+   ordinal); behavior remains within contract (retry-identical within turn,
+   re-render on new user text).
+3. PRUNED_TOOL_PLACEHOLDER reuse — hygiene sweep (US3) reuses
+   compressor.rs:173 "[Old tool output cleared to save context space]" and
+   summarize_tool_result pass-2 one-liners verbatim; dedup marker
+   "[Duplicate tool output — same content as a more recent call]" reused.
+   Detection scans full history newest-first; rewrites restricted to
+   pre-tail indices; session-store rows untouched.
+4. Ten additive config keys (crates/joey-core/src/config.rs
+   DEFAULT_CONFIG_YAML + named getters): scratchpad.enabled (true),
+   scratchpad.max_entry_chars (8000, clamp 1000..=64000),
+   state_block.enabled (true), state_block.max_chars (1200, clamp
+   200..=8000), compression.midturn_tool_hygiene (true),
+   compression.midturn_threshold (0.35, clamp 0.10..=0.45, kept <
+   compression.threshold), compression.boundary_trigger (true),
+   compression.boundary_threshold (0.35, clamp 0.10..=0.45),
+   agent.context_economy_guidance (true), agent.retrieval_verification_nudge
+   (true). Float thresholds convert to token counts at runtime (ratio ×
+   compressor.context_length, contracts/context-economy-config-keys.md
+   §Threshold semantics).
+5. Scratchpad tool (crates/joey-tools/src/tools/scratchpad_tool.rs) — new
+   builtin "scratchpad" (toolset "todo"), append/read/clear/stats actions;
+   storage ~/.joey/scratchpads/<sanitized-key>-<fnv1a-hex8>/scratchpad.md
+   (append-only Markdown, atomic writes, flock sibling lock); redaction via
+   joey_core::redact::redact_secrets before persist; CORE_TOOLS additive
+   append "scratchpad" (feature-016 additive-verbs precedent) so default
+   toolsets enable it; gated by check() when scratchpad.enabled=false. pub
+   cross-crate fns stats()/path()/entries() (todo_tool::current precedent).
+6. ToolRegistry definition memoization (crates/joey-tools/src/registry.rs)
+   — per-tool serialized definitions cached at register() time (immutable
+   per tool instance); mutation counter for observability; wire output
+   byte-identical (asserted).
+7. Boundary cleanup (US4) — boundary_cleanup_if_appropriate at all 10
+   run_turn exit sites; gated on todos all-complete-or-empty +
+   boundary_threshold band + cooldown clear + shared turn-local
+   compression_attempts budget; compress_context reused unchanged (0.50
+   backstop intact).
+8. Retrieval-verification nudge (US5) — additive wrapper
+   build_verify_on_stop_nudge_with_retrieval + RetrievalUsage in
+   verification.rs (base fn signature unchanged, constitution VII); one
+   appended line when rag-prefetch or neurocode cold-mode used the turn
+   and agent.retrieval_verification_nudge is on; existing caps preserved.
+
+Also note the test-infrastructure findings for future implementors: host
+EDR SIGKILLs test binaries under ./target — run cargo with
+CARGO_TARGET_DIR=/tmp/joey-agent-target (verified workaround);
+process-global test surfaces (home override, check() TTL cache,
+todo/scratchpad stores, verification ledger) require
+lock()/invalidate_check_cache()/unique session ids in tests (two
+pre-existing races fixed during this feature: toggle_fixture_agent missing
+TEST_HOME_LOCK; test_nudge_non_code_no_nudge unlocked clear_all).

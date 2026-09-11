@@ -75,7 +75,9 @@ ghost-text hints (slash-name/subcommand remainder, history fallback).
 - `/copy [n]` — copy last response to clipboard.
 - `/verbose` — cycle tool-progress off→new→all→verbose. `/timestamps [on|off|status]` (`/ts`).
 - `/version` (`/v`). `/agents` (`/tasks`, `/agent`) — OMO agent registry. `/goal set|pause|resume|clear|show`. `/start-work [plan]`.
-- `/llm-selector …` (subcommands as above). `/neurocode status|tier|index|query|patterns|anti-patterns|domain|ingest|help`.
+- `/llm-selector …` (subcommands as above). `/neurocode status|tier|index|query|patterns|anti-patterns|domain|ingest|memory|help`.
+  `/neurocode memory` manages adaptive memory (feature 027) — grammar:
+  `memory status|list|show|search|correct|delete|enable|disable`.
   `/neurocode ingest` also accepts natural language — a free-text
   description hands off to an agent turn that locates (or writes) the
   source and calls `neurocode_ingest` (REPL and TUI; the strict

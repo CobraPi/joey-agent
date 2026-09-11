@@ -827,6 +827,9 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     if has("skill_manage") {
         tool_guidance.push(SKILLS_GUIDANCE);
     }
+    if has("scratchpad") && cfg.get_bool("agent.context_economy_guidance", true) {
+        tool_guidance.push(CONTEXT_ECONOMY_GUIDANCE);
+    }
     if has("subagent_control") {
         tool_guidance.push(SUBAGENT_CONTROL_GUIDANCE);
     }
@@ -1343,5 +1346,124 @@ mod tests {
         // the copilot category, the stale one is not.
         assert!(prompt.contains("copilot:\n    - live: live agent-cwd skill"));
         assert!(!prompt.contains("stale: stale launch-cwd skill"));
+    }
+
+    /// Context-economy guidance (US5): injected when the scratchpad tool is
+    /// loaded AND `agent.context_economy_guidance` is true (default on).
+    #[test]
+    fn context_economy_guidance_present_by_default() {
+        let _lock = crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("TERMINAL_CWD");
+        std::env::remove_var("JOEY_ENVIRONMENT_HINT");
+        let home = tempfile::tempdir().unwrap();
+        let _guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf(), joey_core::Config::defaults(), "prompt-test");
+        let enabled: Vec<String> = ["scratchpad", "read_file", "terminal"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let prompt = build_system_prompt(&PromptInputs {
+            ctx: &ctx,
+            model: "m",
+            provider: "p",
+            enabled_tools: &enabled,
+            pass_session_id: false,
+            session_id: None,
+        });
+        assert!(prompt.contains("Work economically with context"));
+    }
+
+    /// `agent.context_economy_guidance: false` suppresses the guidance even
+    /// when the scratchpad tool is loaded.
+    #[test]
+    fn context_economy_guidance_absent_when_disabled() {
+        let _lock = crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("TERMINAL_CWD");
+        std::env::remove_var("JOEY_ENVIRONMENT_HINT");
+        let home = tempfile::tempdir().unwrap();
+        let _guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+
+        let cfg_path = home.path().join("config-economy-off.yaml");
+        std::fs::write(&cfg_path, "agent:\n  context_economy_guidance: false\n").unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(
+            cwd.path().to_path_buf(),
+            joey_core::Config::load_from(cfg_path).unwrap(),
+            "prompt-test",
+        );
+        let enabled: Vec<String> = ["scratchpad", "read_file", "terminal"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let prompt = build_system_prompt(&PromptInputs {
+            ctx: &ctx,
+            model: "m",
+            provider: "p",
+            enabled_tools: &enabled,
+            pass_session_id: false,
+            session_id: None,
+        });
+        assert!(!prompt.contains("Work economically with context"));
+    }
+
+    /// The gate is tool-presence AND config: without the scratchpad tool the
+    /// guidance never appears, even at default config.
+    #[test]
+    fn context_economy_guidance_absent_without_scratchpad_tool() {
+        let _lock = crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("TERMINAL_CWD");
+        std::env::remove_var("JOEY_ENVIRONMENT_HINT");
+        let home = tempfile::tempdir().unwrap();
+        let _guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf(), joey_core::Config::defaults(), "prompt-test");
+        let enabled: Vec<String> = ["read_file", "terminal"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let prompt = build_system_prompt(&PromptInputs {
+            ctx: &ctx,
+            model: "m",
+            provider: "p",
+            enabled_tools: &enabled,
+            pass_session_id: false,
+            session_id: None,
+        });
+        assert!(!prompt.contains("Work economically with context"));
+    }
+
+    /// Same inputs render a byte-identical prompt — complements the
+    /// built-once-per-session invariant (the timestamp line is date-only).
+    #[test]
+    fn prompt_rendered_content_deterministic() {
+        let _lock = crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("TERMINAL_CWD");
+        std::env::remove_var("JOEY_ENVIRONMENT_HINT");
+        let home = tempfile::tempdir().unwrap();
+        let _guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("AGENTS.md"), "Determinism fixture.").unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf(), joey_core::Config::defaults(), "prompt-test");
+        let enabled: Vec<String> = ["scratchpad", "read_file", "memory"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let build = || {
+            build_system_prompt(&PromptInputs {
+                ctx: &ctx,
+                model: "anthropic/claude-opus-4",
+                provider: "openrouter",
+                enabled_tools: &enabled,
+                pass_session_id: false,
+                session_id: None,
+            })
+        };
+        let first = build();
+        let second = build();
+        assert_eq!(first, second);
     }
 }

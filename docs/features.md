@@ -64,11 +64,14 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
   final-gate pipeline of parallel subagents with execution-only
   children: the orchestrator side does ALL thinking and dispatches
   fully-specified briefs (exact file paths, exact edits, exact
-  commands, expected outcomes). Read-only Explorers answer factual
-  questions only (paths, line numbers, quotes, command output — no
-  analysis); Implementors execute their brief verbatim — stopping to
-  report what's missing rather than guessing — and verify with
-  targeted checks only (`cargo build/test -p <crate>`), never the full
+  commands, expected outcomes) — the orchestrator owns all planning
+  and decision making. Explorers are read-only executors answering
+  single-question lookups with raw facts (paths, line numbers, quotes,
+  command output — no analysis); Implementors are dumb executors
+  applying fully-specified minimal-scope briefs verbatim (one
+  function/file/edit-cluster per dispatch) — stopping to report what's
+  missing rather than guessing — and verify with targeted checks only
+  (`cargo build/test -p <crate>`), never the full
   suite; after all implementors finish, the orchestrator runs the full
   test suite exactly once as a final gate, dispatches one fix round on
   failures, then synthesizes. Executed on the SAME `SubagentManager`

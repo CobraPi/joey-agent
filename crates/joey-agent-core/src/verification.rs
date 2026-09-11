@@ -609,6 +609,45 @@ pub fn max_verify_nudges(config_value: Option<usize>) -> usize {
     config_value.unwrap_or(MAX_VERIFY_NUDGES)
 }
 
+// ─── Feature 028: retrieval-verification nudge (FR-010) ───────────────
+
+/// Feature 028 (context economy): signals that a turn loaded context on
+/// demand (rag prefetch or neurocode cold-mode) — consumed by the
+/// verify-on-stop nudge extension (FR-010).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetrievalUsage {
+    /// RAG prefetch content was injected this turn.
+    pub rag_prefetch: bool,
+    /// NeuroCode cold-mode context was assembled this turn.
+    pub neurocode_cold: bool,
+}
+
+impl RetrievalUsage {
+    /// True when any on-demand retrieval mechanism fired this turn.
+    pub fn used(self) -> bool {
+        self.rag_prefetch || self.neurocode_cold
+    }
+}
+
+/// Feature 028: wrap [`build_verify_on_stop_nudge`] with an optional
+/// retrieval-verification reminder (FR-010). When `retrieval` signals
+/// on-demand loading and the nudge switch is enabled, one line is appended;
+/// caps and gating of the underlying nudge are fully preserved.
+pub fn build_verify_on_stop_nudge_with_retrieval(
+    session_id: &str,
+    cwd: &str,
+    changed_paths: &[String],
+    attempts: usize,
+    retrieval: RetrievalUsage,
+    config: &joey_core::Config,
+) -> Option<String> {
+    let base = build_verify_on_stop_nudge(session_id, cwd, changed_paths, attempts)?;
+    if !retrieval.used() || !config.retrieval_verification_nudge_enabled() {
+        return Some(base);
+    }
+    Some(format!("{}\nAlso: re-check retrieved facts against their sources before finishing.", base))
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -782,6 +821,7 @@ mod tests {
 
     #[test]
     fn test_nudge_non_code_no_nudge() {
+        let _g = lock();
         clear_all();
         let nudge = build_verify_on_stop_nudge("s1", "/tmp/proj", &["README.md".to_string()], 0);
         assert!(nudge.is_none());
@@ -949,5 +989,169 @@ mod tests {
         mark_workspace_edited("fr006-h", "/tmp/proj", &["src/y.rs".to_string()]);
         clear_all();
         clear_all(); // double clear is safe
+    }
+
+    // ── Feature 028 / T011: retrieval-verification nudge (FR-010) ────────
+
+    /// yaml→Config fixture: no existing pattern in this module, so follow
+    /// the crate-wide one (unique tempdir + `Config::load_from`).
+    fn retrieval_config_from_yaml(yaml: &str) -> joey_core::Config {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, yaml).expect("write yaml");
+        joey_core::Config::load_from(path).expect("config load")
+    }
+
+    #[test]
+    fn retrieval_line_present_only_when_used() {
+        let _g = lock();
+        clear_all();
+        mark_workspace_edited(
+            "retrieval-test-present",
+            "/tmp/proj",
+            &["src/main.rs".to_string()],
+        );
+        let config = joey_core::Config::defaults();
+        let paths = ["src/main.rs".to_string()];
+
+        // rag_prefetch fired → nudge ends with the retrieval line.
+        let rag = RetrievalUsage { rag_prefetch: true, ..Default::default() };
+        let nudge = build_verify_on_stop_nudge_with_retrieval(
+            "retrieval-test-present",
+            "/tmp/proj",
+            &paths,
+            0,
+            rag,
+            &config,
+        )
+        .expect("nudge expected");
+        assert!(
+            nudge
+                .ends_with("Also: re-check retrieved facts against their sources before finishing.")
+        );
+
+        // No retrieval → identical to the base nudge (string equality).
+        let base = build_verify_on_stop_nudge("retrieval-test-present", "/tmp/proj", &paths, 0);
+        let plain = build_verify_on_stop_nudge_with_retrieval(
+            "retrieval-test-present",
+            "/tmp/proj",
+            &paths,
+            0,
+            RetrievalUsage::default(),
+            &config,
+        );
+        assert_eq!(plain, base);
+
+        // neurocode_cold only → line present.
+        let cold = RetrievalUsage { neurocode_cold: true, ..Default::default() };
+        let nudge = build_verify_on_stop_nudge_with_retrieval(
+            "retrieval-test-present",
+            "/tmp/proj",
+            &paths,
+            0,
+            cold,
+            &config,
+        )
+        .expect("nudge expected");
+        assert!(nudge.contains("Also: re-check retrieved facts against their sources"));
+        clear_all();
+    }
+
+    #[test]
+    fn retrieval_line_absent_when_disabled() {
+        let _g = lock();
+        clear_all();
+        mark_workspace_edited(
+            "retrieval-test-absent",
+            "/tmp/proj",
+            &["src/main.rs".to_string()],
+        );
+        let config =
+            retrieval_config_from_yaml("agent:\n  retrieval_verification_nudge: false\n");
+        assert!(!config.retrieval_verification_nudge_enabled());
+
+        let paths = ["src/main.rs".to_string()];
+        let used = RetrievalUsage { rag_prefetch: true, ..Default::default() };
+        let nudge = build_verify_on_stop_nudge_with_retrieval(
+            "retrieval-test-absent",
+            "/tmp/proj",
+            &paths,
+            0,
+            used,
+            &config,
+        )
+        .expect("nudge expected");
+        // Identical to base even though retrieval.used().
+        let base = build_verify_on_stop_nudge("retrieval-test-absent", "/tmp/proj", &paths, 0);
+        assert_eq!(Some(nudge.clone()), base);
+        assert!(!nudge.contains("Also: re-check"));
+        clear_all();
+    }
+
+    #[test]
+    fn retrieval_caps_respected() {
+        let _g = lock();
+        clear_all();
+        mark_workspace_edited(
+            "retrieval-test-caps",
+            "/tmp/proj",
+            &["src/main.rs".to_string()],
+        );
+        let config = joey_core::Config::defaults();
+        let used = RetrievalUsage { rag_prefetch: true, neurocode_cold: true };
+
+        // Empty changed_paths → None even with retrieval used (the base
+        // nudge's None path is preserved).
+        assert!(build_verify_on_stop_nudge_with_retrieval(
+            "retrieval-test-caps",
+            "/tmp/proj",
+            &[],
+            0,
+            used,
+            &config
+        )
+        .is_none());
+
+        // Attempts budget exhausted → None.
+        let paths = ["src/main.rs".to_string()];
+        assert!(build_verify_on_stop_nudge_with_retrieval(
+            "retrieval-test-caps",
+            "/tmp/proj",
+            &paths,
+            MAX_VERIFY_ATTEMPTS,
+            used,
+            &config
+        )
+        .is_none());
+        clear_all();
+    }
+
+    /// Named contract: with default config and no retrieval usage, the
+    /// wrapped nudge is byte-for-byte the pre-feature
+    /// [`build_verify_on_stop_nudge`] output.
+    #[test]
+    fn when_disabled_nudge_text_identical_to_pre_feature() {
+        let _g = lock();
+        clear_all();
+        mark_workspace_edited(
+            "retrieval-test-identical",
+            "/tmp/proj",
+            &["src/main.rs".to_string()],
+        );
+        let config = joey_core::Config::defaults();
+        let paths = ["src/main.rs".to_string()];
+        let base = build_verify_on_stop_nudge("retrieval-test-identical", "/tmp/proj", &paths, 0)
+            .expect("base nudge expected");
+        let wrapped = build_verify_on_stop_nudge_with_retrieval(
+            "retrieval-test-identical",
+            "/tmp/proj",
+            &paths,
+            0,
+            RetrievalUsage::default(),
+            &config,
+        )
+        .expect("wrapped nudge expected");
+        assert_eq!(wrapped, base);
+        clear_all();
     }
 }

@@ -30,6 +30,7 @@ use rayon::prelude::*;
 
 use crate::compression::{self, ContextCompressor};
 use crate::events::AgentEvent;
+use crate::memory_hook;
 use crate::prompt::{build_system_prompt, PromptInputs};
 
 /// Mid-turn steer markers (upstream prompt_builder.py STEER_MARKER_OPEN/
@@ -526,6 +527,10 @@ pub struct Agent {
     fallback_index: usize,
     /// Consecutive turns whose tool calls were ALL invalid (3-strike abort).
     invalid_tool_strikes: u32,
+    /// Feature 028 (FR-010): verify-nudge delivery count this session —
+    /// bounds the retrieval-verification nudge via MAX_VERIFY_NUDGES and
+    /// feeds the per-call attempts parameter (MAX_VERIFY_ATTEMPTS).
+    verify_nudge_count: u32,
     /// Test hook: overrides the provider client when set.
     transport_override: Option<Arc<dyn Transport>>,
     /// Optional shared concurrency limiter (orchestration). When set, each
@@ -590,6 +595,13 @@ pub struct Agent {
     /// would also re-bump anti-pattern hit counts). Cleared at run_turn
     /// start so every user turn re-assembles.
     pub(crate) neurocode_assembled_for: std::sync::Mutex<Option<String>>,
+    /// Feature 028 (context economy): per-turn rendered state block stash —
+    /// `(dedupe_key, rendered_block)`. Key = `"{last user text}#{turn ordinal}"`
+    /// (neurocode last-user-text pattern, extended with the loop ordinal):
+    /// retries of one model call reuse the identical block (FR-005), while a
+    /// loop-iteration advance re-renders with a current PROGRESS ordinal and
+    /// fresh todos. Cleared implicitly by key change on each new user turn.
+    pub(crate) state_block_context: std::sync::Mutex<Option<(String, String)>>,
     /// Pending image attachments for the NEXT user turn (`/image`, `/paste`).
     /// Data-URL strings (data:image/png;base64,...) merged into the user
     /// message's `content_parts` by `run_turn`, then cleared. Additive:
@@ -613,6 +625,10 @@ pub struct Agent {
     /// run_turn start and whenever the gate closes. Never mutated after
     /// the request is built (T033).
     pub(crate) rag_prefetch_context: std::sync::Mutex<Option<String>>,
+    /// ── Feature 027 (adaptive memory) ──────────────────────────────
+    /// Memory runtime (T010). None ⇒ no injection and no capture ever
+    /// (the production implementation is wired in joey-cli, T012).
+    pub(crate) memory_runtime: Option<Arc<dyn memory_hook::MemoryRuntime>>,
 }
 
 impl Agent {
@@ -697,6 +713,7 @@ impl Agent {
             fallback_chain,
             fallback_index: 0,
             invalid_tool_strikes: 0,
+            verify_nudge_count: 0,
             transport_override: None,
             provider_permit: None,
             compressor,
@@ -717,12 +734,14 @@ impl Agent {
             neurocode_engine: None,
             neurocode_context: std::sync::Mutex::new(None),
             neurocode_assembled_for: std::sync::Mutex::new(None),
+            state_block_context: std::sync::Mutex::new(None),
             pending_images: std::sync::Mutex::new(Vec::new()),
             rag_refresh_worker: None,
             rag_prefetch_source: None,
             rag_refresh_phase: Arc::new(std::sync::Mutex::new(RagRefreshPhase::Idle)),
             rag_refresh_handle: std::sync::Mutex::new(None),
             rag_prefetch_context: std::sync::Mutex::new(None),
+            memory_runtime: None,
         })
     }
 
@@ -1077,6 +1096,34 @@ impl Agent {
                 }
             }
         }
+        // Feature 027 (adaptive memory): the bounded memory block for THIS
+        // turn — appended ONLY when `neurocode.memory.enabled` is set AND
+        // the installed runtime reports itself active (double gate; the
+        // key literal mirrors `joey_neurocode_rag::config::`
+        // `KEY_MEMORY_ENABLED` the same way rag_keys mirrors RAG_CONFIG_KEYS
+        // — a normal dependency is deliberately avoided, see rag_keys
+        // docs). None/empty block ⇒ nothing appended, prompt byte-identical.
+        if self.ctx.config().get_bool("neurocode.memory.enabled", false) {
+            if let Some(rt) = &self.memory_runtime {
+                if rt.enabled() {
+                    let prompt = self
+                        .history
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "user")
+                        .map(|m| m.text_content())
+                        .unwrap_or_default();
+                    if !prompt.trim().is_empty() {
+                        if let Some(block) = rt.prefetch_block(&prompt) {
+                            if !block.is_empty() {
+                                combined.push_str("\n\n");
+                                combined.push_str(&block);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         combined
     }
 
@@ -1132,6 +1179,82 @@ impl Agent {
         }
     }
 
+    /// Feature 027 (T011): post-turn adaptive-memory capture. Mirrors the
+    /// neurocode_auto_reindex precedent — called on every run_turn exit path,
+    /// gated, and never allowed to break the turn. The MemoryRuntime impl
+    /// does the real work off this thread (spawn internally per contract).
+    ///
+    /// Field sourcing is best-effort from the live transcript slice added
+    /// THIS turn (older turns live below `turn_start_idx`):
+    /// `user_prompt`/`assistant_final` reuse the t010 prefetch lookup style
+    /// (last user / assistant text message); `files_touched` extracts the
+    /// `path` argument from write-class tool calls (write_file/patch/
+    /// multi_edit/terminal per the tool registry naming); `tools_used` is
+    /// the distinct set of invoked tool names. turn_error is a per-site
+    /// literal (the call-site knows which exit path it is).
+    async fn neurocode_memory_capture(&self, turn_start_idx: usize, turn_error: bool) {
+        let Some(rt) = self.memory_runtime.as_ref() else {
+            return;
+        };
+        if !self.ctx.config().get_bool("neurocode.memory.enabled", false) {
+            return;
+        }
+        if !rt.enabled() {
+            return;
+        }
+        // Same lookup style as the t010 prefetch prompt: last user message
+        // text — but scoped to THIS turn's slice so multi-turn sessions
+        // capture the request that drove the episode being recorded.
+        let turn = &self.history[turn_start_idx.min(self.history.len())..];
+        let user_prompt = turn
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.text_content())
+            .unwrap_or_default();
+        let assistant_final = turn
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .map(|m| m.text_content())
+            .unwrap_or_default();
+        // Write-class tool names per the registry naming (write_file/patch/
+        // multi_edit file tools + terminal; multi_edit is the batch sibling
+        // of patch in the same toolset).
+        const WRITE_CLASS_TOOLS: [&str; 4] = ["write_file", "patch", "multi_edit", "terminal"];
+        let mut files_touched: Vec<String> = Vec::new();
+        let mut tools_used: Vec<String> = Vec::new();
+        for m in turn.iter() {
+            for tc in &m.tool_calls {
+                if !tools_used.contains(&tc.function.name) {
+                    tools_used.push(tc.function.name.clone());
+                }
+                if WRITE_CLASS_TOOLS.contains(&tc.function.name.as_str()) {
+                    // Best-effort path extraction from the JSON arguments
+                    // (write_file/patch/multi_edit take `path`; terminal has
+                    // none — command mutations surface via file_tracker
+                    // instead, which is not consulted here).
+                    if let Ok(args) = serde_json::from_str::<Value>(&tc.function.arguments) {
+                        if let Some(p) = args.get("path").and_then(Value::as_str) {
+                            if !p.is_empty() && !files_touched.contains(&p.to_string()) {
+                                files_touched.push(p.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let summary = memory_hook::MemoryTurnSummary {
+            user_prompt,
+            assistant_final,
+            files_touched,
+            tools_used,
+            turn_error,
+            session_key: self.session_id.clone().unwrap_or_default(),
+        };
+        rt.capture_turn(&summary);
+    }
+
     // ── Feature 021 (NeuroCode RAG): background refresh + pre-fetch ────
 
     /// Observable RAG refresh state for status reporting (T025/FR-004,
@@ -1160,6 +1283,20 @@ impl Agent {
     /// backend).
     pub fn set_rag_prefetch_source(&mut self, source: Option<Arc<dyn RagPrefetchSource>>) {
         self.rag_prefetch_source = source;
+    }
+
+    /// Install (or clear with `None`) the adaptive-memory runtime (feature
+    /// 027, T010 wiring — implemented in joey-cli, T012). The injection
+    /// append in `effective_system_prompt` consults it ONLY when
+    /// `neurocode.memory.enabled` is set AND the runtime reports itself
+    /// active (double gate).
+    pub fn set_memory_runtime(&mut self, rt: Option<Arc<dyn memory_hook::MemoryRuntime>>) {
+        self.memory_runtime = rt;
+    }
+
+    /// The installed adaptive-memory runtime, if any (feature 027).
+    pub fn memory_runtime(&self) -> Option<&Arc<dyn memory_hook::MemoryRuntime>> {
+        self.memory_runtime.as_ref()
     }
 
     /// The pre-fetch block injected into the current turn's context, if
@@ -1756,7 +1893,7 @@ impl Agent {
             .filter_map(|d| serde_json::from_value::<ToolSchema>(d).ok())
             .collect()
     }
-    fn build_request(&self, tools: &[ToolSchema], tx: Option<&mpsc::UnboundedSender<AgentEvent>>) -> ProviderRequest {
+    fn build_request(&self, tools: &[ToolSchema], turn: usize, tx: Option<&mpsc::UnboundedSender<AgentEvent>>) -> ProviderRequest {
         // A one-shot output-cap override from the overflow handler wins
         // (upstream `_ephemeral_max_output_tokens`).
         let max_tokens = self.ephemeral_max_output_tokens.or(self.config.max_tokens);
@@ -1784,12 +1921,292 @@ impl Agent {
             model = %model,
             "provider request model resolved"
         );
-        ProviderRequest::new(model, self.history.clone())
+        let mut request_messages = self.history.clone();
+        if let Some(block) = self.render_state_block_for_request(turn) {
+            request_messages.push(Message::user(block));
+        }
+        ProviderRequest::new(model, request_messages)
             .with_system(Some(self.effective_system_prompt()))
             .with_tools(tools.to_vec())
             .with_reasoning(self.config.reasoning.clone())
             .with_max_tokens(max_tokens)
             .streaming(self.config.stream)
+    }
+
+    /// Feature 028: render (or reuse) the deterministic state block for the
+    /// request tail. Never touches `self.history`; never persisted (FR-005).
+    fn render_state_block_for_request(&self, turn: usize) -> Option<String> {
+        if !self.ctx.config().state_block_enabled() {
+            return None;
+        }
+        // Ordering guard: skip when the history tail is an unresolved tool
+        // result (FR-005, spec edge case — provider message-ordering safety).
+        if self.history.last().map(|m| m.role.as_str()) == Some("tool") {
+            tracing::info!("state block skipped (tool-result tail)");
+            return None;
+        }
+        let last_user_text = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| m.content.clone())?;
+        let key = format!("{}#{}", last_user_text, turn);
+        if let Ok(stash) = self.state_block_context.lock() {
+            if let Some((k, block)) = stash.as_ref() {
+                if k == &key {
+                    return Some(block.clone());
+                }
+            }
+        }
+        let session_id = self
+            .session_id
+            .clone()
+            .unwrap_or_else(|| self.ctx.session_id().to_string());
+        let todos = joey_tools::tools::todo_tool::current(&session_id);
+        let scratchpad = joey_tools::tools::scratchpad_tool::stats(&session_id).map(|s| {
+            crate::state_block::ScratchpadSummary {
+                path: joey_tools::tools::scratchpad_tool::path(&session_id),
+                entries: s.entries,
+                last_entry_at: s.last_entry_at,
+            }
+        });
+        let block = crate::state_block::render(
+            &crate::state_block::StateBlockInput {
+                todos: &todos,
+                scratchpad,
+                turn,
+                max_turns: self.config.max_turns,
+            },
+            self.ctx.config().state_block_max_chars(),
+        )?;
+        if let Ok(mut stash) = self.state_block_context.lock() {
+            *stash = Some((key, block.clone()));
+        }
+        tracing::info!(chars = block.chars().count(), "state block rendered");
+        Some(block)
+    }
+
+    /// Feature 028 (US3): mid-turn tool-result hygiene sweep. Pass 1
+    /// DEDUPLICATES identical tool results — detection scans the FULL
+    /// history newest-first (real compressor pass-1 semantics: a protected
+    /// newer copy still claims its content), while REWRITES are restricted
+    /// to indices below the protected tail. Pass 2 rewrites IN PLACE
+    /// (history only — session-store rows keep verbatim originals) the
+    /// contents of remaining old tool results, oldest-first, to compressor
+    /// pass-2 one-line summaries / PRUNED_TOOL_PLACEHOLDER. No summary
+    /// message or marker is emitted (FR-007 distinguishability). Returns
+    /// the number of messages rewritten.
+    pub(crate) fn hygiene_sweep_tool_results(&mut self) -> usize {
+        let protect = self.compressor.protect_last_n;
+        let boundary = self.history.len().saturating_sub(protect);
+        if boundary == 0 {
+            return 0;
+        }
+        // call_id -> (tool_name, arguments) from assistant messages.
+        let mut call_map: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        for m in &self.history {
+            for tc in &m.tool_calls {
+                call_map.insert(
+                    tc.id.clone(),
+                    (tc.function.name.clone(), tc.function.arguments.clone()),
+                );
+            }
+        }
+        const DUPLICATE_MARKER: &str =
+            "[Duplicate tool output — same content as a more recent call]";
+        let mut rewritten = 0usize;
+        // Pass 1: dedup — detect over the full history, rewrite pre-tail only.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for i in (0..self.history.len()).rev() {
+            let m = &self.history[i];
+            if m.role != "tool" || m.content_parts.is_some() {
+                continue;
+            }
+            let Some(content) = m.content.clone() else { continue };
+            if content.len() < 200 {
+                continue;
+            }
+            if content == crate::compression::compressor::PRUNED_TOOL_PLACEHOLDER
+                || content.starts_with("[Duplicate tool output")
+            {
+                continue;
+            }
+            let digest = {
+                use sha2::Digest;
+                let d = sha2::Sha256::digest(content.as_bytes());
+                hex::encode(&d[..6])
+            };
+            if seen.contains(&digest) {
+                if i < boundary {
+                    let m = &mut self.history[i];
+                    if m.content.as_deref() != Some(DUPLICATE_MARKER) {
+                        m.content = Some(DUPLICATE_MARKER.to_string());
+                        rewritten += 1;
+                    }
+                }
+                // Inside the protected tail: already claimed, leave verbatim.
+            } else {
+                seen.insert(digest);
+            }
+        }
+        // Pass 2: oldest-first one-line rewrite of remaining old tool results.
+        for i in 0..boundary {
+            let m = &self.history[i];
+            if m.role != "tool" || m.content_parts.is_some() {
+                continue;
+            }
+            let Some(content) = m.content.clone() else { continue };
+            if content.len() <= 200 {
+                continue;
+            }
+            if content == crate::compression::compressor::PRUNED_TOOL_PLACEHOLDER
+                || content.starts_with("[Duplicate tool output")
+            {
+                continue;
+            }
+            let (tool_name, tool_args) = m
+                .tool_call_id
+                .as_ref()
+                .and_then(|id| call_map.get(id).cloned())
+                .unwrap_or_else(|| ("unknown".to_string(), String::new()));
+            let summary = crate::compression::compressor::summarize_tool_result(
+                &tool_name,
+                &tool_args,
+                &content,
+            );
+            let replacement = if summary.trim().is_empty() {
+                crate::compression::compressor::PRUNED_TOOL_PLACEHOLDER.to_string()
+            } else {
+                summary
+            };
+            self.history[i].content = Some(replacement);
+            rewritten += 1;
+        }
+        rewritten
+    }
+
+    /// Feature 028 (FR-010): retrieval usage for the finishing turn, read
+    /// from the per-turn stashes (both are cleared at run_turn start and set
+    /// only when the corresponding mechanism actually injected context).
+    fn retrieval_usage_this_turn(&self) -> crate::verification::RetrievalUsage {
+        crate::verification::RetrievalUsage {
+            rag_prefetch: self
+                .rag_prefetch_context
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some(),
+            neurocode_cold: self
+                .neurocode_assembled_for
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some(),
+        }
+    }
+
+    /// Feature 028 (FR-010): decide + build the retrieval-verification
+    /// nudge for a finishing turn. Feeds the ledger with this turn's edited
+    /// paths, then delegates to the capped verify-on-stop wrapper. `None`
+    /// when retrieval was unused, the switch is off, nothing was edited, or
+    /// caps are exhausted. Pure decision — the caller pushes + continues.
+    fn verify_nudge_decision(&mut self, turn_edited_paths: &[String]) -> Option<String> {
+        let retrieval = self.retrieval_usage_this_turn();
+        // FR-013 parity: switch off (or no retrieval this turn) → zero
+        // behavior change, not even a ledger write.
+        if !retrieval.used() || !self.ctx.config().retrieval_verification_nudge_enabled() {
+            return None;
+        }
+        if !crate::verification::verify_on_stop_enabled(None) {
+            return None;
+        }
+        if self.verify_nudge_count as usize >= crate::verification::max_verify_nudges(None) {
+            return None;
+        }
+        if turn_edited_paths.is_empty() {
+            return None;
+        }
+        let session_id = self
+            .session_id
+            .clone()
+            .unwrap_or_else(|| self.ctx.session_id().to_string());
+        let cwd = self.ctx.cwd().display().to_string();
+        crate::verification::mark_workspace_edited(&session_id, &cwd, turn_edited_paths);
+        let nudge = crate::verification::build_verify_on_stop_nudge_with_retrieval(
+            &session_id,
+            &cwd,
+            turn_edited_paths,
+            self.verify_nudge_count as usize,
+            retrieval,
+            self.ctx.config(),
+        )?;
+        self.verify_nudge_count += 1;
+        Some(nudge)
+    }
+
+    /// Feature 028 (US4): boundary-aligned cleanup. Fires at run_turn exits
+    /// when the todo list is all-complete-or-empty and usage is in the
+    /// boundary band [boundary_threshold, compression.threshold): runs the
+    /// existing compressor exactly once, counted as one attempt against the
+    /// turn-local budget (shared with hygiene). Gated off → exit paths behave
+    /// exactly as before (FR-008/013 parity). The pressure estimate mirrors
+    /// the pre-API gate (history + system + tool-schema tokens) per
+    /// contracts/context-economy-config-keys.md §Threshold semantics
+    /// (FR-008 parity).
+    pub(crate) async fn boundary_cleanup_if_appropriate(
+        &mut self,
+        tx: &mpsc::UnboundedSender<AgentEvent>,
+        tools: &[ToolSchema],
+        compression_attempts: &mut u32,
+    ) {
+        if !self.ctx.config().boundary_trigger_enabled() {
+            return;
+        }
+        // Fresh post-turn budget slot: this fires after the tool loop, using
+        // the same turn-local counter (R5c — one attempt accounting).
+        if *compression_attempts >= 3 {
+            return;
+        }
+        if self
+            .compressor
+            .get_active_compression_failure_cooldown(false)
+            .is_some()
+        {
+            return;
+        }
+        let session_id = self
+            .session_id
+            .clone()
+            .unwrap_or_else(|| self.ctx.session_id().to_string());
+        let todos = joey_tools::tools::todo_tool::current(&session_id);
+        let boundary_complete = todos
+            .iter()
+            .all(|t| t.status == "completed" || t.status == "cancelled");
+        if !boundary_complete {
+            return;
+        }
+        let request_pressure_tokens = compression::estimate_request_tokens_rough(
+            &self.history,
+            &self.effective_system_prompt(),
+            None,
+        ) + if tools.is_empty() {
+            0
+        } else {
+            compression::estimate_tools_tokens_rough(tools)
+        };
+        let context_length = self.compressor.context_length.max(1);
+        let boundary_tokens =
+            (self.ctx.config().boundary_threshold() * context_length as f64) as i64;
+        if request_pressure_tokens < boundary_tokens {
+            return;
+        }
+        tracing::info!(
+            tokens = request_pressure_tokens,
+            "boundary cleanup fired (todos complete, above boundary threshold)"
+        );
+        *compression_attempts += 1;
+        self.compress_context(Some(request_pressure_tokens), None, false, Some(tx))
+            .await;
     }
 
     /// NeuroCode intercept (feature 015, FR-020). Before model dispatch, if
@@ -2131,6 +2548,7 @@ impl Agent {
         tools: &[ToolSchema],
         tx: &mpsc::UnboundedSender<AgentEvent>,
         compression_attempts: &mut u32,
+        turn: usize,
     ) -> Result<NormalizedResponse, TurnAbort> {
         let max_retries = self.config.api_max_retries.max(1);
         let mut retry_count: usize = 0;
@@ -2143,9 +2561,9 @@ impl Agent {
         let mut fallback_activations: usize = 0;
         loop {
             let req = if with_tools {
-                self.build_request(tools, Some(tx))
+                self.build_request(tools, turn, Some(tx))
             } else {
-                self.build_request(&[], Some(tx))
+                self.build_request(&[], turn, Some(tx))
             };
             match self.transport_call(&req, tx).await {
                 Ok(resp) => {
@@ -2676,6 +3094,12 @@ impl Agent {
             self.push_message(Message::user(notice), None);
         }
 
+        // Feature 027 (T011): transcript slice boundary — marks the start
+        // of THIS turn's transcript INCLUDING the user message, so every
+        // exit path can summarize exactly this turn's messages/tool calls
+        // (neurocode_memory_capture reads the slice from this index).
+        let turn_start_idx = self.history.len();
+
         self.push_message(self.take_pending_images_into(user_input), None);
 
         // Live context view: baseline snapshot with the user turn appended.
@@ -2685,6 +3109,9 @@ impl Agent {
         let mut total_usage = Usage::default();
         let mut final_text = String::new();
         let mut api_calls: usize = 0;
+        // Feature 028 (FR-010): file paths mutated by this turn's tool calls
+        // (write_file / patch / multi_edit) — feeds the verification ledger.
+        let mut turn_edited_paths: Vec<String> = Vec::new();
         // Per-turn recovery state (conversation_loop locals).
         let mut post_tool_empty_retried = false;
         let mut empty_content_retries: u32 = 0;
@@ -2703,6 +3130,8 @@ impl Agent {
                 // trigger must read the pre-reindex tracker state.
                 self.rag_auto_refresh();
                 self.neurocode_auto_reindex(&tx).await;
+                self.boundary_cleanup_if_appropriate(&tx, &tools, &mut compression_attempts).await;
+                self.neurocode_memory_capture(turn_start_idx, true).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: final_text.clone(),
                     usage: total_usage.clone(),
@@ -2735,6 +3164,41 @@ impl Agent {
             } else {
                 compression::estimate_tools_tokens_rough(&tools)
             };
+
+            // ── Feature 028 (US3): mid-turn tool-result hygiene sweep ─────
+            // A cheap in-place rewrite band BELOW the full-compression
+            // threshold: dedup + one-line-summarize OLD tool results
+            // (pre-tail indices only; the protected tail stays verbatim).
+            // History-only rewrites; no summary message or marker is
+            // emitted (FR-007 distinguishability from real compaction).
+            if self.compression_enabled
+                && self.ctx.config().midturn_tool_hygiene_enabled()
+                && self.history.len() > 1
+                && compression_attempts < 3
+                && !self
+                    .compressor
+                    .should_defer_preflight_to_real_usage(request_pressure_tokens)
+                && self
+                    .compressor
+                    .get_active_compression_failure_cooldown(false)
+                    .is_none()
+            {
+                let midturn_floor = (self.ctx.config().midturn_threshold()
+                    * self.compressor.context_length.max(1) as f64)
+                    as i64;
+                if request_pressure_tokens >= midturn_floor
+                    && request_pressure_tokens < self.compressor.threshold_tokens
+                {
+                    let swept = self.hygiene_sweep_tool_results();
+                    if swept > 0 {
+                        compression_attempts += 1;
+                        tracing::info!(swept, "hygiene swept old tool results");
+                        self.emit_context_snapshot(&tx);
+                        continue;
+                    }
+                }
+            }
+
             // Guard chain short-circuits exactly like upstream: the defer
             // check (which advances its calibration baseline) and the
             // cooldown read only run when the earlier gates pass.
@@ -2790,7 +3254,7 @@ impl Agent {
             self.ctx.turn_budget().reset();
 
             let resp = match self
-                .call_with_retries(true, &tools, &tx, &mut compression_attempts)
+                .call_with_retries(true, &tools, &tx, &mut compression_attempts, api_calls)
                 .await
             {
                 Ok(r) => r,
@@ -2799,6 +3263,8 @@ impl Agent {
                     self.close_interrupted_tool_sequence(&text);
                     self.rag_auto_refresh();
                     self.neurocode_auto_reindex(&tx).await;
+                    self.boundary_cleanup_if_appropriate(&tx, &tools, &mut compression_attempts).await;
+                    self.neurocode_memory_capture(turn_start_idx, true).await;
                     let _ = tx.send(AgentEvent::Done {
                         final_text: text.clone(),
                         usage: total_usage.clone(),
@@ -2813,6 +3279,8 @@ impl Agent {
                     self.push_message(Message::assistant(err.clone()), None);
                     self.rag_auto_refresh();
                     self.neurocode_auto_reindex(&tx).await;
+                    self.boundary_cleanup_if_appropriate(&tx, &tools, &mut compression_attempts).await;
+                    self.neurocode_memory_capture(turn_start_idx, true).await;
                     let _ = tx.send(AgentEvent::Failed(err));
                     return TurnResult { final_text, usage: total_usage, iterations: api_calls, interrupted: false, fatal: true, fatal_provider_error: true };
                 }
@@ -2973,6 +3441,20 @@ impl Agent {
                 // Successful tool round: re-arm the post-tool empty nudge
                 // (conversation_loop.py:4995).
                 post_tool_empty_retried = false;
+                // Feature 028 (FR-010): collect this round's edited paths for
+                // the retrieval-verification nudge decision at turn end.
+                for tc in &tool_calls {
+                    if matches!(tc.function.name.as_str(), "write_file" | "patch" | "multi_edit") {
+                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
+                            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                                let p = p.to_string();
+                                if !turn_edited_paths.contains(&p) {
+                                    turn_edited_paths.push(p);
+                                }
+                            }
+                        }
+                    }
+                }
                 // Live context view: tool results are now in the history.
                 self.emit_context_snapshot(&tx);
                 if !batch_interrupted {
@@ -2987,6 +3469,8 @@ impl Agent {
                     self.close_interrupted_tool_sequence("");
                     self.rag_auto_refresh();
                     self.neurocode_auto_reindex(&tx).await;
+                    self.boundary_cleanup_if_appropriate(&tx, &tools, &mut compression_attempts).await;
+                    self.neurocode_memory_capture(turn_start_idx, true).await;
                     let _ = tx.send(AgentEvent::Done {
                         final_text: final_text.clone(),
                         usage: total_usage.clone(),
@@ -3061,6 +3545,8 @@ impl Agent {
                 ));
                 self.rag_auto_refresh();
                 self.neurocode_auto_reindex(&tx).await;
+                self.boundary_cleanup_if_appropriate(&tx, &tools, &mut compression_attempts).await;
+                self.neurocode_memory_capture(turn_start_idx, false).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: partial.clone(),
                     usage: total_usage.clone(),
@@ -3127,6 +3613,8 @@ impl Agent {
                 final_text = "(empty)".to_string();
                 self.rag_auto_refresh();
                 self.neurocode_auto_reindex(&tx).await;
+                self.boundary_cleanup_if_appropriate(&tx, &tools, &mut compression_attempts).await;
+                self.neurocode_memory_capture(turn_start_idx, true).await;
                 let _ = tx.send(AgentEvent::Done {
                     final_text: final_text.clone(),
                     usage: total_usage.clone(),
@@ -3139,11 +3627,21 @@ impl Agent {
             let assistant_msg = self.build_assistant_message(&resp, &[]);
             self.push_message(assistant_msg, Some(finish_str));
             final_text = visible.trim().to_string();
+            // Feature 028 (FR-010): when this turn used on-demand retrieval
+            // and edited files, require one bounded verification pass before
+            // completion (nudge-and-continue, POST_TOOL_EMPTY pattern).
+            if let Some(nudge) = self.verify_nudge_decision(&turn_edited_paths) {
+                tracing::info!(count = self.verify_nudge_count, "verify nudge delivered");
+                self.push_synthetic(Message::user(nudge));
+                continue;
+            }
             let _ = tx.send(AgentEvent::AssistantMessage(final_text.clone()));
             // Live context view: the final assistant message is in history.
             self.emit_context_snapshot(&tx);
             self.rag_auto_refresh();
             self.neurocode_auto_reindex(&tx).await;
+            self.boundary_cleanup_if_appropriate(&tx, &tools, &mut compression_attempts).await;
+            self.neurocode_memory_capture(turn_start_idx, false).await;
             let _ = tx.send(AgentEvent::Done {
                 final_text: final_text.clone(),
                 usage: total_usage.clone(),
@@ -3166,7 +3664,7 @@ impl Agent {
         // failure message. Other errors keep the upstream fallback-message
         // behavior (empty → one retry → canned message).
         let mut interrupted_text: Option<String> = None;
-        let mut summary = match self.call_with_retries(false, &[], &tx, &mut compression_attempts).await {
+        let mut summary = match self.call_with_retries(false, &[], &tx, &mut compression_attempts, api_calls).await {
             Ok(resp) => {
                 accumulate_usage(&mut total_usage, &self.usage_or_estimate(&[], &resp));
                 strip_think_blocks(&resp.content).trim().to_string()
@@ -3179,7 +3677,7 @@ impl Agent {
         };
         if interrupted_text.is_none() && summary.is_empty() {
             // One retry (handle_max_iterations "Retry summary generation").
-            summary = match self.call_with_retries(false, &[], &tx, &mut compression_attempts).await {
+            summary = match self.call_with_retries(false, &[], &tx, &mut compression_attempts, api_calls).await {
                 Ok(resp) => {
                     accumulate_usage(&mut total_usage, &self.usage_or_estimate(&[], &resp));
                     strip_think_blocks(&resp.content).trim().to_string()
@@ -3196,6 +3694,8 @@ impl Agent {
             self.close_interrupted_tool_sequence(&text);
             self.rag_auto_refresh();
             self.neurocode_auto_reindex(&tx).await;
+            self.boundary_cleanup_if_appropriate(&tx, &tools, &mut compression_attempts).await;
+            self.neurocode_memory_capture(turn_start_idx, true).await;
             let _ = tx.send(AgentEvent::Done {
                 final_text: text.clone(),
                 usage: total_usage.clone(),
@@ -3210,6 +3710,8 @@ impl Agent {
         }
         self.rag_auto_refresh();
         self.neurocode_auto_reindex(&tx).await;
+        self.boundary_cleanup_if_appropriate(&tx, &tools, &mut compression_attempts).await;
+        self.neurocode_memory_capture(turn_start_idx, false).await;
         let _ = tx.send(AgentEvent::AssistantMessage(summary.clone()));
         let _ = tx.send(AgentEvent::Done {
             final_text: summary.clone(),
@@ -4655,6 +5157,7 @@ mod tests {
         enabled: Vec<&str>,
     ) -> (Agent, tempfile::TempDir, tempfile::TempDir, joey_core::constants::HomeOverrideGuard)
     {
+        let _lock = crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = tempfile::tempdir().unwrap();
         let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
         let cwd = tempfile::tempdir().unwrap();
@@ -7280,6 +7783,199 @@ mod tests {
         let _ = guard;
     }
 
+    // ── Feature 027 (adaptive memory) tests — T011/T013 ────────────────
+
+    /// A recording MemoryRuntime: enabled, prefetch returns None, capture
+    /// clones every summary into a shared vec.
+    struct RecordingMemoryRuntime {
+        captured: Arc<Mutex<Vec<memory_hook::MemoryTurnSummary>>>,
+    }
+
+    impl memory_hook::MemoryRuntime for RecordingMemoryRuntime {
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn prefetch_block(&self, _prompt: &str) -> Option<String> {
+            None
+        }
+        fn capture_turn(&self, summary: &memory_hook::MemoryTurnSummary) {
+            self.captured.lock().unwrap().push(summary.clone());
+        }
+    }
+
+    /// T011: the success-exit path (plain final answer, no tool calls)
+    /// hands the memory runtime exactly ONE MemoryTurnSummary with
+    /// turn_error == false, the turn's user prompt, and a non-empty
+    /// assistant final.
+    #[tokio::test]
+    async fn capture_called_on_success_exit() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let config = rag_yaml_config(
+            home.path(),
+            "neurocode:\n  memory:\n    enabled: true\n",
+        );
+        let (mut agent, _transport) = rag_agent_at(
+            home.path(),
+            cwd.path(),
+            config,
+            vec![Ok(text_resp("all done, shipped it"))],
+        );
+        let captured: Arc<Mutex<Vec<memory_hook::MemoryTurnSummary>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        agent.set_memory_runtime(Some(Arc::new(RecordingMemoryRuntime {
+            captured: captured.clone(),
+        })));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = agent.run_turn("please fix the flaky test", tx).await;
+        assert_eq!(result.final_text, "all done, shipped it");
+        let summaries = captured.lock().unwrap().clone();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "exactly one capture on the success exit"
+        );
+        let s = &summaries[0];
+        assert!(!s.turn_error, "success exit reports turn_error == false");
+        assert!(
+            s.user_prompt.contains("please fix the flaky test"),
+            "user_prompt carries the turn's request: {:?}",
+            s.user_prompt
+        );
+        assert!(
+            !s.assistant_final.is_empty(),
+            "assistant_final is non-empty: {:?}",
+            s.assistant_final
+        );
+        let _ = guard;
+    }
+
+    /// T015: transport that sets the agent's cooperative interrupt flag and
+    /// then fails the provider call — Ctrl-C landing during the first API
+    /// request (the `SummaryInterruptTransport` pattern, wired to a
+    /// memory-enabled fixture).
+    struct InterruptingErrorTransport {
+        slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    }
+
+    #[async_trait]
+    impl Transport for InterruptingErrorTransport {
+        async fn complete(&self, _req: &ProviderRequest) -> Result<NormalizedResponse, ProviderError> {
+            if let Some(flag) = self.slot.lock().unwrap().as_ref() {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Err(ProviderError::ServerError("ctrl-c during request".to_string()))
+        }
+        async fn stream(
+            &self,
+            req: &ProviderRequest,
+            _tx: mpsc::UnboundedSender<StreamEvent>,
+        ) -> Result<NormalizedResponse, ProviderError> {
+            self.complete(req).await
+        }
+    }
+
+    /// T015: a turn that ends INTERRUPTED (interrupt flag set during the
+    /// provider call — `TurnAbort::Interrupted`) still hands the memory
+    /// runtime exactly ONE summary, flagged turn_error == true.
+    #[tokio::test]
+    async fn capture_flags_interrupted_exit_as_error() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let config = rag_yaml_config(
+            home.path(),
+            "neurocode:\n  memory:\n    enabled: true\n",
+        );
+        let (mut agent, _transport) = rag_agent_at(home.path(), cwd.path(), config, vec![]);
+        let captured: Arc<Mutex<Vec<memory_hook::MemoryTurnSummary>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        agent.set_memory_runtime(Some(Arc::new(RecordingMemoryRuntime {
+            captured: captured.clone(),
+        })));
+        // Wire the interrupt-setting transport to the agent's real handle.
+        let slot: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+        let transport = Arc::new(InterruptingErrorTransport { slot: slot.clone() });
+        agent.set_transport_for_tests(transport);
+        *slot.lock().unwrap() = Some(agent.interrupt_handle());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = agent.run_turn("please fix the flaky test", tx).await;
+        assert!(result.interrupted, "turn must surface as interrupted");
+        assert!(!result.fatal, "interrupt is not a fatal provider error");
+        let summaries = captured.lock().unwrap().clone();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "exactly one capture on the interrupted exit"
+        );
+        assert!(
+            summaries[0].turn_error,
+            "interrupted exit reports turn_error == true"
+        );
+        let _ = guard;
+    }
+
+    /// T015: a turn with one write-class tool round (a `write_file` call
+    /// carrying a `path` argument) followed by a plain final answer captures
+    /// that path in files_touched and the tool name in tools_used.
+    #[tokio::test]
+    async fn capture_collects_files_touched_from_write_tools() {
+        let _l = lock();
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let config = rag_yaml_config(
+            home.path(),
+            "neurocode:\n  memory:\n    enabled: true\n",
+        );
+        let (mut agent, _transport) = rag_agent_at(
+            home.path(),
+            cwd.path(),
+            config,
+            vec![
+                Ok(tool_resp(
+                    vec![ToolCall::new(
+                        "c1",
+                        "write_file",
+                        r#"{"path":"/tmp/t015-demo.rs"}"#,
+                    )],
+                    FinishReason::ToolCalls,
+                )),
+                Ok(text_resp("wrote the file, all good")),
+            ],
+        );
+        let captured: Arc<Mutex<Vec<memory_hook::MemoryTurnSummary>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        agent.set_memory_runtime(Some(Arc::new(RecordingMemoryRuntime {
+            captured: captured.clone(),
+        })));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = agent.run_turn("write the demo file", tx).await;
+        assert_eq!(result.final_text, "wrote the file, all good");
+        let summaries = captured.lock().unwrap().clone();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "exactly one capture after the final answer"
+        );
+        let s = &summaries[0];
+        assert_eq!(
+            s.files_touched,
+            vec!["/tmp/t015-demo.rs".to_string()],
+            "files_touched contains exactly the write_file path: {:?}",
+            s.files_touched
+        );
+        assert!(
+            s.tools_used.contains(&"write_file".to_string()),
+            "tools_used contains the tool name: {:?}",
+            s.tools_used
+        );
+        let _ = guard;
+    }
+
     mod steer_tests {
         use super::*;
 
@@ -7606,5 +8302,986 @@ mod tests {
             2,
             "tool call + interrupted summary — no summary retry after abort"
         );
+    }
+
+    // ── Feature 028 (T007): state-block tail injection ──────────────────
+
+    /// Register the real Todo tool on a fixture agent (dispatch resolves
+    /// against the full registry, not the enabled list). Returns the agent.
+    fn fixture_with_todo(
+        script: Vec<Result<NormalizedResponse, ProviderError>>,
+        max_turns: usize,
+        api_max_retries: usize,
+    ) -> Fixture {
+        let mut fx = fixture(script, max_turns, api_max_retries, None);
+        fx.agent.registry.register(Arc::new(joey_tools::tools::todo_tool::Todo));
+        fx
+    }
+
+    /// Seed todos for "test-session" (fixture ToolContext session id).
+    async fn seed_todos(agent: &Agent, contents: &[(&str, &str)]) {
+        let items: Vec<Value> = contents
+            .iter()
+            .enumerate()
+            .map(|(i, (content, status))| {
+                json!({"id": format!("{}", i + 1), "content": content, "status": status})
+            })
+            .collect();
+        agent
+            .registry
+            .dispatch(
+                "todo",
+                json!({"todos": items, "merge": false}),
+                &agent.ctx,
+            )
+            .await;
+    }
+
+    /// Restore the process-global todo store for "test-session" (replace
+    /// with an empty list) so seeded items never leak into sibling tests.
+    async fn clear_todos(agent: &Agent) {
+        agent
+            .registry
+            .dispatch("todo", json!({"todos": [], "merge": false}), &agent.ctx)
+            .await;
+    }
+
+    /// The rendered state block message in a request, if any.
+    fn state_block_message(req: &ProviderRequest) -> Option<String> {
+        req.messages
+            .iter()
+            .rev()
+            .find(|m| {
+                m.role == "user"
+                    && m.content.as_deref().map(|c| c.starts_with("[STATE BLOCK")).unwrap_or(false)
+            })
+            .and_then(|m| m.content.clone())
+    }
+
+    /// The block is appended to the request tail and NEVER persisted into
+    /// history (FR-005).
+    #[tokio::test]
+    async fn state_block_present_in_request_absent_from_history() {
+        let _l = lock();
+        let mut fx = fixture_with_todo(vec![Ok(text_resp("done"))], 5, 3);
+        seed_todos(
+            &fx.agent,
+            &[
+                ("alpha task T007a", "completed"),
+                ("beta task T007a", "in_progress"),
+            ],
+        )
+        .await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("hello", tx).await;
+        assert_eq!(fx.transport.request_count(), 1);
+        let block = state_block_message(&fx.transport.request(0)).expect("state block in request");
+        assert!(block.starts_with("[STATE BLOCK"));
+        assert!(block.contains("TASKS:"));
+        assert!(block.contains("[>] beta task T007a"));
+        assert!(block.contains("PROGRESS: turn 1 of"));
+        assert!(
+            !fx.agent.history.iter().any(|m| {
+                m.content.as_deref().map(|c| c.contains("[STATE BLOCK")).unwrap_or(false)
+            }),
+            "state block must never be persisted into history"
+        );
+        clear_todos(&fx.agent).await;
+    }
+
+    /// With `state_block.enabled: false` the request is byte-identical to the
+    /// pre-feature request (byte-for-byte non-regression when disabled).
+    #[tokio::test]
+    async fn state_block_disabled_request_byte_identical() {
+        let _l = lock();
+        // fixture() hardcodes Config::defaults(); build the disabled-config
+        // variant manually, copying fixture()'s body with a yaml Config.
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let config_path = home.path().join("config.yaml");
+        std::fs::write(&config_path, "state_block:\n  enabled: false\n").unwrap();
+        let config = Config::load_from(config_path).unwrap();
+        assert!(!config.state_block_enabled());
+        let ctx = ToolContext::new(cwd.path().to_path_buf(), config, "test-session");
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let agent_config = AgentConfig {
+            model: "test-model".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: None,
+            max_turns: 5,
+            api_max_retries: 3,
+            tool_delay: 0.0,
+            reasoning: None,
+            enabled_tools: vec!["echo".to_string()],
+            max_tokens: None,
+            stream: false,
+            pass_session_id: false,
+            model_pinned: false,
+        };
+        let mut agent = Agent::new(agent_config, registry, ctx).expect("agent");
+        let transport = ScriptedTransport::new(vec![Ok(text_resp("ok"))]);
+        agent.set_transport_for_tests(transport.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _ = agent.run_turn("hello", tx).await;
+        assert_eq!(transport.request_count(), 1);
+        let req = transport.request(0);
+        assert!(
+            !req.messages.iter().any(|m| {
+                m.content.as_deref().map(|c| c.contains("[STATE BLOCK")).unwrap_or(false)
+            }),
+            "disabled state block must not appear in the request"
+        );
+        // Byte-identical: the request messages are exactly the history (the
+        // single user message). take_pending_images_into returns
+        // Message::user(text) when no images are queued (plain text).
+        assert_eq!(req.messages.len(), 1);
+        // history[0] is the user message (history also holds the final
+        // assistant reply after the turn; the request only ever saw the
+        // prefix that existed at build time).
+        assert_eq!(agent.history[0].role, "user");
+        assert_eq!(agent.history[0].content.as_deref(), Some("hello"));
+        let got = serde_json::to_string(&req.messages[0]).unwrap();
+        let want = serde_json::to_string(&agent.history[0]).unwrap();
+        assert_eq!(got, want, "request messages must be byte-identical to history");
+    }
+
+    /// Retries within one turn reuse the identical block (composite dedupe
+    /// key); a loop-iteration advance re-renders with a fresh ordinal.
+    #[tokio::test]
+    async fn state_block_retry_identical_within_turn() {
+        let _l = lock();
+        let mut fx = fixture_with_todo(vec![], 5, 3);
+        fx.agent.history.push(Message::user("hello"));
+        seed_todos(
+            &fx.agent,
+            &[
+                ("alpha task T007c", "completed"),
+                ("beta task T007c", "in_progress"),
+            ],
+        )
+        .await;
+        let tools = fx.agent.tool_schemas();
+        let r1 = fx.agent.build_request(&tools, 1, None);
+        let r2 = fx.agent.build_request(&tools, 1, None);
+        let b1 = state_block_message(&r1).expect("block in r1");
+        let b2 = state_block_message(&r2).expect("block in r2");
+        assert_eq!(b1, b2, "same turn ordinal must reuse the identical block");
+        let r3 = fx.agent.build_request(&tools, 2, None);
+        let b3 = state_block_message(&r3).expect("block in r3");
+        assert!(b3.contains("PROGRESS: turn 2 of"));
+        clear_todos(&fx.agent).await;
+    }
+
+    /// Ordering guard: no state block when the history tail is an unresolved
+    /// tool result (provider message-ordering safety, FR-005 edge case).
+    #[tokio::test]
+    async fn state_block_guard_skips_on_tool_result_tail() {
+        let _l = lock();
+        let mut fx = fixture_with_todo(vec![], 5, 3);
+        fx.agent.history.push(Message::user("hello"));
+        fx.agent
+            .history
+            .push(Message::tool_result("call_1", "todo", "raw result"));
+        seed_todos(&fx.agent, &[("alpha task T007d", "in_progress")]).await;
+        let tools = fx.agent.tool_schemas();
+        let r = fx.agent.build_request(&tools, 2, None);
+        assert!(
+            state_block_message(&r).is_none(),
+            "no state block may follow an unresolved tool result"
+        );
+        clear_todos(&fx.agent).await;
+    }
+
+    /// A new user turn re-renders (fresh todos) and the block carries the
+    /// scratchpad pointer when entries exist.
+    #[tokio::test]
+    async fn state_block_new_turn_rerenders_and_scratchpad_pointer() {
+        let _l = lock();
+        let mut fx = fixture_with_todo(vec![Ok(text_resp("a")), Ok(text_resp("b"))], 5, 3);
+        fx.agent
+            .registry
+            .register(Arc::new(joey_tools::tools::scratchpad_tool::Scratchpad));
+        seed_todos(&fx.agent, &[("first task T007e", "in_progress")]).await;
+        fx.agent
+            .registry
+            .dispatch(
+                "scratchpad",
+                json!({"action": "append", "text": "found path=/x id=7 T007e", "label": "f"}),
+                &fx.agent.ctx,
+            )
+            .await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("first question", tx).await;
+        let block1 =
+            state_block_message(&fx.transport.request(0)).expect("block in first request");
+        assert!(block1.contains("SCRATCHPAD:"));
+        assert!(block1.contains("1 entries"));
+        assert!(block1.contains("scratchpads"));
+        // Replace todos, then a NEW user turn must show the fresh items.
+        seed_todos(&fx.agent, &[("fresh task T007e", "pending")]).await;
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("second question", tx2).await;
+        let block2 =
+            state_block_message(&fx.transport.request(1)).expect("block in second request");
+        assert!(block2.contains("fresh task T007e"));
+        clear_todos(&fx.agent).await;
+    }
+
+    // ── Feature 028 (T008): mid-turn tool-result hygiene sweep ─────────
+
+    /// fixture() variant with a YAML config (T007 disabled-config pattern).
+    /// Registers the real Todo tool (for clear_todos cleanup) but keeps the
+    /// enabled set to `echo` only.
+    #[allow(clippy::too_many_arguments)]
+    fn fixture_yaml(
+        script: Vec<Result<NormalizedResponse, ProviderError>>,
+        max_turns: usize,
+        api_max_retries: usize,
+        yaml: &str,
+    ) -> Fixture {
+        let home = tempfile::tempdir().unwrap();
+        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let config_path = home.path().join("config.yaml");
+        std::fs::write(&config_path, yaml).unwrap();
+        let config = Config::load_from(config_path).unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf(), config, "test-session");
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        registry.register(Arc::new(joey_tools::tools::todo_tool::Todo));
+        let config = AgentConfig {
+            model: "test-model".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: None,
+            max_turns,
+            api_max_retries,
+            tool_delay: 0.0,
+            reasoning: None,
+            enabled_tools: vec!["echo".to_string()],
+            max_tokens: None,
+            stream: false,
+            pass_session_id: false,
+            model_pinned: false,
+        };
+        let mut agent = Agent::new(config, registry, ctx).expect("agent");
+        let transport = ScriptedTransport::new(script);
+        agent.set_transport_for_tests(transport.clone());
+        Fixture { agent, transport, _home: home, _cwd: cwd, _guard: guard }
+    }
+
+    /// A >200-char tool-result body (uniquely prefixed per call site),
+    /// padded past 60k chars so the rough estimator lands mid-band.
+    fn big_tool_output(prefix: &str) -> String {
+        let mut s = String::new();
+        while s.len() < 60_000 {
+            s.push_str(prefix);
+            s.push_str(" padding 0123456789 abcdefghijklmnopqrstuvwxyz\n");
+        }
+        s
+    }
+
+    /// A.1: pre-tail tool results are rewritten oldest-first to the exact
+    /// compressor pass-2 one-liners (computed independently here); the
+    /// protected tail stays verbatim.
+    #[tokio::test]
+    async fn hygiene_tail_verbatim_and_oldest_first() {
+        let _l = lock();
+        let mut fx = fixture_yaml(vec![], 5, 3, "compression:\n  protect_last_n: 2\n");
+        let big_a = big_tool_output("[terminal alpha]");
+        let big_b = big_tool_output("[read_file beta]");
+        let big_c = big_tool_output("[tail gamma]");
+        fx.agent.history.push(Message::user("first question"));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("c0", "terminal", r#"{"command":"ls -la /tmp"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("c0", "terminal", &big_a));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("c1", "read_file", r#"{"path":"/tmp/x.rs"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("c1", "read_file", &big_b));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("c2", "terminal", r#"{"command":"pwd"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("c2", "terminal", &big_c));
+        // len 7, protect_last_n 2 -> boundary 5: t0 (idx 2) and t1 (idx 4)
+        // are pre-tail; t2 (idx 6) is protected.
+        let swept = fx.agent.hygiene_sweep_tool_results();
+        assert_eq!(swept, 2);
+        assert_eq!(
+            fx.agent.history[2].content.as_deref(),
+            Some(
+                compression::compressor::summarize_tool_result(
+                    "terminal",
+                    r#"{"command":"ls -la /tmp"}"#,
+                    &big_a
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            fx.agent.history[4].content.as_deref(),
+            Some(
+                compression::compressor::summarize_tool_result(
+                    "read_file",
+                    r#"{"path":"/tmp/x.rs"}"#,
+                    &big_b
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(fx.agent.history[6].content.as_deref(), Some(big_c.as_str()));
+        clear_todos(&fx.agent).await;
+    }
+
+    /// A.2: identical tool results — detection scans the FULL history
+    /// newest-first, so the newer copy claims the content (even inside the
+    /// protected tail) and the OLDER pre-tail copy collapses to the
+    /// duplicate marker.
+    #[tokio::test]
+    async fn hygiene_dedup_collapses_identical_results() {
+        let _l = lock();
+        let mut fx = fixture_yaml(vec![], 5, 3, "compression:\n  protect_last_n: 2\n");
+        let big = big_tool_output("[identical]");
+        fx.agent.history.push(Message::user("first question"));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("c0", "terminal", r#"{"command":"grep x /tmp/a"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("c0", "terminal", &big));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("c1", "terminal", r#"{"command":"grep x /tmp/b"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("c1", "terminal", &big));
+        // len 5, protect 2 -> boundary 3: older copy (idx 2) pre-tail,
+        // newer copy (idx 4) inside the protected tail.
+        let swept = fx.agent.hygiene_sweep_tool_results();
+        assert_eq!(swept, 1);
+        assert_eq!(
+            fx.agent.history[2].content.as_deref(),
+            Some("[Duplicate tool output — same content as a more recent call]")
+        );
+        assert_eq!(fx.agent.history[4].content.as_deref(), Some(big.as_str()));
+        clear_todos(&fx.agent).await;
+    }
+
+    /// A.3: a second sweep rewrites nothing (one-liners and the duplicate
+    /// marker are below the 200-char bar / already claimed).
+    #[tokio::test]
+    async fn hygiene_idempotent() {
+        let _l = lock();
+        let mut fx = fixture_yaml(vec![], 5, 3, "compression:\n  protect_last_n: 2\n");
+        let big_a = big_tool_output("[idem alpha]");
+        let big_b = big_tool_output("[idem beta]");
+        fx.agent.history.push(Message::user("first question"));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("c0", "terminal", r#"{"command":"ls /tmp"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("c0", "terminal", &big_a));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("c1", "read_file", r#"{"path":"/tmp/y.rs"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("c1", "read_file", &big_b));
+        // len 5, protect 2 -> boundary 3: only idx 2 is pre-tail (idx 4 is
+        // protected) -> the first sweep rewrites exactly one result.
+        assert_eq!(fx.agent.hygiene_sweep_tool_results(), 1);
+        assert_eq!(fx.agent.hygiene_sweep_tool_results(), 0);
+        clear_todos(&fx.agent).await;
+    }
+
+    /// B.4: inside the mid-turn band (>= midturn_threshold x context, <
+    /// threshold_tokens) the sweep fires during run_turn WITHOUT real
+    /// compaction: one-liner only, no summary/marker, no CompressionStart.
+    #[tokio::test]
+    async fn hygiene_fires_in_band_without_compaction_marker() {
+        let _l = lock();
+        // context_length 100000 -> threshold_tokens floors to 75k;
+        // midturn_threshold 0.10 -> band floor 10k. Two ~60k-char tool
+        // bodies ≈ 30k+ rough tokens: inside [10k, 75k).
+        let mut fx = fixture_yaml(
+            vec![Ok(text_resp("done"))],
+            5,
+            3,
+            "compression:\n  protect_last_n: 2\n  midturn_threshold: 0.10\nmodel:\n  context_length: 100000\n",
+        );
+        let big_a = big_tool_output("[band terminal]");
+        let big_b = big_tool_output("[band read]");
+        let term_args = r#"{"command":"ls -la /tmp"}"#;
+        fx.agent.history.push(Message::user("first question"));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("c0", "terminal", term_args)],
+        ));
+        fx.agent.history.push(Message::tool_result("c0", "terminal", &big_a));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("c1", "read_file", r#"{"path":"/tmp/z.rs"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("c1", "read_file", &big_b));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("next question", tx).await;
+        assert_eq!(fx.transport.request_count(), 1);
+        let expected =
+            compression::compressor::summarize_tool_result("terminal", term_args, &big_a);
+        assert!(expected.len() < 300, "one-liner must stay a single short line");
+        // History: old tool result rewritten in place, tail verbatim.
+        assert_eq!(fx.agent.history[2].content.as_deref(), Some(expected.as_str()));
+        assert_eq!(fx.agent.history[4].content.as_deref(), Some(big_b.as_str()));
+        // The outgoing request carries the one-liner.
+        let req = fx.transport.request(0);
+        assert!(req.messages.iter().any(|m| m.content.as_deref() == Some(expected.as_str())));
+        // FR-007: distinguishable from real compaction — no summary prefix,
+        // no compaction marker anywhere in the request.
+        for m in &req.messages {
+            if let Some(c) = m.content.as_deref() {
+                assert!(!c.contains(compression::SUMMARY_PREFIX.as_str()));
+                assert!(!c.contains(compression::COMPACTION_STATUS_MARKER));
+            }
+        }
+        // No CompressionStart event fired.
+        let events = drain(&mut rx);
+        assert!(
+            !events.iter().any(|ev| matches!(ev, AgentEvent::CompressionStart { .. })),
+            "hygiene sweep must not emit CompressionStart"
+        );
+        clear_todos(&fx.agent).await;
+    }
+
+    /// B.5: with `compression.midturn_tool_hygiene: false` the old tool
+    /// content is byte-identical verbatim after run_turn (byte-for-byte
+    /// non-regression when disabled).
+    #[tokio::test]
+    async fn hygiene_disabled_history_byte_identical() {
+        let _l = lock();
+        let mut fx = fixture_yaml(
+            vec![Ok(text_resp("done"))],
+            5,
+            3,
+            "compression:\n  protect_last_n: 2\n  midturn_threshold: 0.10\n  midturn_tool_hygiene: false\nmodel:\n  context_length: 100000\n",
+        );
+        let big_a = big_tool_output("[off terminal]");
+        let big_b = big_tool_output("[off read]");
+        fx.agent.history.push(Message::user("first question"));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("c0", "terminal", r#"{"command":"ls -la /tmp"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("c0", "terminal", &big_a));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("c1", "read_file", r#"{"path":"/tmp/w.rs"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("c1", "read_file", &big_b));
+        let saved_old = big_a.clone();
+        let saved_new = big_b.clone();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("next question", tx).await;
+        assert_eq!(fx.transport.request_count(), 1);
+        assert_eq!(
+            fx.agent.history[2].content.as_deref(),
+            Some(saved_old.as_str()),
+            "disabled hygiene must leave old tool content byte-identical"
+        );
+        assert_eq!(fx.agent.history[4].content.as_deref(), Some(saved_new.as_str()));
+        clear_todos(&fx.agent).await;
+    }
+
+    // ── Feature 028 (T009): boundary-aligned cleanup ──────────────────
+
+    use compression::compressor::ContextCompressor;
+
+    /// Boundary fire test 1: todos all completed + history pressure in the
+    /// boundary band [10k, 75k) → run_turn's exit path runs the compressor
+    /// exactly once (one compaction Notice, one summary message, one
+    /// compression attempt — compression_count 1).
+    #[tokio::test]
+    async fn boundary_fires_once_on_completion_in_band() {
+        let _l = lock();
+        let mut fx = fixture_yaml(
+            vec![Ok(text_resp("done"))],
+            5,
+            3,
+            "compression:\n  boundary_threshold: 0.10\n  protect_last_n: 2\n  midturn_tool_hygiene: false\nmodel:\n  context_length: 100000\n",
+        );
+        fx.agent
+            .set_summary_backend_for_tests(compression::test_support::ScriptedSummary::ok(
+                "## Goal\nscripted summary body",
+            ));
+        let big_1 = big_tool_output("[boundary fire one]");
+        let big_2 = big_tool_output("[boundary fire two]");
+        let big_3 = big_tool_output("[boundary fire three]");
+        // Compactable middle (loop_tests' seed_history shape): three ~15k-
+        // token tool bodies ≈ 45k rough tokens — inside the band [10k, 75k)
+        // and beyond the 15k tail budget, so the older ones fall inside the
+        // compression window (outside the protected head 3 / tail 2).
+        fx.agent.history.push(Message::user("first question"));
+        fx.agent.history.push(Message::assistant("earlier answer"));
+        fx.agent.history.push(Message::user("another question"));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("call_b1", "terminal", r#"{"command":"ls -la /tmp"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("call_b1", "terminal", &big_1));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("call_b2", "read_file", r#"{"path":"/tmp/b1.rs"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("call_b2", "read_file", &big_2));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("call_b3", "terminal", r#"{"command":"pwd"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("call_b3", "terminal", &big_3));
+        seed_todos(&fx.agent, &[("bc-done-1", "completed")]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("go", tx).await;
+        let events = drain(&mut rx);
+        // compress_context surfaces via Notice events (the loop's
+        // CompressionStart emitter is the post-tool-round site only), so a
+        // boundary fire is observable as exactly one compaction Notice.
+        let compaction_notices = events
+            .iter()
+            .filter(|ev| {
+                matches!(ev, AgentEvent::Notice(n) if n.contains(compression::COMPACTION_STATUS_MARKER))
+            })
+            .count();
+        assert_eq!(compaction_notices, 1, "events: {events:?}");
+        assert!(!events.iter().any(|ev| matches!(ev, AgentEvent::CompressionStart { .. })));
+        // Mirror of loop_tests' history_has_summary assertion.
+        assert!(
+            fx.agent.history.iter().any(|m| {
+                ContextCompressor::is_context_summary_content(&m.content.clone().unwrap_or_default())
+            }),
+            "compressed summary missing from history"
+        );
+        assert_eq!(fx.agent.compressor.compression_count, 1);
+        // The compacted transcript is strictly shorter than the 9-message
+        // pre-turn history + the 2 messages the turn itself added.
+        assert!(fx.agent.history.len() < 11);
+        clear_todos(&fx.agent).await;
+    }
+
+    /// Boundary test 2: one in_progress todo → no fire, old content verbatim.
+    #[tokio::test]
+    async fn boundary_never_fires_with_open_todos() {
+        let _l = lock();
+        let mut fx = fixture_yaml(
+            vec![Ok(text_resp("done"))],
+            5,
+            3,
+            "compression:\n  boundary_threshold: 0.10\nmodel:\n  context_length: 100000\n",
+        );
+        fx.agent
+            .set_summary_backend_for_tests(compression::test_support::ScriptedSummary::ok(
+                "## Goal\nscripted summary body",
+            ));
+        let big = big_tool_output("[boundary open]");
+        fx.agent.history.push(Message::user("first question"));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("call_b2", "terminal", r#"{"command":"ls -la /tmp"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("call_b2", "terminal", &big));
+        seed_todos(&fx.agent, &[("bc-open-1", "in_progress")]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("go", tx).await;
+        let events = drain(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| {
+                    matches!(ev, AgentEvent::Notice(n) if n.contains(compression::COMPACTION_STATUS_MARKER))
+                })
+                .count(),
+            0,
+            "events: {events:?}"
+        );
+        assert!(!events.iter().any(|ev| matches!(ev, AgentEvent::CompressionStart { .. })));
+        assert!(!fx.agent.history.iter().any(|m| {
+            ContextCompressor::is_context_summary_content(&m.content.clone().unwrap_or_default())
+        }));
+        // Old content byte-verbatim: the big tool body still contains its
+        // unique substring somewhere in history.
+        assert!(
+            fx.agent
+                .history
+                .iter()
+                .any(|m| m.content.as_deref().is_some_and(|c| c.contains("[boundary open]"))),
+            "old content must stay verbatim with open todos"
+        );
+        clear_todos(&fx.agent).await;
+    }
+
+    /// Boundary test 3: `compression.boundary_trigger: false` → exit paths
+    /// behave exactly as before (no fire despite complete todos + pressure).
+    #[tokio::test]
+    async fn boundary_disabled_exit_paths_untouched() {
+        let _l = lock();
+        let mut fx = fixture_yaml(
+            vec![Ok(text_resp("done"))],
+            5,
+            3,
+            "compression:\n  boundary_trigger: false\n  boundary_threshold: 0.10\nmodel:\n  context_length: 100000\n",
+        );
+        fx.agent
+            .set_summary_backend_for_tests(compression::test_support::ScriptedSummary::ok(
+                "## Goal\nscripted summary body",
+            ));
+        let big = big_tool_output("[boundary off]");
+        fx.agent.history.push(Message::user("first question"));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("call_b3", "terminal", r#"{"command":"ls -la /tmp"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("call_b3", "terminal", &big));
+        seed_todos(&fx.agent, &[("bc-off-1", "completed")]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("go", tx).await;
+        let events = drain(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| {
+                    matches!(ev, AgentEvent::Notice(n) if n.contains(compression::COMPACTION_STATUS_MARKER))
+                })
+                .count(),
+            0,
+            "events: {events:?}"
+        );
+        assert!(!events.iter().any(|ev| matches!(ev, AgentEvent::CompressionStart { .. })));
+        assert!(
+            fx.agent
+                .history
+                .iter()
+                .any(|m| m.content.as_deref().is_some_and(|c| c.contains("[boundary off]"))),
+            "old content must stay verbatim when boundary trigger is off"
+        );
+        clear_todos(&fx.agent).await;
+    }
+
+    /// Boundary test 4: an active compression-failure cooldown gates the
+    /// helper off. Direct unit-call style: seed the cooldown via the
+    /// compressor's test hook, invoke the helper, assert no fire and no
+    /// attempt increment.
+    #[tokio::test]
+    async fn boundary_respects_cooldown() {
+        let _l = lock();
+        let mut fx = fixture_yaml(
+            vec![],
+            5,
+            3,
+            "compression:\n  boundary_threshold: 0.10\nmodel:\n  context_length: 100000\n",
+        );
+        fx.agent
+            .set_summary_backend_for_tests(compression::test_support::ScriptedSummary::ok(
+                "## Goal\nscripted summary body",
+            ));
+        let big = big_tool_output("[boundary cooldown]");
+        fx.agent.history.push(Message::user("first question"));
+        fx.agent.history.push(Message::assistant_with_tools(
+            None,
+            vec![ToolCall::new("call_b4", "terminal", r#"{"command":"ls -la /tmp"}"#)],
+        ));
+        fx.agent.history.push(Message::tool_result("call_b4", "terminal", &big));
+        seed_todos(&fx.agent, &[("bc-cool-1", "completed")]).await;
+        // Far-future cooldown (production sets it on summary failure).
+        fx.agent
+            .compressor
+            .record_cooldown_for_tests(3_600.0, Some("simulated summary failure"));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut attempts: u32 = 0;
+        fx.agent.boundary_cleanup_if_appropriate(&tx, &[], &mut attempts).await;
+        assert_eq!(attempts, 0, "cooldown must block the attempt increment");
+        let events = drain(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| {
+                    matches!(ev, AgentEvent::Notice(n) if n.contains(compression::COMPACTION_STATUS_MARKER))
+                })
+                .count(),
+            0,
+            "events: {events:?}"
+        );
+        assert!(!fx.agent.history.iter().any(|m| {
+            ContextCompressor::is_context_summary_content(&m.content.clone().unwrap_or_default())
+        }));
+        clear_todos(&fx.agent).await;
+    }
+
+    /// Boundary test 5: pressure below the boundary floor → no fire.
+    #[tokio::test]
+    async fn boundary_below_threshold_no_fire() {
+        let _l = lock();
+        let mut fx = fixture_yaml(
+            vec![Ok(text_resp("done"))],
+            5,
+            3,
+            "compression:\n  boundary_threshold: 0.10\nmodel:\n  context_length: 100000\n",
+        );
+        fx.agent
+            .set_summary_backend_for_tests(compression::test_support::ScriptedSummary::ok(
+                "## Goal\nscripted summary body",
+            ));
+        fx.agent.history.push(Message::user("first question"));
+        fx.agent.history.push(Message::assistant("short answer"));
+        seed_todos(&fx.agent, &[("bc-low-1", "completed")]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _ = fx.agent.run_turn("go", tx).await;
+        let events = drain(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| {
+                    matches!(ev, AgentEvent::Notice(n) if n.contains(compression::COMPACTION_STATUS_MARKER))
+                })
+                .count(),
+            0,
+            "events: {events:?}"
+        );
+        assert!(!events.iter().any(|ev| matches!(ev, AgentEvent::CompressionStart { .. })));
+        assert!(!fx.agent.history.iter().any(|m| {
+            ContextCompressor::is_context_summary_content(&m.content.clone().unwrap_or_default())
+        }));
+        clear_todos(&fx.agent).await;
+    }
+
+    /// Boundary test 6 (T020 v2): boundary pressure includes tool-schema
+    /// tokens, mirroring the pre-API gate. Differential proof: a short
+    /// message-only history stays below the 10k boundary floor (Case B,
+    /// no fire), while the SAME history plus one fat tool schema (80k-char
+    /// description ≈ 20k rough tokens) crosses it (Case A, fire). Short
+    /// history → compress_context no-ops by design (min_for_compress); the
+    /// FIRE is the decision, proven by the attempt increment + the single
+    /// compaction-status Notice — compression_count/summary NOT asserted.
+    #[tokio::test]
+    async fn boundary_pressure_includes_tools_tokens() {
+        let _l = lock();
+        crate::verification::clear_all();
+        // Case A: tools included in the pressure estimate → fire.
+        let mut fx_a = fixture_yaml(
+            vec![],
+            5,
+            3,
+            "compression:\n  boundary_threshold: 0.10\n  midturn_tool_hygiene: false\nmodel:\n  context_length: 100000\n",
+        );
+        fx_a.agent.history.push(Message::user("q-bt-tools"));
+        fx_a.agent.history.push(Message::assistant("a-bt-tools"));
+        seed_todos(&fx_a.agent, &[("bt-tools-1", "completed")]).await;
+        let fat_tool = serde_json::from_value::<ToolSchema>(json!({
+            "type": "function",
+            "function": {
+                "name": "fat_tool",
+                "description": "x".repeat(80_000),
+                "parameters": {"type": "object", "properties": {}, "required": []}
+            }
+        }))
+        .unwrap();
+        let fat_tools = vec![fat_tool];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut attempts: u32 = 0;
+        fx_a
+            .agent
+            .boundary_cleanup_if_appropriate(&tx, &fat_tools, &mut attempts)
+            .await;
+        assert_eq!(attempts, 1, "tools tokens must push pressure over the boundary");
+        let events = drain(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| {
+                    matches!(ev, AgentEvent::Notice(n) if n.contains(compression::COMPACTION_STATUS_MARKER))
+                })
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        // Case B (differential): identical fixture, NO tools → message-only
+        // pressure stays below the floor → no fire.
+        let mut fx_b = fixture_yaml(
+            vec![],
+            5,
+            3,
+            "compression:\n  boundary_threshold: 0.10\n  midturn_tool_hygiene: false\nmodel:\n  context_length: 100000\n",
+        );
+        fx_b.agent.history.push(Message::user("q-bt-tools"));
+        fx_b.agent.history.push(Message::assistant("a-bt-tools"));
+        seed_todos(&fx_b.agent, &[("bt-tools-1", "completed")]).await;
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let mut attempts_b: u32 = 0;
+        fx_b
+            .agent
+            .boundary_cleanup_if_appropriate(&tx_b, &[], &mut attempts_b)
+            .await;
+        assert_eq!(attempts_b, 0, "message-only pressure must stay below the boundary");
+        let events_b = drain(&mut rx_b);
+        assert_eq!(
+            events_b
+                .iter()
+                .filter(|ev| {
+                    matches!(ev, AgentEvent::Notice(n) if n.contains(compression::COMPACTION_STATUS_MARKER))
+                })
+                .count(),
+            0,
+            "events: {events_b:?}"
+        );
+        clear_todos(&fx_a.agent).await;
+        clear_todos(&fx_b.agent).await;
+        crate::verification::clear_all();
+    }
+
+    // ── Feature 028 (T019): retrieval-verification nudge (FR-010) ──────
+    // Ledger hygiene: the verification ledger is process-global state
+    // separate from the HOME lock — clear_all() at start AND end keeps
+    // these tests from poisoning (or being poisoned by) sibling tests.
+
+    /// Direct helper level: retrieval (rag stash) + edited code paths →
+    /// nudge built with the retrieval reminder, count bumped, ledger fed.
+    #[tokio::test]
+    async fn verify_nudge_fires_with_retrieval_and_edits() {
+        let _l = lock();
+        crate::verification::clear_all();
+        let mut fx = fixture(vec![], 5, 3, None);
+        *fx.agent.rag_prefetch_context.lock().unwrap() = Some("prefetched".to_string());
+        let nudge = fx
+            .agent
+            .verify_nudge_decision(&["src/lib.rs".to_string()])
+            .expect("nudge");
+        assert!(nudge.contains("re-check retrieved facts"));
+        assert_eq!(fx.agent.verify_nudge_count, 1);
+        let cwd = fx.agent.ctx.cwd().display().to_string();
+        let q = crate::verification::verification_status("test-session", &cwd);
+        assert!(
+            q.changed_paths.contains(&"src/lib.rs".to_string()),
+            "ledger must be fed: {:?}",
+            q.changed_paths
+        );
+        crate::verification::clear_all();
+    }
+
+    /// No retrieval this turn (both stashes None on a fresh fixture) → no
+    /// nudge, no count bump, and not even a ledger write.
+    #[tokio::test]
+    async fn verify_nudge_absent_without_retrieval() {
+        let _l = lock();
+        crate::verification::clear_all();
+        let mut fx = fixture(vec![], 5, 3, None);
+        assert!(fx
+            .agent
+            .verify_nudge_decision(&["src/lib.rs".to_string()])
+            .is_none());
+        assert_eq!(fx.agent.verify_nudge_count, 0);
+        let cwd = fx.agent.ctx.cwd().display().to_string();
+        let q = crate::verification::verification_status("test-session", &cwd);
+        assert!(
+            q.changed_paths.is_empty(),
+            "ledger must stay untouched: {:?}",
+            q.changed_paths
+        );
+        crate::verification::clear_all();
+    }
+
+    /// Switch off via config (agent.retrieval_verification_nudge: false) →
+    /// no nudge even with retrieval + edits (FR-013 parity: zero change).
+    #[tokio::test]
+    async fn verify_nudge_absent_when_disabled() {
+        let _l = lock();
+        crate::verification::clear_all();
+        let mut fx = fixture_yaml(
+            vec![],
+            5,
+            3,
+            "agent:\n  retrieval_verification_nudge: false\n",
+        );
+        *fx.agent.rag_prefetch_context.lock().unwrap() = Some("prefetched".to_string());
+        assert!(fx
+            .agent
+            .verify_nudge_decision(&["src/lib.rs".to_string()])
+            .is_none());
+        assert_eq!(fx.agent.verify_nudge_count, 0);
+        let cwd = fx.agent.ctx.cwd().display().to_string();
+        let q = crate::verification::verification_status("test-session", &cwd);
+        assert!(q.changed_paths.is_empty());
+        crate::verification::clear_all();
+    }
+
+    /// Cap arithmetic: delivery cap MAX_VERIFY_NUDGES=3, but the underlying
+    /// build_verify_on_stop_nudge refuses attempts >= MAX_VERIFY_ATTEMPTS=2,
+    /// so counts 0 and 1 deliver a nudge while 2 and 3 do not.
+    #[tokio::test]
+    async fn verify_nudge_caps_respected() {
+        let _l = lock();
+        crate::verification::clear_all();
+        let mut fx = fixture(vec![], 5, 3, None);
+        *fx.agent.rag_prefetch_context.lock().unwrap() = Some("prefetched".to_string());
+        fx.agent.verify_nudge_count = 0;
+        assert!(fx.agent.verify_nudge_decision(&["src/lib.rs".to_string()]).is_some());
+        fx.agent.verify_nudge_count = 1;
+        assert!(fx.agent.verify_nudge_decision(&["src/lib.rs".to_string()]).is_some());
+        fx.agent.verify_nudge_count = 2;
+        assert!(fx.agent.verify_nudge_decision(&["src/lib.rs".to_string()]).is_none());
+        fx.agent.verify_nudge_count = 3;
+        assert!(fx.agent.verify_nudge_decision(&["src/lib.rs".to_string()]).is_none());
+        crate::verification::clear_all();
+    }
+
+    /// Wiring smoke through run_turn: a write_file round followed by a
+    /// final text response, with NO retrieval this turn → behavior
+    /// unchanged (no nudge in history, exactly one Done, final text kept).
+    ///
+    /// NOTE (brief fallback): the original "ledger fed" assertion is
+    /// unreachable by design — verify_nudge_decision returns before the
+    /// ledger write when retrieval is unused ("not even a ledger write",
+    /// FR-013 parity). The ledger feed itself is covered by
+    /// verify_nudge_fires_with_retrieval_and_edits above.
+    #[tokio::test]
+    async fn verify_nudge_integration_no_retrieval_turn_unchanged() {
+        let _l = lock();
+        crate::verification::clear_all();
+        let mut fx = fixture(
+            vec![
+                Ok(tool_resp(
+                    vec![ToolCall::new(
+                        "call_w",
+                        "write_file",
+                        &serde_json::to_string(
+                            &json!({"path": "nudge_src.rs", "content": "fn a(){}"}),
+                        )
+                        .unwrap(),
+                    )],
+                    FinishReason::ToolCalls,
+                )),
+                Ok(text_resp("done twice")),
+                Ok(text_resp("done final")),
+            ],
+            10,
+            3,
+            Some(Arc::new(joey_tools::tools::file_tools::WriteFile)),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = fx.agent.run_turn("edit please", tx).await;
+        assert!(!result.final_text.trim().is_empty());
+        let events = drain(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| matches!(ev, AgentEvent::Done { .. }))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(!fx.agent.history.iter().any(|m| {
+            m.text_content().contains("re-check retrieved facts")
+        }));
+        crate::verification::clear_all();
     }
 }

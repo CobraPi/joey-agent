@@ -238,7 +238,7 @@ fn v2_db_migrates_additively_with_data_intact() {
         assert_eq!(row_count(conn, table), 0, "{} not empty", table);
     }
 
-    // schema_meta bumped to v3.
+    // schema_meta bumped to the current schema version.
     let version: String = conn
         .query_row(
             "SELECT value FROM schema_meta WHERE key='neurocode_schema_version'",
@@ -247,7 +247,6 @@ fn v2_db_migrates_additively_with_data_intact() {
         )
         .unwrap();
     assert_eq!(version, NEUROCODE_SCHEMA_VERSION.to_string());
-    assert_eq!(NEUROCODE_SCHEMA_VERSION, 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +536,7 @@ fn migration_is_idempotent_on_double_open() {
         assert_eq!(row_count(conn, "code_artifacts"), 2);
         assert_eq!(row_count(conn, "graph_edges"), 1);
 
-        // Version still pinned exactly once at v3.
+        // Version still pinned exactly once at the current schema version.
         let (version, count): (String, i64) = conn
             .query_row(
                 "SELECT value, (SELECT COUNT(*) FROM schema_meta
@@ -547,7 +546,7 @@ fn migration_is_idempotent_on_double_open() {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, NEUROCODE_SCHEMA_VERSION.to_string());
         assert_eq!(count, 1);
     }
 }

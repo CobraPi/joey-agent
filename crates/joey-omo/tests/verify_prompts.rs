@@ -459,16 +459,63 @@ fn conductor_variants_carry_hard_rules_and_doctrine() {
             prompt.contains(".specify/feature.json"),
             "{name} conductor variant must carry step-detection procedure"
         );
-        for agent in [
-            "sisyphus", "hephaestus", "prometheus", "atlas", "oracle",
-            "librarian", "explore", "multimodal-looker", "metis", "momus",
-            "sisyphus-junior",
-        ] {
-            assert!(
-                prompt.contains(agent),
-                "{name} conductor variant must brief roster agent {agent}"
-            );
-        }
+        assert!(
+            prompt.contains("role:\"explorer\""),
+            "{name} conductor variant must brief role:\"explorer\""
+        );
+        assert!(
+            prompt.contains("role:\"implementor\""),
+            "{name} conductor variant must brief role:\"implementor\""
+        );
+        assert!(
+            !prompt.contains("subagent_type:\""),
+            "{name} conductor variant must not advertise subagent_type delegation"
+        );
+        assert!(
+            prompt.contains("NEVER delegate planning or decision making"),
+            "{name} conductor variant must ban delegating planning or decisions"
+        );
+    }
+}
+
+/// Post-FR-010 revision: the conductor roster is roles-only — every variant
+/// briefs exactly the two HyperCode roles and never names OMO agents.
+#[test]
+fn conductor_roster_is_roles_only() {
+    use joey_omo::agents::prompts::conductor;
+    for (name, prompt) in [
+        ("default", conductor::default()),
+        ("gpt", conductor::gpt()),
+        ("gpt_5_6", conductor::gpt_5_6()),
+    ] {
+        assert!(
+            prompt.contains("role:\"explorer\""),
+            "{name} conductor variant must brief role:\"explorer\""
+        );
+        assert!(
+            prompt.contains("role:\"implementor\""),
+            "{name} conductor variant must brief role:\"implementor\""
+        );
+        assert!(
+            prompt.contains("ONLY valid delegation targets"),
+            "{name} conductor variant must declare roles-only bench"
+        );
+        assert!(
+            !prompt.contains("subagent_type"),
+            "{name} conductor variant must not advertise subagent_type delegation"
+        );
+        assert!(
+            !prompt.contains("sisyphus"),
+            "{name} conductor variant must not name the sisyphus agent"
+        );
+        assert!(
+            !prompt.contains("atlas"),
+            "{name} conductor variant must not name the atlas agent"
+        );
+        assert!(
+            prompt.contains("NEVER delegate planning or decision making"),
+            "{name} variant must ban delegating planning or decisions"
+        );
     }
 }
 

@@ -205,6 +205,14 @@ const READ_SEARCH_TOOLS: &[&str] = &["read_file", "search_files"];
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Feature 028 (context economy): memoized per-tool serialized
+    /// definitions, built once at `register` time (the JSON fragment for a
+    /// tool instance is immutable). `definitions()` clones from this cache
+    /// instead of re-sanitizing + re-serializing every request.
+    definition_cache: BTreeMap<String, Value>,
+    /// Feature 028: monotonic counter bumped on every registry mutation —
+    /// observability handle proving cache invalidation on each mutation path.
+    mutations: u64,
 }
 
 impl ToolRegistry {
@@ -214,7 +222,11 @@ impl ToolRegistry {
 
     /// Register a tool, replacing any prior tool of the same name.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+        let name = tool.name().to_string();
+        let def = Self::serialize_definition(tool.as_ref());
+        self.tools.insert(name.clone(), tool);
+        self.definition_cache.insert(name, def);
+        self.mutations += 1;
     }
 
     /// Register every built-in tool.
@@ -241,6 +253,11 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    /// Feature 028: registry mutation count (incremented on every register).
+    pub fn mutations(&self) -> u64 {
+        self.mutations
+    }
+
     /// The emoji for a tool, defaulting to "⚡" when unset (registry.py:678-681).
     pub fn get_emoji(&self, name: &str) -> String {
         match self.get(name) {
@@ -256,6 +273,19 @@ impl ToolRegistry {
         crate::storage::resolve_threshold(name, registered)
     }
 
+    /// Feature 028: build the OpenAI function-definition JSON for one tool.
+    fn serialize_definition(tool: &dyn Tool) -> Value {
+        let schema = crate::sanitize::sanitize_parameters(tool.parameters());
+        json!({
+            "type": "function",
+            "function": {
+                "name": tool.name(),
+                "description": tool.description(),
+                "parameters": schema,
+            }
+        })
+    }
+
     /// The OpenAI tool-schema list for the given set of enabled tool names,
     /// filtered by each tool's TTL-cached `check` gate. Schemas are sanitized.
     pub fn definitions(&self, enabled: &[String], ctx: &ToolContext) -> Vec<Value> {
@@ -269,15 +299,12 @@ impl ToolRegistry {
             if !check_cached(tool.as_ref(), ctx) {
                 continue;
             }
-            let schema = crate::sanitize::sanitize_parameters(tool.parameters());
-            defs.push(json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name(),
-                    "description": tool.description(),
-                    "parameters": schema,
-                }
-            }));
+            defs.push(
+                self.definition_cache
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| Self::serialize_definition(tool.as_ref())),
+            );
         }
         defs
     }
@@ -388,6 +415,29 @@ mod tests {
         }
     }
 
+    struct Demo {
+        name: &'static str,
+        desc: &'static str,
+    }
+    #[async_trait]
+    impl Tool for Demo {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn toolset(&self) -> &str {
+            "test"
+        }
+        fn description(&self) -> &str {
+            self.desc
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::Text("ok".to_string())
+        }
+    }
+
     fn ctx() -> ToolContext {
         ToolContext::new(std::env::temp_dir(), joey_core::Config::defaults(), "t")
     }
@@ -424,5 +474,66 @@ mod tests {
     fn default_emoji() {
         let reg = ToolRegistry::new();
         assert_eq!(reg.get_emoji("missing"), "⚡");
+    }
+
+    #[test]
+    fn definition_cache_hit_returns_identical_bytes() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Demo {
+            name: "demo",
+            desc: "cache me",
+        }));
+        let enabled = vec!["demo".to_string()];
+        let d1 = reg.definitions(&enabled, &ctx());
+        let d2 = reg.definitions(&enabled, &ctx());
+        assert_eq!(
+            serde_json::to_string(&d1).unwrap(),
+            serde_json::to_string(&d2).unwrap()
+        );
+        let cloned = reg.clone();
+        let d3 = cloned.definitions(&enabled, &ctx());
+        assert_eq!(
+            serde_json::to_string(&d1).unwrap(),
+            serde_json::to_string(&d3).unwrap()
+        );
+    }
+
+    #[test]
+    fn definition_cache_invalidated_on_reregister() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Demo {
+            name: "demo",
+            desc: "first",
+        }));
+        let enabled = vec!["demo".to_string()];
+        let d1 = reg.definitions(&enabled, &ctx());
+        assert_eq!(d1[0]["function"]["description"], "first");
+        reg.register(Arc::new(Demo {
+            name: "demo",
+            desc: "second",
+        }));
+        let d2 = reg.definitions(&enabled, &ctx());
+        assert_eq!(d2[0]["function"]["description"], "second");
+        assert_eq!(reg.mutations(), 2);
+    }
+
+    #[test]
+    fn mutation_counter_increments_on_every_register() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Demo {
+            name: "a",
+            desc: "d",
+        }));
+        assert_eq!(reg.mutations(), 1);
+        reg.register(Arc::new(Demo {
+            name: "b",
+            desc: "d",
+        }));
+        assert_eq!(reg.mutations(), 2);
+        reg.register(Arc::new(Demo {
+            name: "c",
+            desc: "d",
+        }));
+        assert_eq!(reg.mutations(), 3);
     }
 }

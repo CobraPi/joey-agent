@@ -233,9 +233,8 @@ fn legacy_v2_graph_db_migrates_additively_with_data_preserved() {
         let graph = DependencyGraph::open(&db_path).unwrap();
         let conn = graph.store().conn();
 
-        // (1) version bumped to 3
-        assert_eq!(NEUROCODE_SCHEMA_VERSION, 3);
-        assert_eq!(schema_version(conn), "3");
+        // (1) version bumped to the current schema version (v4 as of feature 027)
+        assert_eq!(schema_version(conn), NEUROCODE_SCHEMA_VERSION.to_string());
 
         // (2) pre-existing v2 rows intact, values byte-identical
         assert_eq!(row_count(conn, "code_artifacts"), 2);
@@ -301,7 +300,8 @@ fn legacy_v2_graph_db_migrates_additively_with_data_preserved() {
     {
         let graph = DependencyGraph::open(&db_path).unwrap();
         let conn = graph.store().conn();
-        assert_eq!(schema_version(conn), "3");
+        // current schema version (v4 as of feature 027)
+        assert_eq!(schema_version(conn), NEUROCODE_SCHEMA_VERSION.to_string());
         assert_eq!(row_count(conn, "code_artifacts"), 2);
         assert_eq!(row_count(conn, "graph_edges"), 1);
         assert_eq!(row_count(conn, "patterns"), 1);
@@ -394,7 +394,8 @@ fn legacy_v1_style_db_also_reaches_v3() {
 
     let graph = DependencyGraph::open(&db_path).unwrap();
     let conn = graph.store().conn();
-    assert_eq!(schema_version(conn), "3");
+    // current schema version (v4 as of feature 027)
+    assert_eq!(schema_version(conn), NEUROCODE_SCHEMA_VERSION.to_string());
     assert_eq!(row_count(conn, "code_artifacts"), 1);
     // v1→v2 ALTER added the signature column (NULL until re-index)
     let sig: Option<String> = conn

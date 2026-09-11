@@ -304,6 +304,22 @@ fn neurocode_dispatch(args: &str, live_provider: Option<&str>) -> NeurocodeOutco
             ))
         }
 
+        // `/neurocode memory …` — adaptive-memory CLI (feature 027,
+        // T019+T020+T021, contracts/neurocode-memory-command.md): status/
+        // list/show/search/correct/delete/enable|disable over the
+        // per-project memory stores. Production delete-confirmation
+        // reads stdin (consent pattern); tests inject the decision
+        // through `memory_command_text`.
+        "memory" => {
+            let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            NeurocodeOutcome::Text(memory_command_text(
+                &parts[1..],
+                &mut config,
+                &project_root,
+                &mut |prompt| consent_confirm_stdin(prompt),
+            ))
+        }
+
         "patterns" => NeurocodeOutcome::Text(engine.patterns_text()),
 
         "anti-patterns" | "antipatterns" => {
@@ -2026,6 +2042,496 @@ fn help_text() -> String {
      \x20 domain remove <id>              Remove a domain source\n\
      \x20 --help                          Show this help message"
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// /neurocode memory (feature 027, T019+T020+T021,
+// contracts/neurocode-memory-command.md): status/list/show/search/correct/
+// delete/enable|disable over the per-project memory stores — the text-mode
+// adaptive-memory surface. Pattern of `consent_command_text` (injectable
+// confirm; production wires stdin).
+// ---------------------------------------------------------------------------
+
+use joey_neurocode::graph::project_graph_db_path;
+use joey_neurocode::memory::episodes::{EpisodeStore, MemoryEpisode};
+use joey_neurocode::memory::preferences::{MemoryPreference, PreferenceOrigin, PreferenceStore};
+use joey_neurocode_rag::config::{MemoryConfig, KEY_MEMORY_ENABLED};
+use joey_neurocode_rag::memory_search::{search_memory, MemorySearchRequest};
+
+/// Bounded recent-listing size for `memory list` (per section).
+const MEMORY_LIST_LIMIT: usize = 10;
+
+/// Usage line for the memory subcommand (this file's help style).
+const MEMORY_USAGE: &str = "Usage: /neurocode memory [status|list [episodes|preferences]|show <id>|search <text...>|correct <id> <text...>|delete <id> [--yes|-y]|enable|disable]";
+
+/// Cap a string at ~`n` chars (char-boundary safe) for list lines.
+fn memory_cap(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// Core `/neurocode memory` handler (contracts/
+/// neurocode-memory-command.md). `confirm` answers the interactive delete
+/// confirmation (injectable for tests; production wires stdin,
+/// `--yes`/`-y` skips it — mirroring `consent_command_text`).
+fn memory_command_text(
+    parts: &[&str],
+    config: &mut joey_core::Config,
+    project_root: &Path,
+    confirm: &mut dyn FnMut(&str) -> bool,
+) -> String {
+    let mem = MemoryConfig::load(config);
+    match parts.first().copied().unwrap_or("") {
+        "" | "status" => memory_status_text(&mem, project_root),
+        "list" => memory_list_text(&parts[1..], project_root),
+        "show" => memory_show_text(&parts[1..], project_root),
+        "search" => memory_search_text(&mem, config, &parts[1..], project_root),
+        "correct" => memory_correct_text(&parts[1..], project_root),
+        "delete" => memory_delete_text(&parts[1..], project_root, confirm),
+        "enable" => memory_set_enabled_text(config, true),
+        "disable" => memory_set_enabled_text(config, false),
+        other => format!("Unknown memory action '{other}'.\n{MEMORY_USAGE}"),
+    }
+}
+
+/// Friendly line for subcommands that need a store when the project has
+/// no graph.db yet.
+fn memory_no_store_line(db: &Path) -> String {
+    format!(
+        "No memory store yet for this project ({} does not exist; it is \
+         created on first capture or /neurocode index).",
+        db.display()
+    )
+}
+
+/// Open the per-project stores, applying the schema first via `GraphStore`
+/// (idempotent) so the memory tables exist on any graph.db.
+fn memory_open_stores(
+    db: &Path,
+) -> Result<(GraphStore, EpisodeStore, PreferenceStore), String> {
+    let graph = GraphStore::open(db).map_err(|e| e.to_string())?;
+    let eps = EpisodeStore::open(db).map_err(|e| e.to_string())?;
+    let prefs = PreferenceStore::open(db).map_err(|e| e.to_string())?;
+    Ok((graph, eps, prefs))
+}
+
+/// `memory [status]` — overview: enabled state, episode count, active
+/// preference count, superseded count, unresolved explicit-conflict
+/// categories. Read/admin: works with memory disabled; a missing store is
+/// reported friendly, never as an error.
+fn memory_status_text(mem: &MemoryConfig, project_root: &Path) -> String {
+    let state = if mem.enabled { "enabled" } else { "disabled" };
+    let mut out = format!("Memory: {state}\n");
+    if !mem.enabled {
+        out.push_str("Enable with: /neurocode memory enable\n");
+    }
+    let db = project_graph_db_path(project_root);
+    if !db.exists() {
+        out.push_str(
+            "No memory store yet for this project \
+             (created on first capture with memory enabled).",
+        );
+        return out;
+    }
+    let (episodes, active, superseded, conflicts) = match memory_store_counts(&db) {
+        Ok(c) => c,
+        Err(e) => return format!("{out}Memory: cannot read the store ({e})."),
+    };
+    out.push_str(&format!(
+        "Episodes: {episodes}\nActive preferences: {active}\nSuperseded preferences: {superseded}\n"
+    ));
+    if conflicts.is_empty() {
+        out.push_str("Unresolved explicit conflicts: none");
+    } else {
+        out.push_str(&format!(
+            "Unresolved explicit conflicts: {}",
+            conflicts.join(", ")
+        ));
+    }
+    out
+}
+
+/// Counts for the status overview: episodes, active preferences,
+/// superseded preferences, and explicit-conflict categories (>= 2 active
+/// explicit rows in one category — the store's own surfacing query).
+fn memory_store_counts(db: &Path) -> rusqlite::Result<(usize, usize, usize, Vec<String>)> {
+    let graph = GraphStore::open(db)?;
+    let conn = graph.conn();
+    let episodes = EpisodeStore::open(db)?.count()?;
+    let prefs = PreferenceStore::open(db)?;
+    let active = prefs.count_active()?;
+    let superseded: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memory_preferences WHERE status = 'superseded'",
+        [],
+        |r| r.get(0),
+    )?;
+    let conflicts = prefs.explicit_conflict_categories()?;
+    Ok((episodes, active, superseded as usize, conflicts))
+}
+
+/// `memory list [episodes|preferences]` — bounded recent listing with
+/// ids, recency, and origin (episodes) / status (preferences). Bare
+/// `list` shows both sections.
+fn memory_list_text(parts: &[&str], project_root: &Path) -> String {
+    let which = parts.first().copied().unwrap_or("");
+    if which != "" && which != "episodes" && which != "preferences" {
+        return format!("Unknown memory list target '{which}'.\n{MEMORY_USAGE}");
+    }
+    let db = project_graph_db_path(project_root);
+    if !db.exists() {
+        return memory_no_store_line(&db);
+    }
+    let (graph, eps, _prefs) = match memory_open_stores(&db) {
+        Ok(s) => s,
+        Err(e) => return format!("Memory: cannot open the store ({e})."),
+    };
+    let mut out = String::new();
+    if which.is_empty() || which == "episodes" {
+        out.push_str(&format!("Recent episodes (up to {MEMORY_LIST_LIMIT}):\n"));
+        match eps.list_recent(MEMORY_LIST_LIMIT) {
+            Ok(rows) if rows.is_empty() => out.push_str("  (none)\n"),
+            Ok(rows) => {
+                for e in &rows {
+                    out.push_str(&format!(
+                        "  {}  {}  source={}  {}\n",
+                        e.id,
+                        e.created_at,
+                        e.source.as_str(),
+                        memory_cap(&e.title, 80)
+                    ));
+                }
+            }
+            Err(e) => return format!("Memory: cannot list episodes ({e})."),
+        }
+    }
+    if which.is_empty() || which == "preferences" {
+        out.push_str(&format!("Recent preferences (up to {MEMORY_LIST_LIMIT}):\n"));
+        // No list API on the preference store: recent rows (any status)
+        // via one raw query on the graph connection.
+        let conn = graph.conn();
+        let mut stmt = match conn.prepare(
+            "SELECT id, updated_at, origin, status, category, statement \
+             FROM memory_preferences ORDER BY updated_at DESC, id DESC LIMIT ?1",
+        ) {
+            Ok(s) => s,
+            Err(e) => return format!("Memory: cannot list preferences ({e})."),
+        };
+        let rows = match stmt.query_map(rusqlite::params![MEMORY_LIST_LIMIT as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        }) {
+            Ok(r) => r,
+            Err(e) => return format!("Memory: cannot list preferences ({e})."),
+        };
+        let mut count = 0usize;
+        for row in rows {
+            let (id, updated, origin, status, category, statement) = match row {
+                Ok(t) => t,
+                Err(e) => return format!("Memory: cannot list preferences ({e})."),
+            };
+            count += 1;
+            out.push_str(&format!(
+                "  {id}  {updated}  origin={origin} status={status}  {category}: {}\n",
+                memory_cap(&statement, 80)
+            ));
+        }
+        if count == 0 {
+            out.push_str("  (none)\n");
+        }
+    }
+    out
+}
+
+/// `memory show <id>` — full record: every episode field, or the
+/// preference with its evidence trail and supersedes/superseded_by.
+/// Resolution order: episode get first, else preference.
+fn memory_show_text(parts: &[&str], project_root: &Path) -> String {
+    let Some(id) = parts.first().copied().filter(|s| !s.is_empty()) else {
+        return format!("Memory show needs an id.\n{MEMORY_USAGE}");
+    };
+    let db = project_graph_db_path(project_root);
+    if !db.exists() {
+        return memory_no_store_line(&db);
+    }
+    let (_graph, eps, prefs) = match memory_open_stores(&db) {
+        Ok(s) => s,
+        Err(e) => return format!("Memory: cannot open the store ({e})."),
+    };
+    match eps.get(id) {
+        Ok(Some(e)) => return memory_episode_text(&e),
+        Ok(None) => {}
+        Err(e) => return format!("Memory: cannot read episodes ({e})."),
+    }
+    match prefs.get(id) {
+        Ok(Some(p)) => return memory_preference_text(&p),
+        Ok(None) => {}
+        Err(e) => return format!("Memory: cannot read preferences ({e})."),
+    }
+    format!("Memory: no episode or preference with id '{id}'.")
+}
+
+/// `memory search <text...>` — ranked matches over episodes +
+/// preferences via the rag crate's hybrid `search_memory` on the project
+/// graph.db connection. Capture-dependent view: reports "memory disabled"
+/// when the feature is off.
+fn memory_search_text(
+    mem: &MemoryConfig,
+    config: &joey_core::Config,
+    parts: &[&str],
+    project_root: &Path,
+) -> String {
+    if parts.is_empty() {
+        return format!("Memory search needs a query.\n{MEMORY_USAGE}");
+    }
+    if !mem.enabled {
+        return "Memory disabled — enable with /neurocode memory enable to search memory."
+            .to_string();
+    }
+    let db = project_graph_db_path(project_root);
+    if !db.exists() {
+        return memory_no_store_line(&db);
+    }
+    let graph = match GraphStore::open(&db) {
+        Ok(g) => g,
+        Err(e) => return format!("Memory: cannot open the store ({e})."),
+    };
+    let rag = RagConfig::load(config);
+    let req = MemorySearchRequest {
+        query: parts.join(" "),
+        top_k: mem.top_k.max(1) as usize,
+    };
+    match search_memory(graph.conn(), &rag, None, &req) {
+        Ok(hits) if hits.is_empty() => "Memory search: nothing matched.".to_string(),
+        Ok(hits) => {
+            let mut out = format!("Memory search results ({}):", hits.len());
+            for (i, h) in hits.iter().enumerate() {
+                out.push_str(&format!(
+                    "\n{}. [{}] {} — {}\n   {} (score {:.4}, {})",
+                    i + 1,
+                    h.item_kind,
+                    h.item_id,
+                    h.title,
+                    h.snippet,
+                    h.score,
+                    h.created_at
+                ));
+            }
+            out
+        }
+        Err(e) => format!("Memory search failed: {e}."),
+    }
+}
+
+/// `memory correct <id> <text...>` — user correction: a new EXPLICIT
+/// preference row superseding `<id>`. Episodes are immutable: correcting
+/// an episode id is an error with guidance.
+fn memory_correct_text(parts: &[&str], project_root: &Path) -> String {
+    let usage = format!("Memory correct needs an id and the new statement.\n{MEMORY_USAGE}");
+    let Some(id) = parts.first().copied().filter(|s| !s.is_empty()) else {
+        return usage;
+    };
+    let statement = parts[1..].join(" ");
+    if statement.trim().is_empty() {
+        return usage;
+    }
+    let db = project_graph_db_path(project_root);
+    if !db.exists() {
+        return memory_no_store_line(&db);
+    }
+    let (_graph, eps, prefs) = match memory_open_stores(&db) {
+        Ok(s) => s,
+        Err(e) => return format!("Memory: cannot open the store ({e})."),
+    };
+    match eps.get(id) {
+        Ok(Some(_)) => {
+            return format!(
+                "Memory correct: '{id}' is an episode — episodes are immutable; \
+                 corrections apply to preferences. \
+                 Use: /neurocode memory correct <preference-id> <text...>"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => return format!("Memory: cannot read episodes ({e})."),
+    }
+    let target = match prefs.get(id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return format!("Memory: no episode or preference with id '{id}'."),
+        Err(e) => return format!("Memory: cannot read preferences ({e})."),
+    };
+    match prefs.upsert(
+        &target.category,
+        &statement,
+        PreferenceOrigin::Explicit,
+        &[],
+        None,
+        Some(id),
+        None,
+    ) {
+        Ok(outcome) => {
+            if outcome.superseded_id.is_some() {
+                format!(
+                    "Memory corrected: preference {} (category '{}', explicit) \
+                     now supersedes {id}.",
+                    outcome.id, target.category
+                )
+            } else {
+                format!(
+                    "Memory corrected: preference {} (category '{}', explicit) \
+                     inserted; {id} was not active, nothing superseded.",
+                    outcome.id, target.category
+                )
+            }
+        }
+        Err(e) => format!("Memory correct failed: {e}."),
+    }
+}
+
+/// `memory delete <id> [--yes|-y]` — hard delete (row + vector) from
+/// whichever store owns the id; confirms via the consent-style prompt
+/// unless `--yes`/`-y` (mirrors `consent_command_text`'s flag handling).
+fn memory_delete_text(
+    parts: &[&str],
+    project_root: &Path,
+    confirm: &mut dyn FnMut(&str) -> bool,
+) -> String {
+    // T044 pattern: `--yes`/`-y` opts out of the interactive stdin
+    // confirmation (TUI-operable path).
+    let assume_yes = parts.iter().any(|p| *p == "--yes" || *p == "-y");
+    let id = parts
+        .iter()
+        .find(|p| !matches!(**p, "--yes" | "-y"))
+        .copied()
+        .unwrap_or("");
+    if id.is_empty() {
+        return format!("Memory delete needs an id.\n{MEMORY_USAGE}");
+    }
+    let db = project_graph_db_path(project_root);
+    if !db.exists() {
+        return memory_no_store_line(&db);
+    }
+    let (_graph, eps, prefs) = match memory_open_stores(&db) {
+        Ok(s) => s,
+        Err(e) => return format!("Memory: cannot open the store ({e})."),
+    };
+    // Episode get first, else preference (same resolution order as show).
+    match eps.get(id) {
+        Ok(Some(e)) => {
+            let prompt = format!(
+                "Delete this memory episode permanently?\n\n{} — {} ({}, {})\n\n\
+                 This is a HARD delete: the episode row and its vector are \
+                 removed and it will never reappear.",
+                e.id,
+                e.title,
+                e.kind.as_str(),
+                e.outcome.as_str()
+            );
+            if !assume_yes && !confirm(&prompt) {
+                return "Memory delete: confirmation declined — nothing deleted.".to_string();
+            }
+            return match eps.delete(id) {
+                Ok(true) => format!("Memory deleted: episode {id} (row + vector removed)."),
+                Ok(false) => {
+                    format!("Memory: no episode or preference with id '{id}'.")
+                }
+                Err(e) => format!("Memory delete failed: {e}."),
+            };
+        }
+        Ok(None) => {}
+        Err(e) => return format!("Memory: cannot read episodes ({e})."),
+    }
+    match prefs.get(id) {
+        Ok(Some(p)) => {
+            let prompt = format!(
+                "Delete this memory preference permanently?\n\n{}: {} ({}, {}, confidence {}%)\n\n\
+                 This is a HARD delete: the preference row and its vector are \
+                 removed and it will never reappear.",
+                p.category,
+                p.statement,
+                p.origin.as_str(),
+                p.status.as_str(),
+                p.confidence
+            );
+            if !assume_yes && !confirm(&prompt) {
+                return "Memory delete: confirmation declined — nothing deleted.".to_string();
+            }
+            return match prefs.delete(id) {
+                Ok(true) => format!("Memory deleted: preference {id} (row + vector removed)."),
+                Ok(false) => {
+                    format!("Memory: no episode or preference with id '{id}'.")
+                }
+                Err(e) => format!("Memory delete failed: {e}."),
+            };
+        }
+        Ok(None) => {}
+        Err(e) => return format!("Memory: cannot read preferences ({e})."),
+    }
+    format!("Memory: no episode or preference with id '{id}'.")
+}
+
+/// `memory enable|disable` — persist `neurocode.memory.enabled`.
+fn memory_set_enabled_text(config: &mut joey_core::Config, value: bool) -> String {
+    let action = if value { "enable" } else { "disable" };
+    match config.set_and_save(KEY_MEMORY_ENABLED, if value { "true" } else { "false" }) {
+        Ok(()) => format!(
+            "Memory {action}d — neurocode.memory.enabled={} (saved).",
+            if value { "true" } else { "false" }
+        ),
+        Err(e) => format!("Memory {action} failed: {e}."),
+    }
+}
+
+/// Full-record text for one episode (every persisted field).
+fn memory_episode_text(e: &MemoryEpisode) -> String {
+    let evidence = if e.evidence_ids.is_empty() {
+        "none".to_string()
+    } else {
+        e.evidence_ids.join(", ")
+    };
+    format!(
+        "Episode {}\nkind: {}\ntitle: {}\ntask: {}\ncontext: {}\napproach: {}\noutcome: {}\nlessons: {}\nsource: {}\norigin_run: {}\nevidence: {}\ncreated: {}\nupdated: {}",
+        e.id,
+        e.kind.as_str(),
+        e.title,
+        e.task,
+        e.context,
+        e.approach,
+        e.outcome.as_str(),
+        e.lessons,
+        e.source.as_str(),
+        e.origin_run,
+        evidence,
+        e.created_at,
+        e.updated_at,
+    )
+}
+
+/// Full-record text for one preference: statement + evidence trail +
+/// supersedes/superseded_by.
+fn memory_preference_text(p: &MemoryPreference) -> String {
+    let evidence = if p.evidence_ids.is_empty() {
+        "none".to_string()
+    } else {
+        p.evidence_ids.join(", ")
+    };
+    format!(
+        "Preference {}\ncategory: {}\nstatement: {}\norigin: {}\nstatus: {}\nconfidence: {}%\nevidence: {}\nsupersedes: {}\nsuperseded_by: {}\ncreated: {}\nupdated: {}",
+        p.id,
+        p.category,
+        p.statement,
+        p.origin.as_str(),
+        p.status.as_str(),
+        p.confidence,
+        evidence,
+        p.supersedes.as_deref().unwrap_or("none"),
+        p.superseded_by.as_deref().unwrap_or("none"),
+        p.created_at,
+        p.updated_at,
+    )
 }
 
 #[cfg(test)]
@@ -4382,6 +4888,263 @@ pub(crate) mod production_wiring_tests {
             .unwrap();
         assert_eq!(n, 0, "deleted file's rows purged");
         assert!(chunk_rows(project.path()).0 < chunks_before);
+    }
+}
+
+#[cfg(test)]
+mod memory_command_tests {
+    use super::*;
+
+    use joey_neurocode::memory::episodes::{
+        EpisodeKind, EpisodeOutcome, EpisodeSource,
+    };
+    use joey_neurocode::memory::preferences::PreferenceOrigin as Origin;
+
+    /// JOEY_HOME pinned to a temp dir under the shared override lock (same
+    /// guard shape the sibling test modules use) so the per-project graph
+    /// lands in a temp home.
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn pinned_home() -> HomeGuard {
+        let lock = joey_core::constants::TEST_HOME_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("JOEY_HOME");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("JOEY_HOME", dir.path());
+        HomeGuard { prev, _lock: lock, _dir: dir }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("JOEY_HOME", v),
+                None => std::env::remove_var("JOEY_HOME"),
+            }
+        }
+    }
+
+    /// A default (memory-disabled) config against the pinned temp home.
+    fn disabled_config() -> joey_core::Config {
+        joey_core::Config::load().unwrap_or_else(|_| joey_core::Config::defaults())
+    }
+
+    /// A memory-enabled config against the pinned temp home (same
+    /// set-and-save path the `enable` subcommand uses).
+    fn enabled_config() -> joey_core::Config {
+        let mut c = disabled_config();
+        c.set_and_save(KEY_MEMORY_ENABLED, "true").unwrap();
+        c
+    }
+
+    /// Seed one episode directly through the store; returns its id.
+    fn seed_episode(project_root: &Path, title: &str, task: &str) -> String {
+        let db = project_graph_db_path(project_root);
+        let _graph = GraphStore::open(&db).unwrap(); // apply schema
+        let eps = EpisodeStore::open(&db).unwrap();
+        let episode = MemoryEpisode {
+            id: String::new(),
+            kind: EpisodeKind::Task,
+            title: title.to_string(),
+            task: task.to_string(),
+            context: String::new(),
+            approach: String::new(),
+            outcome: EpisodeOutcome::Success,
+            lessons: String::new(),
+            source: EpisodeSource::Interactive,
+            origin_run: "test-run".to_string(),
+            evidence_ids: Vec::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        eps.insert(&episode, None, 500).unwrap().unwrap()
+    }
+
+    /// Seed one explicit preference directly through the store; returns
+    /// its id.
+    fn seed_preference(project_root: &Path, category: &str, statement: &str) -> String {
+        let db = project_graph_db_path(project_root);
+        let _graph = GraphStore::open(&db).unwrap(); // apply schema
+        let prefs = PreferenceStore::open(&db).unwrap();
+        prefs
+            .upsert(category, statement, Origin::Explicit, &[], None, None, None)
+            .unwrap()
+            .id
+    }
+
+    /// Run `memory <args>` with a capturing confirm closure. Returns the
+    /// command text and every prompt the confirm callback received.
+    fn run_memory(
+        args: &[&str],
+        config: &mut joey_core::Config,
+        project_root: &Path,
+        answer: bool,
+    ) -> (String, Vec<String>) {
+        let mut prompts: Vec<String> = Vec::new();
+        let out = memory_command_text(args, config, project_root, &mut |p| {
+            prompts.push(p.to_string());
+            answer
+        });
+        (out, prompts)
+    }
+
+    #[test]
+    fn status_while_disabled_reports_disabled() {
+        let _g = pinned_home();
+        let project = tempfile::tempdir().unwrap();
+        let mut config = disabled_config();
+        // Bare `memory` and `status` both report disabled; neither panics
+        // (also with no store at all).
+        for args in [&[] as &[&str], &["status"] as &[&str]] {
+            let (out, prompts) = run_memory(args, &mut config, project.path(), false);
+            assert!(out.contains("Memory: disabled"), "{out}");
+            assert!(out.contains("enable"), "teaches enable: {out}");
+            assert!(prompts.is_empty(), "status never confirms");
+        }
+        // With a seeded store the counts still render (read/admin works
+        // while disabled per the contract).
+        seed_preference(project.path(), "naming", "prefer snake_case");
+        let (out, _) = run_memory(&["status"], &mut config, project.path(), false);
+        assert!(out.contains("Active preferences: 1"), "{out}");
+        assert!(out.contains("Unresolved explicit conflicts: none"), "{out}");
+    }
+
+    #[test]
+    fn usage_on_malformed_args() {
+        let _g = pinned_home();
+        let project = tempfile::tempdir().unwrap();
+        let mut config = disabled_config();
+        // Unknown sub-subcommand → usage text.
+        let (out, _) = run_memory(&["bogus"], &mut config, project.path(), false);
+        assert!(out.contains("Unknown memory action 'bogus'"), "{out}");
+        assert!(out.contains("Usage: /neurocode memory"), "{out}");
+        // `correct` on an episode id → immutable/preferences guidance.
+        let ep = seed_episode(project.path(), "Refactor module", "Refactor the auth module");
+        let (out, _) = run_memory(
+            &["correct", ep.as_str(), "new text"],
+            &mut config,
+            project.path(),
+            false,
+        );
+        assert!(out.contains("immutable"), "{out}");
+        assert!(out.contains("preferences"), "{out}");
+        assert!(!out.contains("Memory corrected"), "no write happened: {out}");
+        // `show` with no id → usage.
+        let (out, _) = run_memory(&["show"], &mut config, project.path(), false);
+        assert!(out.contains("Usage: /neurocode memory"), "{out}");
+    }
+
+    #[test]
+    fn delete_requires_confirmation_and_hard_deletes() {
+        let _g = pinned_home();
+        let project = tempfile::tempdir().unwrap();
+        let mut config = disabled_config();
+        let pr = seed_preference(project.path(), "naming", "prefer snake_case always");
+
+        // Declined confirmation ⇒ prompt shown, nothing deleted.
+        let (out, prompts) = run_memory(
+            &["delete", pr.as_str()],
+            &mut config,
+            project.path(),
+            false,
+        );
+        assert_eq!(prompts.len(), 1, "exactly one confirm prompt");
+        assert!(prompts[0].contains("HARD delete"), "prompt text: {}", prompts[0]);
+        assert!(out.contains("declined"), "{out}");
+        assert!(out.contains("nothing deleted"), "{out}");
+        let prefs = PreferenceStore::open(&project_graph_db_path(project.path())).unwrap();
+        assert!(prefs.get(&pr).unwrap().is_some(), "row still present");
+
+        // --yes skips the prompt and hard-deletes (SC-004).
+        let (out, prompts) = run_memory(
+            &["delete", pr.as_str(), "--yes"],
+            &mut config,
+            project.path(),
+            true,
+        );
+        assert!(prompts.is_empty(), "--yes must not prompt");
+        assert!(out.contains("Memory deleted: preference"), "{out}");
+        assert!(prefs.get(&pr).unwrap().is_none(), "row gone");
+
+        // Second delete → not-found; the row never reappears.
+        let (out, prompts) = run_memory(
+            &["delete", pr.as_str()],
+            &mut config,
+            project.path(),
+            true,
+        );
+        assert!(out.contains("no episode or preference with id"), "{out}");
+        assert_eq!(prompts.len(), 0, "nothing to confirm for a missing id");
+        let (out, _) = run_memory(&["show", pr.as_str()], &mut config, project.path(), false);
+        assert!(out.contains("no episode or preference with id"), "{out}");
+    }
+
+    #[test]
+    fn enable_persists_config() {
+        let _g = pinned_home();
+        let project = tempfile::tempdir().unwrap();
+        let mut config = disabled_config();
+        assert!(!MemoryConfig::load(&config).enabled, "default is off");
+
+        let (out, _) = run_memory(&["enable"], &mut config, project.path(), false);
+        assert!(out.contains("saved"), "{out}");
+        let reloaded = joey_core::Config::load().unwrap();
+        assert!(reloaded.get_bool(KEY_MEMORY_ENABLED, false), "key true after enable");
+        assert!(MemoryConfig::load(&reloaded).enabled);
+
+        let mut config = reloaded;
+        let (out, _) = run_memory(&["disable"], &mut config, project.path(), false);
+        assert!(out.contains("saved"), "{out}");
+        let reloaded = joey_core::Config::load().unwrap();
+        assert!(!reloaded.get_bool(KEY_MEMORY_ENABLED, true), "key false after disable");
+        assert!(!MemoryConfig::load(&reloaded).enabled);
+    }
+
+    #[test]
+    fn list_and_show_round_trip() {
+        let _g = pinned_home();
+        let project = tempfile::tempdir().unwrap();
+        let mut config = enabled_config();
+        let ep = seed_episode(
+            project.path(),
+            "Fix token validation",
+            "Fix the token validation edge case",
+        );
+        let pr = seed_preference(project.path(), "error-handling", "always log the failure cause");
+
+        // Bare list shows both sections with ids.
+        let (out, _) = run_memory(&["list"], &mut config, project.path(), false);
+        assert!(out.contains("Recent episodes"), "{out}");
+        assert!(out.contains(&ep), "episode id in list: {out}");
+        assert!(out.contains("Recent preferences"), "{out}");
+        assert!(out.contains(&pr), "preference id in list: {out}");
+        // Scoped lists still show their section.
+        let (out, _) = run_memory(&["list", "preferences"], &mut config, project.path(), false);
+        assert!(!out.contains("Recent episodes"), "{out}");
+        assert!(out.contains(&pr), "{out}");
+
+        // show <id> returns the full record for each kind.
+        let (out, _) = run_memory(&["show", ep.as_str()], &mut config, project.path(), false);
+        assert!(out.contains("Episode "), "{out}");
+        assert!(out.contains("kind: task"), "{out}");
+        assert!(out.contains("title: Fix token validation"), "{out}");
+        assert!(out.contains("task: Fix the token validation edge case"), "{out}");
+        assert!(out.contains("outcome: success"), "{out}");
+        assert!(out.contains("source: interactive"), "{out}");
+
+        let (out, _) = run_memory(&["show", pr.as_str()], &mut config, project.path(), false);
+        assert!(out.contains("Preference "), "{out}");
+        assert!(out.contains("category: error-handling"), "{out}");
+        assert!(out.contains("statement: always log the failure cause"), "{out}");
+        assert!(out.contains("origin: explicit"), "{out}");
+        assert!(out.contains("status: active"), "{out}");
+        assert!(out.contains("evidence: none"), "{out}");
+        assert!(out.contains("supersedes: none"), "{out}");
+        assert!(out.contains("superseded_by: none"), "{out}");
     }
 }
 

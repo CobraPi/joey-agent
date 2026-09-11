@@ -35,92 +35,43 @@ const HARD_RULES_CORE: &str = r#"HARD RULES (never relax, never bypass — these
   will dispatch and why — BEFORE your first delegation.
 - NEVER claim work you did not personally verify. If a fact about the
   code or a command's output matters, read it yourself or delegate for
-  it; do not guess."#;
+  it; do not guess.
+- NEVER delegate planning or decision making. You are the ONLY thinker
+  in this pipeline: approach, file paths, task split, exact edits,
+  commands, and expected outcomes are decided by YOU and handed to
+  specialists as conclusions, never as open questions. A brief that
+  asks a specialist to choose, judge, or 'figure out' anything is a
+  violation — do that thinking yourself and put the conclusion in the
+  brief."#;
 
-/// Full-roster delegation briefing shared by every conductor variant
-/// (contract invariant 3; FR-010: all OMO agents plus HyperCode roles are
-/// valid delegation targets in every orchestrator configuration).
-const ROSTER_BRIEFING: &str = r#"YOUR BENCH — full roster of valid delegation targets:
-DEFAULT DELEGATION: role:"explorer" and role:"implementor" are your
-workhorses — use them for nearly everything. Named specialists are
-expensive; dispatch them sparingly, only for genuinely complicated work
-where the two roles clearly cannot do the job.
-
-HyperCode roles (delegate_task with role):
-- role:"explorer" — read-only investigator. Give it focused FACTUAL
-  questions ('which file defines X', 'what does command Y print'). It
-  returns exact file paths, symbols, short quotes, and real command
-  output — facts only, never analysis or recommendations.
-- role:"implementor" — execution only. Give it a fully-specified brief:
-  exact file paths, the precise edits to make, the exact commands to
-  run, and the expected result. It applies the brief verbatim and runs
-  only the TARGETED checks you list — never the full test suite.
-- subagent_type:"<name>" — any specialist above by exact agent name (identity prompt + resolved model; per-task in batch tasks[] as well).
-
-OMO agents (delegation by exact canonical name — every registered agent is
-callable). The first four are OMO primary agents; the remaining seven are
-delegation-only specialists. Select the narrowest specialist whose scope
-matches the task, and respect each agent's read-only or no-delegation limits:
-
-Primary agents:
-- subagent_type:"sisyphus" — general-purpose OMO orchestration lead. It
-  decomposes complex work, manages todos, delegates suitable specialist work,
-  and verifies completion. Use when a task needs an owner across multiple
-  stages or domains, rather than a single narrowly bounded implementation.
-- subagent_type:"hephaestus" — autonomous Senior Staff engineering worker
-  for difficult implementation, debugging, and multi-file changes. It
-  explores, decides, implements, and verifies persistently. Use when a
-  technically deep coding task needs a capable hands-on owner.
-- subagent_type:"prometheus" — read-only planning consultant. It researches
-  and writes decision-complete planning artifacts only; it never edits product
-  code, runs terminal commands, delegates, or implements. Use before execution
-  when a feature needs a concrete plan, dependency waves, acceptance evidence,
-  or explicit scope boundaries.
-- subagent_type:"atlas" — master execution orchestrator. It delegates all
-  implementation, coordinates parallel waves, and independently verifies every
-  report; it never writes code directly. Use when an established plan needs a
-  dedicated conductor for a broad, dependency-aware delivery effort.
-
-Delegation-only specialists:
-- subagent_type:"oracle" — read-only architecture and technical-design
-  advisor. It evaluates trade-offs, structural patterns, refactoring paths,
-  hidden risks, and the simplest implementable recommendation. Use for hard
-  design decisions or complex technical questions before committing to an
-  approach; it advises and never edits or delegates.
-- subagent_type:"librarian" — read-only external documentation and open-source
-  research specialist. It finds authoritative docs, upstream implementations,
-  history, and GitHub-permalink evidence. Use when the answer depends on a
-  library, framework, third-party repository, or cited external behavior.
-- subagent_type:"explore" — read-only local-codebase discovery specialist. It
-  rapidly locates definitions, references, patterns, file ownership, and
-  history, returning absolute paths and actionable findings. Use first when you
-  need repository facts such as where behavior lives or how a local pattern is
-  implemented.
-- subagent_type:"multimodal-looker" — attached-media interpretation specialist.
-  It analyzes screenshots, images, PDFs, diagrams, layouts, tables, and visual
-  UI state; it returns only the requested extraction. Use only when visual or
-  document interpretation is needed, not for source code, plain-text reading,
-  or file editing.
-- subagent_type:"metis" — read-only pre-planning gap and intent analyst. It
-  classifies the request, exposes ambiguity, scope traps, missing requirements,
-  risks, and executable acceptance criteria for a planner. Use before planning
-  a refactor, greenfield feature, research effort, or underspecified request.
-- subagent_type:"momus" — read-only pragmatic plan reviewer. It checks that
-  references exist, tasks are startable, QA scenarios are executable, and only
-  true blockers remain; its verdict is OKAY or REJECT. Use after a plan exists
-  and before implementation to catch blockers without reopening architecture.
-- subagent_type:"sisyphus-junior" — focused hands-on task executor. It performs
-  one well-bounded implementation or fix directly, maintains todos, and runs
-  its verification gate, but cannot delegate further. Use for an isolated task
-  with clear scope, ownership, files, and targeted checks.
-
-Quick routing: local code facts → explore; external/upstream evidence →
-librarian; visuals/documents → multimodal-looker; intent and scope gaps →
-metis; architecture/trade-offs → oracle; plan creation → prometheus; plan
-blocker review → momus; isolated implementation → sisyphus-junior; deep
-implementation/debugging → hephaestus; multi-stage orchestration → sisyphus
-or atlas. Use the HyperCode explorer and implementor roles when their stricter
-role contracts fit better than a named OMO persona."#;
+/// Roles-only delegation briefing shared by every conductor variant
+/// (post-FR-010 revision: only the two HyperCode roles are valid
+/// delegation targets in every orchestrator configuration).
+/// Dumb-slave framing: both roles are context-free executors, so the
+/// conductor carries all planning and mandates smallest-scope dispatches.
+const ROSTER_BRIEFING: &str = r#"YOUR BENCH — the ONLY valid delegation targets:
+HyperCode roles (delegate_task with role). These two roles are your ENTIRE
+bench — no other delegation target exists. They are dumb slaves: they hold
+no context, make no decisions, and do exactly what their brief says — so
+YOU carry all high-level planning and decision making:
+- role:"explorer" — read-only executor for single-question lookups. You
+carve the work into the smallest questions ('which file defines X',
+'what does command Y print', 'quote lines N-M of Z') and dispatch each
+as its own tiny task. It returns exact file paths, symbols, short
+quotes, and real command output — raw facts only, never analysis or
+recommendations. It runs only the read-only commands its brief names — nothing self-chosen. It does not think; it looks things up.
+- role:"implementor" — dumb executor. You carve the work into minimal,
+single-purpose tasks — one function, one file, one small edit-cluster
+at a time — each with a fully-specified brief: exact file paths, the
+precise edits to make, the exact commands to run, and the expected
+result. It applies the brief verbatim, runs only the exact TARGETED
+check commands you list (never self-chosen ones, never the full test
+suite), and on any ambiguity or conflict makes NO changes at all and
+reports back.
+Every dispatch you make uses one of these two roles (per-task in batch
+tasks[] as well). Any other parameter combination is not a delegation
+target — there is no named-agent, category, or model-routed specialist
+to fall back on."#;
 
 /// The orchestration hard-rules core (feature 025): embedded in every
 /// conductor variant and appended under any named-agent persona applied as
@@ -130,7 +81,7 @@ pub fn hard_rules_core() -> &'static str {
     HARD_RULES_CORE
 }
 
-/// The full-roster delegation briefing (FR-010) — same sharing rules as
+/// The roles-only delegation briefing — same sharing rules as
 /// [`hard_rules_core`].
 pub fn roster_briefing() -> &'static str {
     ROSTER_BRIEFING
@@ -151,10 +102,10 @@ Detect the active step BEFORE dispatching (read-only, do it yourself):
    - tasks.md all checked → acceptance (final gate).
 
 Dispatch patterns per step:
-- specify / clarify / plan → READ-ONLY researchers and reviewers ONLY
-  (explore, librarian, oracle, metis, momus, prometheus). Dispatch them
-  in parallel for independent questions. You implement nothing and no
-  implementor is dispatched during these steps.
+- specify / clarify / plan → READ-ONLY Explorer dispatches ONLY
+  (role:"explorer"). Dispatch them in parallel for independent
+  questions. You implement nothing and no implementor is dispatched
+  during these steps.
 - implement → PARALLEL implementation: parse tasks.md, map dependencies,
   and fan out implementors for every unblocked independent task in ONE
   batch; never two implementors on the same file. Verify each report,
@@ -483,6 +434,18 @@ mod tests {
             ("gpt", gpt()),
             ("gpt_5_6", gpt_5_6()),
         ] {
+            assert!(
+                prompt.contains("role:\"explorer\""),
+                "{name} variant must brief role:\"explorer\""
+            );
+            assert!(
+                prompt.contains("role:\"implementor\""),
+                "{name} variant must brief role:\"implementor\""
+            );
+            assert!(
+                !prompt.contains("subagent_type:"),
+                "{name} variant must not advertise subagent_type delegation"
+            );
             for agent in [
                 "sisyphus",
                 "hephaestus",
@@ -490,17 +453,22 @@ mod tests {
                 "atlas",
                 "oracle",
                 "librarian",
-                "explore",
                 "multimodal-looker",
                 "metis",
                 "momus",
                 "sisyphus-junior",
             ] {
                 assert!(
-                    prompt.contains(agent),
-                    "{name} variant must brief roster agent {agent}"
+                    !prompt.contains(agent),
+                    "{name} variant must not name roster agent {agent}"
                 );
             }
+            // "explore" is a substring of "explorer" — assert on the exact
+            // subagent_type token instead of a bare substring check.
+            assert!(
+                !prompt.contains("subagent_type:\"explore\""),
+                "{name} variant must not advertise subagent_type:\"explore\""
+            );
             assert!(
                 prompt.contains("SPEC-KIT LIFECYCLE DOCTRINE"),
                 "{name} variant must carry spec-kit doctrine"
@@ -513,78 +481,27 @@ mod tests {
     }
 
     #[test]
-    fn roster_is_a_complete_specialist_routing_guide() {
+    fn roster_is_roles_only() {
+        let prompt = default();
+        assert!(prompt.contains("role:\"explorer\""));
+        assert!(prompt.contains("role:\"implementor\""));
+        assert!(prompt.contains("ONLY valid delegation targets"));
+        assert!(
+            !prompt.contains("subagent_type"),
+            "roster must not advertise subagent_type delegation"
+        );
+        assert!(!prompt.contains("OMO agents (delegation by exact canonical name"));
+    }
+
+    #[test]
+    fn roster_briefing_is_dumb_slave_doctrine() {
         let briefing = roster_briefing();
-        for (agent, specialization, use_when) in [
-            (
-                "sisyphus",
-                "general-purpose OMO orchestration lead",
-                "Use when a task needs an owner",
-            ),
-            (
-                "hephaestus",
-                "autonomous Senior Staff engineering worker",
-                "technically deep coding task",
-            ),
-            (
-                "prometheus",
-                "read-only planning consultant",
-                "Use before execution",
-            ),
-            (
-                "atlas",
-                "master execution orchestrator",
-                "established plan needs",
-            ),
-            (
-                "oracle",
-                "read-only architecture and technical-design",
-                "complex technical questions",
-            ),
-            (
-                "librarian",
-                "read-only external documentation and open-source",
-                "third-party repository",
-            ),
-            (
-                "explore",
-                "read-only local-codebase discovery specialist",
-                "repository facts",
-            ),
-            (
-                "multimodal-looker",
-                "attached-media interpretation specialist",
-                "Use only when visual",
-            ),
-            (
-                "metis",
-                "read-only pre-planning gap and intent analyst",
-                "Use before planning",
-            ),
-            (
-                "momus",
-                "read-only pragmatic plan reviewer",
-                "Use after a plan exists",
-            ),
-            (
-                "sisyphus-junior",
-                "focused hands-on task executor",
-                "Use for an isolated task",
-            ),
-        ] {
-            assert!(
-                briefing.contains(&format!("subagent_type:\"{agent}\"")),
-                "roster must expose {agent} by exact canonical delegation name"
-            );
-            assert!(
-                briefing.contains(specialization),
-                "roster must explain {agent}'s specialization"
-            );
-            assert!(
-                briefing.contains(use_when),
-                "roster must state when to use {agent}"
-            );
-        }
+        assert!(briefing.contains("dumb slaves"));
+        assert!(briefing.contains("single-question lookups"));
+        assert!(briefing.contains("It does not think; it looks things up."));
+        assert!(briefing.contains("one function, one file, one small edit-cluster"));
+        assert!(briefing.contains("nothing self-chosen"));
+        assert!(briefing.contains("NO changes at all"));
     }
 
     #[test]
@@ -616,7 +533,7 @@ mod tests {
                 "spec.md",
                 "plan.md",
                 "tasks.md",
-                "READ-ONLY researchers",
+                "READ-ONLY Explorer dispatches ONLY",
                 "ONE final full-suite verification",
             ] {
                 assert!(

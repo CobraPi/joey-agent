@@ -332,9 +332,17 @@ fn api_key_set_persists_to_env_not_config_yaml() {
         ".env must carry the value"
     );
 
-    // And it must NOT land in config.yaml.
+    // And the secret must NOT land in config.yaml. Since load-time
+    // materialization (joey-core config, "updated config file population"),
+    // a fresh load CREATES the load-path file containing the full defaults
+    // tree — the old "file never written" pin is stale; the contract that
+    // matters is that the routed secret value never appears in it.
     let yaml_body = read(&ctx._dir.path().join("does-not-exist.yaml"));
-    assert_eq!(yaml_body, "", "fresh config never wrote config.yaml");
+    assert!(
+        !yaml_body.contains("sk-neu...-123"),
+        "api_key value must never be materialized into config.yaml — got: {:?}",
+        yaml_body
+    );
 
     // The generic joey-core rule does NOT route dotted keys — document why
     // this module implements the routing at its own save/set layer.

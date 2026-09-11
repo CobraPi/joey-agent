@@ -246,6 +246,41 @@ Hybrid pipeline (`search::hybrid`, contracts/hybrid-search.md):
    `mode_reason` — the turn never hard-fails (FR-008). The exact-symbol-first
    guarantee and file-scope filters apply in both legs before fusion.
 
+## Memory retrieval leg (feature 027)
+
+Adaptive memory (spec 027; overview in
+[joey-neurocode.md](joey-neurocode.md)) is a second consumer of this crate's
+embedding machinery — reusing it, not forking it:
+
+- **Reuse story**: `search_memory` rides the same hybrid search entry
+  points; `embed_texts` runs on the configured `EmbeddingBackend` (consent
+  gate, profile identity, prefixes — all unchanged);
+  `index_memory_vector` writes through the same vector store;
+  `memory_dense_scan` reuses the exhaustive rayon cosine scan. One
+  embedding implementation, one BLOB codec, one scan — no memory-specific
+  duplicates.
+- **`memory://` synthetic ids**: memory vectors are keyed by synthetic
+  `memory://…` chunk ids inside `memory_vectors` (schema v4), so they can
+  never collide with `rag_chunks` ids.
+- **Namespace isolation**: memory rows live in their own namespace — a code
+  dense scan never returns memory rows, and the memory scan never returns
+  code chunks; the two retrieval surfaces stay disjoint.
+- **Degradation**: same philosophy as FR-008 — any embedding failure
+  degrades the memory leg (skipped for that turn, with a reason) and never
+  hard-fails the turn. With `neurocode.memory.enabled = false` the leg is
+  absent entirely (default-off, byte-identical parity).
+
+Config keys (`neurocode.memory.*` — feature-027 keys, NOT part of the
+pinned 18-key RAG contract):
+
+| Key | Default | Kind / notes |
+|---|---|---|
+| `neurocode.memory.enabled` | `false` | master switch; `false` = memory leg absent (default-off parity) |
+| `neurocode.memory.top_k` | `5` | retrieved memories per injected section |
+| `neurocode.memory.injection_char_limit` | `2048` | character cap on the injected memory block |
+| `neurocode.memory.max_episodes` | `500` | episode-store cap; oldest evicted first |
+| `neurocode.memory.distill_model` | `""` | provider model for distillation; empty = heuristic-only |
+
 ## Vector store
 
 Vectors are SQLite BLOBs in `rag_vectors`, written in the SAME transaction as

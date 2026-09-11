@@ -35,3 +35,14 @@ Active iff orchestration mode enabled AND OMO registry has ≥1 resolved agent (
 ## Compatibility
 
 Persona selection adds no configuration keys and changes no on-disk formats; with integration inactive the surface is byte-identical to today (FR-012).
+
+## Addendum: Roles-Only Delegation (post-FR-010 revision)
+
+The orchestrator persona's delegation surface is restricted to the two
+HyperCode roles — role:"explorer" and role:"implementor" — exclusively.
+Named-agent delegation (subagent_type), category routing, and any other
+model-routed specialist target are no longer advertised to, or accepted
+from, the orchestrator. The delegate_task tool enforces the same
+restriction at the parameter layer for orchestrator sessions. This
+addendum supersedes FR-010's full-roster briefing requirement for the
+orchestrator persona.

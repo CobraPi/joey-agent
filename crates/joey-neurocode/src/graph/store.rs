@@ -181,6 +181,52 @@ impl GraphStore {
             "#,
         )?;
 
+        // v3 → v4 additive migration (feature 027, NeuroCode Adaptive Memory):
+        // pure CREATE ... IF NOT EXISTS — an existing v3 DB opens unchanged and
+        // simply gains empty memory tables; re-running is a no-op.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS memory_episodes (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL CHECK (kind IN ('task','workstream')),
+              title TEXT NOT NULL,
+              task TEXT NOT NULL,
+              context TEXT NOT NULL DEFAULT '',
+              approach TEXT NOT NULL DEFAULT '',
+              outcome TEXT NOT NULL CHECK (outcome IN ('success','failure','partial')),
+              lessons TEXT NOT NULL DEFAULT '',
+              source TEXT NOT NULL CHECK (source IN ('interactive','hypercode')),
+              origin_run TEXT NOT NULL DEFAULT '',
+              evidence_ids TEXT NOT NULL DEFAULT '[]',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memory_preferences (
+              id TEXT PRIMARY KEY,
+              category TEXT NOT NULL,
+              statement TEXT NOT NULL,
+              origin TEXT NOT NULL CHECK (origin IN ('explicit','inferred')),
+              evidence_ids TEXT NOT NULL DEFAULT '[]',
+              status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded')),
+              supersedes TEXT,
+              superseded_by TEXT,
+              confidence INTEGER NOT NULL DEFAULT 50 CHECK (confidence BETWEEN 0 AND 100),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memory_vectors (
+              item_id TEXT PRIMARY KEY,
+              item_kind TEXT NOT NULL CHECK (item_kind IN ('episode','preference')),
+              dim INTEGER NOT NULL,
+              quantization TEXT NOT NULL CHECK (quantization IN ('f32','int8')),
+              vector BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS memory_episodes_created ON memory_episodes(created_at);
+            CREATE INDEX IF NOT EXISTS memory_preferences_status ON memory_preferences(status, category);
+            CREATE INDEX IF NOT EXISTS memory_vectors_kind ON memory_vectors(item_kind);
+            "#,
+        )?;
+
         // graph_edges
         conn.execute_batch(
             r#"

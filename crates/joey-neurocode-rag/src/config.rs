@@ -101,6 +101,20 @@ pub const KEY_TIMEOUT_SECS: &str = "neurocode.rag.timeout_secs";
 /// table).
 pub const KEY_COPILOT_MODEL: &str = "neurocode.rag.copilot.model";
 
+// ─── neurocode.memory.* keys (feature 027) ──────────────────────────────────
+
+/// Master switch for adaptive memory; `false` = feature fully inert
+/// (FR-010: byte-identical existing behavior).
+pub const KEY_MEMORY_ENABLED: &str = "neurocode.memory.enabled";
+/// Results per section (preferences AND episodes each return up to top_k).
+pub const KEY_MEMORY_TOP_K: &str = "neurocode.memory.top_k";
+/// Hard cap on the injected memory block, in chars; whole-entry truncation.
+pub const KEY_MEMORY_INJECTION_CHAR_LIMIT: &str = "neurocode.memory.injection_char_limit";
+/// Episode corpus cap; FIFO eviction beyond it.
+pub const KEY_MEMORY_MAX_EPISODES: &str = "neurocode.memory.max_episodes";
+/// Model for distillation; empty = NeuroCode economical tier.
+pub const KEY_MEMORY_DISTILL_MODEL: &str = "neurocode.memory.distill_model";
+
 /// Env var name `neurocode.rag.api_key` is persisted under (`.env`).
 /// Matches the contract example: `JOEY_NEUROCODE_RAG_API_KEY=***`.
 pub const ENV_API_KEY_NAME: &str = "JOEY_NEUROCODE_RAG_API_KEY";
@@ -129,6 +143,17 @@ pub const DEFAULT_REFRESH_MAX_FILES_PER_TURN: i64 = 50;
 pub const DEFAULT_REFRESH_MAX_BYTES_PER_TURN: i64 = 52428800;
 pub const DEFAULT_TIMEOUT_SECS: i64 = 30;
 pub const DEFAULT_COPILOT_MODEL: &str = "metis-1024-I16-Binary";
+pub const DEFAULT_MEMORY_ENABLED: bool = false;
+pub const DEFAULT_MEMORY_TOP_K: i64 = 5;
+pub const MEMORY_TOP_K_MIN: i64 = 1;
+pub const MEMORY_TOP_K_MAX: i64 = 20;
+pub const DEFAULT_MEMORY_INJECTION_CHAR_LIMIT: i64 = 2048;
+pub const MEMORY_INJECTION_CHAR_LIMIT_MIN: i64 = 256;
+pub const MEMORY_INJECTION_CHAR_LIMIT_MAX: i64 = 8192;
+pub const DEFAULT_MEMORY_MAX_EPISODES: i64 = 500;
+pub const MEMORY_MAX_EPISODES_MIN: i64 = 50;
+pub const MEMORY_MAX_EPISODES_MAX: i64 = 10000;
+pub const DEFAULT_MEMORY_DISTILL_MODEL: &str = "";
 
 // ─── Contract table ──────────────────────────────────────────────────────────
 
@@ -185,6 +210,16 @@ pub const RAG_CONFIG_KEYS: [RagKeySpec; 18] = [
     RagKeySpec::new(KEY_REFRESH_MAX_FILES_PER_TURN, RagValueKind::Int, "50"),
     RagKeySpec::new(KEY_REFRESH_MAX_BYTES_PER_TURN, RagValueKind::Int, "52428800"),
     RagKeySpec::new(KEY_TIMEOUT_SECS, RagValueKind::Int, "30"),
+];
+
+/// The 5-key `neurocode.memory.*` contract table
+/// (`specs/027-please-enhance-neurocode/contracts/neurocode-memory-config-keys.md`).
+pub const MEMORY_CONFIG_KEYS: [RagKeySpec; 5] = [
+    RagKeySpec::new(KEY_MEMORY_ENABLED, RagValueKind::Bool, "false"),
+    RagKeySpec::new(KEY_MEMORY_TOP_K, RagValueKind::Int, "5"),
+    RagKeySpec::new(KEY_MEMORY_INJECTION_CHAR_LIMIT, RagValueKind::Int, "2048"),
+    RagKeySpec::new(KEY_MEMORY_MAX_EPISODES, RagValueKind::Int, "500"),
+    RagKeySpec::new(KEY_MEMORY_DISTILL_MODEL, RagValueKind::Str, ""),
 ];
 
 // ─── Backend enum ────────────────────────────────────────────────────────────
@@ -387,6 +422,56 @@ impl RagConfig {
 }
 
 impl Default for RagConfig {
+    fn default() -> Self {
+        Self::load(&Config::defaults())
+    }
+}
+
+// ─── MemoryConfig (feature 027) ──────────────────────────────────────────────
+
+/// Typed view of the five `neurocode.memory.*` keys, loaded exactly the
+/// way [`RagConfig`] loads: dotted-path getters, documented clamps, no
+/// panics (invalid values clamp; `enabled` defaults to `false`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryConfig {
+    /// `neurocode.memory.enabled` (default `false`).
+    pub enabled: bool,
+    /// `neurocode.memory.top_k`, clamped 1–20 (default 5; per section).
+    pub top_k: i64,
+    /// `neurocode.memory.injection_char_limit`, clamped 256–8192 (default 2048).
+    pub injection_char_limit: i64,
+    /// `neurocode.memory.max_episodes`, clamped 50–10000 (default 500).
+    pub max_episodes: i64,
+    /// `neurocode.memory.distill_model` (default "" = economical tier).
+    pub distill_model: String,
+}
+
+impl MemoryConfig {
+    /// Load all five keys from `config`; ints clamp per the contract.
+    pub fn load(config: &Config) -> Self {
+        Self {
+            enabled: config.get_bool(KEY_MEMORY_ENABLED, DEFAULT_MEMORY_ENABLED),
+            top_k: clamp_i64(
+                config.get_i64(KEY_MEMORY_TOP_K, DEFAULT_MEMORY_TOP_K),
+                MEMORY_TOP_K_MIN,
+                MEMORY_TOP_K_MAX,
+            ),
+            injection_char_limit: clamp_i64(
+                config.get_i64(KEY_MEMORY_INJECTION_CHAR_LIMIT, DEFAULT_MEMORY_INJECTION_CHAR_LIMIT),
+                MEMORY_INJECTION_CHAR_LIMIT_MIN,
+                MEMORY_INJECTION_CHAR_LIMIT_MAX,
+            ),
+            max_episodes: clamp_i64(
+                config.get_i64(KEY_MEMORY_MAX_EPISODES, DEFAULT_MEMORY_MAX_EPISODES),
+                MEMORY_MAX_EPISODES_MIN,
+                MEMORY_MAX_EPISODES_MAX,
+            ),
+            distill_model: config.get_str(KEY_MEMORY_DISTILL_MODEL, DEFAULT_MEMORY_DISTILL_MODEL),
+        }
+    }
+}
+
+impl Default for MemoryConfig {
     fn default() -> Self {
         Self::load(&Config::defaults())
     }
