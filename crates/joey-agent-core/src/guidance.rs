@@ -66,6 +66,17 @@ When using a skill and finding it outdated, incomplete, or wrong, \
 patch it immediately with skill_manage(action='patch') — don't wait to be asked. \
 Skills that aren't maintained become liabilities.";
 
+/// Feature 028 (context economy): Joey-only guidance — NOT ported from
+/// upstream (see PORTING.md Joey-only additions ledger). Injected via the
+/// gated pattern in prompt.rs when the scratchpad tool is present and
+/// `agent.context_economy_guidance` is true.
+pub const CONTEXT_ECONOMY_GUIDANCE: &str = "Work economically with context: keep responses concise — your own output becomes future context. \
+Record discoveries (paths, identifiers, decisions, exact values) to the scratchpad \
+as you find them, before context pressure, so later cleanup is safe. \
+Cite pointers (file paths, ids) instead of pasting content you can re-read. \
+For broad noisy exploration, delegate to sub-agents and keep only their distilled \
+conclusions. Prefer targeted paginated reads (offset/limit) over whole-file loads.";
+
 /// Guidance for the `subagent_control` tool (feature 020, US3). Joey-side
 /// addition — no upstream counterpart; wording follows the delegation-tools
 /// contract (specs/020-async-delegation-control/contracts/delegation-tools.md).
@@ -287,6 +298,7 @@ mod tests {
             ("google", GOOGLE_MODEL_OPERATIONAL_GUIDANCE),
             ("cli", CLI_PLATFORM_HINT),
             ("skills-preamble", SKILLS_INDEX_PREAMBLE),
+            ("context-economy", CONTEXT_ECONOMY_GUIDANCE),
         ] {
             let scrubbed = text
                 .replace("Hermes Agent by Nous Research", "")
@@ -297,6 +309,14 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn context_economy_guidance_matches_contract() {
+        assert_eq!(
+            CONTEXT_ECONOMY_GUIDANCE,
+            "Work economically with context: keep responses concise — your own output becomes future context. Record discoveries (paths, identifiers, decisions, exact values) to the scratchpad as you find them, before context pressure, so later cleanup is safe. Cite pointers (file paths, ids) instead of pasting content you can re-read. For broad noisy exploration, delegate to sub-agents and keep only their distilled conclusions. Prefer targeted paginated reads (offset/limit) over whole-file loads."
+        );
     }
 
     #[test]

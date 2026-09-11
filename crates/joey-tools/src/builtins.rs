@@ -18,6 +18,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register(Arc::new(file_tools::SearchFiles));
     registry.register(Arc::new(terminal_tool::Terminal));
     registry.register(Arc::new(todo_tool::Todo));
+    registry.register(Arc::new(scratchpad_tool::Scratchpad));
     registry.register(Arc::new(memory_tool::Memory));
     registry.register(Arc::new(web_tools::WebSearch));
     registry.register(Arc::new(web_tools::WebExtract));

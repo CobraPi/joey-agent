@@ -33,69 +33,74 @@ subsystem you're working on:
    compression triggers/thresholds/protection, the full `AgentEvent`
    catalog, hooks integration inside the loop, tunables, and subagent
    wiring. Complements `agent-turn-loop.md`.
-5. [`tools.md`](tools.md) — the `Tool` trait, registry and dispatch
+5. [`context-economy.md`](context-economy.md) — the five default-on context
+   economy mechanisms (feature 028): session scratchpad tool, deterministic
+   state block, mid-turn tool-result hygiene, boundary-aligned cleanup, and
+   economy guidance + retrieval verification nudge; the 10 additive config
+   keys, byte-parity guarantees when disabled, and observability.
+6. [`tools.md`](tools.md) — the `Tool` trait, registry and dispatch
    semantics, the complete built-in tool inventory (17 always-on + 6
    conditional), the 18-toolset hierarchy with recursive includes,
    parallel-safe vs sequential dispatch, fuzzy patch matching, checkpoint
    VCS, and the sanitizer/guard layers.
-6. [`providers.md`](providers.md) — provider wire protocols, the provider
+7. [`providers.md`](providers.md) — provider wire protocols, the provider
    registry (10 profiles) and model routing
    (`model.provider`/`base_url`/API-key resolution), SSE streaming,
    retries/backoff and error classification, reasoning/thinking support
    per provider, tool-call wire formats, and the dynamic
    `joey-llm-selector` model allocator.
-7. [`browser.md`](browser.md) — browser automation (feature 016): the
+8. [`browser.md`](browser.md) — browser automation (feature 016): the
    `joey-browser` crate, CDP attach vs managed launch, the browser tool
    family, dedicated-tab discipline, snapshot/action semantics, overlay and
    settle policy, and the per-provider image-model keys.
-7. [`cli.md`](cli.md) — the `joey` binary's complete user-facing surface:
+9. [`cli.md`](cli.md) — the `joey` binary's complete user-facing surface:
    every subcommand and flag, exit codes, the REPL slash-command registry,
    setup wizard, and profiles.
-8. [`state-and-config.md`](state-and-config.md) — `joey-core`: layered
+10. [`state-and-config.md`](state-and-config.md) — `joey-core`: layered
    config (YAML + `.env` + env), ~80 meaningful config keys, `~/.joey`
    directory layout, the SQLite session store (schema v22, FTS5 search,
    non-destructive compaction), profiles, secret redaction, and logging.
-9. [`security.md`](security.md) — the consolidated security model: secret
+11. [`security.md`](security.md) — the consolidated security model: secret
    redaction, credential storage, threat scanning, untrusted-content
    wrapping, SSRF/URL safety, file guards, dangerous-command approvals,
    and the deliberate Anthropic-OAuth omission.
-10. [`orchestration.md`](orchestration.md) — subagent delegation
+12. [`orchestration.md`](orchestration.md) — subagent delegation
     (`delegate_task`, SubagentManager) and OMO multi-agent orchestration
     (11 agents, 11 categories, intent gating, goals/boulder/notepads,
     team mode), plus the OMO integration (feature 025): persona-aware
     orchestrator overlay, full-roster delegation, OMO-chain role model
     defaults. Subagents inherit the parent's NeuroCode engine (same
     graph.db; task-targeted context).
-11. [`cron.md`](cron.md) — the built-in scheduler: schedule kinds, job
+13. [`cron.md`](cron.md) — the built-in scheduler: schedule kinds, job
     store format, delivery targets, script jobs, and the `joey cron` CLI.
-12. [`mcp.md`](mcp.md) — the MCP stdio client: server configuration,
+14. [`mcp.md`](mcp.md) — the MCP stdio client: server configuration,
     `mcp__<server>__<tool>` naming, sanitization layers, and the
     `joey mcp` CLI.
-13. [`gateway.md`](gateway.md) — the messaging-platform-neutral spine:
+15. [`gateway.md`](gateway.md) — the messaging-platform-neutral spine:
     Platform enum, session keys, `PlatformAdapter` trait (no concrete
     adapters ship yet).
-14. [`tui.md`](tui.md) — the animated ratatui dashboard: views/panels,
+16. [`tui.md`](tui.md) — the animated ratatui dashboard: views/panels,
     activity-scaled animations, run modes.
-15. [`speckit-ui.md`](speckit-ui.md) — the SpecKit Visual UI backend:
+17. [`speckit-ui.md`](speckit-ui.md) — the SpecKit Visual UI backend:
     artifact parsing, workflow engine, HTTP/WS API, git-backed staging.
-16. [`HOOKS.md`](HOOKS.md) — `PreToolUse` hooks: shell-command hooks
+18. [`HOOKS.md`](HOOKS.md) — `PreToolUse` hooks: shell-command hooks
     configured in `config.yaml`, the JSON stdin contract, exit-code
     semantics (allow/deny/halt), and argument-rewriting via stdout.
-17. [`LSP.md`](LSP.md) — the Language Server Protocol integration: how to
+19. [`LSP.md`](LSP.md) — the Language Server Protocol integration: how to
     configure a language server per file type, and the `lsp_diagnostics` /
     `lsp_definition` / `lsp_references` / `lsp_symbols` tools that appear
     only when one is configured.
-18. [`speckit-workflow.md`](speckit-workflow.md) — the full spec-kit
+20. [`speckit-workflow.md`](speckit-workflow.md) — the full spec-kit
     lifecycle as native slash commands (`/speckit-specify` → … →
     `/speckit-implement`): real `.specify/` scripts for pre-flight,
     bundled skill workflows as agent turns, `/speckit-status` readiness.
-19. [`speckit-ui-launcher.md`](speckit-ui-launcher.md) — launch recipe for
+21. [`speckit-ui-launcher.md`](speckit-ui-launcher.md) — launch recipe for
     the SpecKit visual UI (`joey speckit`).
-20. [`copilot.md`](copilot.md) — native GitHub Copilot `.github/`
+22. [`copilot.md`](copilot.md) — native GitHub Copilot `.github/`
     integration: copilot-instructions.md / instructions / prompts / skills
     parsing, the `joey copilot` plugin installer, `/copilot` + `/<prompt>`
     slash commands, and `.github/mcp.json` merge semantics.
-21. [`features/README.md`](features/README.md) — per-crate feature
+23. [`features/README.md`](features/README.md) — per-crate feature
     reference — one deep-dive page per workspace crate (APIs, behaviors,
     configuration, defaults, testing).
 

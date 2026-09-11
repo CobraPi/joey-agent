@@ -17,6 +17,7 @@ pub mod image_model;
 pub mod loop_detection;
 pub mod memory_hook;
 pub mod prompt;
+pub mod state_block;
 pub mod threat_scan;
 pub mod verification;
 

@@ -1770,3 +1770,78 @@ Config keys (additive, `RAG_CONFIG_KEYS` pattern):
 **Disabled state is byte-identical**: with
 `neurocode.memory.enabled = false` (the default) no turn is captured,
 nothing is injected, and prompts/behavior are unchanged.
+
+## Feature 028 — Context Economy (Joey-only additions, date 2026-09-10)
+
+All additions are Joey-only (no upstream counterpart); upstream-verbatim
+strings untouched. Default-on with per-mechanism disable switches (FR-013);
+when-disabled byte parity asserted in tests (agent-core tests/parity.rs +
+inline agent.rs tests + joey-tools tests/parity.rs).
+
+1. CONTEXT_ECONOMY_GUIDANCE constant
+   (crates/joey-agent-core/src/guidance.rs) — Joey-only guidance text
+   injected via the gated prompt pattern (prompt.rs, gated on scratchpad
+   tool present + agent.context_economy_guidance). Wording pinned in
+   specs/028-please-create-feature/contracts/state-block-injection.md
+   §Guidance.
+2. State-block marker wording — "[STATE BLOCK — deterministic,
+   auto-maintained]" first line (crates/joey-agent-core/src/state_block.rs);
+   block appended as Message::user to the request CLONE ONLY at
+   build_request (never self.history, never persisted); dedupe key =
+   "{last user text}#{turn ordinal}" (neurocode last-user-text pattern
+   extended with the loop ordinal — retries within a model call reuse the
+   block; iteration advance re-renders with current PROGRESS). DEVIATION
+   NOTE: pure last-user-text keying was the contract's literal wording; the
+   composite key is a refinement (R3e wants the loop variable as the
+   PROGRESS numerator — pure keying would freeze PROGRESS at the first
+   ordinal); behavior remains within contract (retry-identical within turn,
+   re-render on new user text).
+3. PRUNED_TOOL_PLACEHOLDER reuse — hygiene sweep (US3) reuses
+   compressor.rs:173 "[Old tool output cleared to save context space]" and
+   summarize_tool_result pass-2 one-liners verbatim; dedup marker
+   "[Duplicate tool output — same content as a more recent call]" reused.
+   Detection scans full history newest-first; rewrites restricted to
+   pre-tail indices; session-store rows untouched.
+4. Ten additive config keys (crates/joey-core/src/config.rs
+   DEFAULT_CONFIG_YAML + named getters): scratchpad.enabled (true),
+   scratchpad.max_entry_chars (8000, clamp 1000..=64000),
+   state_block.enabled (true), state_block.max_chars (1200, clamp
+   200..=8000), compression.midturn_tool_hygiene (true),
+   compression.midturn_threshold (0.35, clamp 0.10..=0.45, kept <
+   compression.threshold), compression.boundary_trigger (true),
+   compression.boundary_threshold (0.35, clamp 0.10..=0.45),
+   agent.context_economy_guidance (true), agent.retrieval_verification_nudge
+   (true). Float thresholds convert to token counts at runtime (ratio ×
+   compressor.context_length, contracts/context-economy-config-keys.md
+   §Threshold semantics).
+5. Scratchpad tool (crates/joey-tools/src/tools/scratchpad_tool.rs) — new
+   builtin "scratchpad" (toolset "todo"), append/read/clear/stats actions;
+   storage ~/.joey/scratchpads/<sanitized-key>-<fnv1a-hex8>/scratchpad.md
+   (append-only Markdown, atomic writes, flock sibling lock); redaction via
+   joey_core::redact::redact_secrets before persist; CORE_TOOLS additive
+   append "scratchpad" (feature-016 additive-verbs precedent) so default
+   toolsets enable it; gated by check() when scratchpad.enabled=false. pub
+   cross-crate fns stats()/path()/entries() (todo_tool::current precedent).
+6. ToolRegistry definition memoization (crates/joey-tools/src/registry.rs)
+   — per-tool serialized definitions cached at register() time (immutable
+   per tool instance); mutation counter for observability; wire output
+   byte-identical (asserted).
+7. Boundary cleanup (US4) — boundary_cleanup_if_appropriate at all 10
+   run_turn exit sites; gated on todos all-complete-or-empty +
+   boundary_threshold band + cooldown clear + shared turn-local
+   compression_attempts budget; compress_context reused unchanged (0.50
+   backstop intact).
+8. Retrieval-verification nudge (US5) — additive wrapper
+   build_verify_on_stop_nudge_with_retrieval + RetrievalUsage in
+   verification.rs (base fn signature unchanged, constitution VII); one
+   appended line when rag-prefetch or neurocode cold-mode used the turn
+   and agent.retrieval_verification_nudge is on; existing caps preserved.
+
+Also note the test-infrastructure findings for future implementors: host
+EDR SIGKILLs test binaries under ./target — run cargo with
+CARGO_TARGET_DIR=/tmp/joey-agent-target (verified workaround);
+process-global test surfaces (home override, check() TTL cache,
+todo/scratchpad stores, verification ledger) require
+lock()/invalidate_check_cache()/unique session ids in tests (two
+pre-existing races fixed during this feature: toggle_fixture_agent missing
+TEST_HOME_LOCK; test_nudge_non_code_no_nudge unlocked clear_all).

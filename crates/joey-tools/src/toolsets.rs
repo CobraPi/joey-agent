@@ -99,6 +99,9 @@ pub const CORE_TOOLS: &[&str] = &[
     "kanban_attachments",
     // Computer use
     "computer_use",
+    // Session scratchpad (feature 028, context economy) — additive append,
+    // order-preserving (same pattern as the feature-016 additive verbs).
+    "scratchpad",
 ];
 
 static TOOLSETS: Lazy<HashMap<&'static str, Toolset>> = Lazy::new(|| {

@@ -39,6 +39,8 @@ agent:
   reasoning_overrides: {}
   api_max_retries: 3
   gateway_timeout: 1800
+  context_economy_guidance: true
+  retrieval_verification_nudge: true
 terminal:
   backend: "local"
   cwd: "."
@@ -58,6 +60,18 @@ compression:
   hygiene_hard_message_limit: 5000
   protect_first_n: 3
   abort_on_summary_failure: false
+  midturn_tool_hygiene: true
+  midturn_threshold: 0.35
+  boundary_trigger: true
+  boundary_threshold: 0.35
+
+scratchpad:
+  enabled: true
+  max_entry_chars: 8000
+
+state_block:
+  enabled: true
+  max_chars: 1200
 auxiliary:
   compression:
     provider: "auto"
@@ -290,6 +304,77 @@ impl Config {
     /// Dotted bool lookup with a fallback.
     pub fn get_bool(&self, dotted: &str, default: bool) -> bool {
         self.get(dotted).and_then(|v| v.as_bool()).unwrap_or(default)
+    }
+
+    /// Feature 028 (context economy): Int getter with clamp.
+    pub fn get_clamped_i64(&self, dotted: &str, default: i64, min: i64, max: i64) -> i64 {
+        self.get_i64(dotted, default).clamp(min, max)
+    }
+
+    /// Feature 028 (context economy): Float getter with clamp.
+    pub fn get_clamped_f64(&self, dotted: &str, default: f64, min: f64, max: f64) -> f64 {
+        self.get_f64(dotted, default).clamp(min, max)
+    }
+
+    // --- Feature 028: context economy config surface -----------------------
+
+    /// `scratchpad.enabled` (default true).
+    pub fn scratchpad_enabled(&self) -> bool {
+        self.get_bool("scratchpad.enabled", true)
+    }
+
+    /// `scratchpad.max_entry_chars` (default 8000, clamp 1000..=64000).
+    pub fn scratchpad_max_entry_chars(&self) -> usize {
+        self.get_clamped_i64("scratchpad.max_entry_chars", 8000, 1000, 64000) as usize
+    }
+
+    /// `state_block.enabled` (default true).
+    pub fn state_block_enabled(&self) -> bool {
+        self.get_bool("state_block.enabled", true)
+    }
+
+    /// `state_block.max_chars` (default 1200, clamp 200..=8000).
+    pub fn state_block_max_chars(&self) -> usize {
+        self.get_clamped_i64("state_block.max_chars", 1200, 200, 8000) as usize
+    }
+
+    /// `compression.midturn_tool_hygiene` (default true).
+    pub fn midturn_tool_hygiene_enabled(&self) -> bool {
+        self.get_bool("compression.midturn_tool_hygiene", true)
+    }
+
+    /// `compression.midturn_threshold` ratio (default 0.35, clamp 0.10..=0.45),
+    /// kept strictly below `compression.threshold` (same ratio scale). Callers
+    /// convert to tokens: ratio x compressor context_length (feature 028
+    /// contract `context-economy-config-keys.md` §Threshold semantics).
+    pub fn midturn_threshold(&self) -> f64 {
+        let cap = self.get_f64("compression.threshold", 0.50);
+        let t = self.get_clamped_f64("compression.midturn_threshold", 0.35, 0.10, 0.45);
+        if t >= cap {
+            (cap - 0.01).max(0.10)
+        } else {
+            t
+        }
+    }
+
+    /// `compression.boundary_trigger` (default true).
+    pub fn boundary_trigger_enabled(&self) -> bool {
+        self.get_bool("compression.boundary_trigger", true)
+    }
+
+    /// `compression.boundary_threshold` ratio (default 0.35, clamp 0.10..=0.45).
+    pub fn boundary_threshold(&self) -> f64 {
+        self.get_clamped_f64("compression.boundary_threshold", 0.35, 0.10, 0.45)
+    }
+
+    /// `agent.context_economy_guidance` (default true).
+    pub fn context_economy_guidance_enabled(&self) -> bool {
+        self.get_bool("agent.context_economy_guidance", true)
+    }
+
+    /// `agent.retrieval_verification_nudge` (default true).
+    pub fn retrieval_verification_nudge_enabled(&self) -> bool {
+        self.get_bool("agent.retrieval_verification_nudge", true)
     }
 
     /// Dotted string-list lookup.
@@ -1647,6 +1732,57 @@ mod tests {
         assert!(cfg.get_bool("security.redact_secrets", false));
         assert_eq!(cfg.get_str("approvals.mode", ""), "smart");
         assert!(cfg.get("agent.verbose").is_none(), "agent.verbose is cli-tree-only upstream");
+    }
+
+    #[test]
+    fn context_economy_defaults_on() {
+        let cfg = Config::defaults();
+        assert!(cfg.scratchpad_enabled());
+        assert_eq!(cfg.scratchpad_max_entry_chars(), 8000);
+        assert!(cfg.state_block_enabled());
+        assert_eq!(cfg.state_block_max_chars(), 1200);
+        assert!(cfg.midturn_tool_hygiene_enabled());
+        assert!((cfg.midturn_threshold() - 0.35).abs() < 1e-9);
+        assert!(cfg.boundary_trigger_enabled());
+        assert!((cfg.boundary_threshold() - 0.35).abs() < 1e-9);
+        assert!(cfg.context_economy_guidance_enabled());
+        assert!(cfg.retrieval_verification_nudge_enabled());
+        // Raw defaults also readable through the generic getters.
+        assert_eq!(cfg.get_i64("scratchpad.max_entry_chars", 0), 8000);
+        assert!((cfg.get_f64("compression.midturn_threshold", 0.0) - 0.35).abs() < 1e-9);
+    }
+
+    #[test]
+    fn context_economy_clamps() {
+        assert_eq!(cfg_from("scratchpad:\n  max_entry_chars: 99999\n").scratchpad_max_entry_chars(), 64000);
+        assert_eq!(cfg_from("scratchpad:\n  max_entry_chars: 5\n").scratchpad_max_entry_chars(), 1000);
+        assert_eq!(cfg_from("state_block:\n  max_chars: 99999\n").state_block_max_chars(), 8000);
+        assert_eq!(cfg_from("state_block:\n  max_chars: 10\n").state_block_max_chars(), 200);
+        assert!((cfg_from("compression:\n  midturn_threshold: 0.9\n").midturn_threshold() - 0.45).abs() < 1e-9);
+        assert!((cfg_from("compression:\n  midturn_threshold: 0.01\n").midturn_threshold() - 0.10).abs() < 1e-9);
+        assert!((cfg_from("compression:\n  boundary_threshold: 0.9\n").boundary_threshold() - 0.45).abs() < 1e-9);
+        assert!((cfg_from("compression:\n  boundary_threshold: 0.01\n").boundary_threshold() - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn midturn_threshold_stays_below_compression_threshold() {
+        // 0.45 clamped value must drop below a 0.40 compression.threshold.
+        let cfg = cfg_from("compression:\n  threshold: 0.40\n  midturn_threshold: 0.45\n");
+        let t = cfg.midturn_threshold();
+        assert!(t < 0.40, "midturn {} must be < compression threshold", t);
+        // Default pairing stays untouched.
+        let d = Config::defaults();
+        assert!(d.midturn_threshold() < d.get_f64("compression.threshold", 0.50));
+    }
+
+    #[test]
+    fn context_economy_keys_individually_disableable() {
+        assert!(!cfg_from("scratchpad:\n  enabled: false\n").scratchpad_enabled());
+        assert!(!cfg_from("state_block:\n  enabled: false\n").state_block_enabled());
+        assert!(!cfg_from("compression:\n  midturn_tool_hygiene: false\n").midturn_tool_hygiene_enabled());
+        assert!(!cfg_from("compression:\n  boundary_trigger: false\n").boundary_trigger_enabled());
+        assert!(!cfg_from("agent:\n  context_economy_guidance: false\n").context_economy_guidance_enabled());
+        assert!(!cfg_from("agent:\n  retrieval_verification_nudge: false\n").retrieval_verification_nudge_enabled());
     }
 
     #[test]
