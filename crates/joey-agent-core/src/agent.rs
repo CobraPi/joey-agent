@@ -1865,6 +1865,13 @@ impl Agent {
         self.resolve_main_turn_model(false)
     }
 
+    /// True when the active model was explicitly chosen by the user
+    /// (`--model` flag, `/model` switch, agent picker) — i.e. the LIVE
+    /// pin state of the current session model.
+    pub fn model_pinned(&self) -> bool {
+        self.config.model_pinned
+    }
+
     /// Point the cached prompt's `Model:`/`Provider:` lines at the active
     /// runtime after a failover — only the LAST occurrence of each
     /// (chat_completion_helpers.py `rewrite_prompt_model_identity`).

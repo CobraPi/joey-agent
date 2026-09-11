@@ -107,27 +107,6 @@ fn interactive_streaming(config: &Config) -> bool {
 
 pub(crate) fn build_agent_config(config: &Config, ov: &Overrides) -> AgentConfig {
     let mut cfg = AgentConfig::from_config(config);
-    // Feature 025 (T015/FR-005): orchestrator-role session model from OMO —
-    // with hypercode.omo_specialists on (default) the orchestrator maps
-    // directly to the atlas agent's model; with it off, the legacy chain
-    // (sisyphus→hephaestus→metis) — when the user has neither pinned
-    // (--model / /model switch — applied just below, which still wins) nor
-    // configured (model.default in the user layer) a session model. Pure
-    // read-time derivation; no configuration key (contracts/role-defaults.md).
-    // The gate lives in hypercode::orchestrator_session_model_applies so the
-    // engine's T032 startup notice can share it exactly (no drift).
-    if crate::hypercode::orchestrator_session_model_applies(config, cfg.model_pinned) {
-        let profile = joey_providers::profile::resolve_profile(
-            &cfg.provider,
-            &cfg.base_url,
-            &cfg.model,
-        );
-        let available =
-            joey_omo::AvailableModelSet::from_connected_with_catalog(&profile, &cfg.model);
-        if let Some(model) = crate::hypercode::omo_orchestrator_session_model(config, &available) {
-            cfg.model = model;
-        }
-    }
     if let Some(m) = &ov.model {
         cfg.model = m.clone();
         // An explicit --model pins the choice: dynamic model routing
@@ -279,12 +258,11 @@ pub(crate) fn build_agent_parts(
 
     let mut agent =
         Agent::new(agent_cfg.clone(), registry, ctx).map_err(|e| anyhow::anyhow!("{}", e))?;
-    // Orchestrator overlay: feature 025 — session start installs the default
-    // conductor persona when integration is active (fixed prompt otherwise);
-    // applied as extra instructions (rebuild-safe: engine restarts re-derive
-    // it).
+    // Orchestrator overlay: session start installs the fixed orchestrator
+    // prompt when orchestrator mode is active; applied as extra instructions
+    // (rebuild-safe: engine restarts re-derive it).
     if orchestrator_on {
-        agent.set_extra_instructions(Some(crate::hypercode::orchestrator_persona_overlay_for_profile(config, None, agent.model(), agent.client().profile())));
+        agent.set_extra_instructions(Some(crate::hypercode::ORCHESTRATOR_PROMPT.to_string()));
     }
     // Feature 026 (T023): session-start lifecycle context — ONE-TIME
     // injection through the extra_instructions slot (cache-friendly, never
@@ -1751,7 +1729,7 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
                         let tools = crate::hypercode::orchestrator_tool_names();
                         st.agent.set_enabled_tools(tools);
                         st.agent.rebuild_system_prompt();
-                        st.agent.set_extra_instructions(Some(crate::hypercode::orchestrator_persona_overlay_for_profile(&st.config, Some(st.active_agent.as_str()), st.agent.model(), st.agent.client().profile())));
+                        st.agent.set_extra_instructions(Some(crate::hypercode::ORCHESTRATOR_PROMPT.to_string()));
                     } else {
                         let tools = crate::commands::platform_tools(&st.config, "cli");
                         st.agent.set_enabled_tools(tools);

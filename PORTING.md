@@ -309,6 +309,12 @@ no trait signatures modified. All changes are additive SAFETY comments and
 the audit script improvements (cfg(test) filtering, standalone test-file
 detection).
 
+### Follow-up hardening (2026-09-11)
+
+- `joey-cli/llm_selector.rs build_engine()`: last non-test `panic!` in the
+  workspace (double config-load failure path) replaced with a graceful
+  `Config::defaults()` fallback — CLI helpers never panic on config I/O.
+
 ## Terminal async performance & streaming (feature 009, 2026-07-30)
 
 Replaced the terminal tool's blocking `spawn_blocking(read_to_end)` output
@@ -1530,57 +1536,16 @@ T032/T033 in `specs/023-enterprise-orchestration-runtime/tasks.md`.
 
 ## OMO↔HyperCode orchestration integration (feature 025, 2026-09-03)
 
-**Status**: Complete (Joey-native integration per
-`specs/025-please-integrate-omo/`; no upstream Hermes counterpart — the
-persona text is newly authored, NOT an upstream port).
+**Status**: Removed (2026-09-11) — full removal of the HyperCode↔OMO integration per user direction; see below.
 
-- **Delegation-first Conductor persona**
-  (`crates/joey-omo/src/agents/prompts/conductor.rs`): atlas-inherited
-  conductor identity with an embedded orchestration hard-rules core (no
-  direct writes; single final gate), a full-roster delegation briefing,
-  and the spec-kit lifecycle doctrine (read-only research/review during
-  specify/clarify/plan; parallel implementation during implement; one
-  final acceptance run). Ships `default`, `gpt`, and `gpt_5_6` variants
-  with a `for_model(model: &str) -> &'static str` two-level dispatch
-  (model-family prefix match; the GPT arm sub-checks `5.6`/`5-6`).
-  Exported unregistered — no AgentRegistry entry, no tab. GPT-5.6
-  variants were likewise added for the switchable primaries sisyphus,
-  atlas, and prometheus (hephaestus already had one; delegation-only
-  agents fall back without error).
-- **Persona-aware orchestrator overlay** (`crates/joey-cli` —
-  `hypercode.rs`, wired in `engine.rs`/`repl.rs`):
-  `orchestrator_persona_overlay[_for_profile]` swaps the orchestrator's
-  governing instructions for the Conductor persona (or the named agent's
-  persona via the existing dispatch) iff orchestration is enabled AND
-  the OMO registry has ≥1 resolved agent. Inactive integration or empty
-  registry degrades byte-identically to the fixed `ORCHESTRATOR_PROMPT`
-  (FR-012). Switching OMO agents mid-session swaps only the persona
-  (hard-rules core + full-roster briefing stay appended); `/model`
-  re-selects the variant without losing the persona.
-- **Full 11-agent roster delegation** (`joey-orchestration`
-  `delegation_tool.rs`): all 11 registered OMO agents (sisyphus,
-  hephaestus, prometheus, atlas, oracle, librarian, explore,
-  multimodal-looker, metis, momus, sisyphus-junior) are valid
-  `subagent_type` targets on `delegate_task` and on the `call_omo_agent`
-  enum (schema enum advisory; runtime resolver authoritative). Unknown
-  names error with the valid-name list; `load_skills` constructs the
-  skill overlay on the named-agent path exactly as the category path
-  does (FR-004); `category`/`subagent_type` stay mutually exclusive
-  (BC-011).
-- **OMO-chain role model defaults** (mirrored in `joey-cli`
-  `hypercode.rs` role resolution and `joey-orchestration`'s
-  `HyperRoleSettings` gap-fill; config keys unchanged — derivation is
-  read-time): explorer ← explore→librarian; implementor ← momus;
-  orchestrator session model ← sisyphus→hephaestus→metis, applied only
-  when the model is neither pinned (`--model`, `/model`,
-  `model_pinned`) nor configured (`model.default`). An unresolvable
-  chain inherits the existing default with a user-visible FR-006
-  warn-and-inherit notice through the agent-notice channel — never a
-  failure. **2026-09-03:** the `hypercode.omo_specialists.enabled`
-  toggle (default on) now swaps the chain derivation for a direct 1:1
-  mapping — explorer→explore, implementor→hephaestus, orchestrator→
-  atlas; the chains are preserved behind
-  `hypercode.omo_specialists.enabled=false`.
+Removed on 2026-09-11, per user direction ('completely remove the omo
+integration from /hypercode; the orchestrator model must be the currently
+selected model'):
+
+- **Persona-aware orchestrator overlay** (`orchestrator_persona_overlay[_for_profile]`): deleted. The orchestrator's governing instructions are always the fixed `ORCHESTRATOR_PROMPT` (roles-only, workflow-inheritance section embedded).
+- **OMO-chain role model defaults + `hypercode.omo_specialists.enabled` toggle**: deleted everywhere (`joey-cli` hypercode.rs, `joey-orchestration` delegation_tool.rs gap-fill, team.rs specialists addendum). Role model precedence is now two-level: explicit role-table model > inherit the parent's effective model.
+- **Orchestrator session-model swap** (`omo_orchestrator_session_model` + `orchestrator_session_model_applies`): deleted. The HyperCode orchestrator is the MAIN session agent and always runs on the currently selected model — provider-agnostic (zai, copilot, ai-usage-hud alike); no model pinning anywhere in the orchestrator path.
+- **Kept (general, non-hypercode)**: the `joey-omo` crate, `/start-work`, `@plan`, ultrawork keywords, `/agent` switching, `call_omo_agent`, and `delegate_task` `subagent_type`/`category` routing via `omo_resolver.rs` in non-orchestrator sessions, `omo.background_task.*` concurrency config.
 
 Orchestrator-centric role doctrine (2026-09-08): the explorer and
 implementor role prompts/directives (`crates/joey-cli/src/hypercode.rs`,

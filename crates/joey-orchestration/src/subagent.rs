@@ -571,9 +571,7 @@ pub(crate) fn apply_batch_hyper_roles(
                     spec.goal
                 ));
             };
-            // Batch path carries no resolver: no OMO-chain default, no FR-006
-            // warning (chain_applicable=false — byte-identical to pre-feature-025).
-            crate::delegation_tool::apply_hyper_role(req, role, tree, provider, None, false);
+            crate::delegation_tool::apply_hyper_role(req, role, tree, provider);
         }
     }
     Ok(())

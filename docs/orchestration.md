@@ -276,13 +276,7 @@ smallest scoped tasks possible (one question per Explorer, one
 function/file/edit-cluster per Implementor); explorers are read-only
 executors answering single-question lookups with raw facts, and
 implementors are dumb executors applying fully-specified minimal-scope
-briefs verbatim. The lead's model:
-an explicit `hypercode.team.lead_model` always wins; otherwise it
-defaults to the orchestrator tier's mapping — `atlas` under specialists
-ON (`hypercode.omo_specialists.enabled`, default), the legacy chain
-head otherwise. The lead directive additionally carries a SPECIALISTS
-paragraph permitting teammates to be spawned via `subagent_type`; a
-teammate spawned that way uses the agent name as its role label.
+briefs verbatim. The lead's model: an explicit `hypercode.team.lead_model` always wins; otherwise it stays unset and the lead inherits the orchestrator's effective model at dispatch.
 Later references spawn
 TEAMMATES: Leaf children keeping their role toolset plus `team` — they never
 receive `delegate_task` (no nested teams, no background subagents from
@@ -318,71 +312,28 @@ orchestrator's effective model). Each run records its decision in
 `HypercodeReport.mode_decisions` as `mode=<subagent|team> task=<summary>
 rationale=<text>`.
 
-## 4. OMO Integration (feature 025)
+## 4. OMO roster delegation (general delegation, not orchestrator-specific)
 
-Ties the OMO agent roster into HyperCode orchestrator mode. Everything
-here is additive: with the integration inactive, behavior is
-byte-identical to pre-feature. Design trail:
-`specs/025-please-integrate-omo/`.
+The feature-025 HyperCode↔OMO integration (persona-aware orchestrator
+overlay, OMO-derived role model defaults, orchestrator session-model swap,
+the `hypercode.omo_specialists.enabled` toggle) was REMOVED on 2026-09-11:
+the HyperCode orchestrator is the main session agent and always runs on the
+currently selected model (any provider — zai, copilot, ai-usage-hud, ...),
+and hypercode role models use a two-level precedence: an explicit
+`hypercode.explorer`/`hypercode.implementor` role-table model wins, else the
+child inherits the parent's effective model.
 
-### Persona-aware orchestrator overlay
-
-When orchestration is enabled AND the OMO registry has ≥1 resolved agent,
-the orchestrator's governing instructions (`extra_instructions`) become
-the delegation-first **Conductor persona**
-(`crates/joey-omo/src/agents/prompts/conductor.rs` — exported
-unregistered, so it has no tab/registry entry), selected by model
-family: GPT-5.6 → `gpt_5_6`, other GPT → `gpt`, else `default`
-(`conductor::for_model`). Switching OMO agents mid-session swaps only
-the persona — the hard-rules core (no direct writes; single final gate)
-and the full-roster briefing are appended under any named persona;
-`/model` re-selects the variant without losing the persona. Inactive
-integration or an empty registry → the fixed `ORCHESTRATOR_PROMPT`,
-byte-identical to pre-feature. Entry point:
-`hypercode::orchestrator_persona_overlay[_for_profile]`, wired at
-session start / `SetOrchestratorMode` / agent- and model-switch reapply
-in `engine.rs` and `repl.rs`.
-
-### Full-roster delegation
-
-All 11 registered OMO agents (sisyphus, hephaestus, prometheus, atlas,
-oracle, librarian, explore, multimodal-looker, metis, momus,
-sisyphus-junior) are valid `subagent_type` targets on `delegate_task`
-and valid values on the `call_omo_agent` enum — the schema enum is
-advisory; the runtime resolver is authoritative. Unknown names error
-with the valid-name list. `load_skills` works on named routing too: the
-skill overlay (`prompt_append`) is synthesized from `load_skills`
-entries exactly as on the category path. `category` and `subagent_type`
-remain mutually exclusive (BC-011). In batch mode (`tasks[]`), each
-task may carry its own `subagent_type` (any of the 11 agents): the
-resolved model + identity prompt are applied per task, and the resolved
-model wins over both the per-task and batch-level `model`; per-task
-`role` composes with it — the role still gap-fills toolsets/turns and
-appends its directive. The orchestrator prompt/roster advertises
-`subagent_type` dispatch of any OMO specialist.
-
-### Role model defaults from OMO agents
-
-HyperCode role models derive from OMO agents — explicit overrides
-always win; derivation is read-time and keyed on
-`hypercode.omo_specialists.enabled` (bool, default **true**):
-
-- Specialists ON (default): direct 1:1 mapping, strict — no chain
-  fallback. explorer ← explore; implementor ← hephaestus; orchestrator
-  session model ← atlas, applied ONLY when the model is neither pinned
-  (`--model`, `/model`) nor configured (`model.default`). An unresolved
-  agent inherits the existing default with a user-visible warning —
-  never a failure.
-- Specialists OFF (`hypercode.omo_specialists.enabled: false`): legacy
-  feature-025 chains — explorer ← explore→librarian; implementor ←
-  momus; orchestrator session model ← sisyphus→hephaestus→metis (first
-  resolvable), same pinned/configured guard.
-
-Both modes derive identically on both sides: `joey-cli` role resolution
-(`hypercode.rs`) and the mirrored gap-fill in `joey-orchestration`
-(`HyperRoleSettings` in `delegation_tool.rs`). An unresolvable mapping
-inherits the existing default with a user-visible warning (FR-006,
-agent-notice channel) — never a failure.
+What remains is the GENERAL OMO roster delegation, independent of
+orchestrator mode: `subagent_type` on `delegate_task` (any registered OMO
+agent — sisyphus, hephaestus, prometheus, atlas, oracle, librarian, explore,
+multimodal-looker, metis, momus, sisyphus-junior) and the `call_omo_agent`
+tool resolve through the OMO registry via the CLI's `omo_resolver.rs`
+bridge (`CategoryResolver`). The schema enum is advisory; the runtime
+resolver is authoritative; unknown names error with the valid-name list.
+`load_skills` synthesizes the skill overlay on the named-agent path exactly
+as on the category path; `category` and `subagent_type` remain mutually
+exclusive. In orchestrator (roles-only) mode these parameters are rejected
+— every dispatch uses role explorer/implementor.
 
 ### Workflow inheritance: orchestrator toolset
 
@@ -399,13 +350,12 @@ workflow surfaces:
   planning and pass `load_skills` in delegation requests.
 - `task-graph` — the new `task_graph` tool (below): the graph planner.
 
-Every orchestrator prompt — the fixed `ORCHESTRATOR_PROMPT` and every
-persona-overlay variant — carries a `## Workflow inheritance` section
+Every orchestrator prompt — the fixed `ORCHESTRATOR_PROMPT` — carries
+a `## Workflow inheritance` section
 instructing exactly that: load matching skills before planning and pass
 `load_skills` on delegation; build and maintain the session todo list
 from the plan; publish and maintain the task graph and re-plan instead
-of drifting. (With the OMO integration inactive the prompt stays
-byte-identical to the const plus this section.)
+of drifting. (The orchestrator prompt is always the fixed `ORCHESTRATOR_PROMPT` const, which embeds this section.)
 
 ### `task_graph` tool (toolset: task-graph)
 

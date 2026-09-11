@@ -241,7 +241,8 @@ async fn category_and_subagent_type_still_mutually_exclusive_bc011() {
 }
 
 // ---------------------------------------------------------------------------
-// Feature 025, T014/T016: OMO-chain role model defaults + FR-006 warning.
+// Role gap-fill: role-table model fills the model gap; no chain derivation
+// exists anymore.
 // ---------------------------------------------------------------------------
 
 /// Drain an AgentEvent channel for up to ~2s, collecting every event. The
@@ -284,34 +285,8 @@ fn make_tool_with_channel(
     (tool, ctx, rx)
 }
 
-/// T016-a / FR-006: a role delegation whose OMO chain cannot resolve (no
-/// configured role model, NullResolver) emits a Notice warning that the
-/// default model is inherited. A subsequent dispatch error is fine — the
-/// resolution-side notice fires first. (OMO specialists toggle pinned OFF:
-/// this test pins the legacy chain-default path byte-identically.)
-#[tokio::test]
-async fn role_chain_unresolvable_emits_notice() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(
-        tmp.path(),
-        "hypercode:\n  omo_specialists:\n    enabled: false\n",
-    )
-    .unwrap();
-    let tree = Config::load_from(tmp.path().to_path_buf()).unwrap();
-    let (tool, ctx, mut rx) = make_tool_with_channel(tree);
-    let args = json!({ "goal": "g", "role": "explorer" });
-    let _ = tool.execute(args, &ctx).await;
-    let events = drain_events(&mut rx).await;
-    let saw = events.iter().any(|ev| match ev {
-        joey_agent_core::AgentEvent::Notice(n) =>
-            n.contains("no OMO chain member") && n.contains("FR-006"),
-        _ => false,
-    });
-    assert!(saw, "expected an FR-006 chain-warning Notice, got: {events:?}");
-}
-
 /// T016-b / FR-005 precedence 1: an explicit hypercode.<role>.<provider>.model
-/// fills the model gap, so no chain warning fires even with a NullResolver.
+/// fills the model gap, so the request keeps the inherit-the-parent default.
 #[tokio::test]
 async fn role_configured_model_suppresses_chain_warning() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -333,7 +308,7 @@ async fn role_configured_model_suppresses_chain_warning() {
 }
 
 /// T016-c / FR-005 precedence 0: an explicit `model` arg wins before the role
-/// gap-fill, so no chain warning fires.
+/// gap-fill, so the role gap-fill leaves it untouched.
 #[tokio::test]
 async fn explicit_model_arg_suppresses_chain_warning() {
     let (tool, ctx, mut rx) = make_tool_with_channel(Config::defaults());
@@ -348,7 +323,7 @@ async fn explicit_model_arg_suppresses_chain_warning() {
 }
 
 /// T016-d / BC guard: combining `role` with `category` is unaffected by the
-/// chain logic — the result must not be a role/chain error (no chain warning
+/// chain logic — the result must not be a role/chain error (no role
 /// Notice; no Error mentioning "role" as the failure cause).
 #[tokio::test]
 async fn category_mutual_exclusivity_unchanged_with_role() {
@@ -372,11 +347,9 @@ async fn category_mutual_exclusivity_unchanged_with_role() {
     }
 }
 
-/// T030 / FR-004: role enrichment composes with named routing — the named
-/// path's resolved model fills the model gap BEFORE the role chain applies
-/// (explicit values win), so the delegation must resolve and NO FR-006
-/// "no OMO chain member" warning may fire (the AllRosterResolver serves
-/// every roster name, so the chain never hits precedence 3).
+/// T030 / FR-004: role enrichment composes with named routing — named
+/// routing fills the model gap before the role gap-fill applies, so no
+/// warning fires (the AllRosterResolver serves every roster name).
 #[tokio::test]
 async fn role_enrichment_composes_with_named_routing() {
     let (tx, mut rx) = mpsc::unbounded_channel::<joey_agent_core::AgentEvent>();

@@ -1,6 +1,6 @@
 use crate::hypercode::{
     execution_hint_from_graph, format_mode_decision, plan_team_seed, route_mode, try_team_run,
-    ModeRoute, OmoRoleDefaults, TeamConfig,
+    ModeRoute, TeamConfig,
 };
 
 use std::sync::Mutex;
@@ -123,7 +123,7 @@ fn lead_request_inherits_orchestrator_model_when_unset_per_fr019() {
     // carries no model override and inherits the orchestrator's effective
     // model at dispatch; a pinned lead_model is forwarded verbatim.
     let cfg = TeamConfig::default();
-    let req = crate::hypercode::lead_request("objective text", "team-a", "lead", &cfg, &OmoRoleDefaults::default());
+    let req = crate::hypercode::lead_request("objective text", "team-a", "lead", &cfg);
     assert!(req.model.is_none(), "empty lead_model must leave model unset (inherit)");
     assert_eq!(req.team.as_deref(), Some("team-a"));
     assert_eq!(req.name.as_deref(), Some("lead"));
@@ -132,7 +132,7 @@ fn lead_request_inherits_orchestrator_model_when_unset_per_fr019() {
 
     let mut pinned = cfg.clone();
     pinned.lead_model = "glm-4.7".to_string();
-    let req = crate::hypercode::lead_request("objective text", "team-a", "lead", &pinned, &OmoRoleDefaults::default());
+    let req = crate::hypercode::lead_request("objective text", "team-a", "lead", &pinned);
     assert_eq!(req.model.as_deref(), Some("glm-4.7"));
 }
 

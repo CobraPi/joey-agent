@@ -364,83 +364,6 @@ pub fn orchestrator_overlay() -> String {
     ORCHESTRATOR_PROMPT.to_string()
 }
 
-/// Persona-aware orchestrator overlay (feature 025, FR-001/FR-007/FR-012).
-///
-/// Activation gate (research D6): the persona applies iff orchestration mode
-/// is enabled AND the OMO registry has ≥1 resolved agent; otherwise this
-/// returns the existing fixed [`ORCHESTRATOR_PROMPT`] unchanged (and callers
-/// that know orchestration is off don't call it at all).
-///
-/// - `agent = None` (or `"default"`) → the delegation-first Conductor persona
-///   variant for `model`'s family (FR-001).
-/// - `agent = Some(name)` → that OMO agent's identity prompt for its resolved
-///   model, with the orchestration hard-rules core and roster briefing
-///   appended so every persona keeps the safety rails and the full bench
-///   (FR-002/FR-007/FR-010). Unknown names fall back to the Conductor persona.
-pub fn orchestrator_persona_overlay(
-    config: &joey_core::Config,
-    agent: Option<&str>,
-    model: &str,
-    available: &joey_omo::AvailableModelSet,
-    overrides: &joey_omo::agents::registry::ModelOverrides,
-) -> String {
-    if !orchestrator_active(config) {
-        return ORCHESTRATOR_PROMPT.to_string();
-    }
-    let registry = joey_omo::AgentRegistry::build(available.clone(), overrides);
-    let bench_empty = registry.all().iter().all(|a| a.resolved_model.is_none());
-    if bench_empty {
-        // Empty bench degrades to the fixed prompt (FR-012, spec edge case:
-        // the orchestrator still functions and reports the empty bench).
-        return ORCHESTRATOR_PROMPT.to_string();
-    }
-    // Feature 026 (T026/FR-008): feed the conductor the CURRENT lifecycle
-    // state snapshot (None when disabled/not a spec-kit repo → prompt is
-    // byte-identical to the pre-feature static one).
-    let snap = crate::speckit_lifecycle::lifecycle_snapshot_opt(config);
-    match agent {
-        None | Some("default") => format!(
-            "{}\n\n{}",
-            joey_omo::agents::prompts::conductor_prompt_with_lifecycle(model, snap.as_ref()),
-            WORKFLOW_INHERITANCE_GUIDANCE
-        ),
-        Some(name) => {
-            let persona = match registry.get(name) {
-                Some(a) if a.resolved_model.is_some() => joey_omo::dispatch_system_prompt(
-                    name,
-                    a.resolved_model.as_deref().unwrap_or(model),
-                )
-                .to_string(),
-                _ => joey_omo::agents::prompts::conductor_prompt_with_lifecycle(
-                    model,
-                    snap.as_ref(),
-                ),
-            };
-            format!(
-                "{}\n\n{}\n\n{}\n\n{}",
-                persona,
-                joey_omo::agents::prompts::conductor::hard_rules_core(),
-                joey_omo::agents::prompts::conductor::roster_briefing(),
-                WORKFLOW_INHERITANCE_GUIDANCE
-            )
-        }
-    }
-}
-
-/// Convenience wrapper for call sites that have the live agent: builds the
-/// available-model set from the agent's provider profile + active model
-/// (the same construction `engine_switch_agent` uses to rebuild a registry).
-pub fn orchestrator_persona_overlay_for_profile(
-    config: &joey_core::Config,
-    agent: Option<&str>,
-    model: &str,
-    profile: &joey_providers::ProviderProfile,
-) -> String {
-    let available = joey_omo::AvailableModelSet::from_connected_with_catalog(profile, model);
-    let overrides = joey_omo::agents::registry::ModelOverrides::new();
-    orchestrator_persona_overlay(config, agent, model, &available, &overrides)
-}
-
 /// Read one RoleConfig from a YAML mapping (provider table row).
 fn role_config_from_mapping(map: &serde_yaml::Mapping) -> RoleConfig {
     let get_str = |key: &str| -> String {
@@ -651,22 +574,17 @@ pub fn format_mode_decision(mode: &str, task: &str, rationale: &str) -> String {
 
 /// Feature 022 (FR-019 + lead shape): build the lead child's delegation
 /// request. Model precedence: explicit `hypercode.team.lead_model` (when
-/// non-empty) wins; else the OMO orchestrator default `omo.orchestrator`
-/// (atlas's resolved model under hypercode.omo_specialists.enabled, the
-/// legacy chain's head otherwise); else `model` stays None so the lead
-/// inherits the orchestrator's effective model at dispatch.
+/// non-empty) wins; else `model` stays None so the lead inherits the
+/// orchestrator's effective model at dispatch.
 pub(crate) fn lead_request(
     goal: &str,
     team_name: &str,
     member: &str,
     cfg: &TeamConfig,
-    omo: &OmoRoleDefaults,
 ) -> DelegationRequest {
     let mut lead_req = DelegationRequest::single(goal.to_string());
     if !cfg.lead_model.is_empty() {
         lead_req.model = Some(cfg.lead_model.clone());
-    } else if let Some(m) = omo.orchestrator.as_ref() {
-        lead_req.model = Some(m.clone());
     }
     lead_req.role = joey_orchestration::SubagentRole::Orchestrator;
     lead_req.toolsets = vec![
@@ -1053,47 +971,6 @@ check output (command + outcome).\n\
 \n\
 Keep your final summary under 1000 tokens.";
 
-/// Workflow-inheritance guidance appended to every ACTIVE orchestrator
-/// persona overlay. NOTE: this same text is embedded VERBATIM as a section
-/// inside [`ORCHESTRATOR_PROMPT`] (just before "## Execution Modes") so the
-/// fixed prompt carries it too — the duplication is deliberate and MUST be
-/// kept in sync (edit both together).
-pub const WORKFLOW_INHERITANCE_GUIDANCE: &str = "\
-## Workflow inheritance (you keep the main agent's workflow)
-
-You inherit the SAME workflow disciplines the main agent runs with when
-orchestration is off. They are not optional and they are not delegated:
-
-- SKILLS: before planning, review the <available_skills> index in your
-  system prompt; if a skill matches the goal, load it with skill_view(name)
-  and let it shape the plan. Pass matching skills to children via the
-  load_skills field of delegate_task so they inherit the same guidance.
-- TODO LIST: immediately after writing your plan, record it as a todo list
-  with the todo tool (one item per task, in dependency order). Keep it
-  current: mark an item in_progress while its work runs, completed the
-  moment a specialist verifies it. The list is your drift alarm — if reality
-  and the list diverge, re-plan instead of drifting. During a parallel
-  fan-out wave, mark every dispatched item in_progress when the wave fires
-  and complete each item as its specialist reports.
-- TASK GRAPH: publish the plan as a dependency graph with the task_graph
-  tool (action=plan) right after the todo list, then keep it current with
-  action=update as tasks dispatch and complete. The user watches this graph
-  live in the TUI. Explicit dependencies, a visible ready set, and visible
-  blocked work are what keep a long orchestration on track — re-publish
-  (action=plan) whenever the plan changes rather than letting it go stale.
-  STRICT SCHEMA (get it right the first time — the validator rejects
-  guesswork): the graph is {\"format\":\"joey-taskgraph/1\",\"tasks\":[...]} and
-  EVERY task must carry ALL of: id (lowercase [a-z0-9-]), objective,
-  dependencies, read_set, write_set (relative paths), artifact_ids
-  (INTEGERS — use [] if unknown), role (\"explorer\"|\"implementor\"|
-  \"orchestrator\"), model_tier (\"economical\"|\"frontier\"), risk
-  (\"low\"|\"medium\"|\"high\"), acceptance (non-empty [{criterion, kind}]), and
-  verification {\"steps\":[...],\"risk_triggered_review\":false} (empty steps
-  fine; risk \"high\" needs a required:true step or risk_triggered_review:
-  true). No two dependency-unrelated tasks may write the same path. The
-  tool's own description carries the full field list — read it before the
-  first call.";
-
 /// Orchestrator system prompt (delegation-first; no direct file writes or
 /// code-manipulation commands).
 ///
@@ -1145,9 +1022,7 @@ YOUR SUBAGENTS (via delegate_task):\n\
   and real command output — raw facts only, no analysis, plans, or\n\
   recommendations. It runs only the read-only commands its brief names —\n\
   nothing self-chosen. It does not think; it looks things up. Interpreting\n\
-  its findings and deciding what to do is entirely your job. (with\n\
-  hypercode.omo_specialists on, its default model is the explore\n\
-  agent's)\n\
+  its findings and deciding what to do is entirely your job.\n\
 - role:\"implementor\" — dumb executor. You split the work into minimal,\n\
   single-purpose tasks (one function, one file, one small edit-cluster\n\
   at a time) and hand each over as its own dispatch with a\n\
@@ -1157,8 +1032,7 @@ YOUR SUBAGENTS (via delegate_task):\n\
   verbatim like a recipe, runs only the exact TARGETED check commands\n\
   you list (never self-chosen ones, never the full test suite), makes\n\
   NO changes at all on any ambiguity or conflict, and reports what\n\
-  changed plus the real check output. (with hypercode.omo_specialists\n\
-  on, its default model is the hephaestus agent's)\n\
+  changed plus the real check output.\n\
 These two roles are your DEFAULT and should cover nearly all work.\n\
 - That is the COMPLETE bench. There is NO named-agent, category, or\n\
   specialist routing in orchestrator mode — subagent_type, category,\n\
@@ -1387,7 +1261,6 @@ fn planner_request(
     goal: &str,
     cfg: &HyperCodeConfig,
     opts: &HypercodeOptions,
-    omo: &OmoRoleDefaults,
     parent_model: &str,
 ) -> DelegationRequest {
     // The planner uses the IMPLEMENTOR config (it needs to reason about the
@@ -1401,7 +1274,7 @@ fn planner_request(
         ),
         context: None,
         tasks: Vec::new(),
-        model: model_override(&rc, parent_model, &opts.provider, omo.implementor.as_deref()),
+        model: model_override(&rc, parent_model, &opts.provider),
         toolsets: vec![
             "file-read".to_string(),
             "terminal".to_string(),
@@ -1432,7 +1305,6 @@ pub(crate) fn explorer_request(
     goal: &str,
     cfg: &HyperCodeConfig,
     opts: &HypercodeOptions,
-    omo: &OmoRoleDefaults,
     parent_model: &str,
     workdir: &std::path::Path,
 ) -> DelegationRequest {
@@ -1444,7 +1316,7 @@ pub(crate) fn explorer_request(
         ),
         context: None,
         tasks: Vec::new(),
-        model: model_override(&rc, parent_model, &opts.provider, omo.explorer.as_deref()),
+        model: model_override(&rc, parent_model, &opts.provider),
         toolsets: vec![
             "file-read".to_string(),
             "terminal".to_string(),
@@ -1475,7 +1347,6 @@ pub(crate) fn implementor_request(
     explorer_summary: &str,
     cfg: &HyperCodeConfig,
     opts: &HypercodeOptions,
-    omo: &OmoRoleDefaults,
     parent_model: &str,
     workdir: &std::path::Path,
 ) -> DelegationRequest {
@@ -1490,7 +1361,7 @@ pub(crate) fn implementor_request(
             ws.id, explorer_summary
         )),
         tasks: Vec::new(),
-        model: model_override(&rc, parent_model, &opts.provider, omo.implementor.as_deref()),
+        model: model_override(&rc, parent_model, &opts.provider),
         toolsets: vec![
             "file".to_string(),
             "terminal".to_string(),
@@ -1528,34 +1399,22 @@ fn parent_model_for(ctx: &HypercodeContext) -> String {
         .unwrap_or_else(|| ctx.agent_config.model.clone())
 }
 
-/// Resolve a child's model with three-level precedence (feature 025,
-/// FR-005):
+/// Resolve a child's model with two-level precedence:
 /// 1. the role table's explicit per-role model always wins;
-/// 2. otherwise the OMO default (specialists toggle ON: the direct
-///    counterpart agent's model; OFF: the legacy chain) for the role
-///    (when orchestration is active and it resolved against available
-///    providers);
-/// 3. otherwise inherit the parent's (effective) model explicitly so the
+/// 2. otherwise inherit the parent's (effective) model explicitly so the
 ///    config `delegation.default_model` doesn't silently shadow the live
-///    agent (legacy behavior).
+///    agent.
 ///
 /// Copilot-wire visibility: when the FINAL model is one the copilot-wire
 /// provider cannot serve, the real Copilot backend 400s (ModelNotFound) and
 /// proxies like ai-usage-hud silently substitute their default via mapModel
 /// with HTTP 200. Warn so the substitution is visible in logs. Warn-only —
 /// the returned model is unchanged.
-fn model_override(
-    rc: &RoleConfig,
-    parent_model: &str,
-    provider: &str,
-    omo_default: Option<&str>,
-) -> Option<String> {
+fn model_override(rc: &RoleConfig, parent_model: &str, provider: &str) -> Option<String> {
     let model = if !rc.model.is_empty() {
         rc.model.clone() // 1. explicit per-role configuration always wins
-    } else if let Some(m) = omo_default {
-        m.to_string() // 2. OMO-chain default (feature 025, FR-005)
     } else {
-        parent_model.to_string() // 3. inherit the parent (legacy behavior)
+        parent_model.to_string() // 2. inherit the parent (legacy behavior)
     };
     if copilot_wire_unservable(&model, provider) {
         tracing::warn!(
@@ -1565,248 +1424,6 @@ fn model_override(
         );
     }
     Some(model)
-}
-
-/// Outcome of OMO-chain role-default derivation (feature 025, FR-005/FR-006).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoleDefaultOutcome {
-    /// First chain member's resolved model, when one resolved.
-    pub model: Option<String>,
-    /// True when a chain applied but NO member resolved (FR-006: the caller
-    /// inherits the existing default and warns — never a hard failure).
-    pub unresolvable: bool,
-}
-
-/// Per-role OMO agent chains (feature 025, FR-005, contracts/role-defaults.md):
-/// explorer: explore → librarian; implementor: momus; orchestrator:
-/// sisyphus → hephaestus → metis. The first member whose OMO model chain
-/// resolves against available providers (exact then family-fuzzy, provider
-/// gates honored — the standard AgentRegistry resolution) wins.
-fn omo_role_chain(role: &str) -> Option<&'static [&'static str]> {
-    match role {
-        "explorer" => Some(&["explore", "librarian"]),
-        "implementor" => Some(&["momus"]),
-        "orchestrator" => Some(&["sisyphus", "hephaestus", "metis"]),
-        _ => None,
-    }
-}
-
-/// hypercode.omo_specialists.enabled (default true): the three hypercode
-/// tiers map DIRECTLY 1:1 to OMO agents for model defaults —
-/// explorer→explore, implementor→hephaestus, orchestrator→atlas —
-/// replacing the feature-025 chains. Strict: no chain fallback.
-pub fn omo_specialists_enabled(config: &joey_core::Config) -> bool {
-    config.get_bool("hypercode.omo_specialists.enabled", true)
-}
-
-/// The direct tier→agent counterpart for the specialists toggle.
-pub fn omo_specialist_for(role: &str) -> Option<&'static str> {
-    match role {
-        "explorer" => Some("explore"),
-        "implementor" => Some("hephaestus"),
-        "orchestrator" => Some("atlas"),
-        _ => None,
-    }
-}
-
-/// Derive one role's default from its OMO chain against the given
-/// available-model set. Pure read-time derivation — config keys are
-/// unchanged and nothing is persisted (contracts/role-defaults.md).
-pub fn omo_role_default(
-    role: &str,
-    available: &joey_omo::AvailableModelSet,
-    overrides: &joey_omo::agents::registry::ModelOverrides,
-) -> RoleDefaultOutcome {
-    let Some(chain) = omo_role_chain(role) else {
-        return RoleDefaultOutcome { model: None, unresolvable: false };
-    };
-    let registry = joey_omo::AgentRegistry::build(available.clone(), overrides);
-    omo_role_default_from_registry(&registry, chain)
-}
-
-fn omo_role_default_from_registry(
-    registry: &joey_omo::AgentRegistry,
-    chain: &[&str],
-) -> RoleDefaultOutcome {
-    for name in chain {
-        if let Some(model) = registry.get(name).and_then(|a| a.resolved_model.clone()) {
-            return RoleDefaultOutcome { model: Some(model), unresolvable: false };
-        }
-    }
-    RoleDefaultOutcome { model: None, unresolvable: true }
-}
-
-/// OMO-chain defaults for one hypercode run's explorer + implementor roles.
-/// Derived only while orchestration is active with a non-empty bench
-/// (FR-012: otherwise resolution is identical to today — no derivation, no
-/// warnings). Warns once per unresolvable chain (FR-006) via tracing, the
-/// same channel as the copilot-wire guard in [`model_override`]; the same
-/// messages also land in `warnings` so the run path can surface them to the
-/// user (T031/T032).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OmoRoleDefaults {
-    pub explorer: Option<String>,
-    pub implementor: Option<String>,
-    /// Orchestrator-role default: the direct specialist (atlas) resolved
-    /// model when hypercode.omo_specialists.enabled, else the legacy
-    /// orchestrator chain's (sisyphus→hephaestus→metis) first resolved
-    /// model.
-    pub orchestrator: Option<String>,
-    /// FR-006 user-visible warnings (one per unresolvable chain), mirrored
-    /// from the tracing logs so the run path can push them through the
-    /// progress channel (T031). Empty when every chain resolved.
-    pub warnings: Vec<String>,
-}
-
-pub fn omo_role_defaults(
-    config: &joey_core::Config,
-    available: &joey_omo::AvailableModelSet,
-) -> OmoRoleDefaults {
-    if !orchestrator_active(config) {
-        return OmoRoleDefaults::default();
-    }
-    let overrides = joey_omo::agents::registry::ModelOverrides::new();
-    let registry = joey_omo::AgentRegistry::build(available.clone(), &overrides);
-    if registry.all().iter().all(|a| a.resolved_model.is_none()) {
-        // Empty bench (spec edge case): degrade to today's behavior silently.
-        return OmoRoleDefaults::default();
-    }
-    let mut out = OmoRoleDefaults::default();
-    if omo_specialists_enabled(config) {
-        // Direct 1:1 tier→agent mapping (strict — no chain fallback): an
-        // unresolved specialist warns (FR-006 shape) and the slot stays
-        // None so the child inherits the parent/role default.
-        for (role, slot) in [("explorer", &mut out.explorer), ("implementor", &mut out.implementor)] {
-            let agent = omo_specialist_for(role).unwrap();
-            match registry.get(agent).and_then(|a| a.resolved_model.clone()) {
-                Some(model) => *slot = Some(model),
-                None => {
-                    let warning = format!(
-                        "hypercode {role} role: OMO specialist agent '{agent}' unresolved against available providers; inheriting the parent/role default model (FR-006)."
-                    );
-                    tracing::warn!(
-                        role = role,
-                        agent = agent,
-                        "OMO specialist agent '{agent}' unresolved against available providers; inheriting the parent/role default model (FR-006)"
-                    );
-                    out.warnings.push(warning);
-                }
-            }
-        }
-        out.orchestrator = registry.get("atlas").and_then(|a| a.resolved_model.clone());
-    } else {
-        for (role, slot) in [("explorer", &mut out.explorer), ("implementor", &mut out.implementor)] {
-            let outcome = omo_role_default_from_registry(&registry, omo_role_chain(role).unwrap());
-            if outcome.unresolvable {
-                let warning = format!(
-                    "hypercode {role} role: no OMO chain member resolved against available providers; inheriting the parent/role default model (FR-006)."
-                );
-                tracing::warn!(
-                    role = role,
-                    "no OMO chain member resolved against available providers; inheriting the parent/role default model (FR-006)"
-                );
-                out.warnings.push(warning);
-            }
-            *slot = outcome.model;
-        }
-        out.orchestrator =
-            omo_role_default_from_registry(&registry, omo_role_chain("orchestrator").unwrap()).model;
-    }
-    out
-}
-
-/// Orchestrator-role session model, feature 025 T015 / FR-005. With
-/// hypercode.omo_specialists.enabled (default) this is atlas's resolved
-/// model directly; with the toggle off it falls back to the legacy OMO
-/// chain (sisyphus → hephaestus → metis). Callers gate this on the
-/// user having neither pinned (--model / /model switch) nor configured
-/// (model.default in the user layer) a session model; no hypercode
-/// configuration key exists for it (contracts/role-defaults.md).
-pub fn omo_orchestrator_session_model(
-    config: &joey_core::Config,
-    available: &joey_omo::AvailableModelSet,
-) -> Option<String> {
-    let overrides = joey_omo::agents::registry::ModelOverrides::new();
-    if omo_specialists_enabled(config) {
-        let registry = joey_omo::AgentRegistry::build(available.clone(), &overrides);
-        let model = registry.get("atlas").and_then(|a| a.resolved_model.clone());
-        if model.is_none() {
-            tracing::warn!(
-                role = "orchestrator",
-                "no OMO specialist agent 'atlas' resolved against available providers; keeping the configured session model (FR-006)"
-            );
-        }
-        return model;
-    }
-    let outcome = omo_role_default("orchestrator", available, &overrides);
-    if outcome.unresolvable {
-        tracing::warn!(
-            role = "orchestrator",
-            "no OMO chain member (sisyphus→hephaestus→metis) resolved against available providers; keeping the configured session model (FR-006)"
-        );
-    }
-    outcome.model
-}
-
-/// True when the OMO registry resolves zero agents against `available`
-/// (the persona integration's empty-bench degradation state, T031).
-pub fn omo_registry_empty(available: &joey_omo::AvailableModelSet) -> bool {
-    let overrides = joey_omo::agents::registry::ModelOverrides::new();
-    let registry = joey_omo::AgentRegistry::build(available.clone(), &overrides);
-    registry.all().iter().all(|a| a.resolved_model.is_none())
-}
-
-/// True when the T015 session-model gate applies: orchestration active and
-/// the user neither pinned (--model / /model) nor configured (model.default)
-/// a session model. Shared by repl's build_agent_config and the engine's
-/// startup notice so the two can never drift (T032).
-pub fn orchestrator_session_model_applies(config: &joey_core::Config, model_pinned: bool) -> bool {
-    if !orchestrator_active(config) {
-        return false;
-    }
-    let user_configured = joey_core::config::get_nested(config.user_doc(), "model.default")
-        .and_then(|v| v.as_str())
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-    !user_configured && !model_pinned
-}
-
-/// One-time startup/toggle notice for the persona integration (T031/T032):
-/// None when healthy; the empty-bench text when the registry resolved zero
-/// agents; the FR-006 text when the orchestrator session-model chain
-/// (sisyphus→hephaestus→metis) cannot resolve against a non-empty bench.
-pub fn orchestrator_startup_notice(
-    config: &joey_core::Config,
-    model_pinned: bool,
-    available: &joey_omo::AvailableModelSet,
-) -> Option<String> {
-    if !orchestrator_active(config) {
-        return None;
-    }
-    if omo_registry_empty(available) {
-        return Some(
-            "⚠️ HyperCode orchestration is on but no OMO agents resolved against the current provider — the delegation-first persona is inactive; running with the fixed orchestrator prompt and plain HyperCode roles (empty bench).".to_string(),
-        );
-    }
-    if orchestrator_session_model_applies(config, model_pinned) {
-        if omo_specialists_enabled(config) {
-            let overrides = joey_omo::agents::registry::ModelOverrides::new();
-            let registry = joey_omo::AgentRegistry::build(available.clone(), &overrides);
-            if registry.get("atlas").and_then(|a| a.resolved_model.clone()).is_none() {
-                return Some(
-                    "⚠️ No OMO specialist agent 'atlas' resolved against available providers; keeping the configured session model (FR-006).".to_string(),
-                );
-            }
-        } else {
-            let overrides = joey_omo::agents::registry::ModelOverrides::new();
-            if omo_role_default("orchestrator", available, &overrides).unresolvable {
-                return Some(
-                    "⚠️ No OMO orchestrator model chain member (sisyphus→hephaestus→metis) resolved against available providers; keeping the configured session model (FR-006).".to_string(),
-                );
-            }
-        }
-    }
-    None
 }
 
 /// True when `model` cannot be served by a copilot-wire `provider`
@@ -2305,15 +1922,6 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
             ..Default::default()
         };
         let parent_model = parent_model_for(self.ctx);
-        // Feature 025 (FR-005): OMO-chain role model defaults for this run.
-        let omo_profile = joey_providers::profile::resolve_profile(
-            &self.ctx.agent_config.provider,
-            &self.ctx.agent_config.base_url,
-            &parent_model,
-        );
-        let omo_available =
-            joey_omo::AvailableModelSet::from_connected_with_catalog(&omo_profile, &parent_model);
-        let omo = omo_role_defaults(&self.ctx.config, &omo_available);
         let rc = cfg.get_implementor_config(&opts.provider);
         // T028 (US7): structured lessons replace free-text wisdom as
         // execution guidance on the flag-on path (FR-025/SC-008). Consult
@@ -2435,7 +2043,7 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
             goal,
             context: None,
             tasks: Vec::new(),
-            model: model_override(&rc, &parent_model, &opts.provider, omo.implementor.as_deref()),
+            model: model_override(&rc, &parent_model, &opts.provider),
             toolsets: vec![
                 "file".to_string(),
                 "terminal".to_string(),
@@ -2818,22 +2426,6 @@ pub async fn run_hypercode(
     // actually dispatches with) when available, falling back to the raw
     // config default (legacy behavior) when the caller didn't capture it.
     let parent_model = parent_model_for(ctx);
-    // Feature 025 (FR-005): OMO-chain role model defaults for this run.
-    let omo_profile = joey_providers::profile::resolve_profile(
-        &ctx.agent_config.provider,
-        &ctx.agent_config.base_url,
-        &parent_model,
-    );
-    let omo_available =
-        joey_omo::AvailableModelSet::from_connected_with_catalog(&omo_profile, &parent_model);
-    let omo = omo_role_defaults(&ctx.config, &omo_available);
-    // FR-006 user-visible warnings ride the progress channel (engine forwards
-    // them as HypercodeProgress events); tracing remains the log mirror.
-    for warning in &omo.warnings {
-        if let Some(cb) = progress {
-            cb(Phase::Planning, warning);
-        }
-    }
     let cap = effective_cap(&cfg, opts);
 
     // Time-to-completion: children skip the parent's inter-tool pacing
@@ -2861,7 +2453,7 @@ pub async fn run_hypercode(
         if let Some(cb) = progress {
             cb(Phase::Planning, "decomposing the goal into workstreams");
         }
-        let req = planner_request(goal, &cfg, opts, &omo, &parent_model);
+        let req = planner_request(goal, &cfg, opts, &parent_model);
         let results = ctx
             .manager
             .dispatch_requests(
@@ -3039,7 +2631,7 @@ pub async fn run_hypercode(
                 ),
             ));
         }
-        let lead_req = lead_request(goal, &team_name, &member, &cfg.team, &omo);
+        let lead_req = lead_request(goal, &team_name, &member, &cfg.team);
         let results = ctx
             .manager
             .dispatch_requests(&[lead_req], &ctx.agent_config, &ctx.config, &ctx.base_registry, None)
@@ -3072,7 +2664,7 @@ pub async fn run_hypercode(
     }
     let explorer_requests: Vec<DelegationRequest> = workstreams
         .iter()
-        .map(|ws| explorer_request(ws, goal, &cfg, opts, &omo, &parent_model, &ctx.cwd))
+        .map(|ws| explorer_request(ws, goal, &cfg, opts, &parent_model, &ctx.cwd))
         .collect();
     let explorer_results = ctx
         .manager
@@ -3115,7 +2707,7 @@ pub async fn run_hypercode(
         .iter()
         .zip(explorer_summaries.iter())
         .map(|(ws, brief)| {
-            implementor_request(ws, goal, brief, &cfg, opts, &omo, &parent_model, &ctx.cwd)
+            implementor_request(ws, goal, brief, &cfg, opts, &parent_model, &ctx.cwd)
         })
         .collect();
     let build_results = ctx
@@ -3376,7 +2968,7 @@ mod tests {
             id: 0,
             focus: "do things".into(),
         };
-        let req = explorer_request(&ws, "goal", &cfg, &opts, &OmoRoleDefaults::default(), "parent-model", std::path::Path::new("/tmp"));
+        let req = explorer_request(&ws, "goal", &cfg, &opts, "parent-model", std::path::Path::new("/tmp"));
         assert_eq!(req.model.as_deref(), Some("explorer-model"));
         assert_eq!(req.max_turns, Some(6));
         assert_eq!(req.max_tokens, Some(4000));
@@ -3396,7 +2988,7 @@ mod tests {
             id: 1,
             focus: "f".into(),
         };
-        let req = explorer_request(&ws, "g", &cfg, &opts, &OmoRoleDefaults::default(), "live-model", std::path::Path::new("/tmp"));
+        let req = explorer_request(&ws, "g", &cfg, &opts, "live-model", std::path::Path::new("/tmp"));
         // Empty role model → inherit the live parent model (not delegation.default_model).
         assert_eq!(req.model.as_deref(), Some("live-model"));
         assert_eq!(req.max_tokens, None);
@@ -3463,7 +3055,7 @@ mod tests {
         let parent_model = parent_model_for(&ctx);
         assert_eq!(parent_model, "gpt-5.6-sol");
         assert_eq!(
-            model_override(&rc, &parent_model, &opts.provider, None).as_deref(),
+            model_override(&rc, &parent_model, &opts.provider).as_deref(),
             Some("gpt-5.6-sol"),
             "children must inherit the parent's EFFECTIVE model when no role entry exists"
         );
@@ -3479,7 +3071,7 @@ mod tests {
         );
         let rc = cfg.get_explorer_config(&opts.provider);
         assert_eq!(
-            model_override(&rc, &parent_model, &opts.provider, None).as_deref(),
+            model_override(&rc, &parent_model, &opts.provider).as_deref(),
             Some("role-table-model")
         );
     }
@@ -3502,7 +3094,7 @@ mod tests {
 
         // copilot-wire + unservable inherited model: still returned as-is.
         assert_eq!(
-            model_override(&rc, "glm-5.2", "github-copilot", None).as_deref(),
+            model_override(&rc, "glm-5.2", "github-copilot").as_deref(),
             Some("glm-5.2")
         );
         assert!(copilot_wire_unservable("glm-5.2", "github-copilot"));
@@ -3514,7 +3106,7 @@ mod tests {
         // Non-copilot provider: never guarded, whatever the model.
         assert!(!copilot_wire_unservable("glm-5.2", "zai"));
         assert_eq!(
-            model_override(&rc, "glm-5.2", "zai", None).as_deref(),
+            model_override(&rc, "glm-5.2", "zai").as_deref(),
             Some("glm-5.2")
         );
         joey_providers::copilot::restore_catalog_cache_for_tests(saved_catalog);
@@ -3527,7 +3119,7 @@ mod tests {
             provider: "p".into(),
             ..Default::default()
         };
-        let req = planner_request("my goal", &cfg, &opts, &OmoRoleDefaults::default(), "m");
+        let req = planner_request("my goal", &cfg, &opts, "m");
         assert!(req.goal.starts_with("You are the Planner agent"));
         assert!(req.goal.contains("my goal"));
         assert!(req.goal.contains(&format!("Max workstreams: {}", DEFAULT_MAX_WORKSTREAMS)));
@@ -3636,7 +3228,7 @@ mod tests {
         let ws = Workstream { id: 0, focus: "f".into() };
 
         // Explorer: READ-ONLY files + terminal + web.
-        let ex = explorer_request(&ws, "g", &cfg, &opts, &OmoRoleDefaults::default(), "m", std::path::Path::new("/tmp"));
+        let ex = explorer_request(&ws, "g", &cfg, &opts, "m", std::path::Path::new("/tmp"));
         assert!(ex.toolsets.contains(&"file-read".to_string()));
         assert!(!ex.toolsets.contains(&"file".to_string()), "explorer must NOT have write access");
         assert!(ex.toolsets.contains(&"terminal".to_string()), "explorer runs diagnostic commands");
@@ -3645,7 +3237,7 @@ mod tests {
         assert!(ex.prompt_append.as_deref().unwrap_or("").contains("READ-ONLY"));
 
         // Implementor: write access + terminal + web.
-        let im = implementor_request(&ws, "g", "brief", &cfg, &opts, &OmoRoleDefaults::default(), "m", std::path::Path::new("/tmp"));
+        let im = implementor_request(&ws, "g", "brief", &cfg, &opts, "m", std::path::Path::new("/tmp"));
         assert!(im.toolsets.contains(&"file".to_string()), "implementor owns the write path");
         assert!(im.toolsets.contains(&"terminal".to_string()));
         assert!(im.prompt_append.as_deref().unwrap_or("").contains("Implementor agent"));
