@@ -1929,12 +1929,17 @@ impl Agent {
             "provider request model resolved"
         );
         let mut request_messages = self.history.clone();
-        if let Some(block) = self.render_state_block_for_request(turn) {
+        let assembly = self.assemble_request_context(tools, turn);
+        let mut request_tools = tools.to_vec();
+        if let Some(block) = assembly.state_block {
             request_messages.push(Message::user(block));
+        }
+        if !assembly.dropped_tools.is_empty() {
+            request_tools.retain(|t| !assembly.dropped_tools.contains(&t.function.name));
         }
         ProviderRequest::new(model, request_messages)
             .with_system(Some(self.effective_system_prompt()))
-            .with_tools(tools.to_vec())
+            .with_tools(request_tools)
             .with_reasoning(self.config.reasoning.clone())
             .with_max_tokens(max_tokens)
             .streaming(self.config.stream)
@@ -1992,6 +1997,92 @@ impl Agent {
         }
         tracing::info!(chars = block.chars().count(), "state block rendered");
         Some(block)
+    }
+
+    /// Dynamic context assembly (opt-in): applies state-block budget cap,
+    /// relevance-ranked tool selection, and JSONL assembly logging when
+    /// `context_assembly.enabled` is on. Identity when disabled (byte-parity).
+    fn assemble_request_context(
+        &self,
+        tools: &[ToolSchema],
+        request_turn: usize,
+    ) -> RequestContextAssembly {
+        let cfg = self.ctx.config();
+        if !cfg.context_assembly_enabled() {
+            return RequestContextAssembly {
+                state_block: self.render_state_block_for_request(request_turn),
+                dropped_tools: Vec::new(),
+            };
+        }
+        let raw_block = self.render_state_block_for_request(request_turn);
+        let state_block =
+            crate::context_assembly::cap_state_block(raw_block.clone(), cfg.context_assembly_budget_state_chars());
+        let truncated = state_block != raw_block;
+        if truncated {
+            tracing::info!(
+                chars = state_block.as_ref().map(|s| s.chars().count()).unwrap_or(0),
+                "context assembly: state block truncated"
+            );
+        }
+        let mut dropped = Vec::new();
+        let selected = if cfg.context_assembly_tool_schema_retrieval() {
+            let query = self.assembly_query();
+            let (kept, drop_list) = crate::context_assembly::select_tools(
+                &query,
+                tools,
+                cfg.context_assembly_tool_top_k(),
+                &cfg.context_assembly_always_keep_tools(),
+            );
+            dropped = drop_list;
+            tracing::info!(
+                tools_total = tools.len(),
+                tools_kept = kept.len(),
+                "context assembly: tool schema retrieval"
+            );
+            kept
+        } else {
+            Vec::new()
+        };
+        if cfg.context_assembly_log_assembly() {
+            let session_key = self
+                .session_id
+                .clone()
+                .unwrap_or_else(|| self.ctx.session_id().to_string());
+            let rec = crate::context_assembly::AssemblyRecord {
+                ts: chrono::Utc::now().to_rfc3339(),
+                turn: request_turn,
+                tools_total: tools.len(),
+                tools_kept: if cfg.context_assembly_tool_schema_retrieval() {
+                    selected.len()
+                } else {
+                    tools.len()
+                },
+                tools_dropped: dropped.clone(),
+                state_block_truncated: truncated,
+                request_messages: self.history.len() + usize::from(state_block.is_some()),
+            };
+            if let Err(e) =
+                crate::context_assembly::log_assembly_record(&crate::context_assembly::log_dir(&session_key), &rec)
+            {
+                tracing::warn!(error = %e, "context assembly: failed to write assembly log");
+            }
+        }
+        RequestContextAssembly {
+            state_block,
+            dropped_tools: dropped,
+        }
+    }
+
+    /// The last user message's text (newest-first), used as the relevance
+    /// query for tool-schema retrieval — the same anchor the 028 state
+    /// block keys on. Empty string when no user message exists.
+    fn assembly_query(&self) -> String {
+        self.history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default()
     }
 
     /// Feature 028 (US3): mid-turn tool-result hygiene sweep. Pass 1
@@ -4380,6 +4471,12 @@ impl Agent {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Per-request assembly result (feature: dynamic context assembly).
+struct RequestContextAssembly {
+    state_block: Option<String>,
+    dropped_tools: Vec<String>,
+}
 
 /// The checked/loaded tool names (upstream `valid_tool_names`).
 pub(crate) fn valid_tool_names(registry: &ToolRegistry, enabled: &[String], ctx: &ToolContext) -> Vec<String> {
@@ -8535,6 +8632,237 @@ mod tests {
             state_block_message(&fx.transport.request(1)).expect("block in second request");
         assert!(block2.contains("fresh task T007e"));
         clear_todos(&fx.agent).await;
+    }
+
+    // ── Dynamic context assembly: build_request wiring (request-clone) ──
+
+    /// Unit-level integration tests for the opt-in context-assembly layer
+    /// wired into `build_request`. They live here (not under tests/)
+    /// because `build_request` is private — no integration-test surface
+    /// can exercise the request-clone path without a real provider call.
+    mod context_assembly_agent {
+        use super::*;
+        use joey_providers::ToolSchema;
+
+        fn schema(name: &str, description: &str) -> ToolSchema {
+            ToolSchema::new(name, description, json!({"type": "object", "properties": {}}))
+        }
+
+        /// Ten hand-built schemas: the two default-pinned always-keep
+        /// names, three query-relevant names ("zip"/"data"), five filler.
+        fn ten_tools() -> Vec<ToolSchema> {
+            vec![
+                schema("read_file", "Read file contents"),
+                schema("write_file", "Write file contents"),
+                schema("a_zip", "zip archives"),
+                schema("b_zip", "zip archives too"),
+                schema("data_x", "data processor"),
+                schema("m_one", ""),
+                schema("m_two", ""),
+                schema("m_three", ""),
+                schema("m_four", ""),
+                schema("m_five", ""),
+            ]
+        }
+
+        fn tool_names(req: &ProviderRequest) -> Vec<String> {
+            req.tools.iter().map(|t| t.function.name.clone()).collect()
+        }
+
+        /// (a) Disabled (default): the request tool list is IDENTICAL to
+        /// the input (same names, same order) and history is untouched.
+        #[test]
+        fn disabled_byte_parity() {
+            let _l = lock();
+            let mut fx = fixture(vec![], 5, 3, None);
+            assert!(!fx.agent.ctx.config().context_assembly_enabled());
+            fx.agent.history.push(Message::user("hello"));
+            let history_before = fx.agent.history.clone();
+            let tools = vec![
+                schema("alpha_t", ""),
+                schema("beta_t", ""),
+                schema("gamma_t", ""),
+            ];
+            let req = fx.agent.build_request(&tools, 1, None);
+            assert_eq!(
+                tool_names(&req),
+                vec!["alpha_t".to_string(), "beta_t".to_string(), "gamma_t".to_string()],
+                "disabled assembly must keep the tool list identical"
+            );
+            assert_eq!(req.tools.len(), tools.len());
+            // Message has no PartialEq: compare via serialization (the
+            // 028 byte-parity pattern).
+            assert_eq!(
+                serde_json::to_string(&fx.agent.history).unwrap(),
+                serde_json::to_string(&history_before).unwrap(),
+                "build_request must never persist anything into history"
+            );
+        }
+
+        /// (b) Enabled with budget_state_chars=200: any appended state
+        /// block is capped to <= 200 chars (skip-if-none style per spec:
+        /// either no block appended OR the appended block fits the budget).
+        #[tokio::test]
+        async fn enabled_caps_state_block() {
+            let _l = lock();
+            let mut fx = fixture_yaml(
+                vec![],
+                5,
+                3,
+                "context_assembly:\n  enabled: true\n  budget_state_chars: 200\n",
+            );
+            assert!(fx.agent.ctx.config().context_assembly_enabled());
+            assert_eq!(fx.agent.ctx.config().context_assembly_budget_state_chars(), 200);
+            fx.agent.history.push(Message::user("hello"));
+            seed_todos(
+                &fx.agent,
+                &[
+                    (
+                        "a-very-long-task-name-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "in_progress",
+                    ),
+                    (
+                        "another-very-long-task-name-bbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "pending",
+                    ),
+                    ("third-long-task-name-cccccccccccccccccccccccccccccccc", "pending"),
+                ],
+            )
+            .await;
+            let tools = vec![schema("echo_t", "")];
+            let req = fx.agent.build_request(&tools, 1, None);
+            if let Some(block) = state_block_message(&req) {
+                assert!(
+                    block.chars().count() <= 200,
+                    "capped state block is {} chars, budget 200",
+                    block.chars().count()
+                );
+            }
+            clear_todos(&fx.agent).await;
+        }
+
+        /// (b2) Cap applied through the FULL path: with log_assembly=true
+        /// and enabled=true the JSONL assembly record is written under
+        /// the session's log dir and reports the capped assembly.
+        #[tokio::test]
+        async fn enabled_cap_logged_through_full_path() {
+            let _l = lock();
+            let mut fx = fixture_yaml(
+                vec![],
+                5,
+                3,
+                "context_assembly:\n  enabled: true\n  budget_state_chars: 200\n  log_assembly: true\n",
+            );
+            assert!(fx.agent.ctx.config().context_assembly_log_assembly());
+            fx.agent.history.push(Message::user("hello"));
+            seed_todos(
+                &fx.agent,
+                &[("long-task-ddddddddddddddddddddddddddddddddddddd", "in_progress")],
+            )
+            .await;
+            let tools = vec![schema("echo_t", "")];
+            let req = fx.agent.build_request(&tools, 1, None);
+            if let Some(block) = state_block_message(&req) {
+                assert!(block.chars().count() <= 200);
+            }
+            // session_id unset -> ctx session id ("test-session").
+            let dir = crate::context_assembly::log_dir("test-session");
+            let log_path = dir.join("assembly.jsonl");
+            let content = std::fs::read_to_string(&log_path)
+                .expect("assembly.jsonl written when log_assembly=true and enabled=true");
+            let last = content.lines().last().expect("at least one record");
+            let rec: serde_json::Value = serde_json::from_str(last).expect("valid JSONL record");
+            assert_eq!(rec["turn"], 1);
+            assert_eq!(rec["tools_total"], 1);
+            assert_eq!(rec["tools_kept"], 1);
+            assert_eq!(rec["request_messages"], 2, "history (1) + state block (1)");
+            clear_todos(&fx.agent).await;
+        }
+
+        /// (c) Retrieval through the full path: enabled + retrieval with
+        /// effective top_k=5 (config clamps tool_top_k to 5..=60 — the
+        /// brief's literal top_k=3 is unreachable via config; the literal
+        /// 3-slot case is pinned below via direct select_tools). Two
+        /// default-pinned always-keep names stay; irrelevant fillers drop.
+        #[test]
+        fn retrieval_drops_irrelevant() {
+            let _l = lock();
+            let mut fx = fixture_yaml(
+                vec![],
+                5,
+                3,
+                "context_assembly:\n  enabled: true\n  tool_schema_retrieval: true\n  tool_top_k: 5\n",
+            );
+            assert!(fx.agent.ctx.config().context_assembly_tool_schema_retrieval());
+            fx.agent.history.push(Message::user("zip the data"));
+            let history_before = fx.agent.history.clone();
+            let tools = ten_tools();
+            let req = fx.agent.build_request(&tools, 1, None);
+            let names = tool_names(&req);
+            assert_eq!(names.len(), 5, "kept == effective top_k, got {names:?}");
+            for pinned in ["read_file", "write_file"] {
+                assert!(names.contains(&pinned.to_string()), "{pinned} pinned: {names:?}");
+            }
+            for matched in ["a_zip", "b_zip"] {
+                assert!(names.contains(&matched.to_string()), "{matched} relevant: {names:?}");
+            }
+            assert!(!names.contains(&"m_one".to_string()), "irrelevant filler dropped");
+            assert_eq!(
+                serde_json::to_string(&fx.agent.history).unwrap(),
+                serde_json::to_string(&history_before).unwrap(),
+                "no push persisted"
+            );
+        }
+
+        /// (c, literal top_k=3 route) The brief's exact 3-slot semantics,
+        /// exercised at the select_tools level (config cannot express
+        /// top_k < 5).
+        #[test]
+        fn retrieval_drops_irrelevant_select_tools_top3() {
+            let tools = ten_tools();
+            let always_keep = vec!["read_file".to_string(), "write_file".to_string()];
+            let (kept, dropped) =
+                crate::context_assembly::select_tools("zip data", &tools, 3, &always_keep);
+            assert_eq!(kept.len(), 3);
+            let names: Vec<&str> = kept.iter().map(|t| t.function.name.as_str()).collect();
+            assert!(names.contains(&"read_file"));
+            assert!(names.contains(&"write_file"));
+            assert_eq!(dropped.len(), 7);
+        }
+
+        /// (c2) Retrieval active but tool count <= top_k: no-op — the
+        /// request tool list is unchanged.
+        #[test]
+        fn no_retrieval_under_budget() {
+            let _l = lock();
+            let mut fx = fixture_yaml(
+                vec![],
+                5,
+                3,
+                "context_assembly:\n  enabled: true\n  tool_schema_retrieval: true\n",
+            );
+            fx.agent.history.push(Message::user("anything"));
+            let tools = vec![schema("solo_a", ""), schema("solo_b", "")];
+            let req = fx.agent.build_request(&tools, 1, None);
+            assert_eq!(
+                tool_names(&req),
+                vec!["solo_a".to_string(), "solo_b".to_string()],
+                "<= top_k tools pass through unchanged"
+            );
+        }
+
+        /// (d) Zero-relevance query still keeps the pinned always-keep
+        /// tool (module-level direct select_tools).
+        #[test]
+        fn always_keep_pinned() {
+            let tools = ten_tools();
+            let always_keep = vec!["read_file".to_string()];
+            let (kept, _dropped) =
+                crate::context_assembly::select_tools("qqq www", &tools, 3, &always_keep);
+            let names: Vec<&str> = kept.iter().map(|t| t.function.name.as_str()).collect();
+            assert!(names.contains(&"read_file"), "pinned despite zero relevance");
+            assert_eq!(names.len(), 3);
+        }
     }
 
     // ── Feature 028 (T008): mid-turn tool-result hygiene sweep ─────────

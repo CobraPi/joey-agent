@@ -1227,6 +1227,7 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
             }
         }
         "reasoning" => reasoning_slash(st, args),
+        "context-assembly" => context_assembly_slash(st, args),
         "tools" => {
             let cfg = build_agent_config(&st.config, &st.overrides);
             render::info(&format!("Enabled tools ({}):", cfg.enabled_tools.len()));
@@ -2380,6 +2381,62 @@ fn model_slash(st: &mut ReplState, args: &str) {
             render::success(&format!("✓ Model set to {} for this session.", model));
         }
         Err(e) => render::error(&format!("failed to switch model: {}", e)),
+    }
+}
+
+/// `/context-assembly [on|off|status]` — toggle/persist/inspect the dynamic
+/// context-assembly layer. Arg parsing is the pure fn in `slash_extra`
+/// (`parse_context_assembly_args`); this handler applies it: persist via
+/// `context_assembly.enabled`, rebuild the agent (same as `/model`) so the
+/// next request assembles context with the new setting, then report.
+fn context_assembly_slash(st: &mut ReplState, args: &str) {
+    use crate::slash_extra::{parse_context_assembly_args, ContextAssemblyAction};
+    let on_off = |b: bool| if b { "on" } else { "off" };
+    match parse_context_assembly_args(args) {
+        ContextAssemblyAction::Usage => {
+            render::info("usage: /context-assembly [on|off|status]");
+        }
+        ContextAssemblyAction::Status => {
+            let cfg = &st.config;
+            let keep = match cfg.get("context_assembly.always_keep_tools") {
+                Some(v) => match v.as_sequence() {
+                    Some(seq) => seq.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
+                    None => v.as_str().unwrap_or("").to_string(),
+                },
+                None => String::new(),
+            };
+            render::info(&format!(
+                "context assembly:\n  enabled: {}\n  tool_schema_retrieval: {}\n  tool_top_k: {}\n  budget_state_chars: {}\n  log_assembly: {}\n  always_keep_tools: {}",
+                on_off(cfg.get_bool("context_assembly.enabled", false)),
+                on_off(cfg.get_bool("context_assembly.tool_schema_retrieval", false)),
+                cfg.get_i64("context_assembly.tool_top_k", 15),
+                cfg.get_i64("context_assembly.budget_state_chars", 1500),
+                on_off(cfg.get_bool("context_assembly.log_assembly", false)),
+                keep
+            ));
+        }
+        action @ (ContextAssemblyAction::On | ContextAssemblyAction::Off | ContextAssemblyAction::Toggle) => {
+            let current = st.config.get_bool("context_assembly.enabled", false);
+            let next = match action {
+                ContextAssemblyAction::On => true,
+                ContextAssemblyAction::Off => false,
+                _ => !current,
+            };
+            if let Err(e) = st
+                .config
+                .set_and_save("context_assembly.enabled", if next { "true" } else { "false" })
+            {
+                render::error(&format!("failed to save: {e}"));
+                return;
+            }
+            match rebuild_agent_preserving_history(st) {
+                Ok(()) => render::success(&format!(
+                    "context assembly: {}",
+                    if next { "on" } else { "off" }
+                )),
+                Err(e) => render::error(&format!("failed to rebuild agent: {e}")),
+            }
+        }
     }
 }
 

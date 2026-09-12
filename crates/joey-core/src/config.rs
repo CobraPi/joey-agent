@@ -73,6 +73,18 @@ scratchpad:
 state_block:
   enabled: true
   max_chars: 1200
+
+# Dynamic context assembly (feature 030-style layer; OFF by default).
+# When enabled, the agent budget-assembles each request: filters tool
+# schemas by relevance to the current step, pins an always-keep tool set,
+# caps the state block, and (optionally) logs the assembled context.
+context_assembly:
+  enabled: false
+  tool_schema_retrieval: false
+  tool_top_k: 15
+  always_keep_tools: [read_file, write_file, patch, search_files, terminal, todo, scratchpad]
+  budget_state_chars: 1500
+  log_assembly: false
 auxiliary:
   compression:
     provider: "auto"
@@ -337,6 +349,58 @@ impl Config {
     /// `state_block.max_chars` (default 1200, clamp 200..=8000).
     pub fn state_block_max_chars(&self) -> usize {
         self.get_clamped_i64("state_block.max_chars", 1200, 200, 8000) as usize
+    }
+
+    // --- Feature: dynamic context assembly config surface ------------------
+
+    /// Feature: dynamic context assembly — `context_assembly.enabled`
+    /// (default false; the whole layer is OFF by default).
+    pub fn context_assembly_enabled(&self) -> bool {
+        self.get_bool("context_assembly.enabled", false)
+    }
+
+    /// Feature: dynamic context assembly —
+    /// `context_assembly.tool_schema_retrieval` (default false).
+    pub fn context_assembly_tool_schema_retrieval(&self) -> bool {
+        self.get_bool("context_assembly.tool_schema_retrieval", false)
+    }
+
+    /// Feature: dynamic context assembly — `context_assembly.tool_top_k`
+    /// (default 15, clamp 5..=60).
+    pub fn context_assembly_tool_top_k(&self) -> usize {
+        self.get_clamped_i64("context_assembly.tool_top_k", 15, 5, 60) as usize
+    }
+
+    /// Feature: dynamic context assembly —
+    /// `context_assembly.always_keep_tools`. Accepts a YAML sequence of
+    /// strings or a comma-separated string (`"read_file, todo"`);
+    /// a missing key yields an empty vec.
+    pub fn context_assembly_always_keep_tools(&self) -> Vec<String> {
+        match self.get("context_assembly.always_keep_tools") {
+            Some(Value::Sequence(seq)) => seq
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            Some(Value::String(s)) => s
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Feature: dynamic context assembly —
+    /// `context_assembly.budget_state_chars` (default 1500, clamp 200..=8000).
+    pub fn context_assembly_budget_state_chars(&self) -> usize {
+        self.get_clamped_i64("context_assembly.budget_state_chars", 1500, 200, 8000) as usize
+    }
+
+    /// Feature: dynamic context assembly — `context_assembly.log_assembly`
+    /// (default false).
+    pub fn context_assembly_log_assembly(&self) -> bool {
+        self.get_bool("context_assembly.log_assembly", false)
     }
 
     /// `compression.midturn_tool_hygiene` (default true).
@@ -1768,6 +1832,51 @@ mod tests {
         assert!((cfg_from("compression:\n  midturn_threshold: 0.01\n").midturn_threshold() - 0.10).abs() < 1e-9);
         assert!((cfg_from("compression:\n  boundary_threshold: 0.9\n").boundary_threshold() - 0.45).abs() < 1e-9);
         assert!((cfg_from("compression:\n  boundary_threshold: 0.01\n").boundary_threshold() - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn context_assembly_defaults_off() {
+        let cfg = Config::defaults();
+        assert!(!cfg.context_assembly_enabled());
+        assert!(!cfg.context_assembly_tool_schema_retrieval());
+        assert_eq!(cfg.context_assembly_tool_top_k(), 15);
+        let keep = cfg.context_assembly_always_keep_tools();
+        assert_eq!(keep.len(), 7);
+        assert_eq!(keep[0], "read_file");
+        assert!(keep.contains(&"scratchpad".to_string()));
+        assert_eq!(cfg.context_assembly_budget_state_chars(), 1500);
+        assert!(!cfg.context_assembly_log_assembly());
+    }
+
+    #[test]
+    fn context_assembly_clamps() {
+        assert_eq!(cfg_from("context_assembly:\n  tool_top_k: 999\n").context_assembly_tool_top_k(), 60);
+        assert_eq!(cfg_from("context_assembly:\n  tool_top_k: 1\n").context_assembly_tool_top_k(), 5);
+        assert_eq!(cfg_from("context_assembly:\n  budget_state_chars: 99999\n").context_assembly_budget_state_chars(), 8000);
+        assert_eq!(cfg_from("context_assembly:\n  budget_state_chars: 10\n").context_assembly_budget_state_chars(), 200);
+    }
+
+    #[test]
+    fn context_assembly_always_keep_list_parses() {
+        // YAML string form (comma-separated).
+        let cfg = cfg_from("context_assembly:\n  always_keep_tools: \"read_file, terminal\"\n");
+        assert_eq!(
+            cfg.context_assembly_always_keep_tools(),
+            vec!["read_file".to_string(), "terminal".to_string()]
+        );
+        // YAML list form.
+        let cfg = cfg_from("context_assembly:\n  always_keep_tools: [write_file, todo]\n");
+        assert_eq!(
+            cfg.context_assembly_always_keep_tools(),
+            vec!["write_file".to_string(), "todo".to_string()]
+        );
+        // Missing key entirely (raw tree without defaults) -> empty vec.
+        let cfg = Config {
+            user_doc: Value::Mapping(Mapping::new()),
+            root: Value::Mapping(Mapping::new()),
+            path: PathBuf::from("/nonexistent/config.yaml"),
+        };
+        assert!(cfg.context_assembly_always_keep_tools().is_empty());
     }
 
     #[test]

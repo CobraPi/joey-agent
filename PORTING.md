@@ -1811,6 +1811,42 @@ lock()/invalidate_check_cache()/unique session ids in tests (two
 pre-existing races fixed during this feature: toggle_fixture_agent missing
 TEST_HOME_LOCK; test_nudge_non_code_no_nudge unlocked clear_all).
 
+## Dynamic context assembly (opt-in layer) (2026-09-11)
+
+**Status**: Deliberate addition (no upstream counterpart). Opt-in layer (all
+off/false by default; `context_assembly.enabled = false` ⇒ every hook is an
+identity — request wire format byte-identical to pre-feature). Builds on
+feature 028's default-on affordances (see the Feature 028 ledger section
+above) by adding budgeted assembly. Implementation:
+`crates/joey-agent-core/src/context_assembly.rs`
+(`relevance_scores` deterministic term-overlap scorer +3 name / +1
+description; `select_tools` no-op when tool count <= top_k, always-keep
+pinned first, remaining slots score desc then name asc; `cap_state_block`
+line-preserving truncation with `[truncated]` marker; per-session JSONL
+logger), hooked tail-only at `build_request` — request clone only, never
+`self.history`, never persisted; the system prompt and message prefix are
+never mutated (prompt-prefix cache stability; tool list untouched when
+tool count <= top_k).
+
+1. Six additive config keys (crates/joey-core/src/config.rs
+   DEFAULT_CONFIG_YAML + named getters): context_assembly.enabled (false),
+   context_assembly.tool_schema_retrieval (false),
+   context_assembly.tool_top_k (15, clamp 5..=60),
+   context_assembly.always_keep_tools (default [read_file, write_file,
+   patch, search_files, terminal, todo, scratchpad]),
+   context_assembly.budget_state_chars (1500, clamp 200..=8000),
+   context_assembly.log_assembly (false).
+2. `context_assembly.rs` module (crates/joey-agent-core/src/) — scorer /
+   selector / capper / log as described above.
+3. `build_request` tail-only hook — assembly applies to the request clone
+   (tool list + state block) and is never persisted.
+4. `/context-assembly [on|off|status]` REPL command (alias `/ctxasm`);
+   no-arg toggles; persists via `context_assembly.enabled`.
+5. `~/.joey/context-assembly/<sanitized-session-key>-<fnv1a-hex8>/assembly.jsonl`
+   — per-session JSONL assembly logs (fields ts / turn / tools_total /
+   tools_kept / tools_dropped / state_block_truncated / request_messages);
+   best-effort logging, never fails a turn.
+
 ## Adaptive Coding Specialist Guidance (2026-09-11)
 
 **Status**: Deliberate-deviation subsystem (Joey-only prompt guidance, no upstream equivalent; see the Joey-only additions ledger pattern above). Adds `ADAPTIVE_CODING_GUIDANCE` (guidance.rs) to the stable tier of `build_system_prompt` (prompt.rs), pushed after the tool-aware guidance block. Content: coding-specialist identity (read before claiming, surgical edits, verify with the project's own build/test commands) plus preference-adaptation semantics mirroring the feature-027 memory store (apply active preferences automatically; explicit outranks inferred; newer supersedes older; hard project constraints win with a one-line callout). Config gate: `agent.adaptive_coding_guidance` (default `true`, accessor `Config::adaptive_coding_guidance_enabled`); setting it false restores the pre-feature prompt. Tests: guidance contract + branding scrub (guidance.rs), presence/absence/order (prompt.rs), default-on + independent toggle (tests/parity.rs), config default + disable (joey-core config.rs).

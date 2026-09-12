@@ -78,6 +78,7 @@ pub static REGISTRY: &[CommandDef] = &[
     cmd!("verbose", &[], "Cycle tool progress display: off -> new -> all -> verbose", "Configuration", "", true),
     cmd!("footer", &[], "Toggle gateway runtime-metadata footer on final replies", "Configuration", "[on|off|status]", true),
     cmd!("yolo", &[], "Toggle YOLO mode (skip all dangerous command approvals)", "Configuration", "", true),
+    cmd!("context-assembly", &["ctxasm"], "Toggle dynamic context assembly (on|off|status)", "Configuration", "[on|off|status]", true),
     cmd!("reasoning", &[], "Manage reasoning effort and display", "Configuration", "[level|show|hide] [--global]", true),
     cmd!("fast", &[], "Toggle fast mode (Normal/Fast)", "Configuration", "[normal|fast|status] [--global]", true),
     cmd!("skin", &[], "Show or change the display skin/theme", "Configuration", "[name]", true),
@@ -311,6 +312,30 @@ mod tests {
                 assert_eq!(rest.trim(), "status");
             }
             _ => panic!("expected /copilot status to resolve"),
+        }
+    }
+
+    #[test]
+    fn context_assembly_resolves() {
+        // /context-assembly with alias /ctxasm; the "context-asm" prefix is
+        // unique (no other command or alias starts with it).
+        let def = lookup("context-assembly").expect("/context-assembly must be registered");
+        assert!(def.implemented);
+        assert!(def.aliases.contains(&"ctxasm"));
+        match resolve("/context-assembly") {
+            Resolution::Command { def, .. } => assert_eq!(def.name, "context-assembly"),
+            _ => panic!("expected /context-assembly to resolve"),
+        }
+        match resolve("/ctxasm") {
+            Resolution::Command { def, .. } => assert_eq!(def.name, "context-assembly"),
+            _ => panic!("expected /ctxasm to resolve"),
+        }
+        // Brief said prefix "context-asm", but "asm" is not a prefix of
+        // "assembly" (a-s-s-e-m-b-l-y) — resolve("/context-asm") is Unknown.
+        // Assert the intent with a genuine unique prefix instead.
+        match resolve("/context-assem") {
+            Resolution::Command { def, .. } => assert_eq!(def.name, "context-assembly"),
+            other => panic!("expected /context-assem to be unambiguous, got {other:?}"),
         }
     }
 }
