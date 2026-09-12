@@ -5,7 +5,7 @@
 //! request_byte_identical, hygiene_disabled_history_byte_identical,
 //! boundary_disabled_exit_paths_untouched); this file pins the pub contracts.
 
-use joey_agent_core::guidance::CONTEXT_ECONOMY_GUIDANCE;
+use joey_agent_core::guidance::{ADAPTIVE_CODING_GUIDANCE, CONTEXT_ECONOMY_GUIDANCE};
 use joey_agent_core::prompt::{build_system_prompt, PromptInputs};
 use joey_agent_core::state_block::{render, ScratchpadSummary, StateBlockInput};
 use joey_agent_core::verification::{
@@ -187,6 +187,7 @@ fn default_on_activates_every_mechanism() {
     assert!(cfg.midturn_tool_hygiene_enabled());
     assert!(cfg.boundary_trigger_enabled());
     assert!(cfg.context_economy_guidance_enabled());
+    assert!(cfg.adaptive_coding_guidance_enabled());
     assert!(cfg.retrieval_verification_nudge_enabled());
     assert_eq!(cfg.scratchpad_max_entry_chars(), 8000);
     assert_eq!(cfg.state_block_max_chars(), 1200);
@@ -222,6 +223,7 @@ fn default_on_activates_every_mechanism() {
     // System prompt carries the context-economy guidance.
     let prompt = prompt_for(&cfg, &enabled);
     assert!(prompt.contains(CONTEXT_ECONOMY_GUIDANCE));
+    assert!(prompt.contains(ADAPTIVE_CODING_GUIDANCE));
 
     // State-block renderer produces a block for a todo + scratchpad entry.
     let todos = vec![one_todo()];
@@ -521,4 +523,18 @@ fn threshold_switches_route_through() {
     assert!((hi_boundary.boundary_threshold() - 0.45).abs() < 1e-9);
     let lo_boundary = yaml_config("compression:\n  boundary_threshold: 0.01\n");
     assert!((lo_boundary.boundary_threshold() - 0.10).abs() < 1e-9);
+}
+
+#[test]
+fn adaptive_coding_guidance_toggle_is_independent() {
+    let cfg_default = Config::defaults();
+    let cfg_off = yaml_config("agent:\n  adaptive_coding_guidance: false\n");
+    let enabled_full = resolve_toolsets(&cfg_default.get_str_list("toolsets"));
+
+    let p_on = prompt_for(&cfg_default, &enabled_full);
+    let p_off = prompt_for(&cfg_off, &enabled_full);
+    assert!(p_on.contains(ADAPTIVE_CODING_GUIDANCE));
+    assert!(!p_off.contains(ADAPTIVE_CODING_GUIDANCE));
+    // The two Joey-only guidance keys are independent toggles.
+    assert!(p_off.contains(CONTEXT_ECONOMY_GUIDANCE));
 }

@@ -128,6 +128,7 @@ Stable tier (session-stable, ordered):
 5. Tool-aware guidance, space-joined: `MEMORY_GUIDANCE` (memory tool),
    `SESSION_SEARCH_GUIDANCE`, `SKILLS_GUIDANCE` (skill_manage) — all
    verbatim upstream ports.
+- `ADAPTIVE_CODING_GUIDANCE` — Joey-only (not an upstream port): coding-specialist identity + user-preference adaptation semantics (mirrors the feature-027 memory store). Gated on `agent.adaptive_coding_guidance` (default true); off restores the pre-feature prompt.
 6. Model-family guidance, gated by `agent.tool_use_enforcement`
    (bool/string/list/default model-patterns): tool-use enforcement +
    Google (gemini/gemma) or OpenAI-style (gpt/codex/grok) blocks.

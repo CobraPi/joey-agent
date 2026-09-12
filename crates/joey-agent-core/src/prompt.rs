@@ -836,6 +836,12 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     if !tool_guidance.is_empty() {
         stable_parts.push(tool_guidance.join(" "));
     }
+    // Adaptive coding-specialist guidance — Joey-only (mirrors the
+    // context-economy gated pattern): config-gated via
+    // `agent.adaptive_coding_guidance`, default on.
+    if cfg.get_bool("agent.adaptive_coding_guidance", true) {
+        stable_parts.push(ADAPTIVE_CODING_GUIDANCE.to_string());
+    }
     // Mid-turn steering channel note (system_prompt.py:244) — appended
     // whenever tools are loaded (steers piggyback on tool results).
     if has_tools {
@@ -1406,6 +1412,70 @@ mod tests {
             session_id: None,
         });
         assert!(!prompt.contains("Work economically with context"));
+    }
+
+    /// Adaptive coding-specialist guidance (Joey-only): injected when
+    /// `agent.adaptive_coding_guidance` is true (default on).
+    #[test]
+    fn adaptive_coding_guidance_present_by_default() {
+        let _lock = crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("TERMINAL_CWD");
+        std::env::remove_var("JOEY_ENVIRONMENT_HINT");
+        let home = tempfile::tempdir().unwrap();
+        let _guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf(), joey_core::Config::defaults(), "prompt-test");
+        let enabled: Vec<String> = ["read_file", "terminal"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let prompt = build_system_prompt(&PromptInputs {
+            ctx: &ctx,
+            model: "m",
+            provider: "p",
+            enabled_tools: &enabled,
+            pass_session_id: false,
+            session_id: None,
+        });
+        assert!(prompt.contains("You are a coding specialist:"));
+        let par = prompt.find("# Parallel tool calls").unwrap();
+        let spec = prompt.find("You are a coding specialist:").unwrap();
+        let home = prompt.find("User home directory: ").unwrap();
+        assert!(par < spec, "coding-specialist guidance must follow the parallel-tool-calls section");
+        assert!(spec < home, "coding-specialist guidance must precede the environment hints");
+    }
+
+    /// `agent.adaptive_coding_guidance: false` suppresses the guidance.
+    #[test]
+    fn adaptive_coding_guidance_absent_when_disabled() {
+        let _lock = crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("TERMINAL_CWD");
+        std::env::remove_var("JOEY_ENVIRONMENT_HINT");
+        let home = tempfile::tempdir().unwrap();
+        let _guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+
+        let cfg_path = home.path().join("config-economy-off.yaml");
+        std::fs::write(&cfg_path, "agent:\n  adaptive_coding_guidance: false\n").unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(
+            cwd.path().to_path_buf(),
+            joey_core::Config::load_from(cfg_path).unwrap(),
+            "prompt-test",
+        );
+        let enabled: Vec<String> = ["scratchpad", "read_file", "terminal"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let prompt = build_system_prompt(&PromptInputs {
+            ctx: &ctx,
+            model: "m",
+            provider: "p",
+            enabled_tools: &enabled,
+            pass_session_id: false,
+            session_id: None,
+        });
+        assert!(!prompt.contains("You are a coding specialist:"));
     }
 
     /// The gate is tool-presence AND config: without the scratchpad tool the

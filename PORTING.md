@@ -1810,3 +1810,7 @@ todo/scratchpad stores, verification ledger) require
 lock()/invalidate_check_cache()/unique session ids in tests (two
 pre-existing races fixed during this feature: toggle_fixture_agent missing
 TEST_HOME_LOCK; test_nudge_non_code_no_nudge unlocked clear_all).
+
+## Adaptive Coding Specialist Guidance (2026-09-11)
+
+**Status**: Deliberate-deviation subsystem (Joey-only prompt guidance, no upstream equivalent; see the Joey-only additions ledger pattern above). Adds `ADAPTIVE_CODING_GUIDANCE` (guidance.rs) to the stable tier of `build_system_prompt` (prompt.rs), pushed after the tool-aware guidance block. Content: coding-specialist identity (read before claiming, surgical edits, verify with the project's own build/test commands) plus preference-adaptation semantics mirroring the feature-027 memory store (apply active preferences automatically; explicit outranks inferred; newer supersedes older; hard project constraints win with a one-line callout). Config gate: `agent.adaptive_coding_guidance` (default `true`, accessor `Config::adaptive_coding_guidance_enabled`); setting it false restores the pre-feature prompt. Tests: guidance contract + branding scrub (guidance.rs), presence/absence/order (prompt.rs), default-on + independent toggle (tests/parity.rs), config default + disable (joey-core config.rs).

@@ -40,6 +40,7 @@ agent:
   api_max_retries: 3
   gateway_timeout: 1800
   context_economy_guidance: true
+  adaptive_coding_guidance: true
   retrieval_verification_nudge: true
 terminal:
   backend: "local"
@@ -370,6 +371,11 @@ impl Config {
     /// `agent.context_economy_guidance` (default true).
     pub fn context_economy_guidance_enabled(&self) -> bool {
         self.get_bool("agent.context_economy_guidance", true)
+    }
+
+    /// `agent.adaptive_coding_guidance` (default true).
+    pub fn adaptive_coding_guidance_enabled(&self) -> bool {
+        self.get_bool("agent.adaptive_coding_guidance", true)
     }
 
     /// `agent.retrieval_verification_nudge` (default true).
@@ -1783,6 +1789,18 @@ mod tests {
         assert!(!cfg_from("compression:\n  boundary_trigger: false\n").boundary_trigger_enabled());
         assert!(!cfg_from("agent:\n  context_economy_guidance: false\n").context_economy_guidance_enabled());
         assert!(!cfg_from("agent:\n  retrieval_verification_nudge: false\n").retrieval_verification_nudge_enabled());
+    }
+
+    #[test]
+    fn adaptive_coding_guidance_defaults_on() {
+        let cfg = Config::defaults();
+        assert!(cfg.adaptive_coding_guidance_enabled());
+    }
+
+    #[test]
+    fn adaptive_coding_guidance_disableable() {
+        assert!(!cfg_from("agent:\n  adaptive_coding_guidance: false\n")
+            .adaptive_coding_guidance_enabled());
     }
 
     #[test]
