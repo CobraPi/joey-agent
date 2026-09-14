@@ -15,7 +15,7 @@ command bodies, vendored **byte-verbatim** (frontmatter included).
 |---|---|
 | `analyze.md` | 11351 |
 | `checklist.md` | 21970 |
-| `clarify.md` | 19022 |
+| `clarify.md` | 20118 |
 | `constitution.md` | 9778 |
 | `converge.md` | 12383 |
 | `implement.md` | 12409 |

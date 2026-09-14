@@ -38,6 +38,7 @@ mod oneshot;
 mod project_trust;
 mod render;
 mod repl;
+mod clarify_prompt;
 mod secret_prompt;
 mod setup_wizard;
 mod skills_cmd;

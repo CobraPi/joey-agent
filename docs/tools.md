@@ -89,7 +89,7 @@ Registered conditionally by helper functions in `builtins.rs` (registered but
 | Tool | Toolset | Purpose | Availability gate | Registrar |
 |---|---|---|---|---|
 | `session_search` | session_search | FTS5 search over past session messages (snippets, timestamps); scroll mode via `session_id` + `around_message_id` | session DB handle present | `register_session_tools` |
-| `clarify` | clarify | Ask the user a structured multiple-choice (max 4) or open-ended question | interactive session + clarify channel present | `register_clarify_tool` |
+| `clarify` | clarify | Ask the user a structured multiple-choice (max 4) or open-ended question; returns JSON envelope `{question, choices_offered, user_response}`; 120s timeout falls back to a best-judgement notice | interactive session + clarify channel present | `register_clarify_tool` |
 | `neurocode_index` | coding | Build/refresh tree-sitter structural dependency graph for a project | NeuroCode backend active | `register_neurocode_tools` |
 | `neurocode_query` | coding | Query the graph: dependencies/dependents/definition/references for a symbol or FQCN | backend active | same |
 | `neurocode_status` | coding | Engine status: indexed artifacts, edges, schema version, last-index time | backend active | same |

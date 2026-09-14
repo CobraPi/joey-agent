@@ -19,6 +19,7 @@
 
 pub mod anim;
 pub mod app;
+pub mod clarify;
 pub mod input;
 pub mod neurocode_search;
 pub mod neurocode_viz;

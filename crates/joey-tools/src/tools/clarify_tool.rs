@@ -19,15 +19,24 @@ pub struct ClarifyRequest {
     pub response_tx: oneshot::Sender<String>,
 }
 
+/// Upstream parity: hermes_cli/callbacks.py `clarify` timeout (120s).
+pub const CLARIFY_TIMEOUT_SECS: u64 = 120;
+
+/// Returned in the envelope when the user does not answer in time
+/// (upstream hermes_cli/callbacks.py clarify_callback timeout path).
+pub const CLARIFY_TIMEOUT_RESPONSE: &str = "The user did not provide a response within the time limit. Use your best judgement to make the choice and proceed.";
+
 /// The clarify tool.
 pub struct Clarify {
     /// Channel for sending clarify requests to the UI layer.
     clarify_tx: Option<mpsc::UnboundedSender<ClarifyRequest>>,
+    /// How long to wait for the user before falling back.
+    timeout: std::time::Duration,
 }
 
 impl Clarify {
     pub fn new(clarify_tx: Option<mpsc::UnboundedSender<ClarifyRequest>>) -> Self {
-        Self { clarify_tx }
+        Self { clarify_tx, timeout: std::time::Duration::from_secs(CLARIFY_TIMEOUT_SECS) }
     }
 }
 
@@ -42,10 +51,7 @@ impl Tool for Clarify {
     }
 
     fn description(&self) -> &str {
-        "Ask the user a structured question when genuine ambiguity blocks progress. \
-         Presents clear options (multiple-choice or open-ended) rather than guessing \
-         silently. Reserved for decisions where the wrong choice has significant \
-         downstream cost. Not for simple yes/no confirmation."
+        "Ask the user a question when you need clarification, feedback, or a decision before proceeding. Supports two modes:\n\n1. **Multiple choice** — provide up to 4 choices. The user picks one or types their own answer via a 5th 'Other' option.\n2. **Open-ended** — omit choices entirely. The user types a free-form response.\n\nCRITICAL: when you are offering options, put each option ONLY in the `choices` array — NEVER enumerate the options inside the `question` text. The UI renders `choices` as selectable rows; options written into the question string render as dead prose the user can't pick. Right: question='Which deployment target?', choices=['staging', 'prod']. Wrong: question='Which target? 1) staging 2) prod', choices=[].\n\nUse this tool when:\n- The task is ambiguous and you need the user to choose an approach\n- You want post-task feedback ('How did that work out?')\n- You want to offer to save a skill or update memory\n- A decision has meaningful trade-offs the user should weigh in on\n\nDo NOT use this tool for simple yes/no confirmation of dangerous commands (the terminal tool handles that). Prefer making a reasonable default choice yourself when the decision is low-stakes."
     }
 
     fn check(&self, ctx: &ToolContext) -> bool {
@@ -58,12 +64,12 @@ impl Tool for Clarify {
             "properties": {
                 "question": {
                     "type": "string",
-                    "description": "The question itself, and ONLY the question. Do NOT embed answer options here — pass them as the 'choices' array."
+                    "description": "The question itself, and ONLY the question (e.g. 'Which deployment target?'). Do NOT embed the answer options here — pass them as separate elements in `choices`."
                 },
                 "choices": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Up to 4 distinct, mutually exclusive options. The UI renders these as selectable rows. Omit entirely for a genuinely open-ended free-text question.",
+                    "description": "REQUIRED whenever you are presenting selectable options: each distinct option is its own array element (up to 4). The UI renders these as pickable rows and auto-appends an 'Other (type your answer)' option. Omit this parameter entirely ONLY for a genuinely open-ended free-text question.",
                     "maxItems": 4
                 }
             },
@@ -110,14 +116,25 @@ impl Tool for Clarify {
         if tx.send(req).is_err() {
             return ToolResult::Error("Failed to send clarification request to UI.".to_string());
         }
-
-        match resp_rx.await {
-            Ok(response) => ToolResult::Text(response),
-            Err(_) => {
-                ToolResult::Error("Clarification channel closed without response.".to_string())
-            }
+        // Upstream parity: hermes_cli/callbacks.py clarify_callback blocks with a
+        // timeout (default 120s) and returns a best-judgement fallback string.
+        match tokio::time::timeout(self.timeout, resp_rx).await {
+            Ok(Ok(response)) => clarify_envelope(question, choices, response),
+            Ok(Err(_)) => ToolResult::Error("Clarification channel closed without response.".to_string()),
+            Err(_elapsed) => clarify_envelope(question, choices, CLARIFY_TIMEOUT_RESPONSE.to_string()),
         }
     }
+}
+
+/// Upstream parity: tools/clarify_tool.py returns
+/// `{"question", "choices_offered", "user_response"}` as JSON.
+fn clarify_envelope(question: String, choices: Vec<String>, response: String) -> ToolResult {
+    let envelope = serde_json::json!({
+        "question": question,
+        "choices_offered": choices,
+        "user_response": response.trim(),
+    });
+    ToolResult::Text(serde_json::to_string(&envelope).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -179,6 +196,69 @@ mod tests {
             .await;
 
         assert!(!result.is_error());
-        assert_eq!(result.to_content_string(), "option A");
+        let text = result.to_content_string();
+        let v: serde_json::Value = serde_json::from_str(&text).expect("envelope is valid JSON");
+        assert_eq!(v["user_response"], "option A");
+        assert_eq!(v["question"], "Which option?");
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_best_judgement_envelope() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let tool = Clarify { clarify_tx: Some(tx), timeout: std::time::Duration::from_millis(50) };
+        let c = ctx(true);
+
+        let handle = tokio::spawn(async move {
+            tool.execute(
+                json!({
+                    "question": "Pick one:",
+                    "choices": ["a", "b"]
+                }),
+                &c,
+            )
+            .await
+        });
+
+        // Receive the request but NEVER answer: drop response_tx.
+        if let Some(req) = rx.recv().await {
+            drop(req.response_tx);
+        }
+
+        let result = handle.await.expect("task join");
+        assert!(!result.is_error());
+        let text = result.to_content_string();
+        let v: serde_json::Value = serde_json::from_str(&text).expect("envelope is valid JSON");
+        assert_eq!(v["user_response"], CLARIFY_TIMEOUT_RESPONSE);
+    }
+
+    #[tokio::test]
+    async fn empty_choices_open_ended_roundtrip() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let tool = Clarify::new(Some(tx));
+        let c = ctx(true);
+
+        // Spawn a task to respond to the clarification.
+        tokio::spawn(async move {
+            if let Some(req) = rx.recv().await {
+                assert!(req.choices.is_empty());
+                let _ = req.response_tx.send("free text answer".to_string());
+            }
+        });
+
+        let result = tool
+            .execute(
+                json!({
+                    "question": "Any thoughts?",
+                    "choices": []
+                }),
+                &c,
+            )
+            .await;
+
+        assert!(!result.is_error());
+        let text = result.to_content_string();
+        let v: serde_json::Value = serde_json::from_str(&text).expect("envelope is valid JSON");
+        assert_eq!(v["user_response"], "free text answer");
+        assert_eq!(v["choices_offered"], serde_json::json!([]));
     }
 }

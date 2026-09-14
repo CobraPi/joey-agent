@@ -979,6 +979,8 @@ pub struct App {
     // ── OMO agent picker state (T028) ──
     /// Agent picker overlay is open.
     pub agent_picker_open: bool,
+    /// Pending clarify-question modal session, if open.
+    pub clarify: Option<crate::clarify::ClarifySession>,
     /// Cursor position in the agent picker.
     pub agent_picker_cursor: usize,
     /// The agent roster for the picker (Default + available OMO agents).
@@ -1494,6 +1496,7 @@ impl App {
             usage_series: Vec::new(),
             turns: 0,
             agent_picker_open: false,
+            clarify: None,
             agent_picker_cursor: 0,
             agent_roster: Vec::new(),
             active_agent_index: 0,

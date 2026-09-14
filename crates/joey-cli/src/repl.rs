@@ -63,6 +63,7 @@ pub(crate) struct ReplState {
     cwd: PathBuf,
     overrides: Overrides,
     agent: Agent,
+    pub(crate) clarify_rx: Option<tokio::sync::mpsc::UnboundedReceiver<joey_tools::tools::clarify_tool::ClarifyRequest>>,
     session_id: String,
     /// Separate read handle for /sessions, /history, /usage queries (the
     /// agent owns its own store connection).
@@ -149,6 +150,7 @@ pub(crate) struct AgentParts {
     pub agent_config: AgentConfig,
     /// Base (pre-orchestration) tool registry children are built from.
     pub base_registry: ToolRegistry,
+    pub clarify_rx: tokio::sync::mpsc::UnboundedReceiver<joey_tools::tools::clarify_tool::ClarifyRequest>,
 }
 
 pub(crate) fn build_agent_parts(
@@ -180,8 +182,13 @@ pub(crate) fn build_agent_parts(
     });
     joey_tools::builtins::register_session_tools(&mut registry, session_db);
 
-    // Wire clarify (interactive only — channel wired at runtime).
-    joey_tools::builtins::register_clarify_tool(&mut registry, None);
+    // Wire clarify (interactive sessions): the UI side consumes ClarifyRequests
+    // from clarify_rx and answers through the per-request oneshot. HyperCode
+    // child registries (engine.rs hypercode_context_for_agent) still register
+    // the tool with no channel — subagent children are headless by design.
+    let (clarify_tx, clarify_rx) =
+        tokio::sync::mpsc::unbounded_channel::<joey_tools::tools::clarify_tool::ClarifyRequest>();
+    joey_tools::builtins::register_clarify_tool(&mut registry, Some(clarify_tx));
 
     // ── Initialize LSP from config (crush-style code intelligence) ────
     {
@@ -351,6 +358,7 @@ pub(crate) fn build_agent_parts(
         subagent_manager: manager,
         agent_config: agent_cfg,
         base_registry,
+        clarify_rx,
     })
 }
 
@@ -585,6 +593,7 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
     let agent = parts.agent;
+    let clarify_rx = parts.clarify_rx;
 
     let ropts = {
         let capability = crate::capability::RenderCapability::detect();
@@ -611,6 +620,7 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         cwd: cwd.clone(),
         overrides,
         agent,
+        clarify_rx: Some(clarify_rx),
         session_id,
         db,
         ropts,
@@ -1038,12 +1048,39 @@ async fn run_turn_interactive(st: &mut ReplState, input: &str) -> String {
     let interrupt = st.agent.interrupt_handle();
 
     let mut last_ctrlc: Option<Instant> = None;
+    // Clarify: borrow the receiver field disjointly from st.agent so both
+    // live across the select loop. has_clarify disables the arm once the
+    // channel dies (agent rebuilt mid-session) to avoid a busy recv() loop.
+    let mut has_clarify = st.clarify_rx.is_some();
+    let mut clarify_rx = st.clarify_rx.as_mut();
     {
         let turn = st.agent.run_turn(input, tx);
         tokio::pin!(turn);
         loop {
             tokio::select! {
                 _res = &mut turn => break,
+                req = async {
+                    // as_deref_mut: re-borrow (not move) the Option<&mut _>
+                    // so the loop can re-create this future each iteration.
+                    match clarify_rx.as_deref_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if has_clarify => {
+                    match req {
+                        Some(req) => {
+                            // Render the question selector WITHOUT blocking the
+                            // turn/ctrl-c arms. The prompt answers through the
+                            // oneshot; send failure = tool timed out (120s).
+                            tokio::spawn(crate::clarify_prompt::run(
+                                req.question,
+                                req.choices,
+                                req.response_tx,
+                            ));
+                        }
+                        None => has_clarify = false,
+                    }
+                }
                 sig = tokio::signal::ctrl_c() => {
                     if sig.is_err() { continue; }
                     let now = Instant::now();
@@ -2283,6 +2320,7 @@ fn new_session(st: &mut ReplState, name: &str, quiet: bool) {
                 execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
             });
             st.agent = parts.agent;
+            st.clarify_rx = Some(parts.clarify_rx);
             st.session_start = Instant::now();
             st.last_response.clear();
             joey_core::logging::set_session_context(Some(&new_id));
@@ -2313,6 +2351,7 @@ fn rebuild_agent_preserving_history(st: &mut ReplState) -> Result<()> {
         execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
     });
     st.agent = parts.agent;
+    st.clarify_rx = Some(parts.clarify_rx);
     Ok(())
 }
 
@@ -2618,6 +2657,7 @@ fn resume_session(st: &mut ReplState, target: &str) {
                 execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
             });
             st.agent = parts.agent;
+            st.clarify_rx = Some(parts.clarify_rx);
             st.session_id = id.clone();
             joey_core::logging::set_session_context(Some(&id));
             render::success(&format!("Resumed session {} ({} messages).", id, count));

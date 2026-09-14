@@ -878,6 +878,10 @@ impl<B: ratatui::backend::Backend> Tui<B> {
                 widgets::draw_agent_picker(f, area, app, &theme);
             }
 
+            if app.clarify.is_some() {
+                widgets::draw_clarify_modal(f, area, app, &theme);
+            }
+
             if app.search_open {
                 widgets::draw_search_bar(f, area, app, &theme);
             }
@@ -1022,6 +1026,12 @@ impl<B: ratatui::backend::Backend> Tui<B> {
         // most transient UI state goes first).
         if self.selection.range.is_some() {
             self.clear_selection();
+            return None;
+        }
+
+        // Clarify modal swallows every key while open (upstream ClarifyPrompt).
+        if self.app.clarify.is_some() {
+            self.app.clarify_key(key);
             return None;
         }
 

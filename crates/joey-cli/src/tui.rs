@@ -116,6 +116,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
     )?;
     let agent = agent_parts.agent;
     let subagent_manager = agent_parts.subagent_manager;
+    let clarify_rx = agent_parts.clarify_rx;
 
     let provider_name: &'static str = agent.client().profile().name;
     let model_name = crate::repl::build_agent_config(&config, &overrides).model;
@@ -256,6 +257,9 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
             tui,
             ev_rx,
             tap_rx,
+            clarify_rx: Some(clarify_rx),
+            clarify_alive: true,
+            clarify_deadline: None,
             engine: Some(engine),
             interrupt,
             engine_spec,
@@ -314,6 +318,9 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         tui,
         ev_rx,
         tap_rx,
+        clarify_rx: Some(clarify_rx),
+        clarify_alive: true,
+        clarify_deadline: None,
         engine: Some(engine),
         interrupt,
         engine_spec,
@@ -394,6 +401,13 @@ pub struct TuiSession {
     /// here; pumped alongside engine events so per-subagent panes update
     /// live even while the engine is mid-turn.
     pub tap_rx: tokio::sync::mpsc::UnboundedReceiver<joey_agent_core::AgentEvent>,
+    /// Clarify requests from the live agent's clarify tool (Wave: clarify UI).
+    pub clarify_rx: Option<tokio::sync::mpsc::UnboundedReceiver<joey_tools::tools::clarify_tool::ClarifyRequest>>,
+    /// Set false once the clarify channel closes (agent rebuilt) so the
+    /// select arm goes quiet instead of busy-looping on recv() == None.
+    pub clarify_alive: bool,
+    /// When an open clarify modal should auto-dismiss (tool timeout, 120s).
+    pub clarify_deadline: Option<std::time::Instant>,
     pub engine: Option<crate::engine::EngineHandle>,
     pub interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub engine_spec: crate::engine::EngineSpec,
@@ -1057,7 +1071,46 @@ async fn pump_one(session: &mut TuiSession) -> Option<PumpOutcome> {
             }
             return None;
         }
+        clarify_req = async {
+            match session.clarify_rx.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        }, if session.clarify_alive => {
+            match clarify_req {
+                Some(req) => {
+                    let resp_tx = req.response_tx;
+                    session.tui.app_mut().open_clarify(
+                        req.question,
+                        req.choices,
+                        Box::new(move |answer| {
+                            // Send failure = user answered after the tool's
+                            // 120s timeout; the agent already proceeded.
+                            let _ = resp_tx.send(answer);
+                        }),
+                    );
+                    session.clarify_deadline = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs(
+                                joey_tools::tools::clarify_tool::CLARIFY_TIMEOUT_SECS,
+                            ),
+                    );
+                }
+                None => session.clarify_alive = false,
+            }
+            return None;
+        }
         _ = tokio::time::sleep(session.tui.frame_budget()) => {
+            // Auto-dismiss the clarify modal once the tool-side timeout
+            // elapsed (its oneshot receiver is gone; keys must unblock).
+            if session
+                .clarify_deadline
+                .map(|d| std::time::Instant::now() >= d)
+                .unwrap_or(false)
+            {
+                session.tui.app_mut().clarify = None;
+                session.clarify_deadline = None;
+            }
             // Frame tick: drain all pending terminal input (non-blocking).
             // Feature indicator: refresh the browser-connection badge once
             // per tick (cheap atomic load) — only writes on change.

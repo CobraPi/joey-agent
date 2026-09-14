@@ -17,6 +17,23 @@ it is intended to match upstream exactly.
 
 ## Complete and faithful (compiles, tested, runs end-to-end)
 
+- **Clarify tool + interactive question UI (2026-09-14):** `clarify`
+  (crates/joey-tools/src/tools/clarify_tool.rs) at parity with upstream
+  `tools/clarify_tool.py`: verbatim schema/description, JSON response
+  envelope (`question`/`choices_offered`/`user_response`), 120s timeout
+  fallback string, cancel-as-empty-answer semantics (error paths map
+  upstream's JSON `{"error": ...}` onto `ToolResult::Error`). Live in both
+  interactive frontends: the line REPL renders a numbered-choice selector
+  plus free-text prompt inside `run_turn_interactive`; the ratatui TUI
+  renders a centered question modal (joey-tui `clarify.rs`, parity with
+  upstream `ui-tui/src/components/prompts.tsx` ClarifyPrompt: numbered
+  rows, ▸ cursor, auto-appended "Other (type your answer)", 1-N quick
+  pick, Esc cancel). `/speckit-clarify` now delivers its one-question-at-
+  a-time loop through the tool with a plain-text fallback for
+  non-interactive sessions. HyperCode subagent children register the tool
+  with no channel (check() false) — headless by design, matching
+  upstream's orchestration guidance.
+
 **Core foundation (`joey-core`)** — port of `hermes_constants.py`, `hermes_state.py`,
 `hermes_time.py`, `hermes_logging.py`, `agent/redact.py`, `utils.py`, config layer:
 - Home/profile resolution (`JOEY_HOME`, platform defaults, container/WSL/Termux
@@ -578,7 +595,7 @@ Selected solely by explicit `neurocode.rag.backend = copilot` and fully decouple
   (`context.engine` — the trait is ported), and `/compress here|--preview|
   --aggressive` (honest notices) are unported. Thinking-only prefill
   continuation is likewise unported.
-- **Tools:** `session_search`, `delegate_task`, `clarify`, `process`
+- **Tools:** `session_search`, `delegate_task`, `process`
   (background procs), `cronjob` (agent-callable) remain stubs; `terminal`
   `background`/`pty` params return honest not-supported errors; document
   extraction (.docx/.xlsx), lint/LSP result fields, the memory threat-scan/
