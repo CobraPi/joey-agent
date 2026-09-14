@@ -1292,6 +1292,7 @@ fn planner_request(
         prompt_append: None,
         team: None,
         name: None,
+        priority: None,
     }
 }
 
@@ -1334,6 +1335,7 @@ pub(crate) fn explorer_request(
         prompt_append: Some(EXPLORER_PROMPT.to_string()),
         team: None,
         name: None,
+        priority: None,
     }
 }
 
@@ -1379,6 +1381,7 @@ pub(crate) fn implementor_request(
         prompt_append: Some(IMPLEMENTOR_PROMPT.to_string()),
         team: None,
         name: None,
+        priority: None,
     }
 }
 
@@ -2061,6 +2064,7 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
             prompt_append: Some(IMPLEMENTOR_PROMPT.to_string()),
             team: None,
             name: None,
+            priority: None,
         };
         tracing::info!(
             "hypercode: graph dispatching task {} ({} worker)",

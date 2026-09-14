@@ -14,7 +14,7 @@
 //! Every test fn starts with `gov_wave_`.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ use joey_orchestration::governance::GovernanceConfig;
 use joey_orchestration::resource_records::ResourceRecordStore;
 use joey_orchestration::types::{Priority, ResourceRecordOutcome};
 use joey_orchestration::{
-    DelegateTask, ManagerConfig, SubagentManager, TaskSpec,
+    DelegateTask, DelegationRequest, ManagerConfig, SubagentManager, TaskSpec,
 };
 use joey_tools::context::ToolContext;
 use joey_tools::registry::{Tool, ToolResult};
@@ -261,8 +261,160 @@ impl Tool for EchoTool {
 }
 
 // ---------------------------------------------------------------------------
-// Tests.
+// T035: spin-thread helpers (verbatim from tests/governance_isolation.rs —
+// the runaway-test mechanism: real CPU burn for the CPU ceiling to sample).
 // ---------------------------------------------------------------------------
+
+/// Start ONE OS thread spinning pure computation (`spin_loop` under an
+/// AtomicBool stop flag) to give the process real CPU burn for the CPU
+/// ceiling to sample. Returns (join handle, stop flag).
+fn spawn_spin_thread() -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let handle = std::thread::spawn(move || {
+        while !flag.load(Ordering::Relaxed) {
+            std::hint::spin_loop();
+        }
+    });
+    (handle, stop)
+}
+
+/// Stop a spin thread started by `spawn_spin_thread` (flag + join).
+fn stop_spin_thread(handle: std::thread::JoinHandle<()>, stop: &Arc<AtomicBool>) {
+    stop.store(true, Ordering::SeqCst);
+    handle.join().expect("spin thread must join cleanly");
+}
+
+/// T035 regression: a completed batch wave must NOT stop the tree's
+/// watchdog — a runaway child dispatched AFTER the wave on the same
+/// manager must still be aborted at cpu_ceiling_secs with outcome
+/// aborted_by_resource_limit. (Before T035 the wave's transient child
+/// managers shared gov_shutdown, so the first completed wave silenced
+/// the tree's watchdog for the whole session.)
+#[tokio::test(flavor = "multi_thread")]
+async fn gov_wave_watchdog_survives_wave_completion() {
+    // One shared scripted server: 2 fast final steps for the wave, then a
+    // slow-but-finite 8s step the runaway never gets past (the CPU ceiling
+    // aborts it first — same shape as governance_isolation.rs's runaway:
+    // OS spin thread + slow-but-finite script).
+    let steps = vec![
+        ScriptedFinal { delay_ms: 300, text: "done" },
+        ScriptedFinal { delay_ms: 300, text: "done" },
+        ScriptedFinal { delay_ms: 8000, text: "never" },
+    ];
+    let (base_url, _starts, _ends, _max) = spawn_scripted_server(steps).await;
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let mgr = governance_wave_manager(
+        GovernanceConfig {
+            cpu_ceiling_secs: 2,
+            task_timeout_secs: 0, // disabled — the CPU ceiling is the sole aborter
+            retry_budget: 0,
+            max_queue_depth: 4,
+            ..Default::default()
+        },
+        data_dir.path().to_path_buf(),
+    );
+
+    let mut base = ToolRegistry::new();
+    base.register(Arc::new(EchoTool));
+
+    // Stage 1: quick batch wave — 2 children, fast final steps, both
+    // Completed. The wave's transient child managers drop here; they must
+    // NOT stop the tree's watchdog (the T035 bug).
+    let tasks: Vec<TaskSpec> = (0..2)
+        .map(|i| TaskSpec {
+            goal: format!("gov-wave-watchdog-{i}"),
+            context: None,
+            model: None,
+            toolsets: vec!["coding".to_string()],
+            role: None,
+            subagent_type: None,
+            background: false,
+            budgets: None,
+        })
+        .collect();
+    let wave = mgr
+        .dispatch_batch(
+            &tasks,
+            None,
+            &["coding".to_string()],
+            &agent_config(base_url.clone()),
+            &Config::defaults(),
+            &base,
+            None,
+        )
+        .await;
+    assert_eq!(wave.len(), 2);
+    for (i, r) in wave.iter().enumerate() {
+        assert!(
+            r.success,
+            "wave child {i} must succeed against the mock provider, error: {:?}",
+            r.error
+        );
+    }
+
+    // Stage 2: runaway child on the SAME manager — real CPU burn via an
+    // OS spin thread (governance_isolation.rs mechanism); the watchdog
+    // must STILL be alive and abort it at the 2s CPU ceiling.
+    let (spin_handle, stop_flag) = spawn_spin_thread();
+    let req = DelegationRequest::single("gov-wave-runaway-after-wave");
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        mgr.dispatch_single(&req, &agent_config(base_url), &Config::defaults(), &base, None)
+            .await
+    })
+    .await
+    .expect("runaway dispatch must return within the 30s outer bound");
+    stop_spin_thread(spin_handle, &stop_flag);
+
+    assert!(
+        !result.success,
+        "the runaway child must be aborted at the 2s CPU ceiling even after a \
+         completed wave (watchdog silenced by the wave's transient managers — \
+         the T035 bug), summary: {:?}, wall_clock {:?}",
+        result.summary,
+        result.wall_clock
+    );
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("[resource-limit]"),
+        "runaway error must be the CPU-ceiling abort, got: {:?}",
+        result.error
+    );
+
+    // Records: 2 Completed (wave) + 1 aborted_by_resource_limit (runaway)
+    // = 3 total.
+    let records = ResourceRecordStore::open(Some(data_dir.path())).load();
+    assert_eq!(
+        records.len(),
+        3,
+        "expected exactly 3 records (2 wave Completed + 1 runaway aborted), got {}: {:?}",
+        records.len(),
+        records
+            .iter()
+            .map(|r| (&r.task_signature, r.outcome))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.outcome == ResourceRecordOutcome::Completed)
+            .count(),
+        2,
+        "both wave records must be Completed, got {:?}",
+        records.iter().map(|r| r.outcome).collect::<Vec<_>>()
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.outcome == ResourceRecordOutcome::AbortedByResourceLimit),
+        "the runaway record must be AbortedByResourceLimit, got {:?}",
+        records.iter().map(|r| r.outcome).collect::<Vec<_>>()
+    );
+}
 
 /// T034 (a): a dispatch_batch wave of 3 tasks writes exactly one Completed
 /// resource record per child through the shared store (FR-011).

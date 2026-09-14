@@ -557,6 +557,11 @@ pub struct SubagentManager {
     /// Feature 030 (T016): watchdog shutdown flag — set by `Drop` so the
     /// sampling loop always terminates with its manager.
     gov_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Feature 030 (T035): true only for the manager that OWNS the tree's
+    /// watchdog lifecycle (SubagentManager::new). Transient child managers
+    /// share gov_shutdown but must not stop it on drop — a completed wave
+    /// would otherwise silence the tree's watchdog for the session.
+    gov_watchdog_owner: bool,
     /// Feature 030 (T023, R8): sustained-overload tracker for busy
     /// refusals. Always constructed; inert when governance is disabled
     /// (refusals can never occur on a disabled manager).
@@ -754,6 +759,7 @@ impl SubagentManager {
             child_runtime,
             gov_watchdog,
             gov_shutdown,
+            gov_watchdog_owner: true,
             gov_overload: crate::governance::OverloadTracker::new(),
             gov_start_gate: std::sync::Arc::new(crate::governance::StartGate::new()),
         }
@@ -923,6 +929,7 @@ impl SubagentManager {
             child_runtime: self.child_runtime.clone(),
             gov_watchdog: self.gov_watchdog.clone(),
             gov_shutdown: self.gov_shutdown.clone(),
+            gov_watchdog_owner: false,
             gov_overload: crate::governance::OverloadTracker::new(),
             gov_start_gate: self.gov_start_gate.clone(),
         }
@@ -2666,6 +2673,7 @@ impl SubagentManager {
                     child_runtime,
                     gov_watchdog,
                     gov_shutdown,
+                    gov_watchdog_owner: false,
                     gov_overload: crate::governance::OverloadTracker::new(),
                     gov_start_gate: gov_start_gate.clone(),
                 };
@@ -2756,8 +2764,13 @@ impl Drop for SubagentManager {
     /// the caller (acceptable risk — tests drop managers after children
     /// finish; the watchdog itself holds no runtime reference and exits
     /// on this flag).
+    /// T035: only the owner manager stops the watchdog; transient child
+    /// managers share the flag Arc but never set it (a completed wave
+    /// must not silence the tree's watchdog).
     fn drop(&mut self) {
-        self.gov_shutdown.store(true, Ordering::SeqCst);
+        if self.gov_watchdog_owner {
+            self.gov_shutdown.store(true, Ordering::SeqCst);
+        }
         if let Some(rt) = self.child_runtime.take() {
             std::thread::spawn(move || drop(rt));
         }
@@ -3437,5 +3450,34 @@ mod tests {
         };
         assert!(valid_resume_token(Some(stale), goal).is_none());
         assert!(valid_resume_token(None, goal).is_none());
+    }
+
+    /// T035 regression: transient child managers share the tree's
+    /// gov_shutdown Arc but must never set it — only the owning manager's
+    /// drop stops the tree's watchdog (a completed wave killing it was
+    /// the bug).
+    #[test]
+    fn transient_drop_does_not_stop_tree_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = SubagentManager::new(ManagerConfig {
+            governance: GovernanceConfig {
+                enabled: true,
+                data_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let flag = Arc::clone(&owner.gov_shutdown);
+        let transient = owner.shared_child_manager();
+        drop(transient);
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "transient drop must leave the watchdog running"
+        );
+        drop(owner);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "owner drop must stop the watchdog"
+        );
     }
 }
