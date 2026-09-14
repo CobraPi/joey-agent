@@ -829,12 +829,12 @@ async fn gov_tool_surface_priority_reaches_admission_record() {
     );
 }
 
-/// T029 contract 3: the background FLAG keeps precedence over the `priority`
-/// arg (flag > arg). The dispatch returns a background handle line, the
-/// completion notice arrives — and background children write NO resource
-/// records (known FR-011 gap, pinned for follow-up).
+/// T029 contract 3 (T034-converged): the background FLAG keeps precedence
+/// over the `priority` arg (flag > arg). The dispatch returns a background
+/// handle line, the completion notice arrives — and background children
+/// now WRITE resource records through the shared store.
 #[tokio::test]
-async fn gov_tool_surface_background_flag_dispatches_without_records() {
+async fn gov_tool_surface_background_flag_writes_records_via_shared_store() {
     let steps = (0..4)
         .map(|_| ScriptedFinal { delay_ms: 0, text: "done" })
         .collect();
@@ -905,12 +905,24 @@ async fn gov_tool_surface_background_flag_dispatches_without_records() {
 
     // Grace: let any straggling record append land before counting.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    // Background children dispatch via shared_child_manager (governance off,
-    // gov_records: None) — they emit no resource records today (FR-011 gap,
-    // surfaced for follow-up converge; see manager.rs shared_child_manager).
-    assert_eq!(
-        ResourceRecordStore::open(Some(data_dir2.path())).load().len(),
-        record_count_before,
-        "background children must not write resource records (known FR-011 gap)"
+    // T034: background children dispatch via shared_child_manager, which now
+    // inherits governance and shares the records store — background waves write
+    // resource records like every other dispatch kind (FR-011).
+    let records = ResourceRecordStore::open(Some(data_dir2.path())).load();
+    assert!(
+        records.len() >= record_count_before + 1,
+        "background child must write a resource record (T034 shared store), before={record_count_before} after={}",
+        records.len()
+    );
+    assert!(
+        records[record_count_before..]
+            .iter()
+            .any(|r| r.priority == Priority::Background
+                && r.outcome == ResourceRecordOutcome::Completed),
+        "at least one new record must be Completed with priority==Background (the flag beat the critical arg), records: {:?}",
+        records
+            .iter()
+            .map(|r| (r.priority, r.outcome))
+            .collect::<Vec<_>>()
     );
 }

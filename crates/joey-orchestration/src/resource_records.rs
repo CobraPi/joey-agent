@@ -253,7 +253,7 @@ pub fn spawn_watchdog(
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
     let interval = interval_secs.max(1);
-    tokio::spawn(async move {
+    let fut = async move {
         // One System instance alive across ticks: cpu_usage() is measured
         // since the last refresh, so the first tick reads ~0 (sampling
         // warmup — acceptable).
@@ -330,7 +330,30 @@ pub fn spawn_watchdog(
                 }
             }
         }
-    });
+    };
+    // Reactor-safe spawn: prefer the ambient runtime; when constructed
+    // outside any Tokio context (e.g. joey-cli engine tests building
+    // managers synchronously), drive the sampling loop on a detached
+    // std thread with its own current-thread runtime so watchdog
+    // enforcement never depends on the caller's async context.
+    // Fixes the T034 regression where joey-cli actor_tests hit the bare
+    // tokio::spawn with no reactor running (governance now inherited).
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(fut);
+        }
+        Err(_) => {
+            let _ = std::thread::Builder::new()
+                .name("joey-gov-watchdog".to_string())
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("watchdog runtime");
+                    rt.block_on(fut);
+                });
+        }
+    }
 }
 
 #[cfg(test)]

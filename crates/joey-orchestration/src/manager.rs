@@ -886,7 +886,18 @@ impl SubagentManager {
     #[doc(hidden)]
     pub(crate) fn shared_child_manager(&self) -> SubagentManager {
         SubagentManager {
-            config: ManagerConfig::default(),
+            // T034: transient managers INHERIT the parent's governance —
+            // same concurrency caps and GovernanceConfig — and SHARE the
+            // parent's records store, so background children write resource
+            // records like every other dispatch kind (FR-002/FR-011).
+            config: ManagerConfig {
+                governance: self.config.governance.clone(),
+                max_concurrent_children: self.config.max_concurrent_children,
+                max_concurrent_requests: self.config.max_concurrent_requests,
+                parent_reserved_permits: self.config.parent_reserved_permits,
+                subagent_recovery_attempts: self.config.subagent_recovery_attempts,
+                ..ManagerConfig::default()
+            },
             semaphore: self.semaphore.clone(),
             child_semaphore: self.child_semaphore.clone(),
             child_slots: self.child_slots.clone(),
@@ -894,10 +905,10 @@ impl SubagentManager {
             gov_retry_budget: self.gov_retry_budget.clone(),
             gov_cache: self.gov_cache.clone(),
             gov_flights: self.gov_flights.clone(),
-            // T020: transient managers never write resource records —
-            // their default config has governance disabled; emission
-            // belongs to the top-level manager created via `new`.
-            gov_records: None,
+            // T034: transient managers inherit governance and share the
+            // records store — background waves write resource records
+            // through the same JSONL file as blocking dispatch.
+            gov_records: self.gov_records.clone(),
             grant_back: self.grant_back.clone(),
             registry: self.registry.clone(),
             child_pool_owner: true,
@@ -2565,6 +2576,22 @@ impl SubagentManager {
 
         let mut join_set: JoinSet<(usize, DelegationResult)> = JoinSet::new();
 
+        // T034: the transient per-child managers below INHERIT the parent's
+        // governance config (concurrency caps + GovernanceConfig) and SHARE
+        // the parent's records store, so batch children are subject to
+        // timeout/admission/dedup and write resource records (FR-002/004/
+        // 007/008/011) exactly like single blocking dispatch.
+        let parent_governance = self.config.governance.clone();
+        let parent_records = self.gov_records.clone();
+        let parent_cfg_snapshot = ManagerConfig {
+            governance: parent_governance.clone(),
+            max_concurrent_children: self.config.max_concurrent_children,
+            max_concurrent_requests: self.config.max_concurrent_requests,
+            parent_reserved_permits: self.config.parent_reserved_permits,
+            subagent_recovery_attempts: self.config.subagent_recovery_attempts,
+            ..ManagerConfig::default()
+        };
+
         for (task_index, req) in requests.to_vec().into_iter().enumerate() {
             let parent_cfg = parent_config.clone();
             let config_tree = parent_config_tree.clone();
@@ -2589,6 +2616,8 @@ impl SubagentManager {
             let gov_watchdog = shared_gov_watchdog.clone();
             let gov_shutdown = shared_gov_shutdown.clone();
             let gov_start_gate = gov_start_gate.clone();
+            let parent_cfg_snapshot = parent_cfg_snapshot.clone();
+            let parent_records = parent_records.clone();
             // Allocate the child's stable id from the PARENT manager's
             // counter so ids are unique + monotonic across the whole
             // batch (T033: same process-global counter the parent draws
@@ -2609,7 +2638,9 @@ impl SubagentManager {
                 // child registry, so registry-driven per-child control
                 // (stop/steer/status) sees batch children too.
                 let mgr = SubagentManager {
-                    config: ManagerConfig::default(),
+                    // T034: inherited governance + shared records store
+                    // (snapshot built before the loop above).
+                    config: parent_cfg_snapshot,
                     semaphore: sem.clone(),
                     child_semaphore: child_sem.clone(),
                     child_slots: slots.clone(),
@@ -2617,11 +2648,10 @@ impl SubagentManager {
                     gov_retry_budget: gov_retry_budget.clone(),
                     gov_cache: gov_cache.clone(),
                     gov_flights: gov_flights.clone(),
-                    // T020: transient managers never write resource
-                    // records — their default config has governance
-                    // disabled; emission belongs to the top-level
-                    // manager created via `new`.
-                    gov_records: None,
+                    // T034: transient managers inherit governance and
+                    // share the records store — batch children write
+                    // resource records through the parent's JSONL file.
+                    gov_records: parent_records,
                     grant_back: grant_back.clone(),
                     registry: child_registry.clone(),
                     child_pool_owner: true,

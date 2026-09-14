@@ -260,3 +260,9 @@ _Appended by /speckit-converge on 2026-09-13 — gap closure between spec/plan/t
 - [X] T031 Execute quickstart.md M1 (end-to-end feel) and M2 (manual governance-off parity) manual scenarios on a configured provider and record results in specs/030-please-implement-features/manual-validation.md per quickstart M1/M2 (missing)
 - [X] T032 Move the uncommitted feature-030 working tree (13 modified + 6 untracked governance files) onto branch `030-please-implement-features` per plan.md branch decision and commit per tasks.md Notes commit cadence (contradicts)
 - [ ] T033 Run workspace doc-tests (cargo test --workspace --doc), currently unexecuted because the host EDR SIGKILLs cargo-spawned test processes, once an environment permitting them is available per T028 (partial)
+
+## Phase 11: Convergence
+
+_Appended by /speckit-converge on 2026-09-13 (round 2) — one root-caused gap surfaced by T029/T031 verification work._
+
+- [X] T034 Govern batch-wave and background-wave children: both transient SubagentManager constructors (crates/joey-orchestration/src/manager.rs `shared_child_manager` ~:887-916 and the dispatch_requests batch-wave literal ~:2611-2630) set `config: ManagerConfig::default()` (governance disabled) and `gov_records: None`, so batch/background children get no task timeout (FR-004), no admission-queue busy refusal (FR-002), no result-cache/single-flight (FR-007/008), and no resource records (FR-011/SC-005); fix by inheriting the parent's governance config into both transients (keep all shared pools/queue/runtime/watchdog Arcs unchanged) and sharing the records store (wrap `gov_records` in an Arc so every dispatch kind emits), with tests: batch wave appends exactly one record per child, a batch child exceeding task_timeout_secs yields a Timeout record, and a background wave appends records per FR-011 (partial)
