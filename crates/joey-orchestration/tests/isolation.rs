@@ -76,6 +76,7 @@ async fn context_field_is_passed_to_subagent() {
         prompt_append: None,
         team: None,
         name: None,
+        priority: None,
     };
 
     let result = mgr

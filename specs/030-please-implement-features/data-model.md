@@ -31,7 +31,7 @@ Entities keyed to FR numbers (see [spec.md](spec.md)). Fields follow the Rust st
 
 ## Resource Record (FR-011/012)
 - File: `~/.joey/delegation/resource-records.jsonl` (append-only; one JSON object per line).
-- Fields: record_id, task_signature, priority, outcome (completed|failed|timeout|aborted_by_resource_limit|busy_refused|cache_hit), queue_wait_ms, compute_ms, cpu_ms, memory_peak_kb (advisory), retries, checkpoint (token|null), token_usage { prompt, completion, total, cache_read, cache_write, reasoning }, degraded (bool), created_at.
+- Fields: record_id, task_signature, priority, outcome (completed|failed|timeout|aborted_by_resource_limit|busy_refused|cache_hit), queue_wait_ms, compute_ms, cpu_ms, memory_peak_kb (advisory), parent_starved_ms (advisory, sampled), retries, checkpoint (token|null), token_usage { prompt, completion, total, cache_read, cache_write, reasoning }, degraded (bool), created_at.
 - Validation: one record per terminal task outcome (including busy_refused and cache_hit); sampled fields labeled by name (cpu_ms/memory_peak_kb/compute_ms are sampled).
 - State transitions: appended at terminal outcome; immutable after append.
 

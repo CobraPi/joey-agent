@@ -11,10 +11,11 @@ use joey_tools::ToolRegistry;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
+use crate::governance::GovernanceConfig;
 use crate::subagent::{specs_to_requests, Subagent};
 use crate::types::{
     ChildHandle, DelegationOverview, DelegationState, DelegationRequest, DelegationResult,
-    StopReason, SubagentRole, TaskSpec, WorkHandle,
+    Priority, ResourceRecordOutcome, ResumeToken, StopReason, SubagentRole, TaskSpec, WorkHandle,
 };
 
 /// Configuration for the orchestration manager.
@@ -54,6 +55,8 @@ pub struct ManagerConfig {
     /// counts accumulate across attempts. Config key:
     /// `delegation.subagent_recovery_attempts`.
     pub subagent_recovery_attempts: usize,
+    /// Feature 030 resource-governance settings (default: disabled = pre-feature behavior).
+    pub governance: GovernanceConfig,
 }
 
 impl Default for ManagerConfig {
@@ -71,6 +74,7 @@ impl Default for ManagerConfig {
             parent_reserved_permits: 1,
             wind_down_timeout_secs: 10,
             subagent_recovery_attempts: 1,
+            governance: GovernanceConfig::default(),
         }
     }
 }
@@ -110,6 +114,7 @@ impl ManagerConfig {
         } else {
             max_requests
         };
+        let governance = GovernanceConfig::from_config(cfg, max_children);
         let default_model = cfg.get_str("delegation.default_model", "").to_string();
 
         // OMO concurrency config (FR-031, T148).
@@ -147,6 +152,7 @@ impl ManagerConfig {
             subagent_recovery_attempts: cfg
                 .get_i64("delegation.subagent_recovery_attempts", 1)
                 .max(0) as usize,
+            governance,
         }
     }
 }
@@ -473,6 +479,36 @@ pub struct SubagentManager {
     /// one assistant message draw from ONE pool and can never
     /// oversubscribe the documented child cap.
     child_slots: Arc<Semaphore>,
+    /// Feature 030: bounded admission queue (governance).
+    gov_queue: std::sync::Arc<std::sync::Mutex<crate::governance::AdmissionQueue>>,
+    /// Feature 030 (FR-005, R3b): system-wide in-flight retry budget.
+    /// usize::MAX when governance is disabled — acquires are never refused,
+    /// preserving pre-feature behavior while keeping the call sites uniform.
+    gov_retry_budget: std::sync::Arc<crate::governance::RetryBudget>,
+    /// Feature 030 (T018, FR-007): persistent exact-signature result cache
+    /// (shared with transient child managers). None when governance or the
+    /// result cache is disabled — lookups miss and stores are skipped.
+    gov_cache: Option<
+        std::sync::Arc<
+            std::sync::Mutex<crate::result_cache::ResultCache>,
+        >,
+    >,
+    /// Feature 030 (T018, FR-008): single-flight map of in-flight governed
+    /// executions by task signature (leader's Arc; followers await it).
+    /// Always present; inert when governance/single-flight is disabled.
+    gov_flights: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<crate::governance::Flight>>,
+        >,
+    >,
+    /// Feature 030 (T020, FR-011): append-only resource-record store (one
+    /// JSONL record per terminal dispatch outcome). Some ONLY when
+    /// governance is enabled — a disabled manager must never write
+    /// records (None short-circuits `gov_emit_record`). Transient
+    /// per-child managers keep None (their default config has governance
+    /// disabled); emission belongs to the top-level manager created via
+    /// [`SubagentManager::new`].
+    gov_records: Option<crate::resource_records::ResourceRecordStore>,
     /// Grant-back watcher state (T005): how many parent-pool permits are
     /// currently lent to the child pool + the lock serializing
     /// lend/reclaim steps + the once-flag ensuring ONE watcher task for
@@ -510,6 +546,52 @@ pub struct SubagentManager {
     /// at the same Arcs). False only for exotic manually-constructed
     /// non-pool managers, which keep the legacy parent-pool-only path.
     child_pool_owner: bool,
+    /// Feature 030: dedicated child runtime (FR-009, research.md R5) —
+    /// child execution runs here so saturation cannot occupy the parent
+    /// scheduler's threads. None when governance disabled.
+    child_runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+    /// Feature 030 (T016): shared sampling-watchdog state. Created for
+    /// every manager (shared with transient child managers); only sampled
+    /// when governance is enabled and the watchdog task was spawned.
+    gov_watchdog: std::sync::Arc<crate::resource_records::WatchdogState>,
+    /// Feature 030 (T016): watchdog shutdown flag — set by `Drop` so the
+    /// sampling loop always terminates with its manager.
+    gov_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Feature 030 (T023, R8): sustained-overload tracker for busy
+    /// refusals. Always constructed; inert when governance is disabled
+    /// (refusals can never occur on a disabled manager).
+    gov_overload: crate::governance::OverloadTracker,
+    /// Feature 030 (T022, FR-013): start-order gate — admitted waiters
+    /// start (and therefore issue their first provider request) in
+    /// admission order, so a critical dispatch's first request strictly
+    /// precedes the queued normals it jumped. Shared with transient child
+    /// managers; inert when governance is disabled.
+    gov_start_gate: std::sync::Arc<crate::governance::StartGate>,
+}
+
+/// Feature 030 (T016): RAII running-mark guard — ensures
+/// `WatchdogState::mark_finished` runs on EVERY exit of a dispatch attempt
+/// (normal completion, timeout, panic, cancellation), not just the happy
+/// path. Created right after `mark_running`.
+struct RunningMark {
+    state: std::sync::Arc<crate::resource_records::WatchdogState>,
+    id: u64,
+}
+
+impl RunningMark {
+    fn new(
+        state: std::sync::Arc<crate::resource_records::WatchdogState>,
+        id: u64,
+    ) -> Self {
+        state.mark_running(id);
+        Self { state, id }
+    }
+}
+
+impl Drop for RunningMark {
+    fn drop(&mut self) {
+        self.state.mark_finished(self.id);
+    }
 }
 
 /// Feature 022 (FR-014/FR-015): a finishing team child releases its
@@ -549,6 +631,96 @@ impl SubagentManager {
         let reserve = config
             .parent_reserved_permits
             .min(config.max_concurrent_requests.saturating_sub(1));
+        // Feature 030: resolve the queue cap BEFORE the struct literal
+        // moves `config` into the manager.
+        let gov_cap = if config.governance.enabled {
+            config.governance.max_queue_depth
+        } else {
+            0
+        };
+        // Feature 030 (FR-005, R3b): the retry budget is manager-owned so
+        // every dispatch path shares ONE system-wide budget. Disabled →
+        // usize::MAX (never refused; pre-feature behavior).
+        let gov_retry_budget_size = if config.governance.enabled {
+            config.governance.retry_budget
+        } else {
+            usize::MAX
+        };
+        // Feature 030 (T018, FR-007): open the persistent result cache only
+        // when governance AND the cache are enabled; disabled managers keep
+        // None (zero overhead, pre-feature behavior).
+        let gov_cache = if config.governance.enabled && config.governance.result_cache_enabled {
+            let governance_data_dir = config
+                .governance
+                .data_dir
+                .clone()
+                .unwrap_or_else(joey_core::joey_home);
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::result_cache::ResultCache::open(
+                    governance_data_dir.join("delegation").join("result-cache.json"),
+                    config.governance.result_cache_max_entries,
+                    config.governance.result_cache_ttl_hours,
+                ),
+            )))
+        } else {
+            None
+        };
+        // Feature 030 (T020, FR-011): the resource-record store exists
+        // ONLY for governance-enabled managers — a disabled manager must
+        // never write records (None short-circuits `gov_emit_record`).
+        let gov_records = if config.governance.enabled {
+            Some(crate::resource_records::ResourceRecordStore::open(
+                config.governance.data_dir.as_deref(),
+            ))
+        } else {
+            None
+        };
+        // Feature 030 (T015, FR-009/R5): dedicated child runtime — sized to
+        // max_concurrent_children worker threads so saturated children can
+        // never occupy the parent scheduler's threads. None when
+        // governance disabled (pre-feature behavior).
+        let child_runtime = if config.governance.enabled {
+            Some(std::sync::Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(config.max_concurrent_children.max(1))
+                    .thread_name("joey-child")
+                    .enable_all()
+                    .build()
+                    .expect("child runtime"),
+            ))
+        } else {
+            None
+        };
+        let gov_watchdog = std::sync::Arc::new(crate::resource_records::WatchdogState::new());
+        let gov_shutdown =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registry = Arc::new(ChildRegistry::default());
+        // Feature 030 (T016, FR-010/R5b): sampling CPU watchdog — spawned
+        // ONLY when governance is enabled; disabled managers keep the
+        // shared state (zero overhead — nothing samples it).
+        if config.governance.enabled {
+            let abort_registry = std::sync::Arc::clone(&registry);
+            let abort = move |id: u64| {
+                // Mirror stop_child's writes for this id via the registry:
+                // pending_stop FIRST (terminal record keeps the reason),
+                // then the per-child interrupt flag.
+                let mut running = abort_registry.lock_running();
+                if let Some(handle) = running.get_mut(&id) {
+                    if handle.pending_stop.is_none() {
+                        handle.pending_stop = Some(StopReason::BudgetExceeded);
+                    }
+                    handle.interrupt.store(true, Ordering::SeqCst);
+                }
+            };
+            crate::resource_records::spawn_watchdog(
+                std::sync::Arc::clone(&gov_watchdog),
+                config.governance.watchdog_interval_secs,
+                config.governance.cpu_ceiling_secs,
+                config.governance.memory_tracking_enabled,
+                std::sync::Arc::clone(&gov_shutdown),
+                abort,
+            );
+        }
         Self {
             semaphore: Arc::new(Semaphore::new(permits)),
             child_semaphore: Arc::new(Semaphore::new(
@@ -559,14 +731,31 @@ impl SubagentManager {
             child_slots: Arc::new(Semaphore::new(
                 config.max_concurrent_children.max(1),
             )),
+            gov_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::governance::AdmissionQueue::new(gov_cap),
+            )),
+            gov_retry_budget: std::sync::Arc::new(crate::governance::RetryBudget::new(
+                gov_retry_budget_size,
+            )),
+            gov_cache,
+            gov_records,
+            // Always present (empty map; inert when disabled).
+            gov_flights: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             grant_back: Arc::new(GrantBackState::default()),
             config,
             depth: 0,
             interrupt: Arc::new(AtomicBool::new(false)),
             event_tap: std::sync::Mutex::new(None),
             recorder_tap: Arc::new(std::sync::Mutex::new(None)),
-            registry: Arc::new(ChildRegistry::default()),
+            registry,
             child_pool_owner: true,
+            child_runtime,
+            gov_watchdog,
+            gov_shutdown,
+            gov_overload: crate::governance::OverloadTracker::new(),
+            gov_start_gate: std::sync::Arc::new(crate::governance::StartGate::new()),
         }
     }
 
@@ -701,6 +890,14 @@ impl SubagentManager {
             semaphore: self.semaphore.clone(),
             child_semaphore: self.child_semaphore.clone(),
             child_slots: self.child_slots.clone(),
+            gov_queue: self.gov_queue.clone(),
+            gov_retry_budget: self.gov_retry_budget.clone(),
+            gov_cache: self.gov_cache.clone(),
+            gov_flights: self.gov_flights.clone(),
+            // T020: transient managers never write resource records —
+            // their default config has governance disabled; emission
+            // belongs to the top-level manager created via `new`.
+            gov_records: None,
             grant_back: self.grant_back.clone(),
             registry: self.registry.clone(),
             child_pool_owner: true,
@@ -710,6 +907,13 @@ impl SubagentManager {
             // T029: the recorder tap is manager state shared by reference —
             // transient children keep feeding the same recorder channel.
             recorder_tap: self.recorder_tap.clone(),
+            // T015/T016: ONE dedicated child runtime + ONE watchdog per
+            // manager tree — transient children share the parent's.
+            child_runtime: self.child_runtime.clone(),
+            gov_watchdog: self.gov_watchdog.clone(),
+            gov_shutdown: self.gov_shutdown.clone(),
+            gov_overload: crate::governance::OverloadTracker::new(),
+            gov_start_gate: self.gov_start_gate.clone(),
         }
     }
 
@@ -779,6 +983,11 @@ impl SubagentManager {
     /// The manager's configuration.
     pub fn config(&self) -> &ManagerConfig {
         &self.config
+    }
+
+    /// Resolved governance configuration (feature 030).
+    pub fn governance_config(&self) -> &GovernanceConfig {
+        &self.config.governance
     }
 
     /// Current delegation depth (0 = top-level parent).
@@ -1020,6 +1229,263 @@ impl SubagentManager {
         max_spawn_depth: usize,
         allocated_id: u64,
     ) -> DelegationResult {
+        // T020 (US5, FR-011): queue-wait baseline for the dispatch's
+        // resource record (submit → admission), captured before every
+        // dedup/admission stage.
+        let gov_submitted_at = std::time::Instant::now();
+        // ------------------------------------------------------------------
+        // T018 (FR-007/FR-008): dedup stages. Ordering (see the brief's
+        // resolution): cache check → existing-flight await (followers) →
+        // admission → leader registration → retry loop → publish/store.
+        // Governance disabled skips every stage (pre-feature behavior);
+        // a disabled cache/single-flight flag skips its own stage only.
+        // ------------------------------------------------------------------
+        let gov_dedup_on = self.config.governance.enabled;
+        // T022 (FR-013): admission priority lane. `priority.enabled` off (or
+        // governance disabled) collapses every lane to Normal (pre-feature
+        // behavior); enabled dispatches default to Normal and honor
+        // `req.priority` (background waves set Background at construction).
+        let lane = if self.config.governance.priority_enabled {
+            req.priority.unwrap_or_default()
+        } else {
+            Priority::Normal
+        };
+        // Same resolved budgets the retry loop uses (they participate in
+        // the signature — a differing budget is a DIFFERENT task).
+        let timeout_secs_resolved = self.config.governance.task_timeout_secs;
+        let cpu_ceiling_secs_resolved = self.config.governance.cpu_ceiling_secs;
+        let sig = if gov_dedup_on {
+            crate::result_cache::task_signature(
+                req,
+                timeout_secs_resolved,
+                cpu_ceiling_secs_resolved,
+            )
+        } else {
+            String::new()
+        };
+
+        // CACHE (FR-007): a persistent exact-signature hit serves the
+        // dispatch with NO execution and NO admission slot. Cache hits
+        // consume no slot and execute nothing.
+        if gov_dedup_on {
+            if let Some(cache) = &self.gov_cache {
+                if let Some(hit) = cache
+                    .lock()
+                    .unwrap()
+                    .lookup(&sig, &chrono::Utc::now())
+                {
+                    let ev = AgentEvent::DelegationCacheHit {
+                        signature: sig.clone(),
+                    };
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(ev.clone());
+                    }
+                    // Feed the manager tap + recorder tap (DelegationBusy
+                    // emission pattern).
+                    let tap = self.event_tap();
+                    let recorder = self.recorder_tap();
+                    if let Some(tap) = &tap {
+                        let _ = tap.send(ev.clone());
+                    }
+                    if let Some(rec) = &recorder {
+                        let _ = rec.send(ev);
+                    }
+                    // T020 (FR-011): a cache hit is a terminal outcome —
+                    // one record, never admitted (admitted_at None ⇒
+                    // zero-shape queue/compute), usage from the cached
+                    // result (joinable with token telemetry).
+                    self.gov_emit_record(
+                        ResourceRecordOutcome::CacheHit,
+                        &sig,
+                        lane,
+                        gov_submitted_at,
+                        None,
+                        None,
+                        0,
+                        None,
+                        hit.token_usage.clone(),
+                        false,
+                        None,
+                    );
+                    return hit;
+                }
+            }
+        }
+
+        // SINGLE-FLIGHT follower path (FR-008): an identical dispatch is
+        // already in flight — await the leader's outcome. Followers do NOT
+        // consume admission slots (identical in-flight work is awaited,
+        // not duplicated). Entry-based registration below guarantees a
+        // follower only ever sees a flight that is guaranteed to run.
+        if gov_dedup_on && self.config.governance.single_flight_enabled {
+            let existing = self.gov_flights.lock().unwrap().get(&sig).cloned();
+            if let Some(flight) = existing {
+                let outcome = loop {
+                    // Register interest in the NEXT notification BEFORE
+                    // re-checking the result — a notify_waiters() that
+                    // fires between our result check and our notified()
+                    // await cannot be lost.
+                    let mut notified = std::pin::pin!(flight.notify.notified());
+                    notified.as_mut().enable();
+                    if let Some(r) = flight.result.lock().unwrap().clone() {
+                        break r;
+                    }
+                    notified.await;
+                };
+                // T020 (FR-011): a single-flight follower's task IS the
+                // leader's task — re-record the leader's terminal outcome
+                // kind with the follower's own submitted_at (queue_wait)
+                // and zero compute: single-flight followers attribute
+                // compute to the leader's record.
+                self.gov_emit_record(
+                    if outcome.success {
+                        ResourceRecordOutcome::Completed
+                    } else {
+                        ResourceRecordOutcome::Failed
+                    },
+                    &sig,
+                    lane,
+                    gov_submitted_at,
+                    None,
+                    None,
+                    0,
+                    None,
+                    outcome.token_usage.clone(),
+                    false,
+                    outcome.error.as_deref(),
+                );
+                return outcome;
+            }
+        }
+
+        // Feature 030: bounded admission (FR-001/FR-002). Runs BEFORE any
+        // side effect (registry insert, event sends, child-slot acquire):
+        // a busy refusal starts nothing and enqueues nothing.
+        let mut gov_slot_guard: Option<crate::governance::SlotGuard> = None;
+        if self.config.governance.enabled {
+            match Arc::clone(&self.child_slots).try_acquire_owned() {
+                Ok(permit) => {
+                    gov_slot_guard = Some(crate::governance::SlotGuard {
+                        queue: Arc::clone(&self.gov_queue),
+                        slots: Arc::clone(&self.child_slots),
+                        gate: Arc::clone(&self.gov_start_gate),
+                        permit: Some(permit),
+                    });
+                }
+                Err(_) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let waiter = crate::governance::QueuedWaiter {
+                        priority: lane,
+                        enqueued_at: std::time::Instant::now(),
+                        tx,
+                    };
+                    let admitted = {
+                        let mut q = self.gov_queue.lock().unwrap();
+                        q.push(waiter)
+                    };
+                    if !admitted {
+                        let (depth, cap) = {
+                            let q = self.gov_queue.lock().unwrap();
+                            (q.len(), q.cap)
+                        };
+                        // T023 (R8): record the refusal FIRST, then test for
+                        // sustained saturation — refusals 1-2 carry the plain
+                        // busy text; refusal 3+ within 60s appends the
+                        // overload suffix (contracts/busy-and-outcomes.md).
+                        self.gov_overload.record_refusal(std::time::Instant::now());
+                        let mut busy = format!(
+                            "[busy] delegation queue full ({depth} waiting, cap {cap}) — re-plan or defer"
+                        );
+                        if self.gov_overload.is_sustained(std::time::Instant::now()) {
+                            busy.push_str(
+                                " [overload] sustained saturation detected — consider degraded mode",
+                            );
+                        }
+                        let ev = AgentEvent::DelegationBusy { queue_depth: depth, cap };
+                        if let Some(tx) = event_tx {
+                            let _ = tx.send(ev.clone());
+                        }
+                        // Feed the manager tap + recorder tap exactly like
+                        // the spawn-event emission sites below (T029).
+                        let tap = self.event_tap();
+                        let recorder = self.recorder_tap();
+                        if let Some(tap) = &tap {
+                            let _ = tap.send(ev.clone());
+                        }
+                        if let Some(rec) = &recorder {
+                            let _ = rec.send(ev);
+                        }
+                        // T026 (GAP 2 closed): capacity snapshot at the busy
+                        // refusal — the only admission-time emission point
+                        // where running vs caps is exactly observable.
+                        let ev = AgentEvent::CapacitySnapshot {
+                            running: self.config.max_concurrent_children
+                                .saturating_sub(self.child_slots.available_permits()),
+                            queued: depth,
+                            queue_cap: cap,
+                            max_children: self.config.max_concurrent_children,
+                        };
+                        if let Some(tx) = event_tx {
+                            let _ = tx.send(ev.clone());
+                        }
+                        if let Some(tap) = &tap {
+                            let _ = tap.send(ev.clone());
+                        }
+                        if let Some(rec) = &recorder {
+                            let _ = rec.send(ev);
+                        }
+                        // T020 (FR-011): a busy refusal is terminal — one
+                        // record; nothing was admitted or computed
+                        // (admitted_at None, no child id).
+                        self.gov_emit_record(
+                            ResourceRecordOutcome::BusyRefused,
+                            &sig,
+                            lane,
+                            gov_submitted_at,
+                            None,
+                            None,
+                            0,
+                            None,
+                            Default::default(),
+                            false,
+                            Some(&busy),
+                        );
+                        return DelegationResult {
+                            goal: req.goal.clone(),
+                            summary: String::new(),
+                            success: false,
+                            error: Some(busy),
+                            token_usage: Default::default(),
+                            wall_clock: std::time::Duration::from_millis(0),
+                            model: String::new(),
+                            iterations: 1,
+                            persisted_session_id: None,
+                            stop_reason: None,
+                        };
+                    }
+                    match rx.await {
+                        Ok((permit, seq)) => {
+                            if std::env::var_os("JOEY_DIAG_ADMIT").is_some() {
+                                eprintln!("DIAG resumed lane={:?} t={:?}", lane, std::time::Instant::now());
+                            }
+                            // T022 (FR-013): start in admission order — wait
+                            // until every earlier-admitted waiter has started
+                            // before beginning any side effect.
+                            self.gov_start_gate.turn(seq).wait_turn().await;
+                            gov_slot_guard = Some(crate::governance::SlotGuard {
+                                queue: Arc::clone(&self.gov_queue),
+                                slots: Arc::clone(&self.child_slots),
+                                gate: Arc::clone(&self.gov_start_gate),
+                                permit: Some(permit),
+                            });
+                        }
+                        Err(_) => { /* fall back to legacy blocking acquire below */ }
+                    }
+                }
+            }
+        }
+        let _gov_slot_guard = gov_slot_guard; // held to fn exit; Drop releases the slot AND admits the next waiter
+
         // Manager-global child-slot admission (see `child_slots`): EVERY
         // dispatch path funnels through this function — blocking singles,
         // `dispatch_requests` batch waves, and background children — so
@@ -1027,11 +1493,43 @@ impl SubagentManager {
         // `max_concurrent_children`. The permit is held across the whole
         // run and released on completion or panic (RAII), handing the
         // slot straight to the next waiter — no chunk barrier.
-        let _child_slot = self
-            .child_slots
-            .acquire()
-            .await
-            .expect("child slot semaphore closed");
+        let _child_slot = if _gov_slot_guard.is_some() {
+            None
+        } else {
+            Some(
+                self.child_slots
+                    .acquire()
+                    .await
+                    .expect("child slot semaphore closed"),
+            )
+        };
+        // T020 (US5, FR-011): admission succeeded — the compute baseline
+        // (admission → terminal) for the dispatch's resource record.
+        let gov_admitted_at = std::time::Instant::now();
+        // SINGLE-FLIGHT leader registration (FR-008): admission succeeded —
+        // this dispatch is guaranteed to run (slot acquired or admitted
+        // from the queue), so publish the flight for identical followers
+        // to await. Registered ONLY here, never before admission: a
+        // busy-refused dispatch never registers, so no follower can hang
+        // on a leader that was turned away. `leader_guard` publishes the
+        // outcome at the single exit below; Drop covers every early exit
+        // (panic, cancellation, construction failure) with a synthesized
+        // failure so followers never hang.
+        let leader_guard =
+            if gov_dedup_on && self.config.governance.single_flight_enabled {
+                let flight = std::sync::Arc::new(crate::governance::Flight::new());
+                self.gov_flights
+                    .lock()
+                    .unwrap()
+                    .insert(sig.clone(), flight.clone());
+                Some(crate::governance::FlightGuard {
+                    flights: self.gov_flights.clone(),
+                    sig: sig.clone(),
+                    flight,
+                })
+            } else {
+                None
+            };
         let model = crate::subagent::resolve_model(
             None,
             req.model.as_deref(),
@@ -1039,265 +1537,767 @@ impl SubagentManager {
             &parent_config.model,
         );
         let ts_sum = crate::subagent::toolset_summary(&req.toolsets);
-        let id = allocated_id;
+        let mut id = allocated_id;
         let tap = self.event_tap();
         // T029: the recorder tap is fed alongside the external tap so the
         // subagent_control log ring fills without shadowing any host tap.
         let recorder = self.recorder_tap();
-
-        let mut subagent = match Subagent::new(
-            req,
-            parent_config,
-            parent_config_tree,
-            base_registry,
-            default_model,
-            default_max_turns,
-            self.depth + 1,
-            max_spawn_depth,
-            None,
-            self.interrupt.clone(),
-            self.semaphore.clone(),
-            self.team_tools_for(req, parent_config, parent_config_tree, base_registry, event_tx),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                // Feature 020 (T009): a PRE-REGISTERED background child that
-                // fails construction must still archive a terminal record
-                // (its handle is already public). Blocking children were
-                // never registered at this point — unchanged path.
-                if self.child_pool_owner && self.registry.pending_stop(id).is_some() {
-                    let fail = DelegationResult {
-                        goal: req.goal.clone(),
-                        summary: String::new(),
-                        success: false,
-                        error: Some(format!("Failed to create subagent: {}", e)),
-                        token_usage: Default::default(),
-                        wall_clock: std::time::Duration::ZERO,
-                        model: model.clone(),
-                        iterations: 0,
-                        persisted_session_id: None,
-                        stop_reason: None,
-                    };
-                    self.registry.complete(id, &fail);
-                }
-                let err_msg = format!("Failed to create subagent: {}", e);
-                let fail_ev = AgentEvent::SubagentFailed {
-                    id,
-                    goal: req.goal.clone(),
-                    error: err_msg.clone(),
-                    duration_secs: 0.0,
-                };
-                if let Some(tx) = event_tx {
-                    let _ = tx.send(fail_ev.clone());
-                }
-                if let Some(tap) = &tap {
-                    let _ = tap.send(fail_ev.clone());
-                }
-                if let Some(rec) = &recorder {
-                    let _ = rec.send(fail_ev);
-                }
-                return DelegationResult {
-                    goal: req.goal.clone(),
-                    summary: String::new(),
-                    success: false,
-                    error: Some(err_msg),
-                    token_usage: Default::default(),
-                    wall_clock: std::time::Duration::ZERO,
-                    model,
-                    iterations: 0,
-                    persisted_session_id: None,
-                    stop_reason: None,
-                };
-            }
-        };
-
-        // T004/T005: register the child with PER-CHILD interrupt + steer
-        // handles, and switch its provider-permit source to the CHILD pool
-        // (the parent pool keeps its reserved share free — SC-007). Pool
-        // owners are the top-level manager and the transient per-child
-        // managers a batch creates (both share the SAME registry + pools).
-        //
-        // Feature 020 (T009): a background child is PRE-REGISTERED at spawn
-        // so the handle is backed by a registry record immediately. Reuse
-        // that entry's interrupt/steer handles (never overwrite — a
-        // stop/steer recorded in the spawn→start window, including
-        // pending_stop, must survive) and keep its started_at. The blocking
-        // path never pre-registers, so it is byte-identical to before.
-        let (child_interrupt, child_steer, pre_registered) = if self.child_pool_owner {
-            let existing = self
-                .registry
-                .lock_running()
-                .get(&id)
-                .map(|h| (h.interrupt.clone(), h.steer.clone()));
-            match existing {
-                Some((i, s)) => (i, s, true),
-                None => (
-                    Arc::new(AtomicBool::new(false)),
-                    Arc::new(Mutex::new(String::new())),
-                    false,
-                ),
-            }
-        } else {
-            (
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(Mutex::new(String::new())),
-                false,
-            )
-        };
-        if self.child_pool_owner {
-            // Pre-signaled manager-wide interrupt must reach the child.
-            // OR-only (#5 review finding): storing the manager flag
-            // unconditionally would CLEAR a pending per-child stop recorded
-            // in the spawn→start window (`stop_child` set the pre-registered
-            // handle's flag while this dispatch was starting) whenever the
-            // manager-wide flag is false — the stop would be silently lost.
-            // Same pattern as the forwarder in subagent.rs.
-            if self.interrupt.load(Ordering::SeqCst) {
-                child_interrupt.store(true, Ordering::SeqCst);
-            }
-            if !pre_registered {
-                let task = TaskSpec {
-                    goal: req.goal.clone(),
-                    context: req.context.clone(),
-                    model: req.model.clone(),
-                    toolsets: req.toolsets.clone(),
-                    role: None,
-                    subagent_type: None,
-                    background: false,
-                    budgets: None, // req does not carry budgets (watcher is later wave)
-                };
-                self.registry.insert(
-                    id,
-                    ChildHandle::new(task, child_interrupt.clone(), child_steer.clone()),
-                );
-            }
-            // Feature 022 (T007): map the team member to this child id so
-            // team wind-down can stop the right child.
-            if let (Some(team_name), Some(member)) = (req.team.as_deref(), req.name.as_deref()) {
-                crate::team::record_member_child_id(team_name, member, id);
-            }
-            // T005: a live child exists — make sure idle parent capacity can
-            // be lent to the child pool while the parent stays idle.
-            self.ensure_grant_back_watcher();
-        }
-
-        // Emit SubagentSpawn event (per-dispatch channel + live tap).
-        // #10 (review finding): emitted AFTER the registry insert — a host
-        // reacting to the event with `stop_child`/`steer_child` previously
-        // hit the "No subagent with id N" unknown-id window because the
-        // event was emitted before the child was registered. Construction
-        // failures emit SubagentFailed below without a spawn event (the
-        // child never spawned).
-        let spawn_ev = AgentEvent::SubagentSpawn {
-            id,
-            goal: req.goal.clone(),
-            model: model.clone(),
-            toolset_summary: ts_sum.clone(),
-            depth: self.depth,
-        };
-        if let Some(tx) = event_tx {
-            let _ = tx.send(spawn_ev.clone());
-        }
-        if let Some(tap) = &tap {
-            let _ = tap.send(spawn_ev.clone());
-        }
-        if let Some(rec) = &recorder {
-            let _ = rec.send(spawn_ev);
-        }
 
         let child_sem = if self.child_pool_owner {
             self.child_semaphore.clone()
         } else {
             self.semaphore.clone()
         };
-        subagent.agent.set_provider_semaphore(child_sem);
-
-        // Per-child control bridge (T004): polls the child's OWN interrupt
-        // flag and steer slot and forwards them into the child Agent's
-        // handles, so `stop_child`/`steer_child` act on exactly this child
-        // (the manager-wide flag keeps flowing through the subagent's own
-        // forwarder, unchanged).
-        //
-        // #1 review finding: the loop has no natural exit condition, so it
-        // is owned by a [`BridgeGuard`] — `Drop` ABORTS it, so a panic in
-        // `run_with_tap` or cancellation of this whole dispatch future
-        // (e.g. a tool timeout drops it) can never again skip cleanup and
-        // leak the loop with every Arc it holds. The normal path calls
-        // [`BridgeGuard::cancel`], which sets the loop's stop flag so it
-        // exits cooperatively at its next tick (≤50 ms).
-        let agent_interrupt = subagent.agent.interrupt_handle();
-        let agent_steer = subagent.agent.steer_handle();
-        let bridge_flag = child_interrupt.clone();
-        let bridge_steer = child_steer.clone();
-        let bridge_stop = Arc::new(AtomicBool::new(false));
-        let bridge_stop_flag = bridge_stop.clone();
-        let bridge = BridgeGuard::new(
-            tokio::spawn(async move {
-                loop {
-                    if bridge_stop_flag.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    if bridge_flag.load(Ordering::SeqCst) {
-                        agent_interrupt.store(true, Ordering::SeqCst);
-                    }
-                    if let Ok(mut slot) = bridge_steer.lock() {
-                        if !slot.is_empty() {
-                            let text = std::mem::take(&mut *slot);
-                            drop(slot);
-                            Agent::steer_via_handle(&agent_steer, &text);
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }),
-            bridge_stop,
-        );
 
         let start = Instant::now();
-        let result = subagent
-            .run_with_tap(
-                id,
-                event_tx,
-                tap.as_ref(),
-                recorder.as_ref(),
-                self.config().subagent_recovery_attempts,
-            )
-            .await;
-        // Normal completion: cooperative stop — the child is done and the
-        // flagged loop exits on its own; no abort needed (and Drop's abort
-        // is suppressed by consuming the guard).
-        bridge.cancel();
-        let elapsed = start.elapsed().as_secs_f64();
-
-        // T004: archive the finished child into the session history
-        // (one-way terminal record, FR-019) and, when the last child is
-        // done, return any permits the grant-back watcher lent out.
-        if self.child_pool_owner {
-            let stopped = self.registry.pending_stop(id).flatten();
-            self.registry.complete(id, &result);
-            if self.registry.running_is_empty() {
-                self.grant_back
-                    .reclaim_all(&self.semaphore, &self.child_semaphore);
-            }
-            if let Some(reason) = stopped.or(result.stop_reason) {
-                let preview: String = result.summary.chars().take(100).collect();
-                let ev = AgentEvent::SubagentStopped {
-                    id,
-                    goal: result.goal.clone(),
-                    reason: stop_reason_str(reason).to_string(),
-                    summary_preview: preview,
+        // Feature 030 (FR-005): retry backoff/budget flow from governance
+        // config — disabled means (0.0, 0.0) backoff (immediate retry, the
+        // pre-feature behavior); the budget Arc is usize::MAX when disabled,
+        // so passing it always can never refuse a retry.
+        let gov = &self.config.governance;
+        let (backoff_base, backoff_max) = if gov.enabled {
+            (gov.backoff_base_secs, gov.backoff_max_secs)
+        } else {
+            (0.0, 0.0)
+        };
+        // T011/T013 (feature 030, US2): bounded manager-level retry loop
+        // around the build-child + await-run segment. Governance disabled →
+        // timeout 0 (no wrap) and max_retries 0 → exactly ONE iteration,
+        // byte-identical to the pre-feature dispatch. Governance on → a
+        // failed/timed-out attempt is retried (a retry is a FRESH child:
+        // fresh id, registry insert, bridge, spawn event) within the
+        // per-task allowance and the system-wide in-flight retry budget,
+        // spaced by jittered exponential backoff, optionally resuming from
+        // the iteration-granular checkpoint the subagent forwarder wrote.
+        let gov_on = gov.enabled;
+        let timeout_secs = if gov_on { gov.task_timeout_secs } else { 0 };
+        let max_retries = if gov_on {
+            self.config().subagent_recovery_attempts
+        } else {
+            0
+        };
+        let mut retries_used: usize = 0;
+        let mut resume_token: Option<crate::types::ResumeToken> = None;
+        // T020: the terminal record's checkpoint — the LAST attempt's sink
+        // token (overwritten every iteration, read once after the loop).
+        let mut gov_last_checkpoint: Option<ResumeToken> = None;
+        // Retry-budget guard held across the backoff sleep AND the next
+        // attempt (owned guard — see governance.rs RetryGuard).
+        let mut held_guard: Option<crate::governance::RetryGuard> = None;
+        let mut result = loop {
+            // T013: iteration-granular checkpoint sink — the subagent's
+            // event forwarder replaces the resume token at every completed
+            // provider iteration, so a timeout drop still leaves the latest
+            // boundary visible here (shared Arc outlives the dropped run).
+            let sink: Option<Arc<Mutex<Option<crate::types::ResumeToken>>>> =
+                if gov_on && gov.checkpointing {
+                    Some(Arc::new(Mutex::new(None)))
+                } else {
+                    None
                 };
-                if let Some(tx) = event_tx {
-                    let _ = tx.send(ev.clone());
+
+            // T013: resume preamble — when a checkpoint exists, the child's
+            // initial-prompt context carries the resume note (the marker
+            // `Continue the task from turn` must reach the provider wire).
+            let attempt_req;
+            let req_ref = if let Some(t) = resume_token.as_ref() {
+                let note = format!(
+                    "\n\nNOTE: This task previously timed out or failed after {} completed turns. Continue the task from turn {}. Turns 1..{} are already complete — do NOT repeat them; resume directly at the next action.",
+                    t.last_completed_turn,
+                    t.last_completed_turn + 1,
+                    t.last_completed_turn
+                );
+                let mut r = req.clone();
+                let mut ctx = r.context.clone().unwrap_or_default();
+                ctx.push_str(&note);
+                r.context = Some(ctx);
+                attempt_req = r;
+                &attempt_req
+            } else {
+                req
+            };
+
+            let mut subagent = match Subagent::new(
+                req_ref,
+                parent_config,
+                parent_config_tree,
+                base_registry,
+                default_model,
+                default_max_turns,
+                self.depth + 1,
+                max_spawn_depth,
+                None,
+                self.interrupt.clone(),
+                self.semaphore.clone(),
+                self.team_tools_for(req, parent_config, parent_config_tree, base_registry, event_tx),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Feature 020 (T009): a PRE-REGISTERED background child that
+                    // fails construction must still archive a terminal record
+                    // (its handle is already public). Blocking children were
+                    // never registered at this point — unchanged path.
+                    if self.child_pool_owner && self.registry.pending_stop(id).is_some() {
+                        let fail = DelegationResult {
+                            goal: req.goal.clone(),
+                            summary: String::new(),
+                            success: false,
+                            error: Some(format!("Failed to create subagent: {}", e)),
+                            token_usage: Default::default(),
+                            wall_clock: std::time::Duration::ZERO,
+                            model: model.clone(),
+                            iterations: 0,
+                            persisted_session_id: None,
+                            stop_reason: None,
+                        };
+                        self.registry.complete(id, &fail);
+                    }
+                    let err_msg = format!("Failed to create subagent: {}", e);
+                    let fail_ev = AgentEvent::SubagentFailed {
+                        id,
+                        goal: req.goal.clone(),
+                        error: err_msg.clone(),
+                        duration_secs: 0.0,
+                    };
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(fail_ev.clone());
+                    }
+                    if let Some(tap) = &tap {
+                        let _ = tap.send(fail_ev.clone());
+                    }
+                    if let Some(rec) = &recorder {
+                        let _ = rec.send(fail_ev);
+                    }
+                    // T020 (FR-011): construction failure is terminal — one
+                    // Failed record (post-admission, so queue/compute are
+                    // measured; the child never ran, so cpu/memory sample 0).
+                    self.gov_emit_record(
+                        ResourceRecordOutcome::Failed,
+                        &sig,
+                        lane,
+                        gov_submitted_at,
+                        Some(gov_admitted_at),
+                        Some(id),
+                        retries_used as u16,
+                        resume_token.clone(),
+                        Default::default(),
+                        false,
+                        Some(&err_msg),
+                    );
+                    return DelegationResult {
+                        goal: req.goal.clone(),
+                        summary: String::new(),
+                        success: false,
+                        error: Some(err_msg),
+                        token_usage: Default::default(),
+                        wall_clock: std::time::Duration::ZERO,
+                        model,
+                        iterations: 0,
+                        persisted_session_id: None,
+                        stop_reason: None,
+                    };
                 }
-                if let Some(tap) = &tap {
-                    let _ = tap.send(ev.clone());
+            };
+
+            // T004/T005: register the child with PER-CHILD interrupt + steer
+            // handles, and switch its provider-permit source to the CHILD pool
+            // (the parent pool keeps its reserved share free — SC-007). Pool
+            // owners are the top-level manager and the transient per-child
+            // managers a batch creates (both share the SAME registry + pools).
+            //
+            // Feature 020 (T009): a background child is PRE-REGISTERED at spawn
+            // so the handle is backed by a registry record immediately. Reuse
+            // that entry's interrupt/steer handles (never overwrite — a
+            // stop/steer recorded in the spawn→start window, including
+            // pending_stop, must survive) and keep its started_at. The blocking
+            // path never pre-registers, so it is byte-identical to before.
+            let (child_interrupt, child_steer, pre_registered) = if self.child_pool_owner {
+                let existing = self
+                    .registry
+                    .lock_running()
+                    .get(&id)
+                    .map(|h| (h.interrupt.clone(), h.steer.clone()));
+                match existing {
+                    Some((i, s)) => (i, s, true),
+                    None => (
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(Mutex::new(String::new())),
+                        false,
+                    ),
                 }
-                if let Some(rec) = &recorder {
-                    let _ = rec.send(ev);
+            } else {
+                (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(Mutex::new(String::new())),
+                    false,
+                )
+            };
+            if self.child_pool_owner {
+                // Pre-signaled manager-wide interrupt must reach the child.
+                // OR-only (#5 review finding): storing the manager flag
+                // unconditionally would CLEAR a pending per-child stop recorded
+                // in the spawn→start window (`stop_child` set the pre-registered
+                // handle's flag while this dispatch was starting) whenever the
+                // manager-wide flag is false — the stop would be silently lost.
+                // Same pattern as the forwarder in subagent.rs.
+                if self.interrupt.load(Ordering::SeqCst) {
+                    child_interrupt.store(true, Ordering::SeqCst);
                 }
+                if !pre_registered {
+                    let task = TaskSpec {
+                        goal: req.goal.clone(),
+                        context: req.context.clone(),
+                        model: req.model.clone(),
+                        toolsets: req.toolsets.clone(),
+                        role: None,
+                        subagent_type: None,
+                        background: false,
+                        budgets: None, // req does not carry budgets (watcher is later wave)
+                    };
+                    self.registry.insert(
+                        id,
+                        ChildHandle::new(task, child_interrupt.clone(), child_steer.clone()),
+                    );
+                }
+                // Feature 022 (T007): map the team member to this child id so
+                // team wind-down can stop the right child.
+                if let (Some(team_name), Some(member)) = (req.team.as_deref(), req.name.as_deref()) {
+                    crate::team::record_member_child_id(team_name, member, id);
+                }
+                // T005: a live child exists — make sure idle parent capacity can
+                // be lent to the child pool while the parent stays idle.
+                self.ensure_grant_back_watcher();
+            }
+
+            // Emit SubagentSpawn event (per-dispatch channel + live tap).
+            // #10 (review finding): emitted AFTER the registry insert — a host
+            // reacting to the event with `stop_child`/`steer_child` previously
+            // hit the "No subagent with id N" unknown-id window because the
+            // event was emitted before the child was registered. Construction
+            // failures emit SubagentFailed below without a spawn event (the
+            // child never spawned).
+            let spawn_ev = AgentEvent::SubagentSpawn {
+                id,
+                goal: req.goal.clone(),
+                model: model.clone(),
+                toolset_summary: ts_sum.clone(),
+                depth: self.depth,
+            };
+            if let Some(tx) = event_tx {
+                let _ = tx.send(spawn_ev.clone());
+            }
+            if let Some(tap) = &tap {
+                let _ = tap.send(spawn_ev.clone());
+            }
+            if let Some(rec) = &recorder {
+                let _ = rec.send(spawn_ev);
+            }
+
+            subagent.agent.set_provider_semaphore(child_sem.clone());
+
+            // Per-child control bridge (T004): polls the child's OWN interrupt
+            // flag and steer slot and forwards them into the child Agent's
+            // handles, so `stop_child`/`steer_child` act on exactly this child
+            // (the manager-wide flag keeps flowing through the subagent's own
+            // forwarder, unchanged).
+            //
+            // #1 review finding: the loop has no natural exit condition, so it
+            // is owned by a [`BridgeGuard`] — `Drop` ABORTS it, so a panic in
+            // `run_with_tap` or cancellation of this whole dispatch future
+            // (e.g. a tool timeout drops it) can never again skip cleanup and
+            // leak the loop with every Arc it holds. The normal path calls
+            // [`BridgeGuard::cancel`], which sets the loop's stop flag so it
+            // exits cooperatively at its next tick (≤50 ms).
+            let agent_interrupt = subagent.agent.interrupt_handle();
+            let agent_steer = subagent.agent.steer_handle();
+            let bridge_flag = child_interrupt.clone();
+            let bridge_steer = child_steer.clone();
+            let bridge_stop = Arc::new(AtomicBool::new(false));
+            let bridge_stop_flag = bridge_stop.clone();
+            let bridge = BridgeGuard::new(
+                tokio::spawn(async move {
+                    loop {
+                        if bridge_stop_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if bridge_flag.load(Ordering::SeqCst) {
+                            agent_interrupt.store(true, Ordering::SeqCst);
+                        }
+                        if let Ok(mut slot) = bridge_steer.lock() {
+                            if !slot.is_empty() {
+                                let text = std::mem::take(&mut *slot);
+                                drop(slot);
+                                Agent::steer_via_handle(&agent_steer, &text);
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }),
+                bridge_stop,
+            );
+
+            // T015 (FR-009/R5) + T016: execute the run future ON the
+            // dedicated child runtime when present, so saturation cannot
+            // occupy the parent scheduler's threads. The spawned task owns
+            // clones of the tap/recorder/sink/budget handles and consumes
+            // the Subagent by value (spawn needs 'static). None → inline
+            // await, exactly the pre-feature behavior.
+            //
+            // T011 (FR-004): per-attempt wall-clock budget. Governance on →
+            // each attempt gets its own timeout window. Inline path: the
+            // expired run future is DROPPED (= cancellation) while the
+            // checkpoint sink the forwarder wrote stays visible (shared
+            // Arc). Child-runtime path: the timeout wraps the JoinHandle;
+            // on expiry the handle is ABORTED (JoinHandle drop does NOT
+            // cancel the task) and reaped with a bounded 5s wait before
+            // mapping to the timeout result. A panicked child task
+            // (JoinError) maps to a failed DelegationResult instead of
+            // unwrapping.
+            //
+            // T016: the RunningMark guard marks this child running in the
+            // watchdog's view for the duration of the attempt (gated on
+            // governance — strictly zero-overhead when disabled) and
+            // unmarks on EVERY exit path.
+            let _running_mark = if gov_on {
+                Some(RunningMark::new(self.gov_watchdog.clone(), id))
+            } else {
+                None
+            };
+            let recovery_attempts = self.config().subagent_recovery_attempts;
+            let mut attempt_result = if let Some(rt) = self.child_runtime.clone() {
+                if std::env::var_os("JOEY_DIAG_ADMIT").is_some() {
+                    eprintln!("DIAG spawning run id={id} t={:?}", std::time::Instant::now());
+                }
+                let tx_owned = event_tx.cloned();
+                let tap_owned = tap.clone();
+                let recorder_owned = recorder.clone();
+                let sink_owned = sink.clone();
+                let retry_budget = self.gov_retry_budget.clone();
+                let mut handle = rt.spawn(async move {
+                    subagent
+                        .run_with_tap(
+                            id,
+                            tx_owned.as_ref(),
+                            tap_owned.as_ref(),
+                            recorder_owned.as_ref(),
+                            recovery_attempts,
+                            backoff_base,
+                            backoff_max,
+                            Some(&retry_budget),
+                            sink_owned.as_ref(),
+                        )
+                        .await
+                });
+                if timeout_secs > 0 {
+                    match tokio::time::timeout(Duration::from_secs(timeout_secs), &mut handle)
+                        .await
+                    {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(join_err)) => DelegationResult {
+                            goal: req.goal.clone(),
+                            summary: String::new(),
+                            success: false,
+                            error: Some(format!("[panic] child task failed: {join_err}")),
+                            token_usage: Default::default(),
+                            wall_clock: start.elapsed(),
+                            model: model.clone(),
+                            iterations: 0,
+                            persisted_session_id: None,
+                            stop_reason: None,
+                        },
+                        Err(_) => {
+                            // Timeout branch: JoinHandle drop does NOT
+                            // cancel the task — abort it, then reap with a
+                            // bounded 5s wait (after abort the handle
+                            // resolves JoinError::Cancelled).
+                            handle.abort();
+                            let _ =
+                                tokio::time::timeout(Duration::from_secs(5), &mut handle).await;
+                            // Mirror `stop_child`'s flag set (cheaply reachable
+                            // through the registry) so the dropped child's detached
+                            // poll/bridge tasks wind down cooperatively.
+                            {
+                                let mut running = self.registry.lock_running();
+                                if let Some(h) = running.get_mut(&id) {
+                                    if h.pending_stop.is_none() {
+                                        h.pending_stop = Some(StopReason::BudgetExceeded);
+                                    }
+                                    h.interrupt.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            // Fan out DelegationTimeout exactly like the
+                            // DelegationBusy emission pattern above.
+                            let timeout_ev = AgentEvent::DelegationTimeout {
+                                child_id: id,
+                                goal: req.goal.clone(),
+                                timeout_secs,
+                            };
+                            if let Some(tx) = event_tx {
+                                let _ = tx.send(timeout_ev.clone());
+                            }
+                            if let Some(t) = &tap {
+                                let _ = t.send(timeout_ev.clone());
+                            }
+                            if let Some(rec) = &recorder {
+                                let _ = rec.send(timeout_ev);
+                            }
+                            DelegationResult {
+                                goal: req.goal.clone(),
+                                summary: String::new(),
+                                success: false,
+                                error: Some(format!(
+                                    "[timeout] task exceeded {timeout_secs}s wall-clock budget"
+                                )),
+                                token_usage: Default::default(),
+                                wall_clock: Duration::from_secs(timeout_secs),
+                                model: model.clone(),
+                                iterations: sink
+                                    .as_ref()
+                                    .and_then(|s| {
+                                        s.lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .map(|t| t.last_completed_turn)
+                                    })
+                                    .unwrap_or(0),
+                                persisted_session_id: None,
+                                stop_reason: None,
+                            }
+                        }
+                    }
+                } else {
+                    match handle.await {
+                        Ok(r) => r,
+                        Err(join_err) => DelegationResult {
+                            goal: req.goal.clone(),
+                            summary: String::new(),
+                            success: false,
+                            error: Some(format!("[panic] child task failed: {join_err}")),
+                            token_usage: Default::default(),
+                            wall_clock: start.elapsed(),
+                            model: model.clone(),
+                            iterations: 0,
+                            persisted_session_id: None,
+                            stop_reason: None,
+                        },
+                    }
+                }
+            } else if timeout_secs > 0 {
+                // Inline path (governance off, or no child runtime):
+                // identical to the pre-feature dispatch.
+                let run_fut = subagent.run_with_tap(
+                    id,
+                    event_tx,
+                    tap.as_ref(),
+                    recorder.as_ref(),
+                    recovery_attempts,
+                    backoff_base,
+                    backoff_max,
+                    Some(&self.gov_retry_budget),
+                    sink.as_ref(),
+                );
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), run_fut).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Mirror `stop_child`'s flag set (cheaply reachable
+                        // through the registry) so the dropped child's detached
+                        // poll/bridge tasks wind down cooperatively.
+                        {
+                            let mut running = self.registry.lock_running();
+                            if let Some(handle) = running.get_mut(&id) {
+                                if handle.pending_stop.is_none() {
+                                    handle.pending_stop = Some(StopReason::BudgetExceeded);
+                                }
+                                handle.interrupt.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        // Fan out DelegationTimeout exactly like the
+                        // DelegationBusy emission pattern above.
+                        let timeout_ev = AgentEvent::DelegationTimeout {
+                            child_id: id,
+                            goal: req.goal.clone(),
+                            timeout_secs,
+                        };
+                        if let Some(tx) = event_tx {
+                            let _ = tx.send(timeout_ev.clone());
+                        }
+                        if let Some(t) = &tap {
+                            let _ = t.send(timeout_ev.clone());
+                        }
+                        if let Some(rec) = &recorder {
+                            let _ = rec.send(timeout_ev);
+                        }
+                        DelegationResult {
+                            goal: req.goal.clone(),
+                            summary: String::new(),
+                            success: false,
+                            error: Some(format!(
+                                "[timeout] task exceeded {timeout_secs}s wall-clock budget"
+                            )),
+                            token_usage: Default::default(),
+                            wall_clock: Duration::from_secs(timeout_secs),
+                            model: model.clone(),
+                            iterations: sink
+                                .as_ref()
+                                .and_then(|s| {
+                                    s.lock()
+                                        .unwrap()
+                                        .as_ref()
+                                        .map(|t| t.last_completed_turn)
+                                })
+                                .unwrap_or(0),
+                            persisted_session_id: None,
+                            stop_reason: None,
+                        }
+                    }
+                }
+            } else {
+                // Inline path (governance off, or no child runtime):
+                // identical to the pre-feature dispatch.
+                let run_fut = subagent.run_with_tap(
+                    id,
+                    event_tx,
+                    tap.as_ref(),
+                    recorder.as_ref(),
+                    recovery_attempts,
+                    backoff_base,
+                    backoff_max,
+                    Some(&self.gov_retry_budget),
+                    sink.as_ref(),
+                );
+                run_fut.await
+            };
+            // Normal completion: cooperative stop — the child is done and the
+            // flagged loop exits on its own; no abort needed (and Drop's abort
+            // is suppressed by consuming the guard).
+            bridge.cancel();
+            drop(_running_mark); // T016: child no longer running (watchdog view)
+
+            // T016 (FR-010): post-attempt outcome override — the watchdog's
+            // abort closure set pending_stop/interrupt, so run_turn returned
+            // interrupted (attempt_result.success == false); this fixes the
+            // ERROR TEXT and marks the cause. Governance enabled only.
+            if gov_on && self.gov_watchdog.is_cpu_exceeded(id) {
+                attempt_result.error = Some(format!(
+                    "[resource-limit] task exceeded {}s CPU budget",
+                    gov.cpu_ceiling_secs
+                ));
+                attempt_result.success = false;
+                // T020: the dispatch's terminal emission below records
+                // AbortedByResourceLimit when this flag holds for the
+                // FINAL attempt's id — an intermediate aborted attempt
+                // that retries does not emit (one record per dispatch).
+                let _cpu_abort = true;
+            }
+
+            // T004: archive the finished child into the session history
+            // (one-way terminal record, FR-019) and, when the last child is
+            // done, return any permits the grant-back watcher lent out.
+            // Runs PER ATTEMPT (a retry is a fresh registry child).
+            if self.child_pool_owner {
+                let stopped = self.registry.pending_stop(id).flatten();
+                self.registry.complete(id, &attempt_result);
+                if self.registry.running_is_empty() {
+                    self.grant_back
+                        .reclaim_all(&self.semaphore, &self.child_semaphore);
+                }
+                if let Some(reason) = stopped.or(attempt_result.stop_reason) {
+                    let preview: String = attempt_result.summary.chars().take(100).collect();
+                    let ev = AgentEvent::SubagentStopped {
+                        id,
+                        goal: attempt_result.goal.clone(),
+                        reason: stop_reason_str(reason).to_string(),
+                        summary_preview: preview,
+                    };
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(ev.clone());
+                    }
+                    if let Some(tap) = &tap {
+                        let _ = tap.send(ev.clone());
+                    }
+                    if let Some(rec) = &recorder {
+                        let _ = rec.send(ev);
+                    }
+                }
+            }
+
+            // T020: capture the last attempt's checkpoint for the terminal
+            // record (None when checkpointing is off — no sink exists).
+            gov_last_checkpoint = sink.as_ref().and_then(|s| s.lock().unwrap().clone());
+
+            // T011/T013 retry decision: governance on + failed attempt +
+            // allowance left → retry (fresh child) under the system-wide
+            // in-flight retry budget, spaced by jittered backoff.
+            let should_retry = gov_on && !attempt_result.success && retries_used < max_retries;
+            if !should_retry {
+                held_guard = None;
+                break attempt_result;
+            }
+            held_guard = match self.gov_retry_budget.try_acquire() {
+                Some(g) => Some(g),
+                None => {
+                    let mut r = attempt_result;
+                    r.error = Some(format!(
+                        "[retry budget exhausted] {}",
+                        r.error.clone().unwrap_or_default()
+                    ));
+                    // R10 (T026 GAP 1 closed): budget exhaustion must be
+                    // OBSERVABLE, not just error text — emit the event via
+                    // the same triple fanout as RetryAttempt below.
+                    let ev = AgentEvent::DelegationRetryBudgetExhausted {
+                        goal: req.goal.clone(),
+                        budget: self.config.governance.retry_budget,
+                        in_flight: self.config.governance.retry_budget, // exhausted == at capacity
+                    };
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(ev.clone());
+                    }
+                    if let Some(t) = &tap {
+                        let _ = t.send(ev.clone());
+                    }
+                    if let Some(rec) = &recorder {
+                        let _ = rec.send(ev);
+                    }
+                    break r;
+                }
+            };
+            retries_used += 1;
+            resume_token = if self.config.governance.checkpointing {
+                crate::manager::valid_resume_token(
+                    sink.as_ref().and_then(|s| s.lock().unwrap().clone()),
+                    &req.goal,
+                )
+            } else {
+                None
+            };
+            let wait = joey_providers::jittered_backoff_with(
+                retries_used as u32,
+                self.config.governance.backoff_base_secs,
+                self.config.governance.backoff_max_secs,
+            );
+            let retry_ev = AgentEvent::RetryAttempt {
+                attempt: retries_used,
+                max_retries,
+                error: attempt_result.error.clone().unwrap_or_default(),
+                wait_secs: wait.as_secs_f64(),
+            };
+            if let Some(tx) = event_tx {
+                let _ = tx.send(retry_ev.clone());
+            }
+            if let Some(t) = &tap {
+                let _ = t.send(retry_ev.clone());
+            }
+            if let Some(rec) = &recorder {
+                let _ = rec.send(retry_ev);
+            }
+            tokio::time::sleep(wait).await;
+            // A retry is a FRESH child: fresh id from the process-global
+            // counter (registry insert / spawn event / bridge repeat above).
+            id = self.next_id();
+        };
+        // T020 (US5, FR-011): ONE resource record per dispatch, emitted
+        // ONLY here at the dispatch's terminal outcome.
+        // gov_every_terminal_outcome_recorded counts records ==
+        // dispatches (10): scenario (b) (always-500, recovery allowance 1)
+        // retries once but must append exactly ONE Failed record, and
+        // scenario (c) (1s timeout vs 1500ms steps, allowance 1) times out
+        // on BOTH attempts but must append exactly ONE Timeout record —
+        // so intermediate failed/timed-out/CPU-aborted attempts that the
+        // retry loop retries must NOT emit; only the final result does.
+        // Outcome kind at the terminal: a watchdog CPU abort of the FINAL
+        // attempt (is_cpu_exceeded on the final child id) is
+        // AbortedByResourceLimit (gov_aborted_by_resource_limit_recorded:
+        // attempt 1 aborts and retries, attempt 2 aborts terminally →
+        // exactly one record); else a [timeout] final error is Timeout;
+        // else Completed/Failed by result.success.
+        let gov_terminal_outcome = if gov_on && self.gov_watchdog.is_cpu_exceeded(id) {
+            ResourceRecordOutcome::AbortedByResourceLimit
+        } else if result
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("[timeout]"))
+        {
+            ResourceRecordOutcome::Timeout
+        } else if result.success {
+            ResourceRecordOutcome::Completed
+        } else {
+            ResourceRecordOutcome::Failed
+        };
+        // T023 (FR-013): degraded-mode marking — applies ONLY to executed
+        // outputs (this path); cache-hit/follower results never re-mark
+        // (followers share the leader's sig, and the leader's marking
+        // flows to them through the flight result). The critical lane is
+        // NEVER sampled (full fidelity or explicit failure). Sampling
+        // rule: rate 1.0 marks ALL normal/background outputs, rate 0.0
+        // none; fractional rates flip a deterministic per-signature coin
+        // (hash(sig)/u64::MAX < rate).
+        let gov_degraded_sampled = gov_on
+            && self.config.governance.degraded_mode_enabled
+            && matches!(lane, Priority::Normal | Priority::Background)
+            && {
+                let rate = self.config.governance.degraded_sample_rate;
+                if rate >= 1.0 {
+                    true
+                } else if rate <= 0.0 {
+                    false
+                } else {
+                    use std::hash::Hasher;
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    hasher.write(sig.as_bytes());
+                    (hasher.finish() as f64) / (u64::MAX as f64) < rate
+                }
+            };
+        if gov_degraded_sampled {
+            // Exact contract marker (busy-and-outcomes.md): leading space.
+            result.summary.push_str(" [degraded]");
+            let ev = AgentEvent::DelegationDegradedOutput {
+                child_id: id,
+                goal: req.goal.clone(),
+                sample_rate: self.config.governance.degraded_sample_rate,
+            };
+            if let Some(tx) = event_tx {
+                let _ = tx.send(ev.clone());
+            }
+            let tap = self.event_tap();
+            let recorder = self.recorder_tap();
+            if let Some(t) = &tap {
+                let _ = t.send(ev.clone());
+            }
+            if let Some(r) = &recorder {
+                let _ = r.send(ev);
             }
         }
+        self.gov_emit_record(
+            gov_terminal_outcome,
+            &sig,
+            lane,
+            gov_submitted_at,
+            Some(gov_admitted_at),
+            Some(id),
+            retries_used as u16,
+            gov_last_checkpoint,
+            result.token_usage.clone(),
+            gov_degraded_sampled,
+            result.error.as_deref(),
+        );
+        // `held_guard` (if any) drops here — decrementing in-flight retries.
+        // T018 (FR-007/FR-008): publish the final result to any followers
+        // (notify + deregister; the guard's Drop then only deregisters,
+        // pointer-checked) and store SUCCESSFUL results in the persistent
+        // cache (store is independent of single-flight: a cache-enabled
+        // leader stores even when single-flight is off).
+        if let Some(guard) = &leader_guard {
+            guard.complete(&result);
+        }
+        if gov_dedup_on && result.success {
+            if let Some(cache) = &self.gov_cache {
+                cache
+                    .lock()
+                    .unwrap()
+                    .store(sig.clone(), &result, &chrono::Utc::now());
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
 
         team_child_finished(req, result.success);
 
@@ -1332,6 +2332,75 @@ impl SubagentManager {
 
         result
     }
+
+    /// T020 (US5, FR-011..FR-013): append ONE resource record for a
+    /// terminal dispatch outcome (the contracts/resource-record.md field
+    /// set via [`crate::resource_records::new_record`]). Timing shape:
+    /// queue_wait_ms = submitted→admitted (admitted_at None ⇒
+    /// submitted→now — the busy/cache/follower paths that never entered a
+    /// slot); compute_ms = admitted→now (0 when admitted_at None — those
+    /// paths did not compute); cpu_ms/memory_peak_kb from the watchdog
+    /// snapshots when a child id is known, else 0. Append failures are
+    /// logged and swallowed — recording must never fail a task. No-op
+    /// when governance is disabled (`gov_records` is None).
+    #[allow(clippy::too_many_arguments)] // deviation: record-shaped emission, a parameter bag would be speculative abstraction
+    pub(crate) fn gov_emit_record(
+        &self,
+        outcome: ResourceRecordOutcome,
+        sig: &str,
+        priority: Priority,
+        submitted_at: std::time::Instant,
+        admitted_at: Option<std::time::Instant>,
+        id: Option<u64>,
+        retries: u16,
+        checkpoint: Option<ResumeToken>,
+        token_usage: joey_providers::Usage,
+        degraded: bool,
+        result_error_for_record: Option<&str>,
+    ) {
+        let Some(store) = &self.gov_records else {
+            return; // governance disabled — never write records
+        };
+        let now = std::time::Instant::now();
+        let admitted = admitted_at.unwrap_or(now);
+        let queue_wait_ms = admitted
+            .saturating_duration_since(submitted_at)
+            .as_millis() as u64;
+        let compute_ms = now.saturating_duration_since(admitted).as_millis() as u64;
+        let (cpu_ms, memory_peak_kb) = match id {
+            Some(id) => (
+                self.gov_watchdog.snapshot_cpu_ms(id),
+                self.gov_watchdog.snapshot_memory_peak_kb(id),
+            ),
+            None => (0, 0),
+        };
+        // parent-latency probe lands with the capacity snapshot (R10)
+        let parent_starved_ms = 0;
+        let record = crate::resource_records::new_record(
+            sig.to_string(),
+            priority,
+            outcome,
+            queue_wait_ms,
+            compute_ms,
+            cpu_ms,
+            memory_peak_kb,
+            parent_starved_ms,
+            retries,
+            checkpoint,
+            token_usage,
+            degraded,
+        );
+        if let Err(e) = store.append(&record) {
+            tracing::warn!(
+                error = %e,
+                signature = %sig,
+                outcome = ?outcome,
+                result_error = ?result_error_for_record,
+                "governance resource-record append failed (recording must never fail a task)"
+            );
+        }
+    }
+
     /// Dispatch a batch of subagents in parallel (batch mode).
     ///
     /// PARALLEL-SUBAGENT FEATURE: all children in the batch are spawned as
@@ -1457,8 +2526,20 @@ impl SubagentManager {
         // (e.g. multiple tool calls in one assistant message) draw from
         // the same slots and cannot oversubscribe `max_concurrent_children`.
         let slots = Arc::clone(&self.child_slots);
+        let shared_gov_queue = Arc::clone(&self.gov_queue);
+        let shared_gov_retry_budget = Arc::clone(&self.gov_retry_budget);
+        // T018: batch children share the parent's result cache + flights map
+        // (same sharing pattern as gov_watchdog).
+        let shared_gov_cache = self.gov_cache.clone();
+        let shared_gov_flights = self.gov_flights.clone();
         let shared_grant_back = self.grant_back.clone();
         let shared_registry = self.registry.clone();
+        // T015/T016: the batch wave shares the parent manager's dedicated
+        // child runtime + sampling watchdog state + shutdown flag.
+        let shared_child_runtime = self.child_runtime.clone();
+        let shared_gov_watchdog = self.gov_watchdog.clone();
+        let shared_gov_shutdown = self.gov_shutdown.clone();
+        let gov_start_gate = self.gov_start_gate.clone();
         let tap = self.event_tap();
         // T029: the recorder tap is fed ALONGSIDE the external tap — capture
         // the shared slot by Arc so children installed after this snapshot
@@ -1498,6 +2579,16 @@ impl SubagentManager {
             let tap = tap.clone();
             let recorder = recorder.clone();
             let slots = slots.clone();
+            let gov_queue = shared_gov_queue.clone();
+            let gov_retry_budget = shared_gov_retry_budget.clone();
+            let gov_cache = shared_gov_cache.clone();
+            let gov_flights = shared_gov_flights.clone();
+            // T015/T016: per-iteration clones of the shared runtime +
+            // watchdog + shutdown Arcs (moved into each child task).
+            let child_runtime = shared_child_runtime.clone();
+            let gov_watchdog = shared_gov_watchdog.clone();
+            let gov_shutdown = shared_gov_shutdown.clone();
+            let gov_start_gate = gov_start_gate.clone();
             // Allocate the child's stable id from the PARENT manager's
             // counter so ids are unique + monotonic across the whole
             // batch (T033: same process-global counter the parent draws
@@ -1522,6 +2613,15 @@ impl SubagentManager {
                     semaphore: sem.clone(),
                     child_semaphore: child_sem.clone(),
                     child_slots: slots.clone(),
+                    gov_queue: gov_queue.clone(),
+                    gov_retry_budget: gov_retry_budget.clone(),
+                    gov_cache: gov_cache.clone(),
+                    gov_flights: gov_flights.clone(),
+                    // T020: transient managers never write resource
+                    // records — their default config has governance
+                    // disabled; emission belongs to the top-level
+                    // manager created via `new`.
+                    gov_records: None,
                     grant_back: grant_back.clone(),
                     registry: child_registry.clone(),
                     child_pool_owner: true,
@@ -1531,6 +2631,13 @@ impl SubagentManager {
                     // T029: shared by reference with the parent manager —
                     // batch children feed the recorder alongside the tap.
                     recorder_tap: recorder.clone(),
+                    // T015/T016: batch children share the parent's
+                    // dedicated child runtime + watchdog + shutdown flag.
+                    child_runtime,
+                    gov_watchdog,
+                    gov_shutdown,
+                    gov_overload: crate::governance::OverloadTracker::new(),
+                    gov_start_gate: gov_start_gate.clone(),
                 };
                 let result = mgr
                     .dispatch_single_with_overrides(
@@ -1604,6 +2711,41 @@ impl SubagentManager {
 
         ordered
     }
+}
+
+impl Drop for SubagentManager {
+    /// Feature 030 (T016): stop the sampling watchdog when the manager
+    /// goes away. Safe (no await). The dedicated child `Runtime` would
+    /// drop when the LAST `Arc` to the manager goes away — but dropping a
+    /// multi-thread runtime from inside an async context panics ("Cannot
+    /// drop a runtime in a context where blocking is not allowed"), and
+    /// managers are routinely dropped inside async tests/turn loops. The
+    /// runtime's drop is therefore moved onto a detached thread: tokio
+    /// Runtime drop semantics (block until tasks finish) apply THERE; a
+    /// leaked still-running background child could hang that thread, not
+    /// the caller (acceptable risk — tests drop managers after children
+    /// finish; the watchdog itself holds no runtime reference and exits
+    /// on this flag).
+    fn drop(&mut self) {
+        self.gov_shutdown.store(true, Ordering::SeqCst);
+        if let Some(rt) = self.child_runtime.take() {
+            std::thread::spawn(move || drop(rt));
+        }
+    }
+}
+
+/// contracts/checkpoint-token.md: a presented resume token is valid only
+/// if its transcript_digest matches the digest of the turns it claims;
+/// a stale/mismatched token is treated as NO token (full restart, fully
+/// counted against the retry budget).
+pub(crate) fn valid_resume_token(
+    t: Option<crate::types::ResumeToken>,
+    goal: &str,
+) -> Option<crate::types::ResumeToken> {
+    t.filter(|tok| {
+        tok.transcript_digest
+            == crate::subagent::checkpoint_digest(goal, tok.last_completed_turn)
+    })
 }
 
 #[cfg(test)]
@@ -2247,5 +3389,23 @@ mod tests {
         // Cleanup: close record so the global registry holds no active team.
         rec.lock().unwrap().close();
         std::env::remove_var("JOEY_HOME");
+    }
+
+    #[test]
+    fn stale_resume_token_is_rejected_full_restart() {
+        let goal = "analyze the widget";
+        let good = crate::types::ResumeToken {
+            last_completed_turn: 3,
+            transcript_digest: crate::subagent::checkpoint_digest(goal, 3),
+            recorded_at: "2026-09-13T00:00:00Z".to_string(),
+        };
+        assert!(valid_resume_token(Some(good.clone()), goal).is_some());
+        let stale = crate::types::ResumeToken {
+            last_completed_turn: 3,
+            transcript_digest: crate::subagent::checkpoint_digest(goal, 2), // claims 3, digests 2
+            recorded_at: "2026-09-13T00:00:00Z".to_string(),
+        };
+        assert!(valid_resume_token(Some(stale), goal).is_none());
+        assert!(valid_resume_token(None, goal).is_none());
     }
 }

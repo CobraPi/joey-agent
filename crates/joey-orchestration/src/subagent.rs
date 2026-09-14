@@ -41,6 +41,21 @@ fn add_usage(acc: &mut Usage, other: &Usage) {
     acc.reasoning_tokens += other.reasoning_tokens;
 }
 
+/// Transcript digest for the turn-boundary resume token (feature 030,
+/// FR-006/R3c). Deterministic, std-only.
+/// Checkpoint digest inputs: goal + completed provider iteration count — a
+/// pure function of completed-iteration data, so a presented token's
+/// digest can be recomputed and compared byte-for-byte (stale token ⇒
+/// full restart, contracts/checkpoint-token.md).
+pub(crate) fn checkpoint_digest(goal: &str, completed_iterations: usize) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new(); // fixed keys → stable across restarts
+    goal.hash(&mut h);
+    completed_iterations.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// Build a toolset summary string for events (e.g. "file, web").
 pub(crate) fn toolset_summary(toolsets: &[String]) -> String {
     if toolsets.is_empty() {
@@ -312,7 +327,8 @@ impl Subagent {
         self,
         event_tx: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
     ) -> DelegationResult {
-        self.run_with_tap(0, event_tx, None, None, 0).await
+        self.run_with_tap(0, event_tx, None, None, 0, 0.0, 0.0, None, None)
+            .await
     }
 
     /// Run the subagent's turn loop, forwarding every child event to the
@@ -341,6 +357,10 @@ impl Subagent {
         tap: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
         recorder: Option<&tokio::sync::mpsc::UnboundedSender<joey_agent_core::AgentEvent>>,
         recovery_attempts: usize,
+        backoff_base_secs: f64,
+        backoff_max_secs: f64,
+        retry_budget: Option<&std::sync::Arc<crate::governance::RetryBudget>>,
+        checkpoint_sink: Option<&std::sync::Arc<std::sync::Mutex<Option<crate::types::ResumeToken>>>>,
     ) -> DelegationResult {
         let start = Instant::now();
         let goal = self.goal.clone();
@@ -401,37 +421,76 @@ impl Subagent {
         let mut extra_usage = Usage::default();
         let mut extra_iterations = 0usize;
         let mut attempts_used = 0usize;
+        // FR-005 (feature 030, R3b): in-flight retry budget guard. Bound
+        // HERE (not inside the iteration) so it stays alive across the whole
+        // retried attempt — the run_turn at the top of the next iteration;
+        // each retry decision replaces (releases) the previous guard.
+        let mut retry_guard: Option<crate::governance::RetryGuard> = None;
         let result: TurnResult = loop {
-            let r: TurnResult = if tap.is_some() || recorder.is_some() {
-                let (child_tx, mut child_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<joey_agent_core::AgentEvent>();
-                let tap_tx = tap.cloned();
-                let recorder_tx = recorder.cloned();
-                let legacy_tx = tx_for_run.clone();
-                let fanout = tokio::spawn(async move {
-                    while let Some(ev) = child_rx.recv().await {
-                        if id != 0 {
-                            let wrapped = joey_agent_core::AgentEvent::SubagentEvent {
-                                id,
-                                event: Box::new(ev.clone()),
-                            };
-                            if let Some(tx) = tap_tx.as_ref() {
-                                let _ = tx.send(wrapped.clone());
+            // T013: iteration-granular checkpointing. When a checkpoint sink
+            // is wired the tapped (forwarder) path is ALWAYS taken — even if
+            // tap/recorder/legacy fanout are all absent — because the
+            // forwarder is what counts completed provider iterations
+            // (AgentEvent::ApiCallEnd) and replaces the resume token at
+            // every iteration boundary; the child's event channel must
+            // still be drained or the agent would stall on a full channel.
+            let r: TurnResult =
+                if tap.is_some() || recorder.is_some() || checkpoint_sink.is_some() {
+                    let (child_tx, mut child_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<joey_agent_core::AgentEvent>();
+                    let tap_tx = tap.cloned();
+                    let recorder_tx = recorder.cloned();
+                    let legacy_tx = tx_for_run.clone();
+                    let sink = checkpoint_sink.cloned();
+                    let goal_for_checkpoint = goal.clone();
+                    let fanout = tokio::spawn(async move {
+                        // FR-006 (feature 030, R3c): iteration-granular resume
+                        // tokens. One ApiCallEnd = one completed provider
+                        // iteration; the sink is replaced at every boundary
+                        // so a timeout drop of the run future still leaves
+                        // the latest completed iteration visible to the
+                        // manager (the sink Arc outlives the run).
+                        let mut completed_iterations = 0usize;
+                        while let Some(ev) = child_rx.recv().await {
+                            if let (
+                                Some(sink),
+                                joey_agent_core::AgentEvent::ApiCallEnd { .. },
+                            ) = (sink.as_ref(), &ev)
+                            {
+                                completed_iterations += 1;
+                                let digest = checkpoint_digest(
+                                    &goal_for_checkpoint,
+                                    completed_iterations,
+                                );
+                                sink.lock().unwrap().replace(crate::types::ResumeToken {
+                                    last_completed_turn: completed_iterations,
+                                    transcript_digest: digest,
+                                    recorded_at: chrono::Utc::now()
+                                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                                });
                             }
-                            if let Some(tx) = recorder_tx.as_ref() {
-                                let _ = tx.send(wrapped);
+                            if id != 0 {
+                                let wrapped = joey_agent_core::AgentEvent::SubagentEvent {
+                                    id,
+                                    event: Box::new(ev.clone()),
+                                };
+                                if let Some(tx) = tap_tx.as_ref() {
+                                    let _ = tx.send(wrapped.clone());
+                                }
+                                if let Some(tx) = recorder_tx.as_ref() {
+                                    let _ = tx.send(wrapped);
+                                }
                             }
+                            let _ = legacy_tx.send(ev);
                         }
-                        let _ = legacy_tx.send(ev);
-                    }
-                });
-                let r = self.agent.run_turn(&initial_prompt, child_tx).await;
-                // child_tx drops here → fanout drains → task ends.
-                let _ = fanout.await;
-                r
-            } else {
-                self.agent.run_turn(&initial_prompt, tx_for_run.clone()).await
-            };
+                    });
+                    let r = self.agent.run_turn(&initial_prompt, child_tx).await;
+                    // child_tx drops here → fanout drains → task ends.
+                    let _ = fanout.await;
+                    r
+                } else {
+                    self.agent.run_turn(&initial_prompt, tx_for_run.clone()).await
+                };
             let interrupted = r.interrupted || batch_interrupt.load(Ordering::SeqCst);
             if interrupted || !r.fatal_provider_error || attempts_used >= recovery_attempts {
                 break r;
@@ -442,11 +501,34 @@ impl Subagent {
             // Poisoned history out: the fatal turn appended an assistant
             // error message; a clean re-run starts from the initial prompt.
             self.agent.set_history(Vec::new());
+            // FR-005 (feature 030, R3b): system-wide in-flight retry budget.
+            // A spent budget fails fast: break with the fatal failure as-is
+            // and emit NO further RetryAttempt (no new load).
+            retry_guard = match retry_budget {
+                Some(b) => match b.try_acquire() {
+                    Some(g) => Some(g),
+                    None => break r,
+                },
+                None => None,
+            };
+            // FR-005 (feature 030, R3b): jittered exponential backoff before
+            // the retried attempt. (0,0) keeps today's immediate retry.
+            let wait_secs = if backoff_base_secs > 0.0 || backoff_max_secs > 0.0 {
+                let d = joey_providers::jittered_backoff_with(
+                    attempts_used as u32,
+                    backoff_base_secs,
+                    backoff_max_secs,
+                );
+                tokio::time::sleep(d).await;
+                d.as_secs_f64()
+            } else {
+                0.0
+            };
             let retry_ev = joey_agent_core::AgentEvent::RetryAttempt {
                 attempt: attempts_used,
                 max_retries: recovery_attempts,
                 error: "fatal provider error — retrying with a clean context".to_string(),
-                wait_secs: 0.0,
+                wait_secs,
             };
             if id != 0 {
                 if let Some(t) = tap {
@@ -550,6 +632,7 @@ pub(crate) fn specs_to_requests(
         prompt_append: None,
         team: None,
         name: None,
+        priority: None,
     })
     .collect()
 }

@@ -273,6 +273,19 @@ pub(crate) fn parse_role_reasoning(level: &str) -> Option<joey_providers::Reason
     }
 }
 
+/// Parse the `priority` tool arg (T029, FR-013) into an admission lane.
+/// `None` when omitted, non-string, or an unknown value — the dispatch then
+/// keeps its default lane (admission treats unset as Normal, background
+/// waves force Background at their forcing sites).
+fn parse_priority(v: Option<&serde_json::Value>) -> Option<crate::types::Priority> {
+    v.and_then(|v| v.as_str()).and_then(|s| match s {
+        "critical" => Some(crate::types::Priority::Critical),
+        "normal" => Some(crate::types::Priority::Normal),
+        "background" => Some(crate::types::Priority::Background),
+        _ => None,
+    })
+}
+
 /// The delegate_task tool. Holds an Arc<SubagentManager> for dispatching.
 pub struct DelegateTask {
     manager: Arc<SubagentManager>,
@@ -426,6 +439,12 @@ impl Tool for DelegateTask {
                     "type": "boolean",
                     "description": "If true, return immediately with a work handle per task ('[BACKGROUND] id=<child_id> goal=<goal> started') instead of blocking until the subagent finishes; the work runs under the same concurrency limits (excess queues). Check status later via subagent_control. Default: false (blocking).",
                     "default": false
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": ["critical", "normal", "background"],
+                    "default": "normal",
+                    "description": "Admission priority lane (feature 030, FR-013): critical jumps the queued line (never preempts running work); background defers to idle capacity; default normal. Ignored when governance or priority lanes are disabled."
                 },
                 "budgets": {
                     "type": "object",
@@ -693,6 +712,9 @@ impl Tool for DelegateTask {
             prompt_append,
             team: None,
             name: None,
+            // T029 (FR-013): admission lane from the `priority` arg; the
+            // background forcing below then wins (flag > arg precedence).
+            priority: parse_priority(args.get("priority")),
         };
 
         // HyperCode role routing: `role: "explorer"|"implementor"` fills
@@ -783,6 +805,9 @@ impl Tool for DelegateTask {
         // background=false / unset keeps the blocking path below untouched
         // (FR-002 byte parity — pinned by tests/background.rs T007).
         if args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // T022 (FR-013): background waves enqueue as the background
+            // lane (admission reads it only when governance is enabled).
+            req.priority = Some(crate::types::Priority::Background);
             let handle = crate::background::dispatch_background_with_notices_and_budgets(
                 &self.manager,
                 &req,
@@ -940,6 +965,14 @@ impl DelegateTask {
                 // toolset/model restrictions silently violates intent).
                 return ToolResult::Error(e);
             }
+            // T022 (FR-013): background waves enqueue as the background
+            // lane. Setting the field is cheap and unconditional —
+            // admission reads it only when governance is enabled, so
+            // disabled managers ignore it.
+            for r in requests.iter_mut() {
+                r.priority = parse_priority(args.get("priority"));
+                r.priority = Some(crate::types::Priority::Background);
+            }
             // T021: a top-level budgets object applies to EVERY child in the
             // wave (contracts/delegation-tools.md; per-task override out of
             // scope). Do NOT bake budgets.max_turns into req.max_turns here:
@@ -971,6 +1004,7 @@ impl DelegateTask {
                         batch_model.as_deref(),
                         &batch_toolsets,
                         budgets,
+                        parse_priority(args.get("priority")),
                     )
                     .await
                 {
@@ -1031,7 +1065,13 @@ impl DelegateTask {
         // the no-budgets byte-parity path). tokens/wall-clock are deferred
         // on the blocking path (no watcher exists — see single path).
         let results = match self
-            .dispatch_blocking_batch(&task_specs, batch_model.as_deref(), &batch_toolsets, budgets)
+            .dispatch_blocking_batch(
+                &task_specs,
+                batch_model.as_deref(),
+                &batch_toolsets,
+                budgets,
+                parse_priority(args.get("priority")),
+            )
             .await
         {
             Ok(results) => results,
@@ -1062,6 +1102,7 @@ impl DelegateTask {
         batch_model: Option<&str>,
         batch_toolsets: &[String],
         budgets: Option<crate::types::Budgets>,
+        priority: Option<crate::types::Priority>,
     ) -> Result<Vec<DelegationResult>, String> {
         let budgeted_turns = budgets
             .and_then(|b| b.max_turns)
@@ -1075,6 +1116,10 @@ impl DelegateTask {
                 self.manager.config().default_persist,
                 SubagentRole::Leaf,
             );
+            // T029 (FR-013): admission lane from the top-level `priority` arg.
+            for r in requests.iter_mut() {
+                r.priority = priority;
+            }
             if let Err(e) = crate::delegation_tool::resolve_batch_subagent_types(
                 &mut requests,
                 self.resolver.as_ref(),
@@ -1113,6 +1158,10 @@ impl DelegateTask {
                 self.manager.config().default_persist,
                 SubagentRole::Leaf,
             );
+            // T029 (FR-013): admission lane from the top-level `priority` arg.
+            for r in requests.iter_mut() {
+                r.priority = priority;
+            }
             if let Err(e) = crate::delegation_tool::resolve_batch_subagent_types(
                 &mut requests,
                 self.resolver.as_ref(),
@@ -1303,6 +1352,7 @@ mod role_tests {
             prompt_append: None,
             team: None,
             name: None,
+            priority: None,
         }
     }
 

@@ -404,6 +404,42 @@ pub enum AgentEvent {
     },
     /// The turn failed with an error message.
     Failed(String),
+
+    // Feature 030: subagent resource-governance events (additive).
+    /// Emitted when a dispatch is refused because slots and queue are full.
+    DelegationBusy {
+        queue_depth: usize,
+        cap: usize,
+    },
+    /// Emitted when a child exceeds its per-task wall-clock budget.
+    DelegationTimeout {
+        child_id: u64,
+        goal: String,
+        timeout_secs: u64,
+    },
+    /// Emitted when a retry is refused because the system-wide budget is spent.
+    DelegationRetryBudgetExhausted {
+        goal: String,
+        budget: usize,
+        in_flight: usize,
+    },
+    /// Emitted when a dispatch returns from the persistent result cache.
+    DelegationCacheHit {
+        signature: String,
+    },
+    /// Emitted for every output produced under explicitly selected degraded mode.
+    DelegationDegradedOutput {
+        child_id: u64,
+        goal: String,
+        sample_rate: f64,
+    },
+    /// Periodic governance capacity snapshot (running/queued vs caps).
+    CapacitySnapshot {
+        running: usize,
+        queued: usize,
+        queue_cap: usize,
+        max_children: usize,
+    },
 }
 
 #[cfg(test)]

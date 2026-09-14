@@ -2,6 +2,8 @@
 
 Facts are file:line-sourced from the workspace (verified 2026-09-11). Each section: Decision / Rationale / Alternatives considered.
 
+Numeric constants and defaults cited here mirror the canonical values in contracts/ (config-keys.md, busy-and-outcomes.md); the contracts are authoritative on drift.
+
 ## R1: Execution substrate — extend the existing shared pool
 **Decision**: Keep the existing child-slot semaphore pool (defaults `max_concurrent_children: 3`, manager.rs:62-63; admission at manager.rs:1030-1034; one pool shared across all dispatch calls per the comment at manager.rs:1454-1458) as the single admission point; add the waiting queue, priority lanes, and busy refusal at that boundary.
 **Rationale**: The pool already exists, is shared across blocking singles, batches, and background waves, and has capacity-aware sizing via capacity.rs:94-114. Governing it rather than building a parallel executor is the minimal additive change (constitution VI, VIII).
@@ -58,7 +60,7 @@ Facts are file:line-sourced from the workspace (verified 2026-09-11). Each secti
 **Alternatives considered**: (a) subprocess per child — rejected (R1b); (b) same-runtime yielding — rejected: one runtime shares one scheduler, so saturation still delays the parent; (c) OS nice/priority — rejected: not portable and needs privileges; (d) cgroups — rejected: Linux-only; (e) nothing — rejected: FR-009 unmet.
 
 ## R5b: CPU ceiling — sampled watchdog with hard abort
-**Decision**: Per-child CPU ceiling (default 300 CPU-seconds) enforced by a sampling watchdog: the manager samples child CPU time at a fixed interval (default 1s) using a portable mechanism (the exact mechanism — /proc, sysctl, or equivalent — is an implementation-level choice to be settled in tasks.md, with cross-platform support as a hard requirement); when cumulative CPU exceeds the ceiling the child is aborted via the same interrupt path as timeouts and reported `aborted_by_resource_limit`. The sampling interval is recorded in resource records.
+**Decision**: Per-child CPU ceiling (default 300 CPU-seconds) enforced by a sampling watchdog: the manager samples child CPU time at a fixed interval (default 1s) using a portable mechanism (mechanism decided: process-level CPU time sampled at the watchdog interval and attributed to the children running during each interval, apportioned evenly when more than one child executes; attribution is labeled sampled in records; implemented via std-portable per-process CPU time, no cgroups, with a Windows validation note); when cumulative CPU exceeds the ceiling the child is aborted via the same interrupt path as timeouts and reported `aborted_by_resource_limit`. The sampling interval is recorded in resource records.
 **Rationale**: Hard abort satisfies FR-010's 'cannot exceed'; sampling yields the CPU-time attribution FR-011 needs at negligible cost (1s cadence vs multi-second LLM turns).
 **Alternatives considered**: (a) cgroup CPU quota — rejected: Linux-only; (b) POSIX rlimit on CPU — rejected: signals the whole process, killing the parent too (children are in-process tasks); (c) application-level self-accounting — deferred: depends on turns self-reporting; (d) wall-clock-only enforcement — rejected: clarification Q4 requires the CPU dimension to be hard.
 

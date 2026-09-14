@@ -110,6 +110,31 @@ delegation:
   max_concurrent_children: auto
   max_spawn_depth: 1
   subagent_recovery_attempts: 1
+  # Feature 030: subagent resource governance (additive; see specs/030-please-implement-features)
+  resource_governance:
+    enabled: true
+  max_queue_depth: auto
+  task_timeout_secs: 600
+  retry_budget: 2
+  backoff_base_secs: 2.0
+  backoff_max_secs: 60.0
+  checkpointing:
+    enabled: true
+  result_cache:
+    enabled: true
+    max_entries: 256
+    ttl_hours: 24
+  single_flight:
+    enabled: true
+  cpu_ceiling_secs: 300
+  watchdog_interval_secs: 1
+  memory_tracking:
+    enabled: true
+  priority:
+    enabled: true
+  degraded_mode:
+    enabled: false
+    sample_rate: 0.1
 code_execution:
   mode: "project"
 display:
@@ -1777,6 +1802,43 @@ mod tests {
         std::fs::write(&bad, ":\n  - [unbalanced:\n    bracket:\n").unwrap();
         let cfg = Config::load_from(bad).unwrap();
         assert_eq!(cfg.get_str("terminal.max_concurrent", ""), "auto");
+    }
+
+    // ── Feature 030: delegation resource-governance config keys ──
+
+    #[test]
+    fn governance_defaults_present() {
+        let cfg = Config::defaults();
+        // Sentinel defaults are chosen so a MISSING key fails the assert.
+        assert!(cfg.get_bool("delegation.resource_governance.enabled", false));
+        assert_eq!(cfg.get_str("delegation.max_queue_depth", "!missing!"), "auto");
+        assert_eq!(cfg.get_i64("delegation.task_timeout_secs", -1), 600);
+        assert_eq!(cfg.get_i64("delegation.retry_budget", -1), 2);
+        assert!((cfg.get_f64("delegation.backoff_base_secs", -1.0) - 2.0).abs() < 1e-9);
+        assert!((cfg.get_f64("delegation.backoff_max_secs", -1.0) - 60.0).abs() < 1e-9);
+        assert!(cfg.get_bool("delegation.checkpointing.enabled", false));
+        assert!(cfg.get_bool("delegation.result_cache.enabled", false));
+        assert_eq!(cfg.get_i64("delegation.result_cache.max_entries", -1), 256);
+        assert_eq!(cfg.get_i64("delegation.result_cache.ttl_hours", -1), 24);
+        assert!(cfg.get_bool("delegation.single_flight.enabled", false));
+        assert_eq!(cfg.get_i64("delegation.cpu_ceiling_secs", -1), 300);
+        assert_eq!(cfg.get_i64("delegation.watchdog_interval_secs", -1), 1);
+        assert!(cfg.get_bool("delegation.memory_tracking.enabled", false));
+        assert!(cfg.get_bool("delegation.priority.enabled", false));
+        // Sentinel true: a wrongly-defaulted true must fail here.
+        assert!(!cfg.get_bool("delegation.degraded_mode.enabled", true));
+        assert!((cfg.get_f64("delegation.degraded_mode.sample_rate", -1.0) - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn governance_clamped_reads() {
+        // User override wins over the default, then clamps bound it.
+        let cfg = cfg_from("delegation:\n  degraded_mode:\n    sample_rate: 1.7\n");
+        assert!((cfg.get_clamped_f64("delegation.degraded_mode.sample_rate", 0.1, 0.0, 1.0) - 1.0).abs() < 1e-9);
+        let cfg = cfg_from("delegation:\n  degraded_mode:\n    sample_rate: -0.5\n");
+        assert!((cfg.get_clamped_f64("delegation.degraded_mode.sample_rate", 0.1, 0.0, 1.0) - 0.0).abs() < 1e-9);
+        let cfg = cfg_from("delegation:\n  task_timeout_secs: -5\n");
+        assert_eq!(cfg.get_clamped_i64("delegation.task_timeout_secs", 600, 0, 86400), 0);
     }
 
     #[test]

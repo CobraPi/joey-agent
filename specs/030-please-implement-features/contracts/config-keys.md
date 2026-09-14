@@ -21,3 +21,8 @@ All keys live under the existing `delegation.*` namespace (dotted paths, `joey-c
 | delegation.priority.enabled | bool | true | Priority lanes on/off |
 | delegation.degraded_mode.enabled | bool | false | Explicit degraded-mode selection (never auto) |
 | delegation.degraded_mode.sample_rate | f64 | 0.1 | Fraction of background+normal work processed under degraded mode; critical never sampled |
+
+## Notes
+
+- Per-task retry allowance (SC-002): the pre-existing `delegation.subagent_recovery_attempts` key (default 1) caps retries per task; `delegation.retry_budget` caps retries in flight system-wide. Both are enforced together.
+- Clamps: `task_timeout_secs`, `retry_budget`, `backoff_base_secs`, `backoff_max_secs`, `cpu_ceiling_secs`, `watchdog_interval_secs`, `result_cache.max_entries`, `result_cache.ttl_hours` clamp to >= 0 (0 disables the mechanism where noted); `degraded_mode.sample_rate` clamps to [0.0, 1.0]; `max_queue_depth` and the pool clamp to >= 1 after auto-resolution.

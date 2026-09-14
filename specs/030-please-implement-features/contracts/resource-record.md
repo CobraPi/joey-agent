@@ -12,6 +12,7 @@ One JSON object per line, appended at each terminal task outcome to `~/.joey/del
 | compute_ms | u64 (sampled) | Admission → terminal |
 | cpu_ms | u64 (sampled) | Sampled CPU attribution |
 | memory_peak_kb | u64 (sampled, advisory) | Never enforced |
+| parent_starved_ms | u64 (sampled, advisory) | Max parent event-tap latency observed during the task's window; nonzero under control-plane starvation (FR-012c) |
 | retries | u16 | Attempts beyond the first |
 | checkpoint | object \| null | Resume token (contracts/checkpoint-token.md) or null |
 | token_usage | object { prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens } | Mirror of joey-providers Usage; joinable with token telemetry |

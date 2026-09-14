@@ -17,15 +17,15 @@ Runnable validation scenarios keyed to FR/SC ids. Prerequisites: repo checkout; 
 ## A3 — Single-flight + persistent cache (FR-007/008, SC-003)
 `cargo test -p joey-orchestration --test governance_dedup` — expect: 5 identical simultaneous dispatches → exactly 1 child executes, 5 results; after process-restart simulation (cache reload), same signature → cache hit, 0 executions. Differing budgets → different signatures, no cross-serving.
 
-cargo test -p joey-orchestration --test governance_retry_budget — expect: budget invariants under concurrent failures.
+cargo test -p joey-orchestration --test governance_retry -- --nocapture gov_concurrent_failures_respect_global_budget — expect: budget invariants under concurrent failures (system-wide in-flight retries never exceed delegation.retry_budget).
 
 ## A4 — Control-plane isolation + CPU ceiling (FR-009/010, SC-004)
 `cargo test -p joey-orchestration --test governance_isolation` — expect: children saturating all slots; parent scheduling decisions (sampled via event-tap latency) complete within 2× unsaturated baseline in ≥95% of samples; runaway child (infinite-compute mock) aborted at cpu_ceiling_secs with failed-by-resource-limit outcome; siblings unaffected.
 
 ## A5 — Resource records (FR-011/012, SC-005)
-`cargo test -p joey-orchestration --test governance_records` — expect: every terminal task appends exactly one record; records joinable with token telemetry via task_signature; seeded pathologies (stuck-task burn, retry amplification) distinguishable from records alone (synthetic-record fixtures assert the distinguishing queries).
+`cargo test -p joey-orchestration --test governance_records` — expect: every terminal task appends exactly one record; records joinable with token telemetry via task_signature; seeded pathologies (stuck-task burn, retry amplification, control-plane starvation) distinguishable from records alone (synthetic-record fixtures assert the distinguishing queries).
 
-cargo test -p joey-orchestration --test governance_records_diag — synthetic pathology fixtures assert distinguishing queries (A5 diagnostic half).
+cargo test -p joey-orchestration --test governance_records — expect: synthetic pathology fixtures assert distinguishing queries (A5 diagnostic half; see gov_pathologies_distinguishable_from_records_alone).
 
 ## A6 — Priority + degraded mode (FR-013, SC-006)
 `cargo test -p joey-orchestration --test governance_priority` — expect: mixed-priority queue admits critical before normal in ≥95% of admission decisions under contention; degraded mode (explicitly enabled) samples background/normal at configured rate, marks outputs degraded, never samples critical; with degraded off, no degraded outputs possible.
