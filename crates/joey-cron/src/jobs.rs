@@ -632,7 +632,7 @@ fn compute_grace_seconds(schedule: &Schedule) -> i64 {
     const MAX_GRACE: i64 = 7200;
     match schedule.kind_str() {
         "interval" => {
-            let period_seconds = schedule.minutes.unwrap_or(1) * 60;
+            let period_seconds = schedule.minutes.unwrap_or(1).saturating_mul(60);
             (period_seconds / 2).clamp(MIN_GRACE, MAX_GRACE)
         }
         "cron" => {
@@ -948,6 +948,17 @@ impl CronStore {
         opts: CreateJobOptions,
     ) -> Result<Job> {
         let parsed_schedule = parse_schedule(schedule)?;
+
+        // A `once` schedule with repeat.times > 1 can never satisfy runs 2..N
+        // (compute_next_run returns None after the first run stamps
+        // last_run_at), which would silently strand the remaining dispatches.
+        if parsed_schedule.kind_str() == "once" && opts.repeat.is_some_and(|t| t > 1) {
+            bail!(
+                "Invalid schedule '{}': one-shot (once) jobs do not support \
+                 repeat.times > 1 — use an interval or cron schedule instead",
+                schedule
+            );
+        }
 
         // Normalize repeat: 0 or negative means infinite.
         let mut repeat = opts.repeat.filter(|r| *r > 0);
@@ -2797,6 +2808,15 @@ mod tests {
     // -------------------------------------------------------------------
     // create_job / one-shot lifecycle
     // -------------------------------------------------------------------
+
+    #[test]
+    fn create_job_rejects_once_with_repeat_times_above_one() {
+        let (_tmp, store) = store();
+        let mut opts = CreateJobOptions::default();
+        opts.repeat = Some(3);
+        let err = store.create_job(Some("nope"), "30m", opts).unwrap_err();
+        assert!(err.to_string().contains("do not support repeat.times > 1"));
+    }
 
     #[test]
     fn create_job_defaults() {

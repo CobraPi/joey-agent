@@ -48,58 +48,124 @@ fn theme() -> &'static Theme {
     THEME.get_or_init(Theme::pantera)
 }
 
+/// True when styled output should be emitted: a TTY and no NO_COLOR.
+/// Mirrors omo_render.rs's colorize() guard — non-interactive stdout gets
+/// plain text (no escape sequences in redirected output).
+fn colors_enabled() -> bool {
+    std::env::var("NO_COLOR").is_err() && std::io::IsTerminal::is_terminal(&std::io::stdout())
+}
+
 // ---------------------------------------------------------------------------
 // Basic styled prints (now with CharmTone colors)
 // ---------------------------------------------------------------------------
 
 pub fn info(msg: &str) {
-    println!("{}", theme().fg_more_subtle.ansi().paint(msg));
+    println!(
+        "{}",
+        if colors_enabled() {
+            theme().fg_more_subtle.ansi().paint(msg).to_string()
+        } else {
+            msg.to_string()
+        }
+    );
 }
 
 pub fn error(msg: &str) {
-    eprintln!("{}", theme().error.ansi().paint(format!("error: {}", msg)));
+    let text = format!("error: {msg}");
+    eprintln!(
+        "{}",
+        if colors_enabled() {
+            theme().error.ansi().paint(text.as_str()).to_string()
+        } else {
+            text
+        }
+    );
 }
 
 pub fn warning(msg: &str) {
-    eprintln!("{}", theme().warning.ansi().paint(format!("⚠ {}", msg)));
+    let text = format!("⚠ {msg}");
+    eprintln!(
+        "{}",
+        if colors_enabled() {
+            theme().warning.ansi().paint(text.as_str()).to_string()
+        } else {
+            text
+        }
+    );
 }
 
 pub fn success(msg: &str) {
-    println!("{}", theme().success.ansi().paint(msg));
+    println!(
+        "{}",
+        if colors_enabled() {
+            theme().success.ansi().paint(msg).to_string()
+        } else {
+            msg.to_string()
+        }
+    );
 }
 
 pub fn check_ok(text: &str, detail: &str) {
     let t = theme();
     let d = if detail.is_empty() {
         String::new()
-    } else {
+    } else if colors_enabled() {
         format!(" {}", t.fg_more_subtle.ansi().paint(detail))
+    } else {
+        format!(" {}", detail)
     };
-    println!("  {} {}{}", t.success.ansi().paint("✓"), text, d);
+    let sym = if colors_enabled() {
+        t.success.ansi().paint("✓").to_string()
+    } else {
+        "✓".to_string()
+    };
+    println!("  {} {}{}", sym, text, d);
 }
 
 pub fn check_warn(text: &str, detail: &str) {
     let t = theme();
     let d = if detail.is_empty() {
         String::new()
-    } else {
+    } else if colors_enabled() {
         format!(" {}", t.fg_more_subtle.ansi().paint(detail))
+    } else {
+        format!(" {}", detail)
     };
-    println!("  {} {}{}", t.warning.ansi().paint("⚠"), text, d);
+    let sym = if colors_enabled() {
+        t.warning.ansi().paint("⚠").to_string()
+    } else {
+        "⚠".to_string()
+    };
+    println!("  {} {}{}", sym, text, d);
 }
 
 pub fn check_fail(text: &str, detail: &str) {
     let t = theme();
     let d = if detail.is_empty() {
         String::new()
-    } else {
+    } else if colors_enabled() {
         format!(" {}", t.fg_more_subtle.ansi().paint(detail))
+    } else {
+        format!(" {}", detail)
     };
-    println!("  {} {}{}", t.error.ansi().paint("✗"), text, d);
+    let sym = if colors_enabled() {
+        t.error.ansi().paint("✗").to_string()
+    } else {
+        "✗".to_string()
+    };
+    println!("  {} {}{}", sym, text, d);
 }
 
 pub fn check_info(text: &str) {
-    println!("    {} {}", theme().info.ansi().paint("→"), text);
+    println!(
+        "    {} {}",
+        if colors_enabled() {
+            theme().info.ansi().paint("→").to_string()
+        } else {
+            "→".to_string()
+        },
+        text
+    );
 }
 
 /// A `◆ Section` banner with gradient (doctor.py:192-196 `_section`).
@@ -107,8 +173,12 @@ pub fn section(title: &str) {
     println!();
     let t = theme();
     let header = format!("◆ {}", title);
-    let gradient = theme::gradient_fg_bold(&header, t.info, t.secondary, true);
-    println!("{}", gradient);
+    if colors_enabled() {
+        let gradient = theme::gradient_fg_bold(&header, t.info, t.secondary, true);
+        println!("{}", gradient);
+    } else {
+        println!("{}", header);
+    }
 }
 
 /// A boxed header with gradient border.

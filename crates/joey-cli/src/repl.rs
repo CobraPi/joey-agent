@@ -2735,32 +2735,6 @@ fn show_sessions(st: &ReplState) {
     }
 }
 
-/// `/config set` — route exactly like `joey config set` (config_cmd::set_value,
-/// which is private and therefore replicated here): env-shaped keys
-/// ([`joey_core::config::is_env_config_key`]) persist to `.env` via
-/// [`joey_core::config::save_env_value`]; everything else lands in
-/// config.yaml through the session's Config snapshot (set_and_save applies
-/// upstream set-time coercion — and the same env routing as a backstop).
-fn repl_config_set(config: &mut Config, key: &str, value: &str) -> Result<()> {
-    if joey_core::config::is_env_config_key(key) {
-        joey_core::config::save_env_value(&key.to_uppercase(), value)?;
-        render::success(&format!(
-            "✓ Set {} in {}",
-            key,
-            joey_core::constants::env_path().display()
-        ));
-        return Ok(());
-    }
-    config.set_and_save(key, value)?;
-    render::success(&format!(
-        "✓ Set {} = {} in {}",
-        key,
-        mask_config_set_value(key, value),
-        config.path().display()
-    ));
-    Ok(())
-}
-
 /// Display form of a value written via `/config set`: secret-shaped leaf
 /// keys are masked (parity with config_cmd::set_value / upstream
 /// `_SECRET_CONFIG_KEYS`; the const is private there, so mirrored here).
@@ -2789,7 +2763,11 @@ fn config_slash(st: &mut ReplState, args: &str) {
         Some((&"set", rest)) if rest.len() >= 2 => {
             let value = rest[1..].join(" ");
             match st.config.set_and_save(rest[0], &value) {
-                Ok(()) => render::success(&format!("✓ Set {} = {}", rest[0], value)),
+                Ok(()) => render::success(&format!(
+                    "✓ Set {} = {}",
+                    rest[0],
+                    mask_config_set_value(rest[0], &value)
+                )),
                 Err(e) => render::error(&e.to_string()),
             }
         }

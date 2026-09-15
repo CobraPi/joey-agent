@@ -140,7 +140,7 @@ pub fn maybe_persist_tool_result(
     let Some(threshold) = threshold else {
         return content.to_string();
     };
-    if content.len() <= threshold {
+    if content.chars().count() <= threshold {
         return content.to_string();
     }
     let dir = storage_dir();
@@ -154,25 +154,25 @@ pub fn maybe_persist_tool_result(
             "Persisted large tool result: {} ({}, {} chars -> {})",
             tool_name,
             tool_use_id,
-            content.len(),
+            content.chars().count(),
             remote_path.display()
         );
         return build_persisted_message(
             &preview,
             has_more,
-            content.len(),
+            content.chars().count(),
             &remote_path.to_string_lossy(),
         );
     }
     tracing::info!(
         "Inline-truncating large tool result: {} ({} chars, no sandbox write)",
         tool_name,
-        content.len()
+        content.chars().count()
     );
     format!(
         "{}\n\n[Truncated: tool response was {} chars. Full output could not be saved to sandbox.]",
         preview,
-        crate::pyjson::commas(content.len() as u64)
+        crate::pyjson::commas(content.chars().count() as u64)
     )
 }
 
@@ -205,6 +205,15 @@ mod tests {
         let path = path_line.trim_start_matches("Full output saved to: ");
         assert_eq!(std::fs::read_to_string(path).unwrap(), big);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn multibyte_results_count_chars_not_bytes() {
+        // 2,000 chars = 6,000 UTF-8 bytes — the envelope must report chars.
+        let big = "\u{8a9e}".repeat(2000);
+        let out = maybe_persist_tool_result(&big, "terminal", "call_mb1", Some(1500));
+        assert!(out.contains("(2,000 characters,") || out.contains("2,000 chars"));
+        assert!(!out.contains("6,000"));
     }
 
     #[test]

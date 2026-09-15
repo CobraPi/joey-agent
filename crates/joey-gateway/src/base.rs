@@ -503,11 +503,29 @@ pub fn truncate_message(
         }
         let headroom = headroom as usize;
 
-        // Everything remaining fits in one final chunk.
+        // Everything remaining fits in one final chunk. If the previous chunk
+        // ended inside a code block, the prefix reopened the fence — close it
+        // so the final chunk stands alone (mirrors the non-final path below).
         if (measure(&prefix) + measure(&remaining_str)) as i64
             <= max_length as i64 - INDICATOR_RESERVE as i64
         {
-            chunks.push(format!("{prefix}{remaining_str}"));
+            let mut final_chunk = format!("{prefix}{remaining_str}");
+            let mut in_code = carry_lang.is_some();
+            for line in remaining_str.split('\n') {
+                let stripped = line.trim();
+                if let Some(after_fence) = stripped.strip_prefix("```") {
+                    if in_code {
+                        in_code = false;
+                    } else {
+                        in_code = true;
+                        let _ = after_fence;
+                    }
+                }
+            }
+            if in_code {
+                final_chunk.push_str(FENCE_CLOSE);
+            }
+            chunks.push(final_chunk);
             break;
         }
 
@@ -930,6 +948,19 @@ mod tests {
             "no fence reopen: {:?}",
             chunks[1]
         );
+    }
+
+    #[test]
+    fn final_chunk_after_code_split_closes_orphaned_fence() {
+        // Long code block forcing a split inside the fence, then a short tail
+        // that fits entirely in the final chunk.
+        let body = format!("```python\n{}\nprint('tail')\n", "x".repeat(160));
+        let chunks = truncate_message(&body, 50, None);
+        assert!(chunks.len() >= 2);
+        let last = chunks.last().unwrap();
+        let fences = last.matches("```").count();
+        // Whatever fences the final chunk opens, it must close: even count.
+        assert_eq!(fences % 2, 0, "last chunk has unclosed fence: {last}");
     }
 
     #[test]
