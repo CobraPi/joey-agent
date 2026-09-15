@@ -769,7 +769,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------
-// T023/T026/T030: session injection + conductor snapshot + scope wiring
+// T023/T030: session injection + scope wiring
 // ---------------------------------------------------------------------
 
 /// Whether lifecycle context injection is allowed (feature 026, T023):
@@ -779,37 +779,6 @@ mod tests {
 pub fn lifecycle_context_allowed(config: &joey_core::Config) -> bool {
     config.get_bool("speckit.enabled", true)
         && config.get_bool("speckit.lifecycle_context", true)
-}
-
-/// Map the derived on-disk state onto the conductor prompt's
-/// [`LifecycleSnapshot`] (feature 026, T026).
-pub fn lifecycle_snapshot(
-    root: &std::path::Path,
-) -> joey_omo::agents::prompts::conductor::LifecycleSnapshot {
-    let state = derive_state(root);
-    joey_omo::agents::prompts::conductor::LifecycleSnapshot {
-        feature: state.feature_directory.clone(),
-        step: state.step.as_str().to_string(),
-        guidance: state.step.guidance().to_string(),
-        spec_present: state.has_spec,
-        plan_present: state.has_plan,
-        tasks_present: state.has_tasks,
-    }
-}
-
-/// The lifecycle snapshot for the CURRENT working directory, `None` when
-/// lifecycle context is disabled in config or the cwd is not inside a
-/// spec-kit repository (renderers must then stay byte-identical to the
-/// pre-feature prompt).
-pub fn lifecycle_snapshot_opt(
-    config: &joey_core::Config,
-) -> Option<joey_omo::agents::prompts::conductor::LifecycleSnapshot> {
-    if !lifecycle_context_allowed(config) {
-        return None;
-    }
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let root = crate::speckit_slash::find_repo_root(&cwd)?;
-    Some(lifecycle_snapshot(&root))
 }
 
 /// The session-start lifecycle context block (feature 026, T023): `None`

@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod compression;
+pub mod context_assembly;
 pub mod events;
 pub mod guardrails;
 pub mod guidance;

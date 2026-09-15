@@ -139,6 +139,12 @@ Execution steps:
 
 5. Sequential questioning loop (interactive):
     - Present EXACTLY ONE question at a time.
+    - **Delivery channel — `clarify` tool (interactive sessions):** when the `clarify` tool is available, deliver EACH question through it instead of printing it as plain text and waiting for a chat reply:
+       - Pass the question text as the `question` argument, and NOTHING else in it (same wording quality rules as below, minus any `**Question:**` marker).
+       - For multiple-choice questions pass up to 4 `choices`, one per option, formatted as `A - <Option A description>`; put your recommended option FIRST. Do not add a "Short" row — the UI auto-appends an "Other (type your answer)" option.
+       - For short-answer questions omit `choices` entirely.
+       - The tool result is JSON: apply the "After the user answers" validation rules below to its `user_response` field. A `user_response` of "The user did not provide a response within the time limit..." means the user timed out — use your previously stated recommendation and proceed.
+       - If the `clarify` tool is NOT available (non-interactive session), fall back to the plain-text formats below exactly as written.
     - **Question writing quality (applies to every question, MC or short-answer):**
        - Lead with `**Question:**` followed by a full interrogative that ends with `?`. The question text before the `?` must make sense on its own.
        - NEVER use a topic label, section heading, or requirement id as the question itself. For example, `Acceptance device/runtime matrix (FR-023)` is INVALID — it is a label, not a question.

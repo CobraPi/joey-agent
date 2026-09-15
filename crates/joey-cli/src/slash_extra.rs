@@ -768,6 +768,28 @@ pub fn fast_lines(config: &mut Config, args: &str) -> Lines {
     }
 }
 
+/// `/context-assembly [on|off|status]` — dynamic context-assembly toggle.
+/// Pure arg parse (unit-testable); the host (repl.rs) applies it: persist
+/// `context_assembly.enabled`, rebuild the agent, print the new state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextAssemblyAction {
+    On,
+    Off,
+    Status,
+    Toggle,
+    Usage,
+}
+
+pub fn parse_context_assembly_args(args: &str) -> ContextAssemblyAction {
+    match args.trim().to_lowercase().as_str() {
+        "on" => ContextAssemblyAction::On,
+        "off" => ContextAssemblyAction::Off,
+        "status" => ContextAssemblyAction::Status,
+        "" => ContextAssemblyAction::Toggle,
+        _ => ContextAssemblyAction::Usage,
+    }
+}
+
 /// `/skin [name]` — TUI theme selection. joey-tui ships the aurora theme;
 /// skins select palette variants recorded in config and applied on next start.
 pub mod skin {
@@ -1672,6 +1694,17 @@ mod tests {
     fn sanitize_filename_replaces_hostiles() {
         assert_eq!(sanitize_filename("my session/with spaces"), "my_session_with_spaces");
         assert_eq!(sanitize_filename("///"), "session");
+    }
+
+    #[test]
+    fn parse_context_assembly_args_forms() {
+        use super::{parse_context_assembly_args as parse, ContextAssemblyAction::*};
+        assert_eq!(parse("on"), On);
+        assert_eq!(parse("OFF"), Off);
+        assert_eq!(parse("status"), Status);
+        assert_eq!(parse(""), Toggle);
+        assert_eq!(parse("  "), Toggle);
+        assert_eq!(parse("bogus"), Usage);
     }
 
     /// Regression: /undo with nothing rewound (rewind_last_user_exchanges

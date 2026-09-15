@@ -828,6 +828,29 @@ impl ProviderClient {
                             } else {
                                 calls.push((Some(idx), String::new(), String::new(), delta.to_string(), false));
                             }
+                        } else {
+                            // No output_index: find the slot by item_id (from
+                            // output_item.added); append there so non-conformant
+                            // streams that omit output_index don't lose args.
+                            let item_id = event
+                                .get("item_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if !item_id.is_empty() {
+                                if let Some(slot) =
+                                    calls.iter_mut().find(|(_, cid, ..)| cid.as_str() == item_id)
+                                {
+                                    slot.3.push_str(delta);
+                                } else {
+                                    calls.push((
+                                        None,
+                                        item_id.to_string(),
+                                        String::new(),
+                                        delta.to_string(),
+                                        false,
+                                    ));
+                                }
+                            }
                         }
                     }
                     "response.function_call_arguments.done" => {
@@ -1623,10 +1646,14 @@ fn parse_usage(u: &Value) -> Usage {
         .and_then(|d| d.get("cache_write_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let total = u
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| get("prompt_tokens") + get("completion_tokens"));
     Usage {
         prompt_tokens: get("prompt_tokens"),
         completion_tokens: get("completion_tokens"),
-        total_tokens: get("total_tokens"),
+        total_tokens: total,
         cache_read_tokens: cache_read,
         cache_write_tokens: cache_write,
         reasoning_tokens: u
@@ -1829,6 +1856,17 @@ fn clamp_effort(effort: &str, valid: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_usage_total_falls_back_to_sum() {
+        let v: serde_json::Value =
+            serde_json::json!({"prompt_tokens": 3, "completion_tokens": 4});
+        let u = parse_usage(&v);
+        assert_eq!(u.total_tokens, 7);
+        let v2: serde_json::Value =
+            serde_json::json!({"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 100});
+        assert_eq!(parse_usage(&v2).total_tokens, 100);
+    }
 
     #[test]
     fn ai_usage_hud_client_pins_proxy_and_skips_exchange() {

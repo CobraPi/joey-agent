@@ -3841,6 +3841,83 @@ pub fn draw_agent_picker(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
+/// Render the pending clarify question as a centered modal (upstream
+/// ClarifyPrompt parity). Only draws when a session is open.
+pub fn draw_clarify_modal(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let Some(c) = &app.clarify else { return; };
+    let theme = *theme;
+
+    // Wrap the question to the modal width.
+    let w = 64.min(area.width);
+    let inner_w = (w.saturating_sub(4)) as usize;
+    let question_lines: Vec<String> =
+        textwrap::wrap(&c.question, inner_w.max(10)).into_iter().map(|s| s.into_owned()).collect();
+
+    let rows = if c.typing || c.choices.is_empty() { 1 } else { c.choices.len() + 1 };
+    let h = ((question_lines.len() + rows + 1 + 2) as u16).min(area.height); // +footer +borders
+    if w < 30 || h < 5 {
+        return;
+    }
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 2;
+    let modal = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, modal);
+    let block = gradient_block_focused(" ❓ clarify ", theme, 0.8);
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for ql in &question_lines {
+        lines.push(Line::styled(
+            ql.clone(),
+            Style::default().fg(theme.fg_base.to_color()).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(""));
+
+    if c.typing || c.choices.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("> ".to_string(), Style::default().fg(theme.accent.to_color())),
+            Span::styled(c.custom.clone(), Style::default().fg(theme.fg_base.to_color())),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "Enter send · Esc back/cancel · Ctrl+C cancel".to_string(),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        ));
+    } else {
+        for (i, choice) in c.choices.iter().enumerate() {
+            let is_cursor = i == c.cursor;
+            let marker = if is_cursor { "▸ " } else { "  " };
+            let col = if is_cursor { theme.accent } else { theme.fg_subtle };
+            lines.push(Line::from(vec![Span::styled(
+                format!("{marker}{}. {}", i + 1, choice),
+                Style::default()
+                    .fg(col.to_color())
+                    .add_modifier(if is_cursor { Modifier::BOLD } else { Modifier::empty() }),
+            )]));
+        }
+        let other_cursor = c.cursor == c.choices.len();
+        let marker = if other_cursor { "▸ " } else { "  " };
+        let col = if other_cursor { theme.accent } else { theme.fg_subtle };
+        lines.push(Line::from(vec![Span::styled(
+            format!("{marker}{}. Other (type your answer)", c.choices.len() + 1),
+            Style::default()
+                .fg(col.to_color())
+                .add_modifier(if other_cursor { Modifier::BOLD } else { Modifier::empty() }),
+        )]));
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            format!("↑/↓ select · Enter confirm · 1-{} quick pick · Esc/Ctrl+C cancel", c.choices.len()),
+            Style::default().fg(theme.fg_most_subtle.to_color()),
+        ));
+    }
+
+    let paras = lines.into_iter().map(Line::from).collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(paras).wrap(ratatui::widgets::Wrap { trim: false }), inner);
+}
+
 /// Build the TUI agent roster from joey-omo's `AgentRegistry`.
 ///
 /// The "Default" agent (the existing joey-agent) is always first, followed by

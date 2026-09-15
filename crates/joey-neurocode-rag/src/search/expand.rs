@@ -48,6 +48,11 @@ pub fn expand_context(
     if total == 0 {
         return Some(String::new());
     }
+    // Stale chunk: the file shrank after indexing and the chunk's start is
+    // now past EOF — no honest context exists (contract: absent, not error).
+    if start_line > total {
+        return Some(String::new());
+    }
     let from = start_line.saturating_sub(expand).clamp(1, total);
     let to = end_line.saturating_add(expand).clamp(1, total);
     if from > to {
@@ -226,6 +231,16 @@ mod tests {
         write_lines(tmp.path(), "s.py", 3);
         let ctx = expand_context(tmp.path(), "s.py", 2, 2, 200).unwrap();
         assert_eq!(ctx, "line1\nline2\nline3");
+    }
+
+    /// A chunk indexed when the file was longer: start past EOF yields
+    /// EMPTY context, never the tail of the shrunk file.
+    #[test]
+    fn t026_stale_chunk_past_eof_yields_empty_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_lines(tmp.path(), "s.py", 10);
+        let ctx = expand_context(tmp.path(), "s.py", 15, 18, 2).unwrap();
+        assert_eq!(ctx, "");
     }
 
     /// Missing file → `context_absent` (`None`), never an error and

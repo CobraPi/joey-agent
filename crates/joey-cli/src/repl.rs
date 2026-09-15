@@ -63,6 +63,7 @@ pub(crate) struct ReplState {
     cwd: PathBuf,
     overrides: Overrides,
     agent: Agent,
+    pub(crate) clarify_rx: Option<tokio::sync::mpsc::UnboundedReceiver<joey_tools::tools::clarify_tool::ClarifyRequest>>,
     session_id: String,
     /// Separate read handle for /sessions, /history, /usage queries (the
     /// agent owns its own store connection).
@@ -107,27 +108,6 @@ fn interactive_streaming(config: &Config) -> bool {
 
 pub(crate) fn build_agent_config(config: &Config, ov: &Overrides) -> AgentConfig {
     let mut cfg = AgentConfig::from_config(config);
-    // Feature 025 (T015/FR-005): orchestrator-role session model from OMO —
-    // with hypercode.omo_specialists on (default) the orchestrator maps
-    // directly to the atlas agent's model; with it off, the legacy chain
-    // (sisyphus→hephaestus→metis) — when the user has neither pinned
-    // (--model / /model switch — applied just below, which still wins) nor
-    // configured (model.default in the user layer) a session model. Pure
-    // read-time derivation; no configuration key (contracts/role-defaults.md).
-    // The gate lives in hypercode::orchestrator_session_model_applies so the
-    // engine's T032 startup notice can share it exactly (no drift).
-    if crate::hypercode::orchestrator_session_model_applies(config, cfg.model_pinned) {
-        let profile = joey_providers::profile::resolve_profile(
-            &cfg.provider,
-            &cfg.base_url,
-            &cfg.model,
-        );
-        let available =
-            joey_omo::AvailableModelSet::from_connected_with_catalog(&profile, &cfg.model);
-        if let Some(model) = crate::hypercode::omo_orchestrator_session_model(config, &available) {
-            cfg.model = model;
-        }
-    }
     if let Some(m) = &ov.model {
         cfg.model = m.clone();
         // An explicit --model pins the choice: dynamic model routing
@@ -170,6 +150,7 @@ pub(crate) struct AgentParts {
     pub agent_config: AgentConfig,
     /// Base (pre-orchestration) tool registry children are built from.
     pub base_registry: ToolRegistry,
+    pub clarify_rx: tokio::sync::mpsc::UnboundedReceiver<joey_tools::tools::clarify_tool::ClarifyRequest>,
 }
 
 pub(crate) fn build_agent_parts(
@@ -201,8 +182,13 @@ pub(crate) fn build_agent_parts(
     });
     joey_tools::builtins::register_session_tools(&mut registry, session_db);
 
-    // Wire clarify (interactive only — channel wired at runtime).
-    joey_tools::builtins::register_clarify_tool(&mut registry, None);
+    // Wire clarify (interactive sessions): the UI side consumes ClarifyRequests
+    // from clarify_rx and answers through the per-request oneshot. HyperCode
+    // child registries (engine.rs hypercode_context_for_agent) still register
+    // the tool with no channel — subagent children are headless by design.
+    let (clarify_tx, clarify_rx) =
+        tokio::sync::mpsc::unbounded_channel::<joey_tools::tools::clarify_tool::ClarifyRequest>();
+    joey_tools::builtins::register_clarify_tool(&mut registry, Some(clarify_tx));
 
     // ── Initialize LSP from config (crush-style code intelligence) ────
     {
@@ -279,12 +265,11 @@ pub(crate) fn build_agent_parts(
 
     let mut agent =
         Agent::new(agent_cfg.clone(), registry, ctx).map_err(|e| anyhow::anyhow!("{}", e))?;
-    // Orchestrator overlay: feature 025 — session start installs the default
-    // conductor persona when integration is active (fixed prompt otherwise);
-    // applied as extra instructions (rebuild-safe: engine restarts re-derive
-    // it).
+    // Orchestrator overlay: session start installs the fixed orchestrator
+    // prompt when orchestrator mode is active; applied as extra instructions
+    // (rebuild-safe: engine restarts re-derive it).
     if orchestrator_on {
-        agent.set_extra_instructions(Some(crate::hypercode::orchestrator_persona_overlay_for_profile(config, None, agent.model(), agent.client().profile())));
+        agent.set_extra_instructions(Some(crate::hypercode::ORCHESTRATOR_PROMPT.to_string()));
     }
     // Feature 026 (T023): session-start lifecycle context — ONE-TIME
     // injection through the extra_instructions slot (cache-friendly, never
@@ -373,6 +358,7 @@ pub(crate) fn build_agent_parts(
         subagent_manager: manager,
         agent_config: agent_cfg,
         base_registry,
+        clarify_rx,
     })
 }
 
@@ -607,6 +593,7 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
     let agent = parts.agent;
+    let clarify_rx = parts.clarify_rx;
 
     let ropts = {
         let capability = crate::capability::RenderCapability::detect();
@@ -633,6 +620,7 @@ pub async fn run_chat(opts: ChatOptions) -> Result<i32> {
         cwd: cwd.clone(),
         overrides,
         agent,
+        clarify_rx: Some(clarify_rx),
         session_id,
         db,
         ropts,
@@ -1060,12 +1048,39 @@ async fn run_turn_interactive(st: &mut ReplState, input: &str) -> String {
     let interrupt = st.agent.interrupt_handle();
 
     let mut last_ctrlc: Option<Instant> = None;
+    // Clarify: borrow the receiver field disjointly from st.agent so both
+    // live across the select loop. has_clarify disables the arm once the
+    // channel dies (agent rebuilt mid-session) to avoid a busy recv() loop.
+    let mut has_clarify = st.clarify_rx.is_some();
+    let mut clarify_rx = st.clarify_rx.as_mut();
     {
         let turn = st.agent.run_turn(input, tx);
         tokio::pin!(turn);
         loop {
             tokio::select! {
                 _res = &mut turn => break,
+                req = async {
+                    // as_deref_mut: re-borrow (not move) the Option<&mut _>
+                    // so the loop can re-create this future each iteration.
+                    match clarify_rx.as_deref_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if has_clarify => {
+                    match req {
+                        Some(req) => {
+                            // Render the question selector WITHOUT blocking the
+                            // turn/ctrl-c arms. The prompt answers through the
+                            // oneshot; send failure = tool timed out (120s).
+                            tokio::spawn(crate::clarify_prompt::run(
+                                req.question,
+                                req.choices,
+                                req.response_tx,
+                            ));
+                        }
+                        None => has_clarify = false,
+                    }
+                }
                 sig = tokio::signal::ctrl_c() => {
                     if sig.is_err() { continue; }
                     let now = Instant::now();
@@ -1249,6 +1264,7 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
             }
         }
         "reasoning" => reasoning_slash(st, args),
+        "context-assembly" => context_assembly_slash(st, args),
         "tools" => {
             let cfg = build_agent_config(&st.config, &st.overrides);
             render::info(&format!("Enabled tools ({}):", cfg.enabled_tools.len()));
@@ -1751,7 +1767,7 @@ async fn run_slash_command(name: &str, args: &str, st: &mut ReplState) -> SlashO
                         let tools = crate::hypercode::orchestrator_tool_names();
                         st.agent.set_enabled_tools(tools);
                         st.agent.rebuild_system_prompt();
-                        st.agent.set_extra_instructions(Some(crate::hypercode::orchestrator_persona_overlay_for_profile(&st.config, Some(st.active_agent.as_str()), st.agent.model(), st.agent.client().profile())));
+                        st.agent.set_extra_instructions(Some(crate::hypercode::ORCHESTRATOR_PROMPT.to_string()));
                     } else {
                         let tools = crate::commands::platform_tools(&st.config, "cli");
                         st.agent.set_enabled_tools(tools);
@@ -2304,6 +2320,7 @@ fn new_session(st: &mut ReplState, name: &str, quiet: bool) {
                 execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
             });
             st.agent = parts.agent;
+            st.clarify_rx = Some(parts.clarify_rx);
             st.session_start = Instant::now();
             st.last_response.clear();
             joey_core::logging::set_session_context(Some(&new_id));
@@ -2334,6 +2351,7 @@ fn rebuild_agent_preserving_history(st: &mut ReplState) -> Result<()> {
         execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
     });
     st.agent = parts.agent;
+    st.clarify_rx = Some(parts.clarify_rx);
     Ok(())
 }
 
@@ -2402,6 +2420,62 @@ fn model_slash(st: &mut ReplState, args: &str) {
             render::success(&format!("✓ Model set to {} for this session.", model));
         }
         Err(e) => render::error(&format!("failed to switch model: {}", e)),
+    }
+}
+
+/// `/context-assembly [on|off|status]` — toggle/persist/inspect the dynamic
+/// context-assembly layer. Arg parsing is the pure fn in `slash_extra`
+/// (`parse_context_assembly_args`); this handler applies it: persist via
+/// `context_assembly.enabled`, rebuild the agent (same as `/model`) so the
+/// next request assembles context with the new setting, then report.
+fn context_assembly_slash(st: &mut ReplState, args: &str) {
+    use crate::slash_extra::{parse_context_assembly_args, ContextAssemblyAction};
+    let on_off = |b: bool| if b { "on" } else { "off" };
+    match parse_context_assembly_args(args) {
+        ContextAssemblyAction::Usage => {
+            render::info("usage: /context-assembly [on|off|status]");
+        }
+        ContextAssemblyAction::Status => {
+            let cfg = &st.config;
+            let keep = match cfg.get("context_assembly.always_keep_tools") {
+                Some(v) => match v.as_sequence() {
+                    Some(seq) => seq.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
+                    None => v.as_str().unwrap_or("").to_string(),
+                },
+                None => String::new(),
+            };
+            render::info(&format!(
+                "context assembly:\n  enabled: {}\n  tool_schema_retrieval: {}\n  tool_top_k: {}\n  budget_state_chars: {}\n  log_assembly: {}\n  always_keep_tools: {}",
+                on_off(cfg.get_bool("context_assembly.enabled", false)),
+                on_off(cfg.get_bool("context_assembly.tool_schema_retrieval", false)),
+                cfg.get_i64("context_assembly.tool_top_k", 15),
+                cfg.get_i64("context_assembly.budget_state_chars", 1500),
+                on_off(cfg.get_bool("context_assembly.log_assembly", false)),
+                keep
+            ));
+        }
+        action @ (ContextAssemblyAction::On | ContextAssemblyAction::Off | ContextAssemblyAction::Toggle) => {
+            let current = st.config.get_bool("context_assembly.enabled", false);
+            let next = match action {
+                ContextAssemblyAction::On => true,
+                ContextAssemblyAction::Off => false,
+                _ => !current,
+            };
+            if let Err(e) = st
+                .config
+                .set_and_save("context_assembly.enabled", if next { "true" } else { "false" })
+            {
+                render::error(&format!("failed to save: {e}"));
+                return;
+            }
+            match rebuild_agent_preserving_history(st) {
+                Ok(()) => render::success(&format!(
+                    "context assembly: {}",
+                    if next { "on" } else { "off" }
+                )),
+                Err(e) => render::error(&format!("failed to rebuild agent: {e}")),
+            }
+        }
     }
 }
 
@@ -2583,6 +2657,7 @@ fn resume_session(st: &mut ReplState, target: &str) {
                 execution_graph: std::sync::Arc::new(std::sync::Mutex::new(None)),
             });
             st.agent = parts.agent;
+            st.clarify_rx = Some(parts.clarify_rx);
             st.session_id = id.clone();
             joey_core::logging::set_session_context(Some(&id));
             render::success(&format!("Resumed session {} ({} messages).", id, count));
@@ -2660,32 +2735,6 @@ fn show_sessions(st: &ReplState) {
     }
 }
 
-/// `/config set` — route exactly like `joey config set` (config_cmd::set_value,
-/// which is private and therefore replicated here): env-shaped keys
-/// ([`joey_core::config::is_env_config_key`]) persist to `.env` via
-/// [`joey_core::config::save_env_value`]; everything else lands in
-/// config.yaml through the session's Config snapshot (set_and_save applies
-/// upstream set-time coercion — and the same env routing as a backstop).
-fn repl_config_set(config: &mut Config, key: &str, value: &str) -> Result<()> {
-    if joey_core::config::is_env_config_key(key) {
-        joey_core::config::save_env_value(&key.to_uppercase(), value)?;
-        render::success(&format!(
-            "✓ Set {} in {}",
-            key,
-            joey_core::constants::env_path().display()
-        ));
-        return Ok(());
-    }
-    config.set_and_save(key, value)?;
-    render::success(&format!(
-        "✓ Set {} = {} in {}",
-        key,
-        mask_config_set_value(key, value),
-        config.path().display()
-    ));
-    Ok(())
-}
-
 /// Display form of a value written via `/config set`: secret-shaped leaf
 /// keys are masked (parity with config_cmd::set_value / upstream
 /// `_SECRET_CONFIG_KEYS`; the const is private there, so mirrored here).
@@ -2714,7 +2763,11 @@ fn config_slash(st: &mut ReplState, args: &str) {
         Some((&"set", rest)) if rest.len() >= 2 => {
             let value = rest[1..].join(" ");
             match st.config.set_and_save(rest[0], &value) {
-                Ok(()) => render::success(&format!("✓ Set {} = {}", rest[0], value)),
+                Ok(()) => render::success(&format!(
+                    "✓ Set {} = {}",
+                    rest[0],
+                    mask_config_set_value(rest[0], &value)
+                )),
                 Err(e) => render::error(&e.to_string()),
             }
         }

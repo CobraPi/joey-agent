@@ -463,6 +463,7 @@ impl RiskReviewer for MomusReviewer {
             prompt_append: None,
             team: None,
             name: None,
+            priority: None,
         };
         let results = self
             .ctx

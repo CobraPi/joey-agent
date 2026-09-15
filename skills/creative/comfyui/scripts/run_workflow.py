@@ -450,7 +450,7 @@ def _inline_schema(workflow: dict) -> dict:
 
 def load_schema(schema_path: str | None, workflow: dict) -> dict:
     if schema_path:
-        with open(schema_path) as f:
+        with open(schema_path, encoding="utf-8-sig") as f:
             return json.load(f)
     return _inline_schema(workflow)
 

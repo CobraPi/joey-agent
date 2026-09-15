@@ -109,7 +109,11 @@ pub fn parse_plan(markdown: &str) -> ParsedPlan {
             // task row has nothing to attach to — skip it with a recorded
             // warning instead of silently dropping the constraint.
             match tasks.last_mut() {
-                Some(task) => task.dependencies = last_task_deps.clone(),
+                Some(task) => {
+                    task.dependencies.extend(last_task_deps.iter().copied());
+                    task.dependencies.sort_unstable();
+                    task.dependencies.dedup();
+                }
                 None => tracing::warn!(
                     deps = ?last_task_deps,
                     "plan dependency line before the first task ignored"
@@ -161,6 +165,13 @@ pub fn parse_plan(markdown: &str) -> ParsedPlan {
                 continue;
             }
         };
+
+        // Duplicate task numbers conflate in every number-keyed structure
+        // (completion sets, dependency unblocking) — keep the first.
+        if tasks.iter().any(|t| t.number == number) {
+            tracing::warn!(number, "duplicate task number in plan — keeping the first");
+            continue;
+        }
 
         tasks.push(ParsedTask {
             number,
@@ -349,5 +360,19 @@ mod tests {
         let ready2 = plan.ready_tasks(&completed);
         assert_eq!(ready2.len(), 1);
         assert_eq!(ready2[0].number, 2);
+    }
+
+    #[test]
+    fn duplicate_task_numbers_keep_first() {
+        let plan = parse_plan("- [ ] 1. Alpha\n- [ ] 2. Beta\n- [ ] 2. Gamma\n- [ ] 3. Delta\n");
+        assert_eq!(plan.tasks.len(), 3);
+        assert_eq!(plan.tasks[1].title, "Beta");
+    }
+
+    #[test]
+    fn multiple_depends_lines_merge() {
+        let plan =
+            parse_plan("- [ ] 1. A\n- [ ] 2. B\n> Depends on: 1\n> Depends on: 3\n- [ ] 3. C\n");
+        assert_eq!(plan.tasks[1].dependencies, vec![1, 3]);
     }
 }

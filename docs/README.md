@@ -103,6 +103,12 @@ subsystem you're working on:
 23. [`features/README.md`](features/README.md) — per-crate feature
     reference — one deep-dive page per workspace crate (APIs, behaviors,
     configuration, defaults, testing).
+24. [`context-assembly.md`](context-assembly.md) — the opt-in dynamic
+    context-assembly layer: relevance-ranked tool-schema selection
+    ("tool schema retrieval"), always-keep tool pinning, state-block
+    character budget, per-step JSONL assembly logging, the
+    `/context-assembly` (`/ctxasm`) REPL command, byte parity when
+    disabled, and cache-stability guarantees.
 
 All pages were verified against workspace source in August 2026. If code
 and docs disagree, the code wins — and please fix the doc.

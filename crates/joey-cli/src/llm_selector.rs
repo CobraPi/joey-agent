@@ -203,11 +203,9 @@ fn resolve_provider_name(config: &joey_core::Config) -> String {
 
 /// Build a selector engine from the current joey config.
 fn build_engine() -> SelectorEngine {
-    let config = joey_core::Config::load().unwrap_or_else(|_| {
-        // If config can't load, use an empty config (all defaults).
-        joey_core::Config::load_from(std::path::PathBuf::new())
-            .unwrap_or_else(|_| panic!("config load failed"))
-    });
+    // T: panic-hardening — empty-path load is infallible in practice, but a CLI helper must never panic.
+    let config = joey_core::Config::load()
+        .unwrap_or_else(|_| joey_core::Config::load_from(std::path::PathBuf::new()).unwrap_or_else(|_| joey_core::Config::defaults()));
     let selector_cfg = SelectorConfig {
         enabled: config.get_bool("model.selector.enabled", false),
         configured_model: config.model(),

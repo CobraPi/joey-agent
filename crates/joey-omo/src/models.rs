@@ -322,10 +322,13 @@ pub fn resolve_model(
         if available.contains_exact(&entry.model) {
             return Some((entry.model.clone(), entry.variant.clone()));
         }
-        // Family-level fuzzy match (BC-007).
+        // Family-level fuzzy match (BC-007). Unknown-family IDs must NOT
+        // fuzzy-match: any two unrecognized IDs would cross-match.
         let family = ModelFamily::detect(&entry.model);
-        if let Some(fuzzy_model) = available.first_in_family(family) {
-            return Some((fuzzy_model.to_string(), entry.variant.clone()));
+        if family != ModelFamily::Unknown {
+            if let Some(fuzzy_model) = available.first_in_family(family) {
+                return Some((fuzzy_model.to_string(), entry.variant.clone()));
+            }
         }
     }
     None
@@ -516,5 +519,19 @@ mod tests {
         assert!(set.has_provider("github-copilot"));
         assert!(set.has_provider("usage-hud"));
         std::env::remove_var("AI_USAGE_HUD_BASE_URL");
+    }
+
+    /// BC-007: unknown-family IDs must never fuzzy-match — any two
+    /// unrecognized IDs would cross-match.
+    #[test]
+    fn unknown_family_does_not_fuzzy_match() {
+        // Two unrelated unrecognized IDs must never cross-match (BC-007).
+        let req = ModelRequirement {
+            fallback_chain: vec![FallbackEntry::new("totally-unrelated-id", None, &[])],
+            requires_any_model: true,
+            requires_provider: None,
+        };
+        let avail = AvailableModelSet::from_models(["big-pickle".to_string()].into_iter());
+        assert!(resolve_model(&req, &avail).is_none());
     }
 }

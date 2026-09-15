@@ -77,6 +77,19 @@ Cite pointers (file paths, ids) instead of pasting content you can re-read. \
 For broad noisy exploration, delegate to sub-agents and keep only their distilled \
 conclusions. Prefer targeted paginated reads (offset/limit) over whole-file loads.";
 
+/// Joey-only guidance (adaptive coding specialist, building on feature 027
+/// NeuroCode adaptive memory): NOT ported from upstream (see PORTING.md
+/// Joey-only additions ledger). Injected via the gated pattern in prompt.rs
+/// when `agent.adaptive_coding_guidance` is true.
+pub const ADAPTIVE_CODING_GUIDANCE: &str = "You are a coding specialist: ground every answer in the real codebase — read before claiming, \
+make surgical minimal edits, and verify changes with the project's own build and test \
+commands before declaring done. Adapt to the user's learned preferences (structure, \
+naming, testing, workflow): apply them automatically, treat explicit statements as \
+outranking inferred habits, let newer preferences supersede older ones, and keep \
+learning from explicit corrections and recurring patterns — the user's style evolves, \
+and you evolve with it. When a preference conflicts with a hard project constraint, \
+follow the constraint and say so in one line.";
+
 /// Guidance for the `subagent_control` tool (feature 020, US3). Joey-side
 /// addition — no upstream counterpart; wording follows the delegation-tools
 /// contract (specs/020-async-delegation-control/contracts/delegation-tools.md).
@@ -299,6 +312,7 @@ mod tests {
             ("cli", CLI_PLATFORM_HINT),
             ("skills-preamble", SKILLS_INDEX_PREAMBLE),
             ("context-economy", CONTEXT_ECONOMY_GUIDANCE),
+            ("adaptive-coding", ADAPTIVE_CODING_GUIDANCE),
         ] {
             let scrubbed = text
                 .replace("Hermes Agent by Nous Research", "")
@@ -316,6 +330,14 @@ mod tests {
         assert_eq!(
             CONTEXT_ECONOMY_GUIDANCE,
             "Work economically with context: keep responses concise — your own output becomes future context. Record discoveries (paths, identifiers, decisions, exact values) to the scratchpad as you find them, before context pressure, so later cleanup is safe. Cite pointers (file paths, ids) instead of pasting content you can re-read. For broad noisy exploration, delegate to sub-agents and keep only their distilled conclusions. Prefer targeted paginated reads (offset/limit) over whole-file loads."
+        );
+    }
+
+    #[test]
+    fn adaptive_coding_guidance_matches_contract() {
+        assert_eq!(
+            ADAPTIVE_CODING_GUIDANCE,
+            "You are a coding specialist: ground every answer in the real codebase — read before claiming, make surgical minimal edits, and verify changes with the project's own build and test commands before declaring done. Adapt to the user's learned preferences (structure, naming, testing, workflow): apply them automatically, treat explicit statements as outranking inferred habits, let newer preferences supersede older ones, and keep learning from explicit corrections and recurring patterns — the user's style evolves, and you evolve with it. When a preference conflicts with a hard project constraint, follow the constraint and say so in one line."
         );
     }
 

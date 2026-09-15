@@ -334,11 +334,6 @@ async fn engine_task(
     // sends SetOrchestratorMode; the spec is not rebuilt), so switch_model
     // re-application below must consult THIS flag, not re-read the snapshot.
     let mut orchestrator_on = crate::hypercode::orchestrator_active(&spec_config);
-    // Feature 025: the active OMO agent name for persona-aware overlay
-    // re-application (None = default conductor persona). The TUI owns the
-    // roster; the engine mirrors the last switch so /model re-selects the
-    // persona variant without losing the persona.
-    let mut current_agent: Option<String> = None;
     let spec_cwd = spec.cwd;
     let spec_overrides = spec.overrides;
     // T024: the session's SubagentManager for stop/steer routing (FR-017).
@@ -355,23 +350,6 @@ async fn engine_task(
     // The agent's interrupt flag, captured BEFORE any turn future borrows
     // the agent (the borrow lasts for the whole turn).
     let interrupt = agent.interrupt_handle();
-
-    // Feature 025 (T031/T032): one-time persona-integration notice — empty
-    // bench degradation or an unresolvable orchestrator session-model chain,
-    // surfaced through the same Notice channel as other engine notices.
-    {
-        let available = joey_omo::AvailableModelSet::from_connected_with_catalog(
-            agent.client().profile(),
-            agent.model(),
-        );
-        if let Some(notice) = crate::hypercode::orchestrator_startup_notice(
-            &spec_config,
-            agent_config_model_pinned(&spec_overrides),
-            &available,
-        ) {
-            let _ = event_tx.send(EngineEvent::Notice(notice));
-        }
-    }
 
     loop {
         let cmd = match queued.pop_front() {
@@ -554,7 +532,6 @@ async fn engine_task(
             }
             EngineCommand::SwitchAgent(agent_name) => {
                 let notice = engine_switch_agent(&mut agent, &agent_name, orchestrator_on, &spec_config);
-                current_agent = if agent_name == "default" { None } else { Some(agent_name.clone()) };
                 let _ = event_tx.send(EngineEvent::AgentSwitched {
                     display_name: agent_name,
                     model: agent.model().to_string(),
@@ -563,7 +540,7 @@ async fn engine_task(
                 });
             }
             EngineCommand::SwitchModel { model, global } => {
-                let notice = engine_switch_model(&mut agent, &model, global, orchestrator_on, current_agent.as_deref(), &spec_config);
+                let notice = engine_switch_model(&mut agent, &model, global, orchestrator_on, &spec_config);
                 let _ = event_tx.send(EngineEvent::ModelSwitched {
                     model: agent.model().to_string(),
                     provider: agent.provider_name().to_string(),
@@ -809,23 +786,10 @@ async fn engine_task(
                     let tools = crate::hypercode::orchestrator_tool_names();
                     agent.set_enabled_tools(tools);
                     agent.rebuild_system_prompt();
-                    agent.set_extra_instructions(Some(crate::hypercode::orchestrator_persona_overlay_for_profile(&spec_config, current_agent.as_deref(), agent.model(), agent.client().profile())));
+                    agent.set_extra_instructions(Some(crate::hypercode::ORCHESTRATOR_PROMPT.to_string()));
                     let _ = event_tx.send(EngineEvent::Notice(
                         "⚡ orchestrator mode ON — file writes/builds now go through explorer/implementor subagents (you keep process monitoring, read-only peeks, web, plus your inherited workflow: skills, todo list, task-graph planner)".into(),
                     ));
-                    // T031/T032: re-check the persona-integration health on
-                    // every toggle-ON (provider may have changed since startup).
-                    let available = joey_omo::AvailableModelSet::from_connected_with_catalog(
-                        agent.client().profile(),
-                        agent.model(),
-                    );
-                    if let Some(notice) = crate::hypercode::orchestrator_startup_notice(
-                        &spec_config,
-                        agent_config_model_pinned(&spec_overrides),
-                        &available,
-                    ) {
-                        let _ = event_tx.send(EngineEvent::Notice(notice));
-                    }
                 } else {
                     let tools = crate::commands::platform_tools(&spec_config, "cli");
                     agent.set_enabled_tools(tools);
@@ -1110,13 +1074,6 @@ fn engine_pre_turn(
     text
 }
 
-/// The session-start view of model pinning for the T032 notice: an explicit
-/// --model override pins the session model (mirrors repl's Overrides.model
-/// → model_pinned), so the OMO orchestrator chain must not apply.
-fn agent_config_model_pinned(overrides: &crate::repl::Overrides) -> bool {
-    overrides.model.is_some()
-}
-
 /// Agent switching on the engine side (T033/BC-015). Returns a notice for
 /// the transcript. "default" reverts to the base joey prompt.
 ///
@@ -1136,7 +1093,7 @@ fn engine_switch_agent(
         // but switching back to default must RESTORE the conductor overlay
         // (the previous agent's persona no longer applies).
         agent.set_agent_identity(None);
-        reapply_orchestrator_overlay(agent, orchestrator_on, None, config);
+        reapply_orchestrator_overlay(agent, orchestrator_on, config);
         return "Reverted to the default agent".into();
     }
     // Rebuild a registry to resolve the agent's model + provider.
@@ -1159,7 +1116,7 @@ fn engine_switch_agent(
     match agent.switch_model("auto", "", &model, None) {
         Ok(msg) => {
             agent.set_agent_identity(Some(identity));
-            reapply_orchestrator_overlay(agent, orchestrator_on, Some(agent_name), config);
+            reapply_orchestrator_overlay(agent, orchestrator_on, config);
             format!("{msg} — agent mode: {}", omo_agent.display_name)
         }
         Err(e) => format!("Switch failed: {e}"),
@@ -1168,23 +1125,14 @@ fn engine_switch_agent(
 
 /// Re-apply the HyperCode orchestrator overlay after a switch that cleared
 /// it (`Agent::switch_model` resets `extra_instructions` by design). No-op
-/// when the orchestrator is not active. Feature 025: the overlay is
-/// persona-aware — it swaps in the named OMO agent's persona (or the
-/// default Conductor persona for `agent_name = None`) instead of the fixed
-/// prompt, via `hypercode::orchestrator_persona_overlay_for_profile`.
+/// when the orchestrator is not active.
 fn reapply_orchestrator_overlay(
     agent: &mut Agent,
     orchestrator_on: bool,
-    agent_name: Option<&str>,
     config: &joey_core::Config,
 ) {
     if orchestrator_on {
-        agent.set_extra_instructions(Some(crate::hypercode::orchestrator_persona_overlay_for_profile(
-            config,
-            agent_name,
-            agent.model(),
-            agent.client().profile(),
-        )));
+        agent.set_extra_instructions(Some(crate::hypercode::ORCHESTRATOR_PROMPT.to_string()));
     }
     // The overlay set above REPLACED extra_instructions wholesale (and
     // switch_model cleared it even when the orchestrator is off) — restore
@@ -1232,7 +1180,6 @@ fn engine_switch_model(
     model: &str,
     global: bool,
     orchestrator_on: bool,
-    agent_name: Option<&str>,
     config: &joey_core::Config,
 ) -> String {
     let mut notice = match agent.switch_model("auto", "", model, None) {
@@ -1241,7 +1188,7 @@ fn engine_switch_model(
     };
     // switch_model cleared extra_instructions (by design) — restore the
     // orchestrator overlay when HyperCode orchestrator mode is active.
-    reapply_orchestrator_overlay(agent, orchestrator_on, agent_name, config);
+    reapply_orchestrator_overlay(agent, orchestrator_on, config);
     if global {
         match joey_core::Config::load() {
             Ok(mut cfg) => match cfg.set_and_save("model.default", model) {
@@ -1483,15 +1430,14 @@ pub(crate) mod actor_tests {
         assert_eq!(finished, 2, "both queued turns completed");
     }
 
-    /// Regression (orchestrator persona loss, feature 025): `/model` must
-    /// not drop the HyperCode orchestrator persona overlay.
+    /// Regression (orchestrator overlay loss): `/model` must not drop the
+    /// HyperCode orchestrator overlay.
     /// `Agent::switch_model` clears `extra_instructions` BY DESIGN
     /// (identity/personality overlays must not leak across a model swap) —
-    /// the engine's switch handler has to re-apply the persona-aware
-    /// orchestrator overlay (reselecting the conductor variant for the new
-    /// model family) while orchestrator mode is active.
+    /// the engine's switch handler has to re-apply the fixed orchestrator
+    /// overlay while orchestrator mode is active.
     #[test]
-    fn switch_model_preserves_orchestrator_persona_when_active() {
+    fn switch_model_preserves_orchestrator_overlay_when_active() {
         let _env_guard = TestEnvGuard::new();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
@@ -1510,40 +1456,31 @@ pub(crate) mod actor_tests {
             )),
         };
         let mut agent = spec.build_agent().expect("agent builds");
-        // Sanity: build_agent_parts applied the persona overlay at
-        // construction (provider openai-api + gpt-4o-mini → registry
-        // populated → persona active).
+        // Sanity: build_agent_parts applied the orchestrator overlay at
+        // construction (hard rules from the fixed orchestrator prompt).
         assert!(
             agent
                 .effective_system_prompt()
                 .contains("NEVER write, patch, or delete files yourself"),
-            "hard rules present under the persona after build"
-        );
-        assert!(
-            agent.effective_system_prompt().contains("Conductor"),
-            "default persona identity after build"
+            "hard rules present under the overlay after build"
         );
         // Real model swap (different id -> the switch_model path that
         // clears extra_instructions actually runs).
-        let notice = engine_switch_model(&mut agent, "gpt-4.1", false, true, None, &spec.config);
+        let notice = engine_switch_model(&mut agent, "gpt-4.1", false, true, &spec.config);
         assert_eq!(agent.model(), "gpt-4.1", "model actually swapped: {notice}");
         assert!(
             agent
                 .effective_system_prompt()
                 .contains("NEVER write, patch, or delete files yourself"),
-            "persona hard rules survive /model while orchestrator mode is active"
-        );
-        assert!(
-            agent.effective_system_prompt().contains("Conductor"),
-            "default persona identity survives /model"
+            "orchestrator hard rules survive /model while orchestrator mode is active"
         );
         // Control: with the orchestrator off, a switch must NOT inject it.
-        let _ = engine_switch_model(&mut agent, "gpt-4o-mini", false, false, None, &spec.config);
+        let _ = engine_switch_model(&mut agent, "gpt-4o-mini", false, false, &spec.config);
         assert!(
             !agent
                 .effective_system_prompt()
                 .contains("NEVER write, patch, or delete files yourself"),
-            "persona must not be re-applied when orchestrator mode is off"
+            "overlay must not be re-applied when orchestrator mode is off"
         );
     }
 
@@ -1591,15 +1528,14 @@ pub(crate) mod actor_tests {
         );
     }
 
-    /// Regression (orchestrator persona swap, feature 025): `/agents <name>`
-    /// swaps in the named OMO agent's persona as the orchestrator overlay
-    /// (hard rules + roster briefing appended). The OMO identity goes into
-    /// the agent_identity slot and the persona overlay is re-applied on top
-    /// after switch_model cleared it. Uses zai so Sisyphus resolves to
+    /// Regression (orchestrator overlay + agent identity, feature 025):
+    /// `/agents <name>` puts the named OMO agent's identity prompt into the
+    /// agent_identity slot and re-applies the fixed orchestrator overlay on
+    /// top after switch_model cleared it. Uses zai so Sisyphus resolves to
     /// glm-5.2 (exact fallback-chain hit ≠ active glm-4.5-flash), proving
     /// the real clearing path runs (an identical model would no-op).
     #[test]
-    fn switch_agent_preserves_orchestrator_persona_when_active() {
+    fn switch_agent_preserves_orchestrator_overlay_when_active() {
         let _env_guard = TestEnvGuard::new();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
@@ -1626,16 +1562,12 @@ pub(crate) mod actor_tests {
             "model actually swapped (the extra_instructions-clearing path ran)"
         );
         assert!(
-            agent.effective_system_prompt().contains("Sisyphus"),
-            "named persona identity in the overlay"
-        );
-        assert!(
             agent
                 .effective_system_prompt()
                 .contains("NEVER write, patch, or delete files yourself"),
-            "hard rules appended under the named persona"
+            "hard rules re-applied under the orchestrator overlay"
         );
-        // The OMO persona landed in its own slot (stacks with the overlay).
+        // The OMO identity landed in its own slot (stacks with the overlay).
         assert!(agent.agent_identity().is_some(), "identity slot populated");
     }
 

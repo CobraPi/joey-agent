@@ -17,6 +17,23 @@ it is intended to match upstream exactly.
 
 ## Complete and faithful (compiles, tested, runs end-to-end)
 
+- **Clarify tool + interactive question UI (2026-09-14):** `clarify`
+  (crates/joey-tools/src/tools/clarify_tool.rs) at parity with upstream
+  `tools/clarify_tool.py`: verbatim schema/description, JSON response
+  envelope (`question`/`choices_offered`/`user_response`), 120s timeout
+  fallback string, cancel-as-empty-answer semantics (error paths map
+  upstream's JSON `{"error": ...}` onto `ToolResult::Error`). Live in both
+  interactive frontends: the line REPL renders a numbered-choice selector
+  plus free-text prompt inside `run_turn_interactive`; the ratatui TUI
+  renders a centered question modal (joey-tui `clarify.rs`, parity with
+  upstream `ui-tui/src/components/prompts.tsx` ClarifyPrompt: numbered
+  rows, ▸ cursor, auto-appended "Other (type your answer)", 1-N quick
+  pick, Esc cancel). `/speckit-clarify` now delivers its one-question-at-
+  a-time loop through the tool with a plain-text fallback for
+  non-interactive sessions. HyperCode subagent children register the tool
+  with no channel (check() false) — headless by design, matching
+  upstream's orchestration guidance.
+
 **Core foundation (`joey-core`)** — port of `hermes_constants.py`, `hermes_state.py`,
 `hermes_time.py`, `hermes_logging.py`, `agent/redact.py`, `utils.py`, config layer:
 - Home/profile resolution (`JOEY_HOME`, platform defaults, container/WSL/Termux
@@ -309,6 +326,12 @@ no trait signatures modified. All changes are additive SAFETY comments and
 the audit script improvements (cfg(test) filtering, standalone test-file
 detection).
 
+### Follow-up hardening (2026-09-11)
+
+- `joey-cli/llm_selector.rs build_engine()`: last non-test `panic!` in the
+  workspace (double config-load failure path) replaced with a graceful
+  `Config::defaults()` fallback — CLI helpers never panic on config I/O.
+
 ## Terminal async performance & streaming (feature 009, 2026-07-30)
 
 Replaced the terminal tool's blocking `spawn_blocking(read_to_end)` output
@@ -572,7 +595,7 @@ Selected solely by explicit `neurocode.rag.backend = copilot` and fully decouple
   (`context.engine` — the trait is ported), and `/compress here|--preview|
   --aggressive` (honest notices) are unported. Thinking-only prefill
   continuation is likewise unported.
-- **Tools:** `session_search`, `delegate_task`, `clarify`, `process`
+- **Tools:** `session_search`, `delegate_task`, `process`
   (background procs), `cronjob` (agent-callable) remain stubs; `terminal`
   `background`/`pty` params return honest not-supported errors; document
   extraction (.docx/.xlsx), lint/LSP result fields, the memory threat-scan/
@@ -1530,57 +1553,16 @@ T032/T033 in `specs/023-enterprise-orchestration-runtime/tasks.md`.
 
 ## OMO↔HyperCode orchestration integration (feature 025, 2026-09-03)
 
-**Status**: Complete (Joey-native integration per
-`specs/025-please-integrate-omo/`; no upstream Hermes counterpart — the
-persona text is newly authored, NOT an upstream port).
+**Status**: Removed (2026-09-11) — full removal of the HyperCode↔OMO integration per user direction; see below.
 
-- **Delegation-first Conductor persona**
-  (`crates/joey-omo/src/agents/prompts/conductor.rs`): atlas-inherited
-  conductor identity with an embedded orchestration hard-rules core (no
-  direct writes; single final gate), a full-roster delegation briefing,
-  and the spec-kit lifecycle doctrine (read-only research/review during
-  specify/clarify/plan; parallel implementation during implement; one
-  final acceptance run). Ships `default`, `gpt`, and `gpt_5_6` variants
-  with a `for_model(model: &str) -> &'static str` two-level dispatch
-  (model-family prefix match; the GPT arm sub-checks `5.6`/`5-6`).
-  Exported unregistered — no AgentRegistry entry, no tab. GPT-5.6
-  variants were likewise added for the switchable primaries sisyphus,
-  atlas, and prometheus (hephaestus already had one; delegation-only
-  agents fall back without error).
-- **Persona-aware orchestrator overlay** (`crates/joey-cli` —
-  `hypercode.rs`, wired in `engine.rs`/`repl.rs`):
-  `orchestrator_persona_overlay[_for_profile]` swaps the orchestrator's
-  governing instructions for the Conductor persona (or the named agent's
-  persona via the existing dispatch) iff orchestration is enabled AND
-  the OMO registry has ≥1 resolved agent. Inactive integration or empty
-  registry degrades byte-identically to the fixed `ORCHESTRATOR_PROMPT`
-  (FR-012). Switching OMO agents mid-session swaps only the persona
-  (hard-rules core + full-roster briefing stay appended); `/model`
-  re-selects the variant without losing the persona.
-- **Full 11-agent roster delegation** (`joey-orchestration`
-  `delegation_tool.rs`): all 11 registered OMO agents (sisyphus,
-  hephaestus, prometheus, atlas, oracle, librarian, explore,
-  multimodal-looker, metis, momus, sisyphus-junior) are valid
-  `subagent_type` targets on `delegate_task` and on the `call_omo_agent`
-  enum (schema enum advisory; runtime resolver authoritative). Unknown
-  names error with the valid-name list; `load_skills` constructs the
-  skill overlay on the named-agent path exactly as the category path
-  does (FR-004); `category`/`subagent_type` stay mutually exclusive
-  (BC-011).
-- **OMO-chain role model defaults** (mirrored in `joey-cli`
-  `hypercode.rs` role resolution and `joey-orchestration`'s
-  `HyperRoleSettings` gap-fill; config keys unchanged — derivation is
-  read-time): explorer ← explore→librarian; implementor ← momus;
-  orchestrator session model ← sisyphus→hephaestus→metis, applied only
-  when the model is neither pinned (`--model`, `/model`,
-  `model_pinned`) nor configured (`model.default`). An unresolvable
-  chain inherits the existing default with a user-visible FR-006
-  warn-and-inherit notice through the agent-notice channel — never a
-  failure. **2026-09-03:** the `hypercode.omo_specialists.enabled`
-  toggle (default on) now swaps the chain derivation for a direct 1:1
-  mapping — explorer→explore, implementor→hephaestus, orchestrator→
-  atlas; the chains are preserved behind
-  `hypercode.omo_specialists.enabled=false`.
+Removed on 2026-09-11, per user direction ('completely remove the omo
+integration from /hypercode; the orchestrator model must be the currently
+selected model'):
+
+- **Persona-aware orchestrator overlay** (`orchestrator_persona_overlay[_for_profile]`): deleted. The orchestrator's governing instructions are always the fixed `ORCHESTRATOR_PROMPT` (roles-only, workflow-inheritance section embedded).
+- **OMO-chain role model defaults + `hypercode.omo_specialists.enabled` toggle**: deleted everywhere (`joey-cli` hypercode.rs, `joey-orchestration` delegation_tool.rs gap-fill, team.rs specialists addendum). Role model precedence is now two-level: explicit role-table model > inherit the parent's effective model.
+- **Orchestrator session-model swap** (`omo_orchestrator_session_model` + `orchestrator_session_model_applies`): deleted. The HyperCode orchestrator is the MAIN session agent and always runs on the currently selected model — provider-agnostic (zai, copilot, ai-usage-hud alike); no model pinning anywhere in the orchestrator path.
+- **Kept (general, non-hypercode)**: the `joey-omo` crate, `/start-work`, `@plan`, ultrawork keywords, `/agent` switching, `call_omo_agent`, and `delegate_task` `subagent_type`/`category` routing via `omo_resolver.rs` in non-orchestrator sessions, `omo.background_task.*` concurrency config.
 
 Orchestrator-centric role doctrine (2026-09-08): the explorer and
 implementor role prompts/directives (`crates/joey-cli/src/hypercode.rs`,
@@ -1845,3 +1827,58 @@ todo/scratchpad stores, verification ledger) require
 lock()/invalidate_check_cache()/unique session ids in tests (two
 pre-existing races fixed during this feature: toggle_fixture_agent missing
 TEST_HOME_LOCK; test_nudge_non_code_no_nudge unlocked clear_all).
+
+## Dynamic context assembly (opt-in layer) (2026-09-11)
+
+**Status**: Deliberate addition (no upstream counterpart). Opt-in layer (all
+off/false by default; `context_assembly.enabled = false` ⇒ every hook is an
+identity — request wire format byte-identical to pre-feature). Builds on
+feature 028's default-on affordances (see the Feature 028 ledger section
+above) by adding budgeted assembly. Implementation:
+`crates/joey-agent-core/src/context_assembly.rs`
+(`relevance_scores` deterministic term-overlap scorer +3 name / +1
+description; `select_tools` no-op when tool count <= top_k, always-keep
+pinned first, remaining slots score desc then name asc; `cap_state_block`
+line-preserving truncation with `[truncated]` marker; per-session JSONL
+logger), hooked tail-only at `build_request` — request clone only, never
+`self.history`, never persisted; the system prompt and message prefix are
+never mutated (prompt-prefix cache stability; tool list untouched when
+tool count <= top_k).
+
+1. Six additive config keys (crates/joey-core/src/config.rs
+   DEFAULT_CONFIG_YAML + named getters): context_assembly.enabled (false),
+   context_assembly.tool_schema_retrieval (false),
+   context_assembly.tool_top_k (15, clamp 5..=60),
+   context_assembly.always_keep_tools (default [read_file, write_file,
+   patch, search_files, terminal, todo, scratchpad]),
+   context_assembly.budget_state_chars (1500, clamp 200..=8000),
+   context_assembly.log_assembly (false).
+2. `context_assembly.rs` module (crates/joey-agent-core/src/) — scorer /
+   selector / capper / log as described above.
+3. `build_request` tail-only hook — assembly applies to the request clone
+   (tool list + state block) and is never persisted.
+4. `/context-assembly [on|off|status]` REPL command (alias `/ctxasm`);
+   no-arg toggles; persists via `context_assembly.enabled`.
+5. `~/.joey/context-assembly/<sanitized-session-key>-<fnv1a-hex8>/assembly.jsonl`
+   — per-session JSONL assembly logs (fields ts / turn / tools_total /
+   tools_kept / tools_dropped / state_block_truncated / request_messages);
+   best-effort logging, never fails a turn.
+
+## Adaptive Coding Specialist Guidance (2026-09-11)
+
+**Status**: Deliberate-deviation subsystem (Joey-only prompt guidance, no upstream equivalent; see the Joey-only additions ledger pattern above). Adds `ADAPTIVE_CODING_GUIDANCE` (guidance.rs) to the stable tier of `build_system_prompt` (prompt.rs), pushed after the tool-aware guidance block. Content: coding-specialist identity (read before claiming, surgical edits, verify with the project's own build/test commands) plus preference-adaptation semantics mirroring the feature-027 memory store (apply active preferences automatically; explicit outranks inferred; newer supersedes older; hard project constraints win with a one-line callout). Config gate: `agent.adaptive_coding_guidance` (default `true`, accessor `Config::adaptive_coding_guidance_enabled`); setting it false restores the pre-feature prompt. Tests: guidance contract + branding scrub (guidance.rs), presence/absence/order (prompt.rs), default-on + independent toggle (tests/parity.rs), config default + disable (joey-core config.rs).
+
+## Subagent resource governance (feature 030, 2026-09-13)
+
+Joey-only addition; no upstream Hermes equivalent to port. Adds a governance layer over the existing delegation child pool (manager.rs), all mechanisms additive and individually switchable via `delegation.*` config keys (defaults in joey-core `DEFAULT_CONFIG_YAML`; full table in specs/030-please-implement-features/contracts/config-keys.md) and fully bypassed when `delegation.resource_governance.enabled=false` (exact pre-feature behavior).
+
+- In-process pool extension (governance.rs): bounded waiting queue with three priority lanes (critical/normal/background; critical jumps the queue line only — never preempts running work), FIFO within lane; overflow returns an explicit busy refusal (dispatch-level ToolResult, no side effects). Queue cap default `auto` = 2 x resolved `max_concurrent_children`.
+- Bounded retries: per-task wall-clock timeout (`tokio::time::timeout`, cancellation via the existing interrupt path), global in-flight retry budget with fast-fail `retry budget exhausted`, jittered exponential backoff reusing joey-providers `jittered_backoff_with`; turn-boundary checkpoint/resume tokens (prompt-note based resume with digest verification; stale token = full restart, honestly counted).
+- Dedicated child runtime (manager.rs): manager-owned multi-thread tokio Runtime sized to `max_concurrent_children` worker threads; all child execution moves onto it so the parent turn loop and provider calls keep the main runtime responsive under saturation; `parent_reserved_permits` behavior preserved; event taps and steering cross the runtime boundary unchanged.
+- Sampled CPU watchdog with hard abort (resource_records.rs): process-level CPU sampled at `watchdog_interval_secs` and apportioned to the children running during each interval (labeled sampled in records; std-portable per-process sampling, no cgroups — cross-platform by design; Windows validation note: mechanism is std-portable and validated on macOS/Linux, Windows validation deferred pending CI); cumulative CPU over `cpu_ceiling_secs` aborts via the interrupt path with outcome `aborted_by_resource_limit`; peak RSS advisory-only into `memory_peak_kb` (never enforced).
+- Persistent result cache + single-flight (result_cache.rs): `~/.joey/delegation/result-cache.json` — envelope `{ schema_version: 1, entries[] }`, canonical deterministic task signature over `{ goal, context, toolsets, model_override, role, budgets }`, exact byte-for-byte signature compare, success-only storage, LRU eviction, TTL on read, atomic save (temp + fsync + rename, JobStore pattern); lookup order cache -> single-flight -> queue admission; hits return without consuming a slot.
+- Resource records (resource_records.rs): append-only `~/.joey/delegation/resource-records.jsonl`, one JSON object per terminal outcome (completed/failed/timeout/aborted_by_resource_limit/busy_refused/cache_hit) with sampled cost fields (compute_ms, cpu_ms, memory_peak_kb, parent_starved_ms), retries, checkpoint token, and token_usage mirroring joey-providers `Usage` — joinable with token telemetry.
+- Additive AgentEvent variants: `DelegationBusy`, `DelegationTimeout`, `DelegationRetryBudgetExhausted`, `DelegationCacheHit`, `DelegationDegradedOutput`, `CapacitySnapshot` — flow through the existing event_tap; existing variants unchanged.
+- Explicitly selected degraded mode (never auto-engaged): samples background+normal work at `degraded_mode.sample_rate`, marks outputs `[degraded]` + `degraded=true` record; critical never sampled; sustained-overload signal (busy refusals >= 3 in 60s) surfaced in busy text.
+
+**Status**: Joey-only addition (no upstream equivalent). Tests: crates/joey-orchestration/tests/governance_{admission,retry,dedup,isolation,records,priority}.rs plus parity/event suites and inline unit tests in governance.rs / result_cache.rs / resource_records.rs.

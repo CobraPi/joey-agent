@@ -187,6 +187,9 @@ pub struct DelegationRequest {
     /// Member name (mailbox identity) when `team` is set. Defaults to the
     /// child id at dispatch time.
     pub name: Option<String>,
+    /// Feature 030: admission priority lane (default normal; background
+    /// waves enqueue as background). Ignored when governance disabled.
+    pub priority: Option<crate::types::Priority>,
 }
 
 impl DelegationRequest {
@@ -210,6 +213,7 @@ impl DelegationRequest {
             prompt_append: None,
             team: None,
             name: None,
+            priority: None,
         }
     }
 }
@@ -583,5 +587,152 @@ mod tests {
             }
             .is_terminal()
         );
+    }
+}
+
+/// Admission priority class for governed delegation dispatch (feature 030).
+/// Critical jumps the waiting-queue line only — it never preempts running
+/// work and never displaces already-queued work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    Critical,
+    #[default]
+    Normal,
+    Background,
+}
+
+impl Priority {
+    /// Lane ordering for admission: higher rank is admitted first.
+    pub fn rank(self) -> u8 {
+        match self {
+            Priority::Critical => 2,
+            Priority::Normal => 1,
+            Priority::Background => 0,
+        }
+    }
+}
+
+/// Terminal outcome kinds recorded in resource records (feature 030).
+/// Record-level vocabulary only: `DelegationResult` outcome semantics are
+/// unchanged and busy refusal remains a dispatch-level refusal
+/// (contracts/busy-and-outcomes.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceRecordOutcome {
+    Completed,
+    Failed,
+    Timeout,
+    AbortedByResourceLimit,
+    BusyRefused,
+    CacheHit,
+}
+
+/// Turn-boundary resume token (feature 030, contracts/checkpoint-token.md).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResumeToken {
+    pub last_completed_turn: usize,
+    pub transcript_digest: String,
+    pub recorded_at: String,
+}
+
+/// One per-task resource record, appended at every terminal outcome
+/// (feature 030, contracts/resource-record.md). Sampled fields are
+/// compute_ms, cpu_ms, memory_peak_kb, parent_starved_ms.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceRecord {
+    pub record_id: String,
+    pub task_signature: String,
+    pub priority: Priority,
+    pub outcome: ResourceRecordOutcome,
+    pub queue_wait_ms: u64,
+    /// Sampled: admission → terminal.
+    pub compute_ms: u64,
+    /// Sampled CPU attribution (process-level, apportioned).
+    pub cpu_ms: u64,
+    /// Sampled, advisory only — never enforced.
+    pub memory_peak_kb: u64,
+    /// Sampled, advisory: max parent event-tap latency observed during the
+    /// task window (FR-012c).
+    pub parent_starved_ms: u64,
+    pub retries: u16,
+    pub checkpoint: Option<ResumeToken>,
+    pub token_usage: joey_providers::Usage,
+    pub degraded: bool,
+    /// ISO 8601 append time.
+    pub created_at: String,
+}
+
+#[cfg(test)]
+mod governance_types_tests {
+    use super::*;
+
+    #[test]
+    fn priority_default_is_normal_and_serde() {
+        assert_eq!(Priority::default(), Priority::Normal);
+        assert_eq!(serde_json::to_string(&Priority::Critical).unwrap(), "\"critical\"");
+        assert_eq!(serde_json::to_string(&Priority::Normal).unwrap(), "\"normal\"");
+        assert_eq!(serde_json::to_string(&Priority::Background).unwrap(), "\"background\"");
+        assert_eq!(serde_json::from_str::<Priority>("\"background\"").unwrap(), Priority::Background);
+        assert!(Priority::Critical.rank() > Priority::Normal.rank());
+        assert!(Priority::Normal.rank() > Priority::Background.rank());
+    }
+
+    #[test]
+    fn outcome_serde_strings() {
+        for (v, s) in [
+            (ResourceRecordOutcome::Completed, "completed"),
+            (ResourceRecordOutcome::Failed, "failed"),
+            (ResourceRecordOutcome::Timeout, "timeout"),
+            (ResourceRecordOutcome::AbortedByResourceLimit, "aborted_by_resource_limit"),
+            (ResourceRecordOutcome::BusyRefused, "busy_refused"),
+            (ResourceRecordOutcome::CacheHit, "cache_hit"),
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), format!("\"{s}\""));
+            assert_eq!(serde_json::from_str::<ResourceRecordOutcome>(&format!("\"{s}\"")).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn resource_record_round_trip() {
+        let rec = ResourceRecord {
+            record_id: "r1".into(),
+            task_signature: "sig".into(),
+            priority: Priority::Normal,
+            outcome: ResourceRecordOutcome::Completed,
+            queue_wait_ms: 12,
+            compute_ms: 345,
+            cpu_ms: 300,
+            memory_peak_kb: 1024,
+            parent_starved_ms: 5,
+            retries: 1,
+            checkpoint: Some(ResumeToken {
+                last_completed_turn: 2,
+                transcript_digest: "abc123".into(),
+                recorded_at: "2026-09-11T00:00:00+00:00".into(),
+            }),
+            token_usage: joey_providers::Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, ..Default::default() },
+            degraded: false,
+            created_at: "2026-09-11T00:00:05+00:00".into(),
+        };
+        let json = serde_json::to_value(&rec).unwrap();
+        let mut keys: Vec<String> = json.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["checkpoint","compute_ms","cpu_ms","created_at","degraded","memory_peak_kb","outcome","parent_starved_ms","priority","queue_wait_ms","record_id","retries","task_signature","token_usage"]);
+        let tu = json.get("token_usage").unwrap();
+        let mut tk: Vec<String> = tu.as_object().unwrap().keys().cloned().collect();
+        tk.sort();
+        assert_eq!(tk, ["cache_read_tokens","cache_write_tokens","completion_tokens","prompt_tokens","reasoning_tokens","total_tokens"]);
+        let back: ResourceRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back, rec);
+    }
+
+    #[test]
+    fn resume_token_shape() {
+        let t = ResumeToken { last_completed_turn: 1, transcript_digest: "d".into(), recorded_at: "t".into() };
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v.get("last_completed_turn").unwrap(), &serde_json::json!(1));
+        assert_eq!(v.get("transcript_digest").unwrap(), &serde_json::json!("d"));
+        assert_eq!(v.get("recorded_at").unwrap(), &serde_json::json!("t"));
     }
 }
