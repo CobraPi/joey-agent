@@ -551,8 +551,20 @@ impl LspClient {
                 if std::time::Instant::now() >= deadline {
                     // Still not done → kill the hung server (EOF unblocks
                     // the reader; next call respawns).
+                    #[cfg(unix)]
                     unsafe {
                         libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    #[cfg(windows)]
+                    {
+                        // No libc::kill on Windows: taskkill /F /T force-
+                        // terminates the pid and its child tree, matching
+                        // SIGKILL semantics (unconditional, best-effort).
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/F", "/T", "/PID", &pid.to_string()])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
                     }
                     return;
                 }
