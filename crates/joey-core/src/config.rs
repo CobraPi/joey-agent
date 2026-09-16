@@ -41,6 +41,7 @@ agent:
   gateway_timeout: 1800
   context_economy_guidance: true
   adaptive_coding_guidance: true
+  goal_directed_guidance: true
   retrieval_verification_nudge: true
 terminal:
   backend: "local"
@@ -465,6 +466,11 @@ impl Config {
     /// `agent.adaptive_coding_guidance` (default true).
     pub fn adaptive_coding_guidance_enabled(&self) -> bool {
         self.get_bool("agent.adaptive_coding_guidance", true)
+    }
+
+    /// `agent.goal_directed_guidance` (default true) — feature 031.
+    pub fn goal_directed_guidance_enabled(&self) -> bool {
+        self.get_bool("agent.goal_directed_guidance", true)
     }
 
     /// `agent.retrieval_verification_nudge` (default true).
@@ -1972,6 +1978,18 @@ mod tests {
     fn adaptive_coding_guidance_disableable() {
         assert!(!cfg_from("agent:\n  adaptive_coding_guidance: false\n")
             .adaptive_coding_guidance_enabled());
+    }
+
+    #[test]
+    fn goal_directed_guidance_defaults_on() {
+        let cfg = Config::defaults();
+        assert!(cfg.goal_directed_guidance_enabled());
+    }
+
+    #[test]
+    fn goal_directed_guidance_disableable() {
+        assert!(!cfg_from("agent:\n  goal_directed_guidance: false\n")
+            .goal_directed_guidance_enabled());
     }
 
     #[test]

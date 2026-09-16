@@ -81,9 +81,9 @@ joey --yolo                Bypass all dangerous-command approval prompts
 joey --safe-mode           Disable all customizations (user config + MCP servers) for troubleshooting
 
 joey model                 Interactive provider + model picker (persists selection)
-joey auth <provider>       Manage provider authentication (e.g. `auth copilot login|status`)
+joey auth copilot         Copilot OAuth login | status | logout (device-code flow)
 joey tools                 --summary | list | enable/disable <names> [--platform]
-joey skills                Search, install, inspect, and manage skills
+joey skills               list | inspect | enable | disable | config (marketplace subcommands deferred)
 joey config                show | edit | get | set | unset | path | env-path
 joey doctor [--fix]        Diagnose the environment (and fix what it can)
 joey discover              Discover local model servers (Ollama, LM Studio, llama.cpp, …)
@@ -166,7 +166,7 @@ State lives under `~/.joey/` (override with `JOEY_HOME`):
 ~/.joey/SOUL.md         the agent identity (seeded on first run; edit to customize)
 ~/.joey/state.db        SQLite session store (hermes-compatible schema + FTS5 search)
 ~/.joey/memories/       MEMORY.md, USER.md
-~/.joey/skills/         installed Agent Skills (20 skills ship in-repo)
+~/.joey/skills/         installed Agent Skills (75 skills ship in-repo under `skills/`)
 ~/.joey/cron/jobs.json  scheduled jobs (hermes-compatible format)
 ~/.joey/neurocode/      per-project NeuroCode graph databases (when enabled)
 ~/.joey/neurocode/models/  RAG embedding model artifacts (model.onnx + tokenizer.json)
@@ -479,16 +479,17 @@ ledger, R8 no-HF policy).
 
 ## Architecture
 
-A Cargo workspace of 15 crates. The first eight are direct ports of Hermes Agent
-modules; the remaining seven (`joey-tui`, `joey-llm-selector`, `joey-orchestration`,
-`joey-omo`, `joey-speckit-ui`, `joey-neurocode`, `joey-neurocode-rag`) are joey-native
-additions layered on top, not described by the upstream Python project:
+A Cargo workspace of 17 crates. The first nine are direct ports of Hermes Agent
+modules; the remaining eight (`joey-tui`, `joey-llm-selector`, `joey-orchestration`,
+`joey-omo`, `joey-speckit-ui`, `joey-neurocode`, `joey-neurocode-rag`, `joey-copilot`)
+are joey-native additions layered on top, not described by the upstream Python project:
 
 | Crate | Ports | Responsibility |
 |-------|-------|----------------|
 | `joey-core` | `hermes_constants`, `hermes_state`, config, logging, time | Branding, path/profile resolution, layered config, SQLite session store, redaction |
 | `joey-providers` | `providers/`, `agent/transports/` | Provider profiles + registry, OpenAI/Anthropic wire adapters, SSE streaming, error classification |
 | `joey-tools` | `tools/`, `toolsets.py` | Tool trait + registry, toolsets, schema sanitizer, fuzzy matcher, built-in tools |
+| `joey-browser` | — (joey-native) | CDP browser automation (attach or managed launch) behind the 16 `browser_*` tools; see docs/browser.md |
 | `joey-agent-core` | `run_agent.py`, `agent/conversation_loop.py`, `agent/prompt_builder.py` | The turn loop: message assembly, system prompt, tool dispatch, retries |
 | `joey-cron` | `cron/` | Self-contained scheduler (duration/interval/cron), job store, ticker |
 | `joey-mcp` | `tools/mcp_tool.py` (client) | Stdio JSON-RPC MCP client with the `mcp__server__tool` convention |
@@ -501,6 +502,7 @@ additions layered on top, not described by the upstream Python project:
 | `joey-speckit-ui` | — (joey-native) | Standalone HTTP+WebSocket backend for the SpecKit Visual UI (`specs/<feature>/{spec,plan,tasks}.md`); run separately with `cargo run -p joey-speckit-ui`, not embedded in the `joey` binary |
 | `joey-neurocode` | — (joey-native) | NeuroCode engine for enterprise codebases: complexity-tier routing, tree-sitter multi-language structural dependency graph in SQLite+FTS5 (all tree-sitter-supported languages; Pega-tuned for Java), dependency-aware context assembly, Pega rule awareness, verify-loop pattern memory. Consumed by `joey-agent-core` via the narrow `NeuroCodeEngine` trait; see the [NeuroCode](#neurocode-enterprise-java--pega-coding) section |
 | `joey-neurocode-rag` | — (joey-native) | Semantic code retrieval (RAG) layered over the NeuroCode graph: local ONNX embedding (runtime-loaded ORT dylib, offline tokenizers), hybrid dense+BM25 RRF search, incremental atomic re-indexing, consent-gated remote backends. Extends the graph store to schema v3 (`rag_*` tables); see the [Semantic code search (RAG)](#semantic-code-search-rag) section |
+| `joey-copilot` | — (joey-native) | GitHub Copilot `.github/` bundle discovery and plugin manifests (`joey copilot` command) |
 
 `joey-tui`, `joey-llm-selector`, `joey-orchestration`, and `joey-omo` are all wired
 into the live `joey` binary (REPL, one-shot, and cron paths); `joey-neurocode` is

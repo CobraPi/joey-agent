@@ -520,6 +520,15 @@ The steer slot is Arc-shared (`Agent::steer_handle` /
 `steer_via_handle`), so the engine task can receive steers mid-turn while
 the turn future holds the agent borrow.
 
+## Clarify modal (interactive question overlay)
+
+The `clarify` tool (interactive sessions only) renders as a centered modal
+over the TUI instead of blocking the terminal: `joey-tui::clarify::ClarifySession`
+holds the pending question and options; answering (or the 120s upstream
+parity timeout) resolves the tool call with the chosen option. Covered by
+`tests/clarify_modal.rs`; see [tools.md](tools.md) for the tool-side contract
+and [features/joey-tui.md](features/joey-tui.md) for the module map.
+
 ## Slash commands
 
 Full slash menu including `/neurocode` (alias `/nc`) — run asynchronously

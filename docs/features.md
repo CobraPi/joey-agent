@@ -2,7 +2,7 @@
 
 An up-to-date, feature-first tour of everything Joey Agent can do. For
 per-subsystem depth, follow the links into the reference pages. (Last
-updated against workspace code 2026-08.)
+updated against workspace code 2026-09.)
 
 ## What Joey Agent is
 
@@ -98,8 +98,9 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
 
 ## Interfaces
 
-- Line REPL with 90+ registered slash commands (42 implemented incl. the
-  12 spec-kit ones), prefix expansion, smart Tab completion (see below).
+- Line REPL with 94 registered slash commands — all implemented (including
+  the 12 spec-kit ones), with prefix expansion and smart Tab completion
+  (see below).
   → [cli.md](cli.md)
 - Animated ratatui TUI — the default interactive interface (`joey --cli`
   for the line REPL): synthwave theme, streaming transcript,
@@ -166,10 +167,12 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
 
 ## Not yet implemented (upstream parity gaps)
 
-Recognized but stubbed ("not available yet", exit 1): most `skills`
-subcommands (only `list` works), `mcp serve/catalog/...`, `config
-check/migrate`, `cron edit/runs/history`, ~49 REPL slash commands
-(/save, /retry, /undo, /title, /browser, /plugins, …), browser_* /
-vision_analyze / execute_code / computer_use / ha_* / kanban_* tools,
-Anthropic-OAuth subscription login (deliberately omitted), gateway
-platform adapters. See `PORTING.md` for the full tracker.
+Recognized but stubbed ("not available yet" / deferred message, exit 1):
+most `skills` marketplace subcommands (browse, search, install, publish,
+repair-official, tap — `list`/`inspect`/`enable`/`disable`/`config` are
+implemented), `mcp serve/catalog/picker/install/login/reauth`,
+`config check/migrate`, `cron edit/runs/history`, gateway platform
+adapters, and the Anthropic-OAuth subscription login (deliberately
+omitted — see PORTING.md). All REPL slash commands and the browser /
+vision_analyze / computer_use tool families ARE implemented. See
+`PORTING.md` for the full tracker.

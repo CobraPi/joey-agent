@@ -17,8 +17,8 @@ for exhaustive per-crate detail, read these.
 | [joey-mcp.md](joey-mcp.md) | joey-mcp | MCP server config & merging, safe env, JSON-RPC lifecycle, pagination, tool namespacing, schema normalization, security validation |
 | [joey-gateway.md](joey-gateway.md) | joey-gateway | session-key grammar, SessionSource, MessageEvent, SendResult & error classification, PlatformAdapter trait & capabilities |
 | [joey-cli.md](joey-cli.md) | joey-cli | full clap command tree & exit codes, profiles, REPL & slash-command catalog, TUI selection, agent wiring |
-| [joey-tui.md](joey-tui.md) | joey-tui | layout & panels, subagent rail/panes, overlays, keybindings, NeuroCode explorer, rendering states |
-| [joey-orchestration.md](joey-orchestration.md) | joey-orchestration | SubagentManager & config, child lifecycle, concurrency & grant-back, dispatch API, plan→worktree→evaluate→join pipeline, teams |
+| [joey-tui.md](joey-tui.md) | joey-tui | layout & panels, subagent rail/panes, overlays, keybindings, NeuroCode explorer, clarify modal, rendering states |
+| [joey-orchestration.md](joey-orchestration.md) | joey-orchestration | SubagentManager & config, child lifecycle, concurrency & grant-back, dispatch API, plan→worktree→evaluate→join pipeline, teams, feature-030 resource governance |
 | [joey-omo.md](joey-omo.md) | joey-omo | 11-agent roster, categories & model resolution, intent gating, goals, plan parsing & start-work, wisdom/notepad, team mode |
 | [joey-speckit-ui.md](joey-speckit-ui.md) | joey-speckit-ui | spec-kit artifact model, CST & meaning layers, patch engine, workflow runner, REST/WS API |
 | [joey-browser.md](joey-browser.md) | joey-browser | CDP driver, attach vs managed launch, element refs & actions, snapshots/overlays/SoM vision, URL safety |

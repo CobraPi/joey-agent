@@ -23,7 +23,7 @@ The terminal is entered via `Tui::enter` (raw mode + alternate screen + brackete
 
 ## Module map
 
-27 files total (9 source, 15 under `tests/`, 2 examples, 1 manifest):
+32 files total (10 source, 19 under `tests/` incl. the shared `common/mod.rs` fixture, 2 examples, 1 manifest):
 
 | File | Purpose |
 |---|---|
@@ -36,6 +36,7 @@ The terminal is entered via `Tui::enter` (raw mode + alternate screen + brackete
 | `src/app.rs` | `Tui` controller: terminal lifecycle, frame composition (`render_body`), key → `TuiAction` mapping, mouse routing, text selection |
 | `src/neurocode_viz.rs` | Fullscreen NeuroCode explorer: `VizTab`, `VizState`, `layout_nodes`, `line_cells`, `explorer_key/click/scroll`, `draw_explorer` |
 | `src/neurocode_search.rs` | TUI result view over `/neurocode search` payloads: badge/result/context/relation renderers, `styled_notice_spans`, `outcome_lines` |
+| `src/clarify.rs` | `ClarifySession`: pending `clarify`-tool question rendered as a centered modal; option select or 120s timeout resolves the tool call |
 | `tests/smoke.rs` | Rendering-pipeline + event-contract smoke (idle/busy frames, token accounting, dedupe, scroll clamping) |
 | `tests/chrome_overflow.rs` | Main-view chrome overflow regressions: popups inside frame, status-bar yield, header logo protection |
 | `tests/subagent_panes.rs` | Per-subagent pane state + rendering via synthetic orchestration events on a `TestBackend` |
@@ -51,6 +52,7 @@ The terminal is entered via `Tui::enter` (raw mode + alternate screen + brackete
 | `tests/expanded_view_formatting.rs` | Expanded views render embedded newlines as real line breaks in the numbered gutter |
 | `tests/unified_inline_expansion.rs` | Tool/terminal/diff kinds follow the reasoning-history three-state inline cycle |
 | `tests/neurocode_search.rs` | Spec 021 FR-014 (badges) + FR-008 (mode banner) rendering over `SearchOutcome` payloads |
+| `tests/clarify_modal.rs` | Clarify-modal rendering: question/options overlay, selection, timeout path |
 | `examples/stress.rs` | 2000-turn `App::apply` state-machine stress (see Performance & tests) |
 | `examples/anim_stress.rs` | ~500,000-frame animation tick stress across all animators |
 | `Cargo.toml` | Manifest (depends on `joey-agent-core`, `joey-core`, `joey-omo`, …) |
@@ -271,7 +273,7 @@ Text hygiene: the cursor and all truncation are display-width aware (`unicode_wi
 
 `examples/stress.rs` drives 2000 synthetic turns through `App::apply` (each: `TurnStart`, 5 iterations of reasoning/content deltas + a terminal tool round-trip + usage, `Done`) and prints elapsed time and transcript/agent counts every 200 turns — the state machine's scaling guardrail. `examples/anim_stress.rs` ticks every animator for ~500,000 frames (≈4.5 hours at 30 fps) alternating busy/idle targets. Runtime bounds keep the model affordable: transcript rings (`transcript_capacity` = 1024 main / 256 per pane) and per-item live output capped at `LIVE_OUTPUT_CAPACITY` = 128 KB (tail window; the definitive output arrives via `ToolEnd.full_result`). Idle CPU stays low because `Tui::frame_budget` scales the poll interval with `Activity::target_fps` — an idle dashboard doesn't spin at 60 fps.
 
-The 14 integration test files (plus the shared `tests/common/mod.rs` fixture), one line each:
+The 18 integration test files (plus the shared `tests/common/mod.rs` fixture), one line each:
 
 - `smoke.rs` — rendering + event-contract smoke: valid frames for idle/busy states without a real TTY (spec 013 SC-001-adjacent block-rendering checks: token accounting, message dedupe, tool lifecycle resolution, scroll clamping).
 - `chrome_overflow.rs` — popups in-frame, status-bar yield, header logo protection (spec 013 chrome regressions).

@@ -43,7 +43,7 @@ Verified against source (`crates/joey-cli/src/`, debug binary `--help` output).
 - **version** — identical to `-V`.
 - **cron** — bare/list [--all]; `create|add SCHEDULE [PROMPT] [--name] [--deliver origin|local|platform:chat_id] [--repeat N] [--skill s]… [--skills a,b] [--script path] [--workdir path] [--no-agent]`; `pause|resume|remove|rm|delete <job_id>`; `run <job_id>` (trigger + one synchronous tick); `status` (ticker heartbeat health); `tick [--loop]` (once / 60s standalone scheduler daemon). edit/runs/history stubbed. Lists warn when scheduler isn't running.
 - **mcp** — `add <name> (--url URL [--transport T] | --command CMD [--env K=V]… [--args arg…]) [--connect-timeout S]`; `remove|rm <name>`; `list|ls` (table); `test <name>` (connect + list_tools, timing). Entry passes security validation; suspicious configs refused. serve/catalog/picker/install/login/reauth/configure stubbed (exit 1); unknown → exit 2.
-- **skills** — bare prints usage; `list [--enabled-only]` (Name/Category/Source/Status table). All other upstream subcommands (browse, search, install, … 26 total) recognized but stubbed exit 1.
+- **skills** — bare prints usage; `list [--enabled-only]` (Name/Category/Source/Status table); `inspect <name>` (SKILL.md body); `enable|disable <name>` (writes the `skills.disabled` list); `config` (where skills live + manual install). Marketplace subcommands (browse, search, install, publish, repair-official, tap) recognized but deferred (exit 1); unknown subcommand exits 2.
 - **discover** — probes local servers (Ollama :11434, LM Studio :1234, llama.cpp :8080, LiteLLM :4000, MLX :1234/*) and lists their models.
 - **home** — prints resolved home dir (joey extension).
 - **llm-selector [args…]** — CLI mirror of `/llm-selector`: status | pool | allocations | diagnostics | pin <module> <model> | unpin <module> | budget | diagnoser | enable | disable | refresh | help.
@@ -116,7 +116,7 @@ Prefix resolution: exact match → unique prefix → unique-shortest (so `/qui`�
 
 ## 6. README verification
 
-Root README.md command table matches the code, with one caveat: (a) README says "joey auth <provider>" — code only supports `auth copilot`. `joey skills` now implements list/inspect/enable/disable/config (marketplace subcommands deferred). Everything else (flags, cron, mcp, speckit, discover, llm-selector, doctor, home, version) verified accurate.
+Root README.md command table matches the code, including the `joey auth copilot` and `joey skills` rows. Everything else (flags, cron, mcp, speckit, discover, llm-selector, doctor, home, version) verified accurate.
 
 ### `/browser [connect|disconnect|status]`
 

@@ -228,6 +228,22 @@ injected memory block. `neurocode.memory.max_episodes` (500) — episode
 store cap, oldest evicted first. `neurocode.memory.distill_model` ("") —
 provider model for episode distillation; empty = heuristic-only.
 
+### Newer feature key groups (features 023/027/028/030)
+
+- `agent.context_economy_guidance` (default `true`) — feature 028 economy
+  guidance in the system prompt; see [context-economy.md](context-economy.md).
+- `context_assembly.*` — opt-in dynamic context assembly (feature 028+):
+  `enabled`/`tool_schema_retrieval` (default `false`), `tool_top_k` (15,
+  clamped 5..=60), `always_keep_tools` (default empty), `budget_state_chars`
+  (1500, clamped 200..=8000), `log_assembly` (default `false`); see
+  [context-assembly.md](context-assembly.md).
+- `delegation.resource_governance.*` — feature 030 subagent governance;
+  `enabled` defaults to `true`; see [orchestration.md](orchestration.md) §5.
+- `hypercode.execution_graph.*` — spec-023 graph execution (default off;
+  `max_concurrent_workers` 16, `max_repair_attempts` 3).
+- `neurocode.enterprise_context.enabled` — enterprise analysis plane
+  (default off).
+
 ### GitHub Copilot embeddings (explicit backend)
 
 Copilot embeddings are enabled only by setting
@@ -263,7 +279,8 @@ non-loopback, code egress still requires per-project consent
 **mcp**: `mcp_servers` (mapping of server configs; also project-level
 `.joey/mcp.json` / `.mcp.json`).
 
-Config schema version: `_config_version: 33` written on save.
+Config schema version: `_config_version: 35` written on save
+(`CONFIG_VERSION` in `crates/joey-core/src/config.rs`).
 
 ---
 

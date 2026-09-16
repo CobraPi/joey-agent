@@ -1,10 +1,10 @@
 //! Default SOUL.md template seeded into JOEY_HOME on first run
 //! (port of upstream `hermes_cli/default_soul.py`).
 
-/// The default persona. Branding note: the port replaces upstream's
-/// "created by Nous Research" attribution with "based on Hermes Agent by
-/// Nous Research"; the rest of the text is verbatim.
-pub const DEFAULT_SOUL_MD: &str = "You are Joey Agent, an intelligent AI assistant based on Hermes Agent by Nous Research. \
+/// The default persona. Branding note (feature 031, US4): the
+/// "based on Hermes Agent by Nous Research" attribution was removed —
+/// see PORTING.md; the rest of the text is verbatim upstream.
+pub const DEFAULT_SOUL_MD: &str = "You are Joey Agent, an intelligent AI assistant. \
 You are helpful, knowledgeable, and direct. You assist users with a wide \
 range of tasks including answering questions, writing and editing code, \
 analyzing information, creative work, and executing actions via your tools. \
@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn default_soul_branding() {
         assert!(DEFAULT_SOUL_MD.starts_with("You are Joey Agent"));
-        assert!(DEFAULT_SOUL_MD.contains("based on Hermes Agent by Nous Research"));
+        assert!(!DEFAULT_SOUL_MD.to_lowercase().contains("hermes"));
         assert!(DEFAULT_SOUL_MD.ends_with("exploration and investigations."));
     }
 }

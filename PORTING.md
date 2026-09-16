@@ -567,6 +567,18 @@ never runs on tokio's async workers: call sites wrap the pool in
   The Anthropic flow's "Claude Pro/Max subscription (OAuth login)" option
   explains the standing impersonation decision and directs to API keys.
 
+- **Goal-directed guidance + predecessor-brand removal (feature 031, 2026-09-15):**
+  `TASK_COMPLETION_GUIDANCE` is reworded from exploration-permissive to
+  plan-execution-report framing (no longer verbatim upstream
+  `prompt_builder.py`), a new Joey-only `GOAL_DIRECTED_GUIDANCE` constant
+  is added (plan-before-action, ordered execution, explicit plan revision,
+  per-step completion reporting; gated by `agent.goal_directed_guidance`,
+  default true), and the "based on Hermes Agent by Nous Research"
+  attribution plus the upstream docs URL are removed from
+  `AGENT_HELP_GUIDANCE`, `DEFAULT_SOUL_MD`, and the CLI banner. Token-neutral
+  per SC-007; see `specs/031-please-modify-joey/` (spec + contracts) and its
+  baseline bundle.
+
 ### GitHub Copilot embeddings backend (explicit) — 2026-08-30
 
 Status: Joey-native addition (no upstream counterpart; upstream Hermes has no Copilot embeddings path).

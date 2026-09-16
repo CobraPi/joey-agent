@@ -1962,12 +1962,6 @@ pub fn banner(info: &BannerInfo) {
 
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("{} {}", logo_line, field));
-    lines.push(
-        t.fg_more_subtle
-            .ansi()
-            .paint("· based on Hermes Agent by Nous Research")
-            .to_string(),
-    );
     lines.push(String::new());
 
     // ── Model line with accent gradient ──

@@ -810,6 +810,12 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
         stable_parts.push(TASK_COMPLETION_GUIDANCE.to_string());
     }
 
+    // 3b. Goal-directed execution guidance (feature 031), config-gated via
+    // `agent.goal_directed_guidance` (default true), tools loaded.
+    if cfg.get_bool("agent.goal_directed_guidance", true) && has_tools {
+        stable_parts.push(GOAL_DIRECTED_GUIDANCE.to_string());
+    }
+
     // 4. Universal parallel-tool-call guidance.
     if cfg.get_bool("agent.parallel_tool_call_guidance", true) && has_tools {
         stable_parts.push(PARALLEL_TOOL_CALL_GUIDANCE.to_string());
@@ -1113,8 +1119,9 @@ mod tests {
         let idx = |needle: &str| prompt.find(needle).unwrap_or_else(|| panic!("missing: {}", needle));
         let order = [
             idx("You are Joey Agent, an intelligent AI assistant"),
-            idx("You run on Joey Agent (based on Hermes Agent by Nous Research)."),
+            idx("You run on Joey Agent."),
             idx("# Finishing the job"),
+            idx("# Goal-directed execution"),
             idx("# Parallel tool calls"),
             idx("You have persistent memory across sessions."),
             idx("## Skills (mandatory)"),

@@ -10,15 +10,9 @@
 /// the seeded default soul — upstream defines both from the same text.
 pub const DEFAULT_AGENT_IDENTITY: &str = joey_core::default_soul::DEFAULT_SOUL_MD;
 
-/// prompt_builder.py `HERMES_AGENT_HELP_GUIDANCE`, branded.
-pub const AGENT_HELP_GUIDANCE: &str = "You run on Joey Agent (based on Hermes Agent by Nous Research). When the user needs help with \
-Joey itself — configuring, setting up, using, extending, or troubleshooting \
-it — or when you need to understand your own features, tools, or capabilities, \
-the documentation at https://hermes-agent.nousresearch.com/docs is your \
-authoritative reference and always holds the latest, most up-to-date \
-information. Load the `joey-agent` skill with skill_view(name='joey-agent') \
-for additional guidance and proven workflows, but treat the docs as the source \
-of truth when the two differ.";
+/// prompt_builder.py `HERMES_AGENT_HELP_GUIDANCE`, de-branded (feature 031,
+/// US4): attribution and upstream docs URL removed — see PORTING.md.
+pub const AGENT_HELP_GUIDANCE: &str = "You run on Joey Agent. For help with Joey itself — configuring, setting up, using, extending, or troubleshooting it — or to understand your own features, tools, or capabilities, load the `joey-agent` skill with skill_view(name='joey-agent').";
 
 /// Mid-turn user steering channel note (prompt_builder.py STEER_CHANNEL_NOTE,
 /// verbatim). Teaches the model to trust the out-of-band marker and treat
@@ -118,19 +112,14 @@ without acting are not acceptable.";
 pub const TOOL_USE_ENFORCEMENT_MODELS: &[&str] =
     &["gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek"];
 
-/// prompt_builder.py `TASK_COMPLETION_GUIDANCE` — verbatim.
-pub const TASK_COMPLETION_GUIDANCE: &str = "# Finishing the job\n\
-When the user asks you to build, run, or verify something, the deliverable is \
-a working artifact backed by real tool output — not a description of one. \
-Do not stop after writing a stub, a plan, or a single command. Keep working \
-until you have actually exercised the code or produced the requested result, \
-then report what real execution returned.\n\
-If a tool, install, or network call fails and blocks the real path, say so \
-directly and try an alternative (different package manager, different \
-approach, ask the user). NEVER substitute plausible-looking fabricated \
-output (made-up data, invented file contents, synthesised API responses) \
-for results you couldn't actually produce. Reporting a blocker honestly \
-is always better than inventing a result.";
+/// Plan-execution-report framing (feature 031, US2): deliberate rewording
+/// of upstream `TASK_COMPLETION_GUIDANCE` — see PORTING.md.
+pub const TASK_COMPLETION_GUIDANCE: &str = "# Finishing the job\nWhen asked to build, run, or verify something, deliver a working artifact backed by real tool output, not a description. Do not stop at a stub, plan, or single command; work until you have exercised the code and produced the result. If a tool or step fails, say so and try another approach or package manager, or ask the user. NEVER fabricate plausible-looking output (made-up data, invented file contents) for results you couldn't produce; report blockers honestly.";
+/// Goal-directed task execution (feature 031, US1-US3): plan before
+/// non-trivial action, proportionate to task size; execute steps in order;
+/// revise the plan explicitly on blockers; report per-step outcomes.
+/// Joey-only addition (see PORTING.md).
+pub const GOAL_DIRECTED_GUIDANCE: &str = "# Goal-directed execution\nBefore non-trivial work, state an ordered plan of verifiable steps and done-criteria; trivial tasks: act directly; no reasonable default: ask one round of targeted questions first. Work steps in order — every action serves the current step; reuse established results; restate the step at transitions. On failure or blocker: stop, report evidence and plan impact, and present a revised plan — or stop and report what is done, what is blocked, and why. Departures from the plan and mid-task user instructions are explicit revisions. On completion, report each step's outcome and the verification performed.";
 
 /// prompt_builder.py `PARALLEL_TOOL_CALL_GUIDANCE` — verbatim.
 pub const PARALLEL_TOOL_CALL_GUIDANCE: &str = "# Parallel tool calls\n\
@@ -298,8 +287,8 @@ mod tests {
 
     #[test]
     fn no_hermes_branding_in_model_visible_text() {
-        // Upstream attribution ("Hermes Agent by Nous Research") and upstream
-        // doc URLs are the only allowed occurrences.
+        // Zero-allowlist (feature 031, SC-006): no model-visible guidance
+        // constant may contain the predecessor brand, in any case.
         for (name, text) in [
             ("help", AGENT_HELP_GUIDANCE),
             ("memory", MEMORY_GUIDANCE),
@@ -313,13 +302,11 @@ mod tests {
             ("skills-preamble", SKILLS_INDEX_PREAMBLE),
             ("context-economy", CONTEXT_ECONOMY_GUIDANCE),
             ("adaptive-coding", ADAPTIVE_CODING_GUIDANCE),
+            ("goal-directed", GOAL_DIRECTED_GUIDANCE),
         ] {
-            let scrubbed = text
-                .replace("Hermes Agent by Nous Research", "")
-                .replace("https://hermes-agent.nousresearch.com/docs", "");
             assert!(
-                !scrubbed.to_lowercase().contains("hermes"),
-                "unbranded Hermes reference in {}",
+                !text.to_lowercase().contains("hermes"),
+                "hermes reference in {}",
                 name
             );
         }
@@ -334,11 +321,46 @@ mod tests {
     }
 
     #[test]
+    fn task_completion_guidance_matches_contract() {
+        assert_eq!(
+            TASK_COMPLETION_GUIDANCE,
+            "# Finishing the job\nWhen asked to build, run, or verify something, deliver a working artifact backed by real tool output, not a description. Do not stop at a stub, plan, or single command; work until you have exercised the code and produced the result. If a tool or step fails, say so and try another approach or package manager, or ask the user. NEVER fabricate plausible-looking output (made-up data, invented file contents) for results you couldn't produce; report blockers honestly."
+        );
+    }
+
+    #[test]
+    fn agent_help_guidance_matches_contract() {
+        assert_eq!(
+            AGENT_HELP_GUIDANCE,
+            "You run on Joey Agent. For help with Joey itself — configuring, setting up, using, extending, or troubleshooting it — or to understand your own features, tools, or capabilities, load the `joey-agent` skill with skill_view(name='joey-agent')."
+        );
+    }
+
+    #[test]
     fn adaptive_coding_guidance_matches_contract() {
         assert_eq!(
             ADAPTIVE_CODING_GUIDANCE,
             "You are a coding specialist: ground every answer in the real codebase — read before claiming, make surgical minimal edits, and verify changes with the project's own build and test commands before declaring done. Adapt to the user's learned preferences (structure, naming, testing, workflow): apply them automatically, treat explicit statements as outranking inferred habits, let newer preferences supersede older ones, and keep learning from explicit corrections and recurring patterns — the user's style evolves, and you evolve with it. When a preference conflicts with a hard project constraint, follow the constraint and say so in one line."
         );
+    }
+
+    #[test]
+    fn goal_directed_guidance_matches_contract() {
+        assert_eq!(
+            GOAL_DIRECTED_GUIDANCE,
+            "# Goal-directed execution\nBefore non-trivial work, state an ordered plan of verifiable steps and done-criteria; trivial tasks: act directly; no reasonable default: ask one round of targeted questions first. Work steps in order — every action serves the current step; reuse established results; restate the step at transitions. On failure or blocker: stop, report evidence and plan impact, and present a revised plan — or stop and report what is done, what is blocked, and why. Departures from the plan and mid-task user instructions are explicit revisions. On completion, report each step's outcome and the verification performed."
+        );
+    }
+
+    #[test]
+    fn goal_directed_guidance_requires_completion_and_blocker_reporting() {
+        // SC-005 transcript-level contract: completed plans close with
+        // per-step outcomes + verification; blocked plans close with an
+        // explicit done/blocked/why statement and a revised plan.
+        assert!(GOAL_DIRECTED_GUIDANCE
+            .contains("report each step's outcome and the verification performed"));
+        assert!(GOAL_DIRECTED_GUIDANCE.contains("report what is done, what is blocked, and why"));
+        assert!(GOAL_DIRECTED_GUIDANCE.contains("revised plan"));
     }
 
     #[test]

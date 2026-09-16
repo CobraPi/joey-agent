@@ -402,3 +402,38 @@ back as `schema_violation` errors. Shape:
   string `artifact_ids`, unknown enum variants (e.g. `"light"`,
   `"conductor"`), absolute paths, empty `acceptance`,
   dependency-unrelated tasks sharing a write path.
+
+## 5. Subagent resource governance (feature 030)
+
+Feature 030 adds a resource-governance layer over delegation, all under the
+`delegation.resource_governance.*` config block (additive; `enabled`
+defaults to `true`; setting it `false` bypasses every governance code path).
+Implemented in `governance.rs`, `resource_records.rs`, and `result_cache.rs`.
+
+- **Bounded admission** (`governance.rs`) — a semaphore-style bound on queued
+  + running subagents; saturated submitters await a slot instead of ballooning
+  memory with queued closures.
+- **Priority lanes** — critical-lane dispatches jump the queue (never preempt
+  running work); background-lane dispatches defer to idle capacity.
+- **Retry budget** — bounded retries per wave; exhaustion surfaces as a
+  refusal rather than an infinite loop.
+- **Busy refusal** — when the pool is saturated and policy says refuse,
+  `delegate_task` returns a busy refusal the orchestrator can back off on.
+- **Result cache + single-flight dedup** (`result_cache.rs`) — canonical task
+  signatures, a persistent cache, and single-flight deduplication so identical
+  concurrent tasks run once.
+- **Resource records + watchdog** (`resource_records.rs`) — append-only JSONL
+  resource records plus a sampled CPU/memory watchdog; children exceeding
+  their budget are stopped (a transient drop no longer kills the shared
+  watchdog — T035).
+- **Wave-child governing** (T034) — batch/background wave children are
+  governed by the same admission/priority/record paths as direct dispatches.
+
+Tests: `tests/governance_admission.rs`, `governance_dedup.rs`,
+`governance_event_audit.rs`, `governance_event_compat.rs`,
+`governance_isolation.rs`, `governance_parity.rs`, `governance_priority.rs`,
+`governance_records.rs`, `governance_retry.rs`, `governance_waves.rs`,
+`diag_priority.rs`.
+
+See also: [features/joey-orchestration.md](features/joey-orchestration.md),
+[state-and-config.md](state-and-config.md) (governance config keys).

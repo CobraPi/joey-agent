@@ -2203,6 +2203,33 @@ impl Agent {
         }
     }
 
+    /// SC-005 completion-report detector (feature 031, T024): true when the
+    /// agent's final visible text already delivers a compliant completion
+    /// report — a verification claim plus report structure (per-step list
+    /// items or fenced command/output blocks). Once true, the verify-on-stop
+    /// nudge must not fire: the session has delivered what the nudge asks
+    /// for, and re-firing only inflates the action count (SC-001/SC-003).
+    fn completion_report_delivered(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        let verification_claimed = lower.contains("verif")
+            && ["pass", "ok", "succe", "green", "ran"]
+                .iter()
+                .any(|w| lower.contains(w));
+        let list_lines = text
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with("- ")
+                    || t.starts_with("* ")
+                    || (t.len() > 2
+                        && t.as_bytes()[0].is_ascii_digit()
+                        && (t.contains(". ") || t.contains(") ")))
+            })
+            .count();
+        let fences = text.matches("```").count();
+        verification_claimed && (list_lines >= 2 || fences >= 2)
+    }
+
     /// Feature 028 (FR-010): decide + build the retrieval-verification
     /// nudge for a finishing turn. Feeds the ledger with this turn's edited
     /// paths, then delegates to the capped verify-on-stop wrapper. `None`
@@ -3728,10 +3755,12 @@ impl Agent {
             // Feature 028 (FR-010): when this turn used on-demand retrieval
             // and edited files, require one bounded verification pass before
             // completion (nudge-and-continue, POST_TOOL_EMPTY pattern).
-            if let Some(nudge) = self.verify_nudge_decision(&turn_edited_paths) {
-                tracing::info!(count = self.verify_nudge_count, "verify nudge delivered");
-                self.push_synthetic(Message::user(nudge));
-                continue;
+            if !Self::completion_report_delivered(&final_text) {
+                if let Some(nudge) = self.verify_nudge_decision(&turn_edited_paths) {
+                    tracing::info!(count = self.verify_nudge_count, "verify nudge delivered");
+                    self.push_synthetic(Message::user(nudge));
+                    continue;
+                }
             }
             let _ = tx.send(AgentEvent::AssistantMessage(final_text.clone()));
             // Live context view: the final assistant message is in history.
@@ -9617,6 +9646,49 @@ mod tests {
         assert!(!fx.agent.history.iter().any(|m| {
             m.text_content().contains("re-check retrieved facts")
         }));
+        crate::verification::clear_all();
+    }
+
+    #[test]
+    fn completion_report_detector_accepts_real_reports() {
+        // Shaped after the actual feature-031 baseline transcripts: a
+        // verification claim plus fenced command/output blocks, or a
+        // per-step numbered list summary.
+        let fenced = "Verification passed.\n\nExecuted from `/tmp/joey-baseline-t6`:\n```text\npython3 -m unittest discover -v\n```\n\nTest output:\n```text\ntest_add ... ok\nRan 6 tests\n```\n";
+        assert!(Agent::completion_report_delivered(fenced));
+        let listed = "Task complete.\n\n1. Created stringutils.py with is_palindrome.\n2. Added 5 unit tests; all pass.\n3. Verified: python3 -m unittest ran green.\n";
+        assert!(Agent::completion_report_delivered(listed));
+    }
+
+    #[test]
+    fn completion_report_detector_rejects_non_reports() {
+        // Stub/plan/prose text must NOT suppress the nudge.
+        assert!(!Agent::completion_report_delivered("I will now verify the tests."));
+        assert!(!Agent::completion_report_delivered("Done. Files written."));
+        assert!(!Agent::completion_report_delivered(""));
+    }
+
+    #[test]
+    fn verify_nudge_suppressed_after_compliant_completion_report() {
+        // T024 regression: under full nudge conditions (retrieval used +
+        // code edits + unverified ledger), a compliant completion report
+        // in the final visible text must suppress delivery. The decision
+        // fn itself still returns Some (suppression happens at the call
+        // site via completion_report_delivered), which this test pins.
+        let _l = lock();
+        crate::verification::clear_all();
+        let mut fx = fixture(vec![], 5, 3, None);
+        *fx.agent.rag_prefetch_context.lock().unwrap() = Some("prefetched".to_string());
+        let nudge = fx
+            .agent
+            .verify_nudge_decision(&["src/lib.rs".to_string()])
+            .expect("nudge fires without a report");
+        assert!(nudge.contains("re-check retrieved facts"));
+        let report = "Verification passed.\n\n```text\npython3 -m unittest -v\n```\n```text\nRan 5 tests\n```\n";
+        assert!(
+            Agent::completion_report_delivered(report),
+            "compliant report must suppress the nudge at the call site"
+        );
         crate::verification::clear_all();
     }
 }

@@ -5,7 +5,9 @@
 //! request_byte_identical, hygiene_disabled_history_byte_identical,
 //! boundary_disabled_exit_paths_untouched); this file pins the pub contracts.
 
-use joey_agent_core::guidance::{ADAPTIVE_CODING_GUIDANCE, CONTEXT_ECONOMY_GUIDANCE};
+use joey_agent_core::guidance::{
+    ADAPTIVE_CODING_GUIDANCE, CONTEXT_ECONOMY_GUIDANCE, GOAL_DIRECTED_GUIDANCE,
+};
 use joey_agent_core::prompt::{build_system_prompt, PromptInputs};
 use joey_agent_core::state_block::{render, ScratchpadSummary, StateBlockInput};
 use joey_agent_core::verification::{
@@ -537,4 +539,66 @@ fn adaptive_coding_guidance_toggle_is_independent() {
     assert!(!p_off.contains(ADAPTIVE_CODING_GUIDANCE));
     // The two Joey-only guidance keys are independent toggles.
     assert!(p_off.contains(CONTEXT_ECONOMY_GUIDANCE));
+}
+
+#[test]
+fn goal_directed_guidance_toggle_is_independent() {
+    let cfg_default = Config::defaults();
+    let cfg_off = yaml_config("agent:\n  goal_directed_guidance: false\n");
+    let enabled_full = resolve_toolsets(&cfg_default.get_str_list("toolsets"));
+
+    let p_on = prompt_for(&cfg_default, &enabled_full);
+    let p_off = prompt_for(&cfg_off, &enabled_full);
+    assert!(p_on.contains(GOAL_DIRECTED_GUIDANCE));
+    assert!(!p_off.contains(GOAL_DIRECTED_GUIDANCE));
+    // Toggling the key off removes exactly the goal-directed section,
+    // byte-for-byte, and leaves every other guidance in place.
+    assert_eq!(
+        p_on.replace(&format!("{}\n\n", GOAL_DIRECTED_GUIDANCE), ""),
+        p_off
+    );
+    assert!(p_off.contains(CONTEXT_ECONOMY_GUIDANCE));
+    assert!(p_off.contains(ADAPTIVE_CODING_GUIDANCE));
+}
+
+#[test]
+fn system_prompt_token_neutrality_sc007() {
+    let _home_lock = joey_core::constants::TEST_HOME_OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    // SC-007 (feature 031): the assembled model-facing instruction text
+    // after the change is no larger (estimate_tokens) than the committed
+    // pre-change fixture captured from the unmodified build with identical
+    // pinned inputs (Config::defaults, default toolsets, parity-model,
+    // parity-provider, no session id). The "Conversation started:" line is
+    // the only wall-clock-dependent text; normalize it on both sides so the
+    // comparison is deterministic across run dates.
+    let pre_raw = include_str!("../../../specs/031-please-modify-joey/baseline/pre-change-prompt.txt");
+    std::env::remove_var("TERMINAL_CWD");
+    std::env::remove_var("JOEY_ENVIRONMENT_HINT");
+    let empty_home = tempfile::tempdir().unwrap();
+    let _home_guard = joey_core::constants::HomeOverrideGuard::new(empty_home.path().to_path_buf());
+    let cfg = Config::defaults();
+    let tools = resolve_toolsets(&cfg.get_str_list("toolsets"));
+    let post_raw = prompt_for(&cfg, &tools);
+    let normalize = |s: &str| -> String {
+        s.lines()
+            .map(|l| {
+                if l.starts_with("Conversation started: ") {
+                    "Conversation started: <date>"
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let pre = normalize(pre_raw);
+    let post = normalize(&post_raw);
+    let pre_t = joey_core::utils::estimate_tokens(&pre);
+    let post_t = joey_core::utils::estimate_tokens(&post);
+    assert!(
+        post_t <= pre_t,
+        "SC-007 violated: post-change prompt estimates {post_t} tokens > pre-change fixture {pre_t} tokens"
+    );
 }

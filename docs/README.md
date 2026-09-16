@@ -22,7 +22,7 @@ subsystem you're working on:
 1. [`features.md`](features.md) — up-to-date feature-first overview of the
    whole project: every capability with links into the per-subsystem
    reference pages, plus an honest "not yet implemented" list.
-2. [`architecture.md`](architecture.md) — the Cargo workspace (14 crates),
+2. [`architecture.md`](architecture.md) — the Cargo workspace (17 crates),
    crate dependency graph, high-level data flow from user input to final
    answer.
 3. [`agent-turn-loop.md`](agent-turn-loop.md) — the heart of the project:
@@ -110,7 +110,7 @@ subsystem you're working on:
     `/context-assembly` (`/ctxasm`) REPL command, byte parity when
     disabled, and cache-stability guarantees.
 
-All pages were verified against workspace source in August 2026. If code
+All pages were verified against workspace source in September 2026. If code
 and docs disagree, the code wins — and please fix the doc.
 
 ## Project layout

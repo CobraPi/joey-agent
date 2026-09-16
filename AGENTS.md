@@ -20,42 +20,46 @@ model, provider wire protocols, etc).
 ```bash
 cargo build --workspace              # build everything
 cargo build -p <crate>               # build one crate (e.g. joey-cli)
-cargo test --workspace               # run all tests (workspace currently ~520+ tests, must stay green)
+cargo test --workspace               # run all tests (workspace-wide suite must stay green)
 cargo test -p <crate>                # run one crate's tests
 cargo run -p joey-cli -- <args>      # run the joey CLI from source
 cargo build --release                # release binary -> target/release/joey
 ```
 
-There is no CI config in-repo (`.github/` absent) and no lint/format
+There is no CI config in-repo (`.github/` holds only `copilot-instructions.md`) and no lint/format
 config committed — run `cargo build --workspace` and `cargo test
 --workspace` as the acceptance bar (this is mandated by
 `.specify/memory/constitution.md`, not just convention).
 
 ## Workspace layout
 
-Cargo workspace, 12 member crates under `crates/`, dependency graph is a
+Cargo workspace, 17 member crates under `crates/`, dependency graph is a
 strict DAG (lower crates never depend on higher ones):
 
 | Crate | Role |
 |---|---|
 | `joey-core` | branding/paths (`~/.joey`), layered YAML+env config, SQLite session store, logging, secret redaction |
+| `joey-browser` | CDP browser automation (attach or managed launch) backing the 16 `browser_*` tools (feature 016) |
 | `joey-providers` | LLM provider wire protocols (OpenAI Chat Completions, OpenAI Responses, Anthropic Messages), SSE streaming, retries/backoff, error classification |
 | `joey-tools` | `Tool` trait + registry, toolsets, JSON-schema sanitizer, fuzzy patch matcher, built-in tools |
 | `joey-agent-core` | the turn loop (`Agent::run_turn`), system prompt assembly, context compression |
 | `joey-cron` | self-contained scheduler (duration/interval/cron expressions), job store, ticker |
 | `joey-mcp` | Model Context Protocol stdio JSON-RPC client |
 | `joey-gateway` | platform-neutral messaging spine (session keys, message events, `PlatformAdapter` trait) |
-| `joey-cli` | the `joey` binary: clap command tree + reedline REPL |
+| `joey-cli` | the `joey` binary: clap command tree + reedline REPL + TUI engine |
 | `joey-tui` | terminal UI widgets/rendering (ratatui-based) |
-| `joey-orchestration` | multi-agent/task orchestration primitives (newer, not yet in `docs/architecture.md`) |
+| `joey-llm-selector` | dynamic per-module model allocation for `model.default = auto` (feature 011) |
+| `joey-orchestration` | multi-agent/task orchestration primitives (subagent manager, task graphs, governance) |
 | `joey-omo` | "oh-my-openagent" orchestration layer built on `joey-orchestration` — agents, goals, plan parsing, intent gating, team/notepad concepts |
+| `joey-neurocode` | NeuroCode enterprise code-analysis engine: code-graph store, ingest, tiered classifier, context assembly |
+| `joey-neurocode-rag` | local-first semantic RAG over the NeuroCode code graph (embeddings, hybrid search, consent) |
+| `joey-copilot` | GitHub Copilot `.github/` bundle discovery and plugin manifest generation |
 | `joey-speckit-ui` | visual UI over spec-kit artifacts (`.specify/` specs/plans/tasks); reads/writes those files as the source of truth, never diverges into UI-only state |
 
-`joey-orchestration` and `joey-omo` are newer additions layered on top of
-`joey-agent-core`; `docs/architecture.md` and `docs/README.md` predate them
-and only describe the original 8 crates — don't be surprised the diagrams
-there are incomplete, cross-check against `Cargo.toml` workspace members
-for the current full crate list.
+`joey-orchestration` and `joey-omo` are orchestration layers built on top of
+`joey-agent-core`; all crates are covered by `docs/architecture.md` and the
+per-crate pages under `docs/features/` — cross-check against `Cargo.toml`
+workspace members if in doubt.
 
 Full docs index (read the relevant one before touching that subsystem):
 `docs/architecture.md`, `docs/agent-turn-loop.md`, and (per `docs/README.md`)
@@ -137,9 +141,9 @@ actually exist before assuming a link resolves.
 ## Testing approach
 
 - Tests live per-crate under `crates/<crate>/tests/` (integration-style)
-  plus inline `#[cfg(test)]` unit tests in source files — present in
-  `joey-agent-core`, `joey-orchestration`, `joey-speckit-ui`, `joey-tools`,
-  `joey-omo`, `joey-tui`.
+plus inline `#[cfg(test)]` unit tests in source files — notably in
+  `joey-agent-core`, `joey-orchestration` (37 test files), `joey-speckit-ui`,
+  `joey-tools`, `joey-omo`, `joey-tui`, `joey-neurocode`, `joey-neurocode-rag`.
 - Tests assert exact schemas, wire envelopes, grammars, and even prompt
   text in places — this is deliberate given the fidelity-to-upstream goal,
   don't loosen an assertion just because it looks overly strict without

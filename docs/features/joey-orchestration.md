@@ -29,9 +29,9 @@ The crate has three strata:
 3. **Surface tools** — `delegate_task`, `subagent_control`, `call_omo_agent`,
    and the team tools `team_status`/`team_message`/`team_tasks`.
 
-## Module map (39 files)
+## Module map (58 files)
 
-16 source modules, 22 integration test files, `Cargo.toml` (39 total):
+20 source modules, 37 integration test files, `Cargo.toml` (58 total):
 
 | File | Role |
 |---|---|
@@ -50,8 +50,11 @@ The crate has three strata:
 | `src/workspace.rs` | `WorkspaceIsolation`, `WorktreeMode`, baseline revision |
 | `src/joiner.rs` | `ChangeBundle`, `Joiner::collect`/`integrate` |
 | `src/evidence.rs` | `RunHandle`, `DecisionEntry`, `DECISION_CAUSES`, run-directory layout |
+| `src/governance.rs` | Feature 030 resource governance: bounded admission, priority lanes, retry budget, busy refusal (`GovernanceConfig`) |
+| `src/result_cache.rs` | Feature 030 canonical task signatures, persistent result cache, single-flight dedup (`ResultCache`, `task_signature`) |
+| `src/resource_records.rs` | Feature 030 append-only JSONL resource records + sampled CPU/memory watchdog (`ResourceRecordStore`, `spawn_watchdog`) |
 | `src/team.rs` | Team registry, team tools, lead/teammate directives |
-| `tests/*.rs` | 22 integration suites (see Testing) |
+| `tests/*.rs` | 37 integration suites (see Testing) |
 
 ## SubagentManager & ManagerConfig
 
@@ -383,11 +386,18 @@ layer to avoid a circular dependency. Toolset mechanics are described in
 [joey-tools.md](joey-tools.md); the consumer wiring in
 [joey-cli.md](joey-cli.md).
 
-## Testing (22 files)
+## Testing (37 files)
 
 - `tests/background.rs` — feature-020 background mode; blocking-path byte parity (T007/T008).
 - `tests/batch_resilience.rs` — one failed child never aborts the others (SC-003).
 - `tests/budgets.rs` — per-child resource budgets: parse-time rejection, breach stops (T019).
+- `tests/governance_admission.rs` — feature-030 bounded admission under saturation.
+- `tests/governance_priority.rs` — critical/background priority lanes.
+- `tests/governance_retry.rs` — retry-budget exhaustion refusal.
+- `tests/governance_dedup.rs` — result-cache signature dedup / single-flight.
+- `tests/governance_records.rs` — JSONL resource records + watchdog stop on breach (T035 transient-drop fix).
+- `tests/governance_waves.rs` — batch/background wave children governed (T034).
+- `tests/governance_parity.rs` — governance on/off parity (`enabled: false` bypasses).
 - `tests/category_delegation.rs` — `delegate_task` category routing contract (T063).
 - `tests/concurrency_limiter.rs` — the parent semaphore is shared across batch children (SC-008).
 - `tests/control_tool.rs` — `subagent_control` against real manager plumbing (T014/T015).
