@@ -77,7 +77,7 @@ The pinned 18-key contract table (`RAG_CONFIG_KEYS`,
 | `neurocode.rag.enabled` | `false` | master switch; `false` = byte-identical parity |
 | `neurocode.rag.backend` | `auto` | enum `auto \| local_onnx \| openai_compat \| ollama \| copilot`; unknown → warning + `auto` |
 | `neurocode.rag.base_url` | `http://localhost:11434` | base for the HTTP backends |
-| `neurocode.rag.model` | `nomic-embed-text-v1.5` | model profile name |
+| `neurocode.rag.model` | `nomic-embed-text:latest` | model profile name |
 | `neurocode.rag.api_key` | `""` | Bearer token; WRITES route to `.env` as `JOEY_NEUROCODE_RAG_API_KEY` (env wins on read; dotted getter is fallback) |
 | `neurocode.rag.local.model_dir` | `~/.joey/neurocode/models/<profile>/` | path, `~` expanded at load; default resolves through `joey_home()` so `-p/--profile` scoping is honored |
 | `neurocode.rag.local.mirror_url` | `""` | mirror for `/neurocode model fetch`; empty = fetch disabled |
@@ -140,7 +140,8 @@ triggers a full semantic rebuild.
 
 | Profile | Dim | Ctx | Pooling | Prefixes | License |
 |---|---|---|---|---|---|
-| `nomic-embed-text-v1.5` (default) | 768 | 8192 | mean + L2 (client-side) | `search_query: ` / `search_document: ` | Apache-2.0 |
+| `nomic-embed-text:latest` (default) | 768 | 8192 | mean + L2 (client-side) | `search_query: ` / `search_document: ` | Apache-2.0 |
+| `nomic-embed-text-v1.5` | 768 | 8192 | mean + L2 (client-side) | `search_query: ` / `search_document: ` | Apache-2.0 |
 | `CodeRankEmbed` | 768 | 8192 | mean + L2 (client-side) | query `Represent this query for searching relevant code: `; document prefix EMPTY (load-bearing) | MIT |
 | `text-embedding-3-small` | 1536 | 8192 | server-side; L2 client-side after decode | none (instruction-free; prefixes MUST NOT be prepended) | Proprietary — GitHub Copilot subscription |
 | `metis-1024-I16-Binary` | 1024 | 8192 | server-side; L2 client-side | none | Proprietary — GitHub Copilot subscription |

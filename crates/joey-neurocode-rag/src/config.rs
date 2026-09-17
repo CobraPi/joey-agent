@@ -123,7 +123,7 @@ pub const ENV_API_KEY_NAME: &str = "JOEY_NEUROCODE_RAG_API_KEY";
 
 pub const DEFAULT_BACKEND: &str = "auto";
 pub const DEFAULT_BASE_URL: &str = "http://localhost:11434";
-pub const DEFAULT_MODEL: &str = "nomic-embed-text-v1.5";
+pub const DEFAULT_MODEL: &str = "nomic-embed-text:latest";
 pub const DEFAULT_BATCH_SIZE: i64 = 64;
 pub const BATCH_SIZE_MIN: i64 = 16;
 pub const BATCH_SIZE_MAX: i64 = 128;
@@ -191,7 +191,7 @@ pub const RAG_CONFIG_KEYS: [RagKeySpec; 18] = [
     RagKeySpec::new(KEY_ENABLED, RagValueKind::Bool, "false"),
     RagKeySpec::new(KEY_BACKEND, RagValueKind::Backend, "auto"),
     RagKeySpec::new(KEY_BASE_URL, RagValueKind::Str, "http://localhost:11434"),
-    RagKeySpec::new(KEY_MODEL, RagValueKind::Str, "nomic-embed-text-v1.5"),
+    RagKeySpec::new(KEY_MODEL, RagValueKind::Str, "nomic-embed-text:latest"),
     RagKeySpec::new(KEY_API_KEY, RagValueKind::Str, ""),
     RagKeySpec::new(
         KEY_MODEL_DIR,
@@ -288,7 +288,7 @@ pub struct RagConfig {
     pub backend: RagBackend,
     /// `neurocode.rag.base_url` (default `http://localhost:11434`).
     pub base_url: String,
-    /// `neurocode.rag.model` profile name (default `nomic-embed-text-v1.5`).
+    /// `neurocode.rag.model` profile name (default `nomic-embed-text:latest`).
     pub model: String,
     /// `neurocode.rag.api_key` (default empty; see module docs for the
     /// env-first resolution order).

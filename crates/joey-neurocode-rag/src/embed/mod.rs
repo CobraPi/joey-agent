@@ -915,7 +915,7 @@ mod tests {
         let info = backend.describe_embedder(); // static, no I/O
         assert_eq!(info.backend_kind, BackendKind::OpenAiCompat);
         assert_eq!(info.base_url, "http://embed.example.invalid");
-        assert_eq!(info.model, "nomic-embed-text-v1.5");
+        assert_eq!(info.model, "nomic-embed-text:latest");
 
         let mut cfg = cfg;
         cfg.backend = Ollama;

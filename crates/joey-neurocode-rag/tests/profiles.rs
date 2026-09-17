@@ -8,7 +8,7 @@
 
 use joey_neurocode_rag::embed::profiles::{
     default_profile, lookup, rejection_reason, EmbedProfile, Pooling, CODERANK_EMBED,
-    NOMIC_EMBED_TEXT_V1_5, REJECTED_CANDIDATES,
+    NOMIC_EMBED_TEXT_LATEST, NOMIC_EMBED_TEXT_V1_5, REJECTED_CANDIDATES,
 };
 
 // ---------------------------------------------------------------------------
@@ -25,6 +25,27 @@ fn nomic_embed_text_v15_profile_is_pinned() {
     assert_eq!(NOMIC_EMBED_TEXT_V1_5.prefix_query, "search_query: ");
     assert_eq!(NOMIC_EMBED_TEXT_V1_5.prefix_document, "search_document: ");
     assert_eq!(NOMIC_EMBED_TEXT_V1_5.license, "Apache-2.0");
+}
+
+#[test]
+fn nomic_embed_text_latest_profile_is_pinned() {
+    assert_eq!(NOMIC_EMBED_TEXT_LATEST.name, "nomic-embed-text:latest");
+    assert_eq!(NOMIC_EMBED_TEXT_LATEST.dim, 768);
+    assert_eq!(NOMIC_EMBED_TEXT_LATEST.ctx, 8192);
+    assert_eq!(NOMIC_EMBED_TEXT_LATEST.pooling, Pooling::Mean);
+    assert!(NOMIC_EMBED_TEXT_LATEST.l2_normalize, "client-side L2 required");
+    assert_eq!(NOMIC_EMBED_TEXT_LATEST.prefix_query, "search_query: ");
+    assert_eq!(NOMIC_EMBED_TEXT_LATEST.prefix_document, "search_document: ");
+    assert_eq!(NOMIC_EMBED_TEXT_LATEST.license, "Apache-2.0");
+    // Same underlying model as the versioned-name profile, different tag.
+    assert_eq!(NOMIC_EMBED_TEXT_LATEST.dim, NOMIC_EMBED_TEXT_V1_5.dim);
+    assert_eq!(NOMIC_EMBED_TEXT_LATEST.ctx, NOMIC_EMBED_TEXT_V1_5.ctx);
+    assert_eq!(NOMIC_EMBED_TEXT_LATEST.prefix_query, NOMIC_EMBED_TEXT_V1_5.prefix_query);
+    assert_eq!(
+        NOMIC_EMBED_TEXT_LATEST.prefix_document,
+        NOMIC_EMBED_TEXT_V1_5.prefix_document
+    );
+    assert_ne!(NOMIC_EMBED_TEXT_LATEST.name, NOMIC_EMBED_TEXT_V1_5.name);
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +167,9 @@ fn both_profiles_use_mean_pooling_with_client_side_l2() {
 fn lookup_by_name_resolves_both_profiles() {
     let nomic = lookup("nomic-embed-text-v1.5").expect("nomic profile must resolve");
     assert_eq!(nomic, &NOMIC_EMBED_TEXT_V1_5);
+    let latest =
+        lookup("nomic-embed-text:latest").expect("nomic :latest profile must resolve");
+    assert_eq!(latest, &NOMIC_EMBED_TEXT_LATEST);
     let cre = lookup("CodeRankEmbed").expect("CodeRankEmbed profile must resolve");
     assert_eq!(cre, &CODERANK_EMBED);
     // Exact-name lookup only — no fuzzy resolution, no case folding.
@@ -156,10 +180,10 @@ fn lookup_by_name_resolves_both_profiles() {
 }
 
 #[test]
-fn default_resolution_is_nomic_embed_text_v15() {
+fn default_resolution_is_nomic_embed_text_latest() {
     let d: &EmbedProfile = default_profile();
-    assert_eq!(d.name, "nomic-embed-text-v1.5");
-    assert_eq!(d, &NOMIC_EMBED_TEXT_V1_5);
+    assert_eq!(d.name, "nomic-embed-text:latest");
+    assert_eq!(d, &NOMIC_EMBED_TEXT_LATEST);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,4 +230,5 @@ fn rejected_nomic_embed_code_is_recorded_not_resolvable() {
     // Same text is retrievable via the helper.
     assert_eq!(rejection_reason("nomic-embed-code"), Some(recorded.reason));
     assert_eq!(rejection_reason("nomic-embed-text-v1.5"), None);
+    assert_eq!(rejection_reason("nomic-embed-text:latest"), None);
 }

@@ -71,7 +71,7 @@ fn agent_core_rag_key_defaults_match_contract() {
     assert_eq!(default_of(rag_keys::LOCAL_MODEL_DIR), "~/.joey/neurocode/models/<profile>/");
     assert_eq!(default_of(rag_keys::BACKEND), "auto");
     assert_eq!(default_of(rag_keys::BASE_URL), "http://localhost:11434");
-    assert_eq!(default_of(rag_keys::MODEL), "nomic-embed-text-v1.5");
+    assert_eq!(default_of(rag_keys::MODEL), "nomic-embed-text:latest");
     assert_eq!(default_of(rag_keys::ENABLED), "false");
     assert_eq!(default_of(rag_keys::PREFETCH_ENABLED), "false");
 }
