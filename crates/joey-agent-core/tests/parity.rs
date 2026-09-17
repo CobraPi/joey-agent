@@ -9,6 +9,13 @@ use joey_agent_core::guidance::{
     ADAPTIVE_CODING_GUIDANCE, CONTEXT_ECONOMY_GUIDANCE, GOAL_DIRECTED_GUIDANCE,
 };
 use joey_agent_core::prompt::{build_system_prompt, PromptInputs};
+
+// First lines of the platform-specific environment hints (guidance.rs) —
+// used by sc007's normalize() to strip platform-only prompt sections so
+// the token-neutrality comparison stays deterministic across platforms.
+const WSL_ENVIRONMENT_HINT_START: &str = "You are running inside WSL";
+const WINDOWS_BASH_SHELL_HINT_START: &str = "Shell: on this Windows host";
+const WINDOWS_HOSTNAME_NOTE_START: &str = "Note: on Windows, the machine hostname";
 use joey_agent_core::state_block::{render, ScratchpadSummary, StateBlockInput};
 use joey_agent_core::verification::{
     build_verify_on_stop_nudge, build_verify_on_stop_nudge_with_retrieval,
@@ -455,6 +462,14 @@ fn state_block_switch_and_renderer_parity() {
 /// byte-identical to the pre-feature baseline.
 #[test]
 fn guidance_and_nudge_when_disabled_byte_parity() {
+    // Serialize with sc007 and pin HOME to an empty dir: the prompt embeds
+    // the user's SOUL.md, so a concurrent HomeOverrideGuard (or a real home
+    // with a legacy soul) flips the identity line mid-comparison.
+    let _home_lock = joey_core::constants::TEST_HOME_OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let empty_home = tempfile::tempdir().unwrap();
+    let _home_guard = joey_core::constants::HomeOverrideGuard::new(empty_home.path().to_path_buf());
     // (a) context-economy guidance off restores the pre-feature prompt.
     let cfg_default = Config::defaults();
     let cfg_off = yaml_config("agent:\n  context_economy_guidance: false\n");
@@ -543,6 +558,13 @@ fn adaptive_coding_guidance_toggle_is_independent() {
 
 #[test]
 fn goal_directed_guidance_toggle_is_independent() {
+    // Same rationale as guidance_and_nudge_when_disabled_byte_parity: the
+    // byte-parity comparison is only deterministic under a pinned HOME.
+    let _home_lock = joey_core::constants::TEST_HOME_OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let empty_home = tempfile::tempdir().unwrap();
+    let _home_guard = joey_core::constants::HomeOverrideGuard::new(empty_home.path().to_path_buf());
     let cfg_default = Config::defaults();
     let cfg_off = yaml_config("agent:\n  goal_directed_guidance: false\n");
     let enabled_full = resolve_toolsets(&cfg_default.get_str_list("toolsets"));
@@ -589,6 +611,16 @@ fn system_prompt_token_neutrality_sc007() {
                 } else {
                     l
                 }
+            })
+            // Platform-specific environment hints (Windows/WSL shell notes,
+            // hostname note) are emitted only on those platforms; the
+            // baseline fixture was captured on Unix. They are not part of
+            // feature 031's delta, so strip them from BOTH sides to keep
+            // the comparison cross-platform deterministic.
+            .filter(|l| {
+                !l.starts_with(WSL_ENVIRONMENT_HINT_START)
+                    && !l.starts_with(WINDOWS_BASH_SHELL_HINT_START)
+                    && !l.starts_with(WINDOWS_HOSTNAME_NOTE_START)
             })
             .collect::<Vec<_>>()
             .join("\n")

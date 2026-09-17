@@ -110,12 +110,14 @@ fn command_basename(command: &str) -> String {
     let parts = shlex_split(text);
     let first = parts.first().cloned().unwrap_or_else(|| text.to_string());
     // Python os.path.basename: the portion after the final separator (a
-    // trailing separator yields the empty string).
-    first
-        .rsplit(std::path::MAIN_SEPARATOR)
-        .next()
-        .unwrap_or("")
-        .to_lowercase()
+    // trailing separator yields the empty string). Both `/` and `\`
+    // count as separators — ntpath does this on Windows, and accepting
+    // both everywhere keeps POSIX-style commands in cross-platform
+    // configs (`/usr/bin/env bash`) classifying identically on every
+    // platform (otherwise the Windows build would never reduce them to
+    // a basename the shell-interpreter gate can match).
+    let cut = first.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+    first[cut..].to_lowercase()
 }
 
 fn shlex_split(text: &str) -> Vec<String> {

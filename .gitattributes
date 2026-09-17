@@ -1,0 +1,24 @@
+# Joey Agent — line-ending policy.
+#
+# This repo embeds text assets into binaries with include_str! and asserts
+# on exact LF-terminated content (speckit bodies, prompt baselines,
+# fixtures). core.autocrlf=true on Windows rewrites them to CRLF in the
+# worktree, corrupting byte-parity tests. Force LF in worktree AND index
+# for those assets. Everything else stays text=auto (local preference).
+
+# Embedded workflow bodies — parsed with LF-only frontmatter delimiters.
+crates/joey-cli/src/speckit_bodies/** text eol=lf
+
+# Prompt parity baselines compared byte-for-byte after line filtering.
+specs/**/baseline/*.txt text eol=lf
+
+# Shell scripts executed via bash (LF required).
+*.sh text eol=lf
+.specify/scripts/** text eol=lf
+
+# Rust and standard source: normalize to LF in index; worktree follows
+# local autocrlf EXCEPT nothing here depends on CRLF, so keep uniform LF
+# to avoid mixed-ending files.
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf

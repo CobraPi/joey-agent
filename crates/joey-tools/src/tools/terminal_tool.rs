@@ -296,8 +296,11 @@ fn resolve_shell() -> Result<Shell, ShellResolutionError> {
 
     #[cfg(not(unix))]
     {
-        if let Ok(p) = which::which("bash") {
-            return Ok(Shell::Bash(p.to_string_lossy().into_owned()));
+        // Prefer Git Bash explicitly: a bare `which("bash")` can resolve
+        // to the WSL System32 launcher, which cannot run Windows-side
+        // pipelines (see the shell_discovery module docs).
+        if let Some(p) = crate::shell_discovery::git_bash() {
+            return Ok(Shell::Bash(p));
         }
         if let Ok(p) = which::which("pwsh") {
             return Ok(Shell::PowerShell(p.to_string_lossy().into_owned()));

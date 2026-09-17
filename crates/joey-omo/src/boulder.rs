@@ -109,8 +109,8 @@ impl BoulderState {
     /// named temp file in the same directory, fsync it, then rename over the
     /// target — the same atomic-write pattern joey-cron uses
     /// (`jobs.rs::atomic_write_secure`). Rename within a directory is
-    /// atomic on POSIX (and Windows `RENAME` semantics via
-    /// `fs::rename`/remove-first), so readers never observe a partial file.
+    /// atomic on POSIX and replace-atomic via MoveFileEx on Windows, so
+    /// readers never observe a partial file.
     pub fn write(&self, omo_dir: &Path) -> std::io::Result<()> {
         let path = omo_dir.join("boulder.json");
         if let Some(parent) = path.parent() {
@@ -128,13 +128,13 @@ impl BoulderState {
             file.write_all(json.as_bytes())?;
             file.sync_all()?;
         }
-        // Rename over the destination. On Windows, rename onto an existing
-        // file fails, so remove first — the small window is fine here
-        // because the replacement is a complete, fsynced file.
-        #[cfg(windows)]
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
+        // Rename over the destination. `fs::rename` maps to
+        // MoveFileEx(REPLACE_EXISTING) on Windows, so it replaces a live
+        // target without a remove-first dance — a remove-first "fix" races
+        // under concurrency (one writer deletes a file another just
+        // replaced → delete-pending → ACCESS_DENIED) and must not be
+        // reintroduced. Last-writer-wins; readers always see one complete
+        // fsynced file.
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }

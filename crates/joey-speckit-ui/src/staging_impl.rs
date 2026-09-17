@@ -109,6 +109,24 @@ impl StagingArea for GitStagingArea {
                 // Create a temp worktree via git CLI.
                 let worktree_path = std::env::temp_dir().join(format!("joey-stage-{attempt_id}"));
 
+                // Self-heal a leftover from a previous attempt that crashed
+                // between `open` and `discard`: the stale directory (and its
+                // worktree registration in this repo) makes every subsequent
+                // `worktree add` for the same attempt id fail with "already
+                // exists" — permanently, since nothing ever clears it (user
+                // temp dirs persist across runs, especially on Windows).
+                // Delete the path first, then prune now-dangling
+                // registrations, so `worktree add` starts clean.
+                if worktree_path.exists() {
+                    let _ = std::fs::remove_dir_all(&worktree_path);
+                }
+                let _ = Command::new("git")
+                    .arg("worktree")
+                    .arg("prune")
+                    .current_dir(repo_root)
+                    .output()
+                    .await;
+
                 // git worktree add --detach <path>
                 let output = Command::new("git")
                     .arg("worktree")
@@ -636,6 +654,10 @@ diff --git a/alpha.md b/alpha.md
         }
         for args in [
             vec!["init", "-q"],
+            // Pin line-ending handling: a machine-level `core.autocrlf=true`
+            // (Git-for-Windows default) would rewrite LF → CRLF on `git
+            // apply`, breaking the byte-exact content assertions below.
+            vec!["config", "core.autocrlf", "false"],
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
             vec!["add", "-A"],

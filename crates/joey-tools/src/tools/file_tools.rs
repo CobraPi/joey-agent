@@ -1634,7 +1634,11 @@ fn shell_quote(arg: &str) -> String {
 /// stdout (the upstream env merges the streams; diagnostics are separated by
 /// shape afterwards). Returns (combined_output, exit_code).
 async fn run_search_command(script: &str, cwd: &Path) -> (String, i32) {
-    let mut cmd = tokio::process::Command::new("bash");
+    // Resolve Git Bash explicitly: on Windows a bare "bash" spawn can
+    // resolve to the WSL System32 launcher (see shell_discovery module
+    // docs), where Windows paths and rg.exe don't exist — the pipeline
+    // then dies with exit 127 and the search silently returns nothing.
+    let mut cmd = tokio::process::Command::new(crate::shell_discovery::posix_shell());
     cmd.arg("-c")
         .arg(script)
         .current_dir(cwd)
@@ -2203,8 +2207,12 @@ mod tests {
     async fn read_file_guards() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ctx_in(dir.path());
-        let dev = parse(&ReadFile.execute(json!({"path": "/dev/stdin"}), &ctx).await);
-        assert!(dev["error"].as_str().unwrap().contains("device file"));
+        // /dev/* device nodes are Unix-only; Windows has no equivalent path.
+        #[cfg(unix)]
+        {
+            let dev = parse(&ReadFile.execute(json!({"path": "/dev/stdin"}), &ctx).await);
+            assert!(dev["error"].as_str().unwrap().contains("device file"));
+        }
         let bin = parse(&ReadFile.execute(json!({"path": "photo.png"}), &ctx).await);
         assert!(bin["error"].as_str().unwrap().contains("Cannot read binary file"));
         std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();

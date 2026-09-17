@@ -72,6 +72,12 @@ fn scratch_git_repo() -> Option<(tempfile::TempDir, PathBuf)> {
     if !git_ok(&root, &["init"]) {
         return None;
     }
+    // Pin line endings: a machine-level `core.autocrlf=true` (Git-for-
+    // Windows default) rewrites LF → CRLF on checkout/apply and breaks
+    // the byte-exact assertions in these tests.
+    if !git_ok(&root, &["config", "core.autocrlf", "false"]) {
+        return None;
+    }
     if !git_ok(&root, &["config", "user.email", "test@example.com"]) {
         return None;
     }

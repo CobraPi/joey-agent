@@ -212,7 +212,9 @@ pub fn run_specify_script(
     let (pid_tx, pid_rx) = std::sync::mpsc::channel::<u32>();
     let (out_tx, out_rx) = std::sync::mpsc::channel::<std::io::Result<std::process::Output>>();
     std::thread::spawn(move || {
-        let spawned = Command::new("bash")
+        // Git-Bash-aware spawn: a bare "bash" on Windows can resolve to
+        // the WSL System32 launcher (see joey_tools::shell_discovery).
+        let spawned = Command::new(joey_tools::shell_discovery::posix_shell())
             .arg(&path)
             .args(&args)
             .current_dir(&root)
@@ -1000,6 +1002,42 @@ pub struct SpeckitStatus {
 /// substring scraping). When the script itself is ABSENT (missing file, or
 /// a nonzero exit from a scaffold that has no script on disk), the state
 /// is derived from disk instead (`derive_state` + `.git/HEAD`).
+/// Convert an MSYS-style path (`/d/foo/bar`, as emitted by Git Bash
+/// scripts) to a native Windows path (`D:\foo\bar`). Non-MSYS strings
+/// pass through unchanged; no-op on non-Windows. Without this,
+/// `Path::new("/d/...").is_file()` is false on Windows and every
+/// artifact flag in `status` reads as absent.
+#[cfg(windows)]
+fn msys_to_native(p: &str) -> String {
+    let bytes = p.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b'/' {
+        let drive = bytes[1];
+        if drive.is_ascii_alphabetic() {
+            let rest = &p[3..];
+            if rest.is_empty() {
+                return format!("{}:\\", drive.to_ascii_uppercase());
+            }
+            return format!(
+                "{}:\\{}",
+                drive.to_ascii_uppercase(),
+                rest.replace('/', "\\")
+            );
+        }
+    }
+    p.to_string()
+}
+
+#[cfg(not(windows))]
+fn msys_to_native(p: &str) -> String {
+    p.to_string()
+}
+
+/// Gather spec-kit status via `check-prerequisites.sh --json --paths-only`
+/// (structured field lookup — a VALUE containing a quoted
+/// `"FEATURE_DIR":"…"` payload can no longer fool extraction). When the
+/// script itself is ABSENT (missing file, or a nonzero exit from a
+/// scaffold that has no script on disk), the state is derived from disk
+/// instead (`derive_state` + `.git/HEAD`).
 pub fn status(cwd: &Path) -> Result<SpeckitStatus, String> {
     let root = find_repo_root(cwd)
         .ok_or_else(|| "not a spec-kit repository (no .specify/ directory found in this or any parent directory)".to_string())?;
@@ -1027,7 +1065,9 @@ pub fn status(cwd: &Path) -> Result<SpeckitStatus, String> {
             let get = |key: &str| -> String {
                 json.get(key).and_then(|f| f.as_str()).unwrap_or("").to_string()
             };
-            let feature_dir = get("FEATURE_DIR");
+            // The Git Bash script reports MSYS-style paths; native path
+            // checks need the Windows form on Windows.
+            let feature_dir = msys_to_native(&get("FEATURE_DIR"));
             let has = |file: &str| !feature_dir.is_empty() && Path::new(&feature_dir).join(file).is_file();
             Ok(SpeckitStatus {
                 branch: get("BRANCH"),

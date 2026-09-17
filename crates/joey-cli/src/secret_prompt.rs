@@ -7,7 +7,10 @@
 //! equivalent), then plain line input, when raw terminal handling is
 //! unavailable (piped stdin, non-TTY).
 
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Write};
+// Read::read is only used by the raw-mode POSIX prompt below.
+#[cfg(unix)]
+use std::io::Read;
 
 /// Outcome of a secret prompt.
 pub enum SecretInput {

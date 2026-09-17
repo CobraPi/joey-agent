@@ -96,11 +96,14 @@ pub fn ingest_project(graph: &DependencyGraph, project_root: &Path) -> Ingestion
     let parsed: Vec<ParsedFile> = candidate_paths
         .into_par_iter()
         .map(|path| {
+            // Repo-relative path in canonical forward-slash form: the
+            // graph store keys `source_path` rows git-style, so a Windows
+            // walk's native backslashes must not leak into the database.
             let rel_path = path
                 .strip_prefix(project_root)
                 .unwrap_or(&path)
                 .to_string_lossy()
-                .to_string();
+                .replace('\\', "/");
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {

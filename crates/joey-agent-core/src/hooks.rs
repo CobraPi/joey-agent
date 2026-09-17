@@ -537,11 +537,27 @@ mod tests {
 
     #[tokio::test]
     async fn allow_with_input_rewrite() {
+        // The hook runner shells out to `sh -c` on Unix and `cmd /C` on
+        // Windows (hooks are user-configured platform shell commands), so
+        // the echoing command must be platform-appropriate. On Windows a
+        // quoted `echo` mangles JSON: CreateProcess arg-escaping turns
+        // embedded `"` into `\"` and cmd echoes the backslashes verbatim,
+        // so the JSON is emitted from a temp file via quote-free `type`.
+        #[cfg(unix)]
+        let command: String =
+            r#"echo '{"updated_input": {"injected": true}}'"#.to_string();
+        #[cfg(windows)]
+        let command: String = {
+            let json_path = std::env::temp_dir()
+                .join(format!("joey_hook_rewrite_{}.json", std::process::id()));
+            std::fs::write(&json_path, r#"{"updated_input": {"injected": true}}"#).unwrap();
+            format!("type {}", json_path.display())
+        };
         let hooks = vec![HookConfig {
             name: "rewrite".into(),
             event: EVENT_PRE_TOOL_USE.into(),
             matcher: "".into(),
-            command: r#"echo '{"updated_input": {"injected": true}}'"#.into(),
+            command,
             timeout_secs: None,
         }];
         let runner = PreToolUseRunner::new(hooks, "/tmp");

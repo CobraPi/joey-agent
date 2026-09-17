@@ -636,8 +636,21 @@ mod tests {
     #[test]
     fn norm_home_is_lexical() {
         // `..` collapses lexically; no symlink resolution happens.
-        assert_eq!(norm_home_path("/a/b/../c"), "/a/c");
-        assert_eq!(norm_home_path("/a/./b/"), "/a/b");
+        // Platform note: on Windows a rooted-but-prefixless input (`/a/…`)
+        // anchors to the current drive's prefix (Rust `Path::push`
+        // semantics) and the result is normcased to lowercase, mirroring
+        // upstream `normcase` — so the expectations are drive-qualified
+        // there.
+        #[cfg(unix)]
+        {
+            assert_eq!(norm_home_path("/a/b/../c"), "/a/c");
+            assert_eq!(norm_home_path("/a/./b/"), "/a/b");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(norm_home_path("C:\\a\\b\\..\\c"), "c:\\a\\c");
+            assert_eq!(norm_home_path("C:\\a\\.\\b\\"), "c:\\a\\b");
+        }
         assert_eq!(norm_home_path(""), "");
     }
 

@@ -384,6 +384,10 @@ mod tests {
         fs::write(root.join("src/b.rs"), "fn b() {}\n").unwrap();
         fs::write(root.join("src/shared.txt"), "line1\nline2\nline3\n").unwrap();
         git_ok(root, &["init", "-q"]).expect("git init");
+        // Pin line-ending handling: a machine-level `core.autocrlf=true`
+        // (Git-for-Windows default) rewrites LF → CRLF on checkout/apply,
+        // breaking the byte-exact content assertions below.
+        git_ok(root, &["config", "core.autocrlf", "false"]).expect("git config autocrlf");
         git_ok(root, &["config", "user.email", "test@example.com"]).expect("git config email");
         git_ok(root, &["config", "user.name", "Test"]).expect("git config name");
         git_ok(root, &["add", "."]).expect("git add");

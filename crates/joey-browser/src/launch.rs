@@ -28,6 +28,7 @@ const MACOS_CANDIDATES: &[&str] = &[
 ];
 
 /// Linux/Windows PATH + known-location candidate names.
+#[cfg_attr(windows, allow(dead_code))]
 const UNIX_NAMES: &[&str] = &[
     "google-chrome",
     "google-chrome-stable",

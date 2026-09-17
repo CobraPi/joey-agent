@@ -118,10 +118,14 @@ impl Tool for Clarify {
         }
         // Upstream parity: hermes_cli/callbacks.py clarify_callback blocks with a
         // timeout (default 120s) and returns a best-judgement fallback string.
+        // A dropped UI channel (Ok(Err)) is treated the same as a timeout:
+        // upstream has no "channel closed" concept — an unanswered clarify
+        // simply runs out the clock and falls back to best judgement.
         match tokio::time::timeout(self.timeout, resp_rx).await {
             Ok(Ok(response)) => clarify_envelope(question, choices, response),
-            Ok(Err(_)) => ToolResult::Error("Clarification channel closed without response.".to_string()),
-            Err(_elapsed) => clarify_envelope(question, choices, CLARIFY_TIMEOUT_RESPONSE.to_string()),
+            Ok(Err(_)) | Err(_) => {
+                clarify_envelope(question, choices, CLARIFY_TIMEOUT_RESPONSE.to_string())
+            }
         }
     }
 }

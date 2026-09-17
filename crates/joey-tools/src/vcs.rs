@@ -56,6 +56,16 @@ fn git_timeout() -> Duration {
         .unwrap_or(GIT_TIMEOUT)
 }
 
+/// Resolve the git executable for subprocess spawns. Honors an explicit
+/// `JOEY_TEST_GIT_BIN` override (test hook for PATH-shim scenarios on
+/// platforms where shebang scripts are unexecutable, e.g. Windows).
+fn git_program() -> String {
+    std::env::var("JOEY_TEST_GIT_BIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "git".to_string())
+}
+
 /// Max checkpoints retained per project (FR-007 default).
 const MAX_SNAPSHOTS_PER_PROJECT: usize = 50;
 
@@ -259,7 +269,9 @@ impl CheckpointManager {
     /// store, this project's ref/index/metadata, and the first snapshot are
     /// only created lazily on the first `checkpoint()` call.
     pub fn new(_session_id: &str, work_tree: &Path) -> Self {
-        let enabled = which::which("git").is_ok();
+        let enabled = std::env::var("JOEY_TEST_GIT_BIN")
+            .map(|v| !v.is_empty())
+            .unwrap_or_else(|_| which::which("git").is_ok());
         if !enabled {
             tracing::debug!("git not found — checkpoints disabled");
         }
@@ -831,7 +843,7 @@ impl CheckpointManager {
     /// Never errors to the caller: `None` means the command failed or
     /// timed out, and pruning degrades gracefully.
     fn run_prune_git(&self, args: &[&str], envs: &[(&str, &str)]) -> Option<String> {
-        let mut cmd = Command::new("git");
+        let mut cmd = Command::new(git_program());
         cmd.env("GIT_DIR", &self.store);
         cmd.env_remove("GIT_WORK_TREE");
         cmd.env_remove("GIT_INDEX_FILE");
@@ -877,7 +889,7 @@ impl CheckpointManager {
     }
 
     fn run_git_capture(&self, args: &[&str], allowed: &[i32]) -> Result<String> {
-        let mut cmd = Command::new("git");
+        let mut cmd = Command::new(git_program());
         self.git_env(&mut cmd);
         cmd.args(args);
         cmd.current_dir(&self.work_tree);
@@ -893,7 +905,7 @@ impl CheckpointManager {
     /// Like `run_git_capture` but never errors on non-`allowed` exit codes
     /// beyond returning empty output — used by best-effort pruning helpers.
     fn run_git_with_timeout(&self, args: &[&str], allowed: Option<&[i32]>) -> Option<String> {
-        let mut cmd = Command::new("git");
+        let mut cmd = Command::new(git_program());
         self.git_env(&mut cmd);
         cmd.args(args);
         cmd.current_dir(&self.work_tree);
@@ -917,7 +929,7 @@ fn ensure_store_initialized(store: &Path) -> Result<()> {
     }
     std::fs::create_dir_all(store)?;
 
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_program());
     apply_isolation_env(&mut cmd);
     cmd.env_remove("GIT_WORK_TREE");
     cmd.env_remove("GIT_INDEX_FILE");
@@ -1514,22 +1526,35 @@ mod tests {
         if !git_available() {
             return;
         }
-        // Prepend a fake, hanging `git` script to PATH.
+        // Prepend a fake, hanging `git` to PATH. Unix: shebang shell script;
+        // Windows: a .bat batch (CreateProcess can't exec shebang scripts).
         let fake_bin_dir = tempfile::tempdir().unwrap();
-        let fake_git = fake_bin_dir.path().join("git");
-        // Sleep long enough to trip even the shrunk test timeout (>= 2x).
-        std::fs::write(&fake_git, "#!/bin/sh\nsleep 5\n").unwrap();
         #[cfg(unix)]
         {
+            let fake_git = fake_bin_dir.path().join("git");
+            // Sleep long enough to trip even the shrunk test timeout (>= 2x).
+            std::fs::write(&fake_git, "#!/bin/sh\nsleep 5\n").unwrap();
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&fake_git).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&fake_git, perms).unwrap();
         }
+        #[cfg(windows)]
+        {
+            let fake_git = fake_bin_dir.path().join("git.bat");
+            // ping -n 6 ≈ 5s sleep in batch; trips the 400ms test timeout.
+            std::fs::write(&fake_git, "@echo off\r\nping -n 6 127.0.0.1 >nul\r\nexit /b 0\r\n").unwrap();
+            // CreateProcess resolves bare `git` to git.exe only — a .bat on
+            // PATH is never found — so hand the DUT the shim directly.
+            std::env::set_var("JOEY_TEST_GIT_BIN", fake_git.display().to_string());
+        }
 
-        let orig_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{}", fake_bin_dir.path().display(), orig_path);
-        std::env::set_var("PATH", &new_path);
+        #[cfg(unix)]
+        {
+            let orig_path = std::env::var("PATH").unwrap_or_default();
+            let new_path = format!("{}:{}", fake_bin_dir.path().display(), orig_path);
+            std::env::set_var("PATH", &new_path);
+        }
         // Shrink the per-call timeout so the test trips it in milliseconds
         // instead of waiting out the 5s production default. The fake git
         // sleeps 5s — far beyond the 400ms override (kept >= 2x it).
@@ -1544,7 +1569,10 @@ mod tests {
         let result = mgr.checkpoint("should time out");
         let elapsed = start.elapsed();
 
+        #[cfg(unix)]
         std::env::set_var("PATH", &orig_path);
+        #[cfg(windows)]
+        std::env::remove_var("JOEY_TEST_GIT_BIN");
         std::env::remove_var("JOEY_TEST_GIT_TIMEOUT_MS");
 
         assert!(result.is_none(), "hung git call should fail gracefully");
@@ -1563,21 +1591,49 @@ mod tests {
     fn revparse_broken_git_shim() -> tempfile::TempDir {
         let real_git = which::which("git").expect("git required");
         let dir = tempfile::tempdir().unwrap();
-        let shim = dir.path().join("git");
-        std::fs::write(
-            &shim,
-            format!(
-                "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"rev-parse\" ]; then\n    exit 3\n  fi\ndone\nexec \"{}\" \"$@\"\n",
-                real_git.display()
-            ),
-        )
-        .unwrap();
         #[cfg(unix)]
         {
+            let shim = dir.path().join("git");
+            std::fs::write(
+                &shim,
+                format!(
+                    "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"rev-parse\" ]; then\n    exit 3\n  fi\ndone\nexec \"{}\" \"$@\"\n",
+                    real_git.display()
+                ),
+            )
+            .unwrap();
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&shim).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&shim, perms).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            // A .bat shim: CreateProcess cannot exec shebang scripts. The
+            // real git is invoked by absolute path (the shim dir is
+            // prepended to PATH, so a bare `git` would recurse into the
+            // shim itself).
+            let real_git_str = if real_git.extension().is_none() {
+                // which::which returns git.exe — keep the user's PATH form
+                // but ensure the extension so CreateProcess resolves it.
+                let with_ext = real_git.with_extension("exe");
+                if with_ext.is_file() {
+                    with_ext
+                } else {
+                    real_git.clone()
+                }
+            } else {
+                real_git.clone()
+            };
+            let shim = dir.path().join("git.bat");
+            std::fs::write(
+                &shim,
+                format!(
+                    "@echo off\r\nif \"%1\"==\"rev-parse\" exit /b 3\r\n\"{real}\" %*\r\nexit /b %ERRORLEVEL%\r\n",
+                    real = real_git_str.display()
+                ),
+            )
+            .unwrap();
         }
         dir
     }
@@ -1609,9 +1665,15 @@ mod tests {
 
         let shim_dir = revparse_broken_git_shim();
         let orig_path = std::env::var("PATH").unwrap_or_default();
+        #[cfg(unix)]
         std::env::set_var(
             "PATH",
             format!("{}:{}", shim_dir.path().display(), orig_path),
+        );
+        #[cfg(windows)]
+        std::env::set_var(
+            "JOEY_TEST_GIT_BIN",
+            shim_dir.path().join("git.bat").display().to_string(),
         );
 
         // New content would otherwise justify checkpoint #2 — with the
@@ -1619,7 +1681,10 @@ mod tests {
         std::fs::write(work_tree.join("b.txt"), "v2").unwrap();
         let result = mgr.checkpoint("should fail cleanly");
 
+        #[cfg(unix)]
         std::env::set_var("PATH", &orig_path);
+        #[cfg(windows)]
+        std::env::remove_var("JOEY_TEST_GIT_BIN");
 
         assert_eq!(
             result, None,
@@ -1655,14 +1720,23 @@ mod tests {
 
         let shim_dir = revparse_broken_git_shim();
         let orig_path = std::env::var("PATH").unwrap_or_default();
+        #[cfg(unix)]
         std::env::set_var(
             "PATH",
             format!("{}:{}", shim_dir.path().display(), orig_path),
         );
+        #[cfg(windows)]
+        std::env::set_var(
+            "JOEY_TEST_GIT_BIN",
+            shim_dir.path().join("git.bat").display().to_string(),
+        );
 
         let listed = mgr.list();
 
+        #[cfg(unix)]
         std::env::set_var("PATH", &orig_path);
+        #[cfg(windows)]
+        std::env::remove_var("JOEY_TEST_GIT_BIN");
 
         assert!(
             listed.is_err(),

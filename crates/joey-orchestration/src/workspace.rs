@@ -295,6 +295,12 @@ mod tests {
         if !git(&["init"]) {
             return None;
         }
+        // Pin line endings: a machine-level `core.autocrlf=true` (Git-for-
+        // Windows default) rewrites LF → CRLF on worktree checkouts from
+        // this scratch repo, breaking byte-exact assertions.
+        if !git(&["config", "core.autocrlf", "false"]) {
+            return None;
+        }
         if !git(&["config", "user.email", "test@example.com"]) {
             return None;
         }

@@ -307,9 +307,17 @@ mod tests {
         fs::create_dir_all(root.join(".github")).unwrap();
         fs::write(root.join(".github/copilot-instructions.md"), "# Copilot\n").unwrap();
         let found = discover(root);
+        // Rel strings in canonical forward-slash form (the convention
+        // `default_glob` and glob matching use); `strip_prefix` yields
+        // native separators on Windows.
         let rels: Vec<String> = found
             .iter()
-            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
             .collect();
         assert_eq!(
             rels,
