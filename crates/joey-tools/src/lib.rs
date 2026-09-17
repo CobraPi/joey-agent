@@ -21,6 +21,7 @@ pub mod registry;
 pub mod safe_commands;
 pub mod sanitize;
 pub mod sanitize_input;
+pub mod shell_discovery;
 pub mod storage;
 pub mod toolsets;
 pub mod tools;

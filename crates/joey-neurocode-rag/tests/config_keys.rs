@@ -99,7 +99,7 @@ fn fresh_config_yields_exact_contract_defaults() {
     );
     assert_eq!(
         rag.model,
-        "nomic-embed-text-v1.5",
+        "nomic-embed-text:latest",
         "neurocode.rag.model default"
     );
     assert_eq!(rag.api_key, "", "neurocode.rag.api_key default empty");
@@ -156,7 +156,7 @@ fn model_dir_default_is_profile_keyed_under_joey_home() {
         .path()
         .join("neurocode")
         .join("models")
-        .join("nomic-embed-text-v1.5");
+        .join("nomic-embed-text:latest");
     assert_eq!(rag.model_dir, expected);
 }
 

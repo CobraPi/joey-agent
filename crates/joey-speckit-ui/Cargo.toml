@@ -25,6 +25,7 @@ walkdir.workspace = true
 which.workspace = true
 dirs.workspace = true
 tokio-util.workspace = true
+joey-tools.workspace = true
 
 axum = { version = "0.7", features = ["ws"] }
 notify = "6"

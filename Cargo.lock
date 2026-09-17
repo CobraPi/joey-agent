@@ -3032,6 +3032,7 @@ dependencies = [
  "gix",
  "hex",
  "http-body-util",
+ "joey-tools",
  "notify",
  "notify-debouncer-mini",
  "pulldown-cmark",

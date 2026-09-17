@@ -55,7 +55,7 @@ async fn run_script_or_cli(
 
     if let Some(script) = script_path(repo_root, script_name) {
         tracing::info!(script = %script.display(), "invoking speckit bash script");
-        let output = Command::new("bash")
+        let output = Command::new(joey_tools::shell_discovery::posix_shell())
             .arg(&script)
             .args(args)
             .current_dir(repo_root)
@@ -111,7 +111,7 @@ async fn run_implement_task_with_instructions(
     let instructions = instructions.map(str::to_owned);
 
     if let Some(script) = script_path(repo_root, "implement") {
-        let mut command = Command::new("bash");
+        let mut command = Command::new(joey_tools::shell_discovery::posix_shell());
         command
             .arg(script)
             .args(args)

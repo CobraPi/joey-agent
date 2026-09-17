@@ -418,10 +418,13 @@ impl Tool for SkillView {
                     if !f.path().is_file() || f.file_name() == "SKILL.md" {
                         continue;
                     }
+                    // Forward slashes: bucket classification and the
+                    // envelope contract are platform-uniform (Windows
+                    // strip_prefix yields backslashes otherwise).
                     let rel = f
                         .path()
                         .strip_prefix(dir)
-                        .map(|r| r.to_string_lossy().into_owned())
+                        .map(|r| r.to_string_lossy().replace('\\', "/"))
                         .unwrap_or_default();
                     let bucket = if rel.starts_with("references/") {
                         "references"
@@ -484,6 +487,15 @@ impl Tool for SkillView {
         }
 
         // ── Main SKILL.md mode ────────────────────────────────────────
+        // Rel paths are normalized to forward slashes: the file_path
+        // parameter contract ('references/api.md') and the envelope output
+        // are platform-uniform, but Path::strip_prefix + to_string_lossy
+        // yields backslashes on Windows.
+        fn rel_posix(dir: &std::path::Path, p: &std::path::Path) -> String {
+            p.strip_prefix(dir)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default()
+        }
         let mut reference_files: Vec<String> = Vec::new();
         let mut template_files: Vec<String> = Vec::new();
         let mut asset_files: Vec<String> = Vec::new();
@@ -495,9 +507,7 @@ impl Tool for SkillView {
                     if f.path().is_file()
                         && f.path().extension().and_then(|e| e.to_str()) == Some("md")
                     {
-                        if let Ok(rel) = f.path().strip_prefix(dir) {
-                            reference_files.push(rel.to_string_lossy().into_owned());
-                        }
+                        reference_files.push(rel_posix(dir, f.path()));
                     }
                 }
             }
@@ -505,9 +515,7 @@ impl Tool for SkillView {
             if templates.exists() {
                 for f in WalkDir::new(&templates).into_iter().flatten() {
                     if f.path().is_file() {
-                        if let Ok(rel) = f.path().strip_prefix(dir) {
-                            template_files.push(rel.to_string_lossy().into_owned());
-                        }
+                        template_files.push(rel_posix(dir, f.path()));
                     }
                 }
             }
@@ -515,9 +523,7 @@ impl Tool for SkillView {
             if assets.exists() {
                 for f in WalkDir::new(&assets).into_iter().flatten() {
                     if f.path().is_file() {
-                        if let Ok(rel) = f.path().strip_prefix(dir) {
-                            asset_files.push(rel.to_string_lossy().into_owned());
-                        }
+                        asset_files.push(rel_posix(dir, f.path()));
                     }
                 }
             }
@@ -531,9 +537,7 @@ impl Tool for SkillView {
                                 | Some("rb")
                         )
                     {
-                        if let Ok(rel) = f.path().strip_prefix(dir) {
-                            script_files.push(rel.to_string_lossy().into_owned());
-                        }
+                        script_files.push(rel_posix(dir, f.path()));
                     }
                 }
             }

@@ -418,7 +418,7 @@ the canonical `RAG_CONFIG_KEYS` table in `joey-neurocode-rag`):
 `neurocode.rag.enabled` (default false), `neurocode.rag.prefetch.enabled`
 (false), `neurocode.rag.backend` (`"auto"`), `neurocode.rag.base_url`
 (loopback default `http://localhost:11434`), `neurocode.rag.model`
-(`nomic-embed-text-v1.5`), `neurocode.rag.local.model_dir` (empty =
+(`nomic-embed-text:latest`), `neurocode.rag.local.model_dir` (empty =
 profile-scoped default).
 
 `RagRefreshPhase` is `Idle` or `Refreshing { files_done, files_total }`.

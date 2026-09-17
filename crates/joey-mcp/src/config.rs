@@ -725,15 +725,25 @@ mcp_servers:
 
     #[test]
     fn prepend_path_dedupes_and_prepends() {
+        // The helper splits/joins PATH on the NATIVE list separator
+        // (';' on Windows, ':' elsewhere) — inputs and expectations use
+        // the same separator.
+        #[cfg(unix)]
+        let (existing, tool, usr_bin, bin, solo) =
+            ("/usr/bin:/bin", "/opt/tool", "/usr/bin", "/bin", "/solo");
+        #[cfg(windows)]
+        let (existing, tool, usr_bin, bin, solo) =
+            (r"C:\usr\bin;C:\bin", r"C:\opt\tool", r"C:\usr\bin", r"C:\bin", r"C:\solo");
+        let sep = if cfg!(windows) { ';' } else { ':' };
         let mut env: IndexMap<String, String> =
-            [("PATH".to_string(), "/usr/bin:/bin".to_string())].into_iter().collect();
-        prepend_path(&mut env, "/opt/tool");
-        assert_eq!(env["PATH"], "/opt/tool:/usr/bin:/bin");
-        prepend_path(&mut env, "/usr/bin");
-        assert_eq!(env["PATH"], "/opt/tool:/usr/bin:/bin");
+            [("PATH".to_string(), existing.to_string())].into_iter().collect();
+        prepend_path(&mut env, tool);
+        assert_eq!(env["PATH"], format!("{tool}{sep}{usr_bin}{sep}{bin}"));
+        prepend_path(&mut env, usr_bin);
+        assert_eq!(env["PATH"], format!("{tool}{sep}{usr_bin}{sep}{bin}"));
         let mut empty: IndexMap<String, String> = IndexMap::new();
-        prepend_path(&mut empty, "/solo");
-        assert_eq!(empty["PATH"], "/solo");
+        prepend_path(&mut empty, solo);
+        assert_eq!(empty["PATH"], solo);
     }
 
     #[cfg(unix)]

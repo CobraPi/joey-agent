@@ -6,8 +6,11 @@
 //!
 //! Profiles:
 //!
-//! - `nomic-embed-text-v1.5` — 768-dim, 8192 ctx, mean pooling + client-side
-//!   L2, prefixes `search_query: ` / `search_document: `, Apache-2.0 (default).
+//! - `nomic-embed-text:latest` — 768-dim, 8192 ctx, mean pooling +
+//!   client-side L2, prefixes `search_query: ` / `search_document: `,
+//!   Apache-2.0 (default; Ollama's `:latest` tag for nomic-embed-text v1.5).
+//! - `nomic-embed-text-v1.5` — identical parameters under the versioned
+//!   name; kept accepted for existing configs and on-disk indexes.
 //! - `CodeRankEmbed` — 768-dim, 8192 ctx, mean pooling + client-side L2,
 //!   query-only prefix `Represent this query for searching relevant code: `,
 //!   EMPTY document prefix, MIT.
@@ -114,6 +117,22 @@ pub const NOMIC_EMBED_TEXT_V1_5: EmbedProfile = EmbedProfile {
     license: "Apache-2.0",
 };
 
+/// Profile: `nomic-embed-text:latest` — the DEFAULT model profile under the
+/// Ollama provider's tag naming (Ollama serves nomic-embed-text v1.5 under
+/// its `:latest` tag; parameters are byte-identical to
+/// [`NOMIC_EMBED_TEXT_V1_5`], which stays accepted under the versioned name
+/// so existing configs and persisted indexes keep resolving).
+pub const NOMIC_EMBED_TEXT_LATEST: EmbedProfile = EmbedProfile {
+    name: "nomic-embed-text:latest",
+    dim: 768,
+    ctx: 8192,
+    pooling: Pooling::Mean,
+    l2_normalize: true,
+    prefix_query: "search_query: ",
+    prefix_document: "search_document: ",
+    license: "Apache-2.0",
+};
+
 /// Profile: `CodeRankEmbed` — the supported alternative (research.md R2:
 /// 137M params, MIT, 8192 ctx, mean pooling + L2; query prefix
 /// `Represent this query for searching relevant code: `, documents
@@ -165,15 +184,16 @@ pub const METIS_1024_I16_BINARY: EmbedProfile = EmbedProfile {
 /// The accepted profile table. Lookup by name via [`lookup`]; the default
 /// resolution is [`default_profile`] ([`DEFAULT_PROFILE_NAME`]).
 pub const PROFILES: &[EmbedProfile] = &[
+    NOMIC_EMBED_TEXT_LATEST,
     NOMIC_EMBED_TEXT_V1_5,
     CODERANK_EMBED,
     TEXT_EMBEDDING_3_SMALL,
     METIS_1024_I16_BINARY,
 ];
 
-/// Default profile identity (research.md R2: nomic-embed-text-v1.5 is the
-/// default model profile; resolved whenever no explicit profile is set).
-pub const DEFAULT_PROFILE_NAME: &str = "nomic-embed-text-v1.5";
+/// Default profile identity (Ollama's `nomic-embed-text:latest` tag for
+/// nomic-embed-text v1.5; resolved whenever no explicit profile is set).
+pub const DEFAULT_PROFILE_NAME: &str = "nomic-embed-text:latest";
 
 /// Look up an accepted profile by exact name.
 ///
@@ -183,7 +203,7 @@ pub fn lookup(name: &str) -> Option<&'static EmbedProfile> {
     PROFILES.iter().find(|p| p.name == name)
 }
 
-/// Default profile resolution — [`NOMIC_EMBED_TEXT_V1_5`].
+/// Default profile resolution — [`NOMIC_EMBED_TEXT_LATEST`].
 pub fn default_profile() -> &'static EmbedProfile {
     // Const-table invariant: the default name is present in PROFILES
     // (pinned by unit + integration tests).

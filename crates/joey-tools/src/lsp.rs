@@ -773,12 +773,47 @@ fn path_to_uri(path: &str) -> String {
             .map(|c| c.join(path).to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string())
     };
+    // File URIs use forward slashes; a Windows drive-prefixed path
+    // additionally needs the leading slash (`file:///C:/x/y`), per the
+    // LSP/file-URI convention. `\` → `/` first so encoding sees none.
+    #[cfg(windows)]
+    let abs = {
+        let fwd = abs.replace('\\', "/");
+        let b = fwd.as_bytes();
+        if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() && !fwd.starts_with('/') {
+            format!("/{fwd}")
+        } else {
+            fwd
+        }
+    };
+    // Windows: keep the drive colon verbatim (`/C:`) — percent-encoding it
+    // (`C%3A`) is valid URI practice but breaks round-trip parity with the
+    // plain-path form LSP servers echo back. Encode everything after the
+    // 3-byte drive prefix.
+    #[cfg(windows)]
+    {
+        let b = abs.as_bytes();
+        if b.len() >= 3 && b[0] == b'/' && b[2] == b':' && b[1].is_ascii_alphabetic() {
+            return format!("file:///{}{}", &abs[1..3], encode_uri_path(&abs[3..]));
+        }
+    }
     format!("file://{}", encode_uri_path(&abs))
 }
 
 fn uri_to_path(uri: &str) -> String {
     let stripped = uri.strip_prefix("file://").unwrap_or(uri);
-    decode_uri_path(stripped)
+    let decoded = decode_uri_path(stripped);
+    // Windows: a drive-prefixed URI path (`/C:/x/y`) maps back to the
+    // native `C:\x\y` so diagnostics keyed under the native absolute
+    // path (manager `resolve_path`) are found by `.get(&abs)`.
+    #[cfg(windows)]
+    {
+        let b = decoded.as_bytes();
+        if b.len() >= 3 && b[0] == b'/' && b[2] == b':' && b[1].is_ascii_alphabetic() {
+            return decoded[1..].replace('/', "\\");
+        }
+    }
+    decoded
 }
 
 fn severity_string(severity: u64) -> String {
@@ -975,10 +1010,22 @@ mod tests {
 
     #[test]
     fn path_uri_roundtrip() {
-        let path = "/home/user/project/file.rs";
-        let uri = path_to_uri(path);
-        assert!(uri.starts_with("file://"));
-        assert_eq!(uri_to_path(&uri), path);
+        #[cfg(unix)]
+        {
+            let path = "/home/user/project/file.rs";
+            let uri = path_to_uri(path);
+            assert!(uri.starts_with("file://"));
+            assert_eq!(uri_to_path(&uri), path);
+        }
+        #[cfg(windows)]
+        {
+            // Drive-prefixed paths use the file:///C:/... convention and
+            // round-trip back to native backslash form.
+            let path = r"C:\Users\joeyo\project\file.rs";
+            let uri = path_to_uri(path);
+            assert!(uri.starts_with("file:///C:/"), "uri was {uri}");
+            assert_eq!(uri_to_path(&uri), path);
+        }
     }
 
     #[test]
@@ -1237,16 +1284,34 @@ while True:
     /// #13: paths with spaces percent-encode and round-trip.
     #[test]
     fn uri_encoding_spaces_roundtrip() {
-        let path = "/tmp/my dir/file name.rs";
-        let uri = path_to_uri(path);
-        assert_eq!(uri, "file:///tmp/my%20dir/file%20name.rs");
-        assert_eq!(uri_to_path(&uri), path);
+        #[cfg(unix)]
+        {
+            let path = "/tmp/my dir/file name.rs";
+            let uri = path_to_uri(path);
+            assert_eq!(uri, "file:///tmp/my%20dir/file%20name.rs");
+            assert_eq!(uri_to_path(&uri), path);
+        }
+        #[cfg(windows)]
+        {
+            let path = r"C:\tmp\my dir\file name.rs";
+            let uri = path_to_uri(path);
+            assert_eq!(uri, "file:///C:/tmp/my%20dir/file%20name.rs");
+            assert_eq!(uri_to_path(&uri), path);
+        }
     }
 
     /// #13: '#' and '%' are reserved and must be encoded; round-trip holds.
     #[test]
     fn uri_encoding_hash_and_percent_roundtrip() {
+        #[cfg(unix)]
         for path in ["/tmp/a#b/file.rs", "/tmp/100%/weird#name.py"] {
+            let uri = path_to_uri(path);
+            assert!(uri.contains("%23") || !path.contains('#'), "hash encoded: {uri}");
+            assert!(uri.contains("%25") || !path.contains('%'), "percent encoded: {uri}");
+            assert_eq!(uri_to_path(&uri), path, "round-trip must restore the raw path");
+        }
+        #[cfg(windows)]
+        for path in [r"C:\tmp\a#b\file.rs", r"C:\tmp\100%\weird#name.py"] {
             let uri = path_to_uri(path);
             assert!(uri.contains("%23") || !path.contains('#'), "hash encoded: {uri}");
             assert!(uri.contains("%25") || !path.contains('%'), "percent encoded: {uri}");
@@ -1258,7 +1323,10 @@ while True:
     /// the decoded raw path so `diagnostics.get(&abs)` finds them.
     #[test]
     fn diagnostics_keyed_under_decoded_path() {
+        #[cfg(unix)]
         let raw = "/tmp/my dir/a#b.rs";
+        #[cfg(windows)]
+        let raw = r"C:\tmp\my dir\a#b.rs";
         let uri = path_to_uri(raw); // encoded
         let msg = json!({
             "jsonrpc": "2.0",

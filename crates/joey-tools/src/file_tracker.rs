@@ -794,7 +794,11 @@ mod tests {
 
     /// Helper: write a temp file with the given content and return its path.
     fn tmp_write(name: &str, content: &str) -> String {
-        let path = format!("/tmp/joey_ft_test_{}", name);
+        // Native Windows has no /tmp — use the platform temp dir.
+        let path = std::env::temp_dir()
+            .join(format!("joey_ft_test_{}", name))
+            .to_string_lossy()
+            .into_owned();
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         path
@@ -824,9 +828,17 @@ mod tests {
         assert!(d.diff.diff.contains("+MODIFIED"));
         assert!(d.diff.diff.contains("-line2"));
 
-        // Second drain is empty — pending set was cleared.
+        // Second drain no longer contains THIS file's entry — the pending
+        // set was cleared by the first drain. (Other tests in this binary
+        // record writes into the process-global FileTracker without
+        // holding FT_TEST_LOCK, so foreign entries may legitimately appear
+        // here under parallel load; they are not this test's concern.)
         let again = FileTracker::drain_pending_diffs();
-        assert!(again.is_empty(), "drain must clear the pending set");
+        assert!(
+            again.iter().all(|d| d.path != path),
+            "drain must clear the pending set for this file's entry; saw {:?}",
+            again.iter().map(|d| d.path.clone()).collect::<Vec<_>>()
+        );
 
         let _ = std::fs::remove_file(&path);
         FileTracker::reset();
@@ -879,12 +891,15 @@ mod tests {
     fn drain_pending_diffs_binary() {
         let _guard = FT_TEST_LOCK.lock().unwrap();
         FileTracker::reset();
-        let path = "/tmp/joey_ft_test_t007.bin";
+        let path = std::env::temp_dir()
+            .join("joey_ft_test_t007.bin")
+            .to_string_lossy()
+            .into_owned();
         // Write invalid UTF-8 bytes.
-        let mut f = std::fs::File::create(path).unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(&[0xFF, 0xFE, 0x00, 0x01, 0x80]).unwrap();
-        FileTracker::record_read(path, Some("text baseline\n"));
-        FileTracker::record_write(path);
+        FileTracker::record_read(&path, Some("text baseline\n"));
+        FileTracker::record_write(&path);
 
         let diffs = FileTracker::drain_pending_diffs();
         assert_eq!(diffs.len(), 1);

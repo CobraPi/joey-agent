@@ -2821,11 +2821,14 @@ mod model_fetch_tests {
     /// same path production uses (`RagConfig::load` over a temp YAML).
     fn rag_config(mirror_url: &str, model_dir: &Path) -> RagConfig {
         let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Forward-slash the embedded path: a Windows backslash path inside
+        // a double-quoted YAML scalar is an invalid escape sequence, which
+        // would silently drop the whole config (mirror_url included).
+        let model_dir_fwd = model_dir.display().to_string().replace('\\', "/");
         std::fs::write(
             tmp.path(),
             format!(
-                "neurocode:\n  rag:\n    local:\n      mirror_url: \"{mirror_url}\"\n      model_dir: \"{}\"\n",
-                model_dir.display()
+                "neurocode:\n  rag:\n    local:\n      mirror_url: \"{mirror_url}\"\n      model_dir: \"{model_dir_fwd}\"\n"
             ),
         )
         .unwrap();
@@ -4181,6 +4184,8 @@ mod model_fetch_dylib_tests {
     /// A config with the given mirror_url (+ optional ort_dylib_path).
     fn rag_config_dylib(mirror_url: &str, ort_dylib_path: &str) -> RagConfig {
         let tmp = tempfile::NamedTempFile::new().unwrap();
+        // See rag_config: forward-slash paths for valid double-quoted YAML.
+        let ort_dylib_path = ort_dylib_path.replace('\\', "/");
         std::fs::write(
             tmp.path(),
             format!(
@@ -4654,9 +4659,13 @@ mod model_fetch_dylib_tests {
         server.stop();
 
         assert!(dylib_fetch_root().join("9.9.9").join(&platform.filename).exists());
+        // The report echoes the config value as stored in the YAML —
+        // forward-slashed on Windows (see rag_config_dylib) — so match
+        // the normalized form, not the native backslash path.
+        let cfg_dylib_fwd = cfg_dylib.to_str().unwrap().replace('\\', "/");
         assert!(
             out.contains("Runtime resolution: neurocode.rag.local.ort_dylib_path")
-                && out.contains(cfg_dylib.to_str().unwrap()),
+                && out.contains(&cfg_dylib_fwd),
             "config rung wins over the fetched copy: {out}"
         );
     }
@@ -4727,11 +4736,16 @@ pub(crate) mod production_wiring_tests {
     fn rag_enabled_config() -> joey_core::Config {
         let model_dir = tempfile::tempdir().unwrap(); // exists but EMPTY
         let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Forward-slash the embedded path (see rag_config): a Windows
+        // backslash path inside a double-quoted YAML scalar is an invalid
+        // escape sequence, which silently drops the whole config — the
+        // test then runs with RAG disabled and every assertion below
+        // fails for the wrong reason.
+        let model_dir_fwd = model_dir.path().display().to_string().replace('\\', "/");
         std::fs::write(
             tmp.path(),
             format!(
-                "neurocode:\n  rag:\n    enabled: true\n    local:\n      model_dir: \"{}\"\n",
-                model_dir.path().display()
+                "neurocode:\n  rag:\n    enabled: true\n    local:\n      model_dir: \"{model_dir_fwd}\"\n"
             ),
         )
         .unwrap();

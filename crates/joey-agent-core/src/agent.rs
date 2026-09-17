@@ -213,7 +213,7 @@ impl RagGate {
             }
             // "auto" and any unknown value (config-layer fallback).
             _ => {
-                let model = cfg.get_str(rag_keys::MODEL, "nomic-embed-text-v1.5");
+                let model = cfg.get_str(rag_keys::MODEL, "nomic-embed-text:latest");
                 let raw_dir = cfg.get_str(rag_keys::LOCAL_MODEL_DIR, "");
                 let dir = if raw_dir.trim().is_empty() {
                     joey_core::joey_home().join("neurocode").join("models").join(&model)

@@ -77,7 +77,21 @@ fn with_history_lock_deadline<T>(
                 locked = Some(f);
                 break;
             }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            Err(e) if matches!(e.kind(), ErrorKind::AlreadyExists | ErrorKind::PermissionDenied) => {
+                // `AlreadyExists` is the normal "held elsewhere" signal.
+                // Windows additionally returns ACCESS_DENIED
+                // (`PermissionDenied`) for a create-new on a live lock in
+                // some sharing/delete-pending states — treating that as
+                // "unwritable, proceed unlocked" let every waiter into the
+                // critical section at once and tore the file on Windows.
+                // Retry it on the same wait/stale/wedge path instead.
+                if e.kind() == ErrorKind::PermissionDenied {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    if std::time::Instant::now() > deadline {
+                        break; // wedged — proceed unlocked (best-effort)
+                    }
+                    continue;
+                }
                 // Break a stale lock (writer crashed mid-cycle).
                 if let Ok(md) = std::fs::metadata(&lock_path) {
                     let stale = md
@@ -140,7 +154,13 @@ fn record_at(path: &std::path::Path, text: &str) {
         }
         // Commit atomically: write a unique sibling temp file, then rename
         // over the real path — a concurrent reader never sees a torn file.
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        // The name must be unique per COMMIT cycle, not per process: the
+        // CLI and TUI can be distinct processes, but the wedge fallback can
+        // also overlap two writers in THIS process, and a shared name lets
+        // one writer's rename consume the other's file mid-write.
+        static COMMIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COMMIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
         let Ok(mut f) = std::fs::File::create(&tmp) else {
             return;
         };
@@ -149,7 +169,10 @@ fn record_at(path: &std::path::Path, text: &str) {
         }
         let _ = f.flush();
         let _ = f.sync_all();
-        let _ = std::fs::rename(&tmp, path);
+        if std::fs::rename(&tmp, path).is_err() {
+            // Never leave the sibling behind on a failed commit.
+            let _ = std::fs::remove_file(&tmp);
+        }
     });
 }
 

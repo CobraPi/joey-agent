@@ -915,7 +915,7 @@ mod tests {
         let info = backend.describe_embedder(); // static, no I/O
         assert_eq!(info.backend_kind, BackendKind::OpenAiCompat);
         assert_eq!(info.base_url, "http://embed.example.invalid");
-        assert_eq!(info.model, "nomic-embed-text-v1.5");
+        assert_eq!(info.model, "nomic-embed-text:latest");
 
         let mut cfg = cfg;
         cfg.backend = Ollama;
@@ -1225,7 +1225,18 @@ mod tests {
         let store = GraphStore::open(&project.join("graph.db")).unwrap();
         // SQLite reports the db path with symlinks resolved (macOS temp
         // dirs live under /private/var) — canonicalize the expectation.
+        // Windows canonicalize() yields a \\?\-prefixed verbatim path
+        // while the store-derived dir is the plain form; strip it so the
+        // two compare equal.
         let canonical = std::fs::canonicalize(&project).unwrap();
+        #[cfg(windows)]
+        let canonical = {
+            let s = canonical.to_string_lossy().into_owned();
+            match s.strip_prefix(r"\\?\") {
+                Some(stripped) => std::path::PathBuf::from(stripped),
+                None => canonical,
+            }
+        };
         assert_eq!(
             consent_dir_for(Some(&store)),
             Some(canonical),

@@ -854,10 +854,23 @@ fn reaches(from: &TaskId, to: &TaskId, nodes: &BTreeMap<TaskId, TaskNode>) -> bo
 }
 
 /// Why a path violates the project-root constraint, if it does: absolute
-/// paths and any path containing a `..` component are rejected.
+/// paths, rooted-but-drive-relative paths, and any path containing a `..`
+/// component are rejected.
 fn path_violation(path: &Path) -> Option<&'static str> {
     if path.is_absolute() {
         return Some("absolute path");
+    }
+    // Windows: `/abs/x` and `\abs\x` carry a root but no drive prefix, so
+    // `is_absolute()` is false — yet joining them onto a project base
+    // anchors to the base's DRIVE root, outside the project. A bare
+    // drive-relative `C:x` escapes the same way (Path::push with a
+    // prefixed path replaces the base entirely). Reject any root or
+    // drive-prefix component on every platform.
+    if path
+        .components()
+        .any(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
+    {
+        return Some("rooted or drive-prefixed path");
     }
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Some("parent-dir component");
