@@ -17,7 +17,10 @@ pub struct Watchdog {
 }
 
 impl Watchdog {
-    /// A watchdog with the default 30-second limit.
+    /// The documented default limit: 30 seconds (FR-011, contracts/api.md §2).
+    pub const DEFAULT_LIMIT: Duration = Duration::from_secs(30);
+
+    /// A watchdog with a caller-configured per-job limit.
     pub fn new(limit: Duration) -> Self {
         Self { limit }
     }
@@ -45,5 +48,13 @@ impl Watchdog {
     /// The configured limit.
     pub fn limit(&self) -> Duration {
         self.limit
+    }
+}
+
+impl Default for Watchdog {
+    fn default() -> Self {
+        Self {
+            limit: Self::DEFAULT_LIMIT,
+        }
     }
 }

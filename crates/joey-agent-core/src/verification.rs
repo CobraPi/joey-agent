@@ -650,17 +650,27 @@ pub fn build_verify_on_stop_nudge_with_retrieval(
 
 // ─── Tests ────────────────────────────────────────────────────────────
 
+/// Serialize ALL tests that mutate the process-global LEDGER. Defined
+/// outside `mod tests` so `agent::tests` (which also calls `clear_all` /
+/// `verify_nudge_decision` on the ledger) shares the SAME lock — two
+/// module-local locks over one global ledger raced under parallel load
+/// and flaked the retrieval/nudge suites.
+#[cfg(test)]
+pub(crate) fn ledger_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Serialize tests that share the global LEDGER.
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        super::ledger_test_lock()
     }
 
     #[test]

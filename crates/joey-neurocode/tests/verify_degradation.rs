@@ -7,10 +7,37 @@ use joey_neurocode::graph::DependencyGraph;
 use joey_neurocode::verify::runner::VerifyStep;
 use joey_neurocode::verify::VerifyLoop;
 
+/// Portable fixture commands (Unix `true`/`false`/`sleep` are not on the
+/// Windows PATH; the runner shlex-splits and PATH-resolves the program).
+#[cfg(unix)]
+fn hang_cmd() -> &'static str {
+    "sleep 30"
+}
+#[cfg(windows)]
+fn hang_cmd() -> &'static str {
+    "ping -n 31 127.0.0.1"
+}
+#[cfg(unix)]
+fn ok_cmd() -> &'static str {
+    "true"
+}
+#[cfg(windows)]
+fn ok_cmd() -> &'static str {
+    "cmd /C exit 0"
+}
+#[cfg(unix)]
+fn fail_cmd() -> &'static str {
+    "false"
+}
+#[cfg(windows)]
+fn fail_cmd() -> &'static str {
+    "cmd /C exit 1"
+}
+
 #[test]
 fn timeout_kills_hung_step() {
-    // `sleep 30` with a 1s timeout must be killed and reported skipped.
-    let step = VerifyStep::new("hang".into(), "sleep 30".into(), 1);
+    // A 30s no-op with a 1s timeout must be killed and reported skipped.
+    let step = VerifyStep::new("hang".into(), hang_cmd().into(), 1);
     let start = std::time::Instant::now();
     let out = step.run(std::path::Path::new("."));
     let elapsed = start.elapsed();
@@ -28,7 +55,7 @@ fn timeout_kills_hung_step() {
 
 #[test]
 fn fast_step_unaffected_by_timeout() {
-    let step = VerifyStep::new("noop".into(), "true".into(), 30);
+    let step = VerifyStep::new("noop".into(), ok_cmd().into(), 30);
     let out = step.run(std::path::Path::new("."));
     assert!(!out.skipped);
     assert_eq!(out.exit_code, 0);
@@ -75,7 +102,7 @@ fn hung_step_in_loop_degrades_not_escalates() {
     let config = VerifyConfig {
         steps: vec![VerifyStepConfig {
             name: "hang".into(),
-            command: "sleep 30".into(),
+            command: hang_cmd().into(),
             parse: "plain".into(),
             timeout_sec: 1,
         }],
@@ -97,7 +124,7 @@ fn real_failure_still_triggers_fix_iterations() {
     let config = VerifyConfig {
         steps: vec![VerifyStepConfig {
             name: "compile".into(),
-            command: "false".into(), // exits 1, always fails
+            command: fail_cmd().into(), // exits 1, always fails
             parse: "plain".into(),
             timeout_sec: 5,
         }],

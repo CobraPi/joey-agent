@@ -128,7 +128,7 @@
 - [x] T022 [P] Create `docs/compute-pool.md` (architecture and hard rule; scheduling policy; config keys; metrics; chunking guidance incl. the ~100µs small-op threshold; the subprocess-babysit op pattern as a documented recipe only; the singleton-vs-per-crate instantiation note) and add its index entry to `docs/README.md`.
 - [x] T023 [P] Add a Compute Pool section to `PORTING.md`: additive subsystem, no upstream-parity surface touched, "Deliberate divergence: none".
 - [x] T024 Run every validation scenario in `specs/033-please-reference-plan/quickstart.md` (Scenarios 1–7) and record results; any failure triggers a scoped fix in the owning task's files, not a spec change.
-- [ ] T025 Final gate: `cargo build --workspace && cargo test --workspace` exactly once; on failure, one fix round using targeted `-p <crate>` tests only, then re-run the gate once. Note: debug test binaries are large — run only with host memory headroom (see quickstart.md Prerequisites).
+- [x] T025 Final gate: `cargo build --workspace && cargo test --workspace` exactly once; on failure, one fix round using targeted `-p <crate>` tests only, then re-run the gate once. Note: debug test binaries are large — run only with host memory headroom (see quickstart.md Prerequisites).
 
 ---
 
@@ -213,3 +213,10 @@ Note: [Story] labels map tasks to spec.md user stories for traceability.
 - Weight honesty: weights come only from the orchestrator's `weight_for_task`; never accept LLM/subagent-supplied weights.
 - Deferred by design (see research.md): core pinning, EWMA scheduling input, per-agent caps, non-terminal call-site migration, subprocess-kill preemption wiring.
 - Commit after each task or logical group; stop at any checkpoint to validate the story independently.
+
+---
+
+## Phase 9: Convergence
+
+- [x] T026 Stabilize the file_tracker pending-diff tests against foreign parallel writers so `cargo test -p joey-tools` is reliably green on Windows: in `crates/joey-tools/src/file_tracker.rs`, make the first-drain assertion in `drain_pending_diffs_edit_and_clear` (~line 821) path-scoped (filter/compare only this test's file, mirroring the tolerant second-drain assertion at ~lines 836-841) or route the `FileTracker::record_write` callers exercised by file_tools tests through `FT_TEST_LOCK`; verify with repeated full `cargo test -p joey-tools` runs (the failure mode: foreign entries from parallel file_tools tests yield `diffs.len() == 3` instead of 1, poisoning `FT_TEST_LOCK` and cascading PoisonErrors into `drain_pending_diffs_noop_write` and `tracker_records_and_resets`) per SC-006/FR-013 (partial; blocks the T025 gate on Windows)
+- [x] T027 Add the documented 30-second default watchdog limit in `crates/joey-compute/src/watchdog.rs`: a `DEFAULT_LIMIT` constant plus a `Default` impl for `Watchdog` (or equivalent) so the "caller-configured per job; defaults to 30 seconds" behavior in FR-011 and contracts/api.md §2 is real in code, with a small test proving the default resolves to 30 s per FR-011 (partial)

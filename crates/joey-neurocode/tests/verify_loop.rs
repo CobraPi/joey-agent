@@ -9,10 +9,29 @@ use joey_neurocode::graph::DependencyGraph;
 use joey_neurocode::verify::parse::{parse_errors, StructuredError};
 use joey_neurocode::verify::runner::VerifyStep;
 
+/// Portable fixture commands (Unix `true`/`false` are not on the Windows
+/// PATH; the runner shlex-splits and PATH-resolves the program).
+#[cfg(unix)]
+fn ok_cmd() -> &'static str {
+    "true"
+}
+#[cfg(windows)]
+fn ok_cmd() -> &'static str {
+    "cmd /C exit 0"
+}
+#[cfg(unix)]
+fn fail_cmd() -> &'static str {
+    "false"
+}
+#[cfg(windows)]
+fn fail_cmd() -> &'static str {
+    "cmd /C exit 1"
+}
+
 #[test]
 fn failing_command_captured() {
     // `false` always exits non-zero.
-    let step = VerifyStep::new("compile".into(), "false".into(), 10);
+    let step = VerifyStep::new("compile".into(), fail_cmd().into(), 10);
     let out = step.run(std::path::Path::new("."));
 
     assert_ne!(
@@ -24,7 +43,7 @@ fn failing_command_captured() {
 
 #[test]
 fn passing_command_captured() {
-    let step = VerifyStep::new("noop".into(), "true".into(), 10);
+    let step = VerifyStep::new("noop".into(), ok_cmd().into(), 10);
     let out = step.run(std::path::Path::new("."));
     assert_eq!(out.exit_code, 0, "true should exit 0");
 }
@@ -203,7 +222,7 @@ fn record_pattern_and_anti_pattern() {
 
 #[test]
 fn verify_step_output_duration_nonzero() {
-    let step = VerifyStep::new("check".into(), "true".into(), 10);
+    let step = VerifyStep::new("check".into(), ok_cmd().into(), 10);
     let out = step.run(std::path::Path::new("."));
     // duration_ms may be 0 on very fast systems, but the field is populated.
     let _ = out.duration_ms;

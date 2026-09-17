@@ -1230,6 +1230,29 @@ while True:
         );
     }
 
+    /// Spawn a long-lived stand-in for a live LSP server (piped stdio).
+    /// Unix: `sleep 300`; Windows: `ping -n 301 127.0.0.1` (no sleep.exe;
+    /// same idiom as the fake-git timeout test in vcs.rs).
+    fn spawn_sleeper() -> std::process::Child {
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("300");
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("ping");
+            c.args(["-n", "301", "127.0.0.1"]);
+            c
+        };
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleeper")
+    }
+
     /// #12 regression (watchdog-kill shape): an entry whose child process
     /// was SIGKILLed (exactly what the request watchdog leaves behind)
     /// must be detected by ensure_client and replaced by a fresh spawn.
@@ -1243,13 +1266,7 @@ while True:
         // Manually insert a dead client: spawn a real child, kill it, wait
         // for it to be reaped, and register it under the "python" config
         // (simulating what the watchdog leaves in self.clients).
-        let mut child = std::process::Command::new("sleep")
-            .arg("300")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleep");
+        let mut child = spawn_sleeper();
         let stdin: Box<dyn Write + Send> = Box::new(child.stdin.take().unwrap());
         let stdout = BufReader::new(child.stdout.take().unwrap());
         child.kill().unwrap();
@@ -1340,13 +1357,7 @@ while True:
                 ]
             }
         });
-        let mut sleep_child = std::process::Command::new("sleep")
-            .arg("300")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut sleep_child = spawn_sleeper();
         let stdin: Box<dyn Write + Send> = Box::new(sleep_child.stdin.take().unwrap());
         let stdout = BufReader::new(sleep_child.stdout.take().unwrap());
         let mut client = LspClient {

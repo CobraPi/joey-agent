@@ -815,14 +815,26 @@ mod tests {
         }
 
         // Make a real dead child (exits immediately) for each session.
+        // Unix: `sleep 0`; Windows: one immediate ping (no sleep.exe).
         async fn dead_child() -> Child {
-            let mut c = tokio::process::Command::new("sleep")
-                .arg("0")
+            #[cfg(unix)]
+            let mut cmd = {
+                let mut c = tokio::process::Command::new("sleep");
+                c.arg("0");
+                c
+            };
+            #[cfg(windows)]
+            let mut cmd = {
+                let mut c = tokio::process::Command::new("ping");
+                c.args(["-n", "1", "127.0.0.1"]);
+                c
+            };
+            let mut c = cmd
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .expect("spawn sleep 0");
+                .expect("spawn dead child");
             let _ = c.wait().await;
             c
         }

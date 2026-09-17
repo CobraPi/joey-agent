@@ -817,9 +817,16 @@ mod tests {
         let _ = tmp_write("t006.txt", "line1\nMODIFIED\nline3\n");
         FileTracker::record_write(&path);
 
+        // First drain: filter to THIS test's file. Foreign entries from
+        // parallel file_tools tests (which record writes into the
+        // process-global FileTracker without holding FT_TEST_LOCK) may
+        // legitimately appear alongside it — mirroring the tolerant
+        // second-drain assertion below.
         let diffs = FileTracker::drain_pending_diffs();
-        assert_eq!(diffs.len(), 1, "one pending write should yield one diff");
-        let d = &diffs[0];
+        let d = diffs
+            .iter()
+            .find(|d| d.path == path)
+            .expect("this file's pending write should yield one diff");
         assert_eq!(d.path, path);
         assert_eq!(d.kind, PendingDiffKind::Edit);
         assert!(!d.is_binary);
@@ -853,11 +860,16 @@ mod tests {
         let path = tmp_write("t006b.txt", "new\ncontent\n");
         FileTracker::record_write(&path); // no record_read → Create
 
+        // Path-scoped: foreign entries from parallel tests are not this
+        // test's concern (see drain_pending_diffs_edit_and_clear).
         let diffs = FileTracker::drain_pending_diffs();
-        assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].kind, PendingDiffKind::Create);
-        assert_eq!(diffs[0].diff.added, 2);
-        assert_eq!(diffs[0].diff.removed, 0);
+        let d = diffs
+            .iter()
+            .find(|d| d.path == path)
+            .expect("this file's write should yield one diff");
+        assert_eq!(d.kind, PendingDiffKind::Create);
+        assert_eq!(d.diff.added, 2);
+        assert_eq!(d.diff.removed, 0);
 
         let _ = std::fs::remove_file(&path);
         FileTracker::reset();
@@ -876,10 +888,15 @@ mod tests {
         let _ = tmp_write("t006c.txt", "same\n");
         FileTracker::record_write(&path);
 
+        // Path-scoped: foreign entries from parallel tests are not this
+        // test's concern (see drain_pending_diffs_edit_and_clear).
         let diffs = FileTracker::drain_pending_diffs();
-        assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].diff.added, 0, "identical content → 0 additions");
-        assert_eq!(diffs[0].diff.removed, 0, "identical content → 0 removals");
+        let d = diffs
+            .iter()
+            .find(|d| d.path == path)
+            .expect("this file's write should yield one diff");
+        assert_eq!(d.diff.added, 0, "identical content → 0 additions");
+        assert_eq!(d.diff.removed, 0, "identical content → 0 removals");
 
         let _ = std::fs::remove_file(&path);
         FileTracker::reset();
@@ -901,9 +918,13 @@ mod tests {
         FileTracker::record_read(&path, Some("text baseline\n"));
         FileTracker::record_write(&path);
 
+        // Path-scoped: foreign entries from parallel tests are not this
+        // test's concern (see drain_pending_diffs_edit_and_clear).
         let diffs = FileTracker::drain_pending_diffs();
-        assert_eq!(diffs.len(), 1);
-        let d = &diffs[0];
+        let d = diffs
+            .iter()
+            .find(|d| d.path == path)
+            .expect("this file's write should yield one diff");
         assert!(d.is_binary, "non-UTF-8 content must be flagged binary");
         assert!(d.diff.diff.is_empty(), "binary diff text must be empty");
 
@@ -939,11 +960,16 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         FileTracker::record_delete(&path);
 
+        // Path-scoped: foreign entries from parallel tests are not this
+        // test's concern (see drain_pending_diffs_edit_and_clear).
         let diffs = FileTracker::drain_pending_diffs();
-        assert_eq!(diffs.len(), 1, "delete should yield one diff");
-        assert_eq!(diffs[0].kind, PendingDiffKind::Delete);
-        assert_eq!(diffs[0].diff.removed, 2, "prior content becomes removals");
-        assert!(diffs[0].diff.diff.contains("-to be removed"));
+        let d = diffs
+            .iter()
+            .find(|d| d.path == path)
+            .expect("delete should yield one diff");
+        assert_eq!(d.kind, PendingDiffKind::Delete);
+        assert_eq!(d.diff.removed, 2, "prior content becomes removals");
+        assert!(d.diff.diff.contains("-to be removed"));
         FileTracker::reset();
     }
 }

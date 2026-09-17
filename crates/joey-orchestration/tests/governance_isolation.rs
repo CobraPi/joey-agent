@@ -47,6 +47,21 @@ use tokio::net::{TcpListener, TcpStream};
 /// configured ceiling inlined.
 const RESOURCE_LIMIT_TEXT: &str = "[resource-limit] task exceeded 2s CPU budget";
 
+/// Serialize this file's tests. `gov_runaway_child_aborted_at_cpu_ceiling`
+/// deliberately burns a pure-computation OS thread, and the latency
+/// measurements in `gov_parent_scheduling_responsive_under_saturation`
+/// (2x baseline, 29/30 samples) are tight enough that overlapping CPU
+/// burn from a parallel sibling test corrupts whichever phase it lands
+/// in (observed flaking on Windows's default parallel test threads).
+/// Guard held across `.await`: it serializes CPU, not an async
+/// resource — same accepted pattern as joey-agent-core's TEST_HOME_LOCK.
+static GOV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the file-wide serialization lock (panic-safe).
+fn gov_lock() -> std::sync::MutexGuard<'static, ()> {
+    GOV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 // ---------------------------------------------------------------------------
 // Scripted mock OpenAI-compatible provider (governance_admission.rs harness
 // style + budgets.rs `tool_calls` scripting): one scripted response per HTTP
@@ -353,7 +368,9 @@ fn median_of(mut v: Vec<Duration>) -> Duration {
 ///     (~30µs preemption ≈ 66% of a 100-call batch but only ~7% of a
 ///     1000-call batch); batching raises the signal well above both.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn gov_parent_scheduling_responsive_under_saturation() {
+    let _gov = gov_lock();
     // Warm-up wave first: 2 fast-final children (~50ms) complete and land
     // in history, so the idle baseline builds the same 2 overview records
     // the saturated phase will (apples-to-apples).
@@ -452,7 +469,9 @@ async fn gov_parent_scheduling_responsive_under_saturation() {
 /// 2s CPU budget`. RED today: no CPU-ceiling abort exists — the child runs
 /// to natural completion (~9s) and reports success.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn gov_runaway_child_aborted_at_cpu_ceiling() {
+    let _gov = gov_lock();
     // Slow-but-finite script: 3 tool steps x 3s ≈ 9s total — long enough
     // for the 2s ceiling to hit, short enough to bound the test.
     let steps = vec![tool_step(3000), tool_step(3000), tool_step(3000), final_step(0)];
@@ -498,7 +517,9 @@ async fn gov_runaway_child_aborted_at_cpu_ceiling() {
 /// the exact `[resource-limit]` error. RED today: A is never aborted — it
 /// completes naturally (~9s) with success=true.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn gov_siblings_unaffected_by_runaway_abort() {
+    let _gov = gov_lock();
     // Separate deterministic servers: A's script is runaway-prone, B's is
     // a fast final (~300ms).
     let (url_a, _in_a, _max_a) =

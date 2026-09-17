@@ -53,3 +53,11 @@ fn overrun_warns_and_job_still_completes() {
         *logs
     );
 }
+
+/// T027 — the documented 30-second default limit is real in code (FR-011,
+/// contracts/api.md §2): `Watchdog::default()` resolves to `DEFAULT_LIMIT`.
+#[test]
+fn default_limit_is_30_seconds() {
+    assert_eq!(Watchdog::DEFAULT_LIMIT, Duration::from_secs(30));
+    assert_eq!(Watchdog::default().limit(), Duration::from_secs(30));
+}

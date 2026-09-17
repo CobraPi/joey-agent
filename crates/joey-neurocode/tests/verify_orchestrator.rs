@@ -13,11 +13,36 @@ use joey_neurocode::config::{VerifyConfig, VerifyStepConfig};
 use joey_neurocode::graph::DependencyGraph;
 use joey_neurocode::verify::{VerifyLoop, VerifyOutcome};
 
+/// Portable fixture commands (Unix `true`/`false` are not on the Windows
+/// PATH; the runner shlex-splits and PATH-resolves the program).
+#[cfg(unix)]
+fn ok_cmd() -> &'static str {
+    "true"
+}
+#[cfg(windows)]
+fn ok_cmd() -> &'static str {
+    "cmd /C exit 0"
+}
+#[cfg(unix)]
+fn fail_cmd() -> &'static str {
+    "false"
+}
+#[cfg(windows)]
+fn fail_cmd() -> &'static str {
+    "cmd /C exit 1"
+}
+
 /// A step command that passes iff `marker` exists in the working directory.
+/// (Unix needs the `sh -c` wrapper — `test` is a shell builtin; Windows
+/// uses cmd's `if not exist <marker> exit 1`.)
 fn marker_step(name: &str, marker: &str) -> VerifyStepConfig {
+    #[cfg(unix)]
+    let command = format!("sh -c 'test -f {}'", marker);
+    #[cfg(windows)]
+    let command = format!("cmd /C if not exist {} exit 1", marker);
     VerifyStepConfig {
         name: name.into(),
-        command: format!("test -f {}", marker),
+        command,
         parse: "plain".into(),
         timeout_sec: 10,
     }
@@ -36,8 +61,7 @@ fn run_with_fixes_recovers_when_fix_flips_marker() {
     let project_root = dir.path();
 
     // Step fails while `fixed.txt` is absent; the fix closure creates it.
-    let mut cfg = config(vec![marker_step("compile", "fixed.txt")], 3);
-    cfg.steps[0].command = "sh -c 'test -f fixed.txt'".into();
+    let cfg = config(vec![marker_step("compile", "fixed.txt")], 3);
 
     let graph = Arc::new(DependencyGraph::open_in_memory().unwrap());
     let verify = VerifyLoop::new(cfg, graph);
@@ -72,7 +96,7 @@ fn max_fix_iterations_respected_when_fix_never_works() {
     let cfg = config(
         vec![VerifyStepConfig {
             name: "compile".into(),
-            command: "false".into(),
+            command: fail_cmd().into(),
             parse: "plain".into(),
             timeout_sec: 10,
         }],
@@ -104,7 +128,7 @@ fn fix_callback_returning_false_breaks_early() {
     let cfg = config(
         vec![VerifyStepConfig {
             name: "compile".into(),
-            command: "false".into(),
+            command: fail_cmd().into(),
             parse: "plain".into(),
             timeout_sec: 10,
         }],
@@ -132,7 +156,7 @@ fn all_passing_steps_consume_no_iterations() {
     let cfg = config(
         vec![VerifyStepConfig {
             name: "noop".into(),
-            command: "true".into(),
+            command: ok_cmd().into(),
             parse: "plain".into(),
             timeout_sec: 10,
         }],
@@ -159,7 +183,7 @@ async fn run_detached_completes_and_delivers_outcome() {
     let cfg = config(
         vec![VerifyStepConfig {
             name: "noop".into(),
-            command: "true".into(),
+            command: ok_cmd().into(),
             parse: "plain".into(),
             timeout_sec: 10,
         }],
@@ -191,7 +215,7 @@ async fn run_detached_failing_step_reports_escalation() {
     let cfg = config(
         vec![VerifyStepConfig {
             name: "compile".into(),
-            command: "false".into(),
+            command: fail_cmd().into(),
             parse: "plain".into(),
             timeout_sec: 10,
         }],
@@ -224,7 +248,7 @@ fn run_detached_works_outside_a_runtime() {
     let cfg = config(
         vec![VerifyStepConfig {
             name: "noop".into(),
-            command: "true".into(),
+            command: ok_cmd().into(),
             parse: "plain".into(),
             timeout_sec: 10,
         }],

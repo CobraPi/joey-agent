@@ -5370,6 +5370,15 @@ mod tests {
         crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    // The verification ledger is process-global state with its OWN lock
+    // (shared with verification::tests). Tests that touch the ledger take
+    // BOTH locks — ledger first, then HOME; verification tests never take
+    // the HOME lock, so the order cannot cycle.
+    #[allow(clippy::await_holding_lock)]
+    fn vlock<'a>() -> std::sync::MutexGuard<'a, ()> {
+        crate::verification::ledger_test_lock()
+    }
+
     // ── Loop tests ────────────────────────────────────────────────────
 
     /// Silent model substitution (ai-usage-hud mapModel fallback): when the
@@ -9429,6 +9438,7 @@ mod tests {
     /// compaction-status Notice — compression_count/summary NOT asserted.
     #[tokio::test]
     async fn boundary_pressure_includes_tools_tokens() {
+        let _v = vlock();
         let _l = lock();
         crate::verification::clear_all();
         // Case A: tools included in the pressure estimate → fire.
@@ -9512,6 +9522,7 @@ mod tests {
     /// nudge built with the retrieval reminder, count bumped, ledger fed.
     #[tokio::test]
     async fn verify_nudge_fires_with_retrieval_and_edits() {
+        let _v = vlock();
         let _l = lock();
         crate::verification::clear_all();
         let mut fx = fixture(vec![], 5, 3, None);
@@ -9536,6 +9547,7 @@ mod tests {
     /// nudge, no count bump, and not even a ledger write.
     #[tokio::test]
     async fn verify_nudge_absent_without_retrieval() {
+        let _v = vlock();
         let _l = lock();
         crate::verification::clear_all();
         let mut fx = fixture(vec![], 5, 3, None);
@@ -9558,6 +9570,7 @@ mod tests {
     /// no nudge even with retrieval + edits (FR-013 parity: zero change).
     #[tokio::test]
     async fn verify_nudge_absent_when_disabled() {
+        let _v = vlock();
         let _l = lock();
         crate::verification::clear_all();
         let mut fx = fixture_yaml(
@@ -9583,6 +9596,7 @@ mod tests {
     /// so counts 0 and 1 deliver a nudge while 2 and 3 do not.
     #[tokio::test]
     async fn verify_nudge_caps_respected() {
+        let _v = vlock();
         let _l = lock();
         crate::verification::clear_all();
         let mut fx = fixture(vec![], 5, 3, None);
@@ -9609,6 +9623,7 @@ mod tests {
     /// verify_nudge_fires_with_retrieval_and_edits above.
     #[tokio::test]
     async fn verify_nudge_integration_no_retrieval_turn_unchanged() {
+        let _v = vlock();
         let _l = lock();
         crate::verification::clear_all();
         let mut fx = fixture(
@@ -9675,6 +9690,7 @@ mod tests {
         // in the final visible text must suppress delivery. The decision
         // fn itself still returns Some (suppression happens at the call
         // site via completion_report_delivered), which this test pins.
+        let _v = vlock();
         let _l = lock();
         crate::verification::clear_all();
         let mut fx = fixture(vec![], 5, 3, None);

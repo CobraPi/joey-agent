@@ -509,6 +509,26 @@ mod tests {
         }
     }
 
+    /// Portable fixture commands: Unix `true`/`false` are not on the
+    /// Windows PATH — `cmd /C exit N` is the equivalent (the runner
+    /// shlex-splits the string and PATH-resolves the program).
+    #[cfg(unix)]
+    fn ok_cmd() -> &'static str {
+        "true"
+    }
+    #[cfg(windows)]
+    fn ok_cmd() -> &'static str {
+        "cmd /C exit 0"
+    }
+    #[cfg(unix)]
+    fn fail_cmd() -> &'static str {
+        "false"
+    }
+    #[cfg(windows)]
+    fn fail_cmd() -> &'static str {
+        "cmd /C exit 1"
+    }
+
     fn plan(steps: Vec<VerificationStepView>) -> VerificationPlanView {
         VerificationPlanView {
             steps,
@@ -677,7 +697,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gate = VerifyLoopGate::new(dir.path().to_path_buf());
         let outcome = gate
-            .run(&plan(vec![step("ok", "true", true)]), dir.path())
+            .run(&plan(vec![step("ok", ok_cmd(), true)]), dir.path())
             .await;
         assert_eq!(outcome, GateOutcome::Passed);
         assert!(gate.repair_queue().lock().unwrap().is_empty());
@@ -688,12 +708,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gate = VerifyLoopGate::new(dir.path().to_path_buf());
         let outcome = gate
-            .run(&plan(vec![step("bad", "false", true)]), dir.path())
+            .run(&plan(vec![step("bad", fail_cmd(), true)]), dir.path())
             .await;
         match outcome {
             GateOutcome::Failed(bundle) => {
                 assert!(!bundle.failed_commands.is_empty());
-                assert_eq!(bundle.failed_commands[0].command, "false");
+                assert_eq!(bundle.failed_commands[0].command, fail_cmd());
                 assert_eq!(bundle.failed_commands[0].exit, 1);
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -902,7 +922,7 @@ mod tests {
         ));
         // risk_triggered_review=false — the reviewer must never run.
         let outcome = gate
-            .run(&plan(vec![step("ok", "true", true)]), dir.path())
+            .run(&plan(vec![step("ok", ok_cmd(), true)]), dir.path())
             .await;
         assert_eq!(outcome, GateOutcome::Passed);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
