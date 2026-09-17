@@ -2145,6 +2145,7 @@ async fn execute_graph_run(
             .config
             .get_i64("hypercode.execution_graph.max_repair_attempts", 3)
             .max(0) as u32,
+        chain_unit_ms: 1000,
     };
     // T036: shared helpers (gate + reviewer, outcome store, lesson sweep)
     // — extracted from the inlined blocks so execute and resume cannot
@@ -2356,6 +2357,7 @@ pub async fn resume_execution_run(
             .config
             .get_i64("hypercode.execution_graph.max_repair_attempts", 3)
             .max(0) as u32,
+        chain_unit_ms: 1000,
     };
     let gate = graph_gate(ctx);
     let review_events = gate.review_events();

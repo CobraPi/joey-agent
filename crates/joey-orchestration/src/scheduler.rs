@@ -43,6 +43,10 @@ pub struct SchedulerConfig {
     pub max_concurrent_workers: usize,
     /// Per-tier repair budget handed to the evaluator (FR-021).
     pub max_repair_attempts: u32,
+    /// Chain-unit cost (ms) feeding compute-weight estimation
+    /// (feature 033; mirrors `orchestration.compute.chain_unit_ms`,
+    /// default 1000 — set from config where SchedulerConfig is built).
+    pub chain_unit_ms: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -50,6 +54,7 @@ impl Default for SchedulerConfig {
         Self {
             max_concurrent_workers: 16,
             max_repair_attempts: 3,
+            chain_unit_ms: 1000,
         }
     }
 }
@@ -294,6 +299,7 @@ impl Scheduler {
                 process_group(
                     group,
                     &graph_m,
+                    self.config.chain_unit_ms,
                     &run_m,
                     &self.snapshot_sink,
                     &ledger_m,
@@ -396,6 +402,7 @@ fn transition_and_persist(
 async fn process_group(
     group: Vec<TaskId>,
     graph_m: &Mutex<&mut TaskGraph>,
+    chain_unit_ms: u64,
     run_m: &Mutex<&mut RunHandle>,
     sink: &Option<SnapshotSink>,
     ledger_m: &tokio::sync::Mutex<&mut RepairLedger>,
@@ -410,6 +417,7 @@ async fn process_group(
         process_task(
             id,
             graph_m,
+            chain_unit_ms,
             run_m,
             sink,
             ledger_m,
@@ -430,6 +438,7 @@ async fn process_group(
 async fn process_task(
     id: TaskId,
     graph_m: &Mutex<&mut TaskGraph>,
+    chain_unit_ms: u64,
     run_m: &Mutex<&mut RunHandle>,
     sink: &Option<SnapshotSink>,
     ledger_m: &tokio::sync::Mutex<&mut RepairLedger>,
@@ -498,6 +507,29 @@ async fn process_task(
                 return;
             }
         };
+        // Feature 033 (T013): orchestrator-assigned compute weight for
+        // this task's downstream CPU-op submissions — deadline-form,
+        // deterministic (EWMA explicitly rejected, research.md D5).
+        // Weights are orchestrator-assigned ONLY, never accepted from
+        // LLM/subagent input (honesty guardrail, contracts/api.md §4).
+        // joey-orchestration runs no CPU-op pool submissions of its own
+        // yet (non-terminal call-site migration deferred by design); the
+        // weight is assigned here at the dispatch seam for consumers
+        // (e.g. the joey-cli TaskDispatcher impl) and recorded via debug
+        // logging. Scheduler semantics are unchanged.
+        let compute_weight = with_graph(graph_m, |g| {
+            crate::compute_weight::weight_for_task(
+                g,
+                &snapshot.id,
+                chain_unit_ms, // op_est defaults to one chain unit
+                chain_unit_ms,
+            )
+        });
+        tracing::debug!(
+            task = %snapshot.id,
+            weight = compute_weight,
+            "compute weight assigned at dispatch"
+        );
         let ok = dispatcher.dispatch(&snapshot, workdir).await;
         with_stats(stats_m, |s| s.dispatched += 1);
         transition_and_persist(
@@ -928,6 +960,7 @@ mod tests {
         let scheduler = Scheduler::new(SchedulerConfig {
             max_concurrent_workers: 4,
             max_repair_attempts: 3,
+            chain_unit_ms: 1000,
         });
         let stats = scheduler
             .run_to_completion(&mut graph, &mut run, &dispatcher, &PassGate, tmp.path())
@@ -955,6 +988,7 @@ mod tests {
         let scheduler = Scheduler::new(SchedulerConfig {
             max_concurrent_workers: 2,
             max_repair_attempts: 3,
+            chain_unit_ms: 1000,
         });
         let stats = scheduler
             .run_to_completion(&mut graph, &mut run, &dispatcher, &PassGate, tmp.path())
@@ -1003,6 +1037,7 @@ mod tests {
         let scheduler = Scheduler::new(SchedulerConfig {
             max_concurrent_workers: 16,
             max_repair_attempts: 2,
+            chain_unit_ms: 1000,
         });
         let stats = scheduler
             .run_to_completion(&mut graph, &mut run, &OkDispatcher::new(), &gate, tmp.path())
@@ -1029,6 +1064,7 @@ mod tests {
         let scheduler = Scheduler::new(SchedulerConfig {
             max_concurrent_workers: 16,
             max_repair_attempts: 1,
+            chain_unit_ms: 1000,
         });
         let stats = scheduler
             .run_to_completion(&mut graph, &mut run, &OkDispatcher::new(), &FailGate, tmp.path())

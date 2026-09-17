@@ -1894,3 +1894,10 @@ Joey-only addition; no upstream Hermes equivalent to port. Adds a governance lay
 - Explicitly selected degraded mode (never auto-engaged): samples background+normal work at `degraded_mode.sample_rate`, marks outputs `[degraded]` + `degraded=true` record; critical never sampled; sustained-overload signal (busy refusals >= 3 in 60s) surfaced in busy text.
 
 **Status**: Joey-only addition (no upstream equivalent). Tests: crates/joey-orchestration/tests/governance_{admission,retry,dedup,isolation,records,priority}.rs plus parity/event suites and inline unit tests in governance.rs / result_cache.rs / resource_records.rs.
+
+## Compute Pool (feature 033, 2026-09-16)
+
+- Status: **Complete** (2026-09-16) — new leaf crate `joey-compute` (feature 033, `specs/033-please-reference-plan`).
+- Upstream-parity surface touched: **none**. Additive subsystem — no upstream Hermes behavior, on-disk format, prompt surface, or wire protocol is replicated or modified here. Terminal-tool observable outputs are byte-identical; only the execution substrate moved from `tokio::task::spawn_blocking` to the pool.
+- Scheduling: deadline-form weighted fair queuing (`deadline = now + scale / weight`, weights clamped [1.0, 100.0]), semaphore admission control (backpressure, default 256 queued+running), panic isolation, drain-on-close.
+- Deliberate divergence: **none**.

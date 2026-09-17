@@ -7,6 +7,8 @@
 
 pub mod background;
 pub mod capacity;
+pub mod chain_est;
+pub mod compute_weight;
 pub mod control_tool;
 pub mod delegation_tool;
 pub mod evidence;

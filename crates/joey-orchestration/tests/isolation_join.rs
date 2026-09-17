@@ -194,6 +194,7 @@ fn scheduler() -> Scheduler {
     Scheduler::new(SchedulerConfig {
         max_concurrent_workers: 4,
         max_repair_attempts: 1,
+        chain_unit_ms: 1000,
     })
 }
 

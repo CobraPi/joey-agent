@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+joey-compute.workspace = true
 joey-core.workspace = true
 joey-copilot.workspace = true
 anyhow.workspace = true

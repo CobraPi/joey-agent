@@ -185,6 +185,18 @@ hypercode:
     enabled: true
     max_concurrent_workers: 16
     max_repair_attempts: 3
+orchestration:
+  compute:
+    # CPU-bound compute pool (feature 033, specs/033-please-reference-plan).
+    # "auto" workers = max(cores - 1, 1); a positive integer pins the pool
+    # size. Env ORCHESTRATION_COMPUTE_WORKERS overrides (env > file > auto).
+    workers: auto
+    # Max queued+running jobs before submitters wait (admission backpressure).
+    max_inflight: 256
+    # Fairness scale for deadline = now + scale / weight, in milliseconds.
+    scale_ms: 2000
+    # Cost of one dependency-chain edge for weight estimation, in ms.
+    chain_unit_ms: 1000
 speckit:
   enabled: true
   lifecycle_context: true
@@ -333,6 +345,111 @@ impl Config {
     /// Dotted integer lookup with a fallback.
     pub fn get_i64(&self, dotted: &str, default: i64) -> i64 {
         self.get(dotted).and_then(value_as_i64).unwrap_or(default)
+    }
+
+    // ── orchestration.compute.* (feature 033, contracts/api.md §3) ──────
+
+    /// Resolve an optional usize env override (> 0), if present and valid.
+    fn compute_env_usize(var: &str) -> Option<usize> {
+        match std::env::var(var) {
+            Ok(v) => match v.trim().parse::<usize>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => {
+                    tracing::warn!(
+                        "ignoring invalid value for {}: {:?} — falling back",
+                        var,
+                        v
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// Resolve an optional u64 env override (> 0), if present and valid.
+    fn compute_env_u64(var: &str) -> Option<u64> {
+        Self::compute_env_usize(var).map(|n| n as u64)
+    }
+
+    /// Worker-thread count for the compute pool (feature 033).
+    /// Precedence: `ORCHESTRATION_COMPUTE_WORKERS` env > config
+    /// `orchestration.compute.workers` ("auto" or int ≥ 1) >
+    /// auto = max(cores - 1, 1). Never panics; invalid values fall back with
+    /// a warning (mirrors the `terminal.max_concurrent` resolution pattern).
+    pub fn compute_workers(&self) -> usize {
+        if let Some(n) = Self::compute_env_usize("ORCHESTRATION_COMPUTE_WORKERS") {
+            return n;
+        }
+        let configured = self.get_i64("orchestration.compute.workers", 0);
+        if configured > 0 {
+            return configured as usize;
+        }
+        if configured < 0 {
+            tracing::warn!(
+                "ignoring invalid orchestration.compute.workers = {} — using auto",
+                configured
+            );
+        }
+        auto_compute_workers(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2),
+        )
+    }
+
+    /// Admission bound (max queued + running) for the compute pool.
+    /// Env `ORCHESTRATION_COMPUTE_MAX_INFLIGHT` > config > default 256.
+    pub fn compute_max_inflight(&self) -> usize {
+        if let Some(n) = Self::compute_env_usize("ORCHESTRATION_COMPUTE_MAX_INFLIGHT") {
+            return n;
+        }
+        let configured = self.get_i64("orchestration.compute.max_inflight", 256);
+        if configured >= 1 {
+            configured as usize
+        } else {
+            tracing::warn!(
+                "ignoring invalid orchestration.compute.max_inflight = {} — using default 256",
+                configured
+            );
+            256
+        }
+    }
+
+    /// Fairness scale (ms) for deadline = now + scale / weight.
+    /// Env `ORCHESTRATION_COMPUTE_SCALE_MS` > config > default 2000; > 0.
+    pub fn compute_scale_ms(&self) -> u64 {
+        if let Some(n) = Self::compute_env_u64("ORCHESTRATION_COMPUTE_SCALE_MS") {
+            return n;
+        }
+        let configured = self.get_i64("orchestration.compute.scale_ms", 2000);
+        if configured > 0 {
+            configured as u64
+        } else {
+            tracing::warn!(
+                "ignoring invalid orchestration.compute.scale_ms = {} — using default 2000",
+                configured
+            );
+            2000
+        }
+    }
+
+    /// Cost of one dependency-chain edge (ms) for weight estimation.
+    /// Env `ORCHESTRATION_COMPUTE_CHAIN_UNIT_MS` > config > default 1000; > 0.
+    pub fn compute_chain_unit_ms(&self) -> u64 {
+        if let Some(n) = Self::compute_env_u64("ORCHESTRATION_COMPUTE_CHAIN_UNIT_MS") {
+            return n;
+        }
+        let configured = self.get_i64("orchestration.compute.chain_unit_ms", 1000);
+        if configured > 0 {
+            configured as u64
+        } else {
+            tracing::warn!(
+                "ignoring invalid orchestration.compute.chain_unit_ms = {} — using default 1000",
+                configured
+            );
+            1000
+        }
     }
 
     /// Dotted float lookup with a fallback.
@@ -589,6 +706,12 @@ impl Config {
             .expect("config lkg lock")
             .insert(self.path.clone(), self.root.clone());
     }
+}
+
+/// Auto compute-pool worker count: `max(cores - 1, 1)` — always at least
+/// one worker, even on single-core hosts (contracts/api.md §3).
+fn auto_compute_workers(cores: usize) -> usize {
+    cores.saturating_sub(1).max(1)
 }
 
 // ─── Load pipeline ───────────────────────────────────────────────────────────
@@ -2626,5 +2749,83 @@ mod tests {
         let reparsed: Value = serde_yaml::from_str(&once).unwrap();
         let twice = serde_yaml::to_string(&reparsed).unwrap();
         assert_eq!(once, twice);
+    }
+
+    // ── orchestration.compute.* (feature 033, T017) ─────────────────
+
+    #[test]
+    fn compute_defaults_resolve() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cfg = Config::defaults();
+        assert_eq!(cfg.compute_max_inflight(), 256);
+        assert_eq!(cfg.compute_scale_ms(), 2000);
+        assert_eq!(cfg.compute_chain_unit_ms(), 1000);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        assert_eq!(cfg.compute_workers(), auto_compute_workers(cores));
+    }
+
+    #[test]
+    fn compute_auto_workers_floor_is_one() {
+        assert_eq!(auto_compute_workers(1), 1);
+        assert_eq!(auto_compute_workers(2), 1);
+        assert_eq!(auto_compute_workers(8), 7);
+        assert_eq!(auto_compute_workers(0), 1);
+    }
+
+    #[test]
+    fn compute_env_overrides_config_file_and_auto() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ORCHESTRATION_COMPUTE_WORKERS", "7");
+        std::env::set_var("ORCHESTRATION_COMPUTE_MAX_INFLIGHT", "9");
+        std::env::set_var("ORCHESTRATION_COMPUTE_SCALE_MS", "123");
+        std::env::set_var("ORCHESTRATION_COMPUTE_CHAIN_UNIT_MS", "77");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "orchestration:\n  compute:\n    workers: 3\n    max_inflight: 5\n    scale_ms: 999\n    chain_unit_ms: 55\n",
+        )
+        .unwrap();
+        let cfg = Config::load_from(path.clone()).unwrap();
+        assert_eq!(cfg.compute_workers(), 7, "env > file");
+        assert_eq!(cfg.compute_max_inflight(), 9, "env > file");
+        assert_eq!(cfg.compute_scale_ms(), 123, "env > file");
+        assert_eq!(cfg.compute_chain_unit_ms(), 77, "env > file");
+        std::env::remove_var("ORCHESTRATION_COMPUTE_WORKERS");
+        std::env::remove_var("ORCHESTRATION_COMPUTE_MAX_INFLIGHT");
+        std::env::remove_var("ORCHESTRATION_COMPUTE_SCALE_MS");
+        std::env::remove_var("ORCHESTRATION_COMPUTE_CHAIN_UNIT_MS");
+        let cfg2 = Config::load_from(path).unwrap();
+        assert_eq!(cfg2.compute_workers(), 3, "file > auto");
+        assert_eq!(cfg2.compute_max_inflight(), 5, "file > auto");
+        assert_eq!(cfg2.compute_scale_ms(), 999, "file > auto");
+        assert_eq!(cfg2.compute_chain_unit_ms(), 55, "file > auto");
+    }
+
+    #[test]
+    fn compute_invalid_values_fall_back_without_panic() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ORCHESTRATION_COMPUTE_WORKERS", "not-a-number");
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        let cfg = Config::defaults();
+        assert_eq!(cfg.compute_workers(), auto_compute_workers(cores), "invalid env → auto");
+        std::env::remove_var("ORCHESTRATION_COMPUTE_WORKERS");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "orchestration:\n  compute:\n    workers: -5\n    max_inflight: 0\n    scale_ms: 0\n    chain_unit_ms: -1\n",
+        )
+        .unwrap();
+        let cfg2 = Config::load_from(path).unwrap();
+        assert_eq!(cfg2.compute_workers(), auto_compute_workers(cores), "negative workers → auto");
+        assert_eq!(cfg2.compute_max_inflight(), 256, "zero max_inflight → default 256");
+        assert_eq!(cfg2.compute_scale_ms(), 2000, "zero scale_ms → default 2000");
+        assert_eq!(cfg2.compute_chain_unit_ms(), 1000, "negative chain_unit_ms → default 1000");
     }
 }

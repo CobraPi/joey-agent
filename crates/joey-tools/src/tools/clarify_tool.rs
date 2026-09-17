@@ -221,7 +221,10 @@ mod tests {
 
         // Receive the request but NEVER answer: drop response_tx.
         if let Some(req) = rx.recv().await {
-            drop(req.response_tx);
+            // Keep the channel open but never answer: exercises the TIMEOUT
+            // path deterministically (dropping the sender would race the
+            // 50ms timeout against the channel-closed error arm).
+            std::mem::forget(req.response_tx);
         }
 
         let result = handle.await.expect("task join");

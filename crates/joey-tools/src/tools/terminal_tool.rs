@@ -697,10 +697,28 @@ impl Tool for Terminal {
 
         // Feature 005 (T012): snapshot known-read files before running the
         // command so we can detect terminal-caused mutations afterward.
-        // Blocking + parallel (rayon) — off the async workers.
-        let pre_snapshot = tokio::task::spawn_blocking(snapshot_tracked_files)
+        // Feature 033 (T008): the snapshot runs as an op on the process-global
+        // compute pool (dedicated CPU threads) instead of tokio blocking
+        // spawn; the Vec<FileSnapshot> result passes through a one-shot
+        // channel because the pool is typed ComputePool<Vec<u8>> (no
+        // tool-internal types cross the pool boundary). The governor slot is
+        // intentionally still held here — identical ordering semantics to
+        // the previous spawn_blocking call (pre-snapshot must precede
+        // run_command; the await yields the worker).
+        let (snap_tx, snap_rx) = tokio::sync::oneshot::channel();
+        let pre_snapshot =
+            match crate::tools::compute_pool::submit_global(move |_| {
+                let _ = snap_tx.send(snapshot_tracked_files());
+                Vec::new()
+            })
             .await
-            .unwrap_or_default();
+            {
+                Ok(_) => snap_rx.await.unwrap_or_default(),
+                // Pool error ⇒ same default as a failed snapshot (this call
+                // site's pre-existing error path — observable behavior
+                // unchanged, FR-013/SC-006).
+                Err(_) => Vec::new(),
+            };
 
         let (raw_output, returncode, timed_out, interrupted) =
             run_command(&command, &cwd, effective_timeout, ctx).await;
@@ -757,18 +775,22 @@ impl Tool for Terminal {
             output.push_str("\n[Command interrupted by user]");
         }
 
-        // CPU-bound post-processing pipeline (truncate → ANSI strip →
-        // redaction, ~30 regex passes on big outputs). Runs on the blocking
-        // pool; the strip/redact internals parallelize across rayon for
-        // large payloads. Mutation detection (stat+hash fan-out) is also
-        // rayon-parallel.
         let limits = truncate::get_tool_output_limits(ctx.config());
         let max_bytes = limits.max_bytes;
         let cmd_for_redact = command.clone();
         let fallback_output = output.clone();
+        // CPU-bound post-processing pipeline (truncate → ANSI strip →
+        // redaction, ~30 regex passes on big outputs) — feature 033 (T008):
+        // runs as an op on the process-global compute pool (weight 5.0 —
+        // TODO(weight): replace with rank-derived weight, see
+        // compute_pool::submit_global); the strip/redact internals still
+        // parallelize across rayon for large payloads inside the op. The
+        // governor slot was already released above, so this work holds no
+        // execution slot. Mutation detection (stat+hash fan-out) runs in
+        // the same op.
         let output = {
             let pre_for_mutations = pre_snapshot;
-            tokio::task::spawn_blocking(move || {
+            match crate::tools::compute_pool::submit_global(move |_| {
                 let mut out = truncate::truncate_terminal_output(&output, max_bytes);
                 out = strip_ansi(&out);
                 if !out.is_empty() {
@@ -779,10 +801,21 @@ impl Tool for Terminal {
                 // emits FileChange events with source: Terminal
                 // (mtime+hash compare, rayon fan-out).
                 detect_terminal_mutations(&pre_for_mutations);
-                out
+                out.into_bytes()
             })
             .await
-            .unwrap_or_else(|_| fallback_output)
+            {
+                Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|e| {
+                    tracing::warn!("compute pool returned non-UTF-8 output: {e}");
+                    fallback_output
+                }),
+                // Panicked/PoolClosed ⇒ this call site's pre-existing error
+                // path: the unprocessed fallback output (contracts/api.md §5
+                // mapped onto the site's existing behavior — observable
+                // outputs stay identical, FR-013/SC-006; Cancelled cannot
+                // occur: the receiver is awaited, never dropped).
+                Err(_) => fallback_output,
+            }
         };
 
         let exit_note = interpret_exit_code(&command, returncode);

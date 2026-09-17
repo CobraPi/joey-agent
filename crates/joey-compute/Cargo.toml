@@ -1,0 +1,13 @@
+[package]
+name = "joey-compute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt", "registry", "env-filter"] }

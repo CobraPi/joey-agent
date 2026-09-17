@@ -2,6 +2,7 @@
 
 pub mod browser_tools;
 pub mod clarify_tool;
+pub mod compute_pool;
 pub mod file_tools;
 pub mod lsp_tools;
 pub mod memory_tool;

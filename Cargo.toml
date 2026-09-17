@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/joey-core",
+    "crates/joey-compute",
     "crates/joey-browser",
     "crates/joey-providers",
     "crates/joey-tools",
@@ -29,6 +30,7 @@ description = "joey-agent — the self-improving AI agent, in Rust. A port of He
 
 [workspace.dependencies]
 joey-core = { path = "crates/joey-core" }
+joey-compute = { path = "crates/joey-compute" }
 joey-browser = { path = "crates/joey-browser" }
 joey-providers = { path = "crates/joey-providers" }
 joey-tools = { path = "crates/joey-tools" }

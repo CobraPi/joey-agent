@@ -109,6 +109,13 @@ subsystem you're working on:
     character budget, per-step JSONL assembly logging, the
     `/context-assembly` (`/ctxasm`) REPL command, byte parity when
     disabled, and cache-stability guarantees.
+25. [`compute-pool.md`](compute-pool.md) — the `joey-compute` CPU-bound
+    work execution substrate (feature 033): dedicated OS worker threads
+    (never tokio workers), earliest-deadline-first scheduling with
+    bounded starvation, semaphore admission/backpressure, panic
+    isolation, chunked cancellation, the watchdog, metrics, the four
+    `orchestration.compute.*` config keys, and the orchestrator-side
+    weight policy.
 
 All pages were verified against workspace source in September 2026. If code
 and docs disagree, the code wins — and please fix the doc.

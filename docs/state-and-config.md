@@ -177,6 +177,19 @@ prompt on the same provider/model; N counts extra attempts after the initial
 run, 0 disables). Each retry is surfaced as an `AgentEvent::RetryAttempt` on
 the child's event stream.
 
+**orchestration.compute**: `orchestration.compute.workers` ("auto" or
+integer >= 1; default "auto" = max(cores - 1, 1); env override
+`ORCHESTRATION_COMPUTE_WORKERS`), `orchestration.compute.max_inflight`
+(integer >= 1; 256; env override `ORCHESTRATION_COMPUTE_MAX_INFLIGHT`),
+`orchestration.compute.scale_ms` (integer > 0; 2000; env override
+`ORCHESTRATION_COMPUTE_SCALE_MS`), `orchestration.compute.chain_unit_ms`
+(integer > 0; 1000; env override `ORCHESTRATION_COMPUTE_CHAIN_UNIT_MS`).
+Deadline scheduling: each admitted job gets `deadline = now + scale / weight`
+(weight clamped to [1.0, 100.0]). Precedence: environment variable > config
+file > auto default; invalid values fall back to defaults with a warning —
+startup never panics. See docs/compute-pool.md for the compute-pool
+architecture and metrics.
+
 **hypercode.team** (feature 022, off by default):
 `hypercode.team.enabled` (false) — feature gate; disabled sessions behave
 byte-identically to plain delegation. `hypercode.team.lead_model` ("") —
