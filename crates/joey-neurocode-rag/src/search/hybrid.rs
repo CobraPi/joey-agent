@@ -1091,14 +1091,20 @@ fn find_symbol_chunk(store: &GraphStore, node: &CodeArtifactNode) -> Option<Chun
         "SELECT {CHUNK_COLUMNS} FROM rag_chunks \
          WHERE source_path = ?1 AND symbol_name = ?2 ORDER BY chunk_id LIMIT 1"
     );
-    store
+    match store
         .conn()
         .query_row(
             &sql,
             rusqlite::params![node.source_path, node.simple_name()],
             row_to_chunk,
-        )
-        .ok()
+        ) {
+        Ok(row) => Some(row),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(err) => {
+            tracing::warn!(error = %err, "rag: symbol-chunk lookup failed — skipping FTS hit");
+            None
+        }
+    }
 }
 
 /// FTS5 symbol hits mapped to their chunk rows, each paired with its RAW
@@ -1197,7 +1203,16 @@ fn like_search_chunks(
     let rows = stmt
         .query_map(rusqlite::params_from_iter(params.iter()), row_to_chunk)
         .map_err(|e| SearchError::Store(e.to_string()))?;
-    Ok(rows.filter_map(Result::ok).collect())
+    let mut out = Vec::new();
+    for row in rows {
+        match row {
+            Ok(chunk) => out.push(chunk),
+            Err(err) => {
+                tracing::warn!(error = %err, "rag: chunk row decode failed — skipping row")
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Minimal glob for `file_filter` (`*` = any run incl. `/`, `?` = one
@@ -1259,10 +1274,24 @@ fn content_search_chunks(
          WHERE chunk_kind = 'fallback' ORDER BY chunk_id"
     )) {
         Ok(mut stmt) => match stmt.query_map([], row_to_chunk) {
-            Ok(iter) => iter.filter_map(Result::ok).collect(),
-            Err(_) => return Vec::new(),
+            Ok(iter) => iter
+                .filter_map(|row| match row {
+                    Ok(chunk) => Some(chunk),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "rag: chunk row decode failed — skipping row");
+                        None
+                    }
+                })
+                .collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "rag: fallback-chunk query failed — content leg empty");
+                return Vec::new();
+            }
         },
-        Err(_) => return Vec::new(),
+        Err(err) => {
+            tracing::warn!(error = %err, "rag: fallback-chunk scan prepare failed — content leg empty");
+            return Vec::new();
+        }
     };
     let mut by_path: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();

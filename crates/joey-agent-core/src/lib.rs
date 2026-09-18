@@ -34,7 +34,11 @@ pub use loop_detection::LoopDetector;
 pub use memory_hook::{MemoryRuntime, MemoryTurnSummary};
 pub use prompt::{build_system_prompt, PromptInputs};
 
-/// Serializes tests that override the process-global joey home.
+/// Serializes tests that override the process-global joey home. Aliases
+/// joey-core's process-wide `TEST_HOME_OVERRIDE_LOCK` — a second,
+/// crate-local mutex here would NOT serialize against the feature034
+/// fixtures (support.rs), which lock the same process-global home via
+/// the joey-core lock; the split lock let concurrent home overrides race
+/// (assembly_log_records_gauge_fields flake).
 #[cfg(test)]
-pub(crate) static TEST_HOME_LOCK: once_cell::sync::Lazy<std::sync::Mutex<()>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
+pub(crate) use joey_core::constants::TEST_HOME_OVERRIDE_LOCK as TEST_HOME_LOCK;

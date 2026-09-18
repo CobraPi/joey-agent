@@ -280,7 +280,7 @@ impl<'de> Deserialize<'de> for SessionSource {
         let scope_id = wire
             .scope_id
             .filter(|s| !s.is_empty())
-            .or(wire.guild_id);
+            .or(wire.guild_id.filter(|s| !s.is_empty()));
         let mut source = SessionSource {
             platform: wire.platform,
             chat_id: coerce_to_python_str(&wire.chat_id),

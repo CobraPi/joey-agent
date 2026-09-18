@@ -92,12 +92,31 @@ impl Default for BoulderState {
 
 impl BoulderState {
     /// Read the boulder state from a `.omo/` directory.
-    /// Missing file returns an empty state (VR-004: not an error).
+    /// Missing file returns an empty state (VR-004: not an error). An
+    /// unparseable file is preserved as `boulder.json.corrupt` (best-effort
+    /// rename, mirroring `goal.rs::GoalState::read`) with a warning, and
+    /// treated as empty — the next write would otherwise silently destroy
+    /// the corrupt file and all prior works with it.
     pub fn read(omo_dir: &Path) -> Self {
         let path = omo_dir.join("boulder.json");
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-            Err(_) => BoulderState::default(),
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(_) => return BoulderState::default(),
+        };
+        match serde_json::from_str(&contents) {
+            Ok(state) => state,
+            Err(exc) => {
+                let corrupt = path.with_extension("json.corrupt");
+                let _ = std::fs::rename(&path, &corrupt);
+                tracing::warn!(
+                    "omo: failed to parse {} ({}) — treating boulder state as empty. \
+                     Corrupt file preserved at {}",
+                    path.display(),
+                    exc,
+                    corrupt.display()
+                );
+                BoulderState::default()
+            }
         }
     }
 

@@ -378,9 +378,6 @@ pub fn classify_send_error(
             return "transient";
         }
     }
-    if blob.contains("connecttimeout") {
-        return "transient";
-    }
     "unknown"
 }
 

@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(normalize_whatsapp_identifier("60123456789@s.whatsapp.net"), "60123456789");
         assert_eq!(normalize_whatsapp_identifier("999999999999999@lid"), "999999999999999");
         assert_eq!(normalize_whatsapp_identifier("60123456789:47@s.whatsapp.net"), "60123456789");
-        assert_eq!(normalize_whatsapp_identifier("+60123456789"), "60123456789");
+        assert_eq!(normalize_whatsapp_identifier("+601****6789"), "601****6789");
         assert_eq!(normalize_whatsapp_identifier("60123456789"), "60123456789");
         assert_eq!(normalize_whatsapp_identifier(""), "");
         assert_eq!(normalize_whatsapp_identifier("   "), "");

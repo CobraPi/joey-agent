@@ -1420,7 +1420,7 @@ impl ContextCompressor {
             let hash = hash[..12].to_string();
             if let std::collections::hash_map::Entry::Vacant(e) = content_hashes.entry(hash) {
                 e.insert(i);
-            } else {
+            } else if i < prune_boundary {
                 result[i].content = Some(
                     "[Duplicate tool output — same content as a more recent call]".to_string(),
                 );

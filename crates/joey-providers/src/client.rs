@@ -222,7 +222,7 @@ impl ProviderClient {
         is_vision: bool,
     ) -> reqwest::RequestBuilder {
         builder = builder.bearer_auth(token);
-        for (name, value) in copilot::request_headers(user_initiated, is_vision) {
+        for (name, value) in copilot::request_headers(!user_initiated, is_vision) {
             builder = builder.header(name, value);
         }
         builder

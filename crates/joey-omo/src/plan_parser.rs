@@ -74,7 +74,7 @@ fn parse_dep_token(token: &str) -> Option<usize> {
         num_part
             .parse::<usize>()
             .ok()
-            .map(|n| F_TASK_NUMBER_OFFSET + n)
+            .and_then(|n| n.checked_add(F_TASK_NUMBER_OFFSET))
     } else {
         token.parse::<usize>().ok()
     };
@@ -145,7 +145,10 @@ pub fn parse_plan(markdown: &str) -> ParsedPlan {
                     // raw F-number collided with the implementation task of
                     // the same number (F1 vs task 1) in every `number`-keyed
                     // lookup (completion sets, dependency unblocking).
-                    (F_TASK_NUMBER_OFFSET + num, title, true)
+                    match num.checked_add(F_TASK_NUMBER_OFFSET) {
+                        Some(n) => (n, title, true),
+                        None => continue,
+                    }
                 } else {
                     continue;
                 }
@@ -186,13 +189,14 @@ pub fn parse_plan(markdown: &str) -> ParsedPlan {
     // number. A dangling dep (typo, removed task) would otherwise stall the
     // task forever in `ready_tasks` (its blocker never completes), so drop
     // it with a recorded warning instead.
+    // A self-dependency stalls identically — drop it the same way.
     let known_numbers: std::collections::HashSet<usize> =
         tasks.iter().map(|t| t.number).collect();
     for task in tasks.iter_mut() {
         let (valid, invalid): (Vec<usize>, Vec<usize>) = task
             .dependencies
             .iter()
-            .partition(|dep| known_numbers.contains(dep));
+            .partition(|dep| known_numbers.contains(dep) && **dep != task.number);
         if !invalid.is_empty() {
             tracing::warn!(
                 task = task.number,
