@@ -613,7 +613,7 @@ impl Tool for WriteFile {
         "file"
     }
     fn description(&self) -> &str {
-        "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out)."
+        "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). Large content can be persisted and re-sent by path: invoke once with inline content, then re-invoke with the returned content_path. Source output is not truncated."
     }
     fn emoji(&self) -> &str {
         "✍\u{fe0f}"
@@ -626,14 +626,15 @@ impl Tool for WriteFile {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
-                "content": {"type": "string", "description": "Complete content to write to the file"},
+                "content": {"type": "string", "description": "Complete content to write to the file (or provide content_path instead — exactly one of the two)"},
+                "content_path": {"type": "string", "description": "Path to a persisted payload file; its current content is written. Provide exactly one of content or content_path."},
                 "cross_profile": {
                     "type": "boolean",
                     "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Joey profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
                     "default": false,
                 },
             },
-            "required": ["path", "content"]
+            "required": ["path"]
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
@@ -646,18 +647,47 @@ impl Tool for WriteFile {
                 )
             }
         };
-        let content = match args.get("content") {
-            None => {
-                return tool_error(
-                    "write_file: missing required field 'content'. The tool call included a path but no content argument — this is almost always a dropped-arg bug under context pressure. Re-emit the tool call with the full content payload, or use execute_code with joey_tools.write_file() for very large files.",
-                )
-            }
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => {
+        // US7 (feature 034): `content` / `content_path` XOR — exactly one.
+        // Neither/both is a uniform contract error (replaces the old
+        // dropped-arg missing-content diagnostic for the 'neither' case;
+        // wrong-typed values keep their type error).
+        if let Some(other) = args.get("content") {
+            if !other.is_string() {
                 return tool_error(format!(
                     "write_file: 'content' must be a string, got {}.",
                     python_type_name(other)
-                ))
+                ));
+            }
+        }
+        let inline_content = args.get("content").and_then(|v| v.as_str()).map(str::to_string);
+        let content_path_arg = args.get("content_path").and_then(|v| v.as_str()).map(str::to_string);
+        let (content, content_path_out): (String, Option<String>) = match (inline_content, content_path_arg) {
+            (Some(c), None) => {
+                // FR-011: persist inline payloads before executing; failure
+                // never fails the call (path omitted from result).
+                let persisted = crate::payload_store::persist_payload(ctx.session_id(), "write_file", &c)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+                (c, persisted)
+            }
+            (None, Some(p)) => {
+                // FR-012/FR-013: cross-session references are copied into the
+                // current session's payload dir; the file's CURRENT disk
+                // content is written verbatim.
+                let resolved = match crate::payload_store::copy_payload_into_current_session(
+                    std::path::Path::new(&p),
+                    ctx.session_id(),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => return tool_error(format!("write_file: content_path unreadable: {e}")),
+                };
+                match crate::payload_store::read_payload(&resolved) {
+                    Ok(c) => (c, Some(resolved.to_string_lossy().into_owned())),
+                    Err(e) => return tool_error(format!("write_file: content_path unreadable: {e}")),
+                }
+            }
+            _ => {
+                return tool_error("write_file: provide exactly one of 'content' or 'content_path'")
             }
         };
 
@@ -698,6 +728,10 @@ impl Tool for WriteFile {
                 }
                 result.insert("resolved_path".into(), json!(resolved.to_string_lossy()));
                 result.insert("files_modified".into(), json!([resolved.to_string_lossy()]));
+                // US7 (FR-011): surface the persisted payload path on success.
+                if let Some(p) = &content_path_out {
+                    result.insert("content_path".into(), json!(p));
+                }
                 update_read_timestamp(ctx, &resolved);
                 // Track for session change detection.
                 crate::file_tracker::FileTracker::record_write(&resolved.to_string_lossy());
@@ -2242,10 +2276,15 @@ mod tests {
         assert!(w["resolved_path"].as_str().unwrap().ends_with("sub/a.txt"));
         assert_eq!(w["files_modified"].as_array().unwrap().len(), 1);
 
-        // Missing content diagnostics.
-        let m = parse(&WriteFile.execute(json!({"path": "x.txt"}), &ctx).await);
-        assert!(m["error"].as_str().unwrap().starts_with("write_file: missing required field 'content'."));
-        let t = parse(&WriteFile.execute(json!({"path": "x.txt", "content": 42}), &ctx).await);
+        // US7: 'neither' content nor content_path is now the uniform XOR
+        // contract error (previously the dropped-arg missing-content
+        // diagnostic).
+        let m = parse(&WriteFile.execute(json!({ "path": "x.txt" }), &ctx).await);
+        assert_eq!(
+            m["error"],
+            "write_file: provide exactly one of 'content' or 'content_path'"
+        );
+        let t = parse(&WriteFile.execute(json!({ "path": "x.txt", "content": 42 }), &ctx).await);
         assert_eq!(t["error"], "write_file: 'content' must be a string, got int.");
 
         // Sensitive path.

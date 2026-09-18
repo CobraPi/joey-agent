@@ -8,7 +8,7 @@ use joey_providers::ToolSchema;
 use std::path::PathBuf;
 
 /// FNV-1a 64-bit hash rendered as 8 lowercase hex chars (low 32 bits).
-fn fnv1a64_hex8(s: &str) -> String {
+pub(crate) fn fnv1a64_hex8(s: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
         hash ^= u64::from(b);
@@ -191,12 +191,17 @@ pub fn log_dir(session_key: &str) -> PathBuf {
 #[derive(serde::Serialize)]
 pub struct AssemblyRecord {
     pub ts: String,
+    #[serde(rename = "request_turn")]
     pub turn: usize,
     pub tools_total: usize,
     pub tools_kept: usize,
     pub tools_dropped: Vec<String>,
     pub state_block_truncated: bool,
     pub request_messages: usize,
+    pub gauge_remaining: Option<i64>,
+    pub gauge_low: Option<bool>,
+    pub notice_channel_on: bool,
+    pub tool_list_hash: Option<String>,
 }
 
 /// Append one record as a JSON line to `<dir>/assembly.jsonl`.
@@ -385,6 +390,10 @@ mod tests {
             tools_dropped: vec!["a".to_string()],
             state_block_truncated: false,
             request_messages: 4,
+            gauge_remaining: None,
+            gauge_low: None,
+            notice_channel_on: false,
+            tool_list_hash: None,
         };
         let record2 = AssemblyRecord {
             ts: chrono::Utc::now().to_rfc3339(),
@@ -394,6 +403,10 @@ mod tests {
             tools_dropped: vec![],
             state_block_truncated: true,
             request_messages: 6,
+            gauge_remaining: None,
+            gauge_low: None,
+            notice_channel_on: false,
+            tool_list_hash: None,
         };
         log_assembly_record(tmp.path(), &record1).expect("first append");
         log_assembly_record(tmp.path(), &record2).expect("second append");
@@ -403,7 +416,7 @@ mod tests {
         for line in lines {
             let value: serde_json::Value = serde_json::from_str(line).expect("valid JSON line");
             assert!(value.get("ts").is_some());
-            assert!(value.get("turn").is_some());
+            assert!(value.get("request_turn").is_some());
         }
     }
 }

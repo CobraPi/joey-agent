@@ -539,7 +539,7 @@ const CWD_MARKER: &str = "__JOEY_CWD_MARKER__";
 pub struct Terminal;
 
 static DESCRIPTION: Lazy<String> = Lazy::new(|| {
-    "Execute shell commands on a Linux environment. Filesystem, current working directory, and exported environment variables persist between calls.\n\nDo NOT use cat/head/tail to read files — use read_file instead.\nDo NOT use grep/rg/find to search — use search_files instead.\nDo NOT use ls to list directories — use search_files(target='files') instead.\nDo NOT use sed/awk to edit files — use patch instead.\nDo NOT use echo/cat heredoc to create files — use write_file instead.\nReserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.\nBecause exported environment state persists, activate a virtualenv or export setup variables once per session; do not re-source the same environment before every command unless a command proves the shell state was reset.\n\nForeground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.\nBackground: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:\n  (1) Long-lived processes that never exit (servers, watchers, daemons) — silent is correct, there's no exit to notify on.\n  (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.\nFor servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Joey can track lifecycle and output.\nAfter starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.\nUse process(action=\"poll\") for progress checks, process(action=\"wait\") to block until done.\nWorking directory: Use 'workdir' for per-command cwd.\nPTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).\n\nDo NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.\n".to_string()
+    "Execute shell commands on a Linux environment. Filesystem, current working directory, and exported environment variables persist between calls.\n\nDo NOT use cat/head/tail to read files — use read_file instead.\nDo NOT use grep/rg/find to search — use search_files instead.\nDo NOT use ls to list directories — use search_files(target='files') instead.\nDo NOT use sed/awk to edit files — use patch instead.\nDo NOT use echo/cat heredoc to create files — use write_file instead.\nReserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.\nBecause exported environment state persists, activate a virtualenv or export setup variables once per session; do not re-source the same environment before every command unless a command proves the shell state was reset.\n\nForeground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.\nBackground: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:\n  (1) Long-lived processes that never exit (servers, watchers, daemons) — silent is correct, there's no exit to notify on.\n  (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.\nFor servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Joey can track lifecycle and output.\nAfter starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.\nUse process(action=\"poll\") for progress checks, process(action=\"wait\") to block until done.\nWorking directory: Use 'workdir' for per-command cwd.\nPTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).\n\nDo NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.\n Large commands can be persisted and re-run by path: invoke once with the inline command, then re-invoke with the returned command_path instead of resending the script. Output is truncated to the configured tool-output byte limit; compose commands to keep output within it.".to_string()
 });
 
 #[async_trait]
@@ -566,7 +566,11 @@ impl Tool for Terminal {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The command to execute on the VM"
+                    "description": "The command to execute on the VM (or provide command_path instead — exactly one of the two)"
+                },
+                "command_path": {
+                    "type": "string",
+                    "description": "Path to a persisted command script; the file's current content is used as the command. Provide exactly one of command or command_path."
                 },
                 "background": {
                     "type": "boolean",
@@ -598,18 +602,65 @@ impl Tool for Terminal {
                     "description": "Strings to watch for in background process output. HARD RATE LIMIT: at most 1 notification per 15 seconds per process — matches arriving inside the cooldown are dropped. After 3 consecutive 15-second windows with dropped matches, watch_patterns is automatically disabled for that process and promoted to notify_on_complete behavior (one notification on exit, no more mid-process spam). USE ONLY for truly rare, one-shot mid-process signals on LONG-LIVED processes that will never exit on their own — e.g. ['Application startup complete'] on a server so you know when to hit its endpoint, or ['migration done'] on a daemon. DO NOT use for: (1) end-of-run markers like 'DONE'/'PASS' — use notify_on_complete instead; (2) error patterns like 'ERROR'/'Traceback' in loops or multi-item batch jobs — they fire on every iteration and you'll hit the strike limit fast; (3) anything you'd ever combine with notify_on_complete. When in doubt, choose notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both."
                 }
             },
-            "required": ["command"]
+            "required": []
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let Some(command) = args.get("command").and_then(|v| v.as_str()).map(str::to_string)
-        else {
-            return ToolResult::Text(dumps(&json!({
-                "output": "",
-                "exit_code": -1,
-                "error": "Failed to execute command: command is required",
-                "status": "error",
-            })));
+        // US7 (feature 034): `command` / `command_path` XOR — exactly one.
+        // Neither (or both) is a contract error reported in the tool's
+        // existing error-JSON shape (previously the missing-command error).
+        let inline_command = args.get("command").and_then(|v| v.as_str()).map(str::to_string);
+        let command_path_arg = args.get("command_path").and_then(|v| v.as_str()).map(str::to_string);
+        let (command, command_path_out): (String, Option<String>) = match (inline_command, command_path_arg) {
+            (Some(c), None) => {
+                // FR-011: persist the inline payload BEFORE executing so the
+                // model can re-send it by path. Persistence failure must
+                // never fail a working call — the path is simply omitted
+                // from the result.
+                let persisted = crate::payload_store::persist_payload(ctx.session_id(), "terminal", &c)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+                (c, persisted)
+            }
+            (None, Some(p)) => {
+                // FR-012/FR-013: cross-session references are copied into
+                // the current session's payload dir; the file's CURRENT
+                // disk content is the command, verbatim (no trim).
+                let resolved = match crate::payload_store::copy_payload_into_current_session(
+                    std::path::Path::new(&p),
+                    ctx.session_id(),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return ToolResult::Text(dumps(&json!({
+                            "output": "",
+                            "exit_code": -1,
+                            "error": format!("terminal: command_path unreadable: {e}"),
+                            "status": "error",
+                        })));
+                    }
+                };
+                match crate::payload_store::read_payload(&resolved) {
+                    Ok(c) => (c, Some(resolved.to_string_lossy().into_owned())),
+                    Err(e) => {
+                        return ToolResult::Text(dumps(&json!({
+                            "output": "",
+                            "exit_code": -1,
+                            "error": format!("terminal: command_path unreadable: {e}"),
+                            "status": "error",
+                        })));
+                    }
+                }
+            }
+            _ => {
+                // Neither or both.
+                return ToolResult::Text(dumps(&json!({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": "terminal: provide exactly one of 'command' or 'command_path'",
+                    "status": "error",
+                })));
+            }
         };
         let background = args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
         let pty = args.get("pty").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -625,7 +676,7 @@ impl Tool for Terminal {
         // Background mode: spawn the process, register in ProcessRegistry,
         // and return the session_id immediately (FR-012, T069).
         if background {
-            return self.execute_background(command, &cwd, args, ctx).await;
+            return self.execute_background(command, &cwd, args, ctx, command_path_out).await;
         }
         if pty {
             return ToolResult::Text(dumps(&json!({
@@ -837,6 +888,11 @@ impl Tool for Terminal {
         if let Some(note) = exit_note {
             result.insert("exit_code_meaning".into(), json!(note));
         }
+        // US7 (FR-011): surface the persisted payload path on success so the
+        // model can re-send this command by reference.
+        if let Some(p) = command_path_out {
+            result.insert("command_path".into(), json!(p));
+        }
         ToolResult::Text(dumps(&Value::Object(result)))
     }
 }
@@ -851,6 +907,7 @@ impl Terminal {
         cwd: &std::path::Path,
         args: Value,
         ctx: &ToolContext,
+        command_path: Option<String>,
     ) -> ToolResult {
         let notify_on_complete = args
             .get("notify_on_complete")
@@ -1030,12 +1087,18 @@ impl Terminal {
             });
         }
 
-        ToolResult::Text(dumps(&json!({
+        let mut bg = json!({
             "output": format!("Background process started. Use process(action=\"poll\", session_id=\"{}\") to check output.", session_id),
             "exit_code": -1,
             "session_id": session_id,
             "status": "background",
-        })))
+        });
+        // US7 (FR-011): surface the persisted payload path when available
+        // (omitted — not null — when persistence failed).
+        if let Some(p) = command_path {
+            bg["command_path"] = json!(p);
+        }
+        ToolResult::Text(dumps(&bg))
     }
 }
 

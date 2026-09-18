@@ -78,6 +78,21 @@ pub const LEGACY_SUMMARY_PREFIX: &str = "[CONTEXT SUMMARY]:";
 pub const SUMMARY_END_MARKER: &str = "--- END OF CONTEXT SUMMARY — \
 respond to the message below, not the summary above ---";
 
+/// Feature 034 (US4) — calm continuation sentence appended after
+/// SUMMARY_END_MARKER when enabled (research D7). Upstream SUMMARY_PREFIX
+/// mechanics untouched; see PORTING.md deliberate deviations.
+pub const CALM_CONTINUATION_SENTENCE: &str = "Context compaction is routine housekeeping — continue the current task; no wrap-up or hand-off is needed.";
+
+/// Feature 034 (US4): the summary tail — the END marker, plus the calm
+/// continuation sentence when calm framing is enabled.
+fn summary_tail(calm: bool) -> String {
+    if calm {
+        format!("{SUMMARY_END_MARKER}\n\n{CALM_CONTINUATION_SENTENCE}")
+    } else {
+        SUMMARY_END_MARKER.to_string()
+    }
+}
+
 pub const MERGED_PRIOR_CONTEXT_HEADER: &str =
     "[PRIOR CONTEXT — for reference only; not a new message]";
 pub const MERGED_SUMMARY_DELIMITER: &str =
@@ -633,6 +648,10 @@ pub struct ContextCompressor {
     pub compression_count: u32,
     pub tail_token_budget: i64,
     pub max_summary_tokens: i64,
+    /// Feature 034 (US4): append CALM_CONTINUATION_SENTENCE after the end
+    /// marker (default false at this layer; Agent::new wires it from
+    /// compaction.calm_framing, config default true).
+    pub(crate) calm_framing: bool,
 
     pub last_prompt_tokens: i64,
     pub last_completion_tokens: i64,
@@ -743,6 +762,7 @@ impl ContextCompressor {
             compression_count: 0,
             tail_token_budget: target_tokens,
             max_summary_tokens,
+            calm_framing: false,
             last_prompt_tokens: 0,
             last_completion_tokens: 0,
             last_total_tokens: 0,
@@ -780,6 +800,11 @@ impl ContextCompressor {
 
     pub fn set_summary_backend(&mut self, backend: Arc<dyn SummaryBackend>) {
         self.summary_backend = Some(backend);
+    }
+
+    /// Feature 034 (US4): toggle calm continuation framing.
+    pub fn set_calm_framing(&mut self, on: bool) {
+        self.calm_framing = on;
     }
 
     pub(crate) fn summary_backend_arc(&self) -> Option<Arc<dyn SummaryBackend>> {
@@ -2863,7 +2888,7 @@ Write only the summary body. Do not include any preamble or prefix."#,
         }
 
         if !merge_summary_into_tail {
-            summary = format!("{}\n\n{}", summary, SUMMARY_END_MARKER);
+            summary = format!("{}\n\n{}", summary, summary_tail(self.calm_framing));
             let mut summary_msg = if summary_role == "user" {
                 Message::user(summary.clone())
             } else {
@@ -2880,7 +2905,7 @@ Write only the summary body. Do not include any preamble or prefix."#,
                 // MARKER at the very end and prior content clearly delimited.
                 let suffix = format!(
                     "\n\n{}\n\n{}\n\n{}",
-                    MERGED_SUMMARY_DELIMITER, summary, SUMMARY_END_MARKER
+                    MERGED_SUMMARY_DELIMITER, summary, summary_tail(self.calm_framing)
                 );
                 append_text_to_content(&mut msg, &suffix, false);
                 append_text_to_content(
@@ -3346,6 +3371,50 @@ respond to the message below, not the summary above ---";
         // Iterative-update state was stored (without the prefix).
         let prev = c.previous_summary_for_tests().unwrap();
         assert!(!prev.starts_with("[CONTEXT COMPACTION"));
+    }
+
+    // ── Feature 034 (US4): calm continuation framing ────────────────────
+
+    #[tokio::test]
+    async fn compaction_framing_calm_sentence_appended_when_enabled() {
+        let mut c = make_compressor(200_000, 0.50);
+        c.set_calm_framing(true);
+        c.set_summary_backend(ScriptedSummary::ok("## Goal\nsummary body"));
+        c.tail_token_budget = 300;
+        let messages = transcript(30, false);
+        let compressed = c.compress(messages, Some(999_999), None, false, "").await;
+        let summary = compressed.iter().find(|m| m.compressed_summary).unwrap();
+        let text = summary.content.clone().unwrap();
+        let idx = text.find(SUMMARY_END_MARKER).expect("end marker");
+        let after = &text[idx + SUMMARY_END_MARKER.len()..];
+        assert_eq!(after, format!("\n\n{}", CALM_CONTINUATION_SENTENCE));
+    }
+
+    #[tokio::test]
+    async fn compaction_framing_pre_feature_text_when_disabled() {
+        let mut c = make_compressor(200_000, 0.50);
+        c.set_calm_framing(false);
+        c.set_summary_backend(ScriptedSummary::ok("## Goal\nsummary body"));
+        c.tail_token_budget = 300;
+        let messages = transcript(30, false);
+        let compressed = c.compress(messages, Some(999_999), None, false, "").await;
+        let summary = compressed.iter().find(|m| m.compressed_summary).unwrap();
+        let text = summary.content.clone().unwrap();
+        let idx = text.find(SUMMARY_END_MARKER).expect("end marker");
+        assert_eq!(
+            &text[idx..], SUMMARY_END_MARKER,
+            "byte-exact pre-feature tail when disabled"
+        );
+        assert!(!text.contains(CALM_CONTINUATION_SENTENCE));
+    }
+
+    #[test]
+    fn compaction_framing_summary_tail_helper_variants() {
+        assert_eq!(summary_tail(false), SUMMARY_END_MARKER.to_string());
+        assert_eq!(
+            summary_tail(true),
+            format!("{SUMMARY_END_MARKER}\n\n{CALM_CONTINUATION_SENTENCE}")
+        );
     }
 
     #[test]

@@ -208,7 +208,7 @@ browser_tool!(BrowserPress, "browser_press", "Press a key with optional modifier
 browser_tool!(BrowserGetImages, "browser_get_images", "List images on the current page (src, alt, dimensions, visibility).", "🖼️");
 browser_tool!(BrowserVision, "browser_vision", "Capture an annotated Set-of-Mark screenshot of the viewport with numbered markers; use when structural extraction fails or a visual check is needed.", "👁️");
 browser_tool!(BrowserConsole, "browser_console", "Read buffered console entries from the page (level, text, source).", "🖥️");
-browser_tool!(BrowserCdp, "browser_cdp", "Raw CDP passthrough (expert). Requires browser.allow_raw_cdp=true; bypasses URL-safety gates — use with care.", "🔧");
+browser_tool!(BrowserCdp, "browser_cdp", "Raw CDP passthrough (expert). Requires browser.allow_raw_cdp=true; bypasses URL-safety gates — use with care. Large params payloads can be persisted and re-sent by path via params_path. Results observe the configured tool-output byte limit.", "🔧");
 browser_tool!(BrowserDialog, "browser_dialog", "Accept or dismiss a JavaScript dialog (alert/confirm/prompt); optional prompt_text.", "💬");
 browser_tool!(BrowserHover, "browser_hover", "Hover an element (opens hover-only menus).", "🖱️");
 browser_tool!(BrowserSelectOption, "browser_select_option", "Select an option on a native <select> dropdown.", "📋");
@@ -671,19 +671,89 @@ impl Tool for BrowserCdp {
             "type": "object",
             "properties": {
                 "method": { "type": "string", "description": "CDP method name." },
-                "params": { "type": "object", "description": "CDP params object." }
+                "params": { "type": "object", "description": "CDP params object." },
+                "params_path": { "type": "string", "description": "Path to a persisted params JSON file; its current content is parsed as the CDP params object." }
             },
             "required": ["method"]
         })
     }
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
         let method = match args.get("method").and_then(|v| v.as_str()) {
             Some(m) => m.to_string(),
             None => return ToolResult::Error("missing method".into()),
         };
-        let params = args.get("params").cloned().unwrap_or(json!({}));
+        // US7 (feature 034): `params` / `params_path` — at most one
+        // (`params` was never required; 'neither' keeps the params={}
+        // default, Principle VII backward compat).
+        let inline_params = args.get("params").cloned();
+        let params_path_arg = args.get("params_path").and_then(|v| v.as_str()).map(str::to_string);
+        let (params, params_path_out): (Value, Option<String>) = match (inline_params, params_path_arg) {
+            (Some(p), None) => {
+                // FR-011: persist inline params before dispatch; failure
+                // never fails the call (path omitted from result).
+                let persisted = crate::payload_store::persist_payload(
+                    ctx.session_id(),
+                    "browser_cdp",
+                    &p.to_string(),
+                )
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned());
+                (p, persisted)
+            }
+            (None, Some(path)) => {
+                // FR-012/FR-013: cross-session references are copied into
+                // the current session's payload dir; the file's CURRENT
+                // content must parse as a JSON object.
+                let resolved = match crate::payload_store::copy_payload_into_current_session(
+                    std::path::Path::new(&path),
+                    ctx.session_id(),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return ToolResult::Error(format!(
+                            "browser_cdp: params_path unreadable: {e}"
+                        ))
+                    }
+                };
+                let text = match crate::payload_store::read_payload(&resolved) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return ToolResult::Error(format!(
+                            "browser_cdp: params_path unreadable: {e}"
+                        ))
+                    }
+                };
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(v) if v.is_object() => (v, Some(resolved.to_string_lossy().into_owned())),
+                    Ok(_) => {
+                        return ToolResult::Error(
+                            "browser_cdp: params_path content is not a JSON object: top-level value is not an object".into(),
+                        )
+                    }
+                    Err(e) => {
+                        return ToolResult::Error(format!(
+                            "browser_cdp: params_path content is not a JSON object: {e}"
+                        ))
+                    }
+                }
+            }
+            (None, None) => (json!({}), None),
+            (Some(_), Some(_)) => {
+                return ToolResult::Error(
+                    "browser_cdp: provide at most one of 'params' or 'params_path'".into(),
+                )
+            }
+        };
         match self.handle.run(move |m| async move { m.raw_cdp(&method, params).await }).await {
-            Ok(v) => ok_json(v),
+            Ok(mut v) => {
+                // US7 (FR-011): surface the persisted params path in the
+                // success JSON only (omitted when persistence failed; left
+                // unchanged when the CDP result is not an object).
+                if let (Some(p), Value::Object(map)) = (&params_path_out, &mut v) {
+                    map.insert("params_path".into(), json!(p));
+                }
+                ok_json(v)
+            }
             Err(e) => err(e),
         }
     }

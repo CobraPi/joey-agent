@@ -579,6 +579,25 @@ never runs on tokio's async workers: call sites wrap the pool in
   per SC-007; see `specs/031-please-modify-joey/` (spec + contracts) and its
   baseline bundle.
 
+- **Feature 034 calm compaction framing (US4).** Upstream's
+  SUMMARY_PREFIX/SUMMARY_END_MARKER compaction text is ported byte-for-byte
+ and unchanged; Joey appends ONE additional sentence after the end marker —
+ "Context compaction is routine housekeeping — continue the current task; no
+ wrap-up or hand-off is needed." — behind `compaction.calm_framing`
+ (default `true`; the compressor layer defaults false and Agent::new wires
+ the config value, so upstream-exact output is one config key away). Spec:
+ specs/034-please-implement-previous-recommendations (research D7).
+
+- **Feature 034 terminal truncation marker reworded (US5, FR-007).**
+  truncate_terminal_output's notice changes from the upstream-ported
+ `... [OUTPUT TRUNCATED - N chars omitted out of M total] ...` to
+ `... [output truncated, N chars omitted] ...` (contracts/tool-schemas.md
+ FR-007, matching the verification.rs:469 precedent) so the omitted size is
+ advertised without the total. Defusing of trust-marker literals (feature
+ 034 FR-015) also wraps `<system-notice>`, `<total_tokens`, and
+ `[OUT-OF-BAND USER MESSAGE` literals in backticks inside tool output —
+ additive, upstream has no equivalent markers.
+
 ### GitHub Copilot embeddings backend (explicit) — 2026-08-30
 
 Status: Joey-native addition (no upstream counterpart; upstream Hermes has no Copilot embeddings path).

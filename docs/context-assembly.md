@@ -69,6 +69,44 @@ turn.
 
 Config key: `context_assembly.log_assembly`.
 
+### Context gauge (feature 034)
+
+Every assembled request appends one tail gauge line:
+
+```
+<total_tokens>N tokens left</total_tokens>
+```
+
+When the remaining budget is at or below the compression threshold, the
+line carries a `— LOW` suffix. The figure is
+`context_window − max(last real prompt tokens, rough estimate)`
+(research D3/D4). The gauge is gated by `context_gauge.enabled`
+(default `true`) and rides as the **last message after all stable
+content**, so the cached prefix stays byte-stable; it is request-only and
+never persisted to history. When `notice_channel.enabled` is `true`, the
+line is wrapped in `<system-notice>` markers (see
+[System-notice channel (feature 034)](#system-notice-channel-feature-034)).
+
+### System-notice channel (feature 034)
+
+System-injected notices — the gauge line, the skills index, environment
+hints, and the project-context attachment block — ride a unified
+`<system-notice>...</system-notice>` wrapper when `notice_channel.enabled`
+is on (default `false`; with it off, wire bytes are identical to the
+pre-feature build). The mid-turn steer marker
+(`[OUT-OF-BAND USER MESSAGE ...]`) is **never** wrapped (FR-003).
+Untrusted tool output containing the literal markers is defused
+(backtick-wrapped) by the tools layer before it can reach history
+(FR-015).
+
+### Tool-list stability guard (feature 034)
+
+When `context_assembly` + `tool_schema_retrieval` are enabled, the dynamic
+selection is snapshotted and replayed byte-identically on subsequent turns
+unless the registered toolset changes (input-hash keyed cache). Rationale
+(FR-004): re-ranking the tool list per turn would churn the tool-schema
+section of the prompt and defeat prompt-prefix cache warmth.
+
 ## Configuration
 
 All six keys live under the `context_assembly` block in `config.yaml`
@@ -83,6 +121,15 @@ default.**
 | `context_assembly.always_keep_tools` | `[read_file, write_file, patch, search_files, terminal, todo, scratchpad]` | — | Tools pinned ahead of ranking regardless of score |
 | `context_assembly.budget_state_chars` | `1500` | `200..=8000` | Character budget for the state block; line-preserving truncation with a `[truncated]` marker |
 | `context_assembly.log_assembly` | `false` | — | Write one JSON object per assembled request to the per-session JSONL log |
+| `context_gauge.enabled` | `true` | — | Feature 034: append the tail context-gauge line to every assembled request |
+| `compaction.calm_framing` | `true` | — | Feature 034: calm-framing sentence on the compression continuation |
+| `notice_channel.enabled` | `false` | — | Feature 034: wrap system-injected notices in `<system-notice>` markers |
+| `reasoning_prune.enabled` | `false` | — | Feature 034: strip thinking blocks from completed turns on the request copy |
+
+The last four rows are the feature-034 keys: they live outside the
+`context_assembly` block, in the feature-034 key group documented in
+[state-and-config.md](state-and-config.md), and two of them default to
+`true`.
 
 Enabling the full layer:
 
@@ -121,17 +168,21 @@ appends one JSON object per line to a per-session file:
 ~/.joey/context-assembly/<sanitized-session-key>-<fnv1a-hex8>/assembly.jsonl
 ```
 
-Schema (7 fields per line):
+Schema (11 fields per line):
 
 | Field | Meaning |
 |---|---|
 | `ts` | Timestamp of the assembly step |
-| `turn` | Turn ordinal within the session |
+| `request_turn` | Turn ordinal within the session |
 | `tools_total` | Tools visible to the selector before filtering |
 | `tools_kept` | Tools actually sent in the request |
 | `tools_dropped` | Tools filtered out by the budget |
 | `state_block_truncated` | Whether the state block was capped (`true`/`false`) |
 | `request_messages` | Message count in the assembled request |
+| `gauge_remaining` | Remaining-token figure carried by the context gauge line |
+| `gauge_low` | Whether the gauge flagged `— LOW` (at/below the compression threshold) |
+| `notice_channel_on` | Whether `notice_channel.enabled` was on for this request |
+| `tool_list_hash` | Input-hash key of the snapshotted tool list (stability-guard cache) |
 
 Logging is best-effort: failures are reported but never fail or alter the
 turn.
@@ -148,6 +199,13 @@ turn.
    mutated, so provider prompt-prefix caches stay warm; and when
    `tool count <= tool_top_k` the tool list is untouched, so there is no
    schema churn under budget.
+3. **Feature 034 defaults.** The default-on keys (`context_gauge.enabled`,
+   `compaction.calm_framing`) change the wire by exactly one tail line /
+   one appended sentence; the default-off keys (`notice_channel.enabled`,
+   `reasoning_prune.enabled`) leave the request byte-identical to the
+   pre-feature build while disabled. When `reasoning_prune.enabled` is on,
+   reasoning prune strips thinking blocks from completed turns on the
+   **request copy only** — history stays append-only.
 
 ## See also
 
@@ -156,3 +214,9 @@ turn.
   boundary cleanup) this layer builds on.
 - [PORTING.md](../PORTING.md) — upstream parity tracker, including the
   ledger entry for this Joey-only addition.
+- [state-and-config.md](state-and-config.md) — the feature-034 config key
+  group (`context_gauge.enabled`, `compaction.calm_framing`,
+  `notice_channel.enabled`, `reasoning_prune.enabled`).
+- [PORTING.md](../PORTING.md) deliberate deviations — calm framing and
+  the truncation marker are recorded as deliberate deviations from
+  upstream wording/behavior.
