@@ -1114,7 +1114,9 @@ impl Agent {
                         .map(|m| m.text_content())
                         .unwrap_or_default();
                     if !prompt.trim().is_empty() {
+                        tracing::info!(target: "wedgedebug", "WW1 memory prefetch begin");
                         if let Some(block) = rt.prefetch_block(&prompt) {
+                            tracing::info!(target: "wedgedebug", "WW2 memory prefetch done");
                             if !block.is_empty() {
                                 combined.push_str("\n\n");
                                 combined.push_str(&block);
@@ -2637,10 +2639,18 @@ impl Agent {
             let _ = forwarder.await;
             resp
         } else {
-            match &self.transport_override {
+            tracing::info!(target: "wedgedebug", "WW3 transport complete() begin");
+            let started = std::time::Instant::now();
+            let out = match &self.transport_override {
                 Some(t) => t.complete(req).await,
                 None => self.client.complete(req).await,
-            }
+            };
+            tracing::info!(
+                target: "wedgedebug",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "WW4 transport complete() returned"
+            );
+            out
         }
     }
 

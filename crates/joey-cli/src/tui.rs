@@ -337,6 +337,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         speckit_hook_depth: 0,
     };
     let (result, outro) = interactive_loop(session).await;
+    eprintln!("[QQ7] interactive_loop returned");
 
     if let Err(e) = result {
         render::error(&format!("TUI session error: {e}"));
@@ -353,6 +354,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         started: session_start,
         profile: crate::active_profile(),
     });
+    eprintln!("[QQ8] exit outro printed; run() returning");
     Ok(0)
 }
 
@@ -1577,7 +1579,9 @@ async fn interactive_loop(mut session: TuiSession) -> (anyhow::Result<()>, Outro
 
     // Quit: leave the terminal, end the session, snapshot the outro.
     let session_id = session.engine_spec.session_id.clone();
+    eprintln!("[QQ1] quitting: leaving terminal");
     let _ = session.tui.leave();
+    eprintln!("[QQ2] terminal left; subagent wind-down");
     // T025 wind-down (FR-015): await a BOUNDED shutdown of the session's
     // delegation children BEFORE final teardown — no fire-and-forget. The
     // bound is the manager's own config (delegation.wind_down_timeout_secs,
@@ -1590,12 +1594,16 @@ async fn interactive_loop(mut session: TuiSession) -> (anyhow::Result<()>, Outro
         .subagent_manager
         .shutdown(session.engine_spec.wind_down_timeout())
         .await;
+    eprintln!("[QQ3] wind-down done; closing teams");
     // Feature 022 (FR-012): team cleanup on TUI quit (same as REPL
     // end_session).
     joey_orchestration::team::global_teams()
         .close_all(&session.engine_spec.subagent_manager);
+    eprintln!("[QQ4] teams closed; ending session");
     end_session_by_id(&session_id, "user_exit");
+    eprintln!("[QQ5] session ended; outro stats");
     let (message_count, user_messages, tool_calls, title) = outro_stats(&session_id);
+    eprintln!("[QQ6] outro stats done");
     (
         Ok(()),
         OutroSnapshot { title, message_count, user_messages, tool_calls },
