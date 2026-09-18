@@ -287,10 +287,12 @@ pub fn render_status(report: &StatusReport) -> String {
             out.push_str("The active provider does not expose a live model catalog.\n");
             out.push_str("Dynamic selection requires a catalog-exposing provider (copilot/openrouter).\n");
         } else {
-            out.push_str(&format!(
-                "LLM Selector: enabled but inactive (model is '{}', not 'auto')\n",
-                report.configured_model
-            ));
+            // Unreachable in a consistent snapshot (configured_model ==
+            // "auto" with a non-empty pool means active); distinct message so
+            // it never prints "model is 'auto', not 'auto'".
+            out.push_str(
+                "LLM Selector: enabled but inactive (inconsistent snapshot — re-run /llm-selector status)\n",
+            );
         }
     }
     out.push_str("Run /llm-selector help for the full command list.\n");

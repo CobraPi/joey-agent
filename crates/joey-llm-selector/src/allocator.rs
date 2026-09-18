@@ -429,7 +429,7 @@ impl SelectorEngine {
             pinned: false,
             implicit_pin: false,
             reason: format!("diagnoser reallocation: {} (p_j={:.2})", rationale, observed_pj),
-            estimated_performance: Some(observed_pj),
+            estimated_performance: None,
             updated_at: Some(now),
         };
         map.upsert(entry);
@@ -619,6 +619,7 @@ impl SelectorEngine {
         // Also update the turn cache if present.
         if let Ok(mut cache) = self.cache.lock() {
             cache.allocations.remove(&module);
+            cache.context_windows.remove(&module);
         }
         Ok(())
     }
@@ -638,6 +639,7 @@ impl SelectorEngine {
                 // otherwise, hiding the unpin from same-turn resolves.
                 if let Ok(mut cache) = self.cache.lock() {
                     cache.allocations.remove(module);
+                    cache.context_windows.remove(module);
                 }
                 Ok(())
             }
@@ -682,21 +684,18 @@ impl SelectorEngine {
         }
         // Empty pool AND cfg is "auto"/empty: still never the literal "auto"
         // sentinel (FR-020). Substitute the first provider-curated fallback,
-        // else the provider's default model id.
-        if cfg_model == "auto" || cfg_model.is_empty() {
-            if let Some(fb) = fallbacks.first() {
-                return Allocation {
-                    model_id: fb.clone(),
-                    source: AllocationSource::DegradedFallback,
-                };
-            }
+        // else the provider's default model id. (Every non-empty non-"auto"
+        // config already returned above, so the former trailing fallback was
+        // unreachable — and would have returned the forbidden "auto"
+        // sentinel had it ever run.)
+        if let Some(fb) = fallbacks.first() {
             return Allocation {
-                model_id: self.provider_default_model(),
+                model_id: fb.clone(),
                 source: AllocationSource::DegradedFallback,
             };
         }
         Allocation {
-            model_id: cfg_model,
+            model_id: self.provider_default_model(),
             source: AllocationSource::DegradedFallback,
         }
     }
@@ -1921,7 +1920,9 @@ mod tests {
         let snap = engine.map_snapshot();
         let entry = snap.get(&ModuleId::MainTurn).unwrap();
         assert_eq!(entry.model_id, "versatile-model");
-        assert!(entry.estimated_performance.is_some());
+        // The observed p_j (0.10) was measured on the OLD model (flash-model)
+        // — the replacement entry must stay unobserved, not inherit it.
+        assert!(entry.estimated_performance.is_none());
     }
 
     /// T044: pinned modules are never reallocated by the learning loop.

@@ -337,7 +337,6 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         speckit_hook_depth: 0,
     };
     let (result, outro) = interactive_loop(session).await;
-    eprintln!("[QQ7] interactive_loop returned");
 
     if let Err(e) = result {
         render::error(&format!("TUI session error: {e}"));
@@ -354,7 +353,6 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<i32> {
         started: session_start,
         profile: crate::active_profile(),
     });
-    eprintln!("[QQ8] exit outro printed; run() returning");
     Ok(0)
 }
 

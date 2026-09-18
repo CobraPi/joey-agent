@@ -5427,9 +5427,9 @@ mod tests {
 
     fn toggle_fixture_agent(
         enabled: Vec<&str>,
-    ) -> (Agent, tempfile::TempDir, tempfile::TempDir, joey_core::constants::HomeOverrideGuard)
+    ) -> (std::sync::MutexGuard<'static, ()>, Agent, tempfile::TempDir, tempfile::TempDir, joey_core::constants::HomeOverrideGuard)
     {
-        let _lock = crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let lock = crate::TEST_HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = tempfile::tempdir().unwrap();
         let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
         let cwd = tempfile::tempdir().unwrap();
@@ -5453,7 +5453,7 @@ mod tests {
             model_pinned: false,
         };
         let agent = Agent::new(config, registry, ctx).expect("agent");
-        (agent, home, cwd, guard)
+        (lock, agent, home, cwd, guard)
     }
 
     /// Regression (orchestrator toggle): after `set_enabled_tools` +
@@ -5464,7 +5464,7 @@ mod tests {
     /// tool guidance remain.
     #[test]
     fn rebuild_system_prompt_reflects_current_enabled_tools() {
-        let (mut agent, _home, _cwd, _guard) = toggle_fixture_agent(vec!["memory", "session_search"]);
+        let (_lock, mut agent, _home, _cwd, _guard) = toggle_fixture_agent(vec!["memory", "session_search"]);
 
         // Baked at init with the full surface: both guidance blocks present.
         assert!(agent.system_prompt().contains("persistent memory"));

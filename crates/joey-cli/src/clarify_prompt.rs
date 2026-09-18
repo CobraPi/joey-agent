@@ -32,7 +32,7 @@ fn prompt_sync(question: &str, choices: &[String]) -> Option<String> {
         for (i, choice) in choices.iter().enumerate() {
             println!("  {}. {}", i + 1, choice);
         }
-        println!("  {}. Other (type your answer)", choices.len() + 1);
+        println!("  Other (type your answer)");
         render::info(&format!(
             "reply with 1-{} (or your own answer)",
             choices.len()
