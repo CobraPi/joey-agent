@@ -47,6 +47,11 @@ pub fn replace_line_if_unchanged(
     let current_content = std::fs::read_to_string(path).unwrap_or_default();
     check_conflict(&current_content, based_on_hash)?;
 
+    // Preserve the file's dominant line terminator: `str::lines()` strips
+    // a trailing \r, so a CRLF file would otherwise be silently normalized
+    // to LF file-wide on any single-line edit.
+    let newline = if current_content.contains("\r\n") { "\r\n" } else { "\n" };
+
     let mut replaced = false;
     let new_content: String = current_content
         .lines()
@@ -59,10 +64,10 @@ pub fn replace_line_if_unchanged(
             }
         })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(newline);
 
     let new_content = if current_content.ends_with('\n') {
-        format!("{}\n", new_content)
+        format!("{}{}", new_content, newline)
     } else {
         new_content
     };
@@ -91,6 +96,9 @@ pub fn mark_task_complete(
         Err(_) => return Ok(()),
     };
 
+    // Same CRLF preservation as `replace_line_if_unchanged` — see above.
+    let newline = if content.contains("\r\n") { "\r\n" } else { "\n" };
+
     let mut changed = false;
     let new_content: String = content
         .lines()
@@ -115,14 +123,14 @@ pub fn mark_task_complete(
             line.to_string()
         })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(newline);
 
     if !changed {
         return Ok(());
     }
 
     let new_content = if content.ends_with('\n') {
-        format!("{}\n", new_content)
+        format!("{}{}", new_content, newline)
     } else {
         new_content
     };
@@ -155,6 +163,43 @@ mod tests {
         let err = write_if_unchanged(&path, "updated", &stale_hash);
         assert!(err.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    #[test]
+    fn replace_line_preserves_crlf_line_endings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks.md");
+        let original = "- [ ] T001 First\r\n- [ ] T002 Second\r\n";
+        std::fs::write(&path, original).unwrap();
+        let hash = content_hash(original);
+
+        replace_line_if_unchanged(&path, "- [ ] T002 Second", "- [X] T002 Second", &hash)
+            .unwrap();
+
+        // The whole file must round-trip with CRLF intact, not just the
+        // edited line — no silent file-wide normalization to LF.
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "- [ ] T001 First\r\n- [X] T002 Second\r\n");
+    }
+
+    #[test]
+    fn mark_task_complete_preserves_crlf_line_endings() {
+        let dir = tempdir().unwrap();
+        let feature_dir = dir.path().join("specs").join("001-test");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        std::fs::write(
+            feature_dir.join("tasks.md"),
+            "- [ ] T001 First task in src/a.rs\r\n- [ ] T002 Second task in src/b.rs\r\n",
+        )
+        .unwrap();
+
+        mark_task_complete(dir.path(), "001-test", "T002").unwrap();
+
+        let content = std::fs::read_to_string(feature_dir.join("tasks.md")).unwrap();
+        assert_eq!(
+            content,
+            "- [ ] T001 First task in src/a.rs\r\n- [X] T002 Second task in src/b.rs\r\n"
+        );
     }
 
     #[test]

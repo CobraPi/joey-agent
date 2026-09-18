@@ -265,7 +265,15 @@ async fn run_agent(
     // and leaves the agent byte-identical to pre-feature-011 (Constitution VII).
     // Built before orchestration registration so it can be threaded into the
     // delegate_task tool (T028 subagent intercept).
-    let allocator = crate::llm_selector::try_build_allocator(config);
+    // Pool population performs blocking HTTP (catalog fetch, 10-15s) — run it
+    // on the blocking pool, not the async worker thread.
+    let allocator_config = config.clone();
+    let allocator = tokio::task::spawn_blocking(move || {
+        crate::llm_selector::try_build_allocator(&allocator_config)
+    })
+    .await
+    .ok()
+    .flatten();
 
     // Feature 015 (NeuroCode): build the engine when enabled and register the
     // 4 NeuroCode tools (T056/T057). None when disabled — byte-identical

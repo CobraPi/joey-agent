@@ -4,6 +4,8 @@
 //! interfaces, decorators as annotations), methods, module-level functions,
 //! and imports (plain + from-import + aliased).
 
+use std::collections::VecDeque;
+
 use tree_sitter::{Node, Parser};
 
 use super::extract::{ExtractedField, ExtractedMethod, ExtractedType, SourceExtraction};
@@ -28,8 +30,12 @@ pub fn parse_python_file(source: &str) -> Result<SourceExtraction, String> {
     // caller, not here). Leave package empty; ingestion derives grouping
     // from the file path.
     let mut cursor = root.walk();
-    let mut queue = vec![root];
-    while let Some(node) = queue.pop() {
+    // VecDeque + pop_front: insertion-ordered (FIFO) traversal so emitted
+    // types/module_functions come out in source order. (A Vec + pop() is
+    // LIFO and emitted top-level declarations reversed.)
+    let mut queue = VecDeque::new();
+    queue.push_back(root);
+    while let Some(node) = queue.pop_front() {
         cursor.reset(node);
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i as u32) {
@@ -72,7 +78,7 @@ pub fn parse_python_file(source: &str) -> Result<SourceExtraction, String> {
                         }
                     }
                     "future_import_statement" => {}
-                    _ => queue.push(child),
+                    _ => queue.push_back(child),
                 }
             }
         }
@@ -341,6 +347,29 @@ def standalone(x):
         // Module function.
         assert_eq!(ext.module_functions.len(), 1);
         assert_eq!(ext.module_functions[0].name, "standalone");
+    }
+
+    #[test]
+    fn emits_declarations_in_source_order() {
+        let src = "\
+class Alpha:
+    pass
+
+def one():
+    pass
+
+class Beta:
+    pass
+
+def two():
+    pass
+";
+        let ext = parse_python_file(src).unwrap();
+        let type_names: Vec<&str> = ext.types.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(type_names, vec!["Alpha", "Beta"], "types in source order");
+        let fn_names: Vec<&str> =
+            ext.module_functions.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(fn_names, vec!["one", "two"], "functions in source order");
     }
 
     #[test]

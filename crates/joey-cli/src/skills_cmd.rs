@@ -176,7 +176,7 @@ fn config_info() -> Result<i32> {
 /// (skills_hub.do_list approximation; Trust column not ported).
 fn list(enabled_only: bool) -> Result<i32> {
     let config = joey_core::Config::load()?;
-    let disabled: Vec<String> = config.get_str_list("skills.disabled");
+    let disabled: Vec<String> = disabled_list(&config);
     let skills = joey_tools::tools::skills_tool::discover();
 
     let mut title = "Installed Skills".to_string();

@@ -133,15 +133,32 @@ pub fn parse_ruby_file(source: &str) -> Result<SourceExtraction, String> {
         }
     }
 
-    walk_ruby(&root, source, "", &mut extraction);
+    walk_ruby(&root, source, "", &mut extraction, true);
     Ok(extraction)
 }
 
 /// Recursive Ruby walk: classes/modules become types; `def` inside a
 /// class/module body becomes a method of the innermost enclosing type.
-fn walk_ruby<'a>(node: &Node<'a>, source: &str, package: &str, extraction: &mut SourceExtraction) {
+/// Top-level `def foo` (a `method` child of the program node, seen only on
+/// the `top_level` walk) becomes a module function — mirroring how the
+/// heuristic extractor captures it.
+fn walk_ruby<'a>(
+    node: &Node<'a>,
+    source: &str,
+    package: &str,
+    extraction: &mut SourceExtraction,
+    top_level: bool,
+) {
     for child in named_children(node) {
         match child.kind() {
+            "method" if top_level => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = txt(&name_node, source);
+                    if !name.is_empty() {
+                        extraction.module_functions.push(method_node(name, &child));
+                    }
+                }
+            }
             "class" => {
                 let name = child
                     .child_by_field_name("name")
@@ -184,20 +201,21 @@ fn walk_ruby<'a>(node: &Node<'a>, source: &str, package: &str, extraction: &mut 
                 walk_ruby_types_only(&child, source, &nested, extraction);
                 extraction.types.push(ty);
             }
-            _ => walk_ruby(&child, source, package, extraction),
+            _ => walk_ruby(&child, source, package, extraction, false),
         }
     }
 }
 
-/// Collect direct `method` (def) nodes inside a class/module body — the
-/// innermost enclosing type owns them, so nested classes' methods are NOT
-/// included (they are handled by their own class walk).
+/// Collect direct `method` (def) and `singleton_method` (`def self.foo`)
+/// nodes inside a class/module body — the innermost enclosing type owns
+/// them, so nested classes' methods are NOT included (they are handled by
+/// their own class walk).
 fn collect_ruby_methods<'a>(body: &Node<'a>, source: &str, ty: &mut ExtractedType) {
     // Descend only through body_statement containers, not into nested
     // class/module/singleton bodies.
     for child in named_children(body) {
         match child.kind() {
-            "method" => {
+            "method" | "singleton_method" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = txt(&name_node, source);
                     if !name.is_empty() {
@@ -221,7 +239,7 @@ fn walk_ruby_types_only<'a>(
 ) {
     for child in named_children(node) {
         match child.kind() {
-            "class" | "module" => walk_ruby(&child, source, package, extraction),
+            "class" | "module" => walk_ruby(&child, source, package, extraction, false),
             "body_statement" => walk_ruby_types_only(&child, source, package, extraction),
             _ => {}
         }
@@ -1376,10 +1394,18 @@ class UserService < BaseService
   def find(id)
     @store[id]
   end
+
+  def self.build
+    new
+  end
 end
 
 module Billing
   def charge(x); end
+end
+
+def util(x)
+  x
 end
 "#;
         let ext = parse_ruby_file(src).unwrap();
@@ -1393,8 +1419,12 @@ end
             .implemented_interfaces
             .contains(&"BaseService".to_string()));
         assert!(svc.methods.iter().any(|m| m.name == "find"));
+        // `def self.foo` (singleton_method) is a method of the class too.
+        assert!(svc.methods.iter().any(|m| m.name == "build"));
         let billing = ext.types.iter().find(|t| t.name == "Billing").unwrap();
         assert!(billing.methods.iter().any(|m| m.name == "charge"));
+        // Top-level `def` is a module function (heuristic-extractor shape).
+        assert!(ext.module_functions.iter().any(|f| f.name == "util"));
     }
 
     #[test]

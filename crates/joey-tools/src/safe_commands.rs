@@ -72,9 +72,40 @@ const CHAINING_METACHARACTERS: &[&str] =
 /// flag disqualifies auto-approval.
 fn git_flag_denylist(subcommand: &str) -> Option<&'static [&'static str]> {
     match subcommand {
-        "git branch" => Some(&["-d", "-D", "-m", "--edit", "-e", "--force", "-f"]),
-        "git tag" => Some(&["-d", "-D", "-f", "-s", "-u", "--force", "--delete"]),
-        "git diff" => Some(&["--output", "--ext-diff", "--no-index"]),
+        "git branch" => Some(&[
+            "-d",
+            "-D",
+            "-m",
+            "--edit",
+            "-e",
+            "--force",
+            "-f",
+            "-c",
+            "-C",
+            "--copy",
+            "-M",
+            "-u",
+            "--set-upstream-to",
+            "--unset-upstream",
+            "--track",
+            "--edit-description",
+        ]),
+        "git tag" => Some(&[
+            "-d",
+            "-D",
+            "-f",
+            "-s",
+            "-u",
+            "--force",
+            "--delete",
+            "-a",
+            "-m",
+            "-F",
+            "--annotate",
+            "--message",
+            "--file",
+        ]),
+        "git diff" => Some(&["-o", "--output", "--ext-diff", "--no-index"]),
         _ => None,
     }
 }
@@ -328,6 +359,15 @@ mod tests {
         assert!(!is_safe_read_only_command("git remote remove origin"));
         assert!(!is_safe_read_only_command("git remote rename a b"));
         assert!(!is_safe_read_only_command("git remote set-url origin https://y"));
+    }
+
+    #[test]
+    fn test_git_extended_flag_denylist() {
+        assert!(!is_safe_read_only_command("git branch -M main"));
+        assert!(!is_safe_read_only_command("git tag -a v1"));
+        assert!(!is_safe_read_only_command("git diff --output /tmp/x"));
+        assert!(is_safe_read_only_command("git diff HEAD"));
+        assert!(!is_safe_read_only_command("git branch -d topic"));
     }
 
     #[test]

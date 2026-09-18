@@ -552,7 +552,9 @@ pub fn parse_schedule(schedule: &str) -> Result<Schedule> {
     // Duration like "30m", "2h", "1d" → one-shot from now.
     if let Ok(minutes) = parse_duration(schedule) {
         let delta = Duration::try_minutes(minutes).ok_or_else(|| duration_error(original))?;
-        let run_at = time_now() + delta;
+        let run_at = time_now()
+            .checked_add_signed(delta)
+            .ok_or_else(|| duration_error(original))?;
         return Ok(Schedule::once(
             fmt_isoformat(&run_at),
             format!("once in {}", original),
@@ -602,11 +604,11 @@ pub fn compute_next_run(schedule: &Schedule, last_run_at: Option<&str>) -> Optio
             let delta = Duration::try_minutes(minutes)?;
             let next_run = match last_run_at {
                 Some(last) => match ensure_aware_str(last) {
-                    Ok(dt) => dt + delta,
-                    Err(_) => now + delta,
+                    Ok(dt) => dt.checked_add_signed(delta)?,
+                    Err(_) => now.checked_add_signed(delta)?,
                 },
                 // First run is now + interval.
-                None => now + delta,
+                None => now.checked_add_signed(delta)?,
             };
             Some(fmt_isoformat(&next_run))
         }
@@ -3326,6 +3328,23 @@ mod tests {
         // A hand-edited store can carry minutes beyond chrono's TimeDelta
         // bound without going through parse_duration at all.
         let sched = Schedule::interval(i64::MAX, "every huge");
+        assert!(compute_next_run(&sched, None).is_none());
+        let last = fmt_isoformat(&(time_now() - Duration::minutes(10)));
+        assert!(compute_next_run(&sched, Some(&last)).is_none());
+    }
+
+    #[test]
+    fn parse_schedule_huge_one_shot_duration_returns_error_not_panic() {
+        // 8.21e12 minutes fits chrono's TimeDelta bound but overflows any
+        // DateTime when added to now — must error, not panic.
+        assert!(parse_schedule("8210000000000m").is_err());
+    }
+
+    #[test]
+    fn compute_next_run_parsed_huge_interval_is_none_not_panic() {
+        // The `every` branch of parse_schedule does no time arithmetic, so
+        // huge-but-parseable intervals only overflow here — no next run.
+        let sched = parse_schedule("every 8210000000000m").unwrap();
         assert!(compute_next_run(&sched, None).is_none());
         let last = fmt_isoformat(&(time_now() - Duration::minutes(10)));
         assert!(compute_next_run(&sched, Some(&last)).is_none());

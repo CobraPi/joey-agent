@@ -775,13 +775,16 @@ impl NeuroCodeCommands for DefaultEngine {
                 // T063: shared ingestion path — single file or directory,
                 // capped + binary-skipping, registry + FTS indexed.
                 match crate::memory::domain::ingest_source(graph.store(), &source) {
-                    Ok(id) => format!(
-                        "Ingested {} source #{} from '{}' [category={}].",
-                        cat.as_str(),
-                        id,
-                        path,
-                        cat.as_str()
-                    ),
+                    Ok(id) => {
+                        let ver = version.unwrap_or("-");
+                        format!(
+                            "Ingested {} source #{} from '{}' [version={}].",
+                            cat.as_str(),
+                            id,
+                            path,
+                            ver
+                        )
+                    }
                     Err(e) => format!("Ingestion failed: {}", e),
                 }
             }

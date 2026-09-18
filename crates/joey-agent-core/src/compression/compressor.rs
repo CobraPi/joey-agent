@@ -1387,7 +1387,7 @@ impl ContextCompressor {
                 continue; // multimodal — not hashed/deduped by text
             }
             let Some(content) = result[i].content.clone() else { continue };
-            if content.len() < 200 {
+            if content.chars().count() < 200 {
                 continue;
             }
             use sha2::Digest;
@@ -1433,7 +1433,7 @@ impl ContextCompressor {
             if content.starts_with("[Duplicate tool output") {
                 continue;
             }
-            if content.len() > 200 {
+            if content.chars().count() > 200 {
                 let call_id = item.tool_call_id.clone().unwrap_or_default();
                 let (tool_name, tool_args) = call_id_to_tool
                     .get(&call_id)
@@ -1452,7 +1452,7 @@ impl ContextCompressor {
                 continue;
             }
             for tc in &mut msg.tool_calls {
-                if tc.function.arguments.len() > 500 {
+                if tc.function.arguments.chars().count() > 500 {
                     let new_args = truncate_tool_call_args_json(&tc.function.arguments, 200);
                     if new_args != tc.function.arguments {
                         tc.function.arguments = new_args;
@@ -2630,7 +2630,8 @@ Write only the summary body. Do not include any preamble or prefix."#,
             self.clear_compression_failure_cooldown();
         }
         let n_messages = messages.len();
-        // Only need head + 3 tail messages minimum.
+        // Only need head + 3 tail messages minimum (plus 1 margin: refuse at
+        // <= head + 4 so there is always at least one message to compress).
         let min_for_compress = self.protect_head_size(&messages) + 3 + 1;
         if n_messages <= min_for_compress {
             // Record the no-op so the anti-thrashing guard can fire (#40803).

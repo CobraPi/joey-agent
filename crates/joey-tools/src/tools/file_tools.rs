@@ -566,8 +566,9 @@ fn write_with_preservation(resolved: &Path, content: &str) -> Result<(u64, bool)
     }
     let mut dirs_created = false;
     if let Some(parent) = resolved.parent() {
+        let parent_existed = parent.exists();
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to write file: {}", e))?;
-        dirs_created = true;
+        dirs_created = !parent_existed;
     }
     joey_core::utils::atomic_replace(resolved, content.as_bytes())
         .map_err(|e| format!("Failed to write file: {}", e))?;
@@ -662,6 +663,9 @@ impl Tool for WriteFile {
 
         let resolved = ctx.resolve_path(&path);
         if let Some(err) = guards::check_sensitive_path(&path, &resolved) {
+            return tool_error(err);
+        }
+        if let Some(err) = guards::check_sensitive_path_canonical(&path, &resolved) {
             return tool_error(err);
         }
         // NOTE: the upstream cross-profile soft guard needs profile metadata
@@ -866,6 +870,9 @@ impl Tool for Patch {
         for p in &paths_to_check {
             let resolved = ctx.resolve_path(p);
             if let Some(err) = guards::check_sensitive_path(p, &resolved) {
+                return tool_error(err);
+            }
+            if let Some(err) = guards::check_sensitive_path_canonical(p, &resolved) {
                 return tool_error(err);
             }
         }
@@ -1177,6 +1184,9 @@ count for multi-spot edits."
 
         let resolved = ctx.resolve_path(&path);
         if let Some(err) = guards::check_sensitive_path(&path, &resolved) {
+            return tool_error(err);
+        }
+        if let Some(err) = guards::check_sensitive_path_canonical(&path, &resolved) {
             return tool_error(err);
         }
 
@@ -2272,6 +2282,59 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with('\u{feff}'));
         assert!(text.contains("x\r\ny\r\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_symlink_writes_through() {
+        // Symlinked writes follow the link to the real file (atomic_replace
+        // resolves the target); the lexical + canonical guards must both
+        // pass for a tempdir-local symlink.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        std::fs::write(dir.path().join("real.txt"), "before\n").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link.txt"))
+            .unwrap();
+        let w = parse(
+            &WriteFile
+                .execute(json!({"path": "link.txt", "content": "after\n"}), &ctx)
+                .await,
+        );
+        assert_eq!(w["bytes_written"], 6);
+        // Writing through the link replaced the TARGET's content.
+        assert_eq!(std::fs::read_to_string(dir.path().join("real.txt")).unwrap(), "after\n");
+        // The symlink itself survives.
+        assert!(dir.path().join("link.txt").symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[tokio::test]
+    async fn write_file_tempdir_exempt_from_canonical_check() {
+        // macOS tempdirs canonicalize under /private/var/, which the
+        // sensitive-prefix list would reject; the canonical check must be
+        // skipped for paths under the canonicalized process temp dir.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        let w = parse(
+            &WriteFile
+                .execute(json!({"path": "exempt.txt", "content": "ok\n"}), &ctx)
+                .await,
+        );
+        assert_eq!(w["bytes_written"], 3);
+        assert!(w.get("error").is_none());
+        assert_eq!(std::fs::read_to_string(dir.path().join("exempt.txt")).unwrap(), "ok\n");
+    }
+
+    #[tokio::test]
+    async fn write_file_existing_parent_reports_dirs_created_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        let w = parse(
+            &WriteFile
+                .execute(json!({"path": "plain.txt", "content": "x\n"}), &ctx)
+                .await,
+        );
+        assert_eq!(w["bytes_written"], 2);
+        assert_eq!(w["dirs_created"], false);
     }
 
     #[tokio::test]

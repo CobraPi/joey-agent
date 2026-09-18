@@ -411,7 +411,13 @@ impl BrowserManager {
         if is_printable_key(key, ctrl, alt, meta) {
             // Printable keys must be dispatched as keyDown WITH `text` —
             // rawKeyDown with text omitted types nothing.
-            let ch = key.to_string();
+            // Shift modifies the typed character: shift+a must type 'A'.
+            // Non-alpha chars pass through unchanged (symbol remapping
+            // across layouts is out of scope).
+            let mut ch = key.to_string();
+            if shift {
+                ch = ch.chars().map(|c| c.to_ascii_uppercase()).collect();
+            }
             for kind in ["keyDown", "keyUp"] {
                 self.conn()?
                     .send(

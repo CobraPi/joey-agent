@@ -30,13 +30,13 @@ pub fn content_length_for_budget(msg: &Message) -> usize {
         let mut total = 0usize;
         for p in parts {
             match p {
-                ContentPart::Text { text } => total += text.len(),
+                ContentPart::Text { text } => total += text.chars().count(),
                 ContentPart::ImageUrl { .. } => total += IMAGE_CHAR_EQUIVALENT,
             }
         }
         return total;
     }
-    msg.content.as_deref().map(str::len).unwrap_or(0)
+    msg.content.as_deref().map(|s| s.chars().count()).unwrap_or(0)
 }
 
 /// Stable char-length for non-content replay/metadata fields
@@ -126,11 +126,11 @@ fn estimate_message_chars(msg: &Message) -> usize {
     if let Some(rd) = &msg.reasoning_details {
         shadow.insert("reasoning_details".to_string(), rd.clone());
     }
-    serde_json::to_string(&Value::Object(shadow)).map(|s| s.len()).unwrap_or(0)
+    serde_json::to_string(&Value::Object(shadow)).map(|s| s.chars().count()).unwrap_or(0)
 }
 
 /// Rough token estimate for a message list (`estimate_messages_tokens_rough`):
-/// serialized chars/4 (ceiling) + a flat ~11000 tokens per image.
+/// serialized chars/4 (ceiling) + a flat ~1500 tokens per image.
 ///
 /// Rayon: per-message shadow-JSON serialization is independent CPU work;
 /// the fan-out only engages above a small-message threshold (sequential
@@ -220,7 +220,7 @@ mod tests {
         // Budget walk: text 2 chars + IMAGE_CHAR_EQUIVALENT.
         assert_eq!(content_length_for_budget(&m), 2 + IMAGE_CHAR_EQUIVALENT);
         // Request estimate: base64 payload must NOT be counted as chars —
-        // one image ≈ 11000 tokens, not ~25K.
+        // one image ≈ 1500 tokens, not ~25K.
         let est = estimate_messages_tokens_rough(&[m]);
         assert!(est < 2000, "image over-counted: {}", est);
         assert!(est >= 1500);

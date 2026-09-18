@@ -1018,7 +1018,7 @@ impl<B: ratatui::backend::Backend> Tui<B> {
     /// focus — global shortcuts are limited to control-modified keys and
     /// keys that can't collide with typing (Esc, Tab, F1, PgUp/PgDn).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<TuiAction> {
-        if key.kind != KeyEventKind::Press {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return None;
         }
 

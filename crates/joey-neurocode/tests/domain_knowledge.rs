@@ -377,3 +377,46 @@ fn different_categories_do_not_conflict() {
     assert!(!retrieve(graph.store(), "framework", None, 10).is_empty());
     assert!(!retrieve(graph.store(), "entity", None, 10).is_empty());
 }
+
+#[test]
+fn none_plus_one_version_yields_exactly_one_conflict_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.md");
+    let b = dir.path().join("b.md");
+    let c = dir.path().join("c.md");
+    std::fs::write(&a, "Postmortem alpha incident summary.\n").unwrap();
+    std::fs::write(&b, "Postmortem beta incident summary.\n").unwrap();
+    std::fs::write(&c, "Postmortem gamma incident summary.\n").unwrap();
+
+    let graph = DependencyGraph::open_in_memory().unwrap();
+    // One None-tagged source overlapping two distinct version tags in the
+    // same category: the None-vs-version conflict must be reported exactly
+    // ONCE for the category, not once per version group.
+    ingest_source(
+        graph.store(),
+        &make_source(KnowledgeCategory::Postmortem, a.to_str().unwrap(), None, "PM A"),
+    )
+    .unwrap();
+    ingest_source(
+        graph.store(),
+        &make_source(KnowledgeCategory::Postmortem, b.to_str().unwrap(), Some("v1"), "PM B"),
+    )
+    .unwrap();
+    ingest_source(
+        graph.store(),
+        &make_source(KnowledgeCategory::Postmortem, c.to_str().unwrap(), Some("v2"), "PM C"),
+    )
+    .unwrap();
+
+    let conflicts = resolve_conflicts(graph.store());
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "None-vs-version overlap must yield exactly one category-level report, got: {:?}",
+        conflicts
+    );
+    assert_eq!(conflicts[0].category, "Postmortem");
+    assert_eq!(conflicts[0].version_tag, None);
+    // The single report covers all three overlapping sources.
+    assert_eq!(conflicts[0].sources.len(), 3);
+}

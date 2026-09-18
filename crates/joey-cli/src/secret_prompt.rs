@@ -52,8 +52,8 @@ pub fn masked_secret_prompt(prompt: &str) -> SecretInput {
 }
 
 fn plain_prompt(prompt: &str) -> SecretInput {
-    print!("{}", prompt);
-    let _ = std::io::stdout().flush();
+    eprint!("{}", prompt);
+    let _ = std::io::stderr().flush();
     let mut buf = String::new();
     match std::io::stdin().read_line(&mut buf) {
         Ok(0) => SecretInput::Cancelled,

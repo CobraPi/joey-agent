@@ -257,6 +257,55 @@ fn contains_id_token(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// Anchored id match for PATCH line targeting: the id token must START the
+/// line's content, immediately after the structural marker the parsers
+/// emit — a checkbox (`- [ ] T005 …`, parser/tasks.rs), a plain list marker
+/// (`- **FR-001**: …`, parser/spec.rs), or a heading (`### User Story 1 …`).
+/// A token that merely appears in prose (`See FR-012 …`) no longer hijacks
+/// the edit onto the wrong line.
+fn line_targets_id(line: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    // Lines without a structural marker (plain prose) are never targets —
+    // the id must immediately follow a checkbox/list/heading marker.
+    let Some(content) = content_after_line_marker(line.trim_start()) else {
+        return false;
+    };
+    // spec.md bolds requirement ids: `- **FR-001**: …`.
+    let content = content.strip_prefix("**").unwrap_or(content);
+    if !content.starts_with(token) {
+        return false;
+    }
+    // Whole-token boundary, same rule as `contains_id_token`: "FR-01" must
+    // not anchor "FR-011"'s line.
+    let after = &content[token.len()..];
+    after.is_empty() || !after.as_bytes()[0].is_ascii_alphanumeric()
+}
+
+/// Strip the leading structural marker of a markdown line, returning the
+/// content that follows: checkbox forms (`- [ ]`/`- [x]`/`- [X]`/`- [~]`/
+/// `- [-]` — the shapes parser/tasks.rs recognizes), plain list markers
+/// (`- `), or ATX heading markers (`### `).
+fn content_after_line_marker(trimmed: &str) -> Option<&str> {
+    if let Some(rest) = trimmed.strip_prefix("- [") {
+        if let Some(close) = rest.find(']') {
+            // Single-char checkbox markers only (" ", "x", "X", "~", "-").
+            if close <= 1 {
+                return Some(rest[close + 1..].trim_start());
+            }
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return Some(rest.trim_start());
+    }
+    let without_hashes = trimmed.trim_start_matches('#');
+    if without_hashes.len() != trimmed.len() {
+        return Some(without_hashes.trim_start());
+    }
+    None
+}
+
 // ---------------------------------------------------------------------
 // GET /api/features
 // ---------------------------------------------------------------------
@@ -447,7 +496,7 @@ async fn patch_spec(
     let current = std::fs::read_to_string(&spec_path).unwrap_or_default();
     let target_line = current
         .lines()
-        .find(|l| contains_id_token(l.trim_start(), body.target.id.as_str()))
+        .find(|l| line_targets_id(l, body.target.id.as_str()))
         .map(|l| l.to_string());
 
     let Some(target_line) = target_line else {
@@ -523,7 +572,7 @@ async fn patch_task(
     let current = std::fs::read_to_string(&tasks_path).unwrap_or_default();
     let target_line = current
         .lines()
-        .find(|l| contains_id_token(l.trim_start(), task_id.as_str()))
+        .find(|l| line_targets_id(l, task_id.as_str()))
         .map(|l| l.to_string());
 
     let Some(target_line) = target_line else {
@@ -2692,17 +2741,23 @@ async fn post_board_toggle(
         }
     };
 
-    // The checkbox `[ ]` or `[x]`/`[X]` is at byte_start..byte_start+3 within
-    // the node's expected_bytes (after the `- ` marker). We find and flip it.
+    // The checkbox is ANCHORED at the start of the task line: after the
+    // list marker the bytes must be `- [ ]` / `- [x]` / `- [X]` — the only
+    // checkbox shapes parser/tasks.rs emits. A bracket appearing later in
+    // the text is description prose (e.g. a DONE task documenting the
+    // `[ ]` syntax) and must never be rewritten, so locate the checkbox by
+    // position instead of substring search.
     let expected = &node.expected_bytes;
-    let (old_box, new_box) = if expected.contains("[ ]") {
-        ("[ ]", "[x]")
-    } else if expected.contains("[X]") {
-        // Uppercase checked form — replacen("[x]") would never match it
-        // (silent no-op reported as Applied).
-        ("[X]", "[ ]")
-    } else if expected.contains("[x]") {
-        ("[x]", "[ ]")
+    let first_line = expected.split('\n').next().unwrap_or("");
+    let indent = first_line.len() - first_line.trim_start().len();
+    let trimmed = &first_line[indent..];
+    let new_box = if trimmed.starts_with("- [ ]") {
+        "[x]"
+    } else if trimmed.starts_with("- [X]") {
+        // Uppercase checked form — a lowercase-only match would never hit it.
+        "[ ]"
+    } else if trimmed.starts_with("- [x]") {
+        "[ ]"
     } else {
         return (
             StatusCode::CONFLICT,
@@ -2711,8 +2766,14 @@ async fn post_board_toggle(
             .into_response();
     };
 
-    // Build the new expected_bytes with just the checkbox flipped.
-    let new_expected = expected.replacen(old_box, new_box, 1);
+    // Flip the checkbox at its anchored byte position (leading indent + the
+    // 2-byte `- ` marker) rather than by substring search — the description
+    // may legitimately mention the bracket form being flipped away from.
+    let box_pos = indent + 2;
+    let mut new_expected = String::with_capacity(expected.len());
+    new_expected.push_str(&expected[..box_pos]);
+    new_expected.push_str(new_box);
+    new_expected.push_str(&expected[box_pos + 3..]);
 
     // Compile to a single Replace PatchOp on this node.
     let ops = vec![crate::patch::PatchOp::Replace {

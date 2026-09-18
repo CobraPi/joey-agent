@@ -59,12 +59,27 @@ fn thread_id() -> String {
 
 impl GoalState {
     /// Read the goal state from a `.omo/` directory.
-    /// Missing file returns None (no goal set).
+    /// Missing file returns None (no goal set). An unparseable file is
+    /// preserved as `goals.json.corrupt` (best-effort rename, mirroring
+    /// `auth_store.rs`) with a warning, and treated as unset.
     pub fn read(omo_dir: &Path) -> Option<Self> {
         let path = omo_dir.join("goals.json");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|contents| serde_json::from_str(&contents).ok())
+        let contents = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str(&contents) {
+            Ok(state) => Some(state),
+            Err(exc) => {
+                let corrupt = path.with_extension("json.corrupt");
+                let _ = std::fs::rename(&path, &corrupt);
+                tracing::warn!(
+                    "omo: failed to parse {} ({}) — treating goal as unset. \
+                     Corrupt file preserved at {}",
+                    path.display(),
+                    exc,
+                    corrupt.display()
+                );
+                None
+            }
+        }
     }
 
     /// Write the goal state to a `.omo/` directory.
@@ -93,13 +108,11 @@ impl GoalState {
             file.write_all(json.as_bytes())?;
             file.sync_all()?;
         }
-        // Rename over the destination. On Windows, rename onto an existing
-        // file fails, so remove first — the small window is fine here
-        // because the replacement is a complete, fsynced file.
-        #[cfg(windows)]
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
+        // Rename over the destination. `fs::rename` maps to
+        // MoveFileEx(REPLACE_EXISTING) on Windows, so it replaces a live
+        // target without a remove-first dance — a remove-first "fix" races
+        // under concurrency and must not be reintroduced (see
+        // `boulder.rs::BoulderState::write` for the full rationale).
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
@@ -159,6 +172,10 @@ pub enum SubgoalAction {
     Clear,
     /// `` / `list` — show criteria.
     Show,
+    /// A verb whose number argument is missing or non-numeric — the
+    /// message explains what was wrong (never a silent Remove(0) or
+    /// SetDone { number: 0 }, which matched no real subgoal).
+    Invalid(String),
 }
 
 /// Parse a `/subgoal` argument string.
@@ -174,16 +191,25 @@ pub fn parse_subgoal_command(input: &str) -> SubgoalAction {
     let head = parts.next().unwrap_or("");
     match head.to_lowercase().as_str() {
         "remove" | "rm" | "delete" => {
-            let n = parts.next().unwrap_or("").trim().parse().unwrap_or(0);
-            SubgoalAction::Remove(n)
+            let arg = parts.next().unwrap_or("").trim();
+            match arg.parse::<usize>() {
+                Ok(n) => SubgoalAction::Remove(n),
+                Err(_) => SubgoalAction::Invalid(format!("invalid subgoal number: {arg}")),
+            }
         }
         "done" | "check" => {
-            let n = parts.next().unwrap_or("").trim().parse().unwrap_or(0);
-            SubgoalAction::SetDone { number: n, done: true }
+            let arg = parts.next().unwrap_or("").trim();
+            match arg.parse::<usize>() {
+                Ok(n) => SubgoalAction::SetDone { number: n, done: true },
+                Err(_) => SubgoalAction::Invalid(format!("invalid subgoal number: {arg}")),
+            }
         }
         "undone" | "uncheck" => {
-            let n = parts.next().unwrap_or("").trim().parse().unwrap_or(0);
-            SubgoalAction::SetDone { number: n, done: false }
+            let arg = parts.next().unwrap_or("").trim();
+            match arg.parse::<usize>() {
+                Ok(n) => SubgoalAction::SetDone { number: n, done: false },
+                Err(_) => SubgoalAction::Invalid(format!("invalid subgoal number: {arg}")),
+            }
         }
         _ => SubgoalAction::Add(trimmed.to_string()),
     }
@@ -298,6 +324,38 @@ mod tests {
             SubgoalAction::SetDone { number: 3, done: false }
         );
         assert_eq!(parse_subgoal_command("clear"), SubgoalAction::Clear);
+    }
+
+    /// Missing/non-numeric subgoal numbers yield `Invalid` with an
+    /// explanatory message, not a silent `Remove(0)` / `SetDone{number: 0}`
+    /// (which matched no real subgoal).
+    #[test]
+    fn parse_subgoal_command_invalid_number_is_invalid() {
+        assert_eq!(
+            parse_subgoal_command("remove abc"),
+            SubgoalAction::Invalid("invalid subgoal number: abc".into())
+        );
+        assert_eq!(
+            parse_subgoal_command("done xyz"),
+            SubgoalAction::Invalid("invalid subgoal number: xyz".into())
+        );
+    }
+
+    /// A corrupt `goals.json` is preserved as `goals.json.corrupt` and read
+    /// as unset, instead of being silently swallowed into `None`.
+    #[test]
+    fn corrupt_goal_file_preserved_as_dot_corrupt() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let omo = dir.path();
+        std::fs::write(omo.join("goals.json"), "{definitely not json").unwrap();
+        assert!(GoalState::read(omo).is_none());
+        assert!(omo.join("goals.json.corrupt").exists());
+        // The corrupt original was moved aside, and recovery works: a fresh
+        // write recreates a parseable goals.json.
+        assert!(!omo.join("goals.json").exists());
+        GoalState::new("s".into(), "obj".into()).write(omo).unwrap();
+        assert_eq!(GoalState::read(omo).unwrap().objective, "obj");
     }
 
     #[test]

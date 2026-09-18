@@ -134,7 +134,9 @@ pub fn parse_instruction_files(cwd: &Path) -> Vec<InstructionFile> {
         return out;
     }
     for entry in WalkDir::new(&dir).max_depth(1).into_iter().flatten() {
-        if !entry.file_type().is_file() {
+        // `path().is_file()` follows symlinks, so symlinked *.instructions.md
+        // files are discovered (consistent with `parse_instructions`).
+        if !entry.path().is_file() {
             continue;
         }
         if !entry.file_name().to_string_lossy().ends_with(".instructions.md") {
@@ -166,7 +168,8 @@ pub fn parse_prompts(cwd: &Path) -> Vec<CopilotPrompt> {
         return out;
     }
     for entry in WalkDir::new(&dir).max_depth(1).into_iter().flatten() {
-        if !entry.file_type().is_file() {
+        // Follow symlinks: same rationale as `parse_instruction_files`.
+        if !entry.path().is_file() {
             continue;
         }
         let file_name = entry.file_name().to_string_lossy().into_owned();
@@ -208,7 +211,11 @@ pub fn parse_skills(cwd: &Path) -> Vec<CopilotSkill> {
         return out;
     }
     for entry in WalkDir::new(&dir).max_depth(2).into_iter().flatten() {
-        if !entry.file_type().is_file() || entry.file_name() != "SKILL.md" {
+        // Only `<skill-dir>/SKILL.md` at depth 2 counts; a stray SKILL.md
+        // directly under `skills/` (depth 1) must not be registered (its
+        // fallback name would be "skills"). `path().is_file()` follows
+        // symlinks.
+        if entry.depth() != 2 || !entry.path().is_file() || entry.file_name() != "SKILL.md" {
             continue;
         }
         let skill_md = entry.path().to_path_buf();
@@ -309,12 +316,25 @@ pub fn load_manifest() -> PluginManifest {
 }
 
 /// Save the plugin manifest, creating parent directories as needed.
+///
+/// Atomic (mirrors joey-core's `atomic_replace` discipline): serialize
+/// first, write to a sibling temp file in the same directory, then rename
+/// over the destination — a torn write can never wipe all plugin records.
 pub fn save_manifest(m: &PluginManifest) -> std::io::Result<()> {
     let path = plugins_manifest_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(m).unwrap_or_default())
+    let content = serde_json::to_string_pretty(m).unwrap_or_default();
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, content)?;
+    match std::fs::rename(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +678,70 @@ mod tests {
         })();
 
         // Restore env even if assertions fired.
+        match prev {
+            Some(v) => std::env::set_var("JOEY_HOME", v),
+            None => std::env::remove_var("JOEY_HOME"),
+        }
+        result
+    }
+
+    // 10a. symlinked instructions file is discovered (unix-only symlink creation)
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_instruction_file_discovered() {
+        let (root, _t) = temp_project("sym");
+        let target = write("shared/node.instructions.md", "Symlinked body.", &root);
+        let link = root.join(".github/instructions/node.instructions.md");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let files = parse_instruction_files(&root);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].path, link);
+        assert_eq!(files[0].body, "Symlinked body.");
+    }
+
+    // 10a2. stray depth-1 SKILL.md at .github/skills/SKILL.md is NOT registered
+    #[test]
+    fn stray_depth1_skill_md_not_registered() {
+        let (root, _t) = temp_project("stray");
+        write(".github/skills/SKILL.md", "stray depth-1 skill", &root);
+        write(".github/skills/real/SKILL.md", "real skill", &root);
+        let skills = parse_skills(&root);
+        assert_eq!(skills.len(), 1, "{skills:?}");
+        assert_eq!(skills[0].name, "real");
+    }
+
+    // 10a3. save_manifest overwrite is atomic: temp sibling absent, content correct
+    #[test]
+    fn manifest_save_atomic() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().expect("home tempdir");
+        let prev = std::env::var("JOEY_HOME").ok();
+        std::env::set_var("JOEY_HOME", home.path());
+
+        let result = (|| {
+            let record = PluginRecord {
+                name: "demo-plugin".to_string(),
+                source: "https://github.com/octo/demo-plugin".to_string(),
+                installed_at: rfc3339_utc_now(),
+                commit: None,
+                skills: vec![],
+                prompts: vec![],
+            };
+            let manifest = PluginManifest { plugins: vec![record] };
+            save_manifest(&manifest).expect("first save");
+
+            save_manifest(&manifest).expect("overwrite save");
+            let path = plugins_manifest_path();
+            let tmp = path.with_extension("json.tmp");
+            assert!(!tmp.exists(), "temp file {} must be absent", tmp.display());
+            assert!(path.is_file());
+            let loaded = load_manifest();
+            assert_eq!(loaded.plugins.len(), 1);
+            assert_eq!(loaded.plugins[0].name, "demo-plugin");
+            assert_eq!(loaded.plugins[0].source, "https://github.com/octo/demo-plugin");
+        })();
+
         match prev {
             Some(v) => std::env::set_var("JOEY_HOME", v),
             None => std::env::remove_var("JOEY_HOME"),

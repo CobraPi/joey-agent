@@ -215,6 +215,16 @@ impl Agent {
             let old_threshold = threshold;
             let new_threshold = aux_context;
             self.compressor.threshold_tokens = new_threshold;
+            // Re-derive the budgets tied to the threshold, mirroring
+            // `update_model`'s recompute (compressor.rs `update_model`):
+            // tail budget tracks the new threshold; the summary ceiling
+            // tracks the main context window.
+            let target_tokens =
+                (new_threshold as f64 * self.compressor.summary_target_ratio) as i64;
+            self.compressor.tail_token_budget = target_tokens;
+            self.compressor.max_summary_tokens = ((self.compressor.context_length as f64 * 0.05)
+                as i64)
+                .min(super::compressor::SUMMARY_TOKENS_CEILING);
             let main_ctx = self.compressor.context_length;
             if main_ctx > 0 {
                 self.compressor.threshold_percent = new_threshold as f64 / main_ctx as f64;

@@ -2896,19 +2896,19 @@ fn pop_engine_queued_head(mirror: &mut Vec<String>, announced: &str) {
 /// Extract the argument substring after `/command` in a slash input string.
 /// E.g. "/start-work my-plan" → "my-plan", "/goal set Ship it" → "set Ship it".
 fn slash_args_after<'a>(input: &'a str, command: &str) -> &'a str {
-    // input starts with '/'; strip it, then the command name (case-insensitive).
+    // input starts with '/'; strip it, then the command name (case-insensitive,
+    // by char length). Stripping by char length (not "command + space") keeps
+    // prefix-expanded names whole: "/queuefoo bar" → "foo bar" instead of the
+    // after-first-space fallback's "bar", which dropped "foo".
     let stripped = input.trim_start_matches('/');
-    let lower = stripped.to_ascii_lowercase();
-    // "/command <rest>" → "<rest>"
-    let prefix = format!("{command} ");
-    if lower.starts_with(&prefix) {
-        return &stripped[prefix.len()..];
+    let cmd_chars = command.chars().count();
+    let head: String = stripped.chars().take(cmd_chars).collect();
+    if head.eq_ignore_ascii_case(command) {
+        // Covers both "/command <rest>" → "<rest>" and bare "/command" → "".
+        return stripped[head.len()..].trim_start();
     }
-    // Bare "/command" with no args → empty.
-    if lower == command {
-        return "";
-    }
-    // Fallback: anything after the first space.
+    // Fallback (alias or differently-typed name): anything after the first
+    // space — e.g. "/q check" with command "queue" → "check".
     stripped.split_once(' ').map(|(_, r)| r).unwrap_or("")
 }
 
@@ -3186,6 +3186,17 @@ mod tui_tests {
         assert_eq!(super::slash_args_after("/steer look at this instead", "steer"), "look at this instead");
         assert_eq!(super::slash_args_after("/queue", "queue"), "");
         assert_eq!(super::slash_args_after("/q check", "queue"), "check");
+    }
+
+    /// Prefix-expanded names must keep the un-consumed tail: "/queuefoo bar"
+    /// resolves to /queue, so args are "foo bar" — the old after-first-space
+    /// fallback dropped "foo". Exact names stay identical.
+    #[test]
+    fn slash_args_after_prefix_expansion_keeps_tail() {
+        assert_eq!(super::slash_args_after("/queuefoo bar", "queue"), "foo bar");
+        // Exact-name behavior is unchanged.
+        assert_eq!(super::slash_args_after("/queue check the tests", "queue"), "check the tests");
+        assert_eq!(super::slash_args_after("/queue", "queue"), "");
     }
 
     /// T018 (D4, FR-006): `CopyPaneItem` must resolve against the PANE

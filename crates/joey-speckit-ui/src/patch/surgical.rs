@@ -15,30 +15,44 @@ use crate::patch::PatchOp;
 /// All node byte ranges are resolved against the *current* buffer state, with
 /// offsets shifted by any prior op in the same transaction. This keeps a
 /// multi-op transaction correct (FR-014 transactional).
+///
+/// # Undo semantics
+///
+/// The undo is always a single root-replace op: `Replace` of the document
+/// root node with the original `source` bytes. Per-op inverses cannot be
+/// expressed against the post-apply CST (`InsertAfter`'s inverse would need a
+/// node id for the inserted bytes, which no document contains; `Delete`'s
+/// inverse would anchor on a node that no longer exists), so exact restore
+/// (FR-014) is delivered by swapping the root's full `[0, byte_len)` range for
+/// the pre-patch bytes. Callers must apply the undo against a document
+/// re-parsed from the post-patch bytes.
 pub fn apply_ops(source: &str, doc: &CstDocument, ops: &[PatchOp]) -> Result<(String, Vec<PatchOp>), SurgicalError> {
     let mut buffer = source.to_string();
     let mut shift: i64 = 0; // cumulative byte shift from prior ops
-    let mut undo: Vec<PatchOp> = Vec::with_capacity(ops.len());
 
     for op in ops {
-        let (new_buffer, op_shift, undo_op) = apply_one(&buffer, doc, op, shift)?;
-        undo.push(undo_op);
+        let (new_buffer, op_shift) = apply_one(&buffer, doc, op, shift)?;
         buffer = new_buffer;
         shift += op_shift;
     }
 
-    // Undo ops are reversed so applying them undoes in reverse order.
-    undo.reverse();
+    // Undo = replace the root node's full range with the original bytes.
+    // The root node is guaranteed to span [0, source.len()) (see the parser's
+    // `build`), so this restores the pre-patch file byte-for-byte.
+    let undo = vec![PatchOp::Replace {
+        node: doc.root,
+        new_bytes: source.to_string(),
+    }];
     Ok((buffer, undo))
 }
 
-/// Apply a single `PatchOp` to the buffer, returning (new_buffer, byte_shift, undo_op).
+/// Apply a single `PatchOp` to the buffer, returning (new_buffer, byte_shift).
 fn apply_one(
     buffer: &str,
     doc: &CstDocument,
     op: &PatchOp,
     shift: i64,
-) -> Result<(String, i64, PatchOp), SurgicalError> {
+) -> Result<(String, i64), SurgicalError> {
     match op {
         PatchOp::Replace { node, new_bytes } => {
             let n = doc.get(*node).ok_or(SurgicalError::NodeNotFound(*node))?;
@@ -61,11 +75,7 @@ fn apply_one(
             new_buffer.push_str(&buffer[end..]);
 
             let delta = new_bytes.len() as i64 - (end as i64 - start as i64);
-            let undo = PatchOp::Replace {
-                node: *node,
-                new_bytes: old_bytes,
-            };
-            Ok((new_buffer, delta, undo))
+            Ok((new_buffer, delta))
         }
         PatchOp::InsertAfter { anchor, new_bytes } => {
             let n = doc.get(*anchor).ok_or(SurgicalError::NodeNotFound(*anchor))?;
@@ -77,13 +87,7 @@ fn apply_one(
             new_buffer.push_str(&buffer[insert_at..]);
 
             let delta = new_bytes.len() as i64;
-            let undo = PatchOp::Delete {
-                // The inserted bytes form a new range starting at insert_at.
-                // For undo we synthesize a Delete with the anchor's byte range
-                // adjusted — the transaction layer re-parses and rebinds.
-                node: *anchor,
-            };
-            Ok((new_buffer, delta, undo))
+            Ok((new_buffer, delta))
         }
         PatchOp::Delete { node } => {
             let n = doc.get(*node).ok_or(SurgicalError::NodeNotFound(*node))?;
@@ -104,11 +108,7 @@ fn apply_one(
             new_buffer.push_str(&buffer[end..]);
 
             let delta = -(old_bytes.len() as i64);
-            let undo = PatchOp::InsertAfter {
-                anchor: *node,
-                new_bytes: old_bytes,
-            };
-            Ok((new_buffer, delta, undo))
+            Ok((new_buffer, delta))
         }
     }
 }
@@ -183,6 +183,27 @@ mod tests {
         let (new_buffer, _undo) = apply_ops(source, &doc, &ops).unwrap();
 
         assert_eq!(new_buffer, "- keep\n- also keep\n");
+    }
+
+    #[test]
+    fn insert_after_undo_root_replace_restores_original() {
+        let source = "- first\n";
+        let doc = parse_bytes("test.md", source.as_bytes());
+        let anchor = find_first_list_item(&doc).expect("list item");
+
+        let ops = vec![PatchOp::InsertAfter {
+            anchor,
+            new_bytes: "- second\n".to_string(),
+        }];
+        let (proposed, undo) = apply_ops(source, &doc, &ops).unwrap();
+        assert_eq!(proposed, "- first\n- second\n");
+
+        // Undo is a single root-replace; apply it against a document parsed
+        // from the proposed bytes and the original source comes back exactly.
+        assert_eq!(undo.len(), 1);
+        let proposed_doc = parse_bytes("test.md", proposed.as_bytes());
+        let (restored, _undo_of_undo) = apply_ops(&proposed, &proposed_doc, &undo).unwrap();
+        assert_eq!(restored, source);
     }
 
     #[test]

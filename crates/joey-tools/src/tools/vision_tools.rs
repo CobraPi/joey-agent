@@ -72,10 +72,13 @@ fn sniff_magic(path: &str) -> Result<Option<&'static str>, String> {
     })
 }
 
+/// Size cap shared by the file-read path and the data-URL passthrough.
+const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
+
 /// Read the image and return a data-URL content part for the model.
 fn image_part(path: &str) -> Result<Value, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read image '{path}': {e}"))?;
-    if bytes.len() > 15 * 1024 * 1024 {
+    if bytes.len() > MAX_IMAGE_BYTES {
         return Err("image exceeds 15 MB limit".into());
     }
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -160,8 +163,14 @@ impl Tool for VisionAnalyze {
             .and_then(|v| v.as_str())
             .unwrap_or("Describe this image.")
             .to_string();
-        // Data-URL passthrough: if the caller already has a data URL, use it.
+        // Data-URL passthrough: if the caller already has a data URL, use it —
+        // under the same 15 MB cap, measured on the payload after the first
+        // comma (the base64 text, per RFC 2397 data-URL grammar).
         let part = if path.starts_with("data:image/") {
+            let payload_len = path.split_once(',').map(|(_, p)| p.len()).unwrap_or(0);
+            if payload_len > MAX_IMAGE_BYTES {
+                return ToolResult::Error("image exceeds 15 MB limit".into());
+            }
             json!({
                 "type": "image_url",
                 "image_url": { "url": path }

@@ -70,7 +70,7 @@ impl ParsedPlan {
 /// `filter_map`, hiding plan-authoring mistakes like `F1x` or `banana`.
 fn parse_dep_token(token: &str) -> Option<usize> {
     let token = token.trim();
-    let parsed = if let Some(num_part) = token.strip_prefix('F') {
+    let parsed = if let Some(num_part) = token.strip_prefix('F').or_else(|| token.strip_prefix('f')) {
         num_part
             .parse::<usize>()
             .ok()

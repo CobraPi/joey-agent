@@ -23,7 +23,7 @@ use crate::evaluator::VerificationPlanView;
 /// Validated task identifier. Restricted to `[a-z0-9-]+` (non-empty) so ids
 /// are safe to embed in branch names, log lines, and serialized map keys.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize,
 )]
 #[serde(transparent)]
 pub struct TaskId(String);
@@ -59,6 +59,24 @@ impl fmt::Display for TaskId {
 impl From<String> for TaskId {
     fn from(s: String) -> Self {
         TaskId(s)
+    }
+}
+
+// Manual Deserialize: the derived impl skipped the `[a-z0-9-]+` charset
+// check `TaskId::new` enforces, letting invalid ids in through
+// deserialization (e.g. strict planner JSON round-trips). Reuse the same
+// validation and surface a serde error on violation.
+impl<'de> Deserialize<'de> for TaskId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        TaskId::new(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "invalid TaskId `{s}`: must be non-empty and match [a-z0-9-]+"
+            ))
+        })
     }
 }
 

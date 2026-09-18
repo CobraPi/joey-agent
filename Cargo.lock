@@ -2757,6 +2757,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "joey-compute"
+version = "0.19.0"
+dependencies = [
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "joey-copilot"
 version = "0.19.0"
 dependencies = [
@@ -2975,6 +2984,7 @@ dependencies = [
  "futures",
  "futures-util",
  "joey-agent-core",
+ "joey-compute",
  "joey-core",
  "joey-llm-selector",
  "joey-neurocode",
@@ -3067,6 +3077,7 @@ dependencies = [
  "ignore",
  "indexmap",
  "joey-browser",
+ "joey-compute",
  "joey-copilot",
  "joey-core",
  "libc",

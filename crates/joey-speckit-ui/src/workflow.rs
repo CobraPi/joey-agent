@@ -388,14 +388,16 @@ use crate::cst::parser_trait::CstMaterialize;
 /// than all inputs (FR-007). Returns `false` if any output fails this check.
 pub fn outputs_are_valid_and_fresh(
     repo_root: &Path,
-    feature_id: &str,
+    _feature_id: &str,
     inputs: &[ArtifactRef],
     outputs: &[ArtifactRef],
 ) -> bool {
-    let feature_dir = repo_root.join("specs").join(feature_id);
-
+    // `step_artifacts` paths are REPO-RELATIVE (they carry the `specs/<id>/`
+    // prefix — and "constitution" points at `.specify/memory/…`), so they
+    // must be joined against the repo root. Joining against `feature_dir`
+    // would double-nest into `specs/<id>/specs/<id>/…`.
     for output in outputs {
-        let out_path = feature_dir.join(&output.path);
+        let out_path = repo_root.join(&output.path);
         if !out_path.exists() {
             return false;
         }
@@ -413,7 +415,7 @@ pub fn outputs_are_valid_and_fresh(
             Err(_) => return false,
         };
         for input in inputs {
-            let in_path = feature_dir.join(&input.path);
+            let in_path = repo_root.join(&input.path);
             if let Ok(in_meta) = std::fs::metadata(&in_path).and_then(|m| m.modified()) {
                 if in_meta > out_mtime {
                     return false;
@@ -607,5 +609,45 @@ mod tests {
     fn derive_step_state_unavailable_when_not_available() {
         let state = derive_step_state("task_to_issue", &[], &[], false, false, &[], &[]);
         assert_eq!(state, StepState::Unavailable);
+    }
+
+    #[test]
+    fn freshness_resolves_repo_relative_artifact_paths_against_repo_root() {
+        // step_artifacts emits repo-relative paths (`specs/<id>/plan.md`),
+        // so outputs_are_valid_and_fresh must join them against the REPO
+        // ROOT. Joining against the feature dir would look for the
+        // double-nested `specs/<id>/specs/<id>/plan.md` and never find the
+        // file — every step would be stale even with fresh outputs.
+        let dir = tempfile::tempdir().unwrap();
+        let feature_dir = dir.path().join("specs").join("001-test");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        let plan_path = feature_dir.join("plan.md");
+        std::fs::write(&plan_path, "# Implementation Plan: T\n\nA plan.\n").unwrap();
+        let spec_path = feature_dir.join("spec.md");
+        std::fs::write(&spec_path, "# Feature Specification: T\n\n**Status**: Draft\n").unwrap();
+        // Guarantee output is strictly newer than the input on filesystems
+        // with coarse timestamps.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        let file = std::fs::File::options()
+            .append(true)
+            .open(&plan_path)
+            .unwrap();
+        file.set_modified(later).unwrap();
+
+        let inputs = vec![ArtifactRef {
+            path: "specs/001-test/spec.md".to_string(),
+            kind: Some(ArtifactKind::Spec),
+        }];
+        let outputs = vec![ArtifactRef {
+            path: "specs/001-test/plan.md".to_string(),
+            kind: Some(ArtifactKind::Plan),
+        }];
+
+        assert!(outputs_are_valid_and_fresh(
+            dir.path(),
+            "001-test",
+            &inputs,
+            &outputs
+        ));
     }
 }

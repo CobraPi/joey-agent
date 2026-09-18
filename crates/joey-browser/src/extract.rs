@@ -17,7 +17,7 @@ pub const SCAN_JS: &str = r#"
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const visible = (el) => {
     const r = el.getBoundingClientRect();
-    if (r.width <= 0 && r.height <= 0) return false;
+    if (r.width <= 0 || r.height <= 0) return false;
     const st = getComputedStyle(el);
     return st.visibility !== 'hidden' && st.display !== 'none';
   };
@@ -63,7 +63,7 @@ pub const SCAN_JS: &str = r#"
     out.push({
       role, text, frame,
       locator: locatorFor(el, document),
-      geometry: { x: r.x, y: r.y + window.scrollY, w: r.width, h: r.height },
+      geometry: { x: r.x + window.scrollX, y: r.y + window.scrollY, w: r.width, h: r.height },
       attributes: attrs,
       interactable: visible(el) && !el.disabled,
       value: (el.value !== undefined && el.value !== null && el.type !== 'password') ? String(el.value).slice(0, 80) : null,
@@ -107,6 +107,17 @@ pub const SCAN_JS: &str = r#"
 pub const OBSERVER_JS: &str = r#"
 ((quietMs) => {
   const SENTINEL = 'data-joey-sentinel';
+  // Tear down a previous settle probe before reinstalling: a call that
+  // timed out Rust-side left its promise pending forever, with the
+  // MutationObserver attached and the poll interval still firing.
+  if (window.__joeySettle) {
+    try {
+      window.__joeySettle.observer?.disconnect();
+      clearInterval(window.__joeySettle.timer);
+    } catch (e) {}
+  }
+  let observerRef = null;
+  let timerRef = null;
   window.__joeySettle = new Promise((resolve) => {
     let timer = null;
     let last = Date.now();
@@ -124,8 +135,12 @@ pub const OBSERVER_JS: &str = r#"
         resolve({ settled: true, waitedMs: Date.now() - last });
       }
     }, 100);
+    observerRef = obs;
+    timerRef = poll;
     // Hard cap handled Rust-side via timeout; promise stays pending then.
   });
+  window.__joeySettle.observer = observerRef;
+  window.__joeySettle.timer = timerRef;
   return 'installed';
 })(%QUIET_MS%)
 "#;

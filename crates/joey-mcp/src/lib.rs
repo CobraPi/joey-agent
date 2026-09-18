@@ -761,6 +761,21 @@ impl McpClient {
             if frame.get("method").is_some() {
                 continue;
             }
+            // A spec-legal JSON-RPC error frame with a null (or absent) id —
+            // e.g. a server-side parse error (JSON-RPC 2.0 §5.1) — can never
+            // match any in-flight request id; without this check it would be
+            // skipped below and the pending request would hang until
+            // tool_timeout. Treat it as fatal for the CURRENT request,
+            // mirroring the matched-id error path (upstream raises
+            // `McpError(error.message)` for JSON-RPC error frames).
+            if let Some(err) = frame.get("error") {
+                if matches!(frame.get("id"), None | Some(Value::Null)) {
+                    let message =
+                        err.get("message").and_then(Value::as_str).unwrap_or("").to_string();
+                    let message = if message.is_empty() { err.to_string() } else { message };
+                    return Err(RequestError::Rpc { message });
+                }
+            }
             if !id_matches(frame.get("id"), id) {
                 continue;
             }
@@ -998,6 +1013,37 @@ printf '%s\n' '{"jsonrpc": "2.0", "id": 4, "result": {"isError": true, "content"
         let out = client.call_tool("alpha", json!({})).await;
         assert_eq!(out, r#"{"error": "boom [REDACTED]"}"#);
 
+        client.shutdown().await;
+    }
+
+    /// Regression test for null-id error frames: a spec-legal JSON-RPC error
+    /// response with `"id": null` (e.g. a server parse error) can never match
+    /// the in-flight request id. The read loop must fail the pending request
+    /// fast with McpError instead of skipping the frame and hanging to
+    /// timeout — the script sleeps 30s after the error frame (timeout is 5s),
+    /// so a regression surfaces as the TimeoutError envelope.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn null_id_error_frame_fails_the_pending_request_fast() {
+        let script = r#"
+IFS= read -r line
+printf '%s\n' '{"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "nullid", "version": "0"}}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "boom", "inputSchema": {"type": "object"}}]}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "Parse error"}}'
+sleep 30
+"#;
+        let config = ServerConfig { timeout: Some(5.0), ..sh_server(script) };
+        let client = McpClient::connect("null-id-err", &config).await.expect("connect");
+        client.list_tools().await.expect("list_tools");
+        let out = client.call_tool("boom", json!({})).await;
+        assert!(
+            out.contains("MCP call failed: McpError: Parse error"),
+            "unexpected envelope: {out}"
+        );
+        assert!(!out.contains("TimeoutError"), "regressed to timeout: {out}");
         client.shutdown().await;
     }
 

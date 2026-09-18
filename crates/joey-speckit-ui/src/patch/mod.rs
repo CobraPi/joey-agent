@@ -37,7 +37,10 @@ pub enum PatchOp {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum PatchResult {
     /// The patch applied cleanly. `undo` is the verified inverse `PatchOp`
-    /// list — applying it restores the pre-patch bytes exactly (FR-014).
+    /// list — a single root-replace op swapping the document root's full
+    /// `[0, byte_len)` range for the pre-patch source bytes, so applying it
+    /// restores the pre-patch bytes exactly (FR-014). It must be applied
+    /// against a document re-parsed from the post-patch bytes.
     Applied {
         new_revision_hash: String,
         undo: Vec<PatchOp>,

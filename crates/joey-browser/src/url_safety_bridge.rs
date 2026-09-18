@@ -16,6 +16,54 @@ pub fn install_url_safety_check(f: CheckFn) {
     *guard = Some(f);
 }
 
+/// Normalize a browser-accepted non-canonical IPv4 host to a u32:
+/// a whole-host decimal integer (`2130706433` = 127.0.0.1), a whole-host
+/// 0x-hex integer (`0x7f000001`), or four dotted segments where at least
+/// one is 0x-hex or octal-looking (`0x7f.0.0.1`, `0177.0.0.1`). Plain
+/// dotted decimal is intentionally NOT handled here — it falls through
+/// to the caller's dotted-quad check unchanged.
+fn to_ipv4_u32(host: &str) -> Option<u32> {
+    if !host.contains('.') {
+        if let Some(hex) = host.strip_prefix("0x").or_else(|| host.strip_prefix("0X")) {
+            return u32::from_str_radix(hex, 16).ok();
+        }
+        if !host.is_empty() && host.chars().all(|c| c.is_ascii_digit()) {
+            return host.parse::<u32>().ok();
+        }
+        return None;
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    // Only claim the host when at least one segment is non-plain-decimal.
+    let looks_non_decimal = |p: &str| {
+        p.starts_with("0x")
+            || p.starts_with("0X")
+            || (p.len() > 1 && p.starts_with('0') && p[1..].chars().all(|c| c.is_ascii_digit()))
+    };
+    if !parts.iter().any(|p| looks_non_decimal(p)) {
+        return None;
+    }
+    let mut ip: u32 = 0;
+    for p in parts {
+        let v = if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else if p.len() > 1 && p.starts_with('0') {
+            // Octal-looking segment (leading 0 + digits); invalid octal
+            // digits (e.g. `08`) fail and fall back to the dotted check.
+            u32::from_str_radix(&p[1..], 8).ok()?
+        } else {
+            p.parse::<u32>().ok()?
+        };
+        if v > 0xff {
+            return None;
+        }
+        ip = (ip << 8) | v;
+    }
+    Some(ip)
+}
+
 fn default_check(url: &str) -> Result<(), String> {
     // Conservative default: block loopback/private ranges via std only.
     // Mirrors joey-tools url_safety policy until the real checker is wired.
@@ -24,19 +72,30 @@ fn default_check(url: &str) -> Result<(), String> {
         Err(_) => return Err(format!("invalid URL: {url}")),
     };
     let host = parsed.host_str().unwrap_or("");
+    let blocked_octets = |a: u32, b: u32| {
+        a == 10
+            || a == 127
+            || a == 0
+            || (a == 172 && (16..=31).contains(&b))
+            || (a == 192 && b == 168)
+            || (a == 169 && b == 254)
+    };
     let is_private_ipv4 = |h: &str| {
+        // Non-dotted IPv4 forms bypass a dotted-quad-only check (browsers
+        // accept http://2130706433/ = 127.0.0.1, hex 0x7f.0.0.1, octal
+        // 0177.0.0.1): normalize those to a u32 first and check the
+        // resulting range; plain dotted quads fall through unchanged.
+        if let Some(ip) = to_ipv4_u32(h) {
+            let a = (ip >> 24) & 0xff;
+            let b = (ip >> 16) & 0xff;
+            return blocked_octets(a, b);
+        }
         let quad: Vec<u32> = h
             .split('.')
             .filter_map(|o| o.parse::<u32>().ok())
             .collect();
         if quad.len() == 4 {
-            let [a, b, _, _] = [quad[0], quad[1], quad[2], quad[3]];
-            a == 10
-                || a == 127
-                || a == 0
-                || (a == 172 && (16..=31).contains(&b))
-                || (a == 192 && b == 168)
-                || (a == 169 && b == 254)
+            blocked_octets(quad[0], quad[1])
         } else {
             false
         }
@@ -79,6 +138,23 @@ mod tests {
         assert!(url_safety_check("http://172.31.0.1/").is_err());
         assert!(url_safety_check("http://[::1]/").is_err());
         assert!(url_safety_check("not a url").is_err());
+    }
+
+    #[test]
+    fn default_blocks_non_dotted_ipv4_forms() {
+        let _guard = BRIDGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Whole-host integer forms of loopback/private addresses.
+        assert!(url_safety_check("http://2130706433/").is_err()); // decimal 127.0.0.1
+        assert!(url_safety_check("http://0x7f000001/").is_err()); // hex 127.0.0.1
+        assert!(url_safety_check("http://3232235777/").is_err()); // decimal 192.168.1.1
+        // Hex / octal dotted segments.
+        assert!(url_safety_check("http://0x7f.0.0.1/").is_err());
+        assert!(url_safety_check("http://0177.0.0.1/").is_err());
+        // Plain dotted forms still gated (regression).
+        assert!(url_safety_check("http://192.168.1.1/").is_err());
+        // Public addresses stay allowed, dotted and non-dotted.
+        assert!(url_safety_check("http://8.8.8.8/").is_ok());
+        assert!(url_safety_check("http://134744072/").is_ok()); // decimal 8.8.8.8
     }
 
     #[test]

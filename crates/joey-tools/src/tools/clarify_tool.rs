@@ -102,6 +102,7 @@ impl Tool for Clarify {
             .map(|a| {
                 a.iter()
                     .filter_map(|v| v.as_str().map(String::from))
+                    .take(4)
                     .collect()
             })
             .unwrap_or_default();

@@ -621,6 +621,9 @@ pub fn subgoal_lines(cwd: &std::path::Path, args: &str) -> Lines {
             let _ = goal.write(&omo_dir);
             out.push("Cleared all subgoals.");
         }
+        joey_omo::SubgoalAction::Invalid(msg) => {
+            out.push(format!("Invalid /subgoal usage: {msg} — usage: /subgoal remove N · /subgoal done N"));
+        }
     }
     out
 }
@@ -1116,7 +1119,11 @@ pub mod cron {
                 }
             }
             Some("create") | Some("add") => {
-                let rest = args.split_once(parts.next().unwrap_or(" ")).map(|(_, r)| r.trim()).unwrap_or("");
+                // Skip EXACTLY one whitespace-delimited token (the verb) and
+                // take the remainder as `rest`. A substring split on the verb
+                // would cut inside it ("/cron add dd brief" → the 'dd' inside
+                // 'add' matched, losing the real schedule token).
+                let rest = skip_first_token(args.trim());
                 create_job(&mut out, rest);
             }
             Some("run") | Some("trigger") => {
@@ -1209,6 +1216,25 @@ pub mod cron {
             }
         }
         None
+    }
+
+    /// Skip exactly one whitespace-delimited token plus the following
+    /// whitespace run; return the remainder. Byte-based scan over ASCII
+    /// whitespace — boundaries are ASCII so slicing stays on char
+    /// boundaries even with non-ASCII verbs.
+    pub(crate) fn skip_first_token(s: &str) -> &str {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        &s[i..]
     }
 
     fn create_job(out: &mut Lines, rest: &str) {
@@ -1802,6 +1828,22 @@ mod tests {
         // is gone, but genuine non-schedules still fall through to usage).
         assert_eq!(split("definitely-not-a-schedule"), None);
         assert_eq!(split(""), None);
+    }
+
+    /// Regression: `/cron create|add` must skip exactly ONE token (the
+    /// verb). The old code split `args` on the first SUBSTRING occurrence
+    /// of the second token, so `/cron add dd brief` split inside the verb
+    /// itself ("add" contains "dd") and the schedule token was lost.
+    #[test]
+    fn cron_create_skips_exactly_one_verb_token() {
+        use super::cron::skip_first_token as skip;
+        // The schedule token is a substring of the verb 'add'.
+        assert_eq!(skip("add dd brief"), "dd brief");
+        assert_eq!(skip("create 30m ping inbox"), "30m ping inbox");
+        // Leading/extra whitespace and only-the-verb inputs.
+        assert_eq!(skip("  add   every 2h check"), "every 2h check");
+        assert_eq!(skip("add"), "");
+        assert_eq!(skip(""), "");
     }
 
     #[test]
