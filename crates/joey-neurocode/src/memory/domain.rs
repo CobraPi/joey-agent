@@ -171,7 +171,20 @@ pub fn ingest_source(store: &GraphStore, source: &KnowledgeSource) -> Result<u64
         .map_err(|e| format!("failed to register source: {}", e))?;
     store
         .index_domain_content(&content, &source.provenance, source.version_tag.as_deref())
-        .map_err(|e| format!("failed to index content: {}", e))?;
+        .map_err(|e| {
+            // Roll back the just-inserted registry row so the registry and
+            // the FTS index stay rowid-aligned (category filters and removals
+            // key on that alignment). Best-effort: a rollback failure is
+            // logged, not propagated, so the original indexing error wins.
+            if let Err(rb) = store.remove_domain_knowledge(id) {
+                tracing::warn!(
+                    "neurocode: failed to roll back domain source #{} after indexing failure: {}",
+                    id,
+                    rb
+                );
+            }
+            format!("failed to index content: {}", e)
+        })?;
     Ok(id)
 }
 
@@ -360,8 +373,14 @@ pub fn resolve_conflicts(store: &GraphStore) -> Vec<ConflictReport> {
     let mut version_groups: HashMap<(String, String), Vec<(i64, String, String)>> =
         HashMap::new();
     let mut none_by_cat: HashMap<String, Vec<(i64, String, String)>> = HashMap::new();
+    // All sources per category, newest-first (for category-level reports).
+    let mut all_by_cat: HashMap<String, Vec<(i64, String, String)>> = HashMap::new();
     for s in &sources {
         let triple = (s.id, s.provenance.clone(), s.ingested_at.clone());
+        all_by_cat
+            .entry(s.category.clone())
+            .or_default()
+            .push(triple.clone());
         match &s.version_tag {
             Some(v) => version_groups
                 .entry((s.category.clone(), v.clone()))
@@ -373,13 +392,14 @@ pub fn resolve_conflicts(store: &GraphStore) -> Vec<ConflictReport> {
                 .push(triple),
         }
     }
+    let cats_with_versions: HashSet<String> =
+        version_groups.keys().map(|(c, _)| c.clone()).collect();
 
     let mut reports: Vec<ConflictReport> = Vec::new();
-    for ((category, version), mut group) in version_groups {
-        // None-tagged sources in the same category overlap this version group.
-        if let Some(nones) = none_by_cat.get(&category) {
-            group.extend(nones.iter().cloned());
-        }
+    // Same-explicit-version conflicts. A None tag does NOT duplicate into
+    // every version group — the None-vs-version overlap is reported once per
+    // category below instead of once per version group.
+    for ((category, version), group) in version_groups {
         if group.len() >= 2 {
             reports.push(ConflictReport {
                 category,
@@ -389,7 +409,18 @@ pub fn resolve_conflicts(store: &GraphStore) -> Vec<ConflictReport> {
         }
     }
     for (category, nones) in none_by_cat {
-        if nones.len() >= 2 {
+        if cats_with_versions.contains(&category) {
+            // A None tag overlaps every version in its category: report the
+            // conflict ONCE per category, covering all sources in the
+            // category (newest first), rather than duplicating each
+            // None-tagged source into every version group.
+            let sources = all_by_cat.remove(&category).unwrap_or_default();
+            reports.push(ConflictReport {
+                category,
+                version_tag: None,
+                sources,
+            });
+        } else if nones.len() >= 2 {
             reports.push(ConflictReport {
                 category,
                 version_tag: None,

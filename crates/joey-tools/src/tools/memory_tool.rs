@@ -6,7 +6,8 @@
 //! `.bak.<ts>` and refusing), enforce the char budget, and return the
 //! upstream JSON envelopes (`success`/`current_entries`/`usage` and the
 //! terminal success `note`). Batches (`operations`) apply atomically against
-//! the FINAL budget.
+//! the FINAL budget. Exception: `add` is append-only and does not refuse on
+//! external drift; `replace`/`remove`/`batch` do.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};

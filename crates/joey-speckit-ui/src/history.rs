@@ -221,7 +221,13 @@ pub fn sweep_expired(joey_home: &Path, now: chrono::DateTime<chrono::Utc>) -> Re
             continue;
         }
 
+        // Count PARSED records before filtering — the raw line count is
+        // inflated by malformed/partial lines, which `read_all` already
+        // tolerates and skips; removed must reflect real records only.
+        // (We read newest-first; the original file had them oldest-first.
+        // Count is the same either way.)
         let records = read_all(&path)?;
+        let parsed_count = records.len();
         let kept: Vec<HistoryRecord> = records
             .into_iter()
             .filter(|r| {
@@ -235,15 +241,7 @@ pub fn sweep_expired(joey_home: &Path, now: chrono::DateTime<chrono::Utc>) -> Re
             })
             .collect();
 
-        removed += {
-            // We read newest-first; the original file had them oldest-first.
-            // Count is the same either way.
-            let original_count = {
-                let file = std::fs::File::open(&path).map(|f| BufReader::new(f).lines().count());
-                file.unwrap_or(0)
-            };
-            original_count.saturating_sub(kept.len())
-        };
+        removed += parsed_count.saturating_sub(kept.len());
 
         if kept.is_empty() {
             let _ = std::fs::remove_file(&path);
@@ -353,6 +351,29 @@ mod tests {
         let records = read_all(&history_file(dir.path(), "001")).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].attempt.attempt_id, "new");
+    }
+
+    /// Regression: `removed` was computed from the raw line count minus kept
+    /// records, so malformed/partial lines inflated it.
+    #[test]
+    fn sweep_removed_count_ignores_malformed_lines() {
+        let dir = tempdir().unwrap();
+        let path = history_file(dir.path(), "001");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let mut old = make_attempt("old", "001", "plan");
+        old.expires_at = Some("2020-01-01T00:00:00Z".to_string());
+        append(dir.path(), &old).unwrap();
+
+        // Append a partial (crash-truncated) line: a raw line, never a record.
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("{\"schema_version\":1,\"attempt_id\":\"partial");
+        std::fs::write(&path, &raw).unwrap();
+
+        let removed = sweep_expired(dir.path(), chrono::Utc::now()).unwrap();
+        // Exactly one parsed record expired; the malformed line must not
+        // inflate the count (previously reported 2).
+        assert_eq!(removed, 1);
     }
 
     #[test]

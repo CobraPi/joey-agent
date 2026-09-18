@@ -187,14 +187,16 @@ fn estimate_performance(signal: &FailureSignal, module_output: &str) -> f64 {
         // An auxiliary call failure (e.g. compression) → low-moderate.
         FailureSignal::AuxCallFailure => 0.25,
         // A retry means the first attempt was unsatisfactory but eventually
-        // succeeded → moderate degradation.
+        // succeeded → mild degradation only: the turn DID produce output, so
+        // it must NOT trip the 0.5 reallocation gate (allocator) — an
+        // eventually-succeeded retry is not evidence the model is failing.
         FailureSignal::RetryTriggered => {
-            // If the output is very short relative to a non-empty input, that's
-            // a weaker result; otherwise moderate.
+            // Empty output despite the retry → still a weak result, below
+            // the gate. Non-empty output → above the gate: no reallocation.
             if module_output.trim().is_empty() {
                 0.30
             } else {
-                0.45
+                0.55
             }
         }
     }
@@ -291,7 +293,9 @@ mod tests {
     #[test]
     fn test_estimate_performance_retry() {
         let p = estimate_performance(&FailureSignal::RetryTriggered, "some output");
-        assert!(p > 0.35 && p < 0.5);
+        // Non-empty-output retries sit ABOVE the 0.5 reallocation gate —
+        // an eventually-succeeded retry must not force reallocation.
+        assert!(p > 0.5 && p < 0.7);
     }
 
     #[test]

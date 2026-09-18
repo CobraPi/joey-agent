@@ -1550,8 +1550,9 @@ mod tests {
         }
 
         #[cfg(unix)]
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        #[cfg(unix)]
         {
-            let orig_path = std::env::var("PATH").unwrap_or_default();
             let new_path = format!("{}:{}", fake_bin_dir.path().display(), orig_path);
             std::env::set_var("PATH", &new_path);
         }

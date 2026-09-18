@@ -37,7 +37,7 @@ pub fn weight_for_task(
         .max()
         .unwrap_or(0)
         .max(unit);
-    let raw = 1.0 + 99.0 * ((op_est_ms + remaining) as f64 / max_chain as f64);
+    let raw = 1.0 + 99.0 * (op_est_ms.saturating_add(remaining) as f64 / max_chain as f64);
     joey_compute::clamp_weight(raw)
 }
 

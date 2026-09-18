@@ -103,28 +103,54 @@ impl BrowserManager {
         // every OTHER page target so only the agent tab remains.
         // ("Never touch user tabs" applies to attached mode; in managed
         // mode we own the throwaway profile.)
-        {
-            let agent = mgr.ensure_page().await?;
-            let targets = mgr
-                .conn()?
-                .send("Target.getTargets", json!({}), None)
-                .await?;
-            if let Some(infos) = targets["targetInfos"].as_array() {
-                for t in infos {
-                    if t["type"] == "page" && t["targetId"].as_str() != Some(agent.target_id.as_str()) {
-                        let _ = mgr
-                            .conn()?
-                            .send(
-                                "Target.closeTarget",
-                                json!({ "targetId": t["targetId"] }),
-                                None,
-                            )
-                            .await;
-                    }
+        //
+        // If the hygiene pass fails, the `?` below would propagate without
+        // disconnecting — the ephemeral profile dir would leak. Kill the
+        // child and remove the dir first (mirrors `disconnect`'s cleanup,
+        // best-effort), then propagate.
+        if let Err(e) = mgr.ensure_managed_hygiene().await {
+            mgr.cleanup_managed().await;
+            return Err(e);
+        }
+        Ok(Arc::new(mgr))
+    }
+
+    /// Managed hygiene: close every page target except the agent tab
+    /// (see `connect` step 2). Extracted so failures can run cleanup.
+    async fn ensure_managed_hygiene(&self) -> Result<(), BrowserError> {
+        let agent = self.ensure_page().await?;
+        let targets = self
+            .conn()?
+            .send("Target.getTargets", json!({}), None)
+            .await?;
+        if let Some(infos) = targets["targetInfos"].as_array() {
+            for t in infos {
+                if t["type"] == "page" && t["targetId"].as_str() != Some(agent.target_id.as_str()) {
+                    let _ = self
+                        .conn()?
+                        .send(
+                            "Target.closeTarget",
+                            json!({ "targetId": t["targetId"] }),
+                            None,
+                        )
+                        .await;
                 }
             }
         }
-        Ok(Arc::new(mgr))
+        Ok(())
+    }
+
+    /// Best-effort teardown of managed-launch resources: kill the child and
+    /// remove the ephemeral profile dir (same removal `disconnect` performs).
+    async fn cleanup_managed(&self) {
+        if let Some(child) = self.managed_child.lock().await.as_mut() {
+            let _ = child.kill().await;
+        }
+        if let Some(dir) = &self.managed_user_data_dir {
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                tracing::debug!(dir = %dir.display(), error = %e, "profile dir cleanup");
+            }
+        }
     }
 
     pub(crate) fn conn(&self) -> Result<&Arc<CdpConnection>, BrowserError> {
@@ -236,7 +262,21 @@ impl BrowserManager {
             .ok_or_else(|| BrowserError::Protocol("no back entry".into()))?;
         self.conn()?
             .send("Page.navigateToHistoryEntry", json!({ "entryId": entry_id }), Some(&page.session_id))
-            .await
+            .await?;
+        // Safety gate: history navigation can land on ANY prior URL without
+        // the pre-navigation check navigate() applies (entries may predate
+        // the session or have been reached via redirects). Let the frame
+        // tree settle briefly, then re-run the SAME url-safety verdict on
+        // the landed URL. Unsafe landing → same UrlBlocked error navigate()
+        // returns; no re-navigation is attempted.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let landed_url = self.frame_tree().await?.frameTree.frame.url;
+        final_url_blocked_with(
+            &landed_url,
+            self.config.allow_local_urls,
+            crate::url_safety_bridge::url_safety_check,
+        )?;
+        Ok(json!({ "entryId": entry_id, "url": landed_url }))
     }
 
     /// Current frame tree (merged from the page session).

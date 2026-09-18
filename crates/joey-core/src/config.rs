@@ -546,6 +546,32 @@ impl Config {
         self.get_bool("context_assembly.log_assembly", false)
     }
 
+    // --- Feature: 034 context assembly improvements ------------------------
+
+    /// Feature 034 — `context_gauge.enabled` (default true): append the
+    /// per-request context gauge line at the assembly tail.
+    pub fn context_gauge_enabled(&self) -> bool {
+        self.get_bool("context_gauge.enabled", true)
+    }
+
+    /// Feature 034 — `compaction.calm_framing` (default true): append the
+    /// calm continuation sentence after the compaction summary end marker.
+    pub fn compaction_calm_framing(&self) -> bool {
+        self.get_bool("compaction.calm_framing", true)
+    }
+
+    /// Feature 034 — `notice_channel.enabled` (default false): wrap
+    /// system-injected notices in <system-notice> markers.
+    pub fn notice_channel_enabled(&self) -> bool {
+        self.get_bool("notice_channel.enabled", false)
+    }
+
+    /// Feature 034 — `reasoning_prune.enabled` (default false): strip
+    /// thinking blocks from completed turns at assembly time.
+    pub fn reasoning_prune_enabled(&self) -> bool {
+        self.get_bool("reasoning_prune.enabled", false)
+    }
+
     /// `compression.midturn_tool_hygiene` (default true).
     pub fn midturn_tool_hygiene_enabled(&self) -> bool {
         self.get_bool("compression.midturn_tool_hygiene", true)
@@ -2068,6 +2094,27 @@ mod tests {
             path: PathBuf::from("/nonexistent/config.yaml"),
         };
         assert!(cfg.context_assembly_always_keep_tools().is_empty());
+    }
+
+    // ── Feature 034: context assembly improvements ──
+
+    #[test]
+    fn feature_034_context_assembly_keys_default_and_override() {
+        // Defaults: context gauge + calm framing on, notice channel +
+        // reasoning prune off.
+        let cfg = Config::defaults();
+        assert!(cfg.context_gauge_enabled());
+        assert!(cfg.compaction_calm_framing());
+        assert!(!cfg.notice_channel_enabled());
+        assert!(!cfg.reasoning_prune_enabled());
+        // Explicit overrides win.
+        let cfg = cfg_from(
+            "context_gauge:\n  enabled: false\ncompaction:\n  calm_framing: false\nnotice_channel:\n  enabled: true\nreasoning_prune:\n  enabled: true\n",
+        );
+        assert!(!cfg.context_gauge_enabled());
+        assert!(!cfg.compaction_calm_framing());
+        assert!(cfg.notice_channel_enabled());
+        assert!(cfg.reasoning_prune_enabled());
     }
 
     #[test]

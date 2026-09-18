@@ -114,7 +114,9 @@ impl VerifyLoop {
         );
         let raw_output = runner.run(project_root);
         let passed = raw_output.exit_code == 0;
-        let errors = if passed {
+        // Skipped steps (FR-012) carry a skip notice, not diagnostics —
+        // parsing that notice fabricated a bogus Plain:error entry.
+        let errors = if passed || raw_output.skipped {
             Vec::new()
         } else {
             crate::verify::parse::parse_errors(&raw_output.output, &step_cfg.parse)
@@ -339,6 +341,28 @@ mod tests {
             escalated: false,
             served_tier: served_tier.map(String::from),
         }
+    }
+
+    #[test]
+    fn skipped_step_yields_no_structured_errors() {
+        // A skipped step's output is a skip notice ("could not parse
+        // command"), not diagnostics — running the plain parser over it
+        // fabricated a bogus Plain:error entry.
+        let graph = crate::graph::DependencyGraph::open_in_memory().unwrap();
+        let config = crate::config::VerifyConfig {
+            steps: vec![crate::config::VerifyStepConfig {
+                name: "lint".into(),
+                command: String::new(),
+                parse: "plain".into(),
+                timeout_sec: 5,
+            }],
+            max_fix_iterations: 3,
+        };
+        let verify = VerifyLoop::new(config, Arc::new(graph));
+        let results = verify.run_steps(std::path::Path::new("."));
+        assert_eq!(results.len(), 1);
+        assert!(results[0].skipped);
+        assert!(results[0].errors.is_empty());
     }
 
     #[test]

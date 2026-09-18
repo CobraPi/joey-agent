@@ -312,6 +312,15 @@ async fn t011_stopped_child_pushes_stopped_notice_with_reason() {
     let base = spawn_mock_server(MockMode::OkDelayed("PARTIAL WORK", 1500)).await;
     let (mgr, ctx, id) = dispatch_noticed_child(base, "long running goal").await;
 
+    // Bounded wait for the async registration to land (same pattern as
+    // sibling tests, e.g. tap_wiring_order.rs) so stop_child targets a
+    // registered child.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mgr.child_status(id.parse().unwrap()).is_none() {
+        assert!(Instant::now() < deadline, "child {id} never registered");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
     // Stop the child shortly after dispatch (mid-run for the delayed mock).
     mgr.stop_child(id.parse().unwrap(), StopReason::OrchestratorRequested)
         .expect("stop_child must succeed on a live pre-registered child");

@@ -77,9 +77,31 @@ fn extract_pega_version_from_maven(content: &str) -> Option<String> {
     if !lower.contains("pega") {
         return None;
     }
-    // Naive extraction: find <version> near a pega dependency.
-    let in_pega_block = content.contains("<groupId>com.pega</groupId>");
-    if in_pega_block {
+    // Extract the version from the <dependency> block containing the Pega
+    // group id. Extracting from the whole pom would pick up the FIRST
+    // <version> tag, which belongs to whichever dependency is listed first
+    // — with a non-Pega dependency before the Pega one, the wrong version
+    // would be detected.
+    let mut found_pega_dependency = false;
+    let mut rest = content;
+    while let Some(start) = rest.find("<dependency>") {
+        let after = &rest[start + "<dependency>".len()..];
+ let Some(end) = after.find("</dependency>") else {
+            break;
+        };
+        let block = &after[..end];
+        if block.contains("com.pega") {
+            found_pega_dependency = true;
+            if let Some(v) = extract_version_string(block) {
+                return Some(v);
+            }
+        }
+        rest = &after[end + "</dependency>".len()..];
+    }
+    // Fallback for non-dependency poms (e.g. a Pega version declared in
+    // <properties> rather than a <dependency> block): whole-content
+    // extraction, only when no Pega dependency block was found.
+    if !found_pega_dependency && content.contains("<groupId>com.pega</groupId>") {
         if let Some(v) = extract_version_string(content) {
             return Some(v);
         }
@@ -153,6 +175,7 @@ fn detect_from_source(project_root: &Path) -> Option<String> {
         if !entry.path().extension().map_or(false, |e| e == "java") {
             continue;
         }
+        scanned += 1;
         if let Ok(content) = std::fs::read_to_string(entry.path()) {
             if content.contains("com.pega.") || content.contains("Rule-Obj-") {
                 // Markers found: try to extract a real version from lines that
@@ -176,7 +199,6 @@ fn detect_from_source(project_root: &Path) -> Option<String> {
             break;
         }
     }
-    let _ = &mut scanned;
     None
 }
 

@@ -44,6 +44,24 @@ pub fn format_steer_marker(steer_text: &str) -> String {
     format!("\n\n{STEER_MARKER_OPEN}\n{steer_text}\n{STEER_MARKER_CLOSE}")
 }
 
+/// Feature 034 — unified system-notice wrapper markers (US2, research D6,
+/// contracts/events-and-markers.md). Only agent-core injection sites construct
+/// these; tool results must never contain them (the tools layer defuses the
+/// literal marker, FR-015).
+pub(crate) const SYSTEM_NOTICE_OPEN: &str = "<system-notice>";
+pub(crate) const SYSTEM_NOTICE_CLOSE: &str = "</system-notice>";
+
+/// Feature 034 — per-request context gauge line (US1, contracts/
+/// events-and-markers.md). `low` marks remaining <= the compression
+/// threshold (research D4).
+pub(crate) fn format_gauge_line(remaining: i64, low: bool) -> String {
+    if low {
+        format!("<total_tokens>{remaining} tokens left — LOW</total_tokens>")
+    } else {
+        format!("<total_tokens>{remaining} tokens left</total_tokens>")
+    }
+}
+
 
 // ─── Feature 021 — neurocode.rag.* config key literals (T050) ───────────────
 //
@@ -539,6 +557,10 @@ pub struct Agent {
     provider_permit: Option<Arc<tokio::sync::Semaphore>>,
     /// The built-in context engine (upstream `agent.context_compressor`).
     pub(crate) compressor: ContextCompressor,
+    /// Feature 034 (US3, FR-004): last dynamic tool selection, keyed by the
+    /// input tool-list hash — replayed byte-identically unless the
+    /// registered toolset changes.
+    tool_selection_cache: std::sync::Mutex<Option<(String, Vec<ToolSchema>)>>,
     /// `compression.enabled` (upstream `agent.compression_enabled`).
     pub(crate) compression_enabled: bool,
     /// One-shot output-cap override for the next request (upstream
@@ -696,6 +718,8 @@ impl Agent {
             config.api_key.as_deref(),
         );
         compressor.set_summary_backend(Arc::new(backend));
+        // Feature 034 (US4): calm compaction framing from config (default true).
+        compressor.set_calm_framing(cfg.compaction_calm_framing());
 
         Ok(Self {
             config,
@@ -717,6 +741,7 @@ impl Agent {
             transport_override: None,
             provider_permit: None,
             compressor,
+            tool_selection_cache: std::sync::Mutex::new(None),
             compression_enabled,
             ephemeral_max_output_tokens: None,
             output_cap_adjustments: 0,
@@ -896,6 +921,13 @@ impl Agent {
     pub fn set_history(&mut self, history: Vec<Message>) {
         self.history = history;
         self.synthetic_indices.clear();
+    }
+
+    /// Feature 034 tests: read-only view of stored history (prune must never
+    /// mutate it).
+    #[cfg(test)]
+    pub(crate) fn history_for_inspection(&self) -> &[Message] {
+        &self.history
     }
 
     /// Attach the session store: the loop persists the user message, the
@@ -1931,10 +1963,21 @@ impl Agent {
             "provider request model resolved"
         );
         let mut request_messages = self.history.clone();
+        // Feature 034 (US6): reasoning prune — request-only pass over the
+        // assembled copy; completed turns lose thinking, in-progress keeps it.
+        if self.ctx.config().reasoning_prune_enabled() {
+            prune_reasoning_for_request(&mut request_messages);
+        }
         let assembly = self.assemble_request_context(tools, turn);
         let mut request_tools = tools.to_vec();
         if let Some(block) = assembly.state_block {
             request_messages.push(Message::user(block));
+        }
+        // Feature 034 (US1): the gauge rides as the very LAST message — after
+        // all stable content — so the cached prefix stays byte-stable (FR-005).
+        // Request-only: never pushed into self.history.
+        if let Some(gauge) = assembly.gauge_line {
+            request_messages.push(Message::user(gauge));
         }
         if !assembly.dropped_tools.is_empty() {
             request_tools.retain(|t| !assembly.dropped_tools.contains(&t.function.name));
@@ -2010,10 +2053,36 @@ impl Agent {
         request_turn: usize,
     ) -> RequestContextAssembly {
         let cfg = self.ctx.config();
+
+        // Feature 034 (US1): live context gauge — computed BEFORE the assembly
+        // early-return so it rides every request when enabled, independent of
+        // context_assembly. Figure per research D3:
+        // remaining = window − max(real_prompt_tokens, rough_estimate);
+        // low when remaining <= the compression threshold (research D4).
+        let gauge: Option<(i64, bool)> = if cfg.context_gauge_enabled() {
+            let real = if self.compressor.last_prompt_tokens > 0 { self.compressor.last_prompt_tokens } else { 0 };
+            let estimate = compression::estimate_request_tokens_rough(&self.history, "", if tools.is_empty() { None } else { Some(tools) });
+            let used = real.max(estimate);
+            let remaining = (self.compressor.context_length - used).max(0);
+            let low = remaining <= self.compressor.threshold_tokens;
+            Some((remaining, low))
+        } else {
+            None
+        };
+        let gauge_line: Option<String> = gauge.map(|(remaining, low)| {
+            let line = format_gauge_line(remaining, low);
+            if cfg.notice_channel_enabled() {
+                format!("{SYSTEM_NOTICE_OPEN}\n{line}\n{SYSTEM_NOTICE_CLOSE}")
+            } else {
+                line
+            }
+        });
+
         if !cfg.context_assembly_enabled() {
             return RequestContextAssembly {
                 state_block: self.render_state_block_for_request(request_turn),
                 dropped_tools: Vec::new(),
+                gauge_line,
             };
         }
         let raw_block = self.render_state_block_for_request(request_turn);
@@ -2026,15 +2095,46 @@ impl Agent {
                 "context assembly: state block truncated"
             );
         }
+        // Feature 034 (US3, FR-004): the input tool-list hash keys the
+        // selection cache AND rides the JSONL record (`tool_list_hash`) —
+        // one local so the two can never drift.
+        let input_hash = crate::context_assembly::fnv1a64_hex8(&serde_json::to_string(tools).unwrap_or_default());
         let mut dropped = Vec::new();
         let selected = if cfg.context_assembly_tool_schema_retrieval() {
-            let query = self.assembly_query();
-            let (kept, drop_list) = crate::context_assembly::select_tools(
-                &query,
-                tools,
-                cfg.context_assembly_tool_top_k(),
-                &cfg.context_assembly_always_keep_tools(),
-            );
+            let (kept, drop_list) = {
+                let mut cache = self
+                    .tool_selection_cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                match cache.as_ref() {
+                    Some((cached_hash, cached)) if *cached_hash == input_hash => {
+                        // FR-004: replay the previous selection byte-identically
+                        // (query drift must not churn the tool list and poison
+                        // provider prompt-prefix caches). `dropped` is recomputed
+                        // exactly as select_tools would return it: the input
+                        // names not kept, sorted by name.
+                        let kept = cached.clone();
+                        let mut drop_list: Vec<String> = tools
+                            .iter()
+                            .map(|t| t.function.name.clone())
+                            .filter(|name| !kept.iter().any(|c| c.function.name == *name))
+                            .collect();
+                        drop_list.sort();
+                        (kept, drop_list)
+                    }
+                    _ => {
+                        let query = self.assembly_query();
+                        let out = crate::context_assembly::select_tools(
+                            &query,
+                            tools,
+                            cfg.context_assembly_tool_top_k(),
+                            &cfg.context_assembly_always_keep_tools(),
+                        );
+                        *cache = Some((input_hash.clone(), out.0.clone()));
+                        out
+                    }
+                }
+            };
             dropped = drop_list;
             tracing::info!(
                 tools_total = tools.len(),
@@ -2062,6 +2162,10 @@ impl Agent {
                 tools_dropped: dropped.clone(),
                 state_block_truncated: truncated,
                 request_messages: self.history.len() + usize::from(state_block.is_some()),
+                gauge_remaining: gauge.map(|g| g.0),
+                gauge_low: gauge.map(|g| g.1),
+                notice_channel_on: cfg.notice_channel_enabled(),
+                tool_list_hash: Some(input_hash),
             };
             if let Err(e) =
                 crate::context_assembly::log_assembly_record(&crate::context_assembly::log_dir(&session_key), &rec)
@@ -2072,6 +2176,7 @@ impl Agent {
         RequestContextAssembly {
             state_block,
             dropped_tools: dropped,
+            gauge_line,
         }
     }
 
@@ -4515,6 +4620,8 @@ impl Agent {
 struct RequestContextAssembly {
     state_block: Option<String>,
     dropped_tools: Vec<String>,
+    /// Feature 034 US1: formatted tail gauge line (request-only, never persisted to history).
+    gauge_line: Option<String>,
 }
 
 /// The checked/loaded tool names (upstream `valid_tool_names`).
@@ -4785,6 +4892,28 @@ pub(crate) fn strip_think_blocks(content: &str) -> String {
     let stripped = THINK_PAIR_RE.replace_all(content, "");
     let stripped = THINK_OPEN_AT_BOUNDARY_RE.replace_all(&stripped, "");
     stripped.into_owned()
+}
+
+/// Feature 034 (US6, research D9): strip thinking from COMPLETED turns
+/// (messages strictly before the current turn's last user message) on the
+/// REQUEST copy only — self.history is never mutated (append-only, FR-004).
+/// The in-progress turn (at/after the last user message) keeps thinking.
+pub(crate) fn prune_reasoning_for_request(messages: &mut [Message]) {
+    let Some(last_user) = messages.iter().rposition(|m| m.role == "user") else {
+        return; // no user turn to anchor "current" — prune nothing
+    };
+    for m in messages[..last_user].iter_mut() {
+        m.reasoning = None;
+        m.reasoning_details = None;
+        if let Some(blocks) = &mut m.anthropic_content_blocks {
+            if let serde_json::Value::Array(arr) = blocks {
+                arr.retain(|b| {
+                    b.get("type").and_then(|t| t.as_str()) != Some("thinking")
+                        && b.get("type").and_then(|t| t.as_str()) != Some("redacted_thinking")
+                });
+            }
+        }
+    }
 }
 
 /// Inline `<think>` blocks (reasoning fallback when no structured field —
@@ -5831,13 +5960,12 @@ mod tests {
         assert!(fx.transport.request(2).tools.is_empty(), "summary call must strip tools");
         // The injected summary-request user message reached the wire.
         let last_req = fx.transport.request(2);
-        let summary_user = last_req
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .unwrap();
-        assert_eq!(summary_user.content.as_deref(), Some(MAX_ITERATIONS_SUMMARY_REQUEST));
+        // Feature 034: the gauge line (default-on) legitimately rides as the last message (FR-005).
+        assert!(
+            last_req.messages.iter().any(|m| m.role == "user"
+                && m.content.as_deref() == Some(MAX_ITERATIONS_SUMMARY_REQUEST)),
+            "summary request must be present as a user message in the request"
+        );
         let events = drain(&mut rx);
         assert!(events.iter().any(|e| matches!(
             e,
@@ -8552,7 +8680,11 @@ mod tests {
         let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
         let cwd = tempfile::tempdir().unwrap();
         let config_path = home.path().join("config.yaml");
-        std::fs::write(&config_path, "state_block:\n  enabled: false\n").unwrap();
+        std::fs::write(
+            &config_path,
+            "state_block:\n  enabled: false\ncontext_gauge:\n  enabled: false\n",
+        )
+        .unwrap();
         let config = Config::load_from(config_path).unwrap();
         assert!(!config.state_block_enabled());
         let ctx = ToolContext::new(cwd.path().to_path_buf(), config, "test-session");
@@ -8820,11 +8952,25 @@ mod tests {
                 .expect("assembly.jsonl written when log_assembly=true and enabled=true");
             let last = content.lines().last().expect("at least one record");
             let rec: serde_json::Value = serde_json::from_str(last).expect("valid JSONL record");
-            assert_eq!(rec["turn"], 1);
+            assert_eq!(rec["request_turn"], 1);
             assert_eq!(rec["tools_total"], 1);
             assert_eq!(rec["tools_kept"], 1);
             assert_eq!(rec["request_messages"], 2, "history (1) + state block (1)");
             clear_todos(&fx.agent).await;
+        }
+
+        #[test]
+        fn feature034_format_gauge_line_variants() {
+            assert_eq!(
+                format_gauge_line(1234, false),
+                "<total_tokens>1234 tokens left</total_tokens>"
+            );
+            assert_eq!(
+                format_gauge_line(0, true),
+                "<total_tokens>0 tokens left — LOW</total_tokens>"
+            );
+            assert_eq!(SYSTEM_NOTICE_OPEN, "<system-notice>");
+            assert_eq!(SYSTEM_NOTICE_CLOSE, "</system-notice>");
         }
 
         /// (c) Retrieval through the full path: enabled + retrieval with

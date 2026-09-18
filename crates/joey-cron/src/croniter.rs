@@ -241,7 +241,7 @@ impl CronExpr {
             .with_second(0)
             .and_then(|d| d.with_nanosecond(0))
             .unwrap_or(local_after);
-        let cap = local_after + Duration::days(SEARCH_CAP_DAYS);
+        let cap = local_after.checked_add_signed(Duration::days(SEARCH_CAP_DAYS))?;
 
         // With a seconds field, a later second within the current minute is
         // still a valid "next" occurrence.
@@ -254,7 +254,7 @@ impl CronExpr {
             }
         }
 
-        let mut cursor = minute_start + Duration::minutes(1);
+        let mut cursor = minute_start.checked_add_signed(Duration::minutes(1))?;
         while cursor <= cap {
             // Fast-forward over whole non-matching months/days/hours. All
             // jumps stay in naive local wall-clock space, so they can never
@@ -277,15 +277,15 @@ impl CronExpr {
                     .with_minute(0)
                     .and_then(|d| d.with_second(0))
                     .unwrap_or(cursor)
-                    + Duration::hours(1);
+                    .checked_add_signed(Duration::hours(1))?;
                 continue;
             }
             if !self.minutes[cursor.minute() as usize] {
-                cursor += Duration::minutes(1);
+                cursor = cursor.checked_add_signed(Duration::minutes(1))?;
                 continue;
             }
             let second = self.next_second_in_minute(0).unwrap_or(0);
-            let candidate = cursor + Duration::seconds(second as i64);
+            let candidate = cursor.checked_add_signed(Duration::seconds(second as i64))?;
             match zone.localize(candidate) {
                 Some(resolved) => return Some(resolved),
                 // Spring-forward gap: this wall time doesn't exist; keep going.

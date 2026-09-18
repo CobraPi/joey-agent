@@ -64,6 +64,56 @@ async fn patch_spec_success_updates_content_and_returns_new_hash() {
 }
 
 #[tokio::test]
+async fn patch_spec_ignores_prose_reference_to_id_in_earlier_line() {
+    // Regression guard: the target line used to be found by id-token
+    // containment ANYWHERE in the line, so an earlier prose sentence
+    // mentioning FR-002 hijacked the edit onto the wrong line. The id must
+    // now start the line's content right after the list/heading marker.
+    let dir = common::make_fixture_repo("001-test");
+    let app = common::router_for(&dir);
+
+    std::fs::write(
+        dir.path().join("specs/001-test/spec.md"),
+        "# Feature Specification: Test Feature\n\n\
+         **Created**: 2026-01-01\n\
+         **Status**: Draft\n\n\
+         ## Requirements\n\
+         - Note: FR-002 supersedes the old logging approach described below.\n\
+         - **FR-002**: Must log events.\n",
+    )
+    .unwrap();
+
+    let current = std::fs::read_to_string(dir.path().join("specs/001-test/spec.md")).unwrap();
+    let hash = joey_speckit_ui::conflict::content_hash(&current);
+
+    let body = serde_json::json!({
+        "target": { "type": "requirement", "id": "FR-002" },
+        "new_text": "- **FR-002**: Must log all events.",
+        "based_on_hash": hash,
+    });
+
+    let req = Request::builder()
+        .method(Method::PATCH)
+        .uri("/api/features/001-test/spec")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let updated = std::fs::read_to_string(dir.path().join("specs/001-test/spec.md")).unwrap();
+    assert!(
+        updated.contains("- **FR-002**: Must log all events."),
+        "FR-002's own line must be the one edited"
+    );
+    assert!(
+        updated.contains("- Note: FR-002 supersedes the old logging approach described below."),
+        "the prose line mentioning FR-002 must be untouched"
+    );
+}
+
+#[tokio::test]
 async fn patch_spec_conflict_leaves_file_untouched() {
     let dir = common::make_fixture_repo("001-test");
     let app = common::router_for(&dir);

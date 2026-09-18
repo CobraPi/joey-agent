@@ -2965,7 +2965,7 @@ pub fn draw_omo_panel(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("  [{}]", truncate_str(&model_str, cw.saturating_sub(10))),
+                format!("  [{}]", truncate_width(&model_str, cw.saturating_sub(10))),
                 Style::default().fg(theme.fg_most_subtle.to_color()),
             ),
         ]));
@@ -2977,7 +2977,7 @@ pub fn draw_omo_panel(
             .count();
         let slots = app.active_agents.len() + active_count;
         lines.push(Line::from(vec![Span::styled(
-            format!("  {}/{} slots", slots, slots.max(1)),
+            format!("  {} slots in use", slots),
             Style::default().fg(theme.fg_more_subtle.to_color()),
         )]));
         lines.push(Line::from(vec![Span::raw("")]));
@@ -3011,11 +3011,11 @@ pub fn draw_omo_panel(
                     Style::default().fg(theme.gold.to_color()),
                 ),
                 Span::styled(
-                    truncate_str(&agent.display_name, 12),
+                    truncate_width(&agent.display_name, 12),
                     Style::default().fg(name_col.to_color()),
                 ),
                 Span::styled(
-                    format!("  {}", truncate_str(&model_str, cw.saturating_sub(18))),
+                    format!("  {}", truncate_width(&model_str, cw.saturating_sub(18))),
                     Style::default().fg(model_col.to_color()),
                 ),
             ]));
@@ -6124,6 +6124,7 @@ pub fn draw_subagent_rail(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         app.last_subagent_rail_rect.set((0, 0, 0, 0));
         app.last_subagent_rail_max_scroll.set(0);
         app.last_subagent_rail_drawn_offset.set(0);
+        app.last_orchestrator_tab_rect.set((0, 0, 0, 0));
         return;
     }
 

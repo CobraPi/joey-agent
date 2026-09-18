@@ -257,6 +257,23 @@ provider model for episode distillation; empty = heuristic-only.
 - `neurocode.enterprise_context.enabled` — enterprise analysis plane
   (default off).
 
+### Feature key group (feature 034: context assembly improvements)
+
+- `context_gauge.enabled` (default `true`) — per-request context gauge line
+  appended at the assembly tail; accessor `context_gauge_enabled()`;
+  `false` disables the gauge line entirely.
+- `compaction.calm_framing` (default `true`) — calm continuation sentence
+  appended after the compaction summary end marker; accessor
+  `compaction_calm_framing()`; `false` restores the exact pre-feature
+  continuation text (upstream parity).
+- `notice_channel.enabled` (default `false`) — wrap system-injected notices
+  (gauge line, environment hints, skills index, context-file attachment
+  notices) in `<system-notice>` markers; accessor `notice_channel_enabled()`;
+  the out-of-band steer marker is never wrapped, either way.
+- `reasoning_prune.enabled` (default `false`) — strip thinking blocks from
+  completed turns at assembly time; accessor `reasoning_prune_enabled()`;
+  history itself stays append-only.
+
 ### GitHub Copilot embeddings (explicit backend)
 
 Copilot embeddings are enabled only by setting

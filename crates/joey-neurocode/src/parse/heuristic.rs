@@ -146,7 +146,11 @@ fn heuristic_import(line: &str, family: HeuristicFamily) -> Option<String> {
         HeuristicFamily::Ruby => {
             for kw in ["require_relative ", "require ", "load "] {
                 if let Some(rest) = stripped.strip_prefix(kw) {
-                    return Some(format!("{}{}", kw.trim(), rest));
+                    // Keep keyword and value separated (`require json`, not
+                    // the mangled `require'json'`) and strip the surrounding
+                    // quotes from the imported value.
+                    let rest = rest.trim().trim_matches('\'').trim_matches('"');
+                    return Some(format!("{} {}", kw.trim(), rest));
                 }
             }
             None
@@ -313,7 +317,14 @@ fn heuristic_function_decl(line: &str, family: HeuristicFamily) -> Option<String
                 }
             }
             // C/C++/Java-style return-type functions: identifier before '('
-            // with at least two tokens and no statement keywords.
+            // with at least two tokens and no statement keywords. A dotted
+            // call statement (`this.repo.find(id);`) is NOT a declaration:
+            // skip lines ending in `;` (or `);`) with a `.` before the `(`.
+            let call_statement = line.ends_with(';')
+                && line
+                    .split('(')
+                    .next()
+                    .map_or(false, |before| before.contains('.'));
             if line.contains('(')
                 && !line.contains('=')
                 && !line.starts_with("if")
@@ -323,6 +334,7 @@ fn heuristic_function_decl(line: &str, family: HeuristicFamily) -> Option<String
                 && !line.starts_with("catch")
                 && !line.starts_with("return")
                 && !line.starts_with("//")
+                && !call_statement
             {
                 let before_paren = line.split('(').next()?.trim();
                 let last = before_paren.split_whitespace().last()?;
@@ -439,6 +451,10 @@ end
 "#;
         let ext = parse_heuristic_file(src, "rb").unwrap();
         assert!(ext.imports.iter().any(|i| i.contains("json")));
+        // `require 'json'` → readable, unquoted import value (`require
+        // json`), never the mangled `require'json'`.
+        assert!(ext.imports.iter().any(|i| i.contains("json") && !i.contains('\'')));
+        assert!(!ext.imports.iter().any(|i| i.contains("require'")));
         let svc = ext.types.iter().find(|t| t.name == "UserService").unwrap();
         assert_eq!(svc.kind, "class");
         assert!(svc.implemented_interfaces.contains(&"BaseService".to_string()));
@@ -466,6 +482,19 @@ class UserService extends BaseService implements UserServiceInterface {
             .contains(&"UserServiceInterface".to_string()));
         assert!(svc.methods.iter().any(|m| m.name == "find"));
         assert!(ext.imports.iter().any(|i| i.contains("UserRepository")));
+    }
+
+    #[test]
+    fn cstyle_dotted_call_statement_is_not_a_method() {
+        let src = "class UserService {\n    this.repo.find(id);\n    public User Find(int id);\n}\n";
+        let ext = parse_heuristic_file(src, "cs").unwrap();
+        let svc = ext.types.iter().find(|t| t.name == "UserService").unwrap();
+        assert!(
+            !svc.methods.iter().any(|m| m.name == "find"),
+            "dotted call statement `this.repo.find(id);` must not become a method"
+        );
+        // Real declarations (even `;`-terminated) still are captured.
+        assert!(svc.methods.iter().any(|m| m.name == "Find"));
     }
 
     #[test]

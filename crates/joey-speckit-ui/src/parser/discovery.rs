@@ -139,11 +139,13 @@ pub fn parse_outline(content: &str) -> Vec<OutlineEntry> {
     let parser = pulldown_cmark::Parser::new(content);
     let mut entries = Vec::new();
     let mut line = 1usize;
+    let mut in_heading = false;
 
     for event in parser {
         match event {
             pulldown_cmark::Event::Start(pulldown_cmark::Tag::Heading { level, .. }) => {
                 if level <= pulldown_cmark::HeadingLevel::H3 {
+                    in_heading = true;
                     // Compute the line number by counting newlines up to the
                     // current offset. pulldown-cmark doesn't expose byte
                     // ranges in the public API in 0.12, so we approximate by
@@ -153,27 +155,55 @@ pub fn parse_outline(content: &str) -> Vec<OutlineEntry> {
                         line,
                         level: heading_level_int(level),
                     });
+                } else {
+                    // H4-H6 aren't collected; don't let their text leak into
+                    // the previous collected heading's title.
+                    in_heading = false;
                 }
             }
+            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Heading(_)) => {
+                in_heading = false;
+            }
             pulldown_cmark::Event::Text(t) => {
-                if let Some(last) = entries.last_mut() {
-                    if last.title.is_empty() || last.level <= 3 {
+                // Only append while inside the heading — body paragraphs
+                // after HeadingEnd must not pollute the title. Headings with
+                // no text keep their empty title (entry is pushed above).
+                if in_heading {
+                    if let Some(last) = entries.last_mut() {
                         last.title.push_str(&t);
                     }
                 }
                 line += t.as_ref().matches('\n').count();
             }
             pulldown_cmark::Event::Code(t) => {
-                if let Some(last) = entries.last_mut() {
-                    if last.title.is_empty() {
+                if in_heading {
+                    if let Some(last) = entries.last_mut() {
                         last.title.push_str(&t);
                     }
                 }
             }
+            // Inline formatting inside a heading is still heading content.
+            pulldown_cmark::Event::Start(
+                pulldown_cmark::Tag::Emphasis
+                | pulldown_cmark::Tag::Strong
+                | pulldown_cmark::Tag::Strikethrough
+                | pulldown_cmark::Tag::Link { .. }
+                | pulldown_cmark::Tag::Image { .. },
+            ) => {}
+            pulldown_cmark::Event::End(
+                pulldown_cmark::TagEnd::Emphasis
+                | pulldown_cmark::TagEnd::Strong
+                | pulldown_cmark::TagEnd::Strikethrough
+                | pulldown_cmark::TagEnd::Link
+                | pulldown_cmark::TagEnd::Image,
+            ) => {}
             pulldown_cmark::Event::SoftBreak | pulldown_cmark::Event::HardBreak => {
                 line += 1;
             }
-            _ => {}
+            // Any other (block-level) event ends heading text collection.
+            _ => {
+                in_heading = false;
+            }
         }
     }
 
@@ -275,6 +305,17 @@ mod tests {
             .unwrap();
         assert!(checklist.exists);
         assert!(checklist.path.ends_with("requirements.md"));
+    }
+
+    #[test]
+    fn parse_outline_does_not_append_body_text_to_heading_titles() {
+        let md = "## Section A\n\nThis paragraph follows the heading and must not\\
+end up in its title.\n\n### Sub\n\nMore body text here.\n";
+        let outline = parse_outline(md);
+        let a = outline.iter().find(|e| e.title.contains("Section A")).unwrap();
+        assert_eq!(a.title, "Section A");
+        let sub = outline.iter().find(|e| e.title.contains("Sub")).unwrap();
+        assert_eq!(sub.title, "Sub");
     }
 
     #[test]

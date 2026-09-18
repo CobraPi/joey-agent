@@ -1,8 +1,9 @@
 //! Debounced filesystem watcher for feature directories.
 //!
-//! Watches `spec.md`, `plan.md`, `tasks.md` under a feature directory and
-//! emits a `FileChangeEvent` (debounced ~500ms) whenever any of them
-//! changes, per research.md decision 3 (notify + debounce, no polling).
+//! Watches `spec.md`, `plan.md`, `tasks.md`, `data-model.md`, and
+//! `checklists/*.md` under a feature directory and emits a
+//! `FileChangeEvent` (debounced ~500ms) whenever any of them changes, per
+//! research.md decision 3 (notify + debounce, no polling).
 //!
 //! One debouncer per distinct feature directory (a process-global registry):
 //! WS connections come and go, but the watcher survives and is REUSED —
@@ -35,8 +36,21 @@ fn watchers() -> &'static std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::
     WATCHERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Conservative watched-name filter: the core spec/plan/tasks trio, plus
+/// exactly `data-model.md` and any `.md` directly inside a `checklists/`
+/// directory — external edits to those must also invalidate the
+/// meaning-graph cache. Everything else (research.md, quickstart.md,
+/// contracts/*.md, non-markdown files) is ignored.
+fn is_watched_name(file_name: &str, parent_dir: Option<&str>) -> bool {
+    match file_name {
+        "spec.md" | "plan.md" | "tasks.md" | "data-model.md" => true,
+        other => other.ends_with(".md") && parent_dir == Some("checklists"),
+    }
+}
+
 /// Start (or join) watching `feature_dir` for changes to
-/// spec.md/plan.md/tasks.md. Returns a receiver yielding one
+/// spec.md/plan.md/tasks.md (plus data-model.md and checklists/*.md).
+/// Returns a receiver yielding one
 /// `FileChangeEvent` per debounced change batch. Dropping the receiver
 /// detaches this subscriber; the underlying fs-watch is shared per dir
 /// (dead subscribers are pruned on the next event).
@@ -57,7 +71,12 @@ pub fn watch_feature_dir(
                 Ok(events) => {
                     for event in events {
                         if let Some(name) = event.path.file_name().and_then(|n| n.to_str()) {
-                            if matches!(name, "spec.md" | "plan.md" | "tasks.md") {
+                            let parent = event
+                                .path
+                                .parent()
+                                .and_then(|p| p.file_name())
+                                .and_then(|p| p.to_str());
+                            if is_watched_name(name, parent) {
                                 let ev = FileChangeEvent {
                                     file: name.to_string(),
                                     path: event.path.clone(),
@@ -117,5 +136,25 @@ mod tests {
         assert!(event.is_ok(), "expected a debounced file-change event");
         let event = event.unwrap().expect("channel open");
         assert_eq!(event.file, "tasks.md");
+    }
+
+    #[test]
+    fn watched_name_filter_includes_data_model_and_checklists() {
+        assert!(is_watched_name("spec.md", None));
+        assert!(is_watched_name("plan.md", None));
+        assert!(is_watched_name("tasks.md", None));
+        assert!(is_watched_name("data-model.md", None));
+        assert!(is_watched_name("requirements.md", Some("checklists")));
+        assert!(is_watched_name("security.md", Some("checklists")));
+    }
+
+    #[test]
+    fn watched_name_filter_stays_conservative() {
+        // Exactly the two additions — nothing else newly matches.
+        assert!(!is_watched_name("research.md", None));
+        assert!(!is_watched_name("quickstart.md", None));
+        assert!(!is_watched_name("requirements.md", Some("contracts")));
+        assert!(!is_watched_name("requirements.md", None));
+        assert!(!is_watched_name("notes.txt", Some("checklists")));
     }
 }

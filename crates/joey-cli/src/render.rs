@@ -338,7 +338,7 @@ fn reasoning_footer_line(started: Option<Instant>) -> Option<String> {
         if secs > 0.0 {
             let footer = format!("└─ Thought for {:.1}s ", secs);
             let w = box_width();
-            let fill = w.saturating_sub(2 + footer.len());
+            let fill = w.saturating_sub(2 + UnicodeWidthStr::width(footer.as_str()));
             let footer_styled = t.fg_more_subtle.ansi().paint(&footer).to_string();
             let fill_styled = theme::gradient_fg(
                 &"─".repeat(fill.saturating_sub(1)),
@@ -2061,7 +2061,7 @@ pub fn banner(info: &BannerInfo) {
     println!("{}", top_border);
     for line in lines {
         let visible = strip_ansi_width(&line);
-        let pad = inner.saturating_sub(visible + 2);
+        let pad = inner.saturating_sub(visible + 4);
         println!("{} {}{} {}", t.fg_most_subtle.ansi().paint("│"), line, " ".repeat(pad), t.fg_most_subtle.ansi().paint("│"));
     }
     println!("{}", bot_border);
@@ -2069,22 +2069,7 @@ pub fn banner(info: &BannerInfo) {
 
 /// Display width of a string ignoring ANSI escape sequences.
 fn strip_ansi_width(s: &str) -> usize {
-    let mut plain = String::new();
-    let mut in_escape = false;
-    for ch in s.chars() {
-        if in_escape {
-            if ch == 'm' {
-                in_escape = false;
-            }
-            continue;
-        }
-        if ch == '\u{1b}' {
-            in_escape = true;
-            continue;
-        }
-        plain.push(ch);
-    }
-    UnicodeWidthStr::width(plain.as_str())
+    UnicodeWidthStr::width(strip_ansi(s).as_str())
 }
 
 // ---------------------------------------------------------------------------

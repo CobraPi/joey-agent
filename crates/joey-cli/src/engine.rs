@@ -1190,19 +1190,33 @@ fn engine_switch_model(
     // orchestrator overlay when HyperCode orchestrator mode is active.
     reapply_orchestrator_overlay(agent, orchestrator_on, config);
     if global {
-        match joey_core::Config::load() {
-            Ok(mut cfg) => match cfg.set_and_save("model.default", model) {
+        // Under --ignore-user-config/--safe-mode, Config::load serves an
+        // EMPTY user doc (config.rs read_user_doc), so set_and_save would
+        // rewrite config.yaml with ONLY model.default — wiping every other
+        // user key. Detect the flag (main.rs wire_flag_env exports it as
+        // JOEY_IGNORE_USER_CONFIG=1, the same check joey-core applies) and
+        // keep the switch session-only.
+        let user_config_ignored =
+            std::env::var("JOEY_IGNORE_USER_CONFIG").as_deref() == Ok("1");
+        if user_config_ignored {
+            notice.push_str(
+                " — ignoring user config: model switch applies to this session only (no config.yaml write)",
+            );
+        } else {
+            match joey_core::Config::load() {
+                Ok(mut cfg) => match cfg.set_and_save("model.default", model) {
                 Ok(()) => {
                     notice.push_str(&format!(" — saved to {}", cfg.path().display()));
                 }
+                    Err(e) => {
+                        notice.push_str(&format!(
+                            " (session only — failed to persist model.default: {e})"
+                        ));
+                    }
+                },
                 Err(e) => {
-                    notice.push_str(&format!(
-                        " (session only — failed to persist model.default: {e})"
-                    ));
+                    notice.push_str(&format!(" (session only — config unavailable: {e})"));
                 }
-            },
-            Err(e) => {
-                notice.push_str(&format!(" (session only — config unavailable: {e})"));
             }
         }
     }

@@ -153,7 +153,7 @@ pub trait SummaryBackend: Send + Sync {
 ///    step 1)
 ///
 /// with the configured timeout (`auxiliary.compression.timeout`, default
-/// 120s) floored at 300s for compression (#54915).
+/// 30s) floored at 300s for compression (#54915).
 pub struct AuxSummaryBackend {
     client: Option<ProviderClient>,
     model: String,

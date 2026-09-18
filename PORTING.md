@@ -579,6 +579,25 @@ never runs on tokio's async workers: call sites wrap the pool in
   per SC-007; see `specs/031-please-modify-joey/` (spec + contracts) and its
   baseline bundle.
 
+- **Feature 034 calm compaction framing (US4).** Upstream's
+  SUMMARY_PREFIX/SUMMARY_END_MARKER compaction text is ported byte-for-byte
+ and unchanged; Joey appends ONE additional sentence after the end marker —
+ "Context compaction is routine housekeeping — continue the current task; no
+ wrap-up or hand-off is needed." — behind `compaction.calm_framing`
+ (default `true`; the compressor layer defaults false and Agent::new wires
+ the config value, so upstream-exact output is one config key away). Spec:
+ specs/034-please-implement-previous-recommendations (research D7).
+
+- **Feature 034 terminal truncation marker reworded (US5, FR-007).**
+  truncate_terminal_output's notice changes from the upstream-ported
+ `... [OUTPUT TRUNCATED - N chars omitted out of M total] ...` to
+ `... [output truncated, N chars omitted] ...` (contracts/tool-schemas.md
+ FR-007, matching the verification.rs:469 precedent) so the omitted size is
+ advertised without the total. Defusing of trust-marker literals (feature
+ 034 FR-015) also wraps `<system-notice>`, `<total_tokens`, and
+ `[OUT-OF-BAND USER MESSAGE` literals in backticks inside tool output —
+ additive, upstream has no equivalent markers.
+
 ### GitHub Copilot embeddings backend (explicit) — 2026-08-30
 
 Status: Joey-native addition (no upstream counterpart; upstream Hermes has no Copilot embeddings path).
@@ -1901,3 +1920,47 @@ Joey-only addition; no upstream Hermes equivalent to port. Adds a governance lay
 - Upstream-parity surface touched: **none**. Additive subsystem — no upstream Hermes behavior, on-disk format, prompt surface, or wire protocol is replicated or modified here. Terminal-tool observable outputs are byte-identical; only the execution substrate moved from `tokio::task::spawn_blocking` to the pool.
 - Scheduling: deadline-form weighted fair queuing (`deadline = now + scale / weight`, weights clamped [1.0, 100.0]), semaphore admission control (backpressure, default 256 queued+running), panic isolation, drain-on-close.
 - Deliberate divergence: **none**.
+
+## Bug-sweep parity alignments (2026-09-17)
+
+Date-stamped pass aligning today's bug-sweep fixes with upstream Hermes
+semantics. All changes preserve behavior for sane inputs; no public
+surface, on-disk format, or schema changed.
+
+- **joey-agent-core (compression):** the rough token estimators now count
+  **code points** (chars), not bytes, matching upstream Python `len()`
+  semantics for the 4-chars/token approximation — `estimator.rs`
+  (`content_length_for_budget` / `estimate_message_chars`),
+  `breakdown.rs` (`chars_to_tokens`), and `compressor.rs` prune
+  thresholds. Comment-only alignment on the image-cost constant (1500)
+  and the aux-summarization timeout (30s). The orchestrator's
+  feasibility auto-lower path now recomputes derived budgets the same
+  way `update_model` does (no stale budget after a context-window
+  downgrade).
+- **joey-cron (schedule arithmetic):** one-shot `run_at`, the
+  `compute_next_run` interval branch, and the croniter cursor/cap
+  arithmetic converted to `checked_add_signed` — huge-but-parseable
+  durations now error or return `None` instead of panicking on
+  `TimeDelta` overflow. Behavior for all sane values is unchanged
+  (tests pinned).
+- **joey-core (config + auth store):** `Config::unset` now delegates
+  env-routed keys to `remove_env_value` (was a silent no-op, diverging
+  from upstream unset semantics); the `.env` parser accepts an `export`
+  prefix and any whitespace around the assignment; the auth store routes
+  valid-JSON-without-provider-keys through the corrupt-preserve path
+  (`auth.json.corrupt` + empty-store recovery) instead of silently
+  treating it as a healthy store.
+- **joey-mcp (client):** JSON-RPC error frames with a null/absent `id`
+  now fail the pending request fast instead of hanging it to the
+  timeout — parity with upstream `mcp_tool` request-completion handling.
+- **joey-providers (error classification + stream truncation):**
+  Anthropic stream truncation (stream ends with no `stop_reason` and an
+  unparsable tool `json_buf`) now maps to `FinishReason::Length`,
+  matching the OpenAI truncated-call path; the 5xx fail-fast bucket
+  excludes a bare `invalid_request_error` body, mirroring
+  `classify_400`; unknown Anthropic SSE `error` event types classify as
+  retryable `ServerError` instead of a hard fail; Responses API
+  `incomplete` status maps to `FinishReason::Length`.
+
+**Status**: Complete (2026-09-17) — parity restorations only, no
+deviations introduced.

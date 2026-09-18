@@ -872,6 +872,26 @@ impl DelegateTask {
             }
         };
 
+        // NON-roles-only mode: 'category', 'load_skills', and 'persist' are
+        // promised in the tool schema but are single-task-only fields with NO
+        // per-task meaning inside tasks[] — TaskSpec has no such fields, so
+        // serde would silently drop them. Scan the RAW task values (not the
+        // parsed specs, same shape as the roles-only gate in execute) and
+        // reject naming the task index and key BEFORE any dispatch. Unknown
+        // other fields stay silently ignored; 'subagent_type' IS a supported
+        // per-task field (resolved per task below) and is not scanned for.
+        if !crate::orchestrator_roles_only() {
+            for (index, item) in tasks_value.as_array().into_iter().flatten().enumerate() {
+                for field in ["category", "load_skills", "persist"] {
+                    if item.get(field).is_some_and(|v| !v.is_null()) {
+                        return ToolResult::Error(format!(
+                            "'{field}' in tasks[{index}] is single-task mode only and is not supported in batch 'tasks' (per-task fields are goal/context/model/toolsets/role/subagent_type/background/budgets); drop it or use single-task mode"
+                        ));
+                    }
+                }
+            }
+        }
+
         // Extract batch-level overrides from the top-level tool args (FR-006/FR-007).
         let batch_model = args.get("model").and_then(|v| v.as_str()).map(String::from);
         let batch_toolsets: Vec<String> = args

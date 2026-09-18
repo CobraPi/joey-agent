@@ -107,8 +107,6 @@ pub fn extract_and_append_learnings(
     summary: &str,
 ) -> std::io::Result<()> {
     // Heuristic extraction: look for key markers in the summary.
-    let lower = summary.to_ascii_lowercase();
-
     // Patterns → notepad file
     let conventions: Vec<&str> = summary
         .lines()
@@ -133,8 +131,6 @@ pub fn extract_and_append_learnings(
             ll.contains("decided") || ll.contains("chose") || ll.contains("rationale")
         })
         .collect();
-
-    let _ = &lower;
 
     if !conventions.is_empty() {
         store.append(

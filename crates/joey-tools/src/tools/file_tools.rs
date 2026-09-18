@@ -566,8 +566,9 @@ fn write_with_preservation(resolved: &Path, content: &str) -> Result<(u64, bool)
     }
     let mut dirs_created = false;
     if let Some(parent) = resolved.parent() {
+        let parent_existed = parent.exists();
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to write file: {}", e))?;
-        dirs_created = true;
+        dirs_created = !parent_existed;
     }
     joey_core::utils::atomic_replace(resolved, content.as_bytes())
         .map_err(|e| format!("Failed to write file: {}", e))?;
@@ -612,7 +613,7 @@ impl Tool for WriteFile {
         "file"
     }
     fn description(&self) -> &str {
-        "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out)."
+        "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). Large content can be persisted and re-sent by path: invoke once with inline content, then re-invoke with the returned content_path. Source output is not truncated."
     }
     fn emoji(&self) -> &str {
         "✍\u{fe0f}"
@@ -625,14 +626,15 @@ impl Tool for WriteFile {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
-                "content": {"type": "string", "description": "Complete content to write to the file"},
+                "content": {"type": "string", "description": "Complete content to write to the file (or provide content_path instead — exactly one of the two)"},
+                "content_path": {"type": "string", "description": "Path to a persisted payload file; its current content is written. Provide exactly one of content or content_path."},
                 "cross_profile": {
                     "type": "boolean",
                     "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Joey profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
                     "default": false,
                 },
             },
-            "required": ["path", "content"]
+            "required": ["path"]
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
@@ -645,23 +647,55 @@ impl Tool for WriteFile {
                 )
             }
         };
-        let content = match args.get("content") {
-            None => {
-                return tool_error(
-                    "write_file: missing required field 'content'. The tool call included a path but no content argument — this is almost always a dropped-arg bug under context pressure. Re-emit the tool call with the full content payload, or use execute_code with joey_tools.write_file() for very large files.",
-                )
-            }
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => {
+        // US7 (feature 034): `content` / `content_path` XOR — exactly one.
+        // Neither/both is a uniform contract error (replaces the old
+        // dropped-arg missing-content diagnostic for the 'neither' case;
+        // wrong-typed values keep their type error).
+        if let Some(other) = args.get("content") {
+            if !other.is_string() {
                 return tool_error(format!(
                     "write_file: 'content' must be a string, got {}.",
                     python_type_name(other)
-                ))
+                ));
+            }
+        }
+        let inline_content = args.get("content").and_then(|v| v.as_str()).map(str::to_string);
+        let content_path_arg = args.get("content_path").and_then(|v| v.as_str()).map(str::to_string);
+        let (content, content_path_out): (String, Option<String>) = match (inline_content, content_path_arg) {
+            (Some(c), None) => {
+                // FR-011: persist inline payloads before executing; failure
+                // never fails the call (path omitted from result).
+                let persisted = crate::payload_store::persist_payload(ctx.session_id(), "write_file", &c)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+                (c, persisted)
+            }
+            (None, Some(p)) => {
+                // FR-012/FR-013: cross-session references are copied into the
+                // current session's payload dir; the file's CURRENT disk
+                // content is written verbatim.
+                let resolved = match crate::payload_store::copy_payload_into_current_session(
+                    std::path::Path::new(&p),
+                    ctx.session_id(),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => return tool_error(format!("write_file: content_path unreadable: {e}")),
+                };
+                match crate::payload_store::read_payload(&resolved) {
+                    Ok(c) => (c, Some(resolved.to_string_lossy().into_owned())),
+                    Err(e) => return tool_error(format!("write_file: content_path unreadable: {e}")),
+                }
+            }
+            _ => {
+                return tool_error("write_file: provide exactly one of 'content' or 'content_path'")
             }
         };
 
         let resolved = ctx.resolve_path(&path);
         if let Some(err) = guards::check_sensitive_path(&path, &resolved) {
+            return tool_error(err);
+        }
+        if let Some(err) = guards::check_sensitive_path_canonical(&path, &resolved) {
             return tool_error(err);
         }
         // NOTE: the upstream cross-profile soft guard needs profile metadata
@@ -694,6 +728,10 @@ impl Tool for WriteFile {
                 }
                 result.insert("resolved_path".into(), json!(resolved.to_string_lossy()));
                 result.insert("files_modified".into(), json!([resolved.to_string_lossy()]));
+                // US7 (FR-011): surface the persisted payload path on success.
+                if let Some(p) = &content_path_out {
+                    result.insert("content_path".into(), json!(p));
+                }
                 update_read_timestamp(ctx, &resolved);
                 // Track for session change detection.
                 crate::file_tracker::FileTracker::record_write(&resolved.to_string_lossy());
@@ -866,6 +904,9 @@ impl Tool for Patch {
         for p in &paths_to_check {
             let resolved = ctx.resolve_path(p);
             if let Some(err) = guards::check_sensitive_path(p, &resolved) {
+                return tool_error(err);
+            }
+            if let Some(err) = guards::check_sensitive_path_canonical(p, &resolved) {
                 return tool_error(err);
             }
         }
@@ -1177,6 +1218,9 @@ count for multi-spot edits."
 
         let resolved = ctx.resolve_path(&path);
         if let Some(err) = guards::check_sensitive_path(&path, &resolved) {
+            return tool_error(err);
+        }
+        if let Some(err) = guards::check_sensitive_path_canonical(&path, &resolved) {
             return tool_error(err);
         }
 
@@ -2232,10 +2276,15 @@ mod tests {
         assert!(w["resolved_path"].as_str().unwrap().ends_with("sub/a.txt"));
         assert_eq!(w["files_modified"].as_array().unwrap().len(), 1);
 
-        // Missing content diagnostics.
-        let m = parse(&WriteFile.execute(json!({"path": "x.txt"}), &ctx).await);
-        assert!(m["error"].as_str().unwrap().starts_with("write_file: missing required field 'content'."));
-        let t = parse(&WriteFile.execute(json!({"path": "x.txt", "content": 42}), &ctx).await);
+        // US7: 'neither' content nor content_path is now the uniform XOR
+        // contract error (previously the dropped-arg missing-content
+        // diagnostic).
+        let m = parse(&WriteFile.execute(json!({ "path": "x.txt" }), &ctx).await);
+        assert_eq!(
+            m["error"],
+            "write_file: provide exactly one of 'content' or 'content_path'"
+        );
+        let t = parse(&WriteFile.execute(json!({ "path": "x.txt", "content": 42 }), &ctx).await);
         assert_eq!(t["error"], "write_file: 'content' must be a string, got int.");
 
         // Sensitive path.
@@ -2272,6 +2321,59 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with('\u{feff}'));
         assert!(text.contains("x\r\ny\r\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_symlink_writes_through() {
+        // Symlinked writes follow the link to the real file (atomic_replace
+        // resolves the target); the lexical + canonical guards must both
+        // pass for a tempdir-local symlink.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        std::fs::write(dir.path().join("real.txt"), "before\n").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link.txt"))
+            .unwrap();
+        let w = parse(
+            &WriteFile
+                .execute(json!({"path": "link.txt", "content": "after\n"}), &ctx)
+                .await,
+        );
+        assert_eq!(w["bytes_written"], 6);
+        // Writing through the link replaced the TARGET's content.
+        assert_eq!(std::fs::read_to_string(dir.path().join("real.txt")).unwrap(), "after\n");
+        // The symlink itself survives.
+        assert!(dir.path().join("link.txt").symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[tokio::test]
+    async fn write_file_tempdir_exempt_from_canonical_check() {
+        // macOS tempdirs canonicalize under /private/var/, which the
+        // sensitive-prefix list would reject; the canonical check must be
+        // skipped for paths under the canonicalized process temp dir.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        let w = parse(
+            &WriteFile
+                .execute(json!({"path": "exempt.txt", "content": "ok\n"}), &ctx)
+                .await,
+        );
+        assert_eq!(w["bytes_written"], 3);
+        assert!(w.get("error").is_none());
+        assert_eq!(std::fs::read_to_string(dir.path().join("exempt.txt")).unwrap(), "ok\n");
+    }
+
+    #[tokio::test]
+    async fn write_file_existing_parent_reports_dirs_created_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        let w = parse(
+            &WriteFile
+                .execute(json!({"path": "plain.txt", "content": "x\n"}), &ctx)
+                .await,
+        );
+        assert_eq!(w["bytes_written"], 2);
+        assert_eq!(w["dirs_created"], false);
     }
 
     #[tokio::test]

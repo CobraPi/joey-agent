@@ -237,6 +237,18 @@ pub fn extract_wisdom(subagent_response: &str, task_description: &str) -> Extrac
             continue;
         }
 
+        // Unresolved problems. Checked BEFORE the issues bucket: the
+        // issues bucket also matches "problem", so e.g. 'Unresolved
+        // problem: X' would otherwise never reach Problems.
+        if lower.contains("unresolved")
+            || lower.contains("technical debt")
+            || lower.contains("todo:")
+            || lower.contains("fixme")
+        {
+            wisdom.problems.push(trimmed.to_string());
+            continue;
+        }
+
         // Issues and gotchas.
         if lower.contains("issue")
             || lower.contains("problem")
@@ -257,16 +269,6 @@ pub fn extract_wisdom(subagent_response: &str, task_description: &str) -> Extrac
             || lower.contains("found that")
         {
             wisdom.learnings.push(trimmed.to_string());
-            continue;
-        }
-
-        // Unresolved problems.
-        if lower.contains("unresolved")
-            || lower.contains("technical debt")
-            || lower.contains("todo:")
-            || lower.contains("fixme")
-        {
-            wisdom.problems.push(trimmed.to_string());
             continue;
         }
     }
@@ -404,8 +406,15 @@ pub fn build_task_delegation_prompt(
 ) -> String {
     let mut prompt = String::new();
 
-    // Task header.
-    prompt.push_str(&format!("## Task {}: {}\n\n", task.number, task.title));
+    // Task header. F-tasks carry numbers in the internal
+    // F_TASK_NUMBER_OFFSET range; render them back as `F<N>` instead of
+    // leaking the raw offset into the prompt.
+    let task_label = if task.number >= crate::plan_parser::F_TASK_NUMBER_OFFSET {
+        format!("F{}", task.number - crate::plan_parser::F_TASK_NUMBER_OFFSET)
+    } else {
+        task.number.to_string()
+    };
+    prompt.push_str(&format!("## Task {}: {}\n\n", task_label, task.title));
 
     // Plan context (so Junior understands the big picture).
     if !plan_context.is_empty() {
@@ -479,7 +488,7 @@ pub fn start_work(
 
     // Check for existing boulder state (resume mode).
     if boulder_path.exists() {
-        let existing = BoulderState::read(omo_dir);
+        let mut existing = BoulderState::read(omo_dir);
         // Only resume if there are works.
         if !existing.works.is_empty() {
             // An explicit `/start-work <name>` naming a DIFFERENT plan
@@ -500,12 +509,15 @@ pub fn start_work(
                 Some(slug) => active_works
                     .iter()
                     .copied()
-                    .find(|w| w.session_id == session_id && w.plan_name == slug)
+                    .find(|w| {
+                        w.session_id == session_id
+                            && w.plan_name.eq_ignore_ascii_case(slug)
+                    })
                     .or_else(|| {
                         active_works
                             .iter()
                             .copied()
-                            .find(|w| w.plan_name == slug)
+                            .find(|w| w.plan_name.eq_ignore_ascii_case(slug))
                     }),
                 None => active_works
                     .iter()
@@ -517,6 +529,18 @@ pub fn start_work(
             if let Some(work) = active_work {
                 let plan_path = PathBuf::from(&work.plan_path);
                 let progress = calculate_plan_progress(&plan_path);
+                let work_id = work.id.clone();
+                let work_plan_name = work.plan_name.clone();
+                let work_plan_path = work.plan_path.clone();
+
+                // Cross-session takeover: the resuming session takes
+                // ownership of the matched work before persisting.
+                if let Some(w) = existing.works.iter_mut().find(|w| w.id == work_id) {
+                    w.session_id = session_id.to_string();
+                }
+                if let Err(e) = existing.write(omo_dir) {
+                    tracing::warn!("failed to persist boulder state: {e}");
+                }
 
                 let context = format!(
                     "<session-context>\n\
@@ -527,8 +551,8 @@ pub fn start_work(
                      You are Atlas. Continue executing the plan from where it was left off.\n\
                      Read the plan file, identify incomplete tasks, and delegate them.\n\
                      </session-context>",
-                    work.plan_name,
-                    work.plan_path,
+                    work_plan_name,
+                    work_plan_path,
                     progress.completed,
                     progress.total,
                 );
@@ -547,7 +571,26 @@ pub fn start_work(
     // Init mode: find the most recent plan (or use explicit name).
     let plan_path = if let Some(name) = explicit_plan_name {
         let slug = name.trim().replace(' ', "-");
-        plans_dir.join(format!("{}.md", slug))
+        // Case-insensitive plan lookup: `/start-work My Feature` must find
+        // an existing `my-feature.md` (joining with the actual file's stem)
+        // instead of failing and creating a duplicate Active work. Falls
+        // back to the literal slug only when no such file exists.
+        let matched = std::fs::read_dir(&plans_dir).ok().and_then(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| {
+                    p.extension().and_then(|s| s.to_str()) == Some("md")
+                        && p.file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.eq_ignore_ascii_case(&slug))
+                            .unwrap_or(false)
+                })
+        });
+        match matched {
+            Some(p) => p,
+            None => plans_dir.join(format!("{}.md", slug)),
+        }
     } else {
         find_latest_plan(&plans_dir)?
     };
@@ -576,7 +619,9 @@ pub fn start_work(
         plan_name.clone(),
         session_id.to_string(),
     );
-    let _ = boulder.write(omo_dir);
+    if let Err(e) = boulder.write(omo_dir) {
+        tracing::warn!("failed to persist boulder state: {e}");
+    }
 
     let context = format!(
         "<session-context>\n\
@@ -1090,6 +1135,55 @@ mod tests {
         // Naming the SAME plan still resumes.
         let r3 = start_work(&omo_dir, "s1", Some("beta")).unwrap();
         assert!(r3.is_resume, "explicit name matching the active work resumes");
+    }
+
+    #[test]
+    fn start_work_explicit_plan_resume_is_case_insensitive() {
+        // `/start-work My Feature` must resume the stored `my-feature`
+        // work (case-insensitive slug match) instead of failing to find
+        // the plan and creating a duplicate Active work; the resuming
+        // session also takes over the work's session id.
+        let dir = tempfile::tempdir().unwrap();
+        let omo_dir = dir.path().join(".omo");
+        let plans = omo_dir.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join("my-feature.md"), "# MF\n\n- [ ] 1. Task\n").unwrap();
+
+        let r1 = start_work(&omo_dir, "s1", Some("my-feature")).unwrap();
+        assert!(!r1.is_resume);
+
+        // Same plan, different case/spacing → RESUME, not a second work.
+        let r2 = start_work(&omo_dir, "s2", Some("My Feature")).unwrap();
+        assert!(r2.is_resume, "case-insensitive slug must resume the existing work");
+        assert!(r2.plan_path.unwrap().ends_with("my-feature.md"));
+
+        // Still exactly one work, now owned by the resuming session.
+        let boulder = BoulderState::read(&omo_dir);
+        assert_eq!(boulder.works.len(), 1);
+        assert_eq!(boulder.works[0].session_id, "s2");
+    }
+
+    #[test]
+    fn build_task_prompt_renders_f_numbers_without_offset() {
+        // F-task numbers live in the internal F_TASK_NUMBER_OFFSET range;
+        // the delegated prompt must render them as `F<N>`, never the raw
+        // offset (e.g. "## Task 1073741825: ...").
+        let task = ParsedTask {
+            number: crate::plan_parser::F_TASK_NUMBER_OFFSET + 1,
+            title: "Final verification".into(),
+            is_final_verification: true,
+            dependencies: vec![],
+            completed: false,
+        };
+        let prompt = build_task_delegation_prompt(&task, "", "");
+        assert!(
+            prompt.contains("## Task F1: Final verification"),
+            "F-task number must render as F1: {prompt}"
+        );
+        assert!(!prompt.contains(&format!(
+            "Task {}",
+            crate::plan_parser::F_TASK_NUMBER_OFFSET + 1
+        )));
     }
 
     #[test]

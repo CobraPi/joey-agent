@@ -60,6 +60,27 @@ fn detects_from_maven_dependency() {
 }
 
 #[test]
+fn maven_non_pega_dependency_before_pega_does_not_win() {
+    // A non-Pega dependency listed BEFORE the Pega one: the version must be
+    // extracted from the Pega <dependency> block, not the first <version>
+    // tag in the pom.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("pom.xml"),
+        "<project>\n  <dependencies>\n    <dependency>\n      <groupId>org.springframework</groupId>\n      <artifactId>spring-core</artifactId>\n      <version>6.1.0</version>\n    </dependency>\n    <dependency>\n      <groupId>com.pega</groupId>\n      <artifactId>pega-platform</artifactId>\n      <version>24.1.0</version>\n    </dependency>\n  </dependencies>\n</project>\n",
+    )
+    .unwrap();
+
+    let v = detect_pega_version(tmp.path(), "")
+        .expect("should detect the Pega dependency version despite the earlier dependency");
+    assert_eq!(
+        v, "24.1.0",
+        "the Pega dependency's version must win over the earlier non-Pega dependency, got: {}",
+        v
+    );
+}
+
+#[test]
 fn in_source_markers_without_version_yield_none() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("src").join("main").join("java").join("com").join("pega");
@@ -158,4 +179,20 @@ fn rule_obj_in_source_marker_without_version_is_none() {
         None,
         "Rule-Obj-* marker without a version line should return None"
     );
+}
+
+#[test]
+fn maven_pega_properties_fallback_still_works() {
+    // No <dependency> block with com.pega — the direct whole-content
+    // fallback must still extract the version for non-dependency poms.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("pom.xml"),
+        "<project>\n  <groupId>com.pega</groupId>\n  <version>8.8.0</version>\n</project>\n",
+    )
+    .unwrap();
+
+    let v = detect_pega_version(tmp.path(), "")
+        .expect("properties-style pom should still detect via fallback");
+    assert_eq!(v, "8.8.0");
 }

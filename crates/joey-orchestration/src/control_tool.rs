@@ -282,12 +282,24 @@ impl SubagentControl {
         }
 
         let poll = async {
+            let mut warned_vanished = false;
             loop {
                 self.pump();
+                // A child can vanish from the registry between validation
+                // and polling (e.g. session teardown); drop it from the
+                // snapshot instead of panicking.
                 let snap: Vec<DelegationOverview> = ids
                     .iter()
-                    .map(|&i| self.manager.child_status(i).expect("id validated above"))
+                    .filter_map(|&i| self.manager.child_status(i))
                     .collect();
+                if !warned_vanished && snap.len() < ids.len() {
+                    warned_vanished = true;
+                    tracing::warn!(
+                        "joey-orchestration: wait: {} waited-on children \
+                         vanished from the registry",
+                        ids.len() - snap.len()
+                    );
+                }
                 if snap.iter().all(|r| r.state.is_terminal()) {
                     return snap;
                 }
@@ -305,10 +317,13 @@ impl SubagentControl {
             }
             Err(_) => {
                 self.pump();
-                let snap: Vec<DelegationOverview> = ids
-                    .iter()
-                    .map(|&i| self.manager.child_status(i).expect("id validated above"))
-                    .collect();
+                let mut snap: Vec<DelegationOverview> = Vec::with_capacity(ids.len());
+                for &i in &ids {
+                    match self.manager.child_status(i) {
+                        Some(o) => snap.push(o),
+                        None => return ToolResult::Error(unknown_child_error(i)),
+                    }
+                }
                 let lines: Vec<String> = snap.iter().map(wait_line).collect();
                 ToolResult::Text(format!(
                     "[wait] timed out after {timeout_secs}s — partial statuses \

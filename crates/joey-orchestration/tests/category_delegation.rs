@@ -188,6 +188,25 @@ async fn subagent_type_resolves_named_agent_model() {
     }
 }
 
+/// A batch tasks[] item carrying 'category' — a single-task-only field the
+/// schema promises but TaskSpec silently drops — is rejected with a
+/// validation error naming the field and the task index, not silently ignored.
+#[tokio::test]
+async fn batch_task_with_category_is_rejected() {
+    let (tool, ctx) = make_tool(None);
+    let args = json!({
+        "tasks": [
+            { "goal": "first task" },
+            { "goal": "second task", "category": "quick" },
+        ],
+    });
+    let result = tool.execute(args, &ctx).await;
+    assert!(
+        matches!(result, ToolResult::Error(ref e) if e.contains("'category'") && e.contains("tasks[1]")),
+        "batch task with category must be rejected naming the key and task index, got: {result:?}"
+    );
+}
+
 /// The tool's JSON schema advertises category, subagent_type, and load_skills
 /// (T058/T135 contract).
 #[test]

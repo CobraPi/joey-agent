@@ -539,7 +539,7 @@ async fn process_task(
             &id,
             TaskStatus::Evaluating,
             "worker_completed",
-            "worker finished",
+            if ok { "worker finished" } else { "worker crashed" },
         );
 
         // Worker crashed ⇒ terminal failure, no gate evaluation.

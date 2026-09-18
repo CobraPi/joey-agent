@@ -88,7 +88,20 @@ impl SelectorEngine {
         } else {
             config.diagnoser_model.clone()
         };
-        let mut map = AllocationMap::load().unwrap_or_default();
+        let mut map = match AllocationMap::load() {
+            Ok(map) => map,
+            // A missing file is cold start (Ok(default)); any other error
+            // (schema mismatch, corrupt JSON, I/O) falls back to defaults
+            // loudly — map.rs says the caller should treat a mismatch as an
+            // error, so at minimum surface the detail before resetting.
+            Err(e) => {
+                tracing::warn!(
+                    "llm-selector: allocation map load failed ({:?}); starting from defaults",
+                    e
+                );
+                AllocationMap::default()
+            }
+        };
         map.learning_budget = budget;
         if !diagnoser.is_empty() {
             map.diagnoser_model = diagnoser;
@@ -275,16 +288,20 @@ impl SelectorEngine {
         drop(tx_guard);
         // Try to spawn the diagnoser task. If no tokio runtime is available
         // (e.g. called from a sync test context), gracefully skip spawning —
-        // the selector still routes from the cold-start map; observations are
-        // enqueued but never consumed (bounded channel, dropped on engine drop).
+        // but also uninstall the sender: an installed tx with no consumer
+        // would let the unbounded channel grow without bound.
         let engine_handle = std::sync::Arc::clone(self);
         let spawn_result = tokio::runtime::Handle::try_current();
         if let Ok(handle) = spawn_result {
             handle.spawn(async move {
                 crate::diagnoser::run_learning_loop_from_handle(engine_handle).await;
             });
+        } else {
+            // No runtime — diagnoser stays unstarted (no-op). Reset the
+            // sender so observations are dropped at the call site instead
+            // of piling up in a channel nobody drains.
+            *self.observation_tx.lock().unwrap() = None;
         }
-        // Else: no runtime — diagnoser stays unstarted (no-op).
     }
 
     /// Take the observation receiver (called once by `spawn_diagnoser`).
@@ -334,7 +351,9 @@ impl SelectorEngine {
             CapabilityTier::Frontier => 3,
         };
         // Only reallocate when the observed performance indicates a real
-        // failure (below 0.5 — all failure signals score here).
+        // failure (below 0.5 — the hard failure signals score here;
+        // eventually-succeeded retries with output score 0.55, above the
+        // gate, and never force reallocation).
         if observed_pj >= 0.5 {
             return None;
         }
@@ -452,9 +471,9 @@ impl SelectorEngine {
         let mut map = self.map.write().unwrap();
         map.enabled = config.enabled;
         map.learning_budget = config.learning_budget;
-        if !config.diagnoser_model.is_empty() {
-            map.diagnoser_model = config.diagnoser_model.clone();
-        }
+        // Assign unconditionally — symmetric with learning_budget above:
+        // an empty diagnoser_model means "clear it", not "keep the old one".
+        map.diagnoser_model = config.diagnoser_model.clone();
         let path = self.map_path_override.clone().unwrap_or_else(AllocationMap::path);
         let _ = map.save_to(&path);
         *self.config.write().unwrap() = config;

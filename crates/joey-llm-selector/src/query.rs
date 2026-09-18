@@ -273,8 +273,16 @@ pub fn render_status(report: &StatusReport) -> String {
         ));
         out.push_str("Enable by selecting the `auto` model, then /llm-selector enable.\n");
     } else {
-        // Enabled but not active (pool empty or model not auto).
-        if report.pool_size == 0 {
+        // Enabled but not active (pool empty or model not auto). Check the
+        // configured model FIRST: a concrete (non-auto) model is the real
+        // reason the selector can't act, and reporting "no live catalog"
+        // would mask the actual cause when the pool is also empty.
+        if report.configured_model != "auto" {
+            out.push_str(&format!(
+                "LLM Selector: enabled but inactive (model is '{}', not 'auto')\n",
+                report.configured_model
+            ));
+        } else if report.pool_size == 0 {
             out.push_str("LLM Selector: unavailable\n");
             out.push_str("The active provider does not expose a live model catalog.\n");
             out.push_str("Dynamic selection requires a catalog-exposing provider (copilot/openrouter).\n");

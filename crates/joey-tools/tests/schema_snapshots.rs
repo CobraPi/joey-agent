@@ -38,7 +38,7 @@ fn write_file_schema() {
     let t = tool("write_file");
     assert_eq!(
         t.description(),
-        "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out)."
+        "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). Large content can be persisted and re-sent by path: invoke once with inline content, then re-invoke with the returned content_path. Source output is not truncated."
     );
     assert_eq!(
         t.parameters(),
@@ -46,14 +46,15 @@ fn write_file_schema() {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
-                "content": {"type": "string", "description": "Complete content to write to the file"},
+                "content": {"type": "string", "description": "Complete content to write to the file (or provide content_path instead — exactly one of the two)"},
+                "content_path": {"type": "string", "description": "Path to a persisted payload file; its current content is written. Provide exactly one of content or content_path."},
                 "cross_profile": {
                     "type": "boolean",
                     "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Joey profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
                     "default": false,
                 },
             },
-            "required": ["path", "content"]
+            "required": ["path"]
         })
     );
 }
@@ -138,8 +139,15 @@ fn terminal_schema() {
     assert!(d.contains("Use background=true so Joey can track lifecycle and output.\n"));
     assert!(d.contains("PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).\n"));
     let p = t.parameters();
-    assert_eq!(p["required"], json!(["command"]));
-    assert_eq!(p["properties"]["command"]["description"], "The command to execute on the VM");
+    assert_eq!(p["required"], json!([]));
+    assert_eq!(
+        p["properties"]["command"]["description"],
+        "The command to execute on the VM (or provide command_path instead — exactly one of the two)"
+    );
+    assert_eq!(
+        p["properties"]["command_path"]["description"],
+        "Path to a persisted command script; the file's current content is used as the command. Provide exactly one of command or command_path."
+    );
     assert_eq!(p["properties"]["timeout"]["minimum"], 1);
     assert_eq!(
         p["properties"]["timeout"]["description"],
@@ -153,7 +161,7 @@ fn terminal_schema() {
         p["properties"]["workdir"]["description"],
         "Working directory for this command (absolute path). Defaults to the session working directory."
     );
-    for key in ["command", "background", "timeout", "workdir", "pty", "notify_on_complete", "watch_patterns"] {
+    for key in ["command", "command_path", "background", "timeout", "workdir", "pty", "notify_on_complete", "watch_patterns"] {
         assert!(p["properties"].get(key).is_some(), "terminal param {} missing", key);
     }
 }

@@ -205,15 +205,35 @@ impl Joiner {
             _ => Vec::new(),
         };
 
-        // FR-017 divergence check: string comparison on forward-slash paths.
+        // FR-017 divergence check: string comparison on forward-slash
+        // paths. Both sides are normalized (leading `./` stripped,
+        // duplicate `/` collapsed) so trivially-equivalent spellings of
+        // the same path don't count as divergence.
+        fn norm_path(p: &str) -> String {
+            let stripped = p.strip_prefix("./").unwrap_or(p);
+            let mut out = String::with_capacity(stripped.len());
+            let mut prev_slash = false;
+            for c in stripped.chars() {
+                if c == '/' {
+                    if !prev_slash {
+                        out.push(c);
+                    }
+                    prev_slash = true;
+                } else {
+                    out.push(c);
+                    prev_slash = false;
+                }
+            }
+            out
+        }
         let declared: Vec<String> = task
             .write_set
             .iter()
-            .map(|p| p.display().to_string().replace('\\', "/"))
+            .map(|p| norm_path(&p.display().to_string().replace('\\', "/")))
             .collect();
         let undeclared: Vec<String> = actual_write_set
             .iter()
-            .map(|p| p.display().to_string())
+            .map(|p| norm_path(&p.display().to_string()))
             .filter(|p| !declared.iter().any(|d| d == p))
             .collect();
 

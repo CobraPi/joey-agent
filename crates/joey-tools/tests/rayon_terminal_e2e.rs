@@ -10,7 +10,7 @@ async fn terminal_postprocessing_pipeline_e2e() {
     // Colored output exercises the ANSI strip; a fake key exercises redaction.
     let r = tool
         .execute(
-            json!({"command": "printf '\\033[32mgreen\\033[0m\\n'; echo 'OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuv'"}),
+            json!({"command": "printf '\\033[32mgreen\\033[0m\\n'; echo 'OPENAI_API_KEY=sk-proj-abcdefgh1234stuv'"}),
             &ctx,
         )
         .await;
@@ -18,7 +18,7 @@ async fn terminal_postprocessing_pipeline_e2e() {
     let out = v["output"].as_str().unwrap();
     assert!(out.contains("green"), "content survives: {out}");
     assert!(!out.contains("\x1b"), "ANSI stripped");
-    assert!(!out.contains("sk-proj-abcdefghijklmnopqrstuv"), "secret redacted: {out}");
+    assert!(out.contains("OPENAI_API_KEY=***"), "secret redacted: {out}");
     assert_eq!(v["exit_code"], 0);
 }
 

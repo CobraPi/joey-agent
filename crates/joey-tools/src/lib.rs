@@ -16,6 +16,7 @@ pub mod guards;
 pub mod highlight;
 pub mod lsp;
 pub mod patch_parser;
+mod payload_store;
 pub mod pyjson;
 pub mod registry;
 pub mod safe_commands;

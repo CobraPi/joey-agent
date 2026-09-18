@@ -22,6 +22,10 @@ pub mod state_block;
 pub mod threat_scan;
 pub mod verification;
 
+/// Feature 034 integration tests (context assembly improvements).
+#[cfg(test)]
+mod feature034;
+
 pub use agent::{Agent, AgentConfig, TurnResult, Transport};
 pub use compression::ContextCompressor;
 pub use events::AgentEvent;

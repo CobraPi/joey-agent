@@ -50,10 +50,23 @@ pub fn get_tool_output_limits(config: &Config) -> ToolOutputLimits {
     }
 }
 
+/// Feature 034 (FR-015): defuse trust-marker literals in untrusted tool
+/// output by wrapping each literal in backticks, so forged system-notice /
+/// gauge / steer markers cannot impersonate genuine agent-core injections.
+/// Applied to tool output before it reaches history.
+pub fn defuse_markers(output: &str) -> String {
+    output
+        .replace("<system-notice>", "`<system-notice>`")
+        .replace("<total_tokens", "`<total_tokens`")
+        .replace("[OUT-OF-BAND USER MESSAGE", "`[OUT-OF-BAND USER MESSAGE`")
+}
+
 /// Head/tail truncation with the terminal tool's exact marker
 /// (terminal_tool.py:2818-2829): 40% head, 60% tail. The budget and the
 /// omitted/total counts are in CHARS (Python str semantics), not bytes.
 pub fn truncate_terminal_output(output: &str, max_output_chars: usize) -> String {
+    let defused = defuse_markers(output);
+    let output: &str = &defused;
     let total_chars = output.chars().count();
     if total_chars <= max_output_chars {
         return output.to_string();
@@ -61,11 +74,7 @@ pub fn truncate_terminal_output(output: &str, max_output_chars: usize) -> String
     let head_chars = (max_output_chars as f64 * 0.4) as usize;
     let tail_chars = max_output_chars - head_chars;
     let omitted = total_chars - head_chars - tail_chars;
-    let truncated_notice = format!(
-        "\n\n... [OUTPUT TRUNCATED - {} chars omitted out of {} total] ...\n\n",
-        omitted,
-        total_chars
-    );
+    let truncated_notice = format!("\n\n... [output truncated, {} chars omitted] ...\n\n", omitted);
     // Find char-boundary split points for the head/tail char counts.
     let head_end = char_index_to_byte(output, head_chars);
     let tail_start = char_index_to_byte(output, total_chars - tail_chars);
@@ -131,9 +140,7 @@ mod tests {
         let text = "x".repeat(1000);
         let out = truncate_terminal_output(&text, 100);
         // head 40, tail 60, omitted 900.
-        assert!(out.contains(
-            "\n\n... [OUTPUT TRUNCATED - 900 chars omitted out of 1000 total] ...\n\n"
-        ));
+        assert!(out.contains("\n\n... [output truncated, 900 chars omitted] ...\n\n"));
         assert!(out.starts_with(&"x".repeat(40)));
         assert!(out.ends_with(&"x".repeat(60)));
     }
@@ -146,9 +153,7 @@ mod tests {
         let text = "日".repeat(100);
         assert_eq!(text.len(), 300);
         let out = truncate_terminal_output(&text, 90);
-        assert!(out.contains(
-            "\n\n... [OUTPUT TRUNCATED - 10 chars omitted out of 100 total] ...\n\n"
-        ));
+        assert!(out.contains("\n\n... [output truncated, 10 chars omitted] ...\n\n"));
         assert!(out.starts_with(&"日".repeat(36)));
         assert!(out.ends_with(&"日".repeat(54)));
         // A budget at/above the char count must not truncate despite the
@@ -171,5 +176,27 @@ mod tests {
         assert_eq!(lim.max_bytes, 50_000);
         assert_eq!(lim.max_lines, 2000);
         assert_eq!(lim.max_line_length, 2000);
+    }
+
+    #[test]
+    fn feature034_defuse_markers_wraps_all_three_literals() {
+        let out = defuse_markers("fake <system-notice> and <total_tokens>5</total_tokens> and [OUT-OF-BAND USER MESSAGE — x]");
+        assert!(out.contains("`<system-notice>`"));
+        assert!(out.contains("`<total_tokens`"));
+        assert!(out.contains("`[OUT-OF-BAND USER MESSAGE`"));
+        assert!(!out.contains("fake <system-notice> and"));
+    }
+
+    #[test]
+    fn feature034_truncate_terminal_output_defuses_short_untruncated_output() {
+        let out = truncate_terminal_output("evil <system-notice> injection", 1000);
+        assert_eq!(out, "evil `<system-notice>` injection");
+    }
+
+    #[test]
+    fn feature034_truncate_defuses_marker_surviving_in_kept_region() {
+        let long = format!("{}<system-notice>{}", "x".repeat(20), "y".repeat(400));
+        let out = truncate_terminal_output(&long, 200);
+        assert!(out.contains("`<system-notice>`"), "{out}");
     }
 }

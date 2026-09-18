@@ -148,12 +148,23 @@ fn replace_section(content: &str, heading: &str, new_body: &str) -> Option<Strin
         if i < heading_idx || i == heading_idx {
             result.push_str(line);
             result.push('\n');
-        } else if i == heading_idx + 1 && !new_body.is_empty() {
+        } else if i == heading_idx + 1 && i < end_idx && !new_body.is_empty() {
             result.push_str(new_body);
             if !new_body.ends_with('\n') {
                 result.push('\n');
             }
         } else if i >= end_idx {
+            // Empty-section special case: when the matched section has no
+            // body (end_idx == heading_idx + 1), the insert branch above is
+            // skipped (i < end_idx fails), so emit the new body here —
+            // BEFORE the line that ends the section (e.g. the next heading),
+            // which must be preserved verbatim.
+            if i == end_idx && end_idx == heading_idx + 1 && !new_body.is_empty() {
+                result.push_str(new_body);
+                if !new_body.ends_with('\n') {
+                    result.push('\n');
+                }
+            }
             result.push_str(line);
             result.push('\n');
         }
@@ -250,6 +261,36 @@ mod tests {
                 assert!(updated.contains("# Plan"));
             }
             _ => panic!("expected Success"),
+        }
+    }
+
+    #[test]
+    fn section_replace_empty_section_keeps_next_heading() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("plan.md");
+        let content = "## Summary\n## Technical Context\nkeep this\n";
+        std::fs::write(&path, content).unwrap();
+        let hash = content_hash(content);
+
+        // The matched section is EMPTY (the next heading immediately
+        // follows). The new body must be inserted right after the heading,
+        // and the next heading + all following lines must survive verbatim.
+        let result = apply_edit(
+            &path,
+            "NEW",
+            &hash,
+            &EditScope::Section {
+                heading: "Summary".to_string(),
+            },
+            Vec::new(),
+        );
+
+        match result {
+            EditorResult::Success { .. } => {
+                let updated = std::fs::read_to_string(&path).unwrap();
+                assert_eq!(updated, "## Summary\nNEW\n## Technical Context\nkeep this\n");
+            }
+            other => panic!("expected Success, got {other:?}"),
         }
     }
 

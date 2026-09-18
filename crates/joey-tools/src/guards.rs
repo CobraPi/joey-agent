@@ -323,6 +323,25 @@ pub fn check_sensitive_path(filepath: &str, resolved: &Path) -> Option<String> {
     None
 }
 
+/// Supplement to `check_sensitive_path` for write-path guards:
+/// `atomic_replace` follows symlinks (it replaces the symlink TARGET), so a
+/// lexically-clean path can still resolve to a sensitive system location
+/// (e.g. `ln -s /etc/hosts pwn.txt` then write_file pwn.txt). Canonicalize
+/// the resolved path and re-run `check_sensitive_path` on the canonical
+/// form. The canonical check is SKIPPED when the canonical path lies under
+/// the canonicalized process temp dir: macOS tempdirs (TMPDIR=/var/folders/…)
+/// canonicalize under /private/var/, which the sensitive-prefix list would
+/// otherwise reject even though the lexical (upstream) check deliberately
+/// allows tempdir writes.
+pub fn check_sensitive_path_canonical(filepath: &str, resolved: &Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+    let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    if canonical.starts_with(&tmp) {
+        return None;
+    }
+    check_sensitive_path(filepath, &canonical)
+}
+
 // ---------------------------------------------------------------------------
 // Internal display-text write refusal (tools/file_tools.py:796-925)
 // ---------------------------------------------------------------------------

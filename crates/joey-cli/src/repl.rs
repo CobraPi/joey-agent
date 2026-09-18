@@ -2406,7 +2406,20 @@ fn model_slash(st: &mut ReplState, args: &str) {
             // mirror of the session-start capture (`config.model()`).
             st.model = build_agent_config(&st.config, &st.overrides).model;
             if global {
-                if let Err(e) = st.config.set_and_save("model.default", &model) {
+                // Under --ignore-user-config/--safe-mode the in-memory config
+                // was loaded from an EMPTY user doc (config.rs read_user_doc),
+                // so set_and_save would rewrite config.yaml with ONLY
+                // model.default — wiping every other user key. Detect the
+                // flag (main.rs wire_flag_env exports it as
+                // JOEY_IGNORE_USER_CONFIG=1, the same check joey-core
+                // applies) and keep the switch session-only.
+                let user_config_ignored = std::env::var("JOEY_IGNORE_USER_CONFIG").as_deref()
+                    == Ok("1");
+                if user_config_ignored {
+                    render::info(
+                        "ignoring user config: model switch applies to this session only (no config.yaml write)",
+                    );
+                } else if let Err(e) = st.config.set_and_save("model.default", &model) {
                     render::error(&format!("failed to persist model.default: {}", e));
                 } else {
                     render::success(&format!(

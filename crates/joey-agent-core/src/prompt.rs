@@ -793,6 +793,22 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     let has = |name: &str| inputs.enabled_tools.iter().any(|t| t == name);
     let has_tools = !inputs.enabled_tools.is_empty();
 
+    // Feature 034 (US2): wrap system-injected prompt blocks in the unified
+    // <system-notice> channel. With the channel OFF (default) the closure is
+    // the identity — prompt bytes stay identical to pre-feature (FR-016).
+    let wrap_notice = |block: String| -> String {
+        if cfg.notice_channel_enabled() {
+            format!(
+                "{}\n{}\n{}",
+                crate::agent::SYSTEM_NOTICE_OPEN,
+                block,
+                crate::agent::SYSTEM_NOTICE_CLOSE
+            )
+        } else {
+            block
+        }
+    };
+
     // ── Stable tier ──────────────────────────────────────────────────
     let mut stable_parts: Vec<String> = Vec::new();
 
@@ -853,6 +869,12 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     if has_tools {
         stable_parts.push(STEER_CHANNEL_NOTE.to_string());
     }
+    // Feature 034 (US2): trust rule for the notice channel — teaches the
+    // marker so forged copies inside untrusted content are recognizable.
+    // Never wrapped itself; rides only when the channel is on (FR-016).
+    if cfg.notice_channel_enabled() {
+        stable_parts.push(SYSTEM_NOTICE_TRUST_NOTE.to_string());
+    }
 
     // 6. Model-family guidance (tool-use enforcement + per-family blocks).
     if has_tools && tool_use_enforcement_applies(ctx, inputs.model) {
@@ -872,24 +894,24 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     if has_skills_tools {
         let skills_prompt = build_skills_system_prompt(ctx);
         if !skills_prompt.is_empty() {
-            stable_parts.push(skills_prompt);
+            stable_parts.push(wrap_notice(skills_prompt));
         }
     }
 
     // 8. Environment hints (untagged lines).
     let env_hints = build_environment_hints(ctx);
     if !env_hints.is_empty() {
-        stable_parts.push(env_hints);
+        stable_parts.push(wrap_notice(env_hints));
     }
 
     // 9. Platform hint — the port surface is the CLI.
-    stable_parts.push(CLI_PLATFORM_HINT.to_string());
+    stable_parts.push(wrap_notice(CLI_PLATFORM_HINT.to_string()));
 
     // ── Context tier ─────────────────────────────────────────────────
     let mut context_parts: Vec<String> = Vec::new();
     let context_files = build_context_files_prompt(ctx);
     if !context_files.is_empty() {
-        context_parts.push(context_files);
+        context_parts.push(wrap_notice(context_files));
     }
     // Copilot context block (Joey extension) — appended after the project
     // context files, joined with the same "\n\n" tier separator, and given

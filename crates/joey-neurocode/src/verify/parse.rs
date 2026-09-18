@@ -90,11 +90,7 @@ fn parse_compiler_errors(output: &str) -> Vec<StructuredError> {
     for line in output.lines() {
         // Pattern: File.java:line: error: message
         if line.contains(": error:") || line.contains(": ERROR:") {
-            let parts: Vec<&str> = line.splitn(3, ':').collect();
-            if parts.len() >= 3 {
-                let file = parts[0].to_string();
-                let line_num = parts[1].trim().parse::<u32>().ok();
-                let message = parts[2].trim().to_string();
+            if let Some((file, line_num, message)) = split_file_line_message(line) {
                 let sig = format!(
                     "Compile:{}:{}",
                     file,
@@ -112,16 +108,69 @@ fn parse_compiler_errors(output: &str) -> Vec<StructuredError> {
     errors
 }
 
+/// Split a javac-style `path:line: error: message` line from the RIGHT.
+///
+/// Splitting from the left (`splitn(3, ':')`) breaks Windows paths:
+/// `C:\Main.java:42: error: msg` would yield file `"C"`. Here the line
+/// is split on every colon (`rsplit(':')`) and reassembled around the
+/// `error`/`ERROR` marker segment: everything right of the marker is the
+/// message, the segment immediately left of it is the line number, and
+/// everything further left is the file path. Because only the marker and
+/// the line number are peeled off, a drive-letter colon (a single leading
+/// char followed by ':') is always part of the reassembled path, never a
+/// split boundary.
+fn split_file_line_message(line: &str) -> Option<(String, Option<u32>, String)> {
+    // parts is right-to-left: parts[0] is the message tail.
+    let parts: Vec<&str> = line.rsplit(':').collect();
+    // The marker closest to the path (highest index) is the real one; a
+    // marker-looking segment inside the message sits further right.
+    let marker_idx = (0..parts.len())
+        .rev()
+        .find(|&i| parts[i].trim() == "error" || parts[i].trim() == "ERROR")?;
+    // Need a message right of the marker, a line segment left of it, and
+    // a non-empty file path left of that.
+    if marker_idx < 1 || marker_idx + 2 > parts.len() - 1 {
+        return None;
+    }
+    let message = parts[..=marker_idx]
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join(":")
+        .trim()
+        .to_string();
+    let line_num = parts[marker_idx + 1].trim().parse::<u32>().ok();
+    let file = parts[marker_idx + 2..]
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join(":");
+    Some((file, line_num, message))
+}
+
 /// Parse Maven build failures.
 fn parse_maven_errors(output: &str) -> Vec<StructuredError> {
     let mut errors = Vec::new();
     for line in output.lines() {
         if line.contains("BUILD FAILURE") || line.contains("ERROR") {
+            let msg = line.trim().to_string();
+            // `[ERROR] path:line: message` lines carry javac-style
+            // diagnostics — extract file/line with the same right-anchored
+            // split the compiler parser uses. Other ERROR lines (summary
+            // banners, reactor notes) have neither.
+            let (file, line_num) = line
+                .trim()
+                .strip_prefix("[ERROR]")
+                .map(str::trim)
+                .and_then(split_file_line_message)
+                .map_or((None, None), |(f, l, _)| (Some(f), l));
             errors.push(StructuredError {
-                signature: "Maven:build-failure".to_string(),
-                file: None,
-                line: None,
-                message: line.trim().to_string(),
+                signature: format!("Maven:{}", msg),
+                file,
+                line: line_num,
+                message: msg,
             });
         }
     }
@@ -166,6 +215,33 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].file.as_deref(), Some("src/Main.java"));
         assert_eq!(errors[0].line, Some(42));
+    }
+
+    #[test]
+    fn parse_compiler_error_windows_drive_path() {
+        // The drive-letter colon must stay part of the file path (a left
+        // splitn(3, ':') truncated the file to "C").
+        let output = "C:\\Main.java:42: error: cannot find symbol";
+        let errors = parse_compiler_errors(output);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].file.as_deref(), Some("C:\\Main.java"));
+        assert_eq!(errors[0].line, Some(42));
+        assert!(errors[0].message.contains("cannot find symbol"));
+    }
+
+    #[test]
+    fn parse_maven_errors_distinct_signatures() {
+        // Distinct ERROR lines must not collapse into one fixed signature.
+        let output = "[ERROR] /src/A.java:10: error: ';' expected\n[ERROR] /src/B.java:20: error: cannot find symbol";
+        let errors = parse_maven_errors(output);
+        assert_eq!(errors.len(), 2);
+        assert_ne!(errors[0].signature, errors[1].signature);
+        // `[ERROR] path:line:` lines extract file/line like the compiler
+        // parser does.
+        assert_eq!(errors[0].file.as_deref(), Some("/src/A.java"));
+        assert_eq!(errors[0].line, Some(10));
+        assert_eq!(errors[1].file.as_deref(), Some("/src/B.java"));
+        assert_eq!(errors[1].line, Some(20));
     }
 
     #[test]
