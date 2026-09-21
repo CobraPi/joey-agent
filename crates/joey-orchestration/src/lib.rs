@@ -27,6 +27,7 @@ pub mod tap;
 pub mod types;
 pub mod workspace;
 
+mod browser_explorer;
 pub use capacity::{
     capacity_children, capacity_requests, SystemCapacity, DEFAULT_MEM_MAX_FRACTION,
     DEFAULT_MEM_RESERVE_MB_PER_CHILD, HARD_CHILD_CEILING,

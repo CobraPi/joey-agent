@@ -1143,7 +1143,17 @@ Choose the optimum execution mode per task. ALWAYS state your chosen mode with a
 - SUBAGENTS or a single session: for sequential work, same-file edits, or heavily interdependent steps.\n\
 - When ambiguous, prefer the cheaper mode (subagents) and say that you did.\n\
 - While a team is active, keep routing new, unrelated tasks to subagents in parallel with the team — never queue work behind the team (one active team per session).\n\
-- If team mode is disabled in configuration, route the work to subagents and inform the user that team mode is disabled.";
+- If team mode is disabled in configuration, route the work to subagents and inform the user that team mode is disabled.\n\
+\n\
+## Browser explorer steering loop (feature 035)\n\
+\n\
+When a task needs live web work, drive ONE persistent browser explorer instead of dispatching fresh subagents per step:\n\
+- Designate: delegate_task with role explorer, background true, and browser_explorer true. That child keeps the process-global browser session and its page open across steps; browser_explorer_wait is its report channel and keep-alive.\n\
+- Steer: send ONE single-step instruction at a time via subagent_control action steer (for example: navigate to a URL; click a named link). Instructions land at the child wait boundary; the same child and the same page stay alive for the whole task.\n\
+- Read: after each instruction, read the child log via subagent_control action log — every step produces a [PAGE-REPORT] block with the echoed instruction, outcome, url, title, and a complete snapshot. Decide the next instruction ONLY from what the report shows.\n\
+- Finish: steer the literal instruction finish when done; the explorer emits one final [PAGE-REPORT] and completes. Steering a finished explorer returns an explicit already-finished error — never assume silent delivery.\n\
+- Exclusivity: a second browser_explorer designation while one is active is rejected naming the active child; steer the existing explorer or stop it first.\n\
+- Speed: same-URL navigation is skipped automatically (already_open) — keep the explorer and its page warm; zero relaunches, zero restarts, zero redundant reloads.";
 
 /// Planner prompt (decomposition into parallel workstreams).
 pub const PLANNER_PROMPT: &str = "\
@@ -1293,6 +1303,7 @@ fn planner_request(
         team: None,
         name: None,
         priority: None,
+        browser_explorer: false,
     }
 }
 
@@ -1336,6 +1347,7 @@ pub(crate) fn explorer_request(
         team: None,
         name: None,
         priority: None,
+        browser_explorer: false,
     }
 }
 
@@ -1382,6 +1394,7 @@ pub(crate) fn implementor_request(
         team: None,
         name: None,
         priority: None,
+        browser_explorer: false,
     }
 }
 
@@ -2065,6 +2078,7 @@ impl TaskDispatcher for HypercodeDispatcher<'_> {
             team: None,
             name: None,
             priority: None,
+            browser_explorer: false,
         };
         tracing::info!(
             "hypercode: graph dispatching task {} ({} worker)",
@@ -3919,5 +3933,14 @@ mod hypercode_memory_tests {
             "empty memory inputs keep the lessons-only goal byte-identical"
         );
         assert_eq!(compose_memory_goal_prefix(None, &[], &[], 2048), "");
+    }
+
+    #[test]
+    fn orchestrator_overlay_documents_browser_explorer_steering() {
+        let o = orchestrator_overlay();
+        assert!(o.contains("## Browser explorer steering loop (feature 035)"));
+        assert!(o.contains("browser_explorer_wait"));
+        assert!(o.contains("[PAGE-REPORT]"));
+        assert!(o.contains("already-finished"));
     }
 }

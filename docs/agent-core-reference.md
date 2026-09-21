@@ -129,6 +129,8 @@ Stable tier (session-stable, ordered):
    `SESSION_SEARCH_GUIDANCE`, `SKILLS_GUIDANCE` (skill_manage) — all
    verbatim upstream ports.
 - `ADAPTIVE_CODING_GUIDANCE` — Joey-only (not an upstream port): coding-specialist identity + user-preference adaptation semantics (mirrors the feature-027 memory store). Gated on `agent.adaptive_coding_guidance` (default true); off restores the pre-feature prompt.
+- `CONTEXT_ECONOMY_GUIDANCE` — Joey-only (feature 028): work economically with context, record discoveries to the scratchpad early, cite pointers, delegate noisy exploration. Pinned by contract test.
+- `GOAL_DIRECTED_GUIDANCE` — Joey-only (feature 031): plan-before-action for non-trivial tasks (ordered, verifiable steps + done-criteria; trivial tasks act directly; ambiguity gets one round of targeted questions), execution without deviation (every action serves the current step, reuse established results), explicit plan revisions, and step-outcome + verification reporting on completion. Token-neutral vs the text it replaced; pinned by contract test.
 6. Model-family guidance, gated by `agent.tool_use_enforcement`
    (bool/string/list/default model-patterns): tool-use enforcement +
    Google (gemini/gemma) or OpenAI-style (gpt/codex/grok) blocks.

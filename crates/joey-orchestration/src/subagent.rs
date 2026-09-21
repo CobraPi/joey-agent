@@ -247,20 +247,27 @@ impl Subagent {
         // T060/T149: Delegation directive (category prompt_append, named-agent
         // identity, or skills directive) injected as extra instructions.
         // This is prepended to the system prompt alongside any loaded skills.
-        if let Some(ref append) = req.prompt_append {
-            if !append.is_empty() {
-                let mut overlay = String::new();
-                for skill in &req.load_skills {
-                    overlay.push_str(&format!(
-                        "--- Loaded Skill: {} ---\n(Load and follow this skill's guidance.)\n\n",
-                        skill
-                    ));
-                }
-                overlay.push_str("--- Delegation Directive ---\n");
-                overlay.push_str(append);
-                overlay.push_str("\n--- End Delegation Directive ---\n");
-                agent.set_extra_instructions(Some(overlay));
+        // Feature 035 (T011): designated browser explorers additionally carry
+        // the steering-discipline directive.
+        let mut directive = req.prompt_append.clone().unwrap_or_default();
+        if req.browser_explorer {
+            if !directive.is_empty() {
+                directive.push_str("\n\n");
             }
+            directive.push_str(crate::browser_explorer::DESIGNATED_EXPLORER_GUIDANCE);
+        }
+        if !directive.is_empty() {
+            let mut overlay = String::new();
+            for skill in &req.load_skills {
+                overlay.push_str(&format!(
+                    "--- Loaded Skill: {} ---\n(Load and follow this skill's guidance.)\n\n",
+                    skill
+                ));
+            }
+            overlay.push_str("--- Delegation Directive ---\n");
+            overlay.push_str(&directive);
+            overlay.push_str("\n--- End Delegation Directive ---\n");
+            agent.set_extra_instructions(Some(overlay));
         }
 
         // Wire the cooperative interrupt handle into the child Agent so
@@ -633,6 +640,7 @@ pub(crate) fn specs_to_requests(
         team: None,
         name: None,
         priority: None,
+        browser_explorer: false,
     })
     .collect()
 }

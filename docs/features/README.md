@@ -25,6 +25,7 @@ for exhaustive per-crate detail, read these.
 | [joey-neurocode.md](joey-neurocode.md) | joey-neurocode | code graph store & schema, ingest & grammars, tiers/classifier, context assembly, Pega support, verify loop, auto-index |
 | [joey-neurocode-rag.md](joey-neurocode-rag.md) | joey-neurocode-rag | 18 config keys, 5 embedding backends & profiles, consent model, hybrid RRF search, vector quantization |
 | [joey-copilot.md](joey-copilot.md) | joey-copilot | .github Copilot bundle discovery (instructions/prompts/skills/mcp), plugin manifest |
+| [joey-compute.md](joey-compute.md) | joey-compute | CPU-bound compute pool (feature 033): EDF scheduling with bounded starvation, admission semaphore, panic isolation, chunked cancellation, watchdog, metrics, orchestrator weight policy |
 | [skills.md](skills.md) | repo skills/ | the skills system (SKILL.md format, dirs, tooling) and the bundled skill catalog |
 
 ## Reading order

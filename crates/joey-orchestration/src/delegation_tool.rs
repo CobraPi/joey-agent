@@ -440,6 +440,11 @@ impl Tool for DelegateTask {
                     "description": "If true, return immediately with a work handle per task ('[BACKGROUND] id=<child_id> goal=<goal> started') instead of blocking until the subagent finishes; the work runs under the same concurrency limits (excess queues). Check status later via subagent_control. Default: false (blocking).",
                     "default": false
                 },
+                "browser_explorer": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Browser explorer (feature 035): designate this single-task child as the session's steered browser explorer. Requires role='explorer' and background dispatch (forced on). While one browser explorer is active, a second designation is rejected naming the active child. Gated by hypercode.browser_explorer.enabled."
+                },
                 "priority": {
                     "type": "string",
                     "enum": ["critical", "normal", "background"],
@@ -512,6 +517,48 @@ impl Tool for DelegateTask {
         let tasks_value = args.get("tasks");
         let is_batch = tasks_value.is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty()));
 
+        // Feature 035 (FR-001/FR-009): browser-explorer designation gates.
+        // Order: config → mode → role → single-active (contract
+        // contracts/delegate-task.md); all fire before anything is dispatched.
+        let browser_explorer = args
+            .get("browser_explorer")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if browser_explorer
+            && !self
+                .parent_config_tree
+                .get_bool("hypercode.browser_explorer.enabled", true)
+        {
+            return ToolResult::Error(
+                "browser explorer capability disabled by configuration".to_string(),
+            );
+        }
+        if browser_explorer && is_batch {
+            return ToolResult::Error(
+                "browser_explorer is single-task mode only".to_string(),
+            );
+        }
+        if browser_explorer && args.get("background") == Some(&serde_json::json!(false)) {
+            return ToolResult::Error(
+                "browser explorer requires background dispatch".to_string(),
+            );
+        }
+        if browser_explorer
+            && args.get("role").and_then(|v| v.as_str()) != Some("explorer")
+        {
+            return ToolResult::Error(
+                "browser_explorer requires role: explorer".to_string(),
+            );
+        }
+        if browser_explorer {
+            if let Some(active) = self.manager.browser_explorer_registry().active() {
+                return ToolResult::Error(format!(
+                    "browser explorer already active: child {} (goal: {}); steer it via subagent_control or stop it first",
+                    active.child_id, active.goal
+                ));
+            }
+        }
+
         if is_batch {
             if team_arg.is_some() {
                 return ToolResult::Error("team spawns do not support batch tasks".to_string());
@@ -539,7 +586,7 @@ impl Tool for DelegateTask {
                     .into_iter()
                     .flatten()
                 {
-                    for field in ["subagent_type", "category", "load_skills"] {
+                    for field in ["subagent_type", "category", "load_skills", "browser_explorer"] {
                         if item.get(field).is_some_and(|v| !v.is_null()) {
                             return ToolResult::Error(format!(
                                 "'{field}' in tasks[] is not available in HyperCode orchestrator mode — delegate via role:'explorer' or role:'implementor' only."
@@ -715,6 +762,7 @@ impl Tool for DelegateTask {
             // T029 (FR-013): admission lane from the `priority` arg; the
             // background forcing below then wins (flag > arg precedence).
             priority: parse_priority(args.get("priority")),
+            browser_explorer,
         };
 
         // HyperCode role routing: `role: "explorer"|"implementor"` fills
@@ -739,6 +787,12 @@ impl Tool for DelegateTask {
                     ));
                 }
             }
+        }
+
+        // Feature 035: browser toolset is additive on top of the explorer
+        // role toolsets (never replacing them).
+        if req.browser_explorer && !req.toolsets.iter().any(|t| t == "browser") {
+            req.toolsets.push("browser".to_string());
         }
 
         // Feature 022 (agent teams): gate + lazy-create / member-register
@@ -804,7 +858,7 @@ impl Tool for DelegateTask {
         // background dispatcher and return a handle line NOW (SC-001).
         // background=false / unset keeps the blocking path below untouched
         // (FR-002 byte parity — pinned by tests/background.rs T007).
-        if args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) || req.browser_explorer {
             // T022 (FR-013): background waves enqueue as the background
             // lane (admission reads it only when governance is enabled).
             req.priority = Some(crate::types::Priority::Background);
@@ -818,6 +872,32 @@ impl Tool for DelegateTask {
                 ctx,
                 budgets,
             );
+            // Feature 035: record the designation against the real child id.
+            // Roll back on the two races: (a) a concurrent designation won —
+            // stop the child we just spawned; (b) the child already reached a
+            // terminal state before designation — complete() fired before the
+            // registry knew, so clear explicitly (never a stale designation).
+            if req.browser_explorer {
+                if let Ok(id) = handle.child_id.parse::<u64>() {
+                    if let Err(e) = self
+                        .manager
+                        .browser_explorer_registry()
+                        .designate(id, &req.goal)
+                    {
+                        let _ = self
+                            .manager
+                            .stop_child(id, crate::types::StopReason::SessionEnd);
+                        return ToolResult::Error(e);
+                    }
+                    if let Some(rec) = self.manager.child_status(id) {
+                        if rec.state.is_terminal() {
+                            self.manager
+                                .browser_explorer_registry()
+                                .clear_if_active(id);
+                        }
+                    }
+                }
+            }
             return ToolResult::Text(format!(
                 "[BACKGROUND] id={} goal={} started",
                 handle.child_id, handle.goal
@@ -1373,6 +1453,7 @@ mod role_tests {
             team: None,
             name: None,
             priority: None,
+            browser_explorer: false,
         }
     }
 
@@ -1704,6 +1785,104 @@ mod roster_tests {
                 }
                 other => panic!("field '{field}' must be rejected, got: {other:?}"),
             }
+        }
+    }
+
+    /// Feature 035: browser-explorer designation gates (contracts/delegate-task.md).
+    #[tokio::test]
+    async fn browser_explorer_gates_reject_bad_requests() {
+        let (tool, ctx) = (make_delegate_tool(None, None), test_ctx());
+        // config-off (tool built against a tree with the key false)
+        let off = json!({ "goal": "g", "role": "explorer", "browser_explorer": true, "background": true });
+        // role missing
+        let no_role = json!({ "goal": "g", "browser_explorer": true, "background": true });
+        // role wrong
+        let bad_role = json!({ "goal": "g", "role": "implementor", "browser_explorer": true, "background": true });
+        // explicit background:false
+        let fg = json!({ "goal": "g", "role": "explorer", "browser_explorer": true, "background": false });
+        for (args, needle) in [
+            (no_role, "browser_explorer requires role: explorer"),
+            (bad_role, "browser_explorer requires role: explorer"),
+            (fg, "browser explorer requires background dispatch"),
+        ] {
+            match tool.execute(args, &ctx).await {
+                ToolResult::Error(e) => assert!(e.contains(needle), "got: {e}"),
+                other => panic!("expected error {needle}, got {other:?}"),
+            }
+        }
+        // batch mode
+        let batch = json!({ "tasks": [ { "goal": "a" } ], "browser_explorer": true });
+        match tool.execute(batch, &ctx).await {
+            ToolResult::Error(e) => {
+                assert_eq!(e, "browser_explorer is single-task mode only");
+            }
+            other => panic!("batch must be rejected, got {other:?}"),
+        }
+        // keep `off` unused-warning away: config-off is covered by the dedicated test below
+        drop(off);
+    }
+
+    /// Feature 035: the config gate fires with the exact contract text when
+    /// hypercode.browser_explorer.enabled is false.
+    #[tokio::test]
+    async fn browser_explorer_config_off_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &cfg_path,
+            "hypercode:\n  browser_explorer:\n    enabled: false\n",
+        )
+        .unwrap();
+        let tree = joey_core::Config::load_from(cfg_path.clone()).unwrap();
+        let mgr = std::sync::Arc::new(crate::manager::SubagentManager::new(
+            crate::manager::ManagerConfig::default(),
+        ));
+        let tool = DelegateTask::new(
+            mgr,
+            test_agent_config(),
+            tree,
+            joey_tools::ToolRegistry::with_builtins(),
+            None,
+            None,
+        );
+        let ctx = test_ctx();
+        let args = json!({ "goal": "g", "role": "explorer", "browser_explorer": true, "background": true });
+        match tool.execute(args, &ctx).await {
+            ToolResult::Error(e) => {
+                assert_eq!(e, "browser explorer capability disabled by configuration");
+            }
+            other => panic!("config-off must be rejected, got {other:?}"),
+        }
+    }
+
+    /// Feature 035: a second designation while one is active is rejected
+    /// naming the active child id and goal.
+    #[tokio::test]
+    async fn browser_explorer_second_designation_rejected() {
+        let mgr = std::sync::Arc::new(crate::manager::SubagentManager::new(
+            crate::manager::ManagerConfig::default(),
+        ));
+        mgr.browser_explorer_registry()
+            .designate(99, "open example.com")
+            .unwrap();
+        let tool = DelegateTask::new(
+            mgr,
+            test_agent_config(),
+            joey_core::Config::defaults(),
+            joey_tools::ToolRegistry::with_builtins(),
+            None,
+            None,
+        );
+        let ctx = test_ctx();
+        let args = json!({ "goal": "second", "role": "explorer", "browser_explorer": true, "background": true });
+        match tool.execute(args, &ctx).await {
+            ToolResult::Error(e) => {
+                assert_eq!(
+                    e,
+                    "browser explorer already active: child 99 (goal: open example.com); steer it via subagent_control or stop it first"
+                );
+            }
+            other => panic!("second designation must be rejected, got {other:?}"),
         }
     }
 

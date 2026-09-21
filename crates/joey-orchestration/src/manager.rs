@@ -11,6 +11,7 @@ use joey_tools::ToolRegistry;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
+use crate::browser_explorer::{BrowserExplorerRegistry, BrowserExplorerWaitTool};
 use crate::governance::GovernanceConfig;
 use crate::subagent::{specs_to_requests, Subagent};
 use crate::types::{
@@ -207,6 +208,7 @@ fn stop_reason_str(reason: StopReason) -> &'static str {
 struct ChildRegistry {
     running: Mutex<HashMap<u64, ChildHandle>>,
     history: Mutex<Vec<DelegationOverview>>,
+    browser_explorer_registry: Arc<BrowserExplorerRegistry>,
 }
 
 impl ChildRegistry {
@@ -268,6 +270,7 @@ impl ChildRegistry {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(record.clone());
+        self.browser_explorer_registry.clear_if_active(id);
         Some(record)
     }
 
@@ -289,6 +292,7 @@ impl ChildRegistry {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(record.clone());
+        self.browser_explorer_registry.clear_if_active(id);
         Some(record)
     }
 }
@@ -540,6 +544,9 @@ pub struct SubagentManager {
     /// session-lifetime terminal history (FR-019). Shared with the
     /// transient per-child managers a batch dispatch creates.
     registry: Arc<ChildRegistry>,
+    /// Feature 035: the browser-explorer designation registry (the SAME
+    /// instance the child registry clears designations through).
+    browser_explorer_registry: Arc<BrowserExplorerRegistry>,
     /// Whether this manager's `child_semaphore`/`registry` are the shared
     /// top-level ones (true for the manager hosts hold AND for the
     /// transient per-child managers a batch dispatch creates — both point
@@ -699,7 +706,15 @@ impl SubagentManager {
         let gov_watchdog = std::sync::Arc::new(crate::resource_records::WatchdogState::new());
         let gov_shutdown =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let registry = Arc::new(ChildRegistry::default());
+        // Feature 035: the child registry owns the browser-explorer
+        // designation registry so every one-way terminal transition
+        // (complete / finalize_stopped) auto-clears a designation.
+        let browser_explorer_registry = Arc::new(BrowserExplorerRegistry::new());
+        let registry = Arc::new(ChildRegistry {
+            running: Mutex::new(HashMap::new()),
+            history: Mutex::new(Vec::new()),
+            browser_explorer_registry: browser_explorer_registry.clone(),
+        });
         // Feature 030 (T016, FR-010/R5b): sampling CPU watchdog — spawned
         // ONLY when governance is enabled; disabled managers keep the
         // shared state (zero overhead — nothing samples it).
@@ -755,6 +770,7 @@ impl SubagentManager {
             event_tap: std::sync::Mutex::new(None),
             recorder_tap: Arc::new(std::sync::Mutex::new(None)),
             registry,
+            browser_explorer_registry,
             child_pool_owner: true,
             child_runtime,
             gov_watchdog,
@@ -809,6 +825,11 @@ impl SubagentManager {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// Feature 035: the session's browser-explorer designation registry.
+    pub fn browser_explorer_registry(&self) -> &BrowserExplorerRegistry {
+        &self.browser_explorer_registry
     }
 
     /// Allocate the next stable child id from the PROCESS-GLOBAL counter
@@ -917,6 +938,7 @@ impl SubagentManager {
             gov_records: self.gov_records.clone(),
             grant_back: self.grant_back.clone(),
             registry: self.registry.clone(),
+            browser_explorer_registry: self.browser_explorer_registry.clone(),
             child_pool_owner: true,
             depth: self.depth,
             interrupt: self.interrupt.clone(),
@@ -1192,6 +1214,23 @@ impl SubagentManager {
             self.next_id(),
         )
         .await
+    }
+
+    /// Feature 035: (interrupt, steer) for a designated explorer's wait tool.
+    /// Uses the pre-registered child handle's slots when present (background
+    /// path — the SAME slots `stop_child`/`steer_child` act on); fresh ones
+    /// otherwise (out-of-contract blocking dispatch).
+    fn explorer_handles(&self, id: u64) -> (Arc<AtomicBool>, Arc<Mutex<String>>) {
+        self.registry
+            .lock_running()
+            .get(&id)
+            .map(|h| (h.interrupt.clone(), h.steer.clone()))
+            .unwrap_or_else(|| {
+                (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(Mutex::new(String::new())),
+                )
+            })
     }
 
     /// Feature 022 (T006b/T007): per-child team tools. Teammates get bound
@@ -1635,6 +1674,27 @@ impl SubagentManager {
                 req
             };
 
+            // Feature 035: designated browser explorers get the blocking
+            // `browser_explorer_wait` tool injected after toolset filtering
+            // (same mechanism as team tools): it binds to THIS child's steer
+            // slot and is the wait/report channel (FR-002/FR-004/FR-006).
+            let explorer_handles = if req.browser_explorer {
+                Some(self.explorer_handles(id))
+            } else {
+                None
+            };
+            let mut team_tools =
+                self.team_tools_for(req, parent_config, parent_config_tree, base_registry, event_tx);
+            if let Some((ref interrupt, ref steer)) = explorer_handles {
+                team_tools.push(Arc::new(BrowserExplorerWaitTool::new(
+                    id,
+                    req.goal.clone(),
+                    self.browser_explorer_registry.clone(),
+                    interrupt.clone(),
+                    steer.clone(),
+                    self.recorder_tap(),
+                )));
+            }
             let mut subagent = match Subagent::new(
                 req_ref,
                 parent_config,
@@ -1647,7 +1707,7 @@ impl SubagentManager {
                 None,
                 self.interrupt.clone(),
                 self.semaphore.clone(),
-                self.team_tools_for(req, parent_config, parent_config_tree, base_registry, event_tx),
+                team_tools,
             ) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1737,18 +1797,24 @@ impl SubagentManager {
                     .map(|h| (h.interrupt.clone(), h.steer.clone()));
                 match existing {
                     Some((i, s)) => (i, s, true),
+                    None => match explorer_handles.clone() {
+                        Some((i, s)) => (i, s, false),
+                        None => (
+                            Arc::new(AtomicBool::new(false)),
+                            Arc::new(Mutex::new(String::new())),
+                            false,
+                        ),
+                    },
+                }
+            } else {
+                match explorer_handles {
+                    Some((i, s)) => (i, s, false),
                     None => (
                         Arc::new(AtomicBool::new(false)),
                         Arc::new(Mutex::new(String::new())),
                         false,
                     ),
                 }
-            } else {
-                (
-                    Arc::new(AtomicBool::new(false)),
-                    Arc::new(Mutex::new(String::new())),
-                    false,
-                )
             };
             if self.child_pool_owner {
                 // Pre-signaled manager-wide interrupt must reach the child.
@@ -1828,6 +1894,13 @@ impl SubagentManager {
             // exits cooperatively at its next tick (≤50 ms).
             let agent_interrupt = subagent.agent.interrupt_handle();
             let agent_steer = subagent.agent.steer_handle();
+            // Feature 035: a designated browser explorer's wait tool consumes
+            // the steer slot at the wait boundary; the bridge must NOT race it
+            // by forwarding into the agent's steer handle (the text would
+            // park unseen until the next provider call). Interrupt
+            // forwarding is unchanged.
+            let bridge_registry = self.browser_explorer_registry.clone();
+            let bridge_child_id = id;
             let bridge_flag = child_interrupt.clone();
             let bridge_steer = child_steer.clone();
             let bridge_stop = Arc::new(AtomicBool::new(false));
@@ -1841,11 +1914,13 @@ impl SubagentManager {
                         if bridge_flag.load(Ordering::SeqCst) {
                             agent_interrupt.store(true, Ordering::SeqCst);
                         }
-                        if let Ok(mut slot) = bridge_steer.lock() {
-                            if !slot.is_empty() {
-                                let text = std::mem::take(&mut *slot);
-                                drop(slot);
-                                Agent::steer_via_handle(&agent_steer, &text);
+                        if !bridge_registry.is_active_for(bridge_child_id) {
+                            if let Ok(mut slot) = bridge_steer.lock() {
+                                if !slot.is_empty() {
+                                    let text = std::mem::take(&mut *slot);
+                                    drop(slot);
+                                    Agent::steer_via_handle(&agent_steer, &text);
+                                }
                             }
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2552,6 +2627,7 @@ impl SubagentManager {
         let shared_gov_flights = self.gov_flights.clone();
         let shared_grant_back = self.grant_back.clone();
         let shared_registry = self.registry.clone();
+        let shared_browser_explorer_registry = self.browser_explorer_registry.clone();
         // T015/T016: the batch wave shares the parent manager's dedicated
         // child runtime + sampling watchdog state + shutdown flag.
         let shared_child_runtime = self.child_runtime.clone();
@@ -2609,6 +2685,7 @@ impl SubagentManager {
             let child_sem = shared_child_semaphore.clone();
             let grant_back = shared_grant_back.clone();
             let child_registry = shared_registry.clone();
+            let browser_explorer_registry = shared_browser_explorer_registry.clone();
             let interrupt = self.interrupt.clone();
             let tap = tap.clone();
             let recorder = recorder.clone();
@@ -2661,6 +2738,7 @@ impl SubagentManager {
                     gov_records: parent_records,
                     grant_back: grant_back.clone(),
                     registry: child_registry.clone(),
+                    browser_explorer_registry: browser_explorer_registry.clone(),
                     child_pool_owner: true,
                     depth,
                     interrupt,

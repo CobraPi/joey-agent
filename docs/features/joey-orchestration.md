@@ -418,6 +418,50 @@ layer to avoid a circular dependency. Toolset mechanics are described in
 - `tests/task_graph_validation.rs` — public task-graph surface incl. all six invariants (T014).
 - `tests/team_tools.rs` — team registry lifecycle via public API only (T015).
 
+## Browser explorer (feature 035)
+
+- **Designation.** A browser explorer is designated via `delegate_task` with
+  `role: "explorer"` and `browser_explorer: true` (background is forced).
+  Single-active: a second designation while one is live errors
+  `browser explorer already active: child {id} (goal: {goal}); steer it via subagent_control or stop it first`.
+  A terminal state (Completed/Failed/Stopped) auto-clears the designation.
+  Gates that fail fast before dispatch: capability disabled by configuration
+  (`browser explorer capability disabled by configuration`), batch mode,
+  explicit `background: false`, wrong role.
+- **`browser_explorer_wait`.** Visible ONLY to the designated explorer child —
+  injected at dispatch and bound to that child's steer slot; the manager's
+  steer bridge skips designated explorers so the tool is the sole steer
+  consumer. Params: `report` (required: instruction echo, url, title,
+  snapshot, outcome success|failure, error iff failure) and `timeout_secs`
+  (default 300, bounds ONE call). The call blocks for the next steering
+  instruction and returns its text; on timeout it returns a notice and the
+  explorer calls again.
+- **`[PAGE-REPORT]` block.** Each report is emitted in exactly this shape:
+
+  ```
+  [PAGE-REPORT] child=<id> seq=<n>
+  instruction: <echoed instruction>
+  outcome: success|failure
+  url: <current page url>
+  title: <page title>
+  error: <message>            (present only on failure)
+  <complete snapshot payload>
+  ```
+
+  Reports are surfaced on the child's recorder ring (cap 256 lines), read
+  via `subagent_control` action `log`. The loop ends when the orchestrator
+  steers the literal instruction `finish`; steering a finished explorer
+  returns an explicit already-finished error.
+- **Config gate.** `hypercode.browser_explorer.enabled` (default `true`).
+  When false the capability is off and nothing else changes; the feature is
+  strictly additive (FR-009/SC-004).
+- **No-reload navigation.** `browser_navigate` gains `reload` (default
+  `false`) and a response field `already_open` (true exactly when navigation
+  was skipped because the URL is already open); `last_url` tracks the
+  post-redirect final URL and clears on disconnect (FR-007).
+- **Security.** Explorer reports are `browser_*` tool results and pass
+  through the existing untrusted-content wrapper (FR-008).
+
 ## See also
 
 - [../orchestration.md](../orchestration.md) — orchestration subsystem doc

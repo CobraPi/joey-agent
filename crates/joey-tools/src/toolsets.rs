@@ -115,6 +115,31 @@ static TOOLSETS: Lazy<HashMap<&'static str, Toolset>> = Lazy::new(|| {
         },
     );
     m.insert(
+        "browser",
+        Toolset {
+            description: "Browser automation tools (dedicated agent tab)",
+            tools: &[
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_scroll",
+                "browser_back",
+                "browser_press",
+                "browser_get_images",
+                "browser_vision",
+                "browser_console",
+                "browser_cdp",
+                "browser_dialog",
+                "browser_hover",
+                "browser_select_option",
+                "browser_drag",
+                "browser_click_coords",
+            ],
+            includes: &[],
+        },
+    );
+    m.insert(
         "search",
         Toolset {
             description: "Web search only (no content extraction/scraping)",
@@ -493,5 +518,45 @@ mod tests {
         assert!(all.contains(&"memory".to_string()));
         assert!(all.contains(&"web_search".to_string()));
         assert!(all.contains(&"vision_analyze".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod browser_toolset_tests {
+    use super::*;
+
+    #[test]
+    fn browser_toolset_resolves_sixteen_browser_tools() {
+        let tools = resolve("browser");
+        assert_eq!(tools.len(), 16, "browser toolset exposes exactly the 16 browser tools");
+        for name in [
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_scroll",
+            "browser_back",
+            "browser_press",
+            "browser_get_images",
+            "browser_vision",
+            "browser_console",
+            "browser_cdp",
+            "browser_dialog",
+            "browser_hover",
+            "browser_select_option",
+            "browser_drag",
+            "browser_click_coords",
+        ] {
+            assert!(tools.contains(&name.to_string()), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn web_toolset_unchanged_by_browser_entry() {
+        // resolve() returns sorted names (BTreeSet): "web_extract" < "web_search".
+        assert_eq!(
+            resolve("web"),
+            vec!["web_extract".to_string(), "web_search".to_string()]
+        );
     }
 }

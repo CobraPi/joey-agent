@@ -198,7 +198,7 @@ macro_rules! browser_tool {
     };
 }
 
-browser_tool!(BrowserNavigate, "browser_navigate", "Navigate the agent's dedicated browser tab to a URL. Waits for content settle. Refuses local/private network targets per URL-safety policy. Returns url/title/frame count.", "🌐");
+browser_tool!(BrowserNavigate, "browser_navigate", "Navigate the agent's dedicated browser tab to a URL. Waits for content settle. Refuses local/private network targets per URL-safety policy. Returns url/title/frame count. Set reload=true to force reloading an already-open URL; the response carries already_open=true exactly when navigation was skipped.", "🌐");
 browser_tool!(BrowserSnapshot, "browser_snapshot", "Take a deep structural snapshot of the current page: pierces shadow DOM and frames, viewport-priority presentation (in-view elements listed fully, out-of-view summarized). Optional since_last=true returns only the delta (feeds).", "📸");
 browser_tool!(BrowserClick, "browser_click", "Click an element. Target descriptor: {refid?, locator?, text?, geometry?} resolved via cascading fallback (refid→locator→text→geometry); result reports which strategy resolved.", "👆");
 browser_tool!(BrowserType, "browser_type", "Type text into an input. Focuses the target first; optional clear and Enter-submit.", "⌨️");
@@ -261,7 +261,12 @@ impl Tool for BrowserNavigate {
         json!({
             "type": "object",
             "properties": {
-                "url": { "type": "string", "description": "URL to open in the agent tab." }
+                "url": { "type": "string", "description": "URL to open in the agent tab." },
+                "reload": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "If false (default) and the requested URL is already the current page of the shared session tab, navigation is skipped (already_open=true, no reload). Pass true to force a reload of an already-open URL."
+                }
             },
             "required": ["url"]
         })
@@ -271,8 +276,17 @@ impl Tool for BrowserNavigate {
             Some(u) => u,
             None => return ToolResult::Error("missing url".into()),
         };
-        match self.handle.run(|m| async move { m.navigate(url).await }).await {
-            Ok(r) => ok_json(json!({ "navigated": true, "result": r })),
+        let reload = args.get("reload").and_then(|v| v.as_bool()).unwrap_or(false);
+        match self
+            .handle
+            .run(|m| async move { m.navigate_tracked(url, reload).await })
+            .await
+        {
+            Ok((r, already_open)) => ok_json(json!({
+                "navigated": true,
+                "already_open": already_open,
+                "result": r
+            })),
             Err(e) => err(e),
         }
     }

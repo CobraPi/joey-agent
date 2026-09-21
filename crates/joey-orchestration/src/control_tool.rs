@@ -475,7 +475,15 @@ fn describe_event(ev: &AgentEvent) -> Option<String> {
         ),
         AgentEvent::Done { final_text, .. } => format!("done: {}", clip(first_line(final_text), 120)),
         AgentEvent::Failed(e) => format!("failed: {}", clip(first_line(e), 120)),
-        AgentEvent::Notice(n) => format!("notice: {}", clip(first_line(n), 120)),
+        AgentEvent::Notice(text) => {
+            // Feature 035: `[PAGE-REPORT]` blocks are multi-line explorer
+            // reports read by the orchestrator — pass through VERBATIM (no
+            // prefix, no clip; the recorder ring cap bounds memory).
+            if text.starts_with("[PAGE-REPORT]") {
+                return Some(text.clone());
+            }
+            format!("notice: {}", clip(first_line(text), 120))
+        }
         AgentEvent::RetryAttempt {
             attempt,
             max_retries,
@@ -788,5 +796,32 @@ mod tests {
         // but closing keeps the one-active-team rule clear for later tests).
         rec.lock().unwrap().close();
         std::env::remove_var("JOEY_HOME");
+    }
+}
+
+#[cfg(test)]
+mod page_report_render_tests {
+    use super::describe_event;
+    use joey_agent_core::AgentEvent;
+
+    #[test]
+    fn page_report_notice_passes_through_unclipped() {
+        let mut block = String::from(
+            "[PAGE-REPORT] child=7 seq=1\ninstruction: open example.com\nsnapshot: ",
+        );
+        block.push_str(&"x".repeat(500));
+        let line = describe_event(&AgentEvent::Notice(block.clone())).expect("rendered");
+        assert_eq!(line, block, "PAGE-REPORT blocks must not be clipped or prefixed");
+    }
+
+    #[test]
+    fn ordinary_notice_still_prefixed_and_shortened() {
+        let text = "y".repeat(300);
+        let line = describe_event(&AgentEvent::Notice(text)).expect("rendered");
+        assert!(line.starts_with("notice: "), "prefix kept: {line}");
+        assert!(
+            line.chars().count() < 308,
+            "long ordinary notices are still shortened: {line}"
+        );
     }
 }

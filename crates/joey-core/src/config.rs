@@ -171,6 +171,8 @@ hypercode:
   enabled: false
   max_workstreams: 0
   child_tool_delay: 0.0
+  browser_explorer:
+    enabled: true
   explorer: {}
   implementor: {}
   team:
@@ -2168,6 +2170,14 @@ mod tests {
         // Time-to-completion: hypercode children default to NO inter-tool
         // pacing (the parent agent's agent.tool_delay does not apply).
         assert_eq!(cfg.get_f64("hypercode.child_tool_delay", -1.0), 0.0);
+    }
+
+    #[test]
+    fn hypercode_browser_explorer_defaults_to_enabled() {
+        let cfg = Config::defaults();
+        // Feature 035 (FR-009/SC-004): browser-explorer capability defaults ON;
+        // the `false` fallback makes this fail if the default YAML loses the key.
+        assert!(cfg.get_bool("hypercode.browser_explorer.enabled", false));
     }
 
     #[test]

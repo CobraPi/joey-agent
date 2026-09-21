@@ -1964,3 +1964,13 @@ surface, on-disk format, or schema changed.
 
 **Status**: Complete (2026-09-17) — parity restorations only, no
 deviations introduced.
+
+### Feature 035 — Orchestrator-Steered Browser Explorer (2026-09-19)
+
+- joey-core config: `hypercode.browser_explorer.enabled` default true — **Native addition** (no upstream counterpart; HyperCode is a Joey extension, see existing HyperCode note).
+- joey-orchestration: BrowserExplorerRegistry + `browser_explorer_wait` + `[PAGE-REPORT]` + delegate_task `browser_explorer` param + terminal auto-clear + steer-bridge skip for designated explorers — **Native addition** (no upstream equivalent).
+- joey-tools: `browser` toolset (16 tools) — **Native addition**; `browser_navigate` `reload`/`already_open` — **Deliberate deviation** (default same-URL navigation now skips instead of reloading; mandated by FR-007; callers pass reload:true for old behavior; browser stack is a declared native-deviation area).
+- joey-browser: `last_url` tracking + `should_skip_navigate` + `navigate_tracked` — **Native addition**.
+- joey-agent-core: ZERO product changes; untrusted-wrap regression test added pinning existing behavior (FR-008).
+- joey-cli: ORCHESTRATOR_PROMPT steering-loop section — **Native addition** (HyperCode prompt text lives only in joey-cli/src/hypercode.rs, never guidance.rs).
+- On-disk formats: unchanged (all state in-memory).

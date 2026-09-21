@@ -339,3 +339,28 @@ from upstream `hermes_cli/commands.py::SlashCommandCompleter`:
   error), with post-match guards, replacement re-indentation, closest-lines
   hints (`format_no_match_hint`), and a Python-SequenceMatcher port
   (`difflib.rs`) for ratios.
+
+## 10. Payload store — pass-by-reference for heavyweight inputs (feature 034)
+
+`src/payload_store.rs` lets tools accept very large inline payloads by
+reference instead of value. A curated per-tool set (not a generic size
+  threshold) supports it today: **terminal scripts**, **browser JavaScript
+  injection**, and **write_file content**.
+
+Flow:
+
+1. The model may submit either the full content or a `@payload`-style
+   reference produced by an earlier call in the same session.
+2. On the way **in**, oversized inline content is persisted via
+   `persist_payload(session_id, tool_name, content)` under the session's
+   storage dir and replaced by a reference — keeping the wire request
+   small and the history re-readable.
+3. On the way **out**, a reference is resolved with `read_payload`, and a
+   reference that points at a prior session's store is **auto-copied**
+   into the current session first (`copy_payload_into_current_session` —
+   explicit import on resolution, never silent cross-session reuse).
+
+Tests: `tests/payload.rs` (round-trip, cross-session copy, budget
+interaction in `tests/budget.rs`). See
+[context-assembly.md](context-assembly.md) for the other feature-034
+mechanisms this ships with.

@@ -23,6 +23,17 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
 - Automatic context compression with protected head/tail regions,
   structured summaries, per-session locks, and overflow recovery.
   → [agent-core-reference.md](agent-core-reference.md#3-context-compression-compression)
+- **Goal-directed execution (feature 031)**: plan-before-action guidance —
+  non-trivial tasks open with an ordered plan of verifiable steps and
+  done-criteria (trivial tasks act directly; ambiguity gets one round of
+  targeted clarifying questions), execution follows the plan without
+  wandering, and completion reports map each step to its outcome and
+  verification. → [agent-core-reference.md](agent-core-reference.md#2-system-prompt-assembly-promptrs-guidancers)
+- **Live context gauge (feature 034, default on)**: every outgoing request
+  carries a tail line showing remaining context, LOW-flagged at the
+  compression threshold; plus opt-in unified system-notice channel and
+  reasoning pruning, and a pass-by-reference payload store for
+  heavyweight tool inputs. → [context-assembly.md](context-assembly.md)
 - Streaming (SSE) responses, reasoning/thinking display, token accounting.
 
 ## Tools
@@ -33,7 +44,12 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
   skills, 4 LSP tools, NeuroCode graph tools, session search, clarify.
   → [tools.md](tools.md)
 - Parallel-safe read-only tools dispatch concurrently; everything else is
-  sequential with configurable delay.
+  sequential with configurable delay. CPU-heavy output post-processing
+  (terminal bursts) runs on the dedicated compute pool (feature 033) so it
+  never starves the async runtime. → [compute-pool.md](compute-pool.md)
+- Heavyweight inline tool inputs (terminal scripts, browser JavaScript,
+  file-write content) pass by reference via the payload store
+  (feature 034). → [tools.md](tools.md#10-payload-store--pass-by-reference-for-heavyweight-inputs-feature-034)
 - Filesystem checkpointing (shadow-git VCS): snapshot, list, `/rollback`,
   per-project retention. → [tools.md](tools.md#7-checkpoint-vcs-src-vcsrs)
 - Tool result persistence: oversized outputs spill to `~/.joey/storage`
@@ -95,6 +111,13 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
 - OMO (oh-my-openagent): 11 agent personas, 11 delegation categories,
   intent gating (ultrawork/hyperplan/team), goals, boulder plan execution,
   wisdom notepads, optional team mode. → [orchestration.md](orchestration.md)
+- **Browser explorer steering (feature 035, default on)**: in HyperCode
+  mode the orchestrator designates ONE persistent explorer subagent as
+  its eyes and hands, steers it step-by-step via `subagent_control`, and
+  reads `[PAGE-REPORT]` full-snapshot reports back — the explorer keeps
+  the same browser session and open page alive across steps (never
+  improvising navigation) for materially faster multi-step web work.
+  → [orchestration.md](orchestration.md#6-browser-explorer--orchestrator-steered-browsing-feature-035)
 
 ## Interfaces
 
@@ -127,6 +150,9 @@ cron jobs.json, SKILL.md format, session-key grammar, provider payloads.
 - One-shot mode (`-z/--oneshot`) for scripting, with `--usage-file` JSON
   reports. Explicit `--model`/`--provider` pin the choice — dynamic model
   routing (NeuroCode tiers, llm-selector) never rewrites an explicit pick.
+- **Cross-platform**: macOS/Linux first-class; native Windows support
+  (feature 014) across the workspace — path, shell, and process handling
+  all Windows-aware.
 - **Expandable transcript blocks**: every tool call, terminal command, and
   file diff expands in place (collapsed = first 10 lines / last 50 diff
   lines; expanded = full output tail with affordance). Toggle by mouse

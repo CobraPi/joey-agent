@@ -190,6 +190,10 @@ pub struct DelegationRequest {
     /// Feature 030: admission priority lane (default normal; background
     /// waves enqueue as background). Ignored when governance disabled.
     pub priority: Option<crate::types::Priority>,
+    /// Feature 035: designate this child as the session's steered browser
+    /// explorer (set by delegate_task's `browser_explorer: true`; the tool
+    /// layer forces background dispatch + explorer role).
+    pub browser_explorer: bool,
 }
 
 impl DelegationRequest {
@@ -214,6 +218,7 @@ impl DelegationRequest {
             team: None,
             name: None,
             priority: None,
+            browser_explorer: false,
         }
     }
 }

@@ -16,100 +16,114 @@ It complements the top-level `README.md` (quick start / user-facing) and
 ## How to read these docs
 
 Start with the **Feature Overview** for a tour of everything the agent
-does today, then the **Architecture Overview**, then dive into whichever
-subsystem you're working on:
+does today, then the **Architecture Overview** and **System Diagrams**,
+then dive into whichever subsystem you're working on:
 
 1. [`features.md`](features.md) — up-to-date feature-first overview of the
    whole project: every capability with links into the per-subsystem
    reference pages, plus an honest "not yet implemented" list.
-2. [`architecture.md`](architecture.md) — the Cargo workspace (17 crates),
-   crate dependency graph, high-level data flow from user input to final
-   answer.
-3. [`agent-turn-loop.md`](agent-turn-loop.md) — the heart of the project:
+2. [`architecture.md`](architecture.md) — the Cargo workspace (18 crates),
+   the crate dependency DAG, system context, high-level data flow from
+   user input to final answer, and the design principles — with Mermaid
+   diagrams.
+3. [`system-diagrams.md`](system-diagrams.md) — the detailed Mermaid
+   diagram collection: turn-loop internals, tool dispatch, provider
+   stack, prompt assembly, the context-management pipeline (economy /
+   assembly / gauge / compression), subagent delegation, the HyperCode
+   pipeline, the browser-explorer steering loop (035), the enterprise
+   TaskGraph runtime (023), NeuroCode + RAG, the compute pool (033), the
+   llm-selector, security layers, the TUI engine actor, cron, MCP,
+   SpecKit UI, and the state/config layout.
+4. [`agent-turn-loop.md`](agent-turn-loop.md) — the heart of the project:
    `Agent::run_turn`, the iteration loop, tool dispatch, retries, fallback
    providers, interrupts, and persistence.
-4. [`agent-core-reference.md`](agent-core-reference.md) — the comprehensive
-   `joey-agent-core` reference: system-prompt assembly tiers, context
+5. [`agent-core-reference.md`](agent-core-reference.md) — the comprehensive
+   `joey-agent-core` reference: system-prompt assembly tiers (including
+   the Joey-only goal-directed guidance, feature 031), context
    compression triggers/thresholds/protection, the full `AgentEvent`
    catalog, hooks integration inside the loop, tunables, and subagent
    wiring. Complements `agent-turn-loop.md`.
-5. [`context-economy.md`](context-economy.md) — the five default-on context
+6. [`context-economy.md`](context-economy.md) — the five default-on context
    economy mechanisms (feature 028): session scratchpad tool, deterministic
    state block, mid-turn tool-result hygiene, boundary-aligned cleanup, and
    economy guidance + retrieval verification nudge; the 10 additive config
    keys, byte-parity guarantees when disabled, and observability.
-6. [`tools.md`](tools.md) — the `Tool` trait, registry and dispatch
+7. [`tools.md`](tools.md) — the `Tool` trait, registry and dispatch
    semantics, the complete built-in tool inventory (17 always-on + 6
    conditional), the 18-toolset hierarchy with recursive includes,
    parallel-safe vs sequential dispatch, fuzzy patch matching, checkpoint
-   VCS, and the sanitizer/guard layers.
-7. [`providers.md`](providers.md) — provider wire protocols, the provider
+   VCS, the sanitizer/guard layers, and the feature-034 payload store
+   (pass-by-reference for heavyweight tool inputs).
+8. [`providers.md`](providers.md) — provider wire protocols, the provider
    registry (10 profiles) and model routing
    (`model.provider`/`base_url`/API-key resolution), SSE streaming,
    retries/backoff and error classification, reasoning/thinking support
    per provider, tool-call wire formats, and the dynamic
    `joey-llm-selector` model allocator.
-8. [`browser.md`](browser.md) — browser automation (feature 016): the
+9. [`browser.md`](browser.md) — browser automation (feature 016): the
    `joey-browser` crate, CDP attach vs managed launch, the browser tool
    family, dedicated-tab discipline, snapshot/action semantics, overlay and
    settle policy, and the per-provider image-model keys.
-9. [`cli.md`](cli.md) — the `joey` binary's complete user-facing surface:
+10. [`cli.md`](cli.md) — the `joey` binary's complete user-facing surface:
    every subcommand and flag, exit codes, the REPL slash-command registry,
    setup wizard, and profiles.
-10. [`state-and-config.md`](state-and-config.md) — `joey-core`: layered
+11. [`state-and-config.md`](state-and-config.md) — `joey-core`: layered
    config (YAML + `.env` + env), ~80 meaningful config keys, `~/.joey`
    directory layout, the SQLite session store (schema v22, FTS5 search,
    non-destructive compaction), profiles, secret redaction, and logging.
-11. [`security.md`](security.md) — the consolidated security model: secret
+12. [`security.md`](security.md) — the consolidated security model: secret
    redaction, credential storage, threat scanning, untrusted-content
    wrapping, SSRF/URL safety, file guards, dangerous-command approvals,
    and the deliberate Anthropic-OAuth omission.
-12. [`orchestration.md`](orchestration.md) — subagent delegation
-    (`delegate_task`, SubagentManager) and OMO multi-agent orchestration
+13. [`orchestration.md`](orchestration.md) — subagent delegation
+    (`delegate_task`, SubagentManager), OMO multi-agent orchestration
     (11 agents, 11 categories, intent gating, goals/boulder/notepads,
-    team mode), plus the OMO integration (feature 025): persona-aware
-    orchestrator overlay, full-roster delegation, OMO-chain role model
-    defaults. Subagents inherit the parent's NeuroCode engine (same
-    graph.db; task-targeted context).
-13. [`cron.md`](cron.md) — the built-in scheduler: schedule kinds, job
+    team mode), the OMO integration (feature 025), subagent resource
+    governance (feature 030), and the orchestrator-steered browser
+    explorer (feature 035). Subagents inherit the parent's NeuroCode
+    engine (same graph.db; task-targeted context).
+14. [`cron.md`](cron.md) — the built-in scheduler: schedule kinds, job
     store format, delivery targets, script jobs, and the `joey cron` CLI.
-14. [`mcp.md`](mcp.md) — the MCP stdio client: server configuration,
+15. [`mcp.md`](mcp.md) — the MCP stdio client: server configuration,
     `mcp__<server>__<tool>` naming, sanitization layers, and the
     `joey mcp` CLI.
-15. [`gateway.md`](gateway.md) — the messaging-platform-neutral spine:
+16. [`gateway.md`](gateway.md) — the messaging-platform-neutral spine:
     Platform enum, session keys, `PlatformAdapter` trait (no concrete
     adapters ship yet).
-16. [`tui.md`](tui.md) — the animated ratatui dashboard: views/panels,
+17. [`tui.md`](tui.md) — the animated ratatui dashboard: views/panels,
     activity-scaled animations, run modes.
-17. [`speckit-ui.md`](speckit-ui.md) — the SpecKit Visual UI backend:
+18. [`speckit-ui.md`](speckit-ui.md) — the SpecKit Visual UI backend:
     artifact parsing, workflow engine, HTTP/WS API, git-backed staging.
-18. [`HOOKS.md`](HOOKS.md) — `PreToolUse` hooks: shell-command hooks
+19. [`HOOKS.md`](HOOKS.md) — `PreToolUse` hooks: shell-command hooks
     configured in `config.yaml`, the JSON stdin contract, exit-code
     semantics (allow/deny/halt), and argument-rewriting via stdout.
-19. [`LSP.md`](LSP.md) — the Language Server Protocol integration: how to
+20. [`LSP.md`](LSP.md) — the Language Server Protocol integration: how to
     configure a language server per file type, and the `lsp_diagnostics` /
     `lsp_definition` / `lsp_references` / `lsp_symbols` tools that appear
     only when one is configured.
-20. [`speckit-workflow.md`](speckit-workflow.md) — the full spec-kit
+21. [`speckit-workflow.md`](speckit-workflow.md) — the full spec-kit
     lifecycle as native slash commands (`/speckit-specify` → … →
     `/speckit-implement`): real `.specify/` scripts for pre-flight,
     bundled skill workflows as agent turns, `/speckit-status` readiness.
-21. [`speckit-ui-launcher.md`](speckit-ui-launcher.md) — launch recipe for
+22. [`speckit-ui-launcher.md`](speckit-ui-launcher.md) — launch recipe for
     the SpecKit visual UI (`joey speckit`).
-22. [`copilot.md`](copilot.md) — native GitHub Copilot `.github/`
+23. [`copilot.md`](copilot.md) — native GitHub Copilot `.github/`
     integration: copilot-instructions.md / instructions / prompts / skills
     parsing, the `joey copilot` plugin installer, `/copilot` + `/<prompt>`
     slash commands, and `.github/mcp.json` merge semantics.
-23. [`features/README.md`](features/README.md) — per-crate feature
+24. [`features/README.md`](features/README.md) — per-crate feature
     reference — one deep-dive page per workspace crate (APIs, behaviors,
-    configuration, defaults, testing).
-24. [`context-assembly.md`](context-assembly.md) — the opt-in dynamic
+    configuration, defaults, testing), including
+    [`features/joey-compute.md`](features/joey-compute.md) for the
+    compute-pool crate.
+25. [`context-assembly.md`](context-assembly.md) — the dynamic
     context-assembly layer: relevance-ranked tool-schema selection
     ("tool schema retrieval"), always-keep tool pinning, state-block
     character budget, per-step JSONL assembly logging, the
     `/context-assembly` (`/ctxasm`) REPL command, byte parity when
-    disabled, and cache-stability guarantees.
-25. [`compute-pool.md`](compute-pool.md) — the `joey-compute` CPU-bound
+    disabled, cache-stability guarantees — and the feature-034 group
+    (live context gauge, unified notice channel, reasoning pruning).
+26. [`compute-pool.md`](compute-pool.md) — the `joey-compute` CPU-bound
     work execution substrate (feature 033): dedicated OS worker threads
     (never tokio workers), earliest-deadline-first scheduling with
     bounded starvation, semaphore admission/backpressure, panic
@@ -124,10 +138,10 @@ and docs disagree, the code wins — and please fix the doc.
 
 ```
 joey-agent/
-├── Cargo.toml                 workspace manifest (17 member crates)
+├── Cargo.toml                 workspace manifest (18 member crates)
 ├── crates/
 │   ├── joey-core/             branding, config, SQLite state store, logging, redaction
-│   ├── joey-browser/          browser automation over CDP (attach or managed launch)
+│   ├── joey-compute/          CPU-bound compute pool (feature 033)
 │   ├── joey-providers/        LLM provider wire protocols + client
 │   ├── joey-tools/            Tool trait, registry, toolsets, built-in tools
 │   ├── joey-agent-core/       the turn loop, system prompt, context compression
@@ -137,12 +151,13 @@ joey-agent/
 │   ├── joey-cli/              the `joey` binary (REPL + subcommands)
 │   ├── joey-tui/              --tui animated ratatui dashboard
 │   ├── joey-llm-selector/     dynamic model allocator (model.default = auto)
-│   ├── joey-orchestration/    subagent manager + delegate_task tool
+│   ├── joey-orchestration/    subagent manager + delegate_task + TaskGraph + browser explorer
 │   ├── joey-omo/              multi-agent personas, routing, Atlas plan execution
 │   ├── joey-neurocode/        NeuroCode code-graph intelligence (ingest, tiers, context assembly)
 │   ├── joey-neurocode-rag/    NeuroCode RAG: embedding backends, hybrid search, consent
+│   ├── joey-browser/          browser automation over CDP (attach or managed launch)
 │   ├── joey-copilot/          GitHub Copilot `.github/` bundle discovery & plugin manifest
-│   └── joey-speckit-ui/       standalone backend for the SpecKit Visual UI
+│   └── joey-speckit-ui/       backend for the SpecKit Visual UI (parsers shared with joey-cli)
 ├── docs/                      you are here
 ├── skills/                    Agent Skills bundled with the project
 ├── README.md                  user-facing quick start
@@ -154,6 +169,9 @@ joey-agent/
 - File/line references like `agent.rs:290` point at
   `crates/joey-agent-core/src/agent.rs` line 290 as of the time of writing;
   treat them as approximate signposts, not permanent anchors.
+- Diagrams are [Mermaid](https://mermaid.js.org) — GitHub renders them
+  natively; when a subsystem changes shape, update its diagram in the same
+  commit (see the maintenance note in `system-diagrams.md`).
 - "Upstream" always means Hermes Agent (the Python project this is a port
   of). Comments in the Rust source frequently cite the exact upstream
   Python file/line the logic was ported from (e.g. `conversation_loop.py:4309`)

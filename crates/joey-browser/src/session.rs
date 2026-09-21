@@ -55,6 +55,10 @@ pub struct BrowserManager {
     mode: Mutex<Mode>,
     conn: Option<Arc<CdpConnection>>,
     page: Mutex<Option<PageRef>>,
+    /// FR-007 (feature 035): final URL of the dedicated tab's last EXECUTED
+    /// navigation (post-redirect); `None` until one runs and cleared on
+    /// disconnect. Drives `should_skip_navigate`.
+    last_url: Mutex<Option<String>>,
     pub config: BrowserConfig,
     managed_child: Mutex<Option<tokio::process::Child>>,
     /// Ephemeral profile dir of the managed launch (None when attached);
@@ -75,6 +79,7 @@ impl BrowserManager {
                 mode: Mutex::new(Mode::Attached),
                 conn: Some(conn),
                 page: Mutex::new(None),
+                last_url: Mutex::new(None),
                 config: cfg,
                 managed_child: Mutex::new(None),
                 managed_user_data_dir: None,
@@ -93,6 +98,7 @@ impl BrowserManager {
             mode: Mutex::new(Mode::Managed),
             conn: Some(conn),
             page: Mutex::new(None),
+            last_url: Mutex::new(None),
             config: cfg,
             managed_child: Mutex::new(Some(managed.child)),
             managed_user_data_dir: Some(managed.user_data_dir),
@@ -246,7 +252,33 @@ impl BrowserManager {
             self.config.allow_local_urls,
             crate::url_safety_bridge::url_safety_check,
         )?;
+        // FR-007 (feature 035): track the final post-redirect URL of every
+        // executed navigation — `should_skip_navigate` reads it.
+        *self.last_url.lock().await = Some(final_url);
         Ok(r)
+    }
+
+    /// Feature 035 (FR-007): navigate with already-open skip. Returns
+    /// `(cdp_result, already_open)`; `already_open == true` iff the request
+    /// was skipped because `url` (with `reload == false`) is already the
+    /// tab's current page. URL-safety is checked BEFORE the skip so a
+    /// blocked URL is never answered `already_open`.
+    pub async fn navigate_tracked(
+        &self,
+        url: &str,
+        reload: bool,
+    ) -> Result<(serde_json::Value, bool), BrowserError> {
+        if !self.config.allow_local_urls {
+            if let Err(reason) = crate::url_safety_bridge::url_safety_check(url) {
+                return Err(BrowserError::UrlBlocked(reason));
+            }
+        }
+        let last = self.last_url.lock().await.clone();
+        if should_skip_navigate(last.as_deref(), url, reload) {
+            return Ok((serde_json::Value::Null, true));
+        }
+        let r = self.navigate(url).await?;
+        Ok((r, false))
     }
 
     /// History back in the agent tab.
@@ -392,6 +424,8 @@ impl BrowserManager {
             }
         }
         *self.page.lock().await = None;
+        // FR-007 (feature 035): no page → no last-URL tracking.
+        *self.last_url.lock().await = None;
         *mode = Mode::Disconnected;
         Ok(())
     }
@@ -537,6 +571,18 @@ fn final_url_blocked_with(
     check(final_url).map_err(BrowserError::UrlBlocked)
 }
 
+/// FR-007 (feature 035): a navigation request may be skipped iff no reload is
+/// forced AND the requested URL equals the tracked last-executed URL. The
+/// live-tab check is the caller's concern (last_url is cleared on
+/// disconnect, so a live tab is implied when Some).
+pub fn should_skip_navigate(
+    last_url: Option<&str>,
+    requested: &str,
+    reload: bool,
+) -> bool {
+    !reload && last_url == Some(requested)
+}
+
 /// Build the overlay-dismiss probe/click JS for a dismissal label.
 /// The label is embedded as a JSON string literal (serde_json) — Rust
 /// `{:?}` Debug escaping emits sequences like `\u{1}` that are INVALID
@@ -631,6 +677,20 @@ mod tests {
         // Backslashes in the label also survive as valid JS escapes.
         let js2 = overlay_dismiss_js("a\\b");
         assert!(js2.contains("\"a\\\\b\""));
+    }
+
+    #[test]
+    fn should_skip_navigate_truth_table() {
+        // skip iff reload=false AND last_url == Some(requested)
+        assert!(should_skip_navigate(Some("https://a.test/"), "https://a.test/", false));
+        // explicit reload always navigates
+        assert!(!should_skip_navigate(Some("https://a.test/"), "https://a.test/", true));
+        // different URL always navigates
+        assert!(!should_skip_navigate(Some("https://a.test/"), "https://b.test/", false));
+        // nothing tracked yet
+        assert!(!should_skip_navigate(None, "https://a.test/", false));
+        // never skip with no requested URL
+        assert!(!should_skip_navigate(None, "", false));
     }
 }
 

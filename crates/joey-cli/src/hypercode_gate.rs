@@ -464,6 +464,7 @@ impl RiskReviewer for MomusReviewer {
             team: None,
             name: None,
             priority: None,
+            browser_explorer: false,
         };
         let results = self
             .ctx

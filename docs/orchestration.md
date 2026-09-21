@@ -437,3 +437,56 @@ Tests: `tests/governance_admission.rs`, `governance_dedup.rs`,
 
 See also: [features/joey-orchestration.md](features/joey-orchestration.md),
 [state-and-config.md](state-and-config.md) (governance config keys).
+
+## 6. Browser explorer — orchestrator-steered browsing (feature 035)
+
+Feature 035 gives a HyperCode orchestrator **one persistent, manually
+steered browser explorer**: the explorer subagent is the orchestrator's
+eyes and hands — it holds the browser session and the open page across
+every step, takes explicit navigation instructions only, and reports what
+it sees back. This replaces the fresh-subagent-per-step pattern (new
+session + new page per step) with a warm steering loop, targeting ≤ 50%
+of the baseline's completion time. Opt-out via
+`hypercode.browser_explorer.enabled` (default `true`).
+
+Pieces (`crates/joey-orchestration/src/browser_explorer.rs`,
+`control_tool.rs`, `joey-cli/src/hypercode.rs`, `joey-browser/src/session.rs`):
+
+- **`BrowserExplorerRegistry`** — an orchestrator-side singleton enforcing
+  the single-active rule: `designate(child_id, goal)` fails while a
+  designation is active, naming the active child id and goal ("steer it via
+  subagent_control or stop it first"); `clear_if_active(child_id)` fires on
+  every one-way terminal transition (Completed/Failed/Stopped); all state
+  is in-memory, no on-disk format.
+- **Designation** — the orchestrator designates via `delegate_task` with
+  `role: explorer`, `background: true`, `browser_explorer: true`. That
+  child keeps the process-global browser session and its page open across
+  steps; `browser_explorer_wait` is its report channel and keep-alive.
+- **Steering** — instructions flow through `subagent_control` (see
+  [§1](#1-joey-orchestration--subagent-delegation-engine)); the explorer
+  performs exactly the instructed action on the currently open page and
+  never improvises alternatives. Steering a finished explorer returns an
+  explicit already-finished error — never a silent drop. The literal
+  instruction `finish` ends the loop: the explorer emits one final report
+  and completes.
+- **Reporting** — every instructed step produces a `[PAGE-REPORT]` block in
+  the child log (echoed instruction, outcome, `url`, `title`, and a
+  **complete page snapshot**); the orchestrator reads it via
+  `subagent_control action=log` — `[PAGE-REPORT]` blocks pass through
+  unclipped and unprefixed. The orchestrator decides the next instruction
+  ONLY from what the report shows. On failure the report states the error
+  plus a snapshot of the unchanged page.
+- **Page-warmth** — `joey-browser` tracks `last_url` and skips
+  re-navigation when `should_skip_navigate(last_url, requested, reload)`
+  holds (reload=false AND same URL AND a live tab), so the steered page
+  stays warm between instructions.
+
+Tests: `crates/joey-orchestration/tests/browser_explorer.rs`, the
+`page_report_render_tests` in `control_tool.rs`, and the overlay contract
+checks in `joey-cli/src/hypercode.rs` (`browser_explorer_wait`,
+`[PAGE-REPORT]`). Status: partial (T001–T008, T014 of the spec tasks land
+first; steering-loop hardening continues under the feature branch).
+
+See also: [browser.md](browser.md) for the CDP layer underneath, and the
+steering-loop sequence diagram in
+[system-diagrams.md](system-diagrams.md#8-browser-explorer-steering-loop-feature-035).

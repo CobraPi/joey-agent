@@ -77,6 +77,7 @@ async fn context_field_is_passed_to_subagent() {
         team: None,
         name: None,
         priority: None,
+        browser_explorer: false,
     };
 
     let result = mgr

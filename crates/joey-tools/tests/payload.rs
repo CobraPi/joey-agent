@@ -305,3 +305,42 @@ fn browser_cdp_parameters_shape() {
         "Path to a persisted params JSON file; its current content is parsed as the CDP params object."
     );
 }
+
+// ── Feature 035: browser_navigate additive schema (reload/already_open) ───
+
+#[test]
+fn browser_navigate_schema_additive_reload_param() {
+    let h = home();
+    let _ = ctx(&h, "schema");
+    let p = tool("browser_navigate").parameters();
+    // prior surface unchanged: url stays the only required param, same description
+    assert_eq!(p["required"], json!(["url"]));
+    assert_eq!(
+        p["properties"]["url"],
+        json!({ "type": "string", "description": "URL to open in the agent tab." })
+    );
+    // additive: reload, optional boolean defaulting to false
+    assert_eq!(p["properties"]["reload"]["type"], json!("boolean"));
+    assert_eq!(p["properties"]["reload"]["default"], json!(false));
+    assert!(
+        p["properties"]["reload"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("already_open"),
+        "reload description documents the skip behavior"
+    );
+    // exactly two properties — no other silent schema drift
+    assert_eq!(p["properties"].as_object().unwrap().len(), 2);
+}
+
+#[test]
+fn browser_navigate_description_documents_already_open() {
+    let h = home();
+    let _ = ctx(&h, "schema");
+    let t = tool("browser_navigate");
+    let d = t.description();
+    assert!(
+        d.contains("already_open=true exactly when navigation was skipped"),
+        "description: {d}"
+    );
+}
