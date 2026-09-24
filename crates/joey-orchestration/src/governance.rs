@@ -213,12 +213,11 @@ mod governance_config_tests {
 // ---------------------------------------------------------------------------
 
 /// One waiting delegation in the bounded admission queue (feature 030,
-/// FR-001): its priority lane, arrival time for FIFO-within-lane/aging, and
-/// the oneshot that hands the waiter its semaphore permit (paired with its
-/// admission-sequence number for the start gate) when admitted.
+/// FR-001): its priority lane and the oneshot that hands the waiter its
+/// semaphore permit (paired with its admission-sequence number for the
+/// start gate) when admitted. FIFO-within-lane comes from VecDeque order.
 pub(crate) struct QueuedWaiter {
     pub priority: crate::types::Priority,
-    pub enqueued_at: std::time::Instant,
     pub tx: tokio::sync::oneshot::Sender<(
         tokio::sync::OwnedSemaphorePermit,
         u64,
@@ -249,10 +248,6 @@ impl AdmissionQueue {
     /// Total waiters across all lanes.
     pub fn len(&self) -> usize {
         self.lanes.iter().map(|l| l.len()).sum()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Enqueue `w`; false (busy refusal) when the queue is at capacity.
@@ -439,11 +434,7 @@ mod admission_queue_tests {
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (
-            QueuedWaiter {
-                priority,
-                enqueued_at: std::time::Instant::now(),
-                tx,
-            },
+            QueuedWaiter { priority, tx },
             rx,
         )
     }

@@ -432,7 +432,7 @@ impl Subagent {
         // HERE (not inside the iteration) so it stays alive across the whole
         // retried attempt — the run_turn at the top of the next iteration;
         // each retry decision replaces (releases) the previous guard.
-        let mut retry_guard: Option<crate::governance::RetryGuard> = None;
+        let mut _retry_guard: Option<crate::governance::RetryGuard> = None;
         let result: TurnResult = loop {
             // T013: iteration-granular checkpointing. When a checkpoint sink
             // is wired the tapped (forwarder) path is ALWAYS taken — even if
@@ -511,7 +511,7 @@ impl Subagent {
             // FR-005 (feature 030, R3b): system-wide in-flight retry budget.
             // A spent budget fails fast: break with the fatal failure as-is
             // and emit NO further RetryAttempt (no new load).
-            retry_guard = match retry_budget {
+            _retry_guard = match retry_budget {
                 Some(b) => match b.try_acquire() {
                     Some(g) => Some(g),
                     None => break r,

@@ -251,15 +251,15 @@ mod tests {
 
         let db = db_arc.lock().unwrap();
         let sid = db.create_session("test", Some("model"), None).unwrap();
-        let messages = db.messages(&sid).unwrap();
+        let _messages = db.messages(&sid).unwrap();
         // Use a different session that has messages
-        let sessions = vec![sid.clone()];
+        let _sessions = vec![sid.clone()];
         drop(db);
 
         // Get any session ID from the DB
         let db = db_arc.lock().unwrap();
         // Use first session we can find
-        let all_msgs: Vec<_> = (0..20).map(|_| StoredMessage::new(sid.clone(), Role::User, "test")).collect();
+        let _all_msgs: Vec<_> = (0..20).map(|_| StoredMessage::new(sid.clone(), Role::User, "test")).collect();
         drop(db);
 
         // Just verify scroll mode doesn't crash with valid args.

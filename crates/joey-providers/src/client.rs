@@ -1897,7 +1897,7 @@ mod tests {
         // the raw token + pinned base without consulting api_mode.
         let _catalog = crate::copilot::CatalogCacheGuard::seed("gpt-4o");
         std::env::set_var("AI_USAGE_HUD_BASE_URL", "http://10.0.0.5:9000/");
-        let profile = crate::profile::get_profile("ai-usage-hud").unwrap();
+        let _profile = crate::profile::get_profile("ai-usage-hud").unwrap();
         // build_client applies the env override through resolve_base_override.
         let client = crate::build_client("ai-usage-hud", "", "gpt-4o", Some("ghu_test".into()))
             .unwrap();

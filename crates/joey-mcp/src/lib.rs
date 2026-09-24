@@ -1245,8 +1245,8 @@ IFS= read -r line
 "#;
         // connect() itself claims prefixes via the process-global registry,
         // so colliding names are disambiguated at connect time.
-        let mut a = McpClient::connect("my-server", &sh_server(script)).await.expect("connect a");
-        let mut b = McpClient::connect("my_server", &sh_server(script)).await.expect("connect b");
+        let a = McpClient::connect("my-server", &sh_server(script)).await.expect("connect a");
+        let b = McpClient::connect("my_server", &sh_server(script)).await.expect("connect b");
 
         let tools_a = a.list_tools().await.expect("list a");
         let tools_b = b.list_tools().await.expect("list b");

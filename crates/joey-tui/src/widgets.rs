@@ -3226,6 +3226,7 @@ fn fmt_tokens(n: u64) -> String {
 }
 
 /// Truncate a string to `max` chars, appending an ellipsis if cut.
+#[cfg(test)]
 fn truncate_str(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -3239,8 +3240,8 @@ fn truncate_str(s: &str, max: usize) -> String {
 
 /// Truncate a string to at most `max` DISPLAY cells (unicode-width aware),
 /// appending an ellipsis if cut. Double-width glyphs (CJK, emoji) count as
-/// 2 cells. For pure-ASCII input this is identical to `truncate_str`
-/// (char count == cell count), so existing ASCII rendering is unchanged.
+/// 2 cells; pure-ASCII input truncates at exactly `max` chars
+/// (char count == cell count).
 fn truncate_width(s: &str, max: usize) -> String {
     if UnicodeWidthStr::width(s) <= max {
         return s.to_string();

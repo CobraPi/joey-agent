@@ -237,6 +237,7 @@ impl Equalizer {
         self.bars.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.bars.is_empty()
     }

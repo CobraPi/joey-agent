@@ -18,7 +18,6 @@
 //! then a `PATH` scan that rejects the WSL/System32 launcher — and use
 //! the resolved absolute path for every spawn.
 
-use std::path::PathBuf;
 use once_cell::sync::Lazy;
 
 /// Absolute path to the POSIX shell to spawn, resolved once per process

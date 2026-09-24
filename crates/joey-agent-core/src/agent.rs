@@ -7557,7 +7557,7 @@ mod tests {
     /// `neurocode.rag.*` keys under test), sharing caller-provided home +
     /// cwd paths so two agents can be compared byte-for-byte.
     fn rag_agent_at(
-        home: &std::path::Path,
+        _home: &std::path::Path,
         cwd: &std::path::Path,
         config: Config,
         script: Vec<Result<NormalizedResponse, ProviderError>>,
@@ -8677,7 +8677,7 @@ mod tests {
         // fixture() hardcodes Config::defaults(); build the disabled-config
         // variant manually, copying fixture()'s body with a yaml Config.
         let home = tempfile::tempdir().unwrap();
-        let guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
+        let _guard = joey_core::constants::HomeOverrideGuard::new(home.path().to_path_buf());
         let cwd = tempfile::tempdir().unwrap();
         let config_path = home.path().join("config.yaml");
         std::fs::write(

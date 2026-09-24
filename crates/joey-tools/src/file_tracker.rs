@@ -1058,7 +1058,7 @@ mod rayon_diff_tests {
                         ctx_run = 0;
                     }
                 }
-                Some((os, ns, lines)) => {
+                Some((_os, _ns, lines)) => {
                     if is_change {
                         lines.push((e, line));
                         ctx_run = 0;

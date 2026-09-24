@@ -1431,11 +1431,7 @@ impl SubagentManager {
                 }
                 Err(_) => {
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    let waiter = crate::governance::QueuedWaiter {
-                        priority: lane,
-                        enqueued_at: std::time::Instant::now(),
-                        tx,
-                    };
+                    let waiter = crate::governance::QueuedWaiter { priority: lane, tx };
                     let admitted = {
                         let mut q = self.gov_queue.lock().unwrap();
                         q.push(waiter)
@@ -1637,10 +1633,10 @@ impl SubagentManager {
         let mut resume_token: Option<crate::types::ResumeToken> = None;
         // T020: the terminal record's checkpoint — the LAST attempt's sink
         // token (overwritten every iteration, read once after the loop).
-        let mut gov_last_checkpoint: Option<ResumeToken> = None;
+        let mut gov_last_checkpoint: Option<ResumeToken>;
         // Retry-budget guard held across the backoff sleep AND the next
         // attempt (owned guard — see governance.rs RetryGuard).
-        let mut held_guard: Option<crate::governance::RetryGuard> = None;
+        let mut _held_guard: Option<crate::governance::RetryGuard> = None;
         let mut result = loop {
             // T013: iteration-granular checkpoint sink — the subagent's
             // event forwarder replaces the resume token at every completed
@@ -2223,10 +2219,10 @@ impl SubagentManager {
             // in-flight retry budget, spaced by jittered backoff.
             let should_retry = gov_on && !attempt_result.success && retries_used < max_retries;
             if !should_retry {
-                held_guard = None;
+                _held_guard = None;
                 break attempt_result;
             }
-            held_guard = match self.gov_retry_budget.try_acquire() {
+            _held_guard = match self.gov_retry_budget.try_acquire() {
                 Some(g) => Some(g),
                 None => {
                     let mut r = attempt_result;

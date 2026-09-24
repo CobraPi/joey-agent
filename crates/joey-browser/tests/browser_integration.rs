@@ -24,7 +24,7 @@ use joey_browser::BrowserManager;
 
 struct FixtureServers {
     port_a: u16,
-    port_b: u16,
+    _port_b: u16,
 }
 
 fn fixture_dir() -> std::path::PathBuf {
@@ -45,7 +45,7 @@ fn start_servers() -> FixtureServers {
     let (lb, port_b) = bind();
     serve_dir(la, port_b);
     serve_dir(lb, port_b);
-    FixtureServers { port_a, port_b }
+    FixtureServers { port_a, _port_b: port_b }
 }
 
 fn serve_dir(listener: std::net::TcpListener, xport: u16) {
