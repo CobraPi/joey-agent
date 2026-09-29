@@ -19,6 +19,7 @@ sha2.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 joey-browser.workspace = true
+joey-jev.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true

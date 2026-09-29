@@ -77,3 +77,46 @@ only — `--model` always wins).
 Unit/contract tests are browserless (canned CDP JSON, mock element sets,
 fixture DOM dumps). Live-browser integration tests auto-skip when no
 Chromium is found, so `cargo test --workspace` is green everywhere.
+
+## Local decision acceleration (feature 036)
+
+Four recurring judgment calls of the browsing loop route to the user's
+local Jev typed-decision service (loopback HTTP, `choice`/`score`
+questions with calibrated confidence, no text generation). The client
+lives in the leaf crate `joey-jev`; every decision falls back to existing
+behavior on error, timeout, or low confidence. Fully disabled or
+unreachable reproduces pre-feature behavior byte-identically.
+
+Decision points:
+
+| Point | Seam | Question | Confidence gate |
+|---|---|---|---|
+| Target resolution | ambiguous cascade failure in `refs.rs` → `ResolvedBy::JevChoice` | choice among ≤12 candidates | `jev.min_confidence` (0.70) |
+| Settle early exit | `wait_settle_step(ReadOnly)` in `actions.rs` | settled / still_churning | `jev.settle.min_confidence` (0.80) |
+| Snapshot trimming | `structural_snapshot_with_jev` in `snapshot.rs` | batched 4-level relevance scores | `jev.min_confidence` (0.70) |
+| Outcome verdicts | mutating tool results in `browser_tools.rs` → additive `verdict` key | achieved / not_achieved | `jev.min_confidence` (0.70) |
+
+Consequential actions (form submit, purchase, delete, post — heuristic
+classifier, fails toward consequential) never exit settle waits early.
+Salience trimming engages only when a session goal exists
+(`browser_snapshot` `goal` parameter) AND the page exceeds the step
+budget; entries scored ≥ "relevant" are retained; the byte budget is
+never exceeded.
+
+Config (additive dotted keys, inline defaults):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `jev.base_url` | `http://127.0.0.1:8765` | service endpoint |
+| `jev.api_key` | `local` | Bearer key |
+| `jev.model` | `jev-latest` | model alias |
+| `jev.request_timeout_ms` | `1500` | per-request cap before fallback |
+| `jev.probe_ttl_secs` | `30` | positive availability cache TTL |
+| `jev.min_confidence` | `0.70` | global confidence gate |
+| `jev.settle.min_confidence` | `0.80` | stricter gate for settle |
+| `jev.<point>.enabled` ×4 | `true` | per-point toggles (`target_resolution`, `settle`, `trim`, `verdict`) |
+
+Observability: every delegated decision (fallbacks included) appends one
+row to `~/.joey/logs/jev-decisions.jsonl` — `ts`, `point`,
+`question_kind`, `answer`, `confidence`, `latency_ms`, `fallback_used`
+(+ `error` when fallbacked).

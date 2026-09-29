@@ -510,6 +510,68 @@ async fn never_settle_bounded() {
 }
 
 #[tokio::test]
+async fn settle_early_exit_read_only_and_consequential_timing() {
+    if !chromium_available() {
+        eprintln!("SKIP: no Chromium found");
+        return;
+    }
+    use joey_browser::actions::SettleStep;
+    use joey_jev::{self as jev, FixtureTransport, JevConfig};
+    use std::sync::Arc;
+
+    let servers = start_servers();
+    let m = BrowserManager::connect(headless_cfg()).await.expect("connect");
+    // A static page (no churn): quiesce gate (quiet/4 = 75ms) hits fast.
+    m.navigate(&url_for(&servers, "login-then-dom.html")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Decider always answers settled at 0.9 (fixture).
+    let fx = Arc::new(FixtureTransport::new(true));
+    let mut answers = serde_json::Map::new();
+    answers.insert(
+        "settle".into(),
+        serde_json::json!({
+            "type": "choice", "choice": "settled", "confidence": 0.9,
+            "probabilities": {"settled": 0.9, "still_churning": 0.1}
+        }),
+    );
+    fx.push(Ok(jev::SystemOneResponse {
+        model: "m".into(),
+        answers,
+        usage: Default::default(),
+    }));
+    let decider = jev::JevDecider::new(
+        JevConfig {
+            log_dir: Some(std::env::temp_dir().join(format!("joey-us2-{}", std::process::id()))),
+            ..JevConfig::default()
+        },
+        fx.clone(),
+    );
+    m.set_jev_decider(Some(Arc::new(decider))).await;
+
+    // Read-only step: early exit well before the full 300ms quiet window.
+    let t0 = std::time::Instant::now();
+    let waited = m.wait_settle_step(SettleStep::ReadOnly).await.expect("readonly settle");
+    let early = t0.elapsed();
+    assert_eq!(fx.ask_calls(), 1, "read-only step consults Jev once");
+    assert!(
+        early < Duration::from_millis(280),
+        "early exit must beat the quiet window (took {early:?}, waited {waited}ms)"
+    );
+
+    // Consequential step on the same quiesced page: full quiet window, no ask.
+    let t1 = std::time::Instant::now();
+    m.wait_settle_step(SettleStep::Consequential).await.expect("consequential settle");
+    let full = t1.elapsed();
+    assert_eq!(fx.ask_calls(), 1, "consequential step never consults Jev");
+    assert!(
+        full >= Duration::from_millis(280),
+        "consequential waits the full quiet window (took {full:?})"
+    );
+    m.disconnect_arc().await.unwrap();
+}
+
+#[tokio::test]
 async fn visual_fallback_engages_on_canvas() {
     if !chromium_available() {
         eprintln!("SKIP: no Chromium found");

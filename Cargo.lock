@@ -2692,6 +2692,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "joey-core",
+ "joey-jev",
  "reqwest",
  "serde",
  "serde_json",
@@ -2837,6 +2838,22 @@ dependencies = [
  "async-trait",
  "chrono",
  "joey-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "joey-jev"
+version = "0.19.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "joey-core",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
@@ -3080,6 +3097,7 @@ dependencies = [
  "joey-compute",
  "joey-copilot",
  "joey-core",
+ "joey-jev",
  "libc",
  "once_cell",
  "os_pipe",

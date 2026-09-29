@@ -33,7 +33,7 @@ config committed — run `cargo build --workspace` and `cargo test
 
 ## Workspace layout
 
-Cargo workspace, 17 member crates under `crates/`, dependency graph is a
+Cargo workspace, 19 member crates under `crates/`, dependency graph is a
 strict DAG (lower crates never depend on higher ones):
 
 | Crate | Role |
@@ -55,6 +55,8 @@ strict DAG (lower crates never depend on higher ones):
 | `joey-neurocode-rag` | local-first semantic RAG over the NeuroCode code graph (embeddings, hybrid search, consent) |
 | `joey-copilot` | GitHub Copilot `.github/` bundle discovery and plugin manifest generation |
 | `joey-speckit-ui` | visual UI over spec-kit artifacts (`.specify/` specs/plans/tasks); reads/writes those files as the source of truth, never diverges into UI-only state |
+| `joey-compute` | CPU-bound work execution substrate: dedicated OS worker threads, EDF scheduling, admission/backpressure, panic isolation (feature 033) |
+| `joey-jev` | client for the local Jev decision service: System One wire types, availability probe/cache, confidence gates, JSONL decision log; accelerates four browser-loop decision points (feature 036) |
 
 `joey-orchestration` and `joey-omo` are orchestration layers built on top of
 `joey-agent-core`; all crates are covered by `docs/architecture.md` and the

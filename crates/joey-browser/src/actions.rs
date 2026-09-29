@@ -146,29 +146,54 @@ pub(crate) fn doc_to_viewport_coords(
 impl BrowserManager {
     /// The pre-action pipeline: re-scan (fresh registry), resolve the
     /// descriptor through the cascade, then execute the verb (FR-005).
+    ///
+    /// Feature 036 (decision point 1): an ambiguous cascade failure is
+    /// first offered to the local Jev decider; a confident pick proceeds
+    /// as `JevChoice`, everything else keeps today's refusal byte-identically.
     async fn resolve_fresh(
         &self,
         target: &TargetDescriptor,
     ) -> Result<(ElementRefRegistry, crate::refs::ElementRef, ResolvedBy), BrowserError> {
         let registry = self.scan_to_registry().await?;
-        let resolved = {
-            let r = registry
-            .resolve(target)
-            .map_err(|e| match e {
-                crate::refs::ResolutionFailure::Ambiguous(c) => {
-                    BrowserError::ambiguous(&c)
-                }
-                crate::refs::ResolutionFailure::Empty => {
-                    BrowserError::Protocol("empty target descriptor".into())
-                }
-                crate::refs::ResolutionFailure::TargetGone => {
-                    BrowserError::target_not_found(&["element no longer resolvable after re-render".into()])
-                }
-            })?;
-            (r.0.clone(), r.1)
+        let (el, by) = match registry.resolve(target) {
+            Ok((el, by)) => (el.clone(), by),
+            Err(crate::refs::ResolutionFailure::Ambiguous(c)) => match self
+                .jev_pick(&registry, target, &c)
+                .await
+            {
+                Some(el) => (el, ResolvedBy::JevChoice),
+                None => return Err(BrowserError::ambiguous(&c)),
+            },
+            Err(crate::refs::ResolutionFailure::Empty) => {
+                return Err(BrowserError::Protocol("empty target descriptor".into()))
+            }
+            Err(crate::refs::ResolutionFailure::TargetGone) => {
+                return Err(BrowserError::target_not_found(&[
+                    "element no longer resolvable after re-render".into()
+                ]))
+            }
         };
-        let el = resolved.0;
-        Ok((registry, el, resolved.1))
+        Ok((registry, el, by))
+    }
+
+    /// Ask the local decider to disambiguate; None → existing refusal.
+    async fn jev_pick(
+        &self,
+        registry: &ElementRefRegistry,
+        target: &TargetDescriptor,
+        candidates: &[String],
+    ) -> Option<crate::refs::ElementRef> {
+        let decider = self.jev().await?;
+        let instruction = target
+            .text
+            .as_deref()
+            .or(target.locator.as_deref())
+            .or(target.refid.as_deref())?;
+        let title = self.eval_string("document.title").await.unwrap_or_default();
+        let url = self.eval_string("location.href").await.unwrap_or_default();
+        let key = crate::refs::jev_resolve_ambiguous(&decider, instruction, &title, &url, candidates)
+            .await?;
+        registry.get(&key).cloned()
     }
 
     /// Scan the page and build a fresh registry (refids reset per scan).
@@ -442,7 +467,27 @@ impl BrowserManager {
     }
 
     /// Wait for settle (quiet window) — bounded by hard timeout.
+    /// Consequential default (research R7: fails toward consequential).
     pub async fn wait_settle(&self) -> Result<u64, BrowserError> {
+        self.wait_settle_step(SettleStep::Consequential).await
+    }
+
+    /// Settle wait with the Jev early-exit path (decision point 2).
+    ///
+    /// Read-only steps: once the DOM has been candidate-quiesce quiet for
+    /// `quiet_ms / 4`, one local `settled` decision at ≥
+    /// `jev.settle.min_confidence` (0.80) ends the wait early. Anything
+    /// else — consequential step, no decider, low confidence, tie, service
+    /// down — falls through to the existing full quiet window + hard cap,
+    /// timing unchanged (contracts/decision-points.md §2).
+    pub async fn wait_settle_step(&self, step: SettleStep) -> Result<u64, BrowserError> {
+        if step == SettleStep::ReadOnly {
+            if let Some(decider) = self.jev().await {
+                if let Some(waited) = self.settle_early_exit(&decider).await {
+                    return Ok(waited);
+                }
+            }
+        }
         let expr = crate::extract::OBSERVER_JS.replace("%QUIET_MS%", &self.config.quiet_window.as_millis().to_string());
         self.evaluate(&expr).await?;
         // Await the installed promise, bounded by hard timeout.
@@ -454,6 +499,94 @@ impl BrowserManager {
             Err(_) => Err(BrowserError::SettleTimeout { waited_ms: self.config.hard_timeout.as_millis() as u64 }),
         }
     }
+
+    /// Candidate-quiesce poll → one settle decision → early exit.
+    /// `None` → caller runs the legacy full window.
+    async fn settle_early_exit(&self, decider: &joey_jev::JevDecider) -> Option<u64> {
+        // ponytail: quiet/4 quiesce gate — the tunable is the divisor;
+        // make it a config key (jev.settle.quiesce_divisor) if pages flap.
+        let quiesce_ms = self.config.quiet_window.as_millis() / 4;
+        let expr = crate::extract::OBSERVER_JS.replace("%QUIET_MS%", &quiesce_ms.to_string());
+        self.evaluate(&expr).await.ok()?;
+        let started = std::time::Instant::now();
+        let quiesced = tokio::time::timeout(self.config.hard_timeout, self.evaluate("window.__joeySettle"))
+            .await
+            .ok()?
+            .ok()?;
+        if quiesced["settled"].as_bool() != Some(true) {
+            return None; // hard cap hit at quiesce granularity → legacy window
+        }
+        // Mutation summary + content digest of the current DOM (data only).
+        let digest = self
+            .evaluate("({ title: document.title, url: location.href, len: document.body ? document.body.innerText.length : 0 })")
+            .await
+            .ok()?;
+        let content_digest = format!(
+            "title={} url={} text_len={}",
+            digest["title"].as_str().unwrap_or(""),
+            digest["url"].as_str().unwrap_or(""),
+            digest["len"].as_u64().unwrap_or(0)
+        );
+        let mutation_summary = format!("dom quiet for {quiesce_ms}ms");
+        let req = joey_jev::settle(&mutation_summary, &content_digest);
+        match decider.decide(joey_jev::DecisionPoint::Settle, req).await {
+            joey_jev::Decision::Confident(joey_jev::Answer::Choice { key, .. })
+                if key == "settled" =>
+            {
+                Some(started.elapsed().as_millis() as u64)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Step classification for the settle early-exit gate (US2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleStep {
+    /// Navigation/observation style steps — early exit allowed.
+    ReadOnly,
+    /// Mutating steps — always the full quiet window + hard cap.
+    Consequential,
+}
+
+/// Consequential-step classifier (US2, research R7). Role/text/form-action
+/// heuristics over the acted element; FAILS TOWARD CONSEQUENTIAL — any
+/// uncertainty (unknown action, missing element, unknown role) waits the
+/// full window.
+// ponytail: heuristic verb/text list — ceiling: exotic consequential verbs
+// (e.g. "zap", bespoke role attributes) misclassified read-only; upgrade
+// path: pluggable classifier behind this same fn.
+pub fn is_consequential(action: &str, element: Option<&crate::refs::ElementRef>) -> bool {
+    let act = action.trim().to_ascii_lowercase();
+    match act.as_str() {
+        // Navigation/observation verbs are read-only by kind.
+        "navigate" | "back" | "scroll" | "hover" | "snapshot" | "vision" | "console"
+        | "get_images" | "dialog" => return false,
+        // Everything else (click, type, select_option, press, drag, and any
+        // unknown verb) starts consequential.
+        _ => {}
+    }
+    let Some(el) = element else { return true };
+    let text = crate::refs::normalize_text(&el.text).to_ascii_lowercase();
+    let role = el.role.to_ascii_lowercase();
+    // Form/action heuristics on role and visible text.
+    let consequential_hints = [
+        "submit", "sign in", "signin", "log in", "login", "purchase", "buy", "checkout",
+        "pay", "delete", "remove", "confirm", "order", "place order", "post", "publish",
+        "send", "apply", "save", "book", "reserve", "subscribe", "follow", "vote",
+        "accept", "agree", "upgrade", "install", "download", "reset",
+    ];
+    if consequential_hints.iter().any(|h| text.contains(h)) {
+        return true;
+    }
+    if role.contains("option") || el.attributes.get("type").map(|t| t == "submit").unwrap_or(false) {
+        return true;
+    }
+    // A plain link click navigates (read-only in the remote-state sense).
+    if act == "click" && (role == "link" || role == "a") {
+        return false;
+    }
+    true // uncertain → consequential
 }
 
 #[cfg(test)]

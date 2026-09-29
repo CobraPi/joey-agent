@@ -64,6 +64,20 @@ pub struct BrowserManager {
     /// Ephemeral profile dir of the managed launch (None when attached);
     /// removed on disconnect.
     managed_user_data_dir: Option<std::path::PathBuf>,
+    /// Local-decision decider (feature 036): lazily constructed on first
+    /// use from the user's config; `None` when all `jev.*` points are
+    /// disabled (zero footprint, SC-005). Injectable for tests.
+    jev: tokio::sync::Mutex<JevSlot>,
+    /// Session-held browsing goal for salience trimming (decision point 3);
+    /// set by goal-bearing tool calls, cleared on disconnect.
+    current_objective: tokio::sync::Mutex<Option<String>>,
+}
+
+/// Laziness state of the decider slot.
+enum JevSlot {
+    Uninit,
+    Disabled,
+    Active(Arc<joey_jev::JevDecider>),
 }
 
 impl BrowserManager {
@@ -83,6 +97,8 @@ impl BrowserManager {
                 config: cfg,
                 managed_child: Mutex::new(None),
                 managed_user_data_dir: None,
+                jev: tokio::sync::Mutex::new(JevSlot::Uninit),
+                current_objective: tokio::sync::Mutex::new(None),
             };
             return Ok(Arc::new(mgr));
         }
@@ -100,8 +116,10 @@ impl BrowserManager {
             page: Mutex::new(None),
             last_url: Mutex::new(None),
             config: cfg,
+            managed_user_data_dir: Some(managed.user_data_dir.clone()),
             managed_child: Mutex::new(Some(managed.child)),
-            managed_user_data_dir: Some(managed.user_data_dir),
+            jev: tokio::sync::Mutex::new(JevSlot::Uninit),
+            current_objective: tokio::sync::Mutex::new(None),
         };
         // Managed hygiene: the freshly-launched browser opens an initial tab
         // of its own. Create OUR agent tab first (the browser must never
@@ -161,6 +179,50 @@ impl BrowserManager {
 
     pub(crate) fn conn(&self) -> Result<&Arc<CdpConnection>, BrowserError> {
         self.conn.as_ref().ok_or(BrowserError::NotConnected)
+    }
+
+    /// The session's local-decision decider, lazily constructed from the
+    /// user's config on first use (feature 036). `None` when all four
+    /// `jev.*` points are disabled — zero network, zero code paths.
+    pub async fn jev(&self) -> Option<Arc<joey_jev::JevDecider>> {
+        let mut slot = self.jev.lock().await;
+        match &*slot {
+            JevSlot::Active(d) => return Some(d.clone()),
+            JevSlot::Disabled => return None,
+            JevSlot::Uninit => {}
+        }
+        let built = joey_jev::JevDecider::from_disk();
+        match built {
+            Some(d) => {
+                let d = Arc::new(d);
+                *slot = JevSlot::Active(d.clone());
+                Some(d)
+            }
+            None => {
+                *slot = JevSlot::Disabled;
+                None
+            }
+        }
+    }
+
+    /// Test/wiring override for the decider slot.
+    pub async fn set_jev_decider(&self, d: Option<Arc<joey_jev::JevDecider>>) {
+        let mut slot = self.jev.lock().await;
+        *slot = match d {
+            Some(d) => JevSlot::Active(d),
+            None => JevSlot::Disabled,
+        };
+    }
+
+    /// Set the session-held browsing goal (salience trimming input,
+    /// decision point 3). Cleared on disconnect.
+    pub async fn set_current_objective(&self, goal: Option<String>) {
+        *self.current_objective.lock().await = goal;
+    }
+
+    /// The session-held browsing goal, if any.
+    pub async fn current_objective(&self) -> Option<String> {
+        self.current_objective.lock().await.clone()
     }
 
     /// Ensure the agent's dedicated tab exists; idempotent; exactly one.
@@ -426,6 +488,8 @@ impl BrowserManager {
         *self.page.lock().await = None;
         // FR-007 (feature 035): no page → no last-URL tracking.
         *self.last_url.lock().await = None;
+        // No page → no session-held browsing goal (decision point 3).
+        *self.current_objective.lock().await = None;
         *mode = Mode::Disconnected;
         Ok(())
     }
@@ -475,18 +539,42 @@ impl BrowserManager {
     }
 
     /// Full structural snapshot of the agent page (viewport-priority).
+    /// Jev salience trimming (decision point 3) engages only when a decider
+    /// AND a session-held browsing goal exist AND the budget would drop
+    /// bytes anyway — otherwise byte-identical legacy trimming.
     pub async fn snapshot(&self) -> Result<crate::snapshot::Snapshot, BrowserError> {
         let registry = self.scan_to_registry().await?;
-        Ok(crate::snapshot::structural_snapshot(
-            self.eval_string("location.href").await?,
-            self.eval_string("document.title").await?,
-            self.frame_count().await?,
-            self.viewport().await?,
+        let url = self.eval_string("location.href").await?;
+        let title = self.eval_string("document.title").await?;
+        let frame_count = self.frame_count().await?;
+        let viewport = self.viewport().await?;
+        let decider = self.jev().await;
+        let objective = self.current_objective().await;
+        let trim = match (&decider, objective.as_deref()) {
+            (Some(d), Some(goal)) => {
+                Some(crate::snapshot::SalienceCtx { decider: d, goal })
+            }
+            _ => None,
+        };
+        Ok(crate::snapshot::structural_snapshot_with_jev(
+            url,
+            title,
+            frame_count,
+            viewport,
             registry.elements,
             Vec::new(),
             &self.config.budgets,
             self.config.budgets.viewport_margin,
-        ))
+            trim,
+        ).await)
+    }
+
+    /// Compact pre/post-action page state digest for verdict questions
+    /// (decision point 4). Best-effort: empty strings when evaluation fails.
+    pub async fn page_digest(&self) -> String {
+        let title = self.eval_string("document.title").await.unwrap_or_default();
+        let url = self.eval_string("location.href").await.unwrap_or_default();
+        format!("title={title} url={url}")
     }
 
     /// Detect + handle blocking overlays per the configured policy

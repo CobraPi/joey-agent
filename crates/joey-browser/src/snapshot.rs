@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::SnapshotBudgets;
+pub use crate::config::SnapshotBudgets;
 use crate::refs::{ElementRef, Rect};
 
 /// Observation mode (FR-014: explicit in every snapshot).
@@ -171,32 +171,60 @@ impl Snapshot {
     /// Enforce the per-step byte budget on serialized elements: drop the
     /// least-recently-relevant (farthest below) elements to summary form.
     /// Never silent: truncation info always records the reason + omitted.
+    ///
+    /// Feature 036 (decision point 3): when a salience `plan` is supplied,
+    /// entries the Jev path scored below the keep threshold drop FIRST
+    /// (lowest score first); entries scored ≥ threshold are never dropped
+    /// BY THE JEV PATH. Once low scorers are exhausted (or with no plan),
+    /// the legacy bottom-most order governs — budgets are never exceeded.
     pub fn enforce_step_budget(
         elements: Vec<ElementRef>,
         out_of_view: &mut Vec<RegionSummary>,
         budgets: &SnapshotBudgets,
+        plan: Option<&TrimPlan>,
     ) -> (Vec<ElementRef>, TruncationInfo) {
         let serialized_len = |els: &[ElementRef]| -> usize {
             serde_json::to_string(els).map(|s| s.len()).unwrap_or(0)
         };
         let mut kept = elements;
         let mut omitted = 0usize;
+        // Jev priority pass: lowest-score indices drop first (index set
+        // shrinks as elements are removed, so track live positions).
+        let mut drop_first: std::collections::BTreeSet<usize> = plan
+            .map(|p| p.drop_first.iter().copied().collect())
+            .unwrap_or_default();
+        let retain: std::collections::HashSet<usize> =
+            plan.map(|p| p.retain.iter().copied().collect()).unwrap_or_default();
         while serialized_len(&kept) > budgets.max_step_bytes && kept.len() > 1 {
-            // Drop the bottom-most element (farthest from viewport top).
-            if let Some(idx) = kept
+            // Next Jev-priority index still present, else the bottom-most
+            // element (farthest from viewport top) — legacy order.
+            let priority_idx = drop_first
                 .iter()
-                .enumerate()
-                .max_by(|a, b| {
-                    a.1.geometry
-                        .y
-                        .partial_cmp(&b.1.geometry.y)
-                        // NaN rects (CSS calc/transform edge cases) must not
-                        // panic the scan/action path — stable, total fallback.
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(i, _)| i)
-            {
+                .find(|&&i| i < kept.len() && !retain.contains(&i))
+                .copied();
+            let idx = match priority_idx {
+                Some(i) => {
+                    drop_first.remove(&i);
+                    Some(i)
+                }
+                None => kept
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !retain.contains(i) || drop_first.is_empty())
+                    .max_by(|a, b| {
+                        a.1.geometry
+                            .y
+                            .partial_cmp(&b.1.geometry.y)
+                            // NaN rects (CSS calc/transform edge cases) must not
+                            // panic the scan/action path — stable, total fallback.
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(i, _)| i),
+            };
+            if let Some(idx) = idx {
                 let dropped = kept.remove(idx);
+                // Positions after the removal shift down.
+                drop_first = drop_first.into_iter().map(|i| if i > idx { i - 1 } else { i }).collect();
                 omitted += 1;
                 // Fold into the "below" summary.
                 let needs_below = !out_of_view.iter().any(|r| r.region == "below");
@@ -213,6 +241,8 @@ impl Snapshot {
                     .find(|r| r.region == "below")
                     .expect("just pushed");
                 *entry.counts.entry(dropped.role.clone()).or_insert(0) += 1;
+            } else {
+                break; // only retained entries left — budget overridden by relevance
             }
         }
         let applied = omitted > 0;
@@ -298,6 +328,84 @@ impl Snapshot {
     }
 }
 
+/// Precomputed salience trim plan (decision point 3): indices into the
+/// LISTED element vector.
+#[derive(Debug, Clone, Default)]
+pub struct TrimPlan {
+    /// Below-keep-threshold indices, LOWEST score first (drop order).
+    pub drop_first: Vec<usize>,
+    /// ≥ keep-threshold indices — never dropped by the Jev pass.
+    pub retain: std::collections::HashSet<usize>,
+}
+
+// ponytail: cap scored entries at 32 — one request, ≤32 score questions;
+// larger pages fall back to legacy order for the unscored tail.
+const SALIENCE_MAX_ENTRIES: usize = 32;
+
+/// Ask the local decider for relevance scores of the at-risk (listed)
+/// entries against the browsing goal; `None` on any fallback → caller
+/// trims with today's byte-cap order (contracts/decision-points.md §3).
+/// Only called where bytes would be dropped anyway.
+pub async fn plan_salience_trim(
+    decider: &joey_jev::JevDecider,
+    goal: &str,
+    page_title: &str,
+    url: &str,
+    listed: &[ElementRef],
+) -> Option<TrimPlan> {
+    let scored: Vec<(usize, &ElementRef)> = listed
+        .iter()
+        .enumerate()
+        .take(SALIENCE_MAX_ENTRIES)
+        .collect();
+    if scored.is_empty() {
+        return None;
+    }
+    let entries: Vec<(String, String)> = scored
+        .iter()
+        .map(|(i, e)| {
+            (
+                format!("e{}", i + 1),
+                format!("{} \"{}\"", e.role, crate::refs::truncate_char_safe(&e.text, 60)),
+            )
+        })
+        .collect();
+    let req = joey_jev::snapshot_trim(goal, page_title, url, &entries);
+    let scores = match decider
+        .decide(joey_jev::DecisionPoint::SnapshotTrim, req)
+        .await
+    {
+        joey_jev::Decision::Confident(joey_jev::Answer::Scores { entries }) => entries,
+        _ => return None,
+    };
+    let mut plan = TrimPlan::default();
+    let mut scored_pairs: Vec<(usize, u32)> = Vec::with_capacity(scores.len());
+    for s in &scores {
+        // Question names are e<index+1>; ignore anything unexpected.
+        let idx = s.question.strip_prefix('e').and_then(|n| n.parse::<usize>().ok());
+        if let Some(one_based) = idx {
+            let i = one_based.checked_sub(1)?;
+            if i >= listed.len() {
+                continue;
+            }
+            scored_pairs.push((i, s.score));
+        }
+    }
+    if scored_pairs.is_empty() {
+        return None;
+    }
+    let mut by_score = scored_pairs.clone();
+    by_score.sort_by(|a, b| a.1.cmp(&b.1));
+    for (i, score) in &by_score {
+        if *score >= joey_jev::SALIENCE_KEEP_THRESHOLD {
+            plan.retain.insert(*i);
+        } else {
+            plan.drop_first.push(*i);
+        }
+    }
+    Some(plan)
+}
+
 /// Convenience constructor used by the scan pipeline.
 pub fn structural_snapshot(
     url: String,
@@ -312,7 +420,7 @@ pub fn structural_snapshot(
     let (listed, out) = Self0::partition(elements, viewport, margin);
     let mut out_of_view = Snapshot::summarize_out_of_view(&out, viewport);
     let (elements, truncation) =
-        Snapshot::enforce_step_budget(listed, &mut out_of_view, budgets);
+        Snapshot::enforce_step_budget(listed, &mut out_of_view, budgets, None);
     Snapshot {
         v: 1,
         mode: ObsMode::Structural,
@@ -327,6 +435,57 @@ pub fn structural_snapshot(
         visual: None,
         truncation,
     }
+}
+
+/// Async Jev-path wrapper around [`structural_snapshot`] (decision
+/// point 3): plans the salience trim ONLY where listed bytes exceed the
+/// step budget (bytes would drop anyway), needs BOTH a decider and a
+/// session-held browsing goal, and falls back to the legacy byte-cap
+/// order on any miss — output shape and budget invariant unchanged.
+pub async fn structural_snapshot_with_jev(
+    url: String,
+    title: String,
+    frame_count: usize,
+    viewport: Viewport,
+    elements: Vec<ElementRef>,
+    blockers: Vec<Blocker>,
+    budgets: &SnapshotBudgets,
+    margin: f64,
+    trim: Option<SalienceCtx<'_>>,
+) -> Snapshot {
+    let (listed, out) = Snapshot::partition_viewport(elements, viewport, margin);
+    let plan = match &trim {
+        Some(ctx)
+            if serde_json::to_string(&listed).map(|s| s.len()).unwrap_or(0)
+                > budgets.max_step_bytes =>
+        {
+            plan_salience_trim(ctx.decider, ctx.goal, &title, &url, &listed).await
+        }
+        _ => None,
+    };
+    let mut out_of_view = Snapshot::summarize_out_of_view(&out, viewport);
+    let (elements, truncation) =
+        Snapshot::enforce_step_budget(listed, &mut out_of_view, budgets, plan.as_ref());
+    Snapshot {
+        v: 1,
+        mode: ObsMode::Structural,
+        url,
+        title,
+        frame_count,
+        viewport,
+        elements,
+        out_of_view,
+        blockers,
+        delta: None,
+        visual: None,
+        truncation,
+    }
+}
+
+/// Inputs the salience trim needs from the session.
+pub struct SalienceCtx<'a> {
+    pub decider: &'a joey_jev::JevDecider,
+    pub goal: &'a str,
 }
 
 /// Internal helper so structural_snapshot can call partition without a Self.
@@ -399,7 +558,7 @@ mod tests {
             .collect();
         let mut oov = Vec::new();
         let tiny = SnapshotBudgets { max_step_bytes: 2048, ..budgets() };
-        let (kept, trunc) = Snapshot::enforce_step_budget(many, &mut oov, &tiny);
+        let (kept, trunc) = Snapshot::enforce_step_budget(many, &mut oov, &tiny, None);
         assert!(kept.len() < 200);
         assert!(trunc.applied);
         assert_eq!(trunc.reason.as_deref(), Some("step_budget"));

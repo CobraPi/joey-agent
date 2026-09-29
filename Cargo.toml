@@ -19,6 +19,7 @@ members = [
     "crates/joey-neurocode",
     "crates/joey-neurocode-rag",
     "crates/joey-copilot",
+    "crates/joey-jev",
 ]
 
 [workspace.package]
@@ -46,6 +47,7 @@ joey-neurocode = { path = "crates/joey-neurocode" }
 joey-neurocode-rag = { path = "crates/joey-neurocode-rag" }
 joey-copilot = { path = "crates/joey-copilot" }
 joey-speckit-ui = { path = "crates/joey-speckit-ui" }
+joey-jev = { path = "crates/joey-jev" }
 
 # NeuroCode (feature 015): deterministic multi-language AST parsing (FR-006).
 # Originally Java-only (specs/015, ~270KB); generalized to a language registry
@@ -99,6 +101,7 @@ os_pipe = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 reedline = "0.40"
 nu-ansi-term = "0.50"
+parking_lot = "0.12"
 crossterm = "0.28"
 pulldown-cmark = "0.12"
 terminal_size = "0.4"

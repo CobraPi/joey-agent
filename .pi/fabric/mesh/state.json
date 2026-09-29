@@ -1,0 +1,117 @@
+{
+  "format": 1,
+  "entries": {
+    "topology/peer-seq": {
+      "key": "topology/peer-seq",
+      "value": {
+        "format": 1,
+        "next": 1
+      },
+      "version": 1,
+      "updatedAt": 1790218149947,
+      "updatedBy": {
+        "id": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "name": "main",
+        "kind": "main",
+        "sessionId": "01a0d14f-d172-7557-95b7-b3bb00b4e2df"
+      }
+    },
+    "sessions/01a0d14f-d172-7557-95b7-b3bb00b4e2df": {
+      "key": "sessions/01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+      "value": {
+        "id": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "name": "JA-1",
+        "label": "JA-1",
+        "kind": "peer",
+        "status": "idle",
+        "runner": "pi",
+        "transport": "host",
+        "cwd": "/Users/jo110366/Development/joey-agent",
+        "sessionId": "01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "model": "zai/glm-5.3",
+        "thinking": "max",
+        "startedAt": 1790218149938,
+        "updatedAt": 1790230250770,
+        "pendingMessages": false,
+        "local": false
+      },
+      "version": 2599,
+      "updatedAt": 1790230250770,
+      "updatedBy": {
+        "id": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "name": "main",
+        "kind": "main",
+        "sessionId": "01a0d14f-d172-7557-95b7-b3bb00b4e2df"
+      }
+    },
+    "topology/participants/d83a3807b0de15c3bb5560142ecafaaa3ba1269a6c84f426f7bb0b68ebd2ee8b": {
+      "key": "topology/participants/d83a3807b0de15c3bb5560142ecafaaa3ba1269a6c84f426f7bb0b68ebd2ee8b",
+      "value": {
+        "format": 1,
+        "id": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "kind": "root",
+        "rootId": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "ownerHostId": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "ownerIdentityId": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "name": "main",
+        "status": "idle",
+        "runner": "pi",
+        "transport": "host",
+        "capabilities": [
+          "steer",
+          "followUp",
+          "fabric"
+        ],
+        "cwd": "/Users/jo110366/Development/joey-agent",
+        "sessionId": "01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "model": "zai/glm-5.3",
+        "thinking": "max",
+        "startedAt": 1790218149938,
+        "updatedAt": 1790230250770,
+        "pendingMessages": false,
+        "controlProtocol": "v1",
+        "label": "JA-1"
+      },
+      "version": 2599,
+      "updatedAt": 1790230250772,
+      "updatedBy": {
+        "id": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "name": "main",
+        "kind": "main",
+        "sessionId": "01a0d14f-d172-7557-95b7-b3bb00b4e2df"
+      }
+    },
+    "topology/hosts/d83a3807b0de15c3bb5560142ecafaaa3ba1269a6c84f426f7bb0b68ebd2ee8b": {
+      "key": "topology/hosts/d83a3807b0de15c3bb5560142ecafaaa3ba1269a6c84f426f7bb0b68ebd2ee8b",
+      "value": {
+        "format": 1,
+        "id": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "rootId": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "identity": {
+          "id": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+          "name": "main",
+          "kind": "main",
+          "sessionId": "01a0d14f-d172-7557-95b7-b3bb00b4e2df"
+        },
+        "startedAt": 1790218149939,
+        "updatedAt": 1790230250772,
+        "expiresAt": 1790230265772
+      },
+      "version": 2599,
+      "updatedAt": 1790230250773,
+      "updatedBy": {
+        "id": "session:01a0d14f-d172-7557-95b7-b3bb00b4e2df",
+        "name": "main",
+        "kind": "main",
+        "sessionId": "01a0d14f-d172-7557-95b7-b3bb00b4e2df"
+      }
+    }
+  },
+  "versions": {
+    "topology/peer-seq": 1,
+    "sessions/01a0d14f-d172-7557-95b7-b3bb00b4e2df": 2599,
+    "topology/participants/d83a3807b0de15c3bb5560142ecafaaa3ba1269a6c84f426f7bb0b68ebd2ee8b": 2599,
+    "topology/hosts/d83a3807b0de15c3bb5560142ecafaaa3ba1269a6c84f426f7bb0b68ebd2ee8b": 2599
+  },
+  "tombstoneOrder": []
+}

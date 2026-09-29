@@ -101,6 +101,7 @@ pub enum ResolvedBy {
     Text,
     Geometry,
     RefusedAmbiguous,
+    JevChoice,
 }
 
 impl ResolvedBy {
@@ -111,6 +112,7 @@ impl ResolvedBy {
             ResolvedBy::Text => "text",
             ResolvedBy::Geometry => "geometry",
             ResolvedBy::RefusedAmbiguous => "refused_ambiguous",
+            ResolvedBy::JevChoice => "jev-choice",
         }
     }
 }
@@ -288,6 +290,37 @@ pub fn normalize_text(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+
+/// Decision point 1 (contracts/decision-points.md §1): ask the local Jev
+/// decider to pick among ambiguous-match candidates. Returns the picked
+/// refid on a confident single choice; anything else (low confidence, tie,
+/// fallback, disabled) → `None` → the caller keeps today's refusal.
+///
+/// Candidate strings are the resolver's own `"<refid> [role] \"text\""`
+/// renderings (existing order preserved; capped at 12 by the builder).
+pub async fn jev_resolve_ambiguous(
+    decider: &joey_jev::JevDecider,
+    instruction: &str,
+    page_title: &str,
+    url: &str,
+    candidates: &[String],
+) -> Option<String> {
+    let pairs: Vec<(String, String)> = candidates
+        .iter()
+        .map(|c| {
+            let refid = c.split_whitespace().next().unwrap_or_default().to_string();
+            (refid, c.clone())
+        })
+        .collect();
+    let req = joey_jev::target_resolution(instruction, page_title, url, &pairs);
+    match decider
+        .decide(joey_jev::DecisionPoint::TargetResolution, req)
+        .await
+    {
+        joey_jev::Decision::Confident(joey_jev::Answer::Choice { key, .. }) => Some(key),
+        _ => None,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

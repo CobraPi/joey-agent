@@ -479,9 +479,9 @@ ledger, R8 no-HF policy).
 
 ## Architecture
 
-A Cargo workspace of 17 crates. The first nine are direct ports of Hermes Agent
-modules; the remaining eight (`joey-tui`, `joey-llm-selector`, `joey-orchestration`,
-`joey-omo`, `joey-speckit-ui`, `joey-neurocode`, `joey-neurocode-rag`, `joey-copilot`)
+A Cargo workspace of 19 crates. The first nine are direct ports of Hermes Agent
+modules; the remaining ten (`joey-tui`, `joey-llm-selector`, `joey-orchestration`,
+`joey-omo`, `joey-speckit-ui`, `joey-neurocode`, `joey-neurocode-rag`, `joey-copilot`, `joey-compute`, and `joey-jev`)
 are joey-native additions layered on top, not described by the upstream Python project:
 
 | Crate | Ports | Responsibility |
@@ -503,6 +503,8 @@ are joey-native additions layered on top, not described by the upstream Python p
 | `joey-neurocode` | — (joey-native) | NeuroCode engine for enterprise codebases: complexity-tier routing, tree-sitter multi-language structural dependency graph in SQLite+FTS5 (all tree-sitter-supported languages; Pega-tuned for Java), dependency-aware context assembly, Pega rule awareness, verify-loop pattern memory. Consumed by `joey-agent-core` via the narrow `NeuroCodeEngine` trait; see the [NeuroCode](#neurocode-enterprise-java--pega-coding) section |
 | `joey-neurocode-rag` | — (joey-native) | Semantic code retrieval (RAG) layered over the NeuroCode graph: local ONNX embedding (runtime-loaded ORT dylib, offline tokenizers), hybrid dense+BM25 RRF search, incremental atomic re-indexing, consent-gated remote backends. Extends the graph store to schema v3 (`rag_*` tables); see the [Semantic code search (RAG)](#semantic-code-search-rag) section |
 | `joey-copilot` | — (joey-native) | GitHub Copilot `.github/` bundle discovery and plugin manifests (`joey copilot` command) |
+| `joey-compute` | — (joey-native) | CPU-bound work execution substrate (feature 033): dedicated OS worker threads, earliest-deadline-first scheduling, semaphore admission/backpressure, panic isolation, watchdog, metrics |
+| `joey-jev` | — (joey-native) | Client for the local Jev decision service (feature 036): wire types, availability probe/cache, confidence gates, decision log; accelerates four browser-loop decision points; see docs/browser.md |
 
 `joey-tui`, `joey-llm-selector`, `joey-orchestration`, and `joey-omo` are all wired
 into the live `joey` binary (REPL, one-shot, and cron paths); `joey-neurocode` is

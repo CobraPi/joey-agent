@@ -182,6 +182,64 @@ fn err(e: joey_browser::BrowserError) -> ToolResult {
     ToolResult::Error(e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Jev verdict injection (feature 036, decision point 4)
+// ---------------------------------------------------------------------------
+
+/// Attach the additive `verdict` key to a mutating action's result body
+/// (contracts/decision-points.md §4):
+/// - Confident → `verdict: {outcome: achieved|not_achieved, confidence}`
+/// - LowConfidence → `verdict: {outcome: "inconclusive", confidence}`
+/// - Fallback (incl. no decider) → NO key, body byte-identical to today.
+///
+/// Verdict content rides inside tool output that already passes
+/// `<untrusted_tool_result>` wrapping — hint-grade, never instructions.
+/// Map a verdict decision to its additive JSON value (None → NO key).
+pub fn verdict_value(dec: joey_jev::Decision) -> Option<Value> {
+    match dec {
+        joey_jev::Decision::Confident(joey_jev::Answer::Choice { key, confidence, .. }) => {
+            Some(json!({ "outcome": key, "confidence": confidence }))
+        }
+        joey_jev::Decision::Confident(joey_jev::Answer::Scores { .. }) => {
+            // Verdict asks a choice question; a scores answer is shape drift
+            // → no verdict key (byte-identical fallback posture).
+            None
+        }
+        joey_jev::Decision::LowConfidence { got, .. } => {
+            Some(json!({ "outcome": "inconclusive", "confidence": got }))
+        }
+        joey_jev::Decision::Fallback { .. } => None,
+    }
+}
+
+async fn attach_verdict(
+    handle: &BrowserHandle,
+    action: &str,
+    pre_digest: &str,
+    body: &mut Value,
+) {
+    let action = action.to_string();
+    let pre = pre_digest.to_string();
+    let verdict = handle
+        .run(move |m| async move {
+            let Some(decider) = m.jev().await else {
+                return Ok(None);
+            };
+            let post = m.page_digest().await;
+            let req = joey_jev::verdict(&action, &pre, &post);
+            Ok(verdict_value(
+                decider
+                    .decide(joey_jev::DecisionPoint::Verdict, req)
+                    .await,
+            ))
+        })
+        .await;
+    // Run errors (NotConnected etc.) fall back to NO verdict key.
+    if let Ok(Some(v)) = verdict {
+        body["verdict"] = v;
+    }
+}
+
 macro_rules! browser_tool {
     ($name:ident, $wire:literal, $desc:literal, $emoji:literal) => {
         pub struct $name {
@@ -315,25 +373,22 @@ impl Tool for BrowserSnapshot {
             "type": "object",
             "properties": {
                 "viewport_only": { "type": "boolean", "default": false, "description": "Restrict to in-view elements only." },
-                "since_last": { "type": "boolean", "default": false, "description": "Return only elements new since the previous snapshot (feeds)." }
+                "since_last": { "type": "boolean", "default": false, "description": "Return only elements new since the previous snapshot (feeds)." },
+                "goal": { "type": "string", "description": "Optional browsing goal for this task; enables goal-aware snapshot trimming (irrelevant entries drop first when over budget)." }
             }
         })
     }
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
         let since_last = args.get("since_last").and_then(|v| v.as_bool()).unwrap_or(false);
         let _ = since_last; // delta mode wired with the feed pipeline (T057)
+        let goal = args.get("goal").and_then(|v| v.as_str()).map(str::to_string);
         match self.handle.run(|m| async move {
-            let registry = m.scan_to_registry().await?;
-            let snapshot = joey_browser::snapshot::structural_snapshot(
-                m.eval_string("location.href").await?,
-                m.eval_string("document.title").await?,
-                m.frame_count().await?,
-                m.viewport().await?,
-                registry.elements.clone(),
-                vec![],
-                &m.config.budgets,
-                m.config.budgets.viewport_margin,
-            );
+            // Goal-bearing snapshot calls set the session objective used by
+            // salience trimming (decision point 3); cleared on disconnect.
+            if let Some(g) = goal {
+                m.set_current_objective(Some(g)).await;
+            }
+            let snapshot = m.snapshot().await?;
             Ok(snapshot.render())
         }).await {
             Ok(text) => ToolResult::Text(text),
@@ -368,8 +423,16 @@ impl Tool for BrowserClick {
             Ok(t) => t,
             Err(e) => return e,
         };
-        match self.handle.run(|m| async move { m.click(&t).await }).await {
-            Ok(r) => ok_json(json!({ "ok": r.ok, "resolved_by": r.resolved_by.as_str(), "detail": r.detail })),
+        match self.handle.run(|m| async move {
+            let pre = m.page_digest().await;
+            let r = m.click(&t).await?;
+            Ok((r, pre))
+        }).await {
+            Ok((r, pre)) => {
+                let mut body = json!({ "ok": r.ok, "resolved_by": r.resolved_by.as_str(), "detail": r.detail });
+                attach_verdict(&self.handle, "click", &pre, &mut body).await;
+                ok_json(body)
+            }
             Err(e) => err(e),
         }
     }
@@ -413,8 +476,16 @@ impl Tool for BrowserType {
         let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
         let submit = args.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
-        match self.handle.run(move |m| async move { m.r#type(&t, &text, clear, submit).await }).await {
-            Ok(r) => ok_json(json!({ "ok": r.ok, "resolved_by": r.resolved_by.as_str(), "detail": r.detail })),
+        match self.handle.run(move |m| async move {
+            let pre = m.page_digest().await;
+            let r = m.r#type(&t, &text, clear, submit).await?;
+            Ok((r, pre))
+        }).await {
+            Ok((r, pre)) => {
+                let mut body = json!({ "ok": r.ok, "resolved_by": r.resolved_by.as_str(), "detail": r.detail });
+                attach_verdict(&self.handle, "type", &pre, &mut body).await;
+                ok_json(body)
+            }
             Err(e) => err(e),
         }
     }
@@ -535,8 +606,16 @@ impl Tool for BrowserPress {
         let mods = args.get("modifiers").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         let has = |n: &str| mods.iter().any(|m| m.as_str() == Some(n));
         let (ctrl, alt, shift, meta) = (has("ctrl"), has("alt"), has("shift"), has("meta") || has("cmd"));
-        match self.handle.run(move |m| async move { m.press_key(&key, ctrl, alt, shift, meta).await }).await {
-            Ok(r) => ok_json(json!({ "ok": r.ok, "detail": r.detail })),
+        match self.handle.run(move |m| async move {
+            let pre = m.page_digest().await;
+            let r = m.press_key(&key, ctrl, alt, shift, meta).await?;
+            Ok((r, pre))
+        }).await {
+            Ok((r, pre)) => {
+                let mut body = json!({ "ok": r.ok, "detail": r.detail });
+                attach_verdict(&self.handle, "press", &pre, &mut body).await;
+                ok_json(body)
+            }
             Err(e) => err(e),
         }
     }
@@ -878,8 +957,16 @@ impl Tool for BrowserSelectOption {
             Err(e) => return e,
         };
         let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        match self.handle.run(move |m| async move { m.select_option(&t, &value).await }).await {
-            Ok(r) => ok_json(json!({ "ok": r.ok, "resolved_by": r.resolved_by.as_str(), "selected": r.detail })),
+        match self.handle.run(move |m| async move {
+            let pre = m.page_digest().await;
+            let r = m.select_option(&t, &value).await?;
+            Ok((r, pre))
+        }).await {
+            Ok((r, pre)) => {
+                let mut body = json!({ "ok": r.ok, "resolved_by": r.resolved_by.as_str(), "selected": r.detail });
+                attach_verdict(&self.handle, "select_option", &pre, &mut body).await;
+                ok_json(body)
+            }
             Err(e) => err(e),
         }
     }
@@ -922,8 +1009,16 @@ impl Tool for BrowserDrag {
             Some(Ok(t)) => t,
             _ => return ToolResult::Error("missing target".into()),
         };
-        match self.handle.run(move |m| async move { m.drag(&s, &t).await }).await {
-            Ok(r) => ok_json(json!({ "ok": r.ok, "detail": r.detail })),
+        match self.handle.run(move |m| async move {
+            let pre = m.page_digest().await;
+            let r = m.drag(&s, &t).await?;
+            Ok((r, pre))
+        }).await {
+            Ok((r, pre)) => {
+                let mut body = json!({ "ok": r.ok, "detail": r.detail });
+                attach_verdict(&self.handle, "drag", &pre, &mut body).await;
+                ok_json(body)
+            }
             Err(e) => err(e),
         }
     }
